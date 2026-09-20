@@ -144,6 +144,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "DMA request reset epoch is required");
     status = request_context.validate();
+    status = normalize_status(status, "DMA request validation");
     if (!status.ok())
       return status;
     host_key = request_context.route.host_topology_key;
@@ -155,8 +156,18 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     // request snapshot，同时把返回 authority 与该 snapshot 严格比较。
     request_snapshot = rdma_dma_request_context::type_id::create(
       "host_dma_request_snapshot");
+    if (request_snapshot == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "DMA request snapshot allocation failed"
+      );
     request_snapshot.copy(request_context);
     manager = m_managers[host_key];
+    if (manager == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Host route manager is null"
+      );
     manager_mapping = null;
     status = manager.allocate(request_snapshot, size, alignment, direction,
                               manager_mapping);
@@ -302,7 +313,13 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (!status.ok())
       return status;
     manager = m_managers[mapping.route.host_topology_key];
-    return manager.write(mapping, offset, data);
+    if (manager == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Host route manager is null during write"
+      );
+    status = manager.write(mapping, offset, data);
+    return normalize_status(status, "Host manager write");
   endfunction
 
   // 功能：验证 mapping 后从对应 Host manager 读取指定范围，并通过 data 返回字节数组。
@@ -327,7 +344,16 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (!status.ok())
       return status;
     manager = m_managers[mapping.route.host_topology_key];
-    return manager.read(mapping, offset, size, data);
+    if (manager == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Host route manager is null during read"
+      );
+    status = manager.read(mapping, offset, size, data);
+    status = normalize_status(status, "Host manager read");
+    if (!status.ok())
+      data.delete();
+    return status;
   endfunction
 
   // 功能：验证 mapping 后把释放操作交给原 Host manager；底层成功时同步删除所有 parallel
@@ -347,7 +373,13 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (!status.ok())
       return status;
     manager = m_managers[mapping.route.host_topology_key];
+    if (manager == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Host route manager is null during release"
+      );
     status = manager.\release (mapping);
+    status = normalize_status(status, "Host manager release");
     if (status.ok())
       delete_mapping_ledgers(index);
     return status;
@@ -460,7 +492,6 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   //       BDF、四维 reset epoch 和 manager 存在性；返回错误时禁止任何外部访问。
   // 输入/输出及副作用：mapping（输入）、index（输入）；validate_mapping 读取 mapping、index 并使用字段 local_host_epoch、coordinator_host_epoch、function_epoch_value、device_epoch_value；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate_mapping 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_DMA_TRANSLATION、RDMA_SC_STALE_GENERATION；典型拒绝条件为“unknown DMA mapping”“DMA mapping route was modified”；失败路径不提交部分状态或转移未声明资源。
-
   protected function rdma_status validate_mapping(
     rdma_dma_mapping mapping,
     int index,

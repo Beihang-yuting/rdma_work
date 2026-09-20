@@ -490,7 +490,7 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
   // 完成请求后返回的 RoCEv2 数据面报文。
   // 输入/输出及副作用：opcode、index、payload、original_value 为输入；返回
   //   独立 packet，不推进 sink、queue 或 host-memory 统计。
-  // 失败边界：仅接受 RC READ response/Atomic ACK；其他 opcode 返回 NAK 观察值，
+  // 失败/边界：仅接受 RC READ response/Atomic ACK；其他 opcode 返回 NAK 观察值，
   //   调用方必须停止当前 case。
   function automatic rdma_packet make_response_packet(
     rdma_network_opcode_e opcode,

@@ -12,8 +12,8 @@ class rdma_queue_runtime_wrong_factory_object extends uvm_object;
   `uvm_object_utils(rdma_queue_runtime_wrong_factory_object)
 
   // 功能：构造无 RDMA 字段的 UVM 对象，作为 factory 错误类型载体。
-  // 输入输出及副作用：name（输入）仅传给 uvm_object；不登记 RDMA 资源。
-  // 失败边界：对象可被创建，但必须无法 cast 成任一被测 RDMA 类型。
+  // 输入/输出及副作用：name（输入）仅传给 uvm_object；不登记 RDMA 资源。
+  // 失败/边界：对象可被创建，但必须无法 cast 成任一被测 RDMA 类型。
   function new(string name = "rdma_queue_runtime_wrong_factory_object");
     super.new(name);
   endfunction
@@ -29,8 +29,8 @@ class rdma_queue_runtime_factory_fault_wrapper extends uvm_object_wrapper;
   protected bit wrong_type_state;
 
   // 功能：保存被覆盖类型的原 factory wrapper，并以 disarmed 状态启动。
-  // 输入输出及副作用：name/delegate_value（输入）被保存为非拥有引用；无输出。
-  // 失败边界：delegate_value 为 null 时 disarmed create 也只返回 null，不触发 fatal。
+  // 输入/输出及副作用：name/delegate_value（输入）被保存为非拥有引用；无输出。
+  // 失败/边界：delegate_value 为 null 时 disarmed create 也只返回 null，不触发 fatal。
   function new(string name, uvm_object_wrapper delegate_value);
     wrapper_type_name = name;
     delegate = delegate_value;
@@ -39,8 +39,8 @@ class rdma_queue_runtime_factory_fault_wrapper extends uvm_object_wrapper;
   endfunction
 
   // 功能：为当前故障窗口返回 null 或不兼容的 UVM 对象。
-  // 输入输出及副作用：name（输入）传给 delegate/错误载体；返回工厂对象。
-  // 失败边界：armed 且 wrong_type_state=0 返回 null；为 1 返回错误类型；
+  // 输入/输出及副作用：name（输入）传给 delegate/错误载体；返回工厂对象。
+  // 失败/边界：armed 且 wrong_type_state=0 返回 null；为 1 返回错误类型；
   // disarmed 但 delegate 缺失时保守返回 null。
   virtual function uvm_object create_object(string name = "");
     rdma_queue_runtime_wrong_factory_object wrong_object;
@@ -55,23 +55,23 @@ class rdma_queue_runtime_factory_fault_wrapper extends uvm_object_wrapper;
   endfunction
 
   // 功能：返回该故障 wrapper 的唯一测试类型名，供 UVM factory 记录 override。
-  // 输入输出及副作用：无输入；返回 wrapper_type_name，不修改注册表。
-  // 失败边界：名称只用于测试识别，不作为 RDMA 类型 authority。
+  // 输入/输出及副作用：无输入；返回 wrapper_type_name，不修改注册表。
+  // 失败/边界：名称只用于测试识别，不作为 RDMA 类型 authority。
   virtual function string get_type_name();
     return wrapper_type_name;
   endfunction
 
   // 功能：开启持续到 disarm 的 factory 故障窗口。
-  // 输入输出及副作用：wrong_type（输入）选择 null 或错误类型；更新本 wrapper。
-  // 失败边界：重复 arm 只覆盖模式，不更换 delegate 或创建对象。
+  // 输入/输出及副作用：wrong_type（输入）选择 null 或错误类型；更新本 wrapper。
+  // 失败/边界：重复 arm 只覆盖模式，不更换 delegate 或创建对象。
   function void arm(bit wrong_type);
     armed_state = 1'b1;
     wrong_type_state = wrong_type;
   endfunction
 
   // 功能：关闭故障注入，恢复对原 wrapper 的直接委托。
-  // 输入输出及副作用：无输入输出；清除 armed_state/wrong_type_state。
-  // 失败边界：disarm 幂等；不删除 UVM type override，不影响已创建对象。
+  // 输入/输出及副作用：无输入输出；清除 armed_state/wrong_type_state。
+  // 失败/边界：disarm 幂等；不删除 UVM type override，不影响已创建对象。
   function void disarm();
     armed_state = 1'b0;
     wrong_type_state = 1'b0;
@@ -85,16 +85,16 @@ class rdma_queue_runtime_retry_authority_probe extends rdma_queue_runtime;
   `uvm_object_utils(rdma_queue_runtime_retry_authority_probe)
 
   // 功能：构造未配置的 runtime probe，仅复用生产状态机并开放 retry bit 注入。
-  // 输入输出及副作用：name 为对象名；调用基类构造，不配置 queue/route 或状态。
-  // 失败边界：未完成 configure 的 probe 与生产 runtime 一样拒绝业务入口。
+  // 输入/输出及副作用：name 为对象名；调用基类构造，不配置 queue/route 或状态。
+  // 失败/边界：未完成 configure 的 probe 与生产 runtime 一样拒绝业务入口。
   function new(string name = "rdma_queue_runtime_retry_authority_probe");
     super.new(name);
   endfunction
 
   // 功能：set_retry_confirmation_for_test 精确设置 copy gate 应拒绝的一次性恢复授权。
-  // 输入输出及副作用：value 为输入；仅修改 recovery_retry_confirmed，不触碰
+  // 输入/输出及副作用：value 为输入；仅修改 recovery_retry_confirmed，不触碰
   //   pending、reservation、cursor、ledger、state 或 semaphore。
-  // 失败边界：该 helper 仅供本文件在 QUIESCING source/空 ATTACHED target 上构造
+  // 失败/边界：该 helper 仅供本文件在 QUIESCING source/空 ATTACHED target 上构造
   //   public transition 当前不可达的不一致状态，禁止用于正向 runtime 行为测试。
   function void set_retry_confirmation_for_test(bit value);
     recovery_retry_confirmed = value;
@@ -114,9 +114,9 @@ class rdma_queue_runtime_test extends uvm_test;
   protected rdma_queue_runtime_factory_fault_wrapper pending_fault;
 
   // 功能：构造 runtime 单测 component，建立 UVM 层级；具体 fixture 留给各 task。
-  // 输入输出及副作用：name/parent（输入）传给 uvm_test；不创建 runtime、
+  // 输入/输出及副作用：name/parent（输入）传给 uvm_test；不创建 runtime、
   //   不安装 factory override，也不 raise objection。
-  // 失败边界：parent 可为 null；factory wrapper 必须等 run_phase 显式配置后使用。
+  // 失败/边界：parent 可为 null；factory wrapper 必须等 run_phase 显式配置后使用。
   function new(string name = "rdma_queue_runtime_test",
                uvm_component parent = null);
     super.new(name, parent);
@@ -124,9 +124,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：为 runtime 内部六类值副本与 pending 外壳安装可 disarm 的 raw
   //   factory wrapper，使单测可非致命地注入 null 和错误类型。
-  // 输入输出及副作用：无显式参数；更新六个 wrapper 字段并在全局
+  // 输入/输出及副作用：无显式参数；更新六个 wrapper 字段并在全局
   //   UVM factory 安装 type override，每个 wrapper 默认委托原 registry。
-  // 失败边界：本 helper 必须在首次被测创建之前只调用一次；重复安装
+  // 失败/边界：本 helper 必须在首次被测创建之前只调用一次；重复安装
   //   会把 delegate 指向旧故障 wrapper，因此 run_phase 不重复调用。
   function automatic void configure_factory_faults();
     uvm_factory factory;
@@ -156,8 +156,8 @@ class rdma_queue_runtime_test extends uvm_test;
   endfunction
 
   // 功能：关闭全部 factory 故障窗口，使后续正向场景继续委托原类型。
-  // 输入输出及副作用：无显式参数；只清除六个 wrapper 的 arm 状态。
-  // 失败边界：任一 wrapper 未初始化时跳过它；调用幂等且不移除 type override。
+  // 输入/输出及副作用：无显式参数；只清除六个 wrapper 的 arm 状态。
+  // 失败/边界：任一 wrapper 未初始化时跳过它；调用幂等且不移除 type override。
   function automatic void disarm_factory_faults();
     if (handle_fault != null) handle_fault.disarm();
     if (cursor_fault != null) cursor_fault.disarm();
@@ -169,9 +169,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：queue_handle 构造固定 Function UID/generation、由调用方指定 kind/
   //   object_id 的 queue identity fixture。
-  // 输入输出及副作用：name/kind/object_id（输入）；返回调用 task 拥有的
+  // 输入/输出及副作用：name/kind/object_id（输入）；返回调用 task 拥有的
   //   rdma_handle，不登记 lifecycle resource 或修改 runtime。
-  // 失败边界：该 helper 仅在 handle factory disarm 时调用；factory 返回 null 会
+  // 失败/边界：该 helper 仅在 handle factory disarm 时调用；factory 返回 null 会
   //   使 fixture 无法建立，故障注入路径应直接调用被测 non-fatal clone 接口。
   function automatic rdma_handle queue_handle(
     string name,
@@ -289,9 +289,9 @@ class rdma_queue_runtime_test extends uvm_test;
   endfunction
 
   // 功能：expect_ok 断言被测入口返回非 null 且 code=RDMA_SC_OK。
-  // 输入输出及副作用：label/status（输入）；失败时产生带 status 文本的
+  // 输入/输出及副作用：label/status（输入）；失败时产生带 status 文本的
   //   UVM_ERROR，不修改 status 或任何 DUT 状态。
-  // 失败边界：status=null 作为独立契约错误报告；helper 不终止 task，调用方在
+  // 失败/边界：status=null 作为独立契约错误报告；helper 不终止 task，调用方在
   //   后续解引用前仍需显式 return。
   function automatic void expect_ok(string label, rdma_status status);
     if (status == null || !status.ok())
@@ -300,9 +300,9 @@ class rdma_queue_runtime_test extends uvm_test;
   endfunction
 
   // 功能：expect_code 断言被测拒绝路径返回指定 rdma_status_code_e。
-  // 输入输出及副作用：label/status/code（输入）；不修改输入，失配时产生包含
+  // 输入/输出及副作用：label/status/code（输入）；不修改输入，失配时产生包含
   //   实际 status 的 UVM_ERROR。
-  // 失败边界：status=null 必须失败；helper 不检查额外消息文本，也不停止调用 task。
+  // 失败/边界：status=null 必须失败；helper 不检查额外消息文本，也不停止调用 task。
   function automatic void expect_code(
     string label,
     rdma_status status,
@@ -371,9 +371,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：验证 activate 只执行 ATTACHED->ACTIVE 状态迁移，无 route/epoch 时
   //   publish authority 查询、prepared recovery 和 resize-copy 仍分别 fail-closed。
-  // 输入输出及副作用：无显式参数；构造 source/target CQ runtime 与一份完整但
+  // 输入/输出及副作用：无显式参数；构造 source/target CQ runtime 与一份完整但
   //   缺 route/epoch 的 consumer pending，通过公开状态/query/copy 接口观察结果。
-  // 失败边界：configure 后 activate 必须成功；缺 authority 的 query/pending/copy
+  // 失败/边界：configure 后 activate 必须成功；缺 authority 的 query/pending/copy
   //   必须拒绝且 output 归零、source 不进入 recovery、target 保持 ATTACHED。
   task automatic test_activate_without_authority_preserves_boundaries();
     rdma_queue_runtime runtime;
@@ -925,9 +925,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：验证 copy_ring_state 的 source 与 target gate 都显式拒绝尚未消费的
   //   recovery_retry_confirmed，避免 resize 把一次性 retry authority 复制或覆盖。
-  // 输入输出及副作用：构造同 identity/route 的 QUIESCING source 与 ATTACHED target，
+  // 输入/输出及副作用：构造同 identity/route 的 QUIESCING source 与 ATTACHED target，
   //   仅用 probe 注入单一 retry bit；通过生产 copy API 和公开 cursor 查询观察结果。
-  // 失败边界：任一侧带 authorization 时 copy 必须原子拒绝；两侧清零后同一 source/
+  // 失败/边界：任一侧带 authorization 时 copy 必须原子拒绝；两侧清零后同一 source/
   //   target 必须成功复制，证明拒绝并非由其它 geometry/authority 条件造成。
   task automatic test_copy_ring_state_rejects_retry_confirmation();
     rdma_queue_runtime_retry_authority_probe source;
@@ -1475,9 +1475,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：对一个已安装 pending 的 runtime 注入单个 factory 故障，验证
   //   query_pending 的错误状态、安全 output 和原子性。
-  // 输入输出及副作用：label/runtime/fault/wrong_type（输入）；短暂 arm
+  // 输入/输出及副作用：label/runtime/fault/wrong_type（输入）；短暂 arm
   //   wrapper，执行失败查询后立即 disarm，并以成功查询复核原 pending。
-  // 失败边界：runtime/fault 为 null 时报告 UVM_ERROR 并返回；故障路径
+  // 失败/边界：runtime/fault 为 null 时报告 UVM_ERROR 并返回；故障路径
   //   必须返回非空 RESOURCE_EXHAUSTED、snapshot=null，且 pending/occupancy 不变。
   task automatic check_pending_factory_failure(
     string label,
@@ -1526,9 +1526,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：覆盖 pending/handle/cursor/image/status 值副本和 host request 副本的
   //   raw-factory null/错误类型，并验证 host reservation 分配失败不推进 PI。
-  // 输入输出及副作用：无显式参数；构造一个 CQ consumer pending、一个 SQ
+  // 输入/输出及副作用：无显式参数；构造一个 CQ consumer pending、一个 SQ
   //   producer pending 和两个 SQ runtime，通过公开 query/reserve 产生断言。
-  // 失败边界：每次故障后都先 disarm 再继续；任一 fixture 前置失败时
+  // 失败/边界：每次故障后都先 disarm 再继续；任一 fixture 前置失败时
   //   提前返回，避免 null 解引用掩盖原始错误。
   task automatic test_nonfatal_factory_failures();
     rdma_queue_runtime consumer_runtime;
@@ -1685,9 +1685,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：用 depth=2 的 CQ 走完 reserve/full/consumer-credit/wrap，并验证
   //   CEQ 的初始 full occupancy 与 AEQ quiesce/detach 状态守卫。
-  // 输入输出及副作用：无显式参数；构造三个 device runtime，通过
+  // 输入/输出及副作用：无显式参数；构造三个 device runtime，通过
   //   reserve/commit/peek/query/lifecycle 公开接口改变并观察本地账本。
-  // 失败边界：任一配置或事务前置失败即返回；full 和 quiesce busy
+  // 失败/边界：任一配置或事务前置失败即返回；full 和 quiesce busy
   //   必须保持 output/游标/occupancy，DETACHED 不得被 restore 重新激活。
   task automatic test_device_depth_two_ceq_and_lifecycle();
     rdma_queue_runtime cq_runtime;
@@ -1892,9 +1892,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：验证 device-producer recovery 只允许一次 PI/occupancy 提交，且
   //   prepared admission 对缺 image、半有效 route、stale epoch 和非法 MMIO enum 原子拒绝。
-  // 输入输出及副作用：无显式参数；构造一笔 AEQ producer recovery 并
+  // 输入/输出及副作用：无显式参数；构造一笔 AEQ producer recovery 并
   //   四笔 CQ consumer fixture，通过 recovery/query 公开入口观察状态。
-  // 失败边界：任一成功前置失败即返回；重复 producer commit/complete
+  // 失败/边界：任一成功前置失败即返回；重复 producer commit/complete
   //   必须返回 INVALID_STATE，所有 malformed admission 必须保持 ACTIVE 且 occupancy=1。
   task automatic test_device_recovery_and_malformed_prepared();
     rdma_queue_runtime producer_runtime;
@@ -2074,9 +2074,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
   // 功能：run_phase 安装可控 factory fault，依次运行 runtime 边界场景，再执行
   //   legacy host ledger/wrap/recovery 兼容回归。
-  // 输入输出及副作用：phase（输入）由 UVM 提供；task raise/drop objection，
+  // 输入/输出及副作用：phase（输入）由 UVM 提供；task raise/drop objection，
   //   创建本地 fixture 并通过 UVM report 发布全部断言结果。
-  // 失败边界：关键 fixture 创建/configure/activate 失败时先 drop objection 再返回；
+  // 失败/边界：关键 fixture 创建/configure/activate 失败时先 drop objection 再返回；
   //   子 task 自行 disarm 故障窗口，run_phase 不释放任何外部 backend 资源。
   task run_phase(uvm_phase phase);
     rdma_queue_runtime runtime;

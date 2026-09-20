@@ -130,10 +130,12 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：status_or 按函数体读取当前字段并生成 rdma_status 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：status（输入）、fallback_code（输入）、fallback_message（输入）；status_or 读取 status、fallback_code、fallback_message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：status_or 将 host-memory/codec helper 返回的可空 status 规范化为可诊断结果，
+  //   非空 status 原样透传，空值时按 fallback_code 和 fallback_message 构造替代错误。
+  // 输入/输出及副作用：status、fallback_code、fallback_message（输入）；返回一个非空
+  //   rdma_status，不修改 submitter、ledger、mapping 或外部资源。
+  // 失败/边界：status 为 null 时永远采用 fallback；fallback_code/message 由调用方保证能
+  //   描述真实拒绝原因，函数不把 null 当作成功，也不执行重试。
   protected function rdma_status status_or(
     rdma_status status,
     rdma_status_code_e fallback_code,
@@ -162,10 +164,14 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：mapping_identity_status 校验 mapping、request_ctx、requested_size、requested_alignment、requested_direction 与当前对象状态的一致性，并显式处理“host memory adapter returned a null mapping”；“host memory adapter returned an inactive mapping”；“DMA mapping or request Function is null”；“DMA mapping has zero size”；“DMA mapping Function identity mismatch”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：mapping（输入）、request_ctx（输入）、requested_size（输入）、requested_alignment（输入）、requested_direction（输入）；mapping_identity_status 读取 mapping、request_ctx、requested_size、requested_alignment、requested_direction 并使用字段 mapping_last；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：mapping_identity_status 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_DMA_PERMISSION；典型拒绝条件为“DMA mapping Function identity mismatch”“DMA mapping requester BDF mismatch”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：mapping_identity_status 在登记 queue target 前核对 mapping 与 request_ctx 的
+  //   Function、BDF、PASID、DMA domain、route、reset epoch、尺寸、对齐和方向权限。
+  // 输入/输出及副作用：mapping、request_ctx、requested_size、requested_alignment、
+  //   requested_direction（输入）；只读检查并返回 rdma_status，不写 mapping、request_ctx、
+  //   ledger 或外部 Host-memory 资源。
+  // 失败/边界：空/非 ACTIVE mapping、缺少 Function、身份或 route/epoch 不一致、尺寸/对齐/
+  //   方向/权限不符、零长度及 IOVA 溢出或回绕分别返回 INVALID/STATE、DMA_TRANSLATION、
+  //   DMA_PERMISSION 或 STALE_GENERATION；失败不发布 target。
   protected function rdma_status mapping_identity_status(
     rdma_dma_mapping mapping,
     rdma_dma_request_context request_ctx,
@@ -249,14 +255,171 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，lookup_target 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：target（输入）、entry（输出）；lookup_target 读取 target、entry 并使用字段 entry、key，并写入 entry；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：lookup_target 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：ledger_entry_authority_status 校验一条 target ledger 记录的完整
+  //       mapping、release authority、request context、Function、route、epoch
+  //       和生命周期 authority。
+  // 输入/输出及副作用：entry（输入）；函数只读取 entry 及其嵌套字段，返回
+  //       规范化 rdma_status，不调用 host_mem、不修改 ledger 或 mapping。
+  // 失败/边界：entry、mapping、release_authority、request_context 或 Function
+  //       缺失，mapping 非 ACTIVE、身份/路由/epoch/owner 不一致、几何或权限
+  //       非法时返回对应错误；release authority 只通过 mapping 提供的
+  //       opaque equivalence hook 校验，不读取或重建其内部 token。
+  protected function rdma_status ledger_entry_authority_status(
+    rdma_queue_host_mem_ledger_entry entry
+  );
+    rdma_dma_mapping mapping;
+    rdma_dma_request_context request_ctx;
+    rdma_status status;
+
+    if (entry == null)
+      return state_error("queue host-memory target ledger entry is null");
+
+    mapping = entry.mapping;
+    if (mapping == null)
+      return state_error("queue host-memory target mapping is null");
+    if (entry.release_authority == null)
+      return state_error("queue host-memory target release authority is null");
+    if (entry.request_context == null)
+      return state_error("queue host-memory target request context is null");
+    if (entry.released)
+      return state_error("queue host-memory target is already released");
+    if (mapping.state != RDMA_MAPPING_ACTIVE)
+      return state_error("queue host-memory target mapping is not ACTIVE");
+
+    status = mapping.release_authority_status(entry.release_authority);
+    status = status_or(
+      status,
+      RDMA_SC_INVALID_STATE,
+      "queue host-memory target release authority validation returned null"
+    );
+    if (!status.ok())
+      return status;
+
+    request_ctx = entry.request_context;
+    if (request_ctx.function_h == null)
+      return state_error("queue host-memory target request Function is null");
+    if (mapping.function_h == null)
+      return state_error("queue host-memory target mapping Function is null");
+    if (mapping.function_h.kind != RDMA_RESOURCE_FUNCTION ||
+        request_ctx.function_h.kind != RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target Function kind is invalid"
+      );
+
+    status = request_ctx.validate();
+    status = status_or(
+      status,
+      RDMA_SC_INVALID_STATE,
+      "queue host-memory target request validation returned null"
+    );
+    if (!status.ok())
+      return status;
+
+    if (mapping.function_h.function_uid != request_ctx.function_h.function_uid ||
+        mapping.function_h.object_id != request_ctx.function_h.object_id)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target Function identity mismatch"
+      );
+    if (mapping.function_h.generation != request_ctx.function_h.generation)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "queue host-memory target Function generation mismatch"
+      );
+    if (mapping.requester_bdf != request_ctx.requester_bdf)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target requester BDF mismatch"
+      );
+    if (mapping.pasid_valid != request_ctx.pasid_valid ||
+        mapping.pasid != request_ctx.pasid)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target PASID identity mismatch"
+      );
+    if (mapping.dma_domain_valid != request_ctx.dma_domain_valid ||
+        mapping.dma_domain_id != request_ctx.dma_domain_id)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target DMA domain mismatch"
+      );
+
+    // Direct unit callers may omit route/epoch metadata.  Once either side
+    // carries an authority, both copies must be present, valid and identical.
+    if (request_ctx.route_valid || mapping.route_valid) begin
+      if (!request_ctx.route_valid || !mapping.route_valid ||
+          !rdma_route_key_valid(request_ctx.route) ||
+          !rdma_route_key_valid(mapping.route) ||
+          request_ctx.route.host_topology_key != mapping.route.host_topology_key ||
+          request_ctx.route.root_id != mapping.route.root_id ||
+          request_ctx.route.segment != mapping.route.segment ||
+          !rdma_bdf_same(request_ctx.route.bdf, mapping.route.bdf))
+        return rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "queue host-memory target route identity mismatch"
+        );
+    end
+    if (request_ctx.epoch_valid || mapping.epoch_valid) begin
+      if (!request_ctx.epoch_valid || !mapping.epoch_valid ||
+          request_ctx.reset_epoch != mapping.reset_epoch)
+        return rdma_status::make(
+          RDMA_SC_STALE_GENERATION,
+          "queue host-memory target reset epoch mismatch"
+        );
+    end
+
+    if ((mapping.owner_h == null) != (request_ctx.owner_h == null))
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target owner presence mismatch"
+      );
+    if (mapping.owner_h != null &&
+        !mapping.owner_h.same_instance(request_ctx.owner_h))
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target owner identity mismatch"
+      );
+
+    if (!(mapping.direction inside {RDMA_DMA_DEVICE_READ,
+                                    RDMA_DMA_DEVICE_WRITE,
+                                    RDMA_DMA_BIDIRECTIONAL}))
+      return state_error("queue host-memory target mapping direction is invalid");
+    if (entry.direction != mapping.direction)
+      return rdma_status::make(
+        RDMA_SC_DMA_PERMISSION,
+        "queue host-memory target direction authority mismatch"
+      );
+    if (entry.permissions.device_read != mapping.permissions.device_read ||
+        entry.permissions.device_write != mapping.permissions.device_write ||
+        entry.permissions.atomic != mapping.permissions.atomic)
+      return rdma_status::make(
+        RDMA_SC_DMA_PERMISSION,
+        "queue host-memory target permission authority mismatch"
+      );
+    if (mapping.size == 0)
+      return state_error("queue host-memory target mapping has zero size");
+    if (mapping.iova.value >
+        (64'hffff_ffff_ffff_ffff - (mapping.size - 1'b1)))
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "queue host-memory target mapping range overflows"
+      );
+    return rdma_status::success();
+  endfunction
+
+  // 功能：lookup_target 按 opaque capability 查找唯一 ledger 记录，并在返回
+  //       前执行完整 authority 校验，阻止 malformed entry 进入任何 I/O 路径。
+  // 输入/输出及副作用：target（输入）、entry（输出）；函数只读取 target 和
+  //       private ledger，返回经过验证的内部 entry 引用，不取得外部资源所有权。
+  // 失败/边界：target/key 未登记、entry 或其 mapping/context/authority 缺失、
+  //       身份/route/epoch/lifecycle 校验失败时返回非成功 status 且 entry=null。
   protected function rdma_status lookup_target(
     rdma_queue_host_mem_target target,
     output rdma_queue_host_mem_ledger_entry entry
   );
     string key;
+    rdma_status status;
 
     entry = null;
     if (target == null)
@@ -265,15 +428,25 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     if (key.len() == 0 || !ledger.exists(key) || ledger[key] == null)
       return invalid("queue host-memory target is foreign or unknown");
     entry = ledger[key];
-    if (entry.mapping == null || entry.release_authority == null)
-      return state_error("queue host-memory target ledger is malformed");
-    return rdma_status::success();
+    status = ledger_entry_authority_status(entry);
+    if (status == null || !status.ok()) begin
+      entry = null;
+      return status_or(
+        status,
+        RDMA_SC_INVALID_STATE,
+        "queue host-memory target ledger validation returned null"
+      );
+    end
+    return status;
   endfunction
 
-  // 功能：validate_range 校验 entry、offset、length、requested_direction、requested_permissions 与当前对象状态的一致性，并显式处理“queue host-memory target entry is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：entry（输入）、offset（输入）、length（输入）、requested_direction（输入）、requested_permissions（输入）；validate_range 读取 entry、offset、length、requested_direction、requested_permissions 并使用字段 first_iova.value、status；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：validate_range 返回 RDMA_SC_DMA_TRANSLATION；具体拒绝条件包括 “queue host-memory target entry is invalid”；“queue host-memory target is released”；“queue host-memory access length is zero”；“queue host-memory access offset overflows”；“queue host-memory IOVA calculation overflows”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：validate_range 把 target ledger entry 与 offset/length/方向/权限组合成一次
+  //   Host-memory access，并在调用 mapping.check_access 前验证 IOVA 几何和生命周期。
+  // 输入/输出及副作用：entry、offset、length、requested_direction、requested_permissions
+  //   （输入）；只读 entry/mapping/context，返回检查 status，不修改 ledger、mapping 或游标。
+  // 失败/边界：entry 缺失、已 release、length 为零、offset 或 IOVA 计算溢出时拒绝；
+  //   mapping.check_access 的 null status 规范化为 DMA_TRANSLATION，其余失败原样传播，
+  //   任何失败都不启动 I/O。
   protected function rdma_status validate_range(
     rdma_queue_host_mem_ledger_entry entry,
     longint unsigned offset,
@@ -356,25 +529,37 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，complete_read_image 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
-  // 输入/输出及副作用：entry（输入）、offset（输入）、image_length（输入）、image_kind（输入）、codec（输入）、image（输出）；complete_read_image 读取 entry、offset、image_length、image_kind、codec、image 并使用字段 image、status、read_data、candidate、candidate.length、candidate.alignment、candidate.endian、candidate.image_kind，并写入 image；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：complete_read_image 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_CODEC_ERROR；具体拒绝条件包括 “host memory completion read returned a short image”；“completion image allocation failed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：complete_read_image 读取一个已登记的 host-memory entry，建立 detached
+  //   image，并在 CQE 路径上执行与 entry-size/variant 对应的 codec 校验。
+  // 输入/输出及副作用：entry、offset、image_length、image_kind、codec 和可选
+  //   cqe_variant 为输入；image 为输出。函数只读取 backing，成功后发布独立 image，
+  //   不推进队列游标，也不取得调用方资源所有权。
+  // 失败/边界：host-memory 读出长度不符、image 分配失败、variant codec 类型不符、
+  //   codec 返回 null/非成功 status 时返回相应错误；所有失败路径保持 image=null，
+  //   不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status complete_read_image(
     rdma_queue_host_mem_ledger_entry entry,
     longint unsigned offset,
     int unsigned image_length,
     rdma_image_kind_e image_kind,
     rdma_codec_base codec,
-    output rdma_hw_image image
+    output rdma_hw_image image,
+    input bit cqe_variant_valid = 1'b0,
+    input rdma_cqe_variant_e cqe_variant = RDMA_CQE_VARIANT_RC
   );
     byte read_data[];
-    byte unsigned image_bytes[];
     rdma_status status;
     rdma_hw_image candidate;
     rdma_hw_cqe_codec cqe_codec;
 
     image = null;
+    if (entry == null)
+      return state_error("queue completion entry is null");
+    if (codec == null)
+      return codec_error("queue completion codec is null");
+    if (host_mem == null)
+      return state_error("queue host-memory adapter is not configured");
+
     status = validate_range(entry, offset, image_length,
                             RDMA_DMA_DEVICE_WRITE,
                             '{device_read:1'b0, device_write:1'b1,
@@ -408,17 +593,19 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     candidate.backing_target = '0;
     candidate.hmc_target = '0;
     candidate.bar_target = '0;
-    image_bytes = new[image_length];
-    foreach (image_bytes[i])
-      image_bytes[i] = candidate.bytes[i];
+
     // CQE size is a transaction property.  The registry intentionally shares
     // one codec object, so validate through its explicit profile API instead
     // of reading the mutable 64B/32B/128B active profile.
     if (image_kind == RDMA_IMAGE_CQE) begin
       if (!$cast(cqe_codec, codec))
         return codec_error("CQ registry codec cannot validate a variable profile");
-      status = cqe_codec.validate_image_with_entry_bytes(candidate,
-                                                          image_length);
+      if (cqe_variant_valid)
+        status = cqe_codec.validate_image_with_entry_bytes_variant(
+            candidate, image_length, cqe_variant);
+      else
+        status = cqe_codec.validate_image_with_entry_bytes(candidate,
+                                                            image_length);
     end
     else
       status = codec.validate_image(candidate);
@@ -455,6 +642,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     if (request_context == null)
       return invalid("DMA request context is null");
     status = request_context.validate();
+    if (status == null)
+      return state_error(
+          "DMA request context validation returned null status");
     if (!status.ok())
       return status;
     if (size == 0 || alignment == 0 ||
@@ -531,7 +721,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
   // 功能：在 rdma_queue_host_mem_submitter 中，write_queue_entry 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
   // 输入/输出及副作用：target（输入）、offset（输入）、model（输入）、image_kind（输入）、variant（输入）、expected_length（输入）、image（输出）；输入
   //   request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-  // 失败/边界：write_queue_entry 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 失败/边界：target authority、Host-memory adapter、codec 或 model 缺失，
+  //   codec 返回 null status/image、后端拒绝、范围溢出、DMA 权限不足或
+  //   readback 校验失败时返回错误，不发布 image，也不推进本地游标。
   protected function rdma_status write_queue_entry(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -546,25 +738,51 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     rdma_hw_image candidate;
     rdma_hw_image readback_image;
     rdma_status status;
+    string object_type;
+    string codec_variant;
     byte write_data[];
     byte read_data[];
 
     image = null;
     status = lookup_target(target, entry);
+    status = status_or(status, RDMA_SC_INVALID_STATE,
+                       "queue target lookup returned null status");
     if (!status.ok())
       return status;
-    status = lookup_queue_codec(image_kind, "sqe", variant, codec);
-    if (image_kind == RDMA_IMAGE_RQE)
-      status = lookup_queue_codec(image_kind, "rqe", "default", codec);
+
+    if (entry == null || entry.request_context == null ||
+        entry.request_context.function_h == null)
+      return state_error("queue target authority is incomplete");
+
+    if (host_mem == null)
+      return state_error("queue host-memory adapter is not configured");
+
+    object_type = "sqe";
+    codec_variant = variant;
+    if (image_kind == RDMA_IMAGE_RQE) begin
+      object_type = "rqe";
+      codec_variant = "default";
+    end
+
+    status = lookup_queue_codec(image_kind, object_type, codec_variant, codec);
+    status = status_or(status, RDMA_SC_UNSUPPORTED_OPCODE,
+                       "queue codec lookup returned null status");
     if (!status.ok())
       return status;
+    if (codec == null)
+      return codec_error("queue codec lookup returned a null codec");
+    if (model == null)
+      return invalid("queue entry model is null");
+
     candidate = null;
     status = codec.encode(model, candidate);
     status = status_or(status, RDMA_SC_CODEC_ERROR,
                        "queue codec encode returned null status");
     if (!status.ok())
       return status;
-    if (candidate == null || candidate.length != expected_length ||
+    if (candidate == null)
+      return codec_error("queue codec returned a null image");
+    if (candidate.length != expected_length ||
         candidate.bytes.size() != expected_length ||
         candidate.alignment != expected_length ||
         candidate.endian != RDMA_ENDIAN_BIG ||
@@ -612,6 +830,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     // Validate the readback image too.  This catches an adapter that returns
     // bytes with malformed metadata or a codec image that was not detached.
     readback_image = rdma_hw_image::type_id::create("queue_readback_image");
+    if (readback_image == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "queue readback image allocation failed");
     readback_image.bytes.delete();
     foreach (read_data[i])
       readback_image.bytes.push_back(read_data[i]);
@@ -622,6 +843,8 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     readback_image.hardware_version = RDMA_HW_VERSION;
     readback_image.function_generation = candidate.function_generation;
     status = codec.validate_image(readback_image);
+    status = status_or(status, RDMA_SC_CODEC_ERROR,
+                       "queue readback image validation returned null");
     if (!status.ok())
       return status;
     image = candidate;
@@ -639,16 +862,30 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     output rdma_hw_image image
   );
     string variant;
-    if (model == null)
-      begin image = null; return invalid("SQE model is null"); end
+    if (model == null) begin
+      image = null;
+      return invalid("SQE model is null");
+    end
+
     case (model.transport)
       RDMA_TRANSPORT_RC: variant = "rc";
       RDMA_TRANSPORT_UD: variant = "ud";
       RDMA_TRANSPORT_URC: variant = "urc";
-      default: begin image = null; return invalid("SQE transport is unsupported"); end
+      default: begin
+        image = null;
+        return invalid("SQE transport is unsupported");
+      end
     endcase
-    return write_queue_entry(target, offset, model, RDMA_IMAGE_SQE, variant,
-                             RDMA_WQE_BYTES, image);
+
+    return write_queue_entry(
+      target,
+      offset,
+      model,
+      RDMA_IMAGE_SQE,
+      variant,
+      RDMA_WQE_BYTES,
+      image
+    );
   endfunction
 
   // 功能：在 rdma_queue_host_mem_submitter 中，write_rqe 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
@@ -661,10 +898,20 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     rdma_hw_rqe_model model,
     output rdma_hw_image image
   );
-    if (model == null)
-      begin image = null; return invalid("RQE model is null"); end
-    return write_queue_entry(target, offset, model, RDMA_IMAGE_RQE, "default",
-                             RDMA_RQE_BYTES, image);
+    if (model == null) begin
+      image = null;
+      return invalid("RQE model is null");
+    end
+
+    return write_queue_entry(
+      target,
+      offset,
+      model,
+      RDMA_IMAGE_RQE,
+      "default",
+      RDMA_RQE_BYTES,
+      image
+    );
   endfunction
 
   // 功能：在 rdma_queue_host_mem_submitter 中，read_cqe 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
@@ -680,13 +927,37 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return read_cqe_sized(target, offset, RDMA_CQE_BYTES, model, image);
   endfunction
 
-  // 功能：按运行时 CQE entry 大小读取并解码 CQE，供 32/64/128B CQ ring 共用。
-  // 输入输出及副作用：target/offset/entry_size 为输入，model/image 为输出；仅读取 host memory ledger。
-  // 失败边界：entry_size 不是 32/64/128、映像长度不匹配或 codec 解码失败时不发布 model/image。
+  // 功能：按运行时 CQE entry 大小读取并以兼容的 RC variant 解码 CQE，供旧的
+  //       32/64/128B CQ ring 调用方继续使用。
+  // 输入/输出及副作用：target、offset、entry_size 为输入，model/image 为输出；委托
+  //       显式 variant 入口仅读取 host-memory ledger，不修改共享 codec 状态。
+  // 失败/边界：entry_size 不是 32/64/128、映像长度不匹配、RC overlay 不适用或
+  //       codec 解码失败时不发布 model/image；UD/RQ/SRFQ 调用方必须选新入口。
   function rdma_status read_cqe_sized(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
     int unsigned entry_size,
+    output rdma_hw_cqe_model model,
+    output rdma_hw_image image
+  );
+    return read_cqe_sized_variant(target, offset, entry_size,
+                                  RDMA_CQE_VARIANT_RC, model, image);
+  endfunction
+
+  // 功能：按运行时 CQE entry 大小和调用方明确给出的 variant 读取并解码
+  //       CQE；variant 决定 qword2/qword3 中 RC、UD 或 RQ/SRFQ overlay 的
+  //       保留位与字段解释，避免共享 registry codec 隐式沿用 RC 默认值。
+  // 输入/输出及副作用：target、offset、entry_size、variant 为输入；model、image
+  //       为输出；函数仅读取 target 对应 host-memory ledger，发布 detached
+  //       CQE model/image，不修改共享 codec 的 active profile 或 variant。
+  // 失败/边界：target 不存在、entry_size 不是 32/64/128、variant 非法、映像
+  //       metadata/长度不匹配、codec 解码失败或类型转换失败时返回明确错误，且
+  //       model/image 保持 null；调用方不得从 raw qword2/qword3 非零值猜 variant。
+  function rdma_status read_cqe_sized_variant(
+    rdma_queue_host_mem_target target,
+    longint unsigned offset,
+    int unsigned entry_size,
+    rdma_cqe_variant_e variant,
     output rdma_hw_cqe_model model,
     output rdma_hw_image image
   );
@@ -695,32 +966,44 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     rdma_hw_model decoded;
     rdma_status status;
     rdma_hw_image candidate_image;
-    model = null; image = null;
+    model = null;
+    image = null;
+
     if (!(entry_size inside {32,64,128}))
       return invalid("CQE profile size is invalid");
-    status = lookup_target(target, entry); if (!status.ok()) return status;
+
+    status = lookup_target(target, entry);
+    if (!status.ok())
+      return status;
+
     status = lookup_queue_codec(RDMA_IMAGE_CQE, "cqe", "default", codec);
-    if (!status.ok()) return status;
-    // CQE profile is a property of this read transaction, not mutable state
-    // on the shared registry codec.  Decode through the explicit profile API
-    // so interleaved 32/64/128-byte reads cannot observe one another's size.
+    if (!status.ok())
+      return status;
+
+    // CQE profile and variant are properties of this read transaction, not
+    // mutable state on the shared registry codec.  Decode through the
+    // explicit variant API so interleaved reads cannot observe one another's
+    // overlay authority.
     status = complete_read_image(entry, offset, entry_size,
                                  RDMA_IMAGE_CQE, codec,
-                                 candidate_image);
-    if (!status.ok()) return status;
+                                 candidate_image, 1'b1, variant);
+    if (!status.ok())
+      return status;
     begin
       rdma_hw_cqe_codec cqe_codec;
       if (!$cast(cqe_codec, codec)) begin
-        model = null; image = null;
+        model = null;
+        image = null;
         return codec_error("CQ registry codec cannot select a variable profile");
       end
-      status = cqe_codec.decode_with_entry_bytes(candidate_image, entry_size,
-                                                 decoded);
+      status = cqe_codec.decode_with_entry_bytes_variant(
+          candidate_image, entry_size, variant, decoded);
     end
     status = status_or(status, RDMA_SC_CODEC_ERROR,
                        "CQE decode returned null status");
     if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
-      model = null; image = null;
+      model = null;
+      image = null;
       return status.ok() ? codec_error("decoded CQE model type mismatch") : status;
     end
     image = candidate_image;
@@ -742,19 +1025,32 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     rdma_hw_model decoded;
     rdma_status status;
     rdma_hw_image candidate_image;
-    model = null; image = null;
-    status = lookup_target(target, entry); if (!status.ok()) return status;
+    model = null;
+    image = null;
+
+    status = lookup_target(target, entry);
+    if (!status.ok())
+      return status;
+
     status = lookup_queue_codec(RDMA_IMAGE_CEQE, "ceqe", "default", codec);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
+
+    if (codec == null)
+      return codec_error("CEQE registry returned a null codec");
+
     status = complete_read_image(entry, offset, RDMA_CEQE_BYTES,
                                  RDMA_IMAGE_CEQE, codec,
                                  candidate_image);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
+
     status = codec.decode(candidate_image, decoded);
     status = status_or(status, RDMA_SC_CODEC_ERROR,
                        "CEQE decode returned null status");
     if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
-      model = null; image = null;
+      model = null;
+      image = null;
       return status.ok() ? codec_error("decoded CEQE model type mismatch") : status;
     end
     image = candidate_image;
@@ -776,19 +1072,32 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     rdma_hw_model decoded;
     rdma_status status;
     rdma_hw_image candidate_image;
-    model = null; image = null;
-    status = lookup_target(target, entry); if (!status.ok()) return status;
+    model = null;
+    image = null;
+
+    status = lookup_target(target, entry);
+    if (!status.ok())
+      return status;
+
     status = lookup_queue_codec(RDMA_IMAGE_AEQE, "aeqe", "default", codec);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
+
+    if (codec == null)
+      return codec_error("AEQE registry returned a null codec");
+
     status = complete_read_image(entry, offset, RDMA_AEQE_BYTES,
                                  RDMA_IMAGE_AEQE, codec,
                                  candidate_image);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
+
     status = codec.decode(candidate_image, decoded);
     status = status_or(status, RDMA_SC_CODEC_ERROR,
                        "AEQE decode returned null status");
     if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
-      model = null; image = null;
+      model = null;
+      image = null;
       return status.ok() ? codec_error("decoded AEQE model type mismatch") : status;
     end
     image = candidate_image;

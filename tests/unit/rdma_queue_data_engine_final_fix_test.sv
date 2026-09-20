@@ -32,6 +32,22 @@ class rdma_final_null_cqe_decode_codec extends rdma_hw_cqe_codec;
     model = null;
     return null;
   endfunction
+
+  // 功能：在带显式 CQE variant 的真实 poll 入口返回 null decode status，覆盖
+  //       production consumer 实际调用的 profile/variant dispatch seam。
+  // 输入/输出及副作用：image、entry_size、variant 为输入，model 固定输出 null；
+  //       不修改 image、CQ runtime、backing、route 或任何 scheduler 状态。
+  // 失败/边界：所有输入都故意不接受并返回 null；consumer 必须把 null 归一化为
+  //       RDMA_SC_CODEC_ERROR，并在 CQ CI、WQE release 和 completion publish 前退出。
+  virtual function rdma_status decode_with_entry_bytes_variant(
+    rdma_hw_image image,
+    int unsigned entry_size,
+    rdma_cqe_variant_e variant,
+    output rdma_hw_model model
+  );
+    model = null;
+    return null;
+  endfunction
 endclass
 
 // 设计说明：本公共基类只封装 final-review 场景的 fixture 建立、按 key 故障与
@@ -68,7 +84,10 @@ class rdma_queue_data_engine_final_fix_test_base
                                  "final-fix fixture allocation failed");
       return;
     end
-    fixture.setup(status);
+    // CQ poll 的真实 0.1.34 路径通过 CQC shadow 发布 CI；该 final-fix fixture
+    // 必须显式提供 context backing，避免把“缺少驱动必需 authority”的配置拒绝
+    // 误报为 codec lookup/decode 故障。
+    fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
     track_fixture(fixture);
     if (status == null || !status.ok()) return;
     if (!$cast(fault_registry, fixture.registry) || fault_registry == null)
@@ -293,14 +312,19 @@ class rdma_queue_data_engine_final_fix_test_base
     if (status == null || status.code != RDMA_SC_CODEC_ERROR ||
         completion != null ||
         count_pcie_calls(fixture.pcie, "mmio_write") != mmio_before)
-      `uvm_error("CQE_NULL_LOOKUP", "CQE null lookup crossed poll commit")
+      `uvm_error("CQE_NULL_LOOKUP", $sformatf(
+        "CQE null lookup crossed poll commit: status=%s hits=%0d",
+        status == null ? "<null>" : status.convert2string(),
+        fault_registry.null_lookup_status_hit_count()))
     status = fixture.engine.query_runtime_occupancy(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, has_pending);
     if (status == null || !status.ok() || used != 1 || has_pending)
       `uvm_error("CQE_NULL_LOOKUP_STATE", "CQE lookup changed CQ state")
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
     if (status == null || !status.ok() || completion == null)
-      `uvm_error("CQE_NULL_LOOKUP_RETRY", "retained CQE was not consumable")
+      `uvm_error("CQE_NULL_LOOKUP_RETRY", $sformatf(
+        "retained CQE was not consumable: status=%s",
+        status == null ? "<null>" : status.convert2string()))
 
     setup_codec_fixture("cqe_decode_final_fix_fixture", fixture,
                         fault_registry, status);
@@ -321,7 +345,9 @@ class rdma_queue_data_engine_final_fix_test_base
     if (status == null || status.code != RDMA_SC_CODEC_ERROR ||
         completion != null ||
         count_pcie_calls(fixture.pcie, "mmio_write") != mmio_before)
-      `uvm_error("CQE_NULL_DECODE", "CQE null decode crossed poll commit")
+      `uvm_error("CQE_NULL_DECODE", $sformatf(
+        "CQE null decode crossed poll commit: status=%s",
+        status == null ? "<null>" : status.convert2string()))
     status = fixture.engine.query_runtime_occupancy(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, has_pending);
     if (status == null || !status.ok() || used != 1 || has_pending)
@@ -330,7 +356,9 @@ class rdma_queue_data_engine_final_fix_test_base
       `uvm_error("CQE_NULL_DECODE_RESTORE", "cannot restore CQE codec")
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
     if (status == null || !status.ok() || completion == null)
-      `uvm_error("CQE_NULL_DECODE_RETRY", "retained CQE was not consumable")
+      `uvm_error("CQE_NULL_DECODE_RETRY", $sformatf(
+        "retained CQE was not consumable: status=%s",
+        status == null ? "<null>" : status.convert2string()))
   endtask
 
   // 功能：run_entry_image_factory_fault 对 queue_entry_image 的一次 raw factory null

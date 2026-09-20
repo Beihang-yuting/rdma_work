@@ -1,8 +1,10 @@
-// 目录：tests/integration/，验证 pcie_work adapter 的 Function-aware 配置和 BAR 路由。
+// 目录/层次：tests/integration/ 集成测试层，验证 pcie_work adapter 的 Function-aware 配置和 BAR 路由。
 // 职责：用外部 pcie_tl_func_manager 构造 PF/VF/SR-IOV 拓扑，检查配置读写、
 //   VF BAR 解码、MMIO authority 和 stale generation 拒绝边界。
 // 依赖：pcie_tl_pkg、rdma_pcie_work_adapter_pkg、rdma_model_pkg、UVM；测试不拥有
 //   pcie_tl manager 之外的外部环境，adapter 只保存这些对象的非拥有引用。
+// 所有权与生命周期：测试只拥有本地 adapter/configuration fixture；pcie_tl manager、BAR
+//       decoder 和配置代理由外部环境管理，测试结束时释放本地 UVM 引用。
 
 class rdma_pcie_work_adapter_test extends uvm_test;
   `uvm_component_utils(rdma_pcie_work_adapter_test)

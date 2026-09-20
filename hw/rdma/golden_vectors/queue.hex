@@ -6,9 +6,9 @@ cb c5 67 bd a6 a1 55 55 00 00 00 00 00 00 00 00 c7 04 00 00 de ad be ef 01 23 45
 
 # xtr_v1-golden-v1
 # case: rqe_boundary
-# inputs: qpn=0xabcde,index=0x3456,payload=0x10203040,qp_sn=0x5a,opcode=9,wrap=1,valid=1,signature=0x96,sge_num=2
+# inputs: qpn=0xabcde,index=0x3456,payload=0x10203040,qp_sn=0x5a,opcode=9,wrap=1,sign_en=0,valid=1,signature=0x96,sge_num=2,sgb_pa_encoded=0x123456789abcde
 # bytes: 64
-80 b4 56 09 5a 0a bc de 00 00 00 00 10 20 30 40 96 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+80 b4 56 09 5a 0a bc de 00 00 00 00 10 20 30 40 96 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 24 68 ac f1 35 79 bc 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 
 # xtr_v1-golden-v1
 # case: cqe_error

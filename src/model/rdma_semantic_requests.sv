@@ -102,6 +102,7 @@ function automatic bit rdma_send_opcode_valid_for_transport(
       return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
                             RDMA_WR_SEND_WITH_INV,
                             RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
+                            RDMA_WR_RDMA_READ,
                             RDMA_WR_LOCAL_INVALIDATE};
     default:
       return 1'b0;
@@ -266,12 +267,36 @@ class rdma_qp_context_attributes extends uvm_object;
         transport_ext == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP context attributes are incomplete");
-    status = address_vector.validate(); if (!status.ok()) return status;
-    status = behavior.validate(); if (!status.ok()) return status;
+    // 嵌套扩展是可覆写的边界；先把 null 状态归一化，再调用 ok()，避免
+    // 恶意/故障扩展把请求模型带入模拟器空句柄解引用。
+    status = address_vector.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP address vector validation returned null status");
+    if (!status.ok())
+      return status;
+
+    status = behavior.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP behavior validation returned null status");
+    if (!status.ok())
+      return status;
+
     if (transport_ext.transport_kind() != transport)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP transport extension does not match");
-    status = transport_ext.validate(); if (!status.ok()) return status;
+
+    status = transport_ext.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP transport extension validation returned null status");
+    if (!status.ok())
+      return status;
+
     return rdma_status::success();
   endfunction
 endclass
@@ -423,6 +448,10 @@ class rdma_create_cq_req extends rdma_semantic_request;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQ ring backing is null");
     status = ring_backing.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CQ ring backing validation returned null status");
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -431,7 +460,6 @@ endclass
 
 // 功能：rdma_qp_backing_spec_status 校验 spec、required_role、required_storage_bytes 与当前对象状态的一致性，并显式处理“QP backing spec is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：spec（输入）、required_role（输入）、required_storage_bytes（输入）；rdma_qp_backing_spec_status 读取 spec、required_role、required_storage_bytes 并使用字段 next_logical_offset、status；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_backing_spec_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP backing spec is null”“QP backing storage size is invalid”；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_backing_spec_status(
   rdma_queue_backing_spec spec,
@@ -635,6 +663,10 @@ class rdma_create_qp_req extends rdma_semantic_request;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP context attributes are null");
     status = context_attrs.validate(transport);
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP context attributes validation returned null status");
     if (!status.ok()) return status;
     if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -688,6 +720,12 @@ class rdma_create_qp_req extends rdma_semantic_request;
     rdma_status status;
 
     status = validate();
+
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP SRQ-depth validation returned null status");
+
     if (!status.ok())
       return status;
     if (srq_h == null)
@@ -712,6 +750,12 @@ class rdma_create_qp_req extends rdma_semantic_request;
     longint unsigned rq_storage_bytes;
 
     status = validate();
+
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP capability validation returned null status");
+
     if (!status.ok())
       return status;
     if (queue_caps.max_wq_sge == 0 ||
@@ -814,6 +858,10 @@ class rdma_create_srq_req extends rdma_semantic_request;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ payload backing is null");
     status = payload_backing.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "SRQ payload backing validation returned null status");
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -878,6 +926,10 @@ class rdma_create_ceq_req extends rdma_semantic_request;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CEQ ring backing is null");
     status = ring_backing.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CEQ ring backing validation returned null status");
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -942,6 +994,10 @@ class rdma_create_aeq_req extends rdma_semantic_request;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "AEQ ring backing is null");
     status = ring_backing.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "AEQ ring backing validation returned null status");
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -1080,6 +1136,12 @@ class rdma_modify_qp_req extends rdma_semantic_request;
     rdma_status status;
 
     status = validate();
+
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "modify QP validation returned null status");
+
     if (!status.ok())
       return status;
     if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
@@ -1222,9 +1284,14 @@ class rdma_post_send_req extends rdma_semantic_request;
     end
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“post-send target is not a QP handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取对象字段 qp_h、owner、completion_qp_h、mr_h、mw_h、authority_h、transport、opcode、inline_data、sges、length，并返回 rdma_status；函数只读请求快照，不取得句柄或队列所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_STATE；会拒绝引用句柄 kind 错误、UID/generation 不一致、URC completion QP 缺失、control WQE payload 非空以及 FLUSH authority 不再指向本 QP 的请求，失败时不提交部分状态。
+  // 功能：validate 校验 post-send 请求的 QP/owner authority、transport、opcode、
+  //   completion QP、控制面字段和 SGE/payload 形状，决定请求能否进入 SQE 编码。
+  // 输入/输出及副作用：无显式参数；只读 qp_h、owner、completion_qp_h、mr_h、
+  //   mw_h、authority_h、transport、opcode、inline_data、sges 和 payload，返回 status，
+  //   不取得句柄或队列所有权。
+  // 失败/边界：kind、UID/generation 不一致、URC completion QP 缺失、control WQE
+  //   payload 非空、null SGE 或 FLUSH authority 失效时返回相应错误；普通 SEND/WRITE
+  //   的零 SGE、零长度 SGE 和 zero-byte inline 按驱动规则允许，失败不提交部分状态。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1244,6 +1311,14 @@ class rdma_post_send_req extends rdma_semantic_request;
     if (!rdma_send_opcode_valid_for_transport(transport, opcode))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "work opcode is invalid for transport");
+    // 驱动先按原始 ib_send_wr->num_sge 检查硬件 32 项上限，再由各 WQE
+    // 编码路径过滤零长度条目；因此这里必须保留原始数组边界，不能只依赖
+    // 后续 codec 的有效 SGE 计数，否则 33 项（即使尾项长度为零）会越过
+    // 驱动请求边界。
+    if (sges.size() > RDMA_MAX_WQ_SGE)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "send SGE count exceeds driver limit of 32");
     if (opcode == RDMA_WR_LOCAL_INVALIDATE) begin
       if (inline_data || sges.size() != 0 || payload.size() != 0 || !rkey_valid)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1304,16 +1379,15 @@ class rdma_post_send_req extends rdma_semantic_request;
       end
     end
     else begin
-      if (!inline_data && sges.size() == 0)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "non-inline send has no SGE");
-      if (inline_data && payload.size() == 0)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "inline send has no payload");
+      // wr.c permits an ordinary SEND/WRITE WQE with no effective payload:
+      // num_sge may be zero, and zero-length SGE entries are discarded before
+      // the descriptor count is written.  The request layer therefore checks
+      // only descriptor ownership here; the codec computes the effective
+      // count and length from non-zero entries.
       foreach (sges[i]) begin
-        if (sges[i] == null || sges[i].length == 0)
+        if (sges[i] == null)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                   "send SGE is null or has zero length");
+                                   "send SGE handle is null");
       end
     end
     if (opcode inside {RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
@@ -1412,7 +1486,10 @@ class rdma_post_recv_req extends rdma_semantic_request;
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“post-receive target is not a QP or SRQ”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、target_h、target_h.kind、completion_qp_h、completion_qp_h.kind、sges、length 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “post-receive target is not a QP or SRQ”；“private receive cannot specify a completion QP”；“shared SRQ receive requires a QP completion handle”；“receive has no SGE”；“receive SGE is null or has zero length”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括
+  // “post-receive target is not a QP or SRQ”；“private receive cannot specify
+  // a completion QP”；“shared SRQ receive requires a QP completion handle”；或
+  // SGE 句柄为空。零长度 SGE 按驱动 wr.c 规则跳过，全部零长度时允许空 payload。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1438,13 +1515,23 @@ class rdma_post_recv_req extends rdma_semantic_request;
           "shared SRQ receive requires a QP completion handle"
         );
     end
-    if (sges.size() == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "receive has no SGE");
+
+    // 驱动先按原始 ib_recv_wr->num_sge 检查 XTRDMA_MAX_SGE_NUM，再过滤
+    // 零长度 SGE；因此不能只依赖后续 codec 的“有效 SGE”计数。保留原始
+    // 数组边界可避免请求层接受硬件会直接拒绝的描述符列表。
+    if (sges.size() > RDMA_MAX_WQ_SGE)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "receive SGE count exceeds driver limit of 32");
+
+    // wr.c treats num_sge=0 as a valid empty inline RQE.  Do not add a
+    // synthetic “at least one SGE” requirement here; the queue codec will
+    // publish SGE_NUM=0 and TPL=0.  A non-empty list still goes through the
+    // null-handle check below so malformed descriptor arrays remain rejected.
     foreach (sges[i]) begin
-      if (sges[i] == null || sges[i].length == 0)
+      if (sges[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "receive SGE is null or has zero length");
+                                 "receive SGE handle is null");
     end
     return rdma_status::success();
   endfunction

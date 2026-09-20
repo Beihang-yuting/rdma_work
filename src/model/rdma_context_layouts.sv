@@ -12,6 +12,14 @@ typedef enum bit [1:0] {
   RDMA_CONTEXT_ERROR   = 2'd2
 } rdma_context_state_e;
 
+// 驱动 mr.h 将 MRT 状态定义为独立的 INVLD/FREE/VLD 三态；它们与 CQC、SRQC
+// 等上下文的 INVALID/VALID/ERROR 不是同一套语义，因此不能复用通用枚举。
+typedef enum bit [1:0] {
+  RDMA_MR_STATE_INVALID = 2'd0,
+  RDMA_MR_STATE_FREE    = 2'd1,
+  RDMA_MR_STATE_VALID   = 2'd2
+} rdma_mr_state_e;
+
 typedef enum bit [1:0] {
   RDMA_MR_PBL0 = 2'd0,
   RDMA_MR_PBL1 = 2'd1,
@@ -343,6 +351,10 @@ class rdma_mr_page_layout extends uvm_object;
   rdma_backing_addr_t pba0;
   rdma_backing_addr_t pba1;
   int unsigned first_pbl_index;
+  // 驱动 PBLE allocator 允许 index=0；该模型专用位区分 allocator lease
+  // 产生的零索引与遗漏或伪造的索引。它只属于 authority 元数据，不编码进
+  // MRT context image。
+  bit first_pbl_index_valid;
   rdma_mr_address_mode_e address_mode;
   bit odp;
   bit invalidate_enable;
@@ -350,7 +362,11 @@ class rdma_mr_page_layout extends uvm_object;
   int unsigned payload_vf_id;
   int unsigned mr_serial;
 
-  // 功能：构造 rdma_mr_page_layout，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：pbl_mode=RDMA_MR_PBL0；host_page_size=RDMA_MR_PAGE_4K；pba0='0；pba1='0；first_pbl_index='0；address_mode=RDMA_MR_ADDRESS_VA_BASED；odp=1'b0；invalidate_enable=1'b0；其余字段按实现默认值初始化。
+  // 功能：构造 rdma_mr_page_layout，调用 super.new 建立 UVM 对象，并把默认值
+  //   设为 pbl_mode=RDMA_MR_PBL0、host_page_size=RDMA_MR_PAGE_4K、pba0='0、
+  //   pba1='0、first_pbl_index='0、first_pbl_index_valid=1'b0、
+  //   address_mode=RDMA_MR_ADDRESS_VA_BASED、odp=1'b0、
+  //   invalidate_enable=1'b0；其余字段按实现默认值初始化。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_mr_page_layout 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mr_page_layout");
@@ -360,6 +376,7 @@ class rdma_mr_page_layout extends uvm_object;
     pba0 = '0;
     pba1 = '0;
     first_pbl_index = '0;
+    first_pbl_index_valid = 1'b0;
     address_mode = RDMA_MR_ADDRESS_VA_BASED;
     odp = 1'b0;
     invalidate_enable = 1'b0;
@@ -382,6 +399,7 @@ class rdma_mr_page_layout extends uvm_object;
     pba0 = rhs_layout.pba0;
     pba1 = rhs_layout.pba1;
     first_pbl_index = rhs_layout.first_pbl_index;
+    first_pbl_index_valid = rhs_layout.first_pbl_index_valid;
     address_mode = rhs_layout.address_mode;
     odp = rhs_layout.odp;
     invalidate_enable = rhs_layout.invalidate_enable;
@@ -390,25 +408,61 @@ class rdma_mr_page_layout extends uvm_object;
     mr_serial = rhs_layout.mr_serial;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“PBL0 layout fields are contradictory”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、pba0.value、pba1.value、first_pbl_index 并使用字段 rdma_status、pba0.value、pba1.value、first_pbl_index；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“PBL0 layout fields are contradictory”“PBL1 layout fields are contradictory”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：validate 校验当前字段与 PBL mode 的一致性，并显式处理
+  //   “PBL0 layout fields are contradictory”等拒绝条件，返回 rdma_status。
+  // 输入/输出及副作用：无显式参数；读取 pba0、pba1、first_pbl_index 和
+  //   first_pbl_index_valid，返回状态，不取得调用方资源所有权。
+  // 失败/边界：PBL0/PBL1 字段矛盾或 PBL2 validity 缺失时返回
+  //   RDMA_SC_INVALID_ARGUMENT；PBL2 的 index=0 仅在 validity=1 时通过。
   virtual function rdma_status validate();
     case (pbl_mode)
       RDMA_MR_PBL0:
         if ((pba0.value & 64'hfff) != 0 || pba1.value != 0 ||
-            first_pbl_index != 0)
+            first_pbl_index != 0 || first_pbl_index_valid)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "PBL0 layout fields are contradictory");
       RDMA_MR_PBL1:
         if ((pba0.value & 64'hfff) != 0 ||
-            (pba1.value & 64'hfff) != 0 || first_pbl_index != 0)
+            (pba1.value & 64'hfff) != 0 || first_pbl_index != 0 ||
+            first_pbl_index_valid)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "PBL1 layout fields are contradictory");
       RDMA_MR_PBL2:
-        if (pba0.value != 0 || pba1.value != 0 || first_pbl_index == 0)
+        if (pba0.value != 0 || pba1.value != 0 || !first_pbl_index_valid)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "PBL2 layout fields are contradictory");
+      default:
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "MR PBL mode is invalid");
+    endcase
+    return rdma_status::success();
+  endfunction
+
+  // 功能：validate_wire_shape 只校验 MRT image 能表达的 PBL mode/PBA/index
+  //   形状，供没有外部 HMC lease 的编解码模型做语义检查。
+  // 输入/输出及副作用：无显式输入；读取 pbl_mode、pba0、pba1、
+  //   first_pbl_index 和 first_pbl_index_valid，返回状态，不修改 page layout
+  //   或资源账本。
+  // 失败/边界：PBL0/PBL1 的 PBA、index 与 mode 矛盾时返回 INVALID_ARGUMENT；
+  //   PBL2 只要求目录 index 位于 wire 域且 PBA 为空，allocator validity 由
+  //   rdma_mr_backing_desc/rdma_pbl 的严格校验负责。
+  virtual function rdma_status validate_wire_shape();
+    case (pbl_mode)
+      RDMA_MR_PBL0:
+        if ((pba0.value & 64'hfff) != 0 || pba1.value != 0 ||
+            first_pbl_index != 0 || first_pbl_index_valid)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL0 wire fields are contradictory");
+      RDMA_MR_PBL1:
+        if ((pba0.value & 64'hfff) != 0 ||
+            (pba1.value & 64'hfff) != 0 || first_pbl_index != 0 ||
+            first_pbl_index_valid)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL1 wire fields are contradictory");
+      RDMA_MR_PBL2:
+        if (pba0.value != 0 || pba1.value != 0)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL2 wire fields are contradictory");
       default:
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "MR PBL mode is invalid");

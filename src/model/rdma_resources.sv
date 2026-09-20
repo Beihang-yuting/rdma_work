@@ -7,6 +7,7 @@
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 typedef class rdma_qpc_model;
+typedef class rdma_cqc_model;
 
 // 功能：rdma_clone_handle_value 复制 source、copy_label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
 // 输入/输出及副作用：source（输入）、copy_label（输入）；rdma_clone_handle_value 读取 source、copy_label 并使用字段 cloned_object；函数返回 rdma_handle，不取得调用方资源所有权。
@@ -46,7 +47,6 @@ endfunction
 
 // 功能：rdma_ring_state_valid 比较 producer_index、producer_wrap、consumer_index、consumer_wrap 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
 // 输入/输出及副作用：producer_index（输入）、producer_wrap（输入）、consumer_index（输入）、consumer_wrap（输入）；rdma_ring_state_valid 读取 producer_index、producer_wrap、consumer_index、consumer_wrap 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-
 // 失败/边界：rdma_ring_state_valid 先检查 producer_wrap == consumer_wrap，再返回 producer_index >= consumer_index；producer_index <= consumer_index；拒绝分支不提交部分状态，也不隐式重试。
 function automatic bit rdma_ring_state_valid(
   int unsigned producer_index,
@@ -61,7 +61,6 @@ endfunction
 
 // 功能：rdma_qp_projected_handle_status 校验 projected_h、dependency_h、owner、expected_kind、label 与当前对象状态的一致性，并显式处理“handle kind is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：projected_h（输入）、dependency_h（输入）、owner（输入）、expected_kind（输入）、label（输入）；rdma_qp_projected_handle_status 读取 projected_h、dependency_h、owner、expected_kind、label 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_projected_handle_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_projected_handle_status(
   rdma_handle projected_h,
@@ -87,7 +86,6 @@ endfunction
 
 // 功能：rdma_qp_mapping_authority_status 校验 backing_ref、owner、qp_h、label 与当前对象状态的一致性，并显式处理“mapping authority is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：backing_ref（输入）、owner（输入）、qp_h（输入）、label（输入）；rdma_qp_mapping_authority_status 读取 backing_ref、owner、qp_h、label 并使用字段 rdma_status、function_h、owner_h、mapping、mapping.function_h；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_mapping_authority_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_mapping_authority_status(
   rdma_qp_backing_ref backing_ref,
@@ -126,7 +124,6 @@ endfunction
 // normal QP plans continue to use the strict geometry validator below.
 // 功能：rdma_qp_recovery_opaque_mapping_status 校验 mapping、owner、qp_h、label 与当前对象状态的一致性，并显式处理“mapping authority is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：mapping（输入）、owner（输入）、qp_h（输入）、label（输入）；rdma_qp_recovery_opaque_mapping_status 读取 mapping、owner、qp_h、label 并使用字段 release_complete、status；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_recovery_opaque_mapping_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_recovery_opaque_mapping_status(
   rdma_dma_mapping mapping,
@@ -160,7 +157,6 @@ endfunction
 
 // 功能：rdma_qp_partial_ref_status 校验 backing_ref、expected_role、owner、qp_h、label 与当前对象状态的一致性，并显式处理“clone failed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：backing_ref（输入）、expected_role（输入）、owner（输入）、qp_h（输入）、label（输入）；rdma_qp_partial_ref_status 读取 backing_ref、expected_role、owner、qp_h、label 并使用字段 cloned_object、mapping.state、status；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_partial_ref_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_partial_ref_status(
   rdma_qp_backing_ref backing_ref,
@@ -206,7 +202,15 @@ function automatic rdma_status rdma_qp_partial_ref_status(
     );
   end else
     status = validation_ref.validate();
-  if (!status.ok()) return status;
+
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      {label, " backing validation returned null status"}
+    );
+
+  if (!status.ok())
+    return status;
   if (validation_ref.role != expected_role)
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                              {label, " role is invalid"});
@@ -240,7 +244,15 @@ function automatic rdma_status rdma_qp_partial_plan_status(
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "partial QP plan metadata is invalid");
   status = plan.sq_ring.validate();
-  if (!status.ok()) return status;
+
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "partial QP SQ ring validation returned null status"
+    );
+
+  if (!status.ok())
+    return status;
   if (plan.sq_ring.role != RDMA_QUEUE_ROLE_QP_SQ_RING ||
       plan.sq_ring.depth != plan.sq_depth)
     return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -294,7 +306,15 @@ function automatic rdma_status rdma_qp_partial_plan_status(
   end else begin
     if (plan.rq_ring != null) begin
       status = plan.rq_ring.validate();
-      if (!status.ok()) return status;
+
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "partial QP RQ ring validation returned null status"
+        );
+
+      if (!status.ok())
+        return status;
       if (plan.rq_ring.role != RDMA_QUEUE_ROLE_QP_RQ_RING ||
           plan.rq_ring.depth != plan.rq_depth)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -349,7 +369,15 @@ function automatic rdma_status rdma_qp_partial_plan_status(
                              "partial QP URC order is invalid");
   if (plan.context_ref != null) begin
     status = plan.context_ref.validate();
-    if (!status.ok()) return status;
+
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "partial QP context validation returned null status"
+      );
+
+    if (!status.ok())
+      return status;
     if (plan.context_ref.resource_kind != RDMA_RESOURCE_QP ||
         !plan.context_ref.owner.same_instance(owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -365,7 +393,6 @@ endfunction
 
 // 功能：rdma_qp_backing_projection_status 校验 backing_ref、programmed_backing、label 与当前对象状态的一致性，并显式处理“backing authority is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：backing_ref（输入）、programmed_backing（输入）、label（输入）；rdma_qp_backing_projection_status 读取 backing_ref、programmed_backing、label 并使用字段 effective_iova；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_backing_projection_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_backing_projection_status(
   rdma_qp_backing_ref backing_ref,
@@ -603,6 +630,13 @@ class rdma_queue_resource extends rdma_resource;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "queue plan kind does not match resource");
       status = queue_plan.validate();
+
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "queue backing plan validation returned null status"
+        );
+
       if (!status.ok())
         return status;
       if (resource_kind() inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ} &&
@@ -825,6 +859,7 @@ class rdma_cq extends rdma_queue_resource;
   int unsigned global_cq_id;
   int unsigned cqe_size_bytes;
   rdma_handle ceq_h;
+  rdma_cqc_model programmed_cqc;
 
   // 功能：构造 rdma_cq，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：local_cq_id='0；global_cq_id='0；cqe_size_bytes=64；ceq_h=null。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -835,6 +870,7 @@ class rdma_cq extends rdma_queue_resource;
     global_cq_id = '0;
     cqe_size_bytes = 64;
     ceq_h = null;
+    programmed_cqc = null;
   endfunction
 
   // 功能：resource_kind 使用 当前对象字段 计算并返回 rdma_resource_kind_e 结果；不修改对象字段或外部资源。
@@ -849,6 +885,7 @@ class rdma_cq extends rdma_queue_resource;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CQ resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cq rhs_cq;
+    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_cq, rhs))
@@ -857,6 +894,15 @@ class rdma_cq extends rdma_queue_resource;
     global_cq_id = rhs_cq.global_cq_id;
     cqe_size_bytes = rhs_cq.cqe_size_bytes;
     ceq_h = rdma_clone_handle_value(rhs_cq.ceq_h, "CQ CEQ");
+    if (rhs_cq.programmed_cqc == null) begin
+      programmed_cqc = null;
+    end
+    else begin
+      cloned_object = rhs_cq.programmed_cqc.clone();
+      if (cloned_object == null || !$cast(programmed_cqc, cloned_object) ||
+          programmed_cqc == rhs_cq.programmed_cqc)
+        `uvm_fatal("RDMA_COPY_TYPE", "CQ programmed CQC clone mismatch")
+    end
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CQ entry size is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -881,6 +927,26 @@ class rdma_cq extends rdma_queue_resource;
       status = rdma_handle_owner_status(ceq_h, owner);
       if (!status.ok())
         return status;
+      if (programmed_cqc != null) begin
+        status = programmed_cqc.validate();
+
+        if (status == null)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "programmed CQC validation returned null status"
+          );
+
+        if (!status.ok())
+          return status;
+        if (programmed_cqc.cq_h == null ||
+            programmed_cqc.cq_h.object_id != local_cq_id ||
+            programmed_cqc.cq_h.function_uid != handle.function_uid ||
+            programmed_cqc.cq_h.generation != handle.generation)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "CQ programmed CQC identity does not match resource"
+          );
+      end
     end
     return rdma_status::success();
   endfunction
@@ -1081,14 +1147,30 @@ class rdma_qp extends rdma_resource;
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "QP backing authority is incomplete or split");
       status = qp_plan.validate();
-      if (!status.ok()) return status;
+
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "QP backing plan validation returned null status"
+        );
+
+      if (!status.ok())
+        return status;
       if (qp_plan.context_ref.local_id != local_qp_id)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
           "QP context local ID does not match the resource local QP ID"
         );
       status = programmed_qpc.validate();
-      if (!status.ok()) return status;
+
+      if (status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "programmed QPC validation returned null status"
+        );
+
+      if (!status.ok())
+        return status;
       if (qp_plan.transport != transport || programmed_qpc.transport != transport ||
           qp_plan.sq_depth != sq_depth || qp_plan.rq_depth != rq_depth ||
           programmed_qpc.sq_depth != sq_depth ||

@@ -347,7 +347,6 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
 
   // 功能：在 rdma_cmq_port_test 中，next_generation_binding 配置测试 fixture 的定向故障或替代依赖，使下一次调用覆盖指定边界路径。
   // 输入/输出及副作用：name（输入）、binding_state（输入）、generation_delta（输入）；next_generation_binding 读取 name、binding_state、generation_delta 并使用字段 binding、binding.owner_h；函数返回 rdma_function_binding，不取得调用方资源所有权。
-
   // 失败/边界：next_generation_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic rdma_function_binding next_generation_binding(
     string name,

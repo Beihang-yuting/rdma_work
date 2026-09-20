@@ -1,6 +1,8 @@
 // 目录：测试层 unit/rdma_wqe_extended_opcode_test.sv。
 // 职责：验证扩展 WQE typed authority 字段与非法传输组合拒绝。
 // 依赖：rdma_model_pkg、rdma_codec_pkg 与 UVM；测试对象只拥有本地句柄快照。
+// 所有权与生命周期：测试创建的 request、handle 和 image 仅在单次 run_phase 内存活；不取得
+//       外部 Host-memory、PCIe 或 resource-manager 对象所有权。
 class rdma_wqe_extended_opcode_test extends uvm_test;
   `uvm_component_utils(rdma_wqe_extended_opcode_test)
   // 功能：构造扩展 opcode focused 测试组件。
@@ -30,13 +32,45 @@ class rdma_wqe_extended_opcode_test extends uvm_test;
     s=rdma_queue_codec::encode_sqe(req,image);
     if (s==null || !s.ok())
       `uvm_error("URC_PROFILE",$sformatf("URC SEND codec rejected valid completion-QP profile: %s", s == null ? "null status" : s.message))
-    // RoCEv2 的 UC/URC wire profile 没有 RDMA READ opcode；语义入口必须
-    // 在队列写入前 fail-closed，不能把请求伪装成 RC READ。
+    // 0.1.34 wr.c:239-245 明确为 URC RDMA_READ 写入 XTRDMA_WQE_READ。
+    // 直内联 SGE 不需要额外的 PMTU authority，因此语义层和 64B codec
+    // 都必须接受这一条真实驱动路径，不能误判为 RC-only opcode。
     req.opcode=RDMA_WR_RDMA_READ; req.remote_access_valid=1; req.rkey_valid=1;
     req.remote_addr.value=64'h5000; req.rkey=32'h99;
     s=req.validate();
-    if (s==null || s.code != RDMA_SC_INVALID_ARGUMENT)
-      `uvm_error("URC_READ_PROFILE",$sformatf("URC READ was not rejected explicitly: %s", s == null ? "null status" : s.convert2string()))
+    if (s==null || !s.ok())
+      `uvm_error(
+        "URC_READ_PROFILE",
+        $sformatf("URC READ semantic validation failed: %s",
+                  s == null ? "null status" : s.convert2string()))
+    s=rdma_queue_codec::encode_sqe(req,image);
+    if (s==null || !s.ok())
+      `uvm_error(
+        "URC_READ_PROFILE",
+        $sformatf("URC direct-SGE READ encode failed: %s",
+                  s == null ? "null status" : s.convert2string()))
+
+    // external-SGB URC READ 的 TOTAL_PKT_NUM 依赖已编程 QPC PMTU。通用
+    // request facade 没有权威 PMTU 注入点时必须拒绝，而不是猜默认值或
+    // 生成一个驱动无法解释的 descriptor。
+    begin
+      rdma_sge extra_sge;
+      req.sges.delete();
+      repeat (3) begin
+        extra_sge=rdma_sge::type_id::create("urc_read_sge");
+        extra_sge.length = 1024;
+        extra_sge.lkey = 32'h77;
+        extra_sge.iova.value=64'h4000 + (req.sges.size() * 64'h1000);
+        req.sges.push_back(extra_sge);
+      end
+      s=rdma_queue_codec::encode_sqe(req,image);
+      if (s==null || s.code != RDMA_SC_INVALID_STATE)
+        `uvm_error(
+          "URC_READ_PROFILE",
+          $sformatf(
+            "URC external-SGB READ without QPC PMTU was not rejected: %s",
+            s == null ? "null status" : s.convert2string()))
+    end
     req.opcode=RDMA_WR_SEND;
     req.completion_qp_h=null; s=req.validate(); if (s==null || s.ok()) `uvm_error("URC_AUTH","URC accepted missing completion QP")
     // 当前 64B SQE profile 没有驱动 REG_MR/BIND_MW/FLUSH 的固定 body；

@@ -34,8 +34,8 @@ package rdma_codec_pkg;
     int unsigned header_offset;
 
     // 功能：构造 CQE layout，保存 profile 大小与 header 起始偏移。
-    // 输入输出及副作用：name/profile/offset 为输入；对象字段被初始化，不拥有外部资源。
-    // 失败边界：非法 profile、非 16B 对齐偏移或偏移超出 entry 会生成 bytes=0 的无效布局。
+    // 输入/输出及副作用：name/profile/offset 为输入；对象字段被初始化，不拥有外部资源。
+    // 失败/边界：非法 profile、非 16B 对齐偏移或偏移超出 entry 会生成 bytes=0 的无效布局。
     function new(string name="rdma_cqe_layout", rdma_cqe_size_e profile=RDMA_CQE_64B, int unsigned offset=0);
       super.new(name); size_profile=profile; header_offset=offset; bytes=0;
       case (profile)
@@ -49,8 +49,8 @@ package rdma_codec_pkg;
     endfunction
 
     // 功能：验证 layout 的 profile、字节数和 header 偏移共同描述受支持的 CQE entry。
-    // 输入输出及副作用：无显式输入；返回验证结果，不修改 layout 或外部资源。
-    // 失败边界：profile 非法、bytes 被篡改、header 未按 16B 对齐或公共 header 越界时返回 0。
+    // 输入/输出及副作用：无显式输入；返回验证结果，不修改 layout 或外部资源。
+    // 失败/边界：profile 非法、bytes 被篡改、header 未按 16B 对齐或公共 header 越界时返回 0。
     function bit valid();
       int unsigned expected;
       case (size_profile)
@@ -66,8 +66,8 @@ package rdma_codec_pkg;
     endfunction
 
     // 功能：按字节数和 header 偏移创建 CQE layout。
-    // 输入输出及副作用：entry_bytes/header 为输入；返回独立 layout 值对象。
-    // 失败边界：entry_bytes 不是 32/64/128 或 header 未对齐时返回 bytes=0 的无效对象。
+    // 输入/输出及副作用：entry_bytes/header 为输入；返回独立 layout 值对象。
+    // 失败/边界：entry_bytes 不是 32/64/128 或 header 未对齐时返回 bytes=0 的无效对象。
     static function rdma_cqe_layout for_bytes(int unsigned entry_bytes, int unsigned header=0);
       rdma_cqe_size_e p;
       rdma_cqe_layout result;

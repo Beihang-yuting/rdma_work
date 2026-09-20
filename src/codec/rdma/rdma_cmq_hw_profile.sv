@@ -75,6 +75,35 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
                      handle.generation);
   endfunction
 
+  // 功能：使用与 CQC_CREATE 相同的驱动 codec，把 CQC context 的 64B wire
+  //   projection 转成稳定十六进制值，供 CQC_DELETE body 的值比较使用。
+  // 输入/输出及副作用：context 为非拥有只读输入；返回包含所有已编码 context
+  //   bytes 的 string，不修改 context、profile 或外部资源。
+  // 失败/边界：null、非 exact rdma_cqc_model、codec/metadata/长度校验失败时
+  //   返回明确的 invalid sentinel；调用方必须把该 sentinel 视为不可比较。
+  protected function string cqc_context_value_key(rdma_cqc_model ctx_snapshot);
+    rdma_hw_cqc_create_body_codec codec;
+    rdma_hw_image image;
+    rdma_status status;
+    string result;
+
+    if (ctx_snapshot == null ||
+        ctx_snapshot.get_object_type() != rdma_cqc_model::get_type())
+      return "<invalid-cqc-context>";
+    codec = new("cmq_cqc_context_value_codec");
+    image = null;
+    status = codec.encode(ctx_snapshot, image);
+    if (status == null || !status.ok() || image == null ||
+        image.length != 64 || image.bytes.size() != 64 ||
+        image.image_kind != RDMA_IMAGE_CQC ||
+        image.endian != RDMA_ENDIAN_BIG)
+      return "<invalid-cqc-context>";
+    result = "CQC-CONTEXT-WIRE-V1:";
+    foreach (image.bytes[i])
+      result = {result, $sformatf("%02x", image.bytes[i])};
+    return result;
+  endfunction
+
   // 功能：将五种受支持 CMQ body 的全部标量/句柄字段投影为可比较文本。
   // 输入/输出及副作用：body 为非拥有只读输入；返回 QPC/object/MR/OCC/empty
   // 的类型化值投影，不保存 body 或嵌套 handle。
@@ -82,6 +111,7 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   // snapshot 值验证，不是 canonical V1 字节或 journal authority。
   protected function string command_body_value_key(rdma_hw_model body);
     rdma_hw_qpc_command_body qpc_body;
+    rdma_hw_cqc_delete_body cqc_delete_body;
     rdma_hw_object_id_command_body object_body;
     rdma_hw_mr_deregister_body mr_body;
     rdma_hw_occ_flush_body occ_body;
@@ -110,6 +140,17 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
                             qpc_body.modify_wbe[i],
                             qpc_body.modify_data[i])};
       return result;
+    end
+    if (body_type == rdma_hw_cqc_delete_body::get_type() &&
+        $cast(cqc_delete_body, body)) begin
+      return $sformatf(
+        "cqc-delete:%s:%s:%s",
+        command_handle_value_key(cqc_delete_body.cqc_context == null ?
+                                 null : cqc_delete_body.cqc_context.cq_h),
+        command_handle_value_key(cqc_delete_body.cqc_context == null ?
+                                 null : cqc_delete_body.cqc_context.ceq_h),
+        cqc_context_value_key(cqc_delete_body.cqc_context)
+      );
     end
     if (body_type == rdma_hw_object_id_command_body::get_type() &&
         $cast(object_body, body))
@@ -146,12 +187,28 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   );
     rdma_hw_qpc_command_body qpc_body;
     rdma_hw_object_id_command_body object_body;
+    rdma_hw_cqc_delete_body cqc_delete_body;
     rdma_hw_mr_deregister_body mr_body;
 
     if (body == null)
       return;
     nodes.push_back(body);
-    if ($cast(qpc_body, body)) begin
+    if ($cast(cqc_delete_body, body)) begin
+      if (cqc_delete_body.cqc_context != null) begin
+        nodes.push_back(cqc_delete_body.cqc_context);
+        if (cqc_delete_body.cqc_context.cq_h != null)
+          nodes.push_back(cqc_delete_body.cqc_context.cq_h);
+        if (cqc_delete_body.cqc_context.ceq_h != null)
+          nodes.push_back(cqc_delete_body.cqc_context.ceq_h);
+        if (cqc_delete_body.cqc_context.page_layout != null)
+          nodes.push_back(cqc_delete_body.cqc_context.page_layout);
+        if (cqc_delete_body.cqc_context.producer != null)
+          nodes.push_back(cqc_delete_body.cqc_context.producer);
+        if (cqc_delete_body.cqc_context.consumer != null)
+          nodes.push_back(cqc_delete_body.cqc_context.consumer);
+      end
+    end
+    else if ($cast(qpc_body, body)) begin
       if (qpc_body.qp_h != null)
         nodes.push_back(qpc_body.qp_h);
       if (qpc_body.send_cq_h != null)
@@ -237,6 +294,103 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
+  // 功能：直接复制 CQC_DELETE 所需的完整 CQC context 及其嵌套 handle/layout，
+  //   建立不依赖 factory override 的 detached snapshot。
+  // 输入/输出及副作用：source 为非拥有只读 CQC context；snapshot 为输出且入口
+  //   清空；成功时发布新建 rdma_cqc_model 及 page/ring/handle 子对象。
+  // 失败/边界：source 非 exact 类型、任一嵌套对象缺失、validation/handle snapshot
+  //   失败或 candidate 仍与源图共享节点时返回非 OK，绝不发布 partial snapshot。
+  protected function rdma_status checked_cqc_context_snapshot(
+    rdma_cqc_model source,
+    output rdma_cqc_model snapshot
+  );
+    rdma_status status;
+    rdma_handle cq_snapshot;
+    rdma_handle ceq_snapshot;
+    rdma_cqc_model candidate;
+    rdma_page_table_layout page_snapshot;
+    rdma_ring_position producer_snapshot;
+    rdma_ring_position consumer_snapshot;
+
+    snapshot = null;
+    if (source == null ||
+        source.get_object_type() != rdma_cqc_model::get_type())
+      return invalid_argument(
+        "CQC delete context requires exact rdma_cqc_model"
+      );
+    status = source.validate();
+    if (status == null)
+      return invalid_argument("CQC delete context validation returned null");
+    if (!status.ok())
+      return status;
+
+    status = checked_command_handle_snapshot(
+      source.cq_h, "CQC delete context CQ", cq_snapshot
+    );
+    if (!status.ok())
+      return status;
+    if (source.ceq_h != null) begin
+      status = checked_command_handle_snapshot(
+        source.ceq_h, "CQC delete context CEQ", ceq_snapshot
+      );
+      if (!status.ok())
+        return status;
+    end
+    if (source.page_layout == null || source.producer == null ||
+        source.consumer == null)
+      return invalid_argument(
+        "CQC delete context nested layout or ring is null"
+      );
+
+    // 这些值对象不携带外部资源所有权；直接构造，避免测试 factory override
+    //   注入共享节点或不满足约束的对象。
+    page_snapshot = new("cqc_delete_page_layout_snapshot");
+    page_snapshot.mode = source.page_layout.mode;
+    page_snapshot.sd_base = source.page_layout.sd_base;
+    page_snapshot.current_base = source.page_layout.current_base;
+    page_snapshot.current_valid = source.page_layout.current_valid;
+    page_snapshot.next_base = source.page_layout.next_base;
+    page_snapshot.next_valid = source.page_layout.next_valid;
+
+    producer_snapshot = new("cqc_delete_producer_snapshot");
+    producer_snapshot.index = source.producer.index;
+    producer_snapshot.wrap = source.producer.wrap;
+    consumer_snapshot = new("cqc_delete_consumer_snapshot");
+    consumer_snapshot.index = source.consumer.index;
+    consumer_snapshot.wrap = source.consumer.wrap;
+
+    candidate = new("cqc_delete_context_snapshot");
+    candidate.cq_h = cq_snapshot;
+    candidate.ceq_h = ceq_snapshot;
+    candidate.state = source.state;
+    candidate.depth = source.depth;
+    candidate.cqe_size_bytes = source.cqe_size_bytes;
+    candidate.threshold = source.threshold;
+    candidate.page_layout = page_snapshot;
+    candidate.producer = producer_snapshot;
+    candidate.consumer = consumer_snapshot;
+    candidate.urc_enable = source.urc_enable;
+    candidate.load_ci_done = source.load_ci_done;
+    candidate.last_arm_sequence = source.last_arm_sequence;
+    candidate.arm_sequence = source.arm_sequence;
+    candidate.arm_state = source.arm_state;
+    candidate.shadow_backing = source.shadow_backing;
+
+    status = candidate.validate();
+    if (status == null)
+      return invalid_argument("CQC delete context snapshot validation null");
+    if (!status.ok())
+      return status;
+    if (candidate == source || candidate.cq_h == source.cq_h ||
+        candidate.ceq_h == source.ceq_h ||
+        candidate.page_layout == source.page_layout ||
+        candidate.producer == source.producer ||
+        candidate.consumer == source.consumer)
+      return invalid_argument("CQC delete context snapshot aliases source");
+    snapshot = candidate;
+    return rdma_status::success();
+  endfunction
+
   // 功能：对五种 exact RDMA CMQ body 直接构造 typed detached snapshot。
   // 输入/输出及副作用：source 为输入，snapshot 为输出且入口清空；逐字段复制
   //   scalar/fixed-array，并为嵌套 handle 直接构造新值，不修改 source。
@@ -249,6 +403,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_status status;
     rdma_hw_qpc_command_body source_qpc;
     rdma_hw_qpc_command_body snapshot_qpc;
+    rdma_hw_cqc_delete_body source_cqc_delete;
+    rdma_hw_cqc_delete_body snapshot_cqc_delete;
+    rdma_cqc_model cqc_context_snapshot;
     rdma_hw_object_id_command_body source_object;
     rdma_hw_object_id_command_body snapshot_object;
     rdma_hw_mr_deregister_body source_mr;
@@ -270,6 +427,10 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     if (source_type == rdma_hw_qpc_command_body::get_type()) begin
       if (!$cast(source_qpc, source))
         return invalid_argument("rdma CMQ QPC wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_cqc_delete_body::get_type()) begin
+      if (!$cast(source_cqc_delete, source))
+        return invalid_argument("rdma CMQ CQC delete wrapper/cast mismatch");
     end
     else if (source_type == rdma_hw_object_id_command_body::get_type()) begin
       if (!$cast(source_object, source))
@@ -334,6 +495,16 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
         snapshot_qpc.modify_data[i] = source_qpc.modify_data[i];
       end
       candidate = snapshot_qpc;
+    end
+    else if (source_cqc_delete != null) begin
+      status = checked_cqc_context_snapshot(
+        source_cqc_delete.cqc_context, cqc_context_snapshot
+      );
+      if (!status.ok())
+        return status;
+      snapshot_cqc_delete = new("rdma_cqc_delete_body_snapshot");
+      snapshot_cqc_delete.cqc_context = cqc_context_snapshot;
+      candidate = snapshot_cqc_delete;
     end
     else if (source_object != null) begin
       status = checked_command_handle_snapshot(
@@ -408,12 +579,15 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     output byte unsigned canonical_field_bytes[]
   );
     rdma_hw_qpc_command_body qpc_body;
+    rdma_hw_cqc_delete_body cqc_delete_body;
     rdma_hw_object_id_command_body object_body;
     rdma_hw_mr_deregister_body mr_body;
     rdma_hw_occ_flush_body occ_body;
     rdma_hw_cmq_empty_body empty_body;
     rdma_cmq_canonical_writer writer;
     rdma_status status;
+    rdma_hw_cqc_create_body_codec cqc_context_codec;
+    rdma_hw_image cqc_context_image;
     string candidate_tag;
     byte unsigned candidate_bytes[];
     uvm_object_wrapper source_type;
@@ -426,6 +600,12 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     if (source_type == rdma_hw_qpc_command_body::get_type()) begin
       if (!$cast(qpc_body, source))
         return invalid_argument("rdma canonical QPC wrapper/cast mismatch");
+    end
+    else if (source_type == rdma_hw_cqc_delete_body::get_type()) begin
+      if (!$cast(cqc_delete_body, source))
+        return invalid_argument(
+          "rdma canonical CQC delete wrapper/cast mismatch"
+        );
     end
     else if (source_type == rdma_hw_object_id_command_body::get_type()) begin
       if (!$cast(object_body, source))
@@ -476,6 +656,32 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
             "rdma QPC modify tuple canonicalization failed"
           );
       end
+    end
+    else if (cqc_delete_body != null) begin
+      cqc_context_codec = new("cmq_canonical_cqc_context_codec");
+      cqc_context_image = null;
+      status = cqc_context_codec.encode(
+        cqc_delete_body.cqc_context, cqc_context_image
+      );
+      if (!status.ok() || cqc_context_image == null ||
+          cqc_context_image.length != 64 ||
+          cqc_context_image.bytes.size() != 64 ||
+          cqc_context_image.image_kind != RDMA_IMAGE_CQC ||
+          cqc_context_image.endian != RDMA_ENDIAN_BIG)
+        return invalid_argument(
+          "rdma CQC delete context canonical encoding failed"
+        );
+      candidate_tag = "CMQ-BODY-CQC-DELETE-V1";
+      if (!rdma_cmq_append_handle_v1(
+            writer, cqc_delete_body.cqc_context.cq_h, 1'b0
+          ) ||
+          !rdma_cmq_append_handle_v1(
+            writer, cqc_delete_body.cqc_context.ceq_h, 1'b1
+          ) ||
+          !writer.append_raw(cqc_context_image.bytes))
+        return invalid_argument(
+          "rdma CQC delete body canonicalization failed"
+        );
     end
     else if (object_body != null) begin
       candidate_tag = "CMQ-BODY-OBJECT-ID-V1";

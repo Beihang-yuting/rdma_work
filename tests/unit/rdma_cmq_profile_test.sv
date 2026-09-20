@@ -477,9 +477,47 @@ class rdma_cmq_profile_test extends uvm_test;
     return handle;
   endfunction
 
-  // 功能：创建一条有效 rdma/CQC_DELETE command fixture，以 object-ID body 指向固定 CQ。
+  // 功能：创建一条有效 rdma/CQC_DELETE command fixture，并把驱动要求的完整
+  //   CQC context 放入 typed body，避免测试把“仅 CQN”误当成可发送请求。
+  // 输入/输出及副作用：name 派生 context/handle 名；返回 context 拥有自己的
+  //   CQ/CEQ/page/ring 节点，句柄默认使用本 test 的 Function UID/generation。
+  // 失败/边界：function_h==null 仍由调用方用于负例；context 的校验失败由 profile
+  //   compose_sqe() 报告，本 helper 不访问外部资源或 Host memory。
+  function automatic rdma_cqc_model make_cqc_delete_context(string name);
+    rdma_cqc_model cqc_context;
+
+    cqc_context = rdma_cqc_model::type_id::create({name, "_context"});
+    cqc_context.cq_h = make_handle({name, "_cq"}, RDMA_RESOURCE_CQ,
+                               21'h12345);
+    cqc_context.ceq_h = make_handle({name, "_ceq"}, RDMA_RESOURCE_CEQ,
+                                12'h155);
+    cqc_context.state = RDMA_CONTEXT_VALID;
+    cqc_context.depth = 1024;
+    cqc_context.cqe_size_bytes = 64;
+    cqc_context.threshold = 5;
+    cqc_context.page_layout.mode = RDMA_OBJECT_HUGE_2M;
+    cqc_context.page_layout.sd_base.value = 64'h1b23_4567_89ab_c000;
+    cqc_context.page_layout.current_base.value = 64'h3c34_5678_9abc_d000;
+    cqc_context.page_layout.current_valid = 1'b1;
+    cqc_context.page_layout.next_base.value = 64'h5a12_3456_789a_b000;
+    cqc_context.page_layout.next_valid = 1'b1;
+    cqc_context.producer.index = 23'h155;
+    cqc_context.producer.wrap = 1'b0;
+    cqc_context.consumer.index = 23'h2aa;
+    cqc_context.consumer.wrap = 1'b1;
+    cqc_context.urc_enable = 1'b0;
+    cqc_context.load_ci_done = 1'b0;
+    cqc_context.last_arm_sequence = 2'd1;
+    cqc_context.arm_sequence = 2'd2;
+    cqc_context.arm_state = 2'd1;
+    cqc_context.shadow_backing.value = 64'h4d45_6789_abcd_efc0;
+    return cqc_context;
+  endfunction
+
+  // 功能：创建一条有效 rdma/CQC_DELETE command fixture，并把驱动要求的完整
+  //   CQC context 放入 typed body，避免测试把“仅 CQN”误当成可发送请求。
   // 输入/输出及副作用：name 派生 command/key/body/CQ 名，function_h 作非拥有输入；
-  // 返回拥有 key/body/sentinel owner 的 command，设置 VFID override=1/use_vfid=11'h345 与 timeout=100。
+  //   返回拥有 key/body/context 的 command，设置 VFID override=1/use_vfid=11'h345 与 timeout=100。
   // 失败/边界：function_h==null 可用于无效场景且不在 helper 内报错；所有 factory 依赖由测试环境保证。
   function automatic rdma_cmq_command_desc make_command(
     string name,
@@ -487,16 +525,21 @@ class rdma_cmq_profile_test extends uvm_test;
   );
     rdma_cmq_command_desc command;
     rdma_cmq_opcode_key key;
-    rdma_hw_object_id_command_body body;
+    rdma_hw_cqc_delete_body body;
 
     key = rdma_cmq_opcode_key::type_id::create({name, "_key"});
     key.profile_name = "rdma";
     key.opcode = RDMA_OP_CQC_DELETE;
     key.variant = "delete";
-    body = rdma_hw_object_id_command_body::type_id::create(
+    body = rdma_hw_cqc_delete_body::type_id::create(
       {name, "_body"});
-    body.object_h = make_handle({name, "_cq"}, RDMA_RESOURCE_CQ,
-                                21'h12345);
+    body.cqc_context = make_cqc_delete_context(name);
+    if (function_h != null) begin
+      body.cqc_context.cq_h.function_uid = function_h.function_uid;
+      body.cqc_context.cq_h.generation = function_h.generation;
+      body.cqc_context.ceq_h.function_uid = function_h.function_uid;
+      body.cqc_context.ceq_h.generation = function_h.generation;
+    end
     command = rdma_cmq_command_desc::type_id::create(name);
     command.function_h = function_h;
     command.opcode_key = key;
@@ -738,6 +781,16 @@ class rdma_cmq_profile_test extends uvm_test;
                   RDMA_SC_UNSUPPORTED_OPCODE);
     if (descriptor != null)
       `uvm_error("CMQ034_UNKNOWN_LOOKUP", "unknown opcode returned a descriptor")
+
+    // OCC_FLUSH 与 TQ_FLUSH 的 body 不携带 Function generation；profile 的
+    // compose_sqe 会在最终定址 SQE 上恢复调用方 generation，但 registry 仍须
+    // 对外公开同一 generationless 判定，避免不同调用者形成两套规则。
+    if (!rdma_cmq_codec_registry::is_generationless(RDMA_OP_OCC_FLUSH))
+      `uvm_error("CMQ034_GENERATIONLESS_OCC",
+                 "OCC_FLUSH is missing from generationless registry")
+    if (!rdma_cmq_codec_registry::is_generationless(RDMA_OP_TQ_FLUSH))
+      `uvm_error("CMQ034_GENERATIONLESS_TQ",
+                 "TQ_FLUSH is missing from generationless registry")
   endfunction
 
   // 功能：验证 CQC_DELETE compose 的 SQE 字节/metadata、期望响应、输入不可变和输出分离。
@@ -753,8 +806,12 @@ class rdma_cmq_profile_test extends uvm_test;
     rdma_cmq_command_desc command_snapshot;
     rdma_cmq_slot_context slot;
     rdma_cmq_slot_context slot_snapshot;
-    rdma_hw_object_id_command_body body;
-    rdma_hw_object_id_command_body snapshot_body;
+    rdma_hw_cqc_delete_body body;
+    rdma_hw_cqc_delete_body snapshot_body;
+    rdma_hw_object_id_command_body generic_body;
+    rdma_hw_image context_image;
+    rdma_hw_cqc_create_body_codec context_codec;
+    rdma_status context_status;
     rdma_hw_image sqe;
     rdma_hw_image second_sqe;
     rdma_cmq_expected_response expected;
@@ -798,6 +855,34 @@ class rdma_cmq_profile_test extends uvm_test;
         qword0[39:32] != RDMA_OP_CQC_DELETE ||
         qword0[20:0] != 21'h12345)
       `uvm_error("COMPOSE_FIELDS", "composed SQE envelope/body is wrong")
+
+    if (!$cast(body, command.body) ||
+        !$cast(snapshot_body, command_snapshot.body) ||
+        body.cqc_context == null || snapshot_body.cqc_context == null) begin
+      `uvm_error("COMPOSE_TYPED_BODY", "CQC_DELETE body lost its typed context")
+      return;
+    end
+    else begin
+      context_codec = new("compose_context_codec");
+      context_image = null;
+      context_status = context_codec.encode(body.cqc_context, context_image);
+      if (context_status == null || !context_status.ok() ||
+          context_image == null || context_image.bytes.size() != 64)
+        `uvm_error("COMPOSE_CONTEXT_IMAGE", "CQC context fixture did not encode")
+      else begin
+        for (int unsigned i = 0; i < 56; i++) begin
+          if (sqe.bytes[8 + i] != context_image.bytes[8 + i]) begin
+            `uvm_error("COMPOSE_CONTEXT_BYTES",
+                       $sformatf("byte[%0d] expected %02x, got %02x", i,
+                                 context_image.bytes[8 + i], sqe.bytes[8 + i]))
+            break;
+          end
+        end
+        if (sqe.bytes[63] != context_image.bytes[63])
+          `uvm_error("COMPOSE_CONTEXT_LAST_BYTE",
+                     "CQC_DELETE did not copy context byte 63")
+      end
+    end
     if (expected.hardware_opcode != RDMA_OP_CQC_DELETE ||
         expected.variant != "delete")
       `uvm_error("COMPOSE_EXPECTED", "expected response is wrong")
@@ -816,12 +901,14 @@ class rdma_cmq_profile_test extends uvm_test;
         command.vfid_override != command_snapshot.vfid_override ||
         command.use_vfid != command_snapshot.use_vfid ||
         command.timeout != command_snapshot.timeout ||
-        !$cast(body, command.body) ||
-        !$cast(snapshot_body, command_snapshot.body) ||
-        body.object_h.kind != snapshot_body.object_h.kind ||
-        body.object_h.function_uid != snapshot_body.object_h.function_uid ||
-        body.object_h.object_id != snapshot_body.object_h.object_id ||
-        body.object_h.generation != snapshot_body.object_h.generation)
+        body.cqc_context.cq_h.kind != snapshot_body.cqc_context.cq_h.kind ||
+        body.cqc_context.cq_h.function_uid !=
+          snapshot_body.cqc_context.cq_h.function_uid ||
+        body.cqc_context.cq_h.object_id !=
+          snapshot_body.cqc_context.cq_h.object_id ||
+        body.cqc_context.cq_h.generation !=
+          snapshot_body.cqc_context.cq_h.generation ||
+        body.cqc_context == snapshot_body.cqc_context)
       `uvm_error("COMPOSE_COMMAND_IMMUTABLE", "compose mutated command")
     if (slot.function_h != function_h || slot.cmq_h != cmq_h ||
         slot.backing_addr.value != slot_snapshot.backing_addr.value ||
@@ -885,6 +972,25 @@ class rdma_cmq_profile_test extends uvm_test;
       `uvm_error("COMPOSE_INCOMPATIBLE_BODY", "failure published outputs")
     command.opcode_key.opcode = RDMA_OP_CQC_DELETE;
     command.opcode_key.variant = "delete";
+
+    // CQC_DELETE 不允许退回旧的 generic object-ID body；驱动会从 context
+    //   读取 56 bytes，只有 CQN 的旧 fixture 必须在 compose 边界明确拒绝。
+    generic_body = rdma_hw_object_id_command_body::type_id::create(
+      "generic_cqc_delete_body"
+    );
+    generic_body.object_h = make_handle(
+      "generic_cqc_delete_cq", RDMA_RESOURCE_CQ, 21'h12345
+    );
+    command.body = generic_body;
+    sqe = null;
+    expected = null;
+    status = profile.compose_sqe(command, slot, sqe, expected);
+    expect_status("COMPOSE_GENERIC_CQC_DELETE", status,
+                  RDMA_SC_INVALID_ARGUMENT);
+    if (sqe != null || expected != null)
+      `uvm_error("COMPOSE_GENERIC_CQC_DELETE",
+                 "generic CQC_DELETE body published an image")
+    command.body = body;
 
     // 已在 driver 中定义但尚无精确 body codec 的命令，必须在 compose
     //   阶段返回 UNSUPPORTED_OPCODE，禁止生成全零假 body。
@@ -1298,6 +1404,80 @@ class rdma_cmq_profile_test extends uvm_test;
                  "unknown body published tag or bytes")
   endfunction
 
+  // 功能：验证 typed CQC_DELETE body 的 direct snapshot、嵌套图分离和稳定
+  //   canonical schema；该测试把 CQC context 当作驱动 memcpy 的真实输入。
+  // 输入/输出及副作用：创建本地 profile/body/context，调用 snapshot/canonicalize
+  //   seam 并只发布 UVM report；所有句柄和 page/ring 对象均由测试 fixture 拥有。
+  // 失败/边界：context 缺失、快照仍共享嵌套节点、tag/bytes 漂移或 context 字段
+  //   mutation 不改变 digest 时失败；不会把 generic object body 当作成功路径。
+  function automatic void check_cqc_delete_body_contract();
+    rdma_hw_cmq_hw_profile profile;
+    rdma_hw_cqc_delete_body body;
+    rdma_hw_cqc_delete_body snapshot_body;
+    rdma_hw_model snapshot;
+    rdma_status status;
+    rdma_cmq_journal_digest_t baseline_digest;
+    rdma_cmq_journal_digest_t changed_digest;
+    string schema_tag;
+    byte unsigned canonical_bytes[];
+
+    profile = rdma_hw_cmq_hw_profile::type_id::create(
+      "cqc_delete_contract_profile"
+    );
+    body = rdma_hw_cqc_delete_body::type_id::create(
+      "cqc_delete_contract_body"
+    );
+    body.cqc_context = make_cqc_delete_context("cqc_delete_contract");
+
+    status = body.validate();
+    expect_status("CQC_DELETE_BODY_VALIDATE", status, RDMA_SC_OK);
+
+    snapshot = null;
+    status = profile.snapshot_command_body(body, snapshot);
+    expect_status("CQC_DELETE_BODY_SNAPSHOT", status, RDMA_SC_OK);
+    if (!$cast(snapshot_body, snapshot) ||
+        snapshot_body == body || snapshot_body.cqc_context == null ||
+        snapshot_body.cqc_context == body.cqc_context ||
+        snapshot_body.cqc_context.cq_h == body.cqc_context.cq_h ||
+        snapshot_body.cqc_context.ceq_h == body.cqc_context.ceq_h ||
+        snapshot_body.cqc_context.page_layout == body.cqc_context.page_layout ||
+        snapshot_body.cqc_context.producer == body.cqc_context.producer ||
+        snapshot_body.cqc_context.consumer == body.cqc_context.consumer ||
+        !profile.same_command_body_value(body, snapshot_body) ||
+        !profile.command_body_graph_detached(body, snapshot_body))
+      `uvm_error("CQC_DELETE_BODY_SNAPSHOT",
+                 "typed CQC_DELETE snapshot is not equal and detached")
+
+    baseline_digest = digest_body_schema(
+      "CQC_DELETE_BODY_BASELINE", profile, body,
+      "CMQ-BODY-CQC-DELETE-V1"
+    );
+    body.cqc_context.producer.index++;
+    changed_digest = digest_body_schema(
+      "CQC_DELETE_BODY_PRODUCER", profile, body,
+      "CMQ-BODY-CQC-DELETE-V1"
+    );
+    expect_body_digest_changed("CQC_DELETE_BODY_PRODUCER", baseline_digest,
+                               changed_digest);
+
+    schema_tag = "preseeded";
+    canonical_bytes = '{8'hff};
+    status = profile.canonicalize_command_body(
+      body, schema_tag, canonical_bytes
+    );
+    expect_status("CQC_DELETE_BODY_CANONICAL", status, RDMA_SC_OK);
+    if (schema_tag != "CMQ-BODY-CQC-DELETE-V1" ||
+        canonical_bytes.size() <= 64)
+      `uvm_error("CQC_DELETE_BODY_CANONICAL",
+                 "typed CQC_DELETE canonical schema is incomplete")
+
+    body.cqc_context.producer.index--;
+    if (snapshot_body != null &&
+        snapshot_body.cqc_context.producer.index != 23'h155)
+      `uvm_error("CQC_DELETE_BODY_SNAPSHOT_DRIFT",
+                 "snapshot followed source producer mutation")
+  endfunction
+
   // 功能：逐一证明 QPC next_state 的 7..15 spare 编码不能进入 V1 canonical bytes。
   // 输入/输出及副作用：无显式输入；构造 exact QPC body，并为每个 spare 值调用
   //   production profile；只用 UVM error 报告结果，不修改外部资源。
@@ -1656,7 +1836,7 @@ class rdma_cmq_profile_test extends uvm_test;
     rdma_cmq_opcode_key key;
     rdma_cmq_slot_context slot;
     rdma_cmq_slot_context slot_snapshot;
-    rdma_hw_object_id_command_body object_body;
+    rdma_hw_cqc_delete_body cqc_delete_body;
     rdma_hw_occ_flush_body occ_body;
     rdma_hw_occ_flush_body occ_snapshot;
     rdma_hw_cmq_empty_body empty_body;
@@ -1673,12 +1853,14 @@ class rdma_cmq_profile_test extends uvm_test;
     slot = make_slot("generation_slot", function_h, cmq_h);
 
     command = make_command("mismatched_generation_command", function_h);
-    if (!$cast(object_body, command.body)) begin
+    if (!$cast(cqc_delete_body, command.body) ||
+        cqc_delete_body.cqc_context == null ||
+        cqc_delete_body.cqc_context.cq_h == null) begin
       `uvm_error("COMPOSE_BODY_GENERATION_SETUP",
-                 "object-ID command body cast failed")
+                 "typed CQC_DELETE body cast failed")
       return;
     end
-    object_body.object_h.generation = TEST_GENERATION + 1;
+    cqc_delete_body.cqc_context.cq_h.generation = TEST_GENERATION + 1;
     sqe = rdma_hw_image::type_id::create("stale_generation_sqe");
     expected = rdma_cmq_expected_response::type_id::create(
       "stale_generation_expected");
@@ -1688,7 +1870,7 @@ class rdma_cmq_profile_test extends uvm_test;
     if (sqe != null || expected != null)
       `uvm_error("COMPOSE_BODY_GENERATION",
                  "generation mismatch published outputs")
-    if (object_body.object_h.generation != TEST_GENERATION + 1)
+    if (cqc_delete_body.cqc_context.cq_h.generation != TEST_GENERATION + 1)
       `uvm_error("COMPOSE_BODY_GENERATION",
                  "generation mismatch mutated the command body")
 
@@ -2250,6 +2432,7 @@ class rdma_cmq_profile_test extends uvm_test;
     check_driver_034_registry_contract();
     check_body_snapshot_contract();
     check_body_canonicalization_contract();
+    check_cqc_delete_body_contract();
     check_qpc_spare_state_canonicalization();
     check_body_schema_field_mutations();
     check_compose_sqe();

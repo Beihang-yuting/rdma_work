@@ -270,6 +270,7 @@ class rdma_function_binding extends uvm_object;
   function rdma_status configure_identity(rdma_function_identity source);
     uvm_object cloned_object;
     rdma_function_identity configured;
+    rdma_pcie_identity pcie_candidate;
     rdma_status status;
 
     if (source == null)
@@ -287,16 +288,26 @@ class rdma_function_binding extends uvm_object;
     if (cloned_object == null || !$cast(configured, cloned_object))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "Function identity clone failed");
-    identity = configured;
-    function_uid = identity.function_uid;
-    global_function_id = identity.global_function_id;
-    generation = identity.generation;
     // PCIe identity 是同一 owner route 的兼容投影，不建立第二份 authority。
-    if (pcie == null)
-      pcie = rdma_pcie_identity::type_id::create("pcie");
-    pcie.bdf = identity.key.bdf;
-    pcie.parent_pf_bdf = identity.key.parent_pf_bdf;
-    pcie.vf_index = identity.key.vf_index;
+    // 先完成 candidate factory，再一次性发布 identity/scalar/PCIe 三组字段；
+    // factory 失败时保留原 binding，避免“新 identity + 旧 PCIe”半组合。
+    pcie_candidate = pcie;
+    if (pcie_candidate == null) begin
+      pcie_candidate = rdma_pcie_identity::type_id::create("pcie");
+      if (pcie_candidate == null)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "PCIe identity projection allocation failed"
+        );
+    end
+    pcie_candidate.bdf = configured.key.bdf;
+    pcie_candidate.parent_pf_bdf = configured.key.parent_pf_bdf;
+    pcie_candidate.vf_index = configured.key.vf_index;
+    identity = configured;
+    function_uid = configured.function_uid;
+    global_function_id = configured.global_function_id;
+    generation = configured.generation;
+    pcie = pcie_candidate;
     return rdma_status::success();
   endfunction
 
@@ -438,8 +449,8 @@ class rdma_function_binding extends uvm_object;
   // 功能：从已配置 authority identity 构造可交给其他模型的 Function handle 值。
   // 输入/输出及副作用：无参数；比对 identity 与 UID/global-ID/generation/PCIe 镜像，
   // 成功时 factory-create 新 rdma_function_handle，调用方拥有该身份值。
-  // 失败/边界：identity/pcie 缺失、validator 返回 null/无效，以及任一兼容镜像不一致时返回 null；
-  // 不回退到可能歧义的 legacy scalars。
+  // 失败/边界：identity/pcie 缺失、validator 返回 null/无效、任一兼容镜像不一致或
+  // Function handle factory 返回 null 时返回 null；不回退到可能歧义的 legacy scalars。
   function rdma_function_handle make_handle();
     rdma_function_handle handle;
     rdma_status identity_status;
@@ -459,6 +470,8 @@ class rdma_function_binding extends uvm_object;
         identity.key.vf_index != pcie.vf_index)
       return null;
     handle = rdma_function_handle::type_id::create("function_handle");
+    if (handle == null)
+      return null;
     handle.kind = RDMA_RESOURCE_FUNCTION;
     handle.function_uid = identity.function_uid;
     handle.object_id = identity.global_function_id;
@@ -478,6 +491,31 @@ class rdma_function_binding extends uvm_object;
       return 1'b0;
     identity_status = identity.validate();
     if (identity_status == null || !identity_status.ok())
+      return 1'b0;
+    if (function_uid != identity.function_uid ||
+        global_function_id != identity.global_function_id ||
+        generation != identity.generation ||
+        !rdma_bdf_same(identity.key.bdf, pcie.bdf) ||
+        !rdma_bdf_same(identity.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
+        identity.key.vf_index != pcie.vf_index)
+      return 1'b0;
+    return handle.kind == RDMA_RESOURCE_FUNCTION &&
+           handle.function_uid == identity.function_uid &&
+           handle.object_id == identity.global_function_id &&
+           handle.generation == identity.generation;
+  endfunction
+
+  // 功能：在 reset commit 的已验证路径中，以纯字段比较确认 owner handle 仍指向当前
+  //       binding incarnation，避免为只读校验构造 rdma_status 或进入 factory。
+  // 输入/输出及副作用：handle（输入）只读；函数直接读取 identity、PCIe 镜像、UID/
+  //   global-ID/generation 和 route key，返回 bit，不修改 binding、owner 或 reset ledger。
+  // 失败/边界：handle/identity/pcie 缺失、identity 字段为零/route 非法、兼容镜像漂移或
+  //   kind/UID/object-id/generation 不匹配时返回 0；该 seam 不发布诊断 status，调用方需
+  //   在 prepare/validate 阶段使用 accepts() 获取详细错误。
+  function bit accepts_noalloc(rdma_handle handle);
+    if (handle == null || identity == null || pcie == null ||
+        identity.function_uid == 0 || identity.generation == 0 ||
+        !rdma_function_key_route_valid(identity.key))
       return 1'b0;
     if (function_uid != identity.function_uid ||
         global_function_id != identity.global_function_id ||
@@ -763,6 +801,36 @@ class rdma_function_binding extends uvm_object;
     return function_identity_snapshot();
   endfunction
 
+  // 功能：在不分配 detached identity 的前提下，验证 binding 当前 authority 与已准备的
+  //       identity snapshot 仍属于同一 Function incarnation。
+  // 输入/输出及副作用：expected（输入）是调用方在 prepare 阶段保存的 identity snapshot；
+  //   函数只读取 protected identity、UID/global-ID/generation 和 PCIe BDF 镜像，返回 bit，
+  //   不调用 factory/clone、不修改 binding 或外部账本。
+  // 失败/边界：expected/identity/pcie 缺失、当前 identity 的 UID/generation/route 无效、
+  //   UID 或 generation 镜像漂移、BDF/PF-parent/VF 投影不一致时返回 0；成功只表示
+  //   authority 与 snapshot 一致，不代表 queue/capability/vector 业务字段已经完整校验。
+  function bit matches_identity_snapshot(
+    rdma_function_identity expected
+  );
+    if (expected == null || identity == null || pcie == null)
+      return 1'b0;
+    if (identity.function_uid == 0 || identity.generation == 0 ||
+        !rdma_function_key_route_valid(identity.key))
+      return 1'b0;
+    if (!identity.same_incarnation(expected) ||
+        function_uid != expected.function_uid ||
+        global_function_id != expected.global_function_id ||
+        generation != expected.generation ||
+        !rdma_bdf_same(identity.key.bdf, pcie.bdf) ||
+        !rdma_bdf_same(identity.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
+        identity.key.vf_index != pcie.vf_index ||
+        !rdma_bdf_same(expected.key.bdf, pcie.bdf) ||
+        !rdma_bdf_same(expected.key.parent_pf_bdf, pcie.parent_pf_bdf) ||
+        expected.key.vf_index != pcie.vf_index)
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
   // 功能：返回 binding 所拥有 Function identity 的 reset epoch 镜像。
   // 输入/输出及副作用：无参数；只读 protected identity，返回 rdma_reset_epoch_t，
   // 不暴露 identity 句柄也不修改 binding。
@@ -777,7 +845,7 @@ class rdma_function_binding extends uvm_object;
   // 失败/边界：缺失/invalid identity、PCIe 镜像漂移、PASID/BDF/能力/vector 非法、
   // BAR/notify 窗口缺失或溢出时拒绝；ACTIVE 还要求匹配 owner、DMA domain、MSE/BME
   // 及 notify/DMI/VFT valid+ready，owner generation 过时单独返回 STALE_GENERATION。
-  function rdma_status validate();
+  virtual function rdma_status validate();
     longint unsigned bar_last;
     longint unsigned notify_last;
     rdma_bar_info selected_bar;

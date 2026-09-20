@@ -7,15 +7,15 @@ class rdma_responder_registry_test extends uvm_test;
   `uvm_component_utils(rdma_responder_registry_test)
 
   // 功能：构造测试组件并建立 UVM 组件层级关系。
-  // 输入输出及副作用：name、parent 为 UVM 输入；仅调用父类构造，不分配 registry 或外部资源。
-  // 失败边界：UVM 父组件为空是合法的顶层测试场景；其他构造异常由 UVM 报告。
+  // 输入/输出及副作用：name、parent 为 UVM 输入；仅调用父类构造，不分配 registry 或外部资源。
+  // 失败/边界：UVM 父组件为空是合法的顶层测试场景；其他构造异常由 UVM 报告。
   function new(string name = "rdma_responder_registry_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
   // 功能：生成一个完整且可路由的测试 route 快照。
-  // 输入输出及副作用：seed 为输入，决定 bus/device/function；返回值为独立 packed route，不修改共享状态。
-  // 失败边界：seed 的所有 8 位取值均可编码；seed=0 仍通过非零 device 保持 BDF 合法。
+  // 输入/输出及副作用：seed 为输入，决定 bus/device/function；返回值为独立 packed route，不修改共享状态。
+  // 失败/边界：seed 的所有 8 位取值均可编码；seed=0 仍通过非零 device 保持 BDF 合法。
   function automatic rdma_route_key_t make_route(bit [7:0] seed);
     rdma_route_key_t route;
     route.host_topology_key = 32'h1000 + seed;
@@ -29,8 +29,8 @@ class rdma_responder_registry_test extends uvm_test;
   endfunction
 
   // 功能：构造一个可用于 claim 的 BAR 起始地址值。
-  // 输入输出及副作用：value 为输入；返回值为 rdma_bar_addr_t，不修改 registry 或地址所有权。
-  // 失败边界：调用方仍负责保证 value 与 size 的 65 位和不溢出；本辅助函数不做范围拒绝。
+  // 输入/输出及副作用：value 为输入；返回值为 rdma_bar_addr_t，不修改 registry 或地址所有权。
+  // 失败/边界：调用方仍负责保证 value 与 size 的 65 位和不溢出；本辅助函数不做范围拒绝。
   function automatic rdma_bar_addr_t make_base(longint unsigned value);
     rdma_bar_addr_t base;
     base.value = value;
@@ -38,8 +38,8 @@ class rdma_responder_registry_test extends uvm_test;
   endfunction
 
   // 功能：断言 status 的 code 与 resource engine 来源，统一检查登记表错误路径。
-  // 输入输出及副作用：status 为输入句柄，expected_code 为期望错误码；失败时发出 UVM 错误，不修改 status。
-  // 失败边界：status 为空或 code/source_engine 不匹配均报告错误；成功状态不应调用本辅助函数。
+  // 输入/输出及副作用：status 为输入句柄，expected_code 为期望错误码；失败时发出 UVM 错误，不修改 status。
+  // 失败/边界：status 为空或 code/source_engine 不匹配均报告错误；成功状态不应调用本辅助函数。
   function void expect_resource_error(rdma_status status, rdma_status_code_e expected_code);
     if (status == null)
       `uvm_error("REG_STATUS", "registry returned null status")
@@ -52,8 +52,8 @@ class rdma_responder_registry_test extends uvm_test;
   endfunction
 
   // 功能：执行 registry 的完整边界场景，包括四 domain、重叠、溢出、monitor、租约、seal 和重用。
-  // 输入输出及副作用：phase 为 UVM 输入；task 创建并修改本地 registry 账本，最终释放成功登记的 region 并 drop objection。
-  // 失败边界：任一断言失败会使测试报告 UVM_ERROR；claim/release 的失败路径必须保持 active_count 和既有条目不变。
+  // 输入/输出及副作用：phase 为 UVM 输入；task 创建并修改本地 registry 账本，最终释放成功登记的 region 并 drop objection。
+  // 失败/边界：任一断言失败会使测试报告 UVM_ERROR；claim/release 的失败路径必须保持 active_count 和既有条目不变。
   task run_phase(uvm_phase phase);
     rdma_responder_registry registry;
     rdma_responder_region region;

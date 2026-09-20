@@ -533,18 +533,18 @@ class rdma_doorbell_scheduler extends uvm_object;
     rdma_pcie_api pcie_arg
   );
     if (host_mem_arg == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "host memory adapter is null");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "host memory adapter is null");
     if (pcie_arg == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "PCIe adapter is null");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "PCIe adapter is null");
     if (configured)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "doorbell scheduler is already configured");
+      return make_status_direct(RDMA_SC_INVALID_STATE,
+                                "doorbell scheduler is already configured");
     host_mem = host_mem_arg;
     pcie = pcie_arg;
     configured = 1'b1;
-    return rdma_status::success();
+    return make_status_direct(RDMA_SC_OK);
   endfunction
 
   // 功能：将指定 code/message 和标准默认诊断上下文写入既有 status 对象。
@@ -586,6 +586,24 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = new("doorbell_direct_status");
     void'(set_status_fields(status, code, message));
     return status;
+  endfunction
+
+  // 功能：把任一内部/外部 status 结果归一化为可安全解引用的非空值。
+  // 输入/输出及副作用：candidate 为被检查的 status，fallback_code/operation
+  //   提供空返回时的诊断；返回 candidate 或 scheduler 直接构造的 detached status。
+  // 失败/边界：candidate==null 时绝不调用 candidate.ok()，而是 fail-closed 为
+  //   fallback_code；非空 status 原样保留其硬件诊断字段和错误码。
+  protected function rdma_status normalize_status(
+    rdma_status candidate,
+    rdma_status_code_e fallback_code,
+    string operation
+  );
+    if (candidate != null)
+      return candidate;
+    return make_status_direct(
+      fallback_code,
+      {operation, " returned null status"}
+    );
   endfunction
 
   // 功能：把 source 的完整诊断标量复制到已存在的 destination status。
@@ -806,28 +824,41 @@ class rdma_doorbell_scheduler extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：clone 调用方 binding 为锁内只读 detached snapshot，供 preflight 和执行统一消费。
-  // 输入/输出及副作用：source 为输入，snapshot 先置 null；成功输出 rdma_function_binding clone 和 OK。
-  // 失败/边界：source=null 返回 INVALID_ARGUMENT；clone=null/错误类型返回 INVALID_STATE，snapshot 保持 null。
+  // 功能：通过 binding 的 nonfatal authority seam 建立锁内只读 detached snapshot，
+  //   供 preflight 和执行统一消费，并绕过可覆盖的 UVM clone/type_id 路径。
+  // 输入/输出及副作用：source 为输入，snapshot 先置 null；成功输出完整 value
+  //   graph 和 OK，source 的动态 validate 会在 seam 内再次参与校验。
+  // 失败/边界：source=null 返回 INVALID_ARGUMENT；嵌套 authority 缺失、动态
+  //   subtype 不支持、候选不等值或 validator 返回 null 时返回非空错误，snapshot 保持 null。
   protected function rdma_status clone_binding_snapshot(
     rdma_function_binding source,
     output rdma_function_binding snapshot
   );
-    uvm_object cloned_object;
+    rdma_status status;
 
     snapshot = null;
     if (source == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "function binding is null");
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(snapshot, cloned_object)) begin
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "function binding is null");
+    status = source.snapshot_complete_nonfatal(snapshot);
+    if (status == null) begin
       snapshot = null;
-      return rdma_status::make(
+      return make_status_direct(
         RDMA_SC_INVALID_STATE,
-        "function binding snapshot clone failed"
+        "function binding nonfatal snapshot returned null status"
       );
     end
-    return rdma_status::success();
+    if (!status.ok()) begin
+      snapshot = null;
+      return status;
+    end
+    if (snapshot == null) begin
+      return make_status_direct(
+        RDMA_SC_INVALID_STATE,
+        "function binding nonfatal snapshot returned null value"
+      );
+    end
+    return make_status_direct(RDMA_SC_OK);
   endfunction
 
   // 功能：clone 调用方 descriptor 为锁内 detached snapshot，冻结 handle/image/dependency 图。
@@ -841,17 +872,17 @@ class rdma_doorbell_scheduler extends uvm_object;
 
     snapshot = null;
     if (source == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell descriptor is null");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell descriptor is null");
     cloned_object = source.clone();
     if (cloned_object == null || !$cast(snapshot, cloned_object)) begin
       snapshot = null;
-      return rdma_status::make(
+      return make_status_direct(
         RDMA_SC_INVALID_STATE,
         "doorbell descriptor snapshot clone failed"
       );
     end
-    return rdma_status::success();
+    return make_status_direct(RDMA_SC_OK);
   endfunction
 
   // 功能：先 try_get，再以 invocation-local worker/timer 竞争在总 deadline 前取得 Function lock。
@@ -874,7 +905,7 @@ class rdma_doorbell_scheduler extends uvm_object;
     end
     if (function_lock.try_get(1)) begin
       acquired = 1'b1;
-      status = rdma_status::success();
+      status = make_status_direct(RDMA_SC_OK);
       return;
     end
 
@@ -901,7 +932,7 @@ class rdma_doorbell_scheduler extends uvm_object;
       return;
     end
     acquired = 1'b1;
-    status = rdma_status::success();
+    status = make_status_direct(RDMA_SC_OK);
   endtask
 
   // 功能：用总 deadline 的剩余预算执行一次 PCIe DMA visibility barrier。
@@ -1058,11 +1089,27 @@ class rdma_doorbell_scheduler extends uvm_object;
     rdma_handle target_h
   );
     rdma_doorbell_model model;
+    rdma_status status;
+    uvm_object raw_model;
 
-    model = rdma_doorbell_model::type_id::create("target_kind_model");
+    // 通过 raw factory 获取对象，先做显式 cast；typed registry::create 在 hostile
+    //   override 返回错误动态类型时会直接触发 UVM fatal，无法把边界错误转成 status。
+    raw_model = factory_create_object_nonfatal(
+      rdma_doorbell_model::get_type(), "target_kind_model"
+    );
+    if (raw_model == null || !$cast(model, raw_model))
+      return make_status_direct(
+        RDMA_SC_INVALID_STATE,
+        "doorbell target-kind model factory returned null or wrong type"
+      );
     model.kind = kind;
     model.target_h = target_h;
-    return model.validate();
+    status = model.validate();
+    return normalize_status(
+      status,
+      RDMA_SC_INVALID_STATE,
+      "doorbell target-kind validation"
+    );
   endfunction
 
   // 功能：校验 hardware image 的长度、alignment、endian、metadata 和 Function generation 基本形状。
@@ -1074,25 +1121,27 @@ class rdma_doorbell_scheduler extends uvm_object;
     int unsigned function_generation
   );
     if (image == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "hardware image is null");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "hardware image is null");
     if (image.length == 0 || image.bytes.size() != image.length)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "hardware image length does not match bytes");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "hardware image length does not match bytes"
+      );
     if (image.alignment == 0 ||
         (image.alignment & (image.alignment - 1'b1)) != 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "hardware image alignment is invalid");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "hardware image alignment is invalid");
     if (!(image.endian inside {RDMA_ENDIAN_LITTLE, RDMA_ENDIAN_BIG}))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "hardware image endian is invalid");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "hardware image endian is invalid");
     if (image.image_kind == RDMA_IMAGE_NONE || image.hardware_version == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "hardware image metadata is incomplete");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "hardware image metadata is incomplete");
     if (image.function_generation != function_generation)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "hardware image generation is stale");
-    return rdma_status::success();
+      return make_status_direct(RDMA_SC_STALE_GENERATION,
+                                "hardware image generation is stale");
+    return make_status_direct(RDMA_SC_OK);
   endfunction
 
   // 功能：校验 doorbell payload 的 image/width/endian/BAR target、alignment
@@ -1108,52 +1157,74 @@ class rdma_doorbell_scheduler extends uvm_object;
 
     absolute_address = '0;
     if (desc.payload_image == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell payload image is null");
-    status = image_shape_status(desc.payload_image,
-                                desc.function_h.generation);
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell payload image is null");
+    status = normalize_status(
+      image_shape_status(desc.payload_image,
+                         desc.function_h.generation),
+      RDMA_SC_INVALID_STATE,
+      "doorbell payload image validation"
+    );
     if (!status.ok())
       return status;
     if (desc.width == 0 || desc.payload_image.length != desc.width ||
         desc.payload_image.bytes.size() != desc.width)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell width does not match payload image");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell width does not match payload image"
+      );
     if (desc.endian != desc.payload_image.endian)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell endian does not match payload image");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell endian does not match payload image"
+      );
     if (desc.payload_image.image_kind != RDMA_IMAGE_DOORBELL)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "payload image is not a doorbell");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "payload image is not a doorbell");
     if (desc.payload_image.write_target_kind != RDMA_HW_TARGET_BAR)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell payload target is not a BAR");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell payload target is not a BAR"
+      );
     if (desc.payload_image.bar_target.value != desc.relative_offset)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "payload BAR offset does not match descriptor");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "payload BAR offset does not match descriptor"
+      );
     if ((desc.relative_offset &
          (desc.payload_image.alignment - 1'b1)) != 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell offset violates image alignment");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell offset violates image alignment"
+      );
     if (desc.relative_offset > binding.notify_size ||
         desc.width > (binding.notify_size - desc.relative_offset))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell write is outside notify aperture");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell write is outside notify aperture"
+      );
 
     // 此处要求 notify aperture 的半开区间末端可表示，保证后续范围运算无回绕。
     if (binding.notify_base.value >
         (64'hffff_ffff_ffff_ffff - binding.notify_size))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "notify aperture end overflows 64 bits");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "notify aperture end overflows 64 bits"
+      );
     if (binding.notify_base.value >
         (64'hffff_ffff_ffff_ffff - desc.relative_offset))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell absolute address overflows 64 bits");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell absolute address overflows 64 bits"
+      );
     absolute_address.value = binding.notify_base.value + desc.relative_offset;
     if (absolute_address.value >
         (64'hffff_ffff_ffff_ffff - (desc.width - 1'b1)))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell write end overflows 64 bits");
-    return rdma_status::success();
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell write end overflows 64 bits"
+      );
+    return make_status_direct(RDMA_SC_OK);
   endfunction
 
   // 功能：校验单条 dependency 的 identity/stage/readiness、backing image 和 queue-DMA read authority。
@@ -1171,143 +1242,202 @@ class rdma_doorbell_scheduler extends uvm_object;
     rdma_dma_permission_t read_permission;
 
     if (dependency == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell dependency is null");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell dependency is null");
     if (dependency.dependency_id == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell dependency ID is zero");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell dependency ID is zero");
     if (!(dependency.stage inside {RDMA_DB_DEP_PAYLOAD,
                                    RDMA_DB_DEP_QUEUE_CONTEXT}))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell dependency stage is invalid");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell dependency stage is invalid"
+      );
     if (!dependency.ready)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "doorbell dependency is not ready");
+      return make_status_direct(RDMA_SC_INVALID_STATE,
+                                "doorbell dependency is not ready");
     if (dependency.mapping == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell dependency mapping is null");
-    status = image_shape_status(dependency.image,
-                                desc.function_h.generation);
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell dependency mapping is null"
+      );
+    status = normalize_status(
+      image_shape_status(dependency.image, desc.function_h.generation),
+      RDMA_SC_INVALID_STATE,
+      "doorbell dependency image validation"
+    );
     if (!status.ok())
       return status;
     if (dependency.image.write_target_kind != RDMA_HW_TARGET_BACKING)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "dependency image target is not backing memory");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "dependency image target is not backing memory"
+      );
     if (dependency.mapping.iova.value >
         (64'hffff_ffff_ffff_ffff - dependency.relative_offset))
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "dependency IOVA overflows 64 bits");
+      return make_status_direct(
+        RDMA_SC_DMA_TRANSLATION,
+        "dependency IOVA overflows 64 bits"
+      );
 
     first_iova.value = dependency.mapping.iova.value +
                        dependency.relative_offset;
     read_permission = '{device_read:1'b1, device_write:1'b0, atomic:1'b0};
-    status = dependency.mapping.check_access(
-      desc.function_h,
-      binding.queue_dma.requester_bdf,
-      binding.queue_dma.pasid_valid,
-      binding.queue_dma.pasid,
-      binding.queue_dma.dma_domain_valid,
-      binding.queue_dma.dma_domain_id,
-      first_iova,
-      dependency.image.length,
-      RDMA_DMA_DEVICE_READ,
-      read_permission
+    status = normalize_status(
+      dependency.mapping.check_access(
+        desc.function_h,
+        binding.queue_dma.requester_bdf,
+        binding.queue_dma.pasid_valid,
+        binding.queue_dma.pasid,
+        binding.queue_dma.dma_domain_valid,
+        binding.queue_dma.dma_domain_id,
+        first_iova,
+        dependency.image.length,
+        RDMA_DMA_DEVICE_READ,
+        read_permission
+      ),
+      RDMA_SC_INVALID_STATE,
+      "doorbell dependency DMA authority check"
     );
     if (!status.ok())
       return status;
     if ((dependency.relative_offset &
          (dependency.image.alignment - 1'b1)) != 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "dependency offset violates image alignment");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "dependency offset violates image alignment"
+      );
     return status;
   endfunction
 
-  // 功能：在任何外部 I/O 前完整验证配置、锁定 identity、binding lifecycle、doorbell/target、payload 和全部 dependency。
-  // 输入/输出及副作用：binding/desc/locked Function identity 为只读输入；absolute_address 先清零，成功写入已验证 BAR 地址。
+  // 功能：在任何外部 I/O 前完整验证配置、锁定 identity、binding lifecycle、
+  //       doorbell/target、payload 和全部 dependency。
+  // 输入/输出及副作用：binding/desc/locked Function identity/reset epoch 为只读输入；
+  //       absolute_address 先清零，成功写入已验证 BAR 地址。
   // 失败/边界：scheduler 未配置，identity/generation/handle/policy/payload/dependency
-  //   非法或 dependency ID 重复时返回对应错误，且不触发 adapter。
+  //       非法、reset epoch 漂移、status 为空或 dependency ID 重复时返回对应错误，且不触发 adapter。
   protected function rdma_status preflight(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
     longint unsigned locked_function_uid,
     int unsigned locked_object_id,
+    rdma_reset_epoch_t locked_reset_epoch,
     output rdma_bar_addr_t absolute_address
   );
     rdma_status status;
     bit seen_ids[longint unsigned];
 
     absolute_address = '0;
+    if (binding == null)
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "function binding is null");
+    if (desc == null)
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell descriptor is null");
     if (!configured || host_mem == null || pcie == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "doorbell scheduler is not configured");
+      return make_status_direct(RDMA_SC_INVALID_STATE,
+                                "doorbell scheduler is not configured");
     if (binding.function_uid != locked_function_uid ||
         binding.global_function_id != locked_object_id)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "binding identity changed while waiting");
-    status = binding.validate();
+      return make_status_direct(RDMA_SC_INVALID_STATE,
+                                "binding identity changed while waiting");
+    if (locked_reset_epoch != 0 && binding.function_reset_epoch() != 0 &&
+        binding.function_reset_epoch() != locked_reset_epoch)
+      return make_status_direct(
+        RDMA_SC_STALE_GENERATION,
+        "Function reset epoch changed while waiting"
+      );
+
+    status = normalize_status(
+      binding.validate(),
+      RDMA_SC_INVALID_STATE,
+      "Function binding validation"
+    );
     if (!status.ok())
       return status;
     if (binding.state != RDMA_BIND_ACTIVE)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "function binding is not ACTIVE");
+      return make_status_direct(RDMA_SC_INVALID_STATE,
+                                "function binding is not ACTIVE");
     if (desc.function_h == null ||
         desc.function_h.kind != RDMA_RESOURCE_FUNCTION)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell Function handle is invalid");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell Function handle is invalid");
     if (desc.function_h.function_uid != binding.function_uid ||
         desc.function_h.object_id != binding.global_function_id)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell Function does not match binding");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell Function does not match binding");
     if (desc.function_h.generation != binding.generation)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "doorbell Function generation is stale");
+      return make_status_direct(RDMA_SC_STALE_GENERATION,
+                                "doorbell Function generation is stale");
     if (desc.target_h == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell target handle is null");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell target handle is null");
     if (desc.target_h.function_uid != desc.function_h.function_uid)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell target belongs to another Function");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell target belongs to another Function"
+      );
     if (desc.target_h.generation != desc.function_h.generation)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "doorbell target generation is stale");
-    status = target_kind_status(desc.kind, desc.target_h);
+      return make_status_direct(RDMA_SC_STALE_GENERATION,
+                                "doorbell target generation is stale");
+    status = normalize_status(
+      target_kind_status(desc.kind, desc.target_h),
+      RDMA_SC_INVALID_STATE,
+      "doorbell target-kind check"
+    );
     if (!status.ok())
       return status;
     if (desc.notify_bar_id != binding.notify_bar_id)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell notify BAR does not match binding");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "doorbell notify BAR does not match binding"
+      );
     if (desc.timeout == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell timeout is zero");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell timeout is zero");
     if (desc.merge_requested && !desc.allow_merge)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "doorbell merge was not allowed");
+      return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                "doorbell merge was not allowed");
     if (desc.write_combining_policy == RDMA_DB_WRITE_NON_COMBINING &&
         desc.merge_requested)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "non-combining doorbell cannot be merged");
+      return make_status_direct(
+        RDMA_SC_INVALID_ARGUMENT,
+        "non-combining doorbell cannot be merged"
+      );
     if (desc.readback_policy != RDMA_DB_READBACK_NONE)
-      return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                               "doorbell readback is unsupported");
+      return make_status_direct(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        "doorbell readback is unsupported"
+      );
 
-    status = payload_status(binding, desc, absolute_address);
+    status = normalize_status(
+      payload_status(binding, desc, absolute_address),
+      RDMA_SC_INVALID_STATE,
+      "doorbell payload check"
+    );
     if (!status.ok())
       return status;
 
     seen_ids.delete();
     foreach (desc.dependencies[i]) begin
       if (desc.dependencies[i] == null)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "doorbell dependency is null");
+        return make_status_direct(RDMA_SC_INVALID_ARGUMENT,
+                                  "doorbell dependency is null");
       if (seen_ids.exists(desc.dependencies[i].dependency_id))
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "doorbell dependency ID is duplicated");
+        return make_status_direct(
+          RDMA_SC_INVALID_ARGUMENT,
+          "doorbell dependency ID is duplicated"
+        );
       seen_ids[desc.dependencies[i].dependency_id] = 1'b1;
-      status = dependency_status(binding, desc, desc.dependencies[i]);
+      status = normalize_status(
+        dependency_status(binding, desc, desc.dependencies[i]),
+        RDMA_SC_INVALID_STATE,
+        "doorbell dependency check"
+      );
       if (!status.ok())
         return status;
     end
-    return rdma_status::success();
+    return make_status_direct(RDMA_SC_OK);
   endfunction
 
   // 功能：把已通过 preflight 的 hardware image queue 复制为 adapter 调用专用动态数组。
@@ -1365,6 +1495,7 @@ class rdma_doorbell_scheduler extends uvm_object;
     rdma_doorbell_desc desc,
     longint unsigned locked_function_uid,
     int unsigned locked_object_id,
+    rdma_reset_epoch_t locked_reset_epoch,
     time deadline,
     rdma_doorbell_submission_observer observer,
     rdma_doorbell_submission_result result
@@ -1375,7 +1506,8 @@ class rdma_doorbell_scheduler extends uvm_object;
     bit mmio_succeeded;
 
     operation_status = preflight(binding, desc, locked_function_uid,
-                                 locked_object_id, absolute_address);
+                                 locked_object_id, locked_reset_epoch,
+                                 absolute_address);
     capture_pre_submit_status(operation_status, result);
     if (!result.status.ok())
       return;
@@ -1444,6 +1576,7 @@ class rdma_doorbell_scheduler extends uvm_object;
   );
     longint unsigned locked_function_uid;
     int unsigned locked_object_id;
+    rdma_reset_epoch_t locked_reset_epoch;
     semaphore function_lock;
     rdma_function_binding binding_snapshot;
     rdma_doorbell_desc desc_snapshot;
@@ -1486,6 +1619,9 @@ class rdma_doorbell_scheduler extends uvm_object;
     //   teardown/rebind 必须与旧 incarnation 串行。
     locked_function_uid = binding.function_uid;
     locked_object_id = binding.global_function_id;
+    // reset epoch 随入口 identity 一并冻结；它不在 legacy Function handle 的
+    //   wire 字段中，必须独立保存，才能在等待 lock 期间识别 reset 后的 binding。
+    locked_reset_epoch = binding.function_reset_epoch();
     function_lock = lock_for(locked_function_uid, locked_object_id);
     acquire_function_lock_before_deadline(function_lock, deadline,
                                           lock_acquired, operation_status);
@@ -1493,11 +1629,24 @@ class rdma_doorbell_scheduler extends uvm_object;
     if (!lock_acquired)
       return;
 
-    // 取得 immutable-identity lock 后才 snapshot，让等待期间完成的
-    //   binding teardown/rebind 能被 preflight 看见；随后只读取 detached value graph，
-    //   不再读取 caller-owned 对象。
-    operation_status = clone_binding_snapshot(binding, binding_snapshot);
+    // 取得 immutable-identity lock 后，先对 caller-owned binding 做一次动态分派的
+    //   authority 校验，再建立 detached snapshot。不能只依赖 clone 后的 base 类型
+    //   validate：hostile subtype 或 dpu_common 适配器可能在 clone 时丢失动态行为，
+    //   这样会把原 binding 的拒绝结果错误地升级为成功。
+    operation_status = normalize_status(
+      binding.validate(),
+      RDMA_SC_INVALID_STATE,
+      "Function binding validation before snapshot"
+    );
     capture_pre_submit_status(operation_status, result);
+
+    // 只有原 binding 在锁内通过 authority 校验后才 snapshot；随后只读取 detached
+    //   value graph，不再读取 caller-owned 对象。preflight 仍会对 snapshot 重复校验，
+    //   用于发现 clone/value graph 不完整，而不是替代上面的动态 authority 检查。
+    if (result.status.ok()) begin
+      operation_status = clone_binding_snapshot(binding, binding_snapshot);
+      capture_pre_submit_status(operation_status, result);
+    end
     if (result.status.ok()) begin
       operation_status = clone_desc_snapshot(desc, desc_snapshot);
       capture_pre_submit_status(operation_status, result);
@@ -1505,7 +1654,8 @@ class rdma_doorbell_scheduler extends uvm_object;
     if (result.status.ok()) begin
       desc_snapshot.timeout = request_timeout;
       submit_locked(binding_snapshot, desc_snapshot, locked_function_uid,
-                    locked_object_id, deadline, observer, result);
+                    locked_object_id, locked_reset_epoch, deadline,
+                    observer, result);
     end
 
     // 这是取得 token 后的唯一出口；preflight、adapter、timeout 和 snapshot

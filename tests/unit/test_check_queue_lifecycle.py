@@ -3,6 +3,7 @@
 # 依赖与所有权：依赖 tools/check_queue_lifecycle.py 和仓库源码；测试临时目录由 unittest 管理并在用例结束释放。
 
 import importlib.util
+import hashlib
 from pathlib import Path
 import subprocess
 import unittest
@@ -143,28 +144,60 @@ class QueueLifecycleCheckerTest(unittest.TestCase):
     def test_frozen_abi_subprocess_failure_is_validation_error(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            with patch.object(CHECKER.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "git")):
-                with self.assertRaisesRegex(CHECKER.ValidationError, "frozen ABI"): CHECKER.validate_frozen_queue_abi(Path(d))
+            with self.assertRaisesRegex(CHECKER.ValidationError, "manifest"):
+                CHECKER.validate_frozen_queue_abi(Path(d))
 
     def test_modified_frozen_abi_fixture_is_rejected(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             root = copied_repo(Path(d))
-            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
-            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
-            subprocess.run(["git", "add", *[str(p) for p in CHECKER.FROZEN_ABI_CURRENT]], cwd=root, check=True)
-            subprocess.run(["git", "commit", "-m", "baseline"], cwd=root, check=True, capture_output=True)
+            manifest = root / "frozen_abi_manifest.txt"
+            rows = []
+            for relative in CHECKER.FROZEN_ABI_CURRENT:
+                path = root / relative
+                rows.append(
+                    f"{relative}\t{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+                )
+            manifest.write_text("".join(rows), encoding="utf-8")
             p = root / CHECKER.FROZEN_ABI_CURRENT[0]
             p.write_text(p.read_text() + "\n// unauthorized ABI change\n")
-            real_run = CHECKER.subprocess.run
-            def translated_run(args, **kwargs):
-                args = list(args)
-                if "a0abd95" in args:
-                    args[args.index("a0abd95")] = "HEAD"
-                return real_run(args, **kwargs)
-            with patch.object(CHECKER.subprocess, "run", side_effect=translated_run):
-                with self.assertRaises(CHECKER.ValidationError): CHECKER.validate_frozen_queue_abi(root)
+            with self.assertRaises(CHECKER.ValidationError):
+                CHECKER.validate_frozen_queue_abi(root, manifest)
+
+    def test_frozen_abi_manifest_accepts_exact_bytes_and_rejects_drift(self):
+        """
+        功能：确认 frozen ABI 校验以受版本控制的逐文件 SHA-256 manifest 为唯一
+        内容基线，不依赖临时仓库的 Git HEAD，并在任一字节漂移时 fail-closed。
+        输入输出及副作用：在临时目录创建四个 synthetic ABI 文件和 manifest，调用
+        CHECKER.validate_frozen_queue_abi；只读校验文件摘要，临时目录由 unittest 管理。
+        失败边界：manifest 缺行、摘要错误、文件缺失或文件内容改变都必须抛出
+        ValidationError，不能回退到旧的 Git commit 比较或静默接受修改。
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "frozen_abi_manifest.txt"
+            rows = []
+
+            for index, relative in enumerate(CHECKER.FROZEN_ABI_CURRENT):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"abi-{index}\n".encode("utf-8"))
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                rows.append(f"{relative}\t{digest}\n")
+
+            manifest.write_text(
+                "# path sha256\n" + "".join(rows),
+                encoding="utf-8",
+            )
+
+            CHECKER.validate_frozen_queue_abi(root, manifest)
+
+            drifted = root / CHECKER.FROZEN_ABI_CURRENT[0]
+            drifted.write_bytes(drifted.read_bytes() + b"drift\n")
+            with self.assertRaisesRegex(CHECKER.ValidationError, "frozen ABI"):
+                CHECKER.validate_frozen_queue_abi(root, manifest)
 
 
 if __name__ == "__main__":

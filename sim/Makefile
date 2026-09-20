@@ -20,7 +20,7 @@ ENGINE_PROCESS_LIST := rdma_cmq_engine_process.list
 CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
 
 # 功能：把一个 logical core test 转交给唯一 controller；普通 test 自映射，
-#   engine 按十五片展开，profile snapshot/recheck fixture 独占一片。
+#   engine 按十八片展开，base 后八项、profile-wide CQE 与 retention 前缀各自独占一片。
 # 输入输出及副作用：参数 1 是 logical UVM test，参数 2 是含 simv 的 build
 #   目录；写每片独立 log 并打印聚合状态。
 # 失败边界：controller 对参数、manifest、simulator 或 summary 任一失败返回
@@ -87,7 +87,7 @@ cmq_gate:
 	manifest=cmq_gate.list; \
 	[[ -r "$$manifest" ]] || { echo "CMQ gate manifest is missing" >&2; exit 2; }; \
 	mapfile -t cmq_tests < <(sed -e 's/[[:space:]]*#.*$$//' -e '/^[[:space:]]*$$/d' "$$manifest"); \
-	(( $${#cmq_tests[@]} == 6 )) || { echo "CMQ gate requires exactly six tests" >&2; exit 2; }; \
+	(( $${#cmq_tests[@]} == 11 )) || { echo "CMQ gate requires exactly eleven tests" >&2; exit 2; }; \
 	declare -A seen=(); \
 	for test_name in "$${cmq_tests[@]}"; do \
 		[[ "$$test_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]] || { echo "invalid CMQ test name" >&2; exit 2; }; \

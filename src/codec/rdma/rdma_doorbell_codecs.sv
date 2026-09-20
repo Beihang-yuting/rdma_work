@@ -830,9 +830,12 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，selected_mask 根据 opcode、对象类型或 profile 选择允许位掩码/有效 payload 范围，供保留位检查使用。
-  // 输入/输出及副作用：无显式参数；selected_mask 读取 对象字段：hffff_ffff_ffff_ffff 并使用字段 ；函数返回 bit [63:0]，不取得调用方资源所有权。
-  // 失败/边界：selected_mask 是只读访问器，返回 64'h0000_003f_0000_0000；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：selected_mask 根据 variant_name 返回对应门铃布局的字段所有权掩码，
+  //   供 encode、validate_image 和 decode 共同执行保留位检查。
+  // 输入/输出及副作用：无显式参数；函数只读取 variant_name，返回 bit [63:0]，
+  //   不写入 builder、image 或任何外部资源。
+  // 失败/边界：支持的 CMQ/SQ/RQ/SRQ/CQ/CEQ/AEQ/QP-control variant 返回驱动掩码；
+  //   未登记 variant 返回零，调用方应先由 supported_variant() 拒绝该 codec。
   protected function bit [63:0] selected_mask();
     case (variant_name)
       "cmq_sq":   return 64'h0000_003f_0000_0000;
@@ -840,9 +843,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
       "rq":       return 64'h0000_ffff_00ff_ffff;
       "srq_pi":   return 64'h4000_ffff_0000_ffff;
       "srq_limit":return 64'h8000_0000_ffff_ffff;
-      // cq.h:108-113 reserve the top two bits for explicit invalid markers;
-      // they are authored by the driver even when the corresponding cursor is
-      // not valid, so both CQ variants must include them in the selected mask.
+      // cq.h:108-113 define the top fields, including the two explicit invalid
+      // markers.  They are authored by the driver even when the corresponding
+      // cursor is not valid, so both CQ variants must include them in the mask.
       "cq_rc_ud": return 64'hff00_ffff_ffff_ffff;
       "cq_urc":   return 64'hffff_ffff_ffff_ffff;
       "ceq":      return 64'h0007_ffff_003f_ffff;
@@ -901,10 +904,12 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，put 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输入）；put 读取 builder、word_byte_offset、lsb、width、value 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：put 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：put 通过 qword builder 写入 doorbell image 的一个字段，并将字段 authorship 检查
+  //   结果转换为 doorbell codec status。
+  // 输入/输出及副作用：builder、word_byte_offset、lsb、width、value（输入）；成功时更新
+  //   builder 的 words/occupancy，不修改源 model 或外部 MMIO 资源。
+  // 失败/边界：builder 未初始化、字段越界、值宽度不符或与既有写入重叠时返回 CODEC_ERROR；
+  //   失败时不应发布部分 doorbell image。
   protected function rdma_status put(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -1005,9 +1010,12 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：encode_fields 按 variant_name 将具体门铃模型的字段写入单个 qword builder；
+  //   SQ variant 还会把驱动实际写入门铃窗口的 8B WQE header word0 原样复制到 byte 0..7。
+  // 输入/输出及副作用：model 为只读的 typed doorbell 输入，builder 为可变输出；
+  //   通过 put()/put_memcpy() 发布字段 ownership，不修改 model 或其 target handle。
+  // 失败/边界：variant 与 model 动态类型不匹配、builder 写入越界或后端返回错误时
+  //   立即返回对应 rdma_status；未完成字段不会被视为可提交的完整门铃。
   protected function rdma_status encode_fields(
     rdma_hw_model model,
     rdma_hw_qword_builder builder
@@ -1029,12 +1037,14 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     if (!status.ok()) return status;
     case (variant_name)
       "cmq_sq": begin
-        void'($cast(cmq, model));
+        if (!$cast(cmq, model))
+          return invalid_argument("cmq_sq codec requires CMQ doorbell model");
         `DB_PUT(RDMA_CMQ_DB_PI, cmq.pi)
         `DB_PUT(RDMA_CMQ_DB_POLARITY, cmq.polarity)
       end
       "sq": begin
-        void'($cast(sq, model));
+        if (!$cast(sq, model))
+          return invalid_argument("sq codec requires SQ doorbell model");
         header = new[RDMA_DB_BYTES];
         foreach (header[i]) header[i] = sq.sqe_header[i];
         status = builder.put_memcpy(0, header);
@@ -1042,14 +1052,16 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
           return codec_error({"SQ header authorship failed: ", status.message});
       end
       "rq": begin
-        void'($cast(rq, model));
+        if (!$cast(rq, model))
+          return invalid_argument("rq codec requires RQ doorbell model");
         `DB_PUT(RDMA_NOTIFY_RQ_PI_WRAP, rq.wrap)
         `DB_PUT(RDMA_NOTIFY_RQ_PI, rq.pi)
         `DB_PUT(RDMA_NOTIFY_RQ_ICOS, rq.icos)
         `DB_PUT(RDMA_NOTIFY_RQ_QPN, rq.qpn)
       end
       "srq_pi": begin
-        void'($cast(srq, model));
+        if (!$cast(srq, model))
+          return invalid_argument("srq_pi codec requires SRQ doorbell model");
         `DB_PUT(RDMA_NOTIFY_SRQ_LIMIT_INVALID,
                 RDMA_NOTIFY_SRQ_LIMIT_INVALID_VALUE)
         `DB_PUT(RDMA_NOTIFY_SRFQ_WRAP, srq.wrap)
@@ -1057,7 +1069,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
         `DB_PUT(RDMA_NOTIFY_SRFQN, srq.srqn)
       end
       "srq_limit": begin
-        void'($cast(srq, model));
+        if (!$cast(srq, model))
+          return invalid_argument(
+            "srq_limit codec requires SRQ doorbell model");
         `DB_PUT(RDMA_NOTIFY_SRQ_PI_INVALID,
                 RDMA_NOTIFY_SRQ_PI_INVALID_VALUE)
         `DB_PUT(RDMA_NOTIFY_SRQ_LIMIT, srq.limit)
@@ -1065,7 +1079,8 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
         `DB_PUT(RDMA_NOTIFY_SRFQN, srq.srqn)
       end
       "cq_rc_ud", "cq_urc": begin
-        void'($cast(cq, model));
+        if (!$cast(cq, model))
+          return invalid_argument("CQ codec requires CQ doorbell model");
         `DB_PUT(RDMA_NOTIFY_CQ_CI_INVALID, cq.ci_invalid)
         `DB_PUT(RDMA_NOTIFY_CQ_ARM_INVALID, cq.arm_invalid)
         `DB_PUT(RDMA_NOTIFY_CQ_ARM, cq.arm)
@@ -1087,19 +1102,23 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
         `DB_PUT(RDMA_NOTIFY_CQ_CQN, cq.cqn)
       end
       "ceq": begin
-        void'($cast(ceq, model));
+        if (!$cast(ceq, model))
+          return invalid_argument("ceq codec requires CEQ doorbell model");
         `DB_PUT(RDMA_NOTIFY_CEQ_CI_WRAP, ceq.wrap)
         `DB_PUT(RDMA_NOTIFY_CEQ_CI, ceq.ci)
         `DB_PUT(RDMA_NOTIFY_CEQ_CEQN, ceq.ceqn)
       end
       "aeq": begin
-        void'($cast(aeq, model));
+        if (!$cast(aeq, model))
+          return invalid_argument("aeq codec requires AEQ doorbell model");
         `DB_PUT(RDMA_NOTIFY_AEQ_CI_WRAP, aeq.wrap)
         `DB_PUT(RDMA_NOTIFY_AEQ_CI, aeq.ci)
         `DB_PUT(RDMA_NOTIFY_AEQ_AEQN, aeq.aeqn)
       end
       default: begin
-        void'($cast(qp, model));
+        if (!$cast(qp, model))
+          return invalid_argument(
+            "QP-control codec requires QP-control doorbell model");
         `DB_PUT(RDMA_NOTIFY_QP_DST_PORT, qp.dst_port)
         `DB_PUT(RDMA_NOTIFY_QP_SN, qp.qp_sn)
         `DB_PUT(RDMA_NOTIFY_QP_DB_TYPE, expected_db_type())
@@ -1169,9 +1188,12 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_image 校验 image 与当前对象状态的一致性，并显式处理“rdma doorbell codec variant is unsupported”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：image（输入）；validate_image 读取 image 并使用字段 payload、builder、status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：validate_image 校验门铃 image 的 variant、8B 长度、BAR 目标、generation、
+  //   endian/版本元数据，并重新反序列化后核对 selected_mask。
+  // 输入/输出及副作用：image 为只读输入；函数只创建临时 payload、builder、words，
+  //   返回 rdma_status，不修改 image、codec variant 或任何门铃游标。
+  // 失败/边界：variant 不支持、image 为空/非 8B、generation 为零、目标或元数据错误、
+  //   反序列化失败、qword 含非掩码位（含 X/Z）时返回对应错误；成功才允许 decode 使用。
   virtual function rdma_status validate_image(rdma_hw_image image);
     rdma_hw_qword_builder builder;
     byte unsigned payload[];
@@ -1203,7 +1225,8 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     status = builder.deserialize(payload);
     if (!status.ok()) return codec_error(status.message);
     builder.get_words(words);
-    if (words.size() != 1 || (words[0] & ~selected_mask()) != 0)
+    if (words.size() != 1 ||
+        !rdma_raw_qword_mask_is_valid(words[0], selected_mask()))
       return codec_error("doorbell image contains a selected-variant reserved bit");
     return rdma_status::success();
   endfunction

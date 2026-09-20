@@ -169,6 +169,55 @@ class rdma_qword_codec_test extends uvm_test;
     end
   endfunction
 
+  // 功能：在 rdma_qword_codec_test 中，check_four_state_raw_mask_contract 验证
+  //       QPC、通用 qword、CMQ、queue 和 doorbell 共用的原始 ownership 掩码门禁。
+  // 输入/输出及副作用：无显式输入；构造四态 raw qword 与驱动来源 mask，调用
+  //       rdma_raw_qword_mask_is_valid 并产生 UVM 断言，不修改任何生产对象。
+  // 失败/边界：已知且完全被允许的位必须通过；raw word、allowed mask 含任意 X/Z，
+  //       或 raw word 置出 mask 的位必须 fail-closed，不能把未知值当作零。
+  function automatic void check_four_state_raw_mask_contract();
+    string labels[5];
+    logic [63:0] allowed_masks[5];
+    logic [63:0] raw_word;
+
+    labels = '{"QPC", "QWORD", "CMQ", "QUEUE", "DOORBELL"};
+    allowed_masks = '{
+      64'h007f_007f_0000_ffff,
+      64'hefff_ffff_ffff_ffff,
+      64'h0000_00ff_ffff_ffff,
+      64'h0000_0000_0000_ffff,
+      64'h8000_3fff_ff00_0000
+    };
+
+    foreach (labels[index]) begin
+      raw_word = allowed_masks[index];
+      if (!rdma_raw_qword_mask_is_valid(raw_word, allowed_masks[index]))
+        `uvm_error("RAW_MASK_KNOWN",
+                   $sformatf("%s known ownership word was rejected",
+                             labels[index]))
+
+      raw_word = allowed_masks[index];
+      raw_word[0] = 1'bx;
+      if (rdma_raw_qword_mask_is_valid(raw_word, allowed_masks[index]))
+        `uvm_error("RAW_MASK_X",
+                   $sformatf("%s X bit was accepted by ownership check",
+                             labels[index]))
+
+      raw_word = allowed_masks[index];
+      raw_word[1] = 1'bz;
+      if (rdma_raw_qword_mask_is_valid(raw_word, allowed_masks[index]))
+        `uvm_error("RAW_MASK_Z",
+                   $sformatf("%s Z bit was accepted by ownership check",
+                             labels[index]))
+    end
+
+    raw_word = '0;
+    allowed_masks[0] = 'x;
+    if (rdma_raw_qword_mask_is_valid(raw_word, allowed_masks[0]))
+      `uvm_error("RAW_MASK_UNKNOWN_MASK",
+                 "unknown ownership mask was accepted")
+  endfunction
+
   // 功能：在 rdma_qword_codec_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -611,6 +660,7 @@ class rdma_qword_codec_test extends uvm_test;
     end
 
     check_supported_masks();
+    check_four_state_raw_mask_contract();
 
     // Body validation is exact-size, rejects non-body bits, and never mutates
     // words or occupancy on either codec or dispatch errors.

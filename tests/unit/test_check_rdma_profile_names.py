@@ -1491,6 +1491,27 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         self.assertEqual(constants["RDMA_OP"], 0x35)
         self.assertEqual(constants["RDMA_WINDOW"], 0x2000)
 
+    def test_symbolic_constant_expression_is_resolved(self) -> None:
+        """
+        功能：确认 SV localparam 可以由已声明或后声明的 RDMA 常量通过受限
+        加法表达式构成，覆盖 CQC shadow 的绝对偏移来源链。
+        输入输出及副作用：在内存中的 synthetic SV 文本上调用
+        CHECKER.parse_sv_constants，并读取返回的常量字典；不访问或修改仓库文件。
+        失败边界：表达式必须解析为精确整数，符号引用和加法顺序不能被当作
+        字符串或默认零值；未知符号、循环引用仍应由解析器拒绝。
+        """
+        constants = CHECKER.parse_sv_constants(
+            """
+localparam int unsigned RDMA_BASE = 48;
+localparam int unsigned RDMA_DELTA = 4;
+localparam int unsigned RDMA_ABSOLUTE = RDMA_BASE + RDMA_DELTA;
+localparam int unsigned RDMA_FORWARD = RDMA_LATER + 2;
+localparam int unsigned RDMA_LATER = 6;
+"""
+        )
+        self.assertEqual(constants["RDMA_ABSOLUTE"], 52)
+        self.assertEqual(constants["RDMA_FORWARD"], 8)
+
     def test_global_mapping_uniqueness_is_enforced(self) -> None:
         """
         功能：在 SvDefinitionTest 测试类中确认全局 field/value/reference
@@ -2030,6 +2051,16 @@ class Task11DefinitionTest(unittest.TestCase):
         ),
         "RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP": (
             0x00000000001FFFFF, 0, 0, 0, 0, 0, 0, 0,
+        ),
+        "RDMA_CQC_DELETE_BODY_OWNERSHIP": (
+            0x00000000001FFFFF,
+            0xFF0FFFFFFFFFFFFF,
+            0xFFFFFFFFFFFFF8FF,
+            0xFFFFFFFFFFF8C701,
+            0xF000000000FFFFFF,
+            0x0000000000000FFF,
+            0xFFFFFFFFFFFFFFC0,
+            0x0000000F00FFFFFF,
         ),
         "RDMA_EQ_OBJECT_ID_BODY_OWNERSHIP": (
             0x0000000000000FFF, 0, 0, 0, 0, 0, 0, 0,
@@ -4107,15 +4138,15 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(masks["RDMA_SQ_WQE_HEADER_MASK"][0], 0xEFFFFFFFFFFFFFFF)
         self.assertEqual(
             masks["RDMA_SQ_WQE_RC_BODY_MASK"],
-            (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF,
+            (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF,
              0xFFFFFFFFFFFFFE00, 0, 0, 0),
         )
         self.assertEqual(
-            masks["RDMA_SQ_WQE_UD_BODY_MASK"][1], 0xFFFFFFFFFEFFFFFF,
+            masks["RDMA_SQ_WQE_UD_BODY_MASK"][1], 0xFFFFFFFFFDFFFFFF,
         )
         self.assertEqual(
             masks["RDMA_SQ_WQE_ATOMIC_BODY_MASK"],
-            (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF,
+            (0, 0xFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF,
              0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
              0xFFFFFFFFFFFFFFFF),
         )
@@ -4185,7 +4216,7 @@ class ReferenceEncodingTest(unittest.TestCase):
                     "remote_va=0x0123456789abcdef",
                 "rqe_boundary":
                     "qpn=0xabcde,index=0x3456,payload=0x10203040,"
-                    "qp_sn=0x5a,opcode=9,wrap=1,valid=1,signature=0x96,"
+                    "qp_sn=0x5a,opcode=9,wrap=1,sign_en=0,valid=1,signature=0x96,"
                     "sge_num=2,sgb_pa_encoded=0x123456789abcde",
                 "cqe_error":
                     "qpn=0x2aaaa,index=0x4567,ecode=0xf4,"

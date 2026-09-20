@@ -585,20 +585,15 @@ class rdma_sqe_model extends rdma_hw_model;
     end
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“SQE requires a QP handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、opcode、qp_h、qp_h.kind、transport、inline_data、sges、length 并使用字段 rdma_status、opcode、qp_h、qp_h.kind、transport、inline_data、sges、length；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_UNSUPPORTED_OPCODE；典型拒绝条件为“SQE requires a QP handle”“SQE opcode is unsupported for transport”；失败路径不提交部分状态或转移未声明资源。
-  virtual function rdma_status validate();
-    rdma_sqe_rc_ext rc_ext;
-    rdma_sqe_ud_ext ud_ext;
-    rdma_sqe_urc_ext urc_ext;
-
-    if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SQE requires a QP handle");
-    if (!rdma_send_opcode_valid_for_transport(transport, opcode))
-      return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                               "SQE opcode is unsupported for transport");
+  // 功能：validate_payload_shape 根据 wr.c 的发包规则校验本地 payload
+  //       形状，统一处理 local invalidate、atomic、RDMA READ 和普通 SEND/
+  //       WRITE 的 SGE 约束。
+  // 输入/输出及副作用：无显式参数；读取 opcode、inline_data、payload 和
+  //       sges，返回 rdma_status，不修改 SGE、请求对象或外部资源所有权。
+  // 失败/边界：拒绝 atomic 非单个 8-byte SGE、RDMA READ 无非零 SGE、local
+  //       invalidate 携带数据及 null SGE；普通非原子操作允许 inline 空
+  //       payload、num_sge=0 或全零长度 SGE 列表，以匹配驱动过滤语义。
+  protected function rdma_status validate_payload_shape();
     if (opcode == RDMA_WR_LOCAL_INVALIDATE) begin
       if (inline_data || sges.size() != 0 || payload.size() != 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -614,9 +609,8 @@ class rdma_sqe_model extends rdma_hw_model;
                                  "atomic SQE requires one 8-byte SGE");
       if ((sges[0].iova.value & 64'h7) != 0)
         return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "atomic SQE local address is not 8-byte aligned"
-        );
+            RDMA_SC_INVALID_ARGUMENT,
+            "atomic SQE local address is not 8-byte aligned");
     end
     else if (opcode == RDMA_WR_RDMA_READ) begin
       if (inline_data || payload.size() != 0 || sges.size() == 0)
@@ -624,23 +618,49 @@ class rdma_sqe_model extends rdma_hw_model;
                                  "RDMA read SQE shape is invalid");
       foreach (sges[i]) begin
         if (sges[i] == null || sges[i].length == 0)
-          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                   "read SQE SGE is null or has zero length");
+          return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "read SQE SGE is null or has zero length");
       end
     end
     else begin
-      if (!inline_data && sges.size() == 0)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "non-inline SQE has no SGE");
-      if (inline_data && payload.size() == 0)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "inline SQE has no payload");
+      // wr.c treats num_sge==0 and lists containing only zero-length SGEs as
+      // a valid zero-payload WQE. The codec filters those entries before
+      // selecting the wire layout; only null handles remain malformed.  The
+      // same rule applies to IB_SEND_INLINE with payload_len==0: the driver
+      // still publishes a legal inline-marked WQE.
       foreach (sges[i]) begin
-        if (sges[i] == null || sges[i].length == 0)
+        if (sges[i] == null)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                   "SQE SGE is null or has zero length");
+                                   "SQE SGE handle is null");
       end
     end
+
+    return rdma_status::success();
+  endfunction
+
+  // 功能：validate 校验 SQE 模型的句柄、transport、opcode、payload 和 SGE
+  //   形状，确认它可以进入对应的硬件编码器。
+  // 输入/输出及副作用：无显式参数；只读 opcode、qp_h、transport、inline_data、
+  //   payload、sges 和 transport_ext，返回 rdma_status，不取得句柄、队列或 DMA 所有权。
+  // 失败/边界：QP/transport extension 缺失、opcode 不适配、null SGE 或 READ/atomic
+  //   形状非法时返回 INVALID_ARGUMENT/UNSUPPORTED_OPCODE；普通 SEND/WRITE 的零
+  //   SGE、零长度 SGE 和 zero-byte inline 按驱动规则允许，失败不提交部分状态。
+  virtual function rdma_status validate();
+    rdma_sqe_rc_ext rc_ext;
+    rdma_sqe_ud_ext ud_ext;
+    rdma_sqe_urc_ext urc_ext;
+    rdma_status shape_status;
+
+    if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "SQE requires a QP handle");
+    if (!rdma_send_opcode_valid_for_transport(transport, opcode))
+      return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                               "SQE opcode is unsupported for transport");
+    shape_status = validate_payload_shape();
+    if (!shape_status.ok())
+      return shape_status;
     if (transport_ext == null || transport_ext.transport_kind() != transport)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SQE transport extension does not match");
@@ -722,19 +742,19 @@ class rdma_rqe_model extends rdma_hw_model;
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“RQE requires a QP or SRQ handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、target_h、target_h.kind、sges、length 并使用字段 rdma_status、target_h、target_h.kind、sges、length；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“RQE requires a QP or SRQ handle”“RQE has no SGE”；失败路径不提交部分状态或转移未声明资源。
+  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为
+  // “RQE requires a QP or SRQ handle”或 SGE 句柄为空。驱动允许 num_sge=0，
+  // 因而 sges 为空表示合法的空 payload RQE；若调用方显式放入 SGE，则每个
+  // 元素仍必须为非空句柄，零长度元素交由 codec 按 wr.c 规则过滤。
   virtual function rdma_status validate();
     if (target_h == null ||
         !(target_h.kind inside {RDMA_RESOURCE_QP, RDMA_RESOURCE_SRQ}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "RQE requires a QP or SRQ handle");
-    if (sges.size() == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "RQE has no SGE");
     foreach (sges[i]) begin
-      if (sges[i] == null || sges[i].length == 0)
+      if (sges[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "RQE SGE is null or has zero length");
+                                 "RQE SGE handle is null");
     end
     return rdma_status::success();
   endfunction

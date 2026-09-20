@@ -53,26 +53,14 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：比较两个 observed result 中 detached handle 的公开 immutable 值，
-  //   供 adapter 在 source graph 已分离时校验 Function/CMQ/资源 authority。
-  // 输入/输出及副作用：lhs/rhs 为只读句柄；比较 kind、Function UID、object ID
-  //   和 generation，返回 bit，不修改任何输入或 adapter 状态。
-  // 失败/边界：任一句柄为空或字段含 X/Z 时返回 0；值相等不代表两个节点应当
-  //   共享 alias，调用方必须另行检查结果图的 alias topology。
+  // 功能：保留 adapter 的 protected detached-handle 比较 seam，转发到 CMQ 共享值契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 handle；返回 kind、Function UID、object ID 与 generation 比较结果，不修改 adapter。
+  // 失败/边界：null 或任一字段含 X/Z 时共享契约返回 0；转发不推断 observed graph 的 alias topology。
   protected function bit same_handle_value(
     input rdma_handle lhs,
     input rdma_handle rhs
   );
-    if (lhs == null || rhs == null || $isunknown(lhs.kind) ||
-        $isunknown(rhs.kind) || $isunknown(lhs.function_uid) ||
-        $isunknown(rhs.function_uid) || $isunknown(lhs.object_id) ||
-        $isunknown(rhs.object_id) || $isunknown(lhs.generation) ||
-        $isunknown(rhs.generation))
-      return 1'b0;
-    return lhs.kind === rhs.kind &&
-           lhs.function_uid === rhs.function_uid &&
-           lhs.object_id === rhs.object_id &&
-           lhs.generation === rhs.generation;
+    return rdma_cmq_same_handle_value(lhs, rhs);
   endfunction
 
   // 功能：比较两个 detached ticket 的完整公开值，确认 completion 与 operation
@@ -101,29 +89,14 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
            lhs.absolute_deadline == rhs.absolute_deadline;
   endfunction
 
-  // 功能：比较 operation 与 completion 的完整 detached status 值，确保硬件码、
-  //   Function/command 诊断字段及消息在 alias 节点间保持一致。
-  // 输入/输出及副作用：lhs/rhs 为只读 status；返回逐字段值相等 bit，不复制或修改节点。
-  // 失败/边界：任一 status 为空、runtime subtype 不受支持或枚举 shape 非法时返回 0；
-  //   对象 alias 由调用方另行验证。
+  // 功能：保留 adapter 的 protected status 比较 seam，委托 CMQ 共享契约检查完整诊断值。
+  // 输入/输出及副作用：lhs/rhs 为只读 status；返回 shape 与全部现有字段的比较结果，不修改 adapter 或 status。
+  // 失败/边界：null、不支持 subtype 或非法 required-status shape 返回 0；对象 alias 仍由 observed-result 边界检查。
   protected function bit same_status_value(
     input rdma_status lhs,
     input rdma_status rhs
   );
-    if (lhs == null || rhs == null ||
-        !rdma_cmq_status_shape_valid(lhs) ||
-        !rdma_cmq_status_shape_valid(rhs))
-      return 1'b0;
-    return lhs.category === rhs.category && lhs.code === rhs.code &&
-           lhs.hardware_code === rhs.hardware_code &&
-           lhs.hardware_code_valid === rhs.hardware_code_valid &&
-           lhs.source_engine === rhs.source_engine &&
-           lhs.function_uid === rhs.function_uid &&
-           lhs.generation === rhs.generation &&
-           lhs.resource_id === rhs.resource_id &&
-           lhs.command_id === rhs.command_id && lhs.wr_id === rhs.wr_id &&
-           lhs.severity === rhs.severity && lhs.retryable === rhs.retryable &&
-           lhs.message == rhs.message;
+    return rdma_cmq_same_status_value(lhs, rhs);
   endfunction
 
   // 功能：检查 observed envelope 中 command identity 的标量字段是否构成可追踪的

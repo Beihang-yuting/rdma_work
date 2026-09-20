@@ -17,6 +17,113 @@ class rdma_test_slot_token extends rdma_queue_slot_token_contract;
   endfunction
 endclass
 
+// 功能：构造返回 null 状态的 backing slice，覆盖 queue backing spec 的嵌套校验边界。
+// 输入/输出及副作用：name（输入）；new 只初始化本地 slice 字段；validate() 不修改
+//       mapping 或 role，而是返回 null 状态句柄。
+// 失败/边界：null 是刻意注入的 contract violation；spec validator 必须 fail-closed，
+//       不得继续解引用 status.ok() 或发布 backing 计划。
+class rdma_null_queue_slice_status extends rdma_queue_backing_slice;
+  `uvm_object_utils(rdma_null_queue_slice_status)
+
+  // 功能：创建 null-status backing slice fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管 DMA mapping 或 queue 资源所有权。
+  // 失败/边界：构造成功不代表 slice 有效；本 fixture 的 validate() 始终返回 null。
+  function new(string name = "rdma_null_queue_slice_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 backing slice validator 丢失 rdma_status，验证上层 spec 归一化错误。
+  // 输入/输出及副作用：无显式输入；不修改 slice 字段，返回 null 状态句柄。
+  // 失败/边界：调用方不得直接调用 null.ok()；预期结果为 INVALID_STATE。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 QP ring layout，覆盖 QP backing plan 的第一层嵌套校验。
+// 输入/输出及副作用：name（输入）；new 只初始化本地 ring 字段；validate() 返回 null。
+// 失败/边界：该 fixture 不改变 QP WQE 的 64B/4KiB 几何定义，仅注入状态契约故障。
+class rdma_null_qp_ring_status extends rdma_qp_ring_layout;
+  `uvm_object_utils(rdma_null_qp_ring_status)
+
+  // 功能：创建 null-status QP ring fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管 SQ/RQ backing 或 context 资源。
+  // 失败/边界：构造成功不代表 ring 可发布；validate() 始终返回 null。
+  function new(string name = "rdma_null_qp_ring_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 QP ring validator 丢失状态，验证 plan validator 的 fail-closed 行为。
+  // 输入/输出及副作用：无显式输入；不修改 ring 几何字段，返回 null。
+  // 失败/边界：null 结果必须转换为 INVALID_STATE，不能继续访问 ring status。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 slot-token contract，覆盖 context backing authority 边界。
+// 输入/输出及副作用：name（输入）；new 只初始化 token 字段；validate() 返回 null。
+// 失败/边界：该 fixture 不伪造 completion authority，调用方必须把 null 当作确定失败。
+class rdma_null_queue_token_status extends rdma_queue_slot_token_contract;
+  `uvm_object_utils(rdma_null_queue_token_status)
+
+  // 功能：创建 null-status slot-token fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管 context slot 或 HMC lease 所有权。
+  // 失败/边界：构造成功不代表 token authority 有效；validate() 始终返回 null。
+  function new(string name = "rdma_null_queue_token_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 token validator 丢失状态，验证 context backing ref 不解引用空句柄。
+  // 输入/输出及副作用：无显式输入；不修改 completion_authority，返回 null。
+  // 失败/边界：null 结果预期归一化为 INVALID_STATE。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 backing ref，覆盖 flush target 的 PD 引用边界。
+// 输入/输出及副作用：name（输入）；new 只初始化本地 backing ref；validate() 返回 null。
+// 失败/边界：该 fixture 不释放 mapping；flush target 必须在提交前拒绝它。
+class rdma_null_flush_ref_status extends rdma_queue_backing_ref;
+  `uvm_object_utils(rdma_null_flush_ref_status)
+
+  // 功能：创建 null-status flush backing ref fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管 PD mapping 或 flush 生命周期。
+  // 失败/边界：构造成功不代表 PD backing 可用；validate() 始终返回 null。
+  function new(string name = "rdma_null_flush_ref_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 PD backing validator 丢失状态，验证 flush target fail-closed。
+  // 输入/输出及副作用：无显式输入；不修改 backing 字段，返回 null。
+  // 失败/边界：调用方不得继续调用 status.ok()；预期返回 INVALID_STATE。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 preflight backing spec，覆盖提交前配置边界。
+// 输入/输出及副作用：name（输入）；new 只初始化本地 spec 字段；validate() 返回 null。
+// 失败/边界：该 fixture 不改变 depth/CQE size 或驱动 layout；preflight 必须拒绝发布。
+class rdma_null_preflight_spec_status extends rdma_queue_backing_spec;
+  `uvm_object_utils(rdma_null_preflight_spec_status)
+
+  // 功能：创建 null-status preflight spec fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管 backing slice 或 queue 资源所有权。
+  // 失败/边界：构造成功不代表 spec 可用于提交；validate() 始终返回 null。
+  function new(string name = "rdma_null_preflight_spec_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 preflight spec validator 丢失状态，验证上层归一化错误。
+  // 输入/输出及副作用：无显式输入；不修改 spec 字段，返回 null。
+  // 失败/边界：null 结果必须转换为 INVALID_STATE。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
 class rdma_queue_lifecycle_models_test extends uvm_test;
   `uvm_component_utils(rdma_queue_lifecycle_models_test)
 
@@ -135,6 +242,7 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     context_ref.hmc_ref.object_kind = RDMA_RESOURCE_MR;
     context_ref.hmc_ref.size = 512;
     context_ref.hmc_ref.first_pbl_index = 1;
+    context_ref.hmc_ref.index_valid = 1'b1;
     context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     context_ref.shadow_pointer_base.value = 64'h8000_0000;
     context_ref.slot_length = 512;
@@ -171,6 +279,11 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     rdma_queue_opaque_slot_token token, cloned_token;
     rdma_test_slot_token adapter_token;
     rdma_queue_preflight preflight;
+    rdma_null_queue_slice_status null_slice;
+    rdma_null_qp_ring_status null_qp_ring;
+    rdma_null_queue_token_status null_token;
+    rdma_null_flush_ref_status null_flush_ref;
+    rdma_null_preflight_spec_status null_preflight_spec;
     rdma_cq cq, cq_clone;
     rdma_srq srq, srq_clone;
     rdma_ceq ceq, ceq_clone;
@@ -178,6 +291,97 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     uvm_object cloned;
 
     phase.raise_objection(this);
+
+    // 嵌套 validator 返回 null 时，所有上层模型都必须返回确定的
+    // INVALID_STATE，而不是解引用空 status 或发布半成品 authority。
+    spec = rdma_queue_backing_spec::type_id::create(
+      "null_nested_slice_spec"
+    );
+    spec.mode = RDMA_QUEUE_BACKING_BORROWED;
+    null_slice = rdma_null_queue_slice_status::type_id::create(
+      "null_nested_slice"
+    );
+    null_slice.role = RDMA_QUEUE_ROLE_CQ_RING;
+    spec.slices.push_back(null_slice);
+    expect_status(
+      "NULL_NESTED_SLICE_STATUS",
+      spec.validate(),
+      RDMA_SC_INVALID_STATE
+    );
+
+    qp_plan = rdma_qp_backing_plan::type_id::create(
+      "null_nested_qp_ring_plan"
+    );
+    qp_plan.transport = RDMA_TRANSPORT_RC;
+    qp_plan.sq_depth = 128;
+    qp_plan.rq_depth = 128;
+    null_qp_ring = rdma_null_qp_ring_status::type_id::create(
+      "null_nested_qp_ring"
+    );
+    qp_plan.sq_ring = null_qp_ring;
+    qp_plan.sq_ref = rdma_qp_backing_ref::type_id::create(
+      "null_nested_qp_sq_ref"
+    );
+    qp_plan.sq_pd_ref = rdma_qp_backing_ref::type_id::create(
+      "null_nested_qp_sq_pd_ref"
+    );
+    expect_status(
+      "NULL_NESTED_QP_RING_STATUS",
+      qp_plan.validate(),
+      RDMA_SC_INVALID_STATE
+    );
+
+    ctx = rdma_context_backing_ref::type_id::create(
+      "null_nested_context_ref"
+    );
+    ctx.owner = rdma_function_handle::type_id::create(
+      "null_nested_context_owner"
+    );
+    ctx.owner.kind = RDMA_RESOURCE_FUNCTION;
+    ctx.resource_kind = RDMA_RESOURCE_QP;
+    null_token = rdma_null_queue_token_status::type_id::create(
+      "null_nested_context_token"
+    );
+    ctx.slot_token = null_token;
+    ctx.hmc_ref = rdma_hmc_ref::type_id::create(
+      "null_nested_context_hmc"
+    );
+    expect_status(
+      "NULL_NESTED_CONTEXT_TOKEN_STATUS",
+      ctx.validate(),
+      RDMA_SC_INVALID_STATE
+    );
+
+    ft = rdma_queue_flush_target::type_id::create(
+      "null_nested_flush_target"
+    );
+    ft.role = RDMA_QUEUE_ROLE_CQ_PD;
+    null_flush_ref = rdma_null_flush_ref_status::type_id::create(
+      "null_nested_flush_ref"
+    );
+    null_flush_ref.role = RDMA_QUEUE_ROLE_CQ_PD;
+    ft.pd_ref = null_flush_ref;
+    expect_status(
+      "NULL_NESTED_FLUSH_REF_STATUS",
+      ft.validate(),
+      RDMA_SC_INVALID_STATE
+    );
+
+    preflight = rdma_queue_preflight::type_id::create(
+      "null_nested_preflight"
+    );
+    preflight.resource_kind = RDMA_RESOURCE_CQ;
+    preflight.depth = 128;
+    preflight.cqe_size_bytes = 64;
+    null_preflight_spec = rdma_null_preflight_spec_status::type_id::create(
+      "null_nested_preflight_spec"
+    );
+    preflight.backing_spec = null_preflight_spec;
+    expect_status(
+      "NULL_NESTED_PREFLIGHT_SPEC_STATUS",
+      preflight.validate(),
+      RDMA_SC_INVALID_STATE
+    );
 
     if (RDMA_QUEUE_ROLE_CQ_RING != 4'd0 ||
         RDMA_QUEUE_ROLE_SRQ_RING != 4'd1 ||
@@ -542,6 +746,7 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     hmc.object_kind = RDMA_RESOURCE_MR;
     hmc.size = 4096;
     hmc.first_pbl_index = 1;
+    hmc.index_valid = 1'b1;
     plan.rings.push_back(layout);
     plan.refs.push_back(ring_ref);
     plan.refs.push_back(pd);

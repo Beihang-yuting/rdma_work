@@ -11,7 +11,7 @@
 | --- | --- | --- | --- |
 | Python 静态 | `python3 tools/check_rdma_profile_names.py` | 无 | profile、0.1.34 manifest 和 golden 约束通过 |
 | Python 单元 | `python3 -m unittest discover -s tests/unit -p 'test_*.py'` | 无 | 所有用例 `OK` |
-| 定义基线 | `scripts/run_vcs53.sh rdma_defs rdma_defs_test` | VCS53 | `rdma definitions: PASS` |
+| 定义基线 | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test` | VCS53 | `rdma definitions: PASS` 与 CMQ oracle/field ownership PASS |
 | core | `scripts/run_vcs53.sh core regression` | VCS53 | 编译并运行所有 core tests，UVM `warning=0 error=0 fatal=0` |
 | dpu_common integration | `DPU_COMMON_ROOT=/path/to/dpu_common scripts/run_vcs53.sh integration regression` | dpu_common snapshot | route、PF/VF、reset 和 context tests 全通过 |
 | host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | 历史记录：host_mem commit `365b7553fc7dac6b4ad55886a8e4869153607c28`（已被当前锁定记录 superseded） | UMEM/PBL/MW、queue backing 和 release 无泄漏 |

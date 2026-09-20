@@ -58,6 +58,18 @@ class rdma_resource_manager extends uvm_object;
                         RDMA_RESOURCE_AEQ};
   endfunction
 
+  // 功能：lifecycle_queue_kind 集中判定哪些资源由 queue backing plan
+  //   参与 QUIESCING/ERROR 生命周期恢复，供进度、恢复和错误发布分派共用同一分类。
+  // 输入/输出及副作用：kind 为资源类型输入；函数只读取枚举并返回 bit，不修改
+  //   registry、recovery、状态或外部 backing，也不取得任何资源所有权。
+  // 失败/边界：仅 CQ、SRQ、CEQ、AEQ 返回 1；FUNCTION、PD、MR、QP、CMQ 以及
+  //   未定义枚举值均返回 0。该分类比 valid_kind 的“可登记资源”范围更窄，不能替代
+  //   kind 合法性校验或资源存在性校验。
+  protected function bit lifecycle_queue_kind(rdma_resource_kind_e kind);
+    return kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
+                        RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ};
+  endfunction
+
   // 功能：在 rdma_resource_manager 中，local_id_limit 根据资源 kind 返回 Function 内可分配 local ID 的上限，供容量和越界检查使用。
   // 输入/输出及副作用：kind（输入）；local_id_limit 读取 kind 并使用字段 ；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：local_id_limit 按 case(kind) 的固定映射计算 int unsigned（RDMA_RESOURCE_PD→16'hffff；RDMA_RESOURCE_MR→24'hff_ffff；RDMA_RESOURCE_CQ→21'h1f_ffff；RDMA_RESOURCE_QP→21'h1f_ffff；其余 case 分支按源码继续映射；default→32'hffff_ffff）；未列出的输入走 default，不修改运行时账本。
@@ -276,19 +288,43 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_resource_manager 中由 same_mapping_handle_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_mapping_handle_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：same_mapping_handle_value 为 mapping/HMC 值比较提供 nullable handle
+  //       identity seam，并转发到 resource manager 的 canonical handle 比较。
+  // 输入/输出及副作用：lhs、rhs（输入）是非拥有 handle 引用；只读取 kind、
+  //       function_uid、object_id、generation，返回 bit，不修改 handle、mapping、
+  //       runtime、账本或外部 adapter，也不取得任何资源所有权。
+  // 失败/边界：lhs 与 rhs 同为 null 返回 1；仅一侧为 null 返回 0；两侧非空时
+  //       四个字段任一 `==` 不等返回 0。该 seam 不执行 $isunknown，也不判断
+  //       authority、对象 alias 或 generation 新鲜度，调用方须保留自己的门禁。
   protected function bit same_mapping_handle_value(
     rdma_handle lhs,
     rdma_handle rhs
   );
+    return same_handle_instance(lhs, rhs);
+  endfunction
+
+  // 功能：same_hmc_ref_value 比较两个 HMC reference 的 owner、对象类型、地址、大小、
+  //       PBLE index 元数据、所有权和释放完成标志，形成跨 queue/context 比较共用的值契约。
+  // 输入/输出及副作用：lhs、rhs（输入 HMC reference）；函数只读 owner、object_kind、address、
+  //       size、first_pbl_index、index_valid、ownership 和 release_complete，返回 bit，
+  //       不修改 reference、mapping state、账本或外部资源。
+  // 失败/边界：任一 reference 为空时按值比较规则返回 lhs==rhs；owner 为空时交给
+  //       same_mapping_handle_value 保持原 null/null 相等语义；该 helper 不比较 mapping state，
+  //       调用方仍须在使用前完成各自的 null、slot-token、completion-authority 和 release 前置校验。
+  protected function bit same_hmc_ref_value(
+    rdma_hmc_ref lhs,
+    rdma_hmc_ref rhs
+  );
     if (lhs == null || rhs == null)
-      return lhs == null && rhs == null;
-    return lhs.kind == rhs.kind &&
-           lhs.function_uid == rhs.function_uid &&
-           lhs.object_id == rhs.object_id &&
-           lhs.generation == rhs.generation;
+      return lhs == rhs;
+    return same_mapping_handle_value(lhs.owner, rhs.owner) &&
+           lhs.object_kind == rhs.object_kind &&
+           lhs.address.value == rhs.address.value &&
+           lhs.size == rhs.size &&
+           lhs.first_pbl_index == rhs.first_pbl_index &&
+           lhs.index_valid == rhs.index_valid &&
+           lhs.ownership == rhs.ownership &&
+           lhs.release_complete == rhs.release_complete;
   endfunction
 
   // 功能：在 rdma_resource_manager 中比较释放 authority 的全部值字段，包括
@@ -324,9 +360,13 @@ class rdma_resource_manager extends uvm_object;
            same_mapping_handle_value(lhs.owner_h, rhs.owner_h);
   endfunction
 
-  // 功能：在 rdma_resource_manager 中由 same_mapping_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_mapping_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：same_mapping_value 在完整 release-authority 值相等的基础上继续比较
+  //   mapping.state，供需要精确区分 ACTIVE/RELEASED 的 registry 快照校验使用。
+  // 输入/输出及副作用：lhs、rhs（输入）为只读 mapping 引用；函数比较 Function/owner、
+  //   requester/DMA、route/epoch、address/IOVA/size/direction/permissions 和 state，返回 bit，
+  //   不更新 manager 账本、mapping 或外部 adapter。
+  // 失败/边界：两侧同时为 null 时返回 1，只有一侧为 null 或任一 authority/state 字段
+  //   不一致时返回 0；动态 subtype 不参与相等判定，也不会触发隐式投影或完成查询。
   protected function bit same_mapping_value(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -342,9 +382,13 @@ class rdma_resource_manager extends uvm_object;
   // resource and recovery projections can therefore legitimately differ
   // (ACTIVE versus RELEASED) even though all authority-bearing values remain
   // identical.  Completion is checked through the adapter query separately.
-  // 功能：在 rdma_resource_manager 中由 same_recovery_mapping_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_recovery_mapping_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：same_recovery_mapping_value 比较 recovery projection 的完整 release authority，
+  //   但刻意忽略公开 state；opaque release completion 由 adapter query 另行证明。
+  // 输入/输出及副作用：lhs、rhs（输入）为只读 mapping 引用；函数比较 Function/owner、
+  //   requester/DMA、route/epoch、address/IOVA/size/direction/permissions，返回 bit，不修改
+  //   manager、mapping 或外部完成状态。
+  // 失败/边界：两侧同时为 null 时返回 1，只有一侧为 null 或任一 authority 字段不一致时
+  //   返回 0；ACTIVE/RELEASED 不同本身不构成失败，调用方必须继续查询 opaque completion。
   protected function bit same_recovery_mapping_value(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
@@ -390,7 +434,6 @@ class rdma_resource_manager extends uvm_object;
 
   // 功能：在 rdma_resource_manager 中，owned_mapping_hook_graph_intact 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
   // 输入/输出及副作用：source（输入）、result（输入）、saved_value（输入）、source_type（输入）、authority_snapshot（输入）、saved_authority（输入）、authority_type（输入）；owned_mapping_hook_graph_intact 读取 source、result、saved_value、source_type、authority_snapshot、saved_authority、authority_type 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-
   // 失败/边界：owned_mapping_hook_graph_intact 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
   protected function bit owned_mapping_hook_graph_intact(
     rdma_dma_mapping source,
@@ -579,6 +622,26 @@ class rdma_resource_manager extends uvm_object;
            );
   endfunction
 
+  // 功能：same_backing_segment_value 只读比较附加 backing segment 的角色、所有权、
+  //   映射范围、逻辑偏移和 mapping 值，供 queue/QP backing 快照比较复用。
+  // 输入/输出及副作用：lhs、rhs（输入）；只读取两个 segment 及其 mapping，不写入对象、
+  //   账本或外部 adapter；返回 bit 表示字段是否逐项一致。
+  // 失败/边界：任一 segment 句柄为 null 时返回 0（包括两者同时为 null），保持各 parent
+  //   比较循环原有的空段拒绝语义；mapping 值不一致或任一字段不同也返回 0。
+  protected function bit same_backing_segment_value(
+    rdma_queue_backing_segment lhs,
+    rdma_queue_backing_segment rhs
+  );
+    if (lhs == null || rhs == null)
+      return 1'b0;
+    return lhs.role == rhs.role &&
+           lhs.ownership == rhs.ownership &&
+           lhs.mapping_offset == rhs.mapping_offset &&
+           lhs.length == rhs.length &&
+           lhs.logical_queue_offset == rhs.logical_queue_offset &&
+           same_mapping_value(lhs.mapping, rhs.mapping);
+  endfunction
+
   // 功能：在 rdma_resource_manager 中由 same_queue_backing_ref_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
   // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
   // 失败/边界：same_queue_backing_ref_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
@@ -596,19 +659,8 @@ class rdma_resource_manager extends uvm_object;
         !same_mapping_value(lhs.mapping, rhs.mapping))
       return 1'b0;
     foreach (lhs.additional_segments[i]) begin
-      if (lhs.additional_segments[i] == null ||
-          rhs.additional_segments[i] == null ||
-          lhs.additional_segments[i].role != rhs.additional_segments[i].role ||
-          lhs.additional_segments[i].ownership !=
-            rhs.additional_segments[i].ownership ||
-          lhs.additional_segments[i].mapping_offset !=
-            rhs.additional_segments[i].mapping_offset ||
-          lhs.additional_segments[i].length !=
-            rhs.additional_segments[i].length ||
-          lhs.additional_segments[i].logical_queue_offset !=
-            rhs.additional_segments[i].logical_queue_offset ||
-          !same_mapping_value(lhs.additional_segments[i].mapping,
-                              rhs.additional_segments[i].mapping))
+      if (!same_backing_segment_value(lhs.additional_segments[i],
+                                      rhs.additional_segments[i]))
         return 1'b0;
     end
     return 1'b1;
@@ -675,45 +727,149 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：在 rdma_resource_manager 中由 same_released_queue_context_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：authoritative（输入）、candidate（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_released_queue_context_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：same_context_authority_value 比较两个 context backing 共享的 slot-token、
+  //       completion-authority、Function owner、资源定位和 HMC 值字段，集中维护
+  //       context authority 的纯值相等契约，供释放恢复与 QP 计划比较复用。
+  // 输入/输出及副作用：lhs、rhs（输入 context backing）；函数只读两份 backing、
+  //       token、authority、owner 和 HMC reference，返回 bit，不写对象、账本、runtime
+  //       或外部 adapter，也不取得资源所有权。
+  // 失败/边界：lhs/rhs 同时为空按值相等返回 1，只有一侧为空返回 0；slot_token 的
+  //       $cast 失败、completion_authority 缺失或指针不相同、owner/定位字段/HMC
+  //       reference 任一不一致返回 0；HMC reference 的 release_complete 也属于其
+  //       canonical 值。该 helper 不单独比较 context backing 自身的 release_complete，
+  //       也不判断 completion_authority.complete；调用方必须保留各自的释放完成语义。
+  protected function bit same_context_authority_value(
+    rdma_context_backing_ref lhs,
+    rdma_context_backing_ref rhs
+  );
+    rdma_queue_slot_token_contract lhs_token;
+    rdma_queue_slot_token_contract rhs_token;
+
+    if (lhs == null || rhs == null)
+      return lhs == rhs;
+    if (!$cast(lhs_token, lhs.slot_token) || !$cast(rhs_token, rhs.slot_token) ||
+        lhs_token.completion_authority == null ||
+        rhs_token.completion_authority == null ||
+        lhs_token.completion_authority !== rhs_token.completion_authority ||
+        !same_handle_instance(lhs.owner, rhs.owner) ||
+        lhs.resource_kind != rhs.resource_kind ||
+        lhs.local_id != rhs.local_id ||
+        lhs.shadow_pointer_base.value != rhs.shadow_pointer_base.value ||
+        lhs.slot_length != rhs.slot_length ||
+        lhs.shadow_view_offset != rhs.shadow_view_offset ||
+        lhs.shadow_view_length != rhs.shadow_view_length ||
+        lhs.hmc_ref == null || rhs.hmc_ref == null ||
+        !same_hmc_ref_value(lhs.hmc_ref, rhs.hmc_ref))
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
+  // 设计：queue context cleanup 的进度同时存在于 authoritative registry
+  //   快照和 ERROR recovery 快照。两侧 context_ref 必须先证明 presence
+  //   对称，再验证 slot-token 所携带的 opaque completion authority 以及
+  //   owner、资源定位、shadow geometry 和 HMC 值；只有这份只读证明通过后，
+  //   caller 才能在 detached candidate 上置位 release_complete 并原子提交。
+  // 功能：queue_context_progress_authority_status 为 context cleanup progress
+  //   建立 authoritative/recovery 两侧的只读 authority 前置条件，区分调用方
+  //   传入的非法 authoritative context 与 ERROR recovery 已损坏或已漂移的 context。
+  // 输入/输出及副作用：authoritative、recovery（输入 context backing 快照）、
+  //   has_recovery（输入）；函数只读取两侧 context_ref、slot_token、completion_authority、
+  //   canonical 定位字段和 release_complete，不写 registry、recovery_records、快照或
+  //   外部 backing，也不取得资源所有权；返回 rdma_status 供 caller 决定是否提交。
+  // 失败/边界：无 recovery 时保留原语义，authoritative 为空、已置位或 token/authority
+  //   不合法返回 INVALID_ARGUMENT；有 recovery 时先拒绝两侧 context_ref presence 不对称，
+  //   recovery 为空、已置位、token/authority 不合法或 canonical authority 与 authoritative
+  //   不一致返回 INVALID_STATE。成功仅表示两侧都仍可推进，函数不会修改 release_complete。
+  protected function rdma_status queue_context_progress_authority_status(
+    rdma_context_backing_ref authoritative,
+    rdma_context_backing_ref recovery,
+    bit has_recovery
+  );
+    rdma_queue_slot_token_contract authoritative_token;
+    rdma_queue_slot_token_contract recovery_token;
+
+    if (!has_recovery) begin
+      if (authoritative == null || authoritative.release_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue context cleanup is absent or complete"
+        );
+      if (!$cast(authoritative_token, authoritative.slot_token) ||
+          authoritative_token.completion_authority == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "queue context authority is invalid"
+        );
+      return rdma_status::success();
+    end
+
+    // 在任何字段解引用前先检查 presence parity。这里与上面的无 recovery
+    // 分支刻意分开：ERROR queue 的 detached recovery context 缺失属于恢复状态
+    // 破坏，不能据此伪造 context，也不能发布单侧进度。
+    if ((authoritative == null) != (recovery == null))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR queue context presence diverged"
+      );
+    if (authoritative == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "queue context cleanup is absent or complete"
+      );
+    if (authoritative.release_complete)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "queue context cleanup is absent or complete"
+      );
+    if (recovery.release_complete)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR recovery queue context is already complete"
+      );
+    if (!$cast(authoritative_token, authoritative.slot_token) ||
+        authoritative_token.completion_authority == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "queue context authority is invalid"
+      );
+    if (!$cast(recovery_token, recovery.slot_token) ||
+        recovery_token.completion_authority == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR recovery queue context authority is invalid"
+      );
+    if (authoritative_token.completion_authority !==
+          recovery_token.completion_authority ||
+        !same_context_authority_value(authoritative, recovery))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR recovery queue context authority diverged"
+      );
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在 rdma_resource_manager 中先复用 context authority 值比较，再确认
+  //       candidate 的 completion authority 已 complete 且 backing 已 release，判断
+  //       authoritative 与 candidate 是否可作为同一释放恢复记录。
+  // 输入/输出及副作用：authoritative、candidate（输入）；对象、slot token 和 HMC
+  //       reference 只读；返回 bit，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：两者同为空按值相等通过；单侧为空、token cast/authority/HMC 或共同
+  //       字段不一致、candidate completion 未完成或 candidate.release_complete 为 0
+  //       时返回 0，不抛出未处理异常，也不隐式改变 release 状态。
   protected function bit same_released_queue_context_value(
     rdma_context_backing_ref authoritative,
     rdma_context_backing_ref candidate
   );
-    rdma_queue_slot_token_contract authoritative_token;
     rdma_queue_slot_token_contract candidate_token;
 
+    if (!same_context_authority_value(authoritative, candidate))
+      return 1'b0;
     if (authoritative == null || candidate == null)
       return authoritative == candidate;
-    if (!$cast(authoritative_token, authoritative.slot_token) ||
-        !$cast(candidate_token, candidate.slot_token) ||
-        authoritative_token.completion_authority == null ||
+    if (!$cast(candidate_token, candidate.slot_token) ||
         candidate_token.completion_authority == null ||
-        authoritative_token.completion_authority !==
-          candidate_token.completion_authority ||
         !candidate_token.completion_authority.complete ||
-        !candidate.release_complete ||
-        !same_handle_instance(authoritative.owner, candidate.owner) ||
-        authoritative.resource_kind != candidate.resource_kind ||
-        authoritative.local_id != candidate.local_id ||
-        authoritative.shadow_pointer_base.value !=
-          candidate.shadow_pointer_base.value ||
-        authoritative.slot_length != candidate.slot_length ||
-        authoritative.shadow_view_offset != candidate.shadow_view_offset ||
-        authoritative.shadow_view_length != candidate.shadow_view_length ||
-        authoritative.hmc_ref == null || candidate.hmc_ref == null ||
-        !same_mapping_handle_value(authoritative.hmc_ref.owner,
-                                   candidate.hmc_ref.owner) ||
-        authoritative.hmc_ref.object_kind != candidate.hmc_ref.object_kind ||
-        authoritative.hmc_ref.address.value != candidate.hmc_ref.address.value ||
-        authoritative.hmc_ref.size != candidate.hmc_ref.size ||
-        authoritative.hmc_ref.first_pbl_index !=
-          candidate.hmc_ref.first_pbl_index ||
-        authoritative.hmc_ref.ownership != candidate.hmc_ref.ownership ||
-        authoritative.hmc_ref.release_complete !=
-          candidate.hmc_ref.release_complete)
+        !candidate.release_complete)
       return 1'b0;
     return 1'b1;
   endfunction
@@ -741,6 +897,73 @@ class rdma_resource_manager extends uvm_object;
     return backing_completed == 1;
   endfunction
 
+  // 功能：borrowed_queue_backing_release_intact 只读检查 borrowed queue backing 及其附加段仍可安全借用，
+  //       先验证 backing 自身，再按原顺序验证每个 additional segment。
+  // 输入/输出及副作用：backing（输入）；backing_fields_intact（输出，仅在返回 0 时区分 backing 自身字段失败还是附加段失败）；
+  //       函数仅读取 ownership、cleanup_complete、mapping、additional_segments 及 mapping.state，
+  //       不修改对象、账本或外部资源，
+  //       返回 bit 表示整棵 borrowed backing 图是否完整。
+  // 失败/边界：backing 为空、ownership 不是 RDMA_OWNERSHIP_BORROWED、cleanup_complete 已置位、
+  //       主 mapping 为空或非 RDMA_MAPPING_ACTIVE 时返回 0 且 backing_fields_intact=0；
+  //       任一 additional segment 为空、ownership 非 BORROWED、mapping 为空或非 ACTIVE 时返回 0，
+  //       且 backing_fields_intact=1；
+  //       空 additional_segments 表示没有附加段，按既有释放语义通过检查。
+  protected function bit borrowed_queue_backing_release_intact(
+    rdma_queue_backing_ref backing,
+    output bit backing_fields_intact
+  );
+    backing_fields_intact = 1'b0;
+    if (backing == null ||
+        backing.ownership != RDMA_OWNERSHIP_BORROWED ||
+        backing.cleanup_complete ||
+        backing.mapping == null ||
+        backing.mapping.state != RDMA_MAPPING_ACTIVE)
+      return 1'b0;
+    backing_fields_intact = 1'b1;
+    foreach (backing.additional_segments[i]) begin
+      if (backing.additional_segments[i] == null ||
+          backing.additional_segments[i].ownership !=
+            RDMA_OWNERSHIP_BORROWED ||
+          backing.additional_segments[i].mapping == null ||
+          backing.additional_segments[i].mapping.state !=
+            RDMA_MAPPING_ACTIVE)
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：owned_additional_segments_release_complete 只读核对 control-plane
+  //       owned queue backing 的全部 additional_segments 都已取得释放完成证明，
+  //       让 reservation/local 两类释放计划共享同一段 segment 级校验。
+  // 输入/输出及副作用：backing（输入）；函数遍历 backing.additional_segments，
+  //       对每个 segment.mapping 调用 query_owned_release_completion，并返回 bit；
+  //       函数不写 backing、mapping、账本或资源所有权，也不生成业务错误 status。
+  // 失败/边界：backing 为空、ownership 不是 RDMA_OWNERSHIP_CONTROL_PLANE、segment
+  //       为空，或任一 query 返回 null/失败 status 或 release_complete 为 0 时返回
+  //       0；空 additional_segments 表示没有附加段，按释放证明语义返回 1。
+  protected function bit owned_additional_segments_release_complete(
+    rdma_queue_backing_ref backing
+  );
+    rdma_status status;
+    bit release_complete;
+
+    if (backing == null ||
+        backing.ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
+      return 1'b0;
+    foreach (backing.additional_segments[i]) begin
+      if (backing.additional_segments[i] == null)
+        return 1'b0;
+      release_complete = 1'b0;
+      status = query_owned_release_completion(
+        backing.additional_segments[i].mapping,
+        release_complete
+      );
+      if (status == null || !status.ok() || !release_complete)
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
   // 功能：queue_reservation_release_plan_status 校验 authoritative、candidate 与当前对象状态的一致性，并显式处理“queue reservation recovery plan shape changed”；“queue reservation recovery ring authority changed”；“queue reservation recovery backing authority changed”；“queue reservation recovery owned backing is not released”；“queue reservation recovery backing lacks completion proof”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：authoritative（输入）、candidate（输入）；queue_reservation_release_plan_status 读取 authoritative、candidate 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：queue_reservation_release_plan_status 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “queue reservation recovery plan shape changed”；“queue reservation recovery ring authority changed”；“queue reservation recovery backing authority changed”；“queue reservation recovery owned backing is not released”；“queue reservation recovery backing lacks completion proof”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
@@ -750,6 +973,7 @@ class rdma_resource_manager extends uvm_object;
   );
     rdma_status status;
     bit release_complete;
+    bit backing_fields_intact;
 
     if (authoritative == null || candidate == null ||
         authoritative.resource_kind != candidate.resource_kind ||
@@ -796,38 +1020,29 @@ class rdma_resource_manager extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "queue reservation recovery backing lacks completion proof"
           );
-        foreach (candidate.refs[i].additional_segments[j]) begin
-          status = query_owned_release_completion(
-            candidate.refs[i].additional_segments[j].mapping,
-            release_complete
+        if (!owned_additional_segments_release_complete(candidate.refs[i]))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery segment lacks completion proof"
           );
-          if (status == null || !status.ok() || !release_complete)
-            return rdma_status::make(
-              RDMA_SC_INVALID_ARGUMENT,
-              "queue reservation recovery segment lacks completion proof"
-            );
-        end
       end
       else if (candidate.refs[i].ownership == RDMA_OWNERSHIP_BORROWED) begin
-        if (authoritative.refs[i].cleanup_complete ||
-            candidate.refs[i].cleanup_complete ||
-            candidate.refs[i].mapping == null ||
-            candidate.refs[i].mapping.state != RDMA_MAPPING_ACTIVE)
+        if (authoritative.refs[i].cleanup_complete)
           return rdma_status::make(
             RDMA_SC_INVALID_ARGUMENT,
             "queue reservation recovery borrowed backing was released"
           );
-        foreach (candidate.refs[i].additional_segments[j]) begin
-          if (candidate.refs[i].additional_segments[j] == null ||
-              candidate.refs[i].additional_segments[j].ownership !=
-                RDMA_OWNERSHIP_BORROWED ||
-              candidate.refs[i].additional_segments[j].mapping == null ||
-              candidate.refs[i].additional_segments[j].mapping.state !=
-                RDMA_MAPPING_ACTIVE)
+        if (!borrowed_queue_backing_release_intact(
+              candidate.refs[i], backing_fields_intact)) begin
+          if (!backing_fields_intact)
             return rdma_status::make(
               RDMA_SC_INVALID_ARGUMENT,
-              "queue reservation recovery borrowed segment was released"
+              "queue reservation recovery borrowed backing was released"
             );
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery borrowed segment was released"
+          );
         end
       end
       else
@@ -879,41 +1094,31 @@ class rdma_resource_manager extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "queue reservation recovery flush lacks completion proof"
           );
-        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
-          status = query_owned_release_completion(
-            candidate.flush_targets[i].pd_ref.additional_segments[j].mapping,
-            release_complete
+        if (!owned_additional_segments_release_complete(
+              candidate.flush_targets[i].pd_ref))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery flush segment lacks completion proof"
           );
-          if (status == null || !status.ok() || !release_complete)
-            return rdma_status::make(
-              RDMA_SC_INVALID_ARGUMENT,
-              "queue reservation recovery flush segment lacks completion proof"
-            );
-        end
       end
       else if (candidate.flush_targets[i].pd_ref.ownership ==
                  RDMA_OWNERSHIP_BORROWED) begin
-        if (authoritative.flush_targets[i].pd_ref.cleanup_complete ||
-            candidate.flush_targets[i].pd_ref.cleanup_complete ||
-            candidate.flush_targets[i].pd_ref.mapping == null ||
-            candidate.flush_targets[i].pd_ref.mapping.state !=
-              RDMA_MAPPING_ACTIVE)
+        if (authoritative.flush_targets[i].pd_ref.cleanup_complete)
           return rdma_status::make(
             RDMA_SC_INVALID_ARGUMENT,
             "queue reservation recovery borrowed flush backing was released"
           );
-        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
-          if (candidate.flush_targets[i].pd_ref.additional_segments[j] == null ||
-              candidate.flush_targets[i].pd_ref.additional_segments[j].ownership !=
-                RDMA_OWNERSHIP_BORROWED ||
-              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping ==
-                null ||
-              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping.
-                state != RDMA_MAPPING_ACTIVE)
+        if (!borrowed_queue_backing_release_intact(
+              candidate.flush_targets[i].pd_ref, backing_fields_intact)) begin
+          if (!backing_fields_intact)
             return rdma_status::make(
               RDMA_SC_INVALID_ARGUMENT,
-              "queue reservation recovery borrowed flush segment was released"
+              "queue reservation recovery borrowed flush backing was released"
             );
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue reservation recovery borrowed flush segment was released"
+          );
         end
       end
       else
@@ -934,6 +1139,7 @@ class rdma_resource_manager extends uvm_object;
     rdma_queue_slot_token_contract token;
     rdma_status status;
     bit release_complete;
+    bit backing_fields_intact;
 
     if (candidate == null)
       return rdma_status::make(
@@ -958,37 +1164,24 @@ class rdma_resource_manager extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "queue local release backing proof is incomplete"
           );
-        foreach (candidate.refs[i].additional_segments[j]) begin
-          status = query_owned_release_completion(
-            candidate.refs[i].additional_segments[j].mapping,
-            release_complete
-          );
-          if (status == null || !status.ok() || !release_complete)
-            return rdma_status::make(
-              RDMA_SC_INVALID_ARGUMENT,
-              "queue local release segment proof is incomplete"
-            );
-        end
-      end
-      else if (candidate.refs[i].ownership == RDMA_OWNERSHIP_BORROWED) begin
-        if (candidate.refs[i].cleanup_complete ||
-            candidate.refs[i].mapping == null ||
-            candidate.refs[i].mapping.state != RDMA_MAPPING_ACTIVE)
+        if (!owned_additional_segments_release_complete(candidate.refs[i]))
           return rdma_status::make(
             RDMA_SC_INVALID_ARGUMENT,
-            "queue local borrowed backing was released"
+            "queue local release segment proof is incomplete"
           );
-        foreach (candidate.refs[i].additional_segments[j]) begin
-          if (candidate.refs[i].additional_segments[j] == null ||
-              candidate.refs[i].additional_segments[j].ownership !=
-                RDMA_OWNERSHIP_BORROWED ||
-              candidate.refs[i].additional_segments[j].mapping == null ||
-              candidate.refs[i].additional_segments[j].mapping.state !=
-                RDMA_MAPPING_ACTIVE)
+      end
+      else if (candidate.refs[i].ownership == RDMA_OWNERSHIP_BORROWED) begin
+        if (!borrowed_queue_backing_release_intact(
+              candidate.refs[i], backing_fields_intact)) begin
+          if (!backing_fields_intact)
             return rdma_status::make(
               RDMA_SC_INVALID_ARGUMENT,
-              "queue local borrowed segment was released"
+              "queue local borrowed backing was released"
             );
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local borrowed segment was released"
+          );
         end
       end
       else
@@ -1029,40 +1222,26 @@ class rdma_resource_manager extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "queue local owned flush backing proof is incomplete"
           );
-        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
-          status = query_owned_release_completion(
-            candidate.flush_targets[i].pd_ref.additional_segments[j].mapping,
-            release_complete
+        if (!owned_additional_segments_release_complete(
+              candidate.flush_targets[i].pd_ref))
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local owned flush segment proof is incomplete"
           );
-          if (status == null || !status.ok() || !release_complete)
-            return rdma_status::make(
-              RDMA_SC_INVALID_ARGUMENT,
-              "queue local owned flush segment proof is incomplete"
-            );
-        end
       end
       else if (candidate.flush_targets[i].pd_ref.ownership ==
                  RDMA_OWNERSHIP_BORROWED) begin
-        if (candidate.flush_targets[i].pd_ref.cleanup_complete ||
-            candidate.flush_targets[i].pd_ref.mapping == null ||
-            candidate.flush_targets[i].pd_ref.mapping.state !=
-              RDMA_MAPPING_ACTIVE)
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            "queue local borrowed flush backing was released"
-          );
-        foreach (candidate.flush_targets[i].pd_ref.additional_segments[j]) begin
-          if (candidate.flush_targets[i].pd_ref.additional_segments[j] == null ||
-              candidate.flush_targets[i].pd_ref.additional_segments[j].ownership !=
-                RDMA_OWNERSHIP_BORROWED ||
-              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping ==
-                null ||
-              candidate.flush_targets[i].pd_ref.additional_segments[j].mapping.
-                state != RDMA_MAPPING_ACTIVE)
+        if (!borrowed_queue_backing_release_intact(
+              candidate.flush_targets[i].pd_ref, backing_fields_intact)) begin
+          if (!backing_fields_intact)
             return rdma_status::make(
               RDMA_SC_INVALID_ARGUMENT,
-              "queue local borrowed flush segment was released"
+              "queue local borrowed flush backing was released"
             );
+          return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "queue local borrowed flush segment was released"
+          );
         end
       end
       else
@@ -1235,8 +1414,11 @@ class rdma_resource_manager extends uvm_object;
     return status;
   endfunction
 
-  // 功能：在 rdma_resource_manager 中，project_hmc_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_hmc_ref_value 读取 source、copy_label、result 并使用字段 result、status、result.object_kind、result.address、result.size、result.first_pbl_index、result.ownership、result.release_complete，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
+  // 功能：在 rdma_resource_manager 中，project_hmc_ref_value 从输入对象提取
+  //       受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
+  // 输入/输出及副作用：source、copy_label 为输入，result 为输出；函数读取
+  //       source 和 copy_label，并复制 owner、kind、address、size、PBL index、
+  //       validity、ownership 与 release_complete；不取得调用方资源所有权。
   // 失败/边界：project_hmc_ref_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status project_hmc_ref_value(
     rdma_hmc_ref source,
@@ -1260,6 +1442,7 @@ class rdma_resource_manager extends uvm_object;
     result.address = source.address;
     result.size = source.size;
     result.first_pbl_index = source.first_pbl_index;
+    result.index_valid = source.index_valid;
     result.ownership = source.ownership;
     result.release_complete = source.release_complete;
     return rdma_status::success();
@@ -1707,6 +1890,50 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：project_backing_segment_value 将 queue/QP backing 的一个附加 segment 投影为
+  //   detached 对象，复制 source.role、source.ownership、source.mapping_offset、
+  //   source.length 和 source.logical_queue_offset，并按 ownership 选择 mapping clone
+  //   或值投影，供两类 backing-ref 快照共用。
+  // 输入/输出及副作用：source、segment_label、null_error、owned_mapping_label 和
+  //   borrowed_mapping_label（输入）；result（输出）。函数读取 source.mapping，写入
+  //   新的 result，不取得 source 或 mapping 的业务所有权。
+  // 失败/边界：source 为空时按 null_error 返回 RDMA_SC_INVALID_ARGUMENT；映射投影失败
+  //   时原样传播 status 并清空 result；函数不额外执行几何、role 或 ownership 校验，
+  //   borrowed 的 null mapping 继续遵循 project_mapping_value 的既有语义。
+  protected function rdma_status project_backing_segment_value(
+    rdma_queue_backing_segment source,
+    string segment_label,
+    string null_error,
+    string owned_mapping_label,
+    string borrowed_mapping_label,
+    output rdma_queue_backing_segment result
+  );
+    rdma_status status;
+
+    result = null;
+    if (source == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, null_error);
+    result = new(segment_label);
+    result.role = source.role;
+    result.ownership = source.ownership;
+    result.mapping_offset = source.mapping_offset;
+    result.length = source.length;
+    result.logical_queue_offset = source.logical_queue_offset;
+    if (result.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
+      status = clone_owned_mapping_value(
+        source.mapping, owned_mapping_label, result.mapping
+      );
+    else
+      status = project_mapping_value(
+        source.mapping, borrowed_mapping_label, result.mapping
+      );
+    if (!status.ok()) begin
+      result = null;
+      return status;
+    end
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_resource_manager 中，project_queue_backing_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_backing_ref_value 读取 source、copy_label、result 并使用字段 result、result.role、result.ownership、result.mapping_offset、result.length、result.logical_queue_offset、result.cleanup_complete、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：project_queue_backing_ref_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
@@ -1741,33 +1968,14 @@ class rdma_resource_manager extends uvm_object;
       return status;
     end
     foreach (source.additional_segments[i]) begin
-      segment_copy = new($sformatf("%s_segment_%0d", copy_label, i));
-      if (source.additional_segments[i] == null) begin
-        result = null;
-        return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          {copy_label, " additional backing segment is null"}
-        );
-      end
-      segment_copy.role = source.additional_segments[i].role;
-      segment_copy.ownership = source.additional_segments[i].ownership;
-      segment_copy.mapping_offset =
-        source.additional_segments[i].mapping_offset;
-      segment_copy.length = source.additional_segments[i].length;
-      segment_copy.logical_queue_offset =
-        source.additional_segments[i].logical_queue_offset;
-      if (segment_copy.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
-        status = clone_owned_mapping_value(
-          source.additional_segments[i].mapping,
-          $sformatf("%s_segment_%0d_owned_mapping", copy_label, i),
-          segment_copy.mapping
-        );
-      else
-        status = project_mapping_value(
-          source.additional_segments[i].mapping,
-          $sformatf("%s_segment_%0d_borrowed_mapping", copy_label, i),
-          segment_copy.mapping
-        );
+      status = project_backing_segment_value(
+        source.additional_segments[i],
+        $sformatf("%s_segment_%0d", copy_label, i),
+        {copy_label, " additional backing segment is null"},
+        $sformatf("%s_segment_%0d_owned_mapping", copy_label, i),
+        $sformatf("%s_segment_%0d_borrowed_mapping", copy_label, i),
+        segment_copy
+      );
       if (!status.ok()) begin
         result = null;
         return status;
@@ -2065,24 +2273,19 @@ class rdma_resource_manager extends uvm_object;
     result.additional_segments.delete();
     foreach (source.additional_segments[i]) begin
       rdma_queue_backing_segment segment;
-      if (source.additional_segments[i] == null) begin
+
+      status = project_backing_segment_value(
+        source.additional_segments[i],
+        {copy_label, "_segment"},
+        "QP backing segment is null",
+        {copy_label, "_segment_mapping"},
+        {copy_label, "_segment_mapping"},
+        segment
+      );
+      if (!status.ok()) begin
         result = null;
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "QP backing segment is null");
+        return status;
       end
-      segment = new({copy_label, "_segment"});
-      segment.role = source.additional_segments[i].role;
-      segment.ownership = source.additional_segments[i].ownership;
-      segment.mapping_offset = source.additional_segments[i].mapping_offset;
-      segment.length = source.additional_segments[i].length;
-      segment.logical_queue_offset = source.additional_segments[i].logical_queue_offset;
-      if (segment.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
-        status = clone_owned_mapping_value(source.additional_segments[i].mapping,
-          {copy_label, "_segment_mapping"}, segment.mapping);
-      else
-        status = project_mapping_value(source.additional_segments[i].mapping,
-          {copy_label, "_segment_mapping"}, segment.mapping);
-      if (!status.ok()) begin result = null; return status; end
       result.additional_segments.push_back(segment);
     end
     return rdma_status::success();
@@ -2367,14 +2570,9 @@ class rdma_resource_manager extends uvm_object;
         lhs.additional_segments.size() != rhs.additional_segments.size())
       return 1'b0;
     foreach (lhs.additional_segments[i]) begin
-      if (lhs.additional_segments[i] == null || rhs.additional_segments[i] == null ||
-          lhs.additional_segments[i].role != rhs.additional_segments[i].role ||
-          lhs.additional_segments[i].ownership != rhs.additional_segments[i].ownership ||
-          lhs.additional_segments[i].mapping_offset != rhs.additional_segments[i].mapping_offset ||
-          lhs.additional_segments[i].length != rhs.additional_segments[i].length ||
-          lhs.additional_segments[i].logical_queue_offset != rhs.additional_segments[i].logical_queue_offset ||
-          !same_mapping_value(lhs.additional_segments[i].mapping,
-                              rhs.additional_segments[i].mapping)) return 1'b0;
+      if (!same_backing_segment_value(lhs.additional_segments[i],
+                                      rhs.additional_segments[i]))
+        return 1'b0;
     end
     if (lhs.recovery_only)
       return same_recovery_mapping_value(lhs.mapping, rhs.mapping);
@@ -2400,39 +2598,21 @@ class rdma_resource_manager extends uvm_object;
            lhs.object_mode == rhs.object_mode;
   endfunction
 
-  // 功能：在 rdma_resource_manager 中由 same_context_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_context_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：在 rdma_resource_manager 中复用 context authority 值比较，并由 caller
+  //       单独比较 lhs/rhs 的 release_complete，判断两份 context backing 快照是否等价。
+  // 输入/输出及副作用：lhs、rhs（输入）；对象、slot token 和 HMC reference 只读；
+  //       返回 bit，不更新 runtime、账本或外部 adapter。
+  // 失败/边界：两者同为空按值相等通过；单侧为空、token cast/authority/HMC 或共同
+  //       字段不一致，或两侧 release_complete 不同，均返回 0，不抛出未处理异常。
   protected function bit same_context_value(
     rdma_context_backing_ref lhs,
     rdma_context_backing_ref rhs
   );
-    rdma_queue_slot_token_contract lhs_token;
-    rdma_queue_slot_token_contract rhs_token;
-
+    if (!same_context_authority_value(lhs, rhs))
+      return 1'b0;
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    if (!$cast(lhs_token, lhs.slot_token) || !$cast(rhs_token, rhs.slot_token) ||
-        lhs_token.completion_authority == null ||
-        rhs_token.completion_authority == null)
-      return 1'b0;
-    return lhs_token.completion_authority === rhs_token.completion_authority &&
-           same_handle_instance(lhs.owner, rhs.owner) &&
-           lhs.resource_kind == rhs.resource_kind &&
-           lhs.local_id == rhs.local_id &&
-           lhs.shadow_pointer_base.value == rhs.shadow_pointer_base.value &&
-           lhs.slot_length == rhs.slot_length &&
-           lhs.shadow_view_offset == rhs.shadow_view_offset &&
-           lhs.shadow_view_length == rhs.shadow_view_length &&
-           lhs.release_complete == rhs.release_complete &&
-           lhs.hmc_ref != null && rhs.hmc_ref != null &&
-           same_handle_instance(lhs.hmc_ref.owner, rhs.hmc_ref.owner) &&
-           lhs.hmc_ref.object_kind == rhs.hmc_ref.object_kind &&
-           lhs.hmc_ref.address.value == rhs.hmc_ref.address.value &&
-           lhs.hmc_ref.size == rhs.hmc_ref.size &&
-           lhs.hmc_ref.first_pbl_index == rhs.hmc_ref.first_pbl_index &&
-           lhs.hmc_ref.ownership == rhs.hmc_ref.ownership &&
-           lhs.hmc_ref.release_complete == rhs.hmc_ref.release_complete;
+    return lhs.release_complete == rhs.release_complete;
   endfunction
 
   // 功能：在 rdma_resource_manager 中由 same_qp_plan_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
@@ -2755,6 +2935,8 @@ class rdma_resource_manager extends uvm_object;
     rdma_mr result_mr;
     rdma_cq source_cq;
     rdma_cq result_cq;
+    uvm_object cloned_object;
+    rdma_cqc_model cloned_cqc;
     rdma_qp source_qp;
     rdma_qp result_qp;
     rdma_srq source_srq;
@@ -2910,6 +3092,19 @@ class rdma_resource_manager extends uvm_object;
           status = project_handle_value(
             source_cq.ceq_h, {copy_label, "_ceq"}, result_cq.ceq_h
           );
+        if (status.ok() && source_cq.programmed_cqc != null) begin
+          cloned_object = source_cq.programmed_cqc.clone();
+          if (cloned_object == null || !$cast(cloned_cqc, cloned_object) ||
+              cloned_cqc == source_cq.programmed_cqc) begin
+            status = rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              {copy_label, " programmed CQC clone failed"}
+            );
+          end
+          else begin
+            result_cq.programmed_cqc = cloned_cqc;
+          end
+        end
       end
       RDMA_RESOURCE_QP: begin
         result_qp.local_qp_id = source_qp.local_qp_id;
@@ -2994,6 +3189,12 @@ class rdma_resource_manager extends uvm_object;
         result_aeq.function_local_vector = source_aeq.function_local_vector;
         result_aeq.hardware_vector = source_aeq.hardware_vector;
         result_aeq.msix_table_index = source_aeq.msix_table_index;
+      end
+      default: begin
+        status = rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          {copy_label, " resource kind changed during projection"}
+        );
       end
     endcase
 
@@ -3083,9 +3284,15 @@ class rdma_resource_manager extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：在 rdma_resource_manager 中由 same_handle_instance 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_handle_instance 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：same_handle_instance 是 resource manager 内部 canonical handle identity
+  //       比较器，按四个公开身份字段判断两个 handle 是否表示同一值。
+  // 输入/输出及副作用：lhs、rhs（输入）是非拥有 handle 引用；只读取 kind、
+  //       function_uid、object_id、generation，返回 bit，不修改 handle、registry、
+  //       runtime 或外部 adapter，也不取得任何资源所有权。
+  // 失败/边界：lhs 与 rhs 同为 null 返回 1；仅一侧为 null 返回 0；两侧非空时
+  //       四个字段任一 `==` 不等返回 0。函数不执行 $isunknown，不验证
+  //       authority/alias 或 generation 新鲜度；状态、路由和生命周期门禁由
+  //       caller 负责。
   protected function bit same_handle_instance(rdma_handle lhs,
                                                rdma_handle rhs);
     if (lhs == null || rhs == null)
@@ -3440,7 +3647,6 @@ class rdma_resource_manager extends uvm_object;
 
   // 功能：在 rdma_resource_manager 中，binding_context_status 把 binding_context_status 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
   // 输入/输出及副作用：binding（输入）、trusted_binding（输出）、owner（输出）、key（输出）、registration_needed（输出）；binding_context_status 读取 binding、trusted_binding、owner、key、registration_needed 并使用字段 trusted_binding、owner、key、registration_needed、status、source_is_known、observed_generation、trusted_binding.generation，并写入 trusted_binding、owner、key、registration_needed；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
   protected function rdma_status binding_context_status(
     rdma_function_binding binding,
@@ -3831,7 +4037,6 @@ class rdma_resource_manager extends uvm_object;
 
   // 功能：dependency_status 校验 owner、dependency、expected_kind、allow_null 与当前对象状态的一致性，并显式处理“required resource dependency is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：owner（输入）、dependency（输入）、expected_kind（输入）、allow_null（输入）；dependency_status 读取 owner、dependency、expected_kind、allow_null 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：dependency_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“required resource dependency is null”“resource dependency kind is invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status dependency_status(
     rdma_function_handle owner,
@@ -4628,6 +4833,120 @@ class rdma_resource_manager extends uvm_object;
                              "resource handle has been released");
   endfunction
 
+  // 功能：lookup_local_resource 按当前 Function owner、资源 kind 和完整 local_id
+  //   反查唯一权威资源，供 AEQE/CEQE 等 wire owner route 使用。
+  // 输入/输出及副作用：owner、kind、local_id 为输入，resource 为 detached 输出；
+  //   函数只读取 binding/registry，成功时复制资源快照，不修改资源状态或取得外部
+  //   backing 所有权，也不把 wire ID 截断后再查询。
+  // 失败/边界：owner 为空、generation 非当前、kind 不支持、local_id 超出该 kind
+  //   硬件宽度、无匹配、匹配资源已 RELEASED、发现多个 live 匹配或发现旧 generation
+  //   记录时返回明确错误；不同 Function UID、Function object 或 generation 的资源
+  //   永远不会被当作命中。
+  function rdma_status lookup_local_resource(
+    rdma_function_handle owner,
+    rdma_resource_kind_e kind,
+    int unsigned local_id,
+    output rdma_resource resource
+  );
+    rdma_function_handle trusted_owner;
+    rdma_resource candidate;
+    rdma_resource projected;
+    rdma_status status;
+    int unsigned candidate_local_id;
+    bit found_live;
+    bit found_released;
+    bit found_stale;
+
+    resource = null;
+
+    status = project_function_handle_value(
+      owner, "lookup local resource owner", trusted_owner
+    );
+    if (status == null || !status.ok() || trusted_owner == null)
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "lookup local resource owner is invalid"
+      ) : status;
+
+    if (!valid_kind(kind) || kind == RDMA_RESOURCE_FUNCTION)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "lookup local resource kind is invalid"
+      );
+    if (local_id > local_id_limit(kind))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "lookup local resource ID exceeds hardware width"
+      );
+
+    status = owner_binding_status(trusted_owner);
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "lookup local resource owner status is unavailable"
+      ) : status;
+
+    foreach (registry[key]) begin
+      candidate = registry[key];
+      if (candidate == null || candidate.handle == null ||
+          candidate.handle.kind != kind || candidate.owner == null)
+        continue;
+
+      if (candidate.owner.function_uid != trusted_owner.function_uid ||
+          candidate.owner.object_id != trusted_owner.object_id)
+        continue;
+
+      if (candidate.owner.generation != trusted_owner.generation) begin
+        found_stale = 1'b1;
+        continue;
+      end
+
+      candidate_local_id = resource_local_id(candidate);
+      if (candidate_local_id != local_id)
+        continue;
+
+      if (candidate.state == RDMA_RESOURCE_RELEASED) begin
+        found_released = 1'b1;
+        continue;
+      end
+      if (candidate.state inside {RDMA_RESOURCE_NEW, RDMA_RESOURCE_ERROR})
+        continue;
+      if (found_live)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "lookup local resource found multiple live matches"
+        );
+
+      status = project_resource_value(
+        candidate, "lookup local resource", projected
+      );
+      if (status == null || !status.ok() || projected == null)
+        return status == null ? rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "lookup local resource projection failed"
+        ) : status;
+      resource = projected;
+      found_live = 1'b1;
+    end
+
+    if (found_live)
+      return rdma_status::success();
+    if (found_stale)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "lookup local resource found stale generation"
+      );
+    if (found_released)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "lookup local resource has been released"
+      );
+    return rdma_status::make(
+      RDMA_SC_INVALID_ARGUMENT,
+      "lookup local resource is unknown"
+    );
+  endfunction
+
   // 功能：在 rdma_resource_manager 中，stage_allocated 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
   // 输入/输出及副作用：candidate（输入）；stage_allocated 读取 candidate 并使用字段 status、key、prepared.state、replacement.state；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：stage_allocated 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “QP resources require QP-specific programming attachment”；“staged candidate must be ALLOCATED”；“registry resource is not ALLOCATED”；“prepared staged candidate validation returned null”；“staged candidate validation returned null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
@@ -4684,6 +5003,103 @@ class rdma_resource_manager extends uvm_object;
       return status;
     registry[key] = replacement;
     staged_allocations[key] = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：attach_cq_programming 将已构造并校验的 CQC context 绑定到
+  // ALLOCATED/staged CQ authority，使成功、歧义和恢复路径共享 typed snapshot。
+  // 输入/输出及副作用：candidate 必须携带 CQ handle、queue plan 和
+  // programmed_cqc；通过身份、generation、状态和 CQC 校验后替换 manager
+  // registry 的 detached CQ 快照，并保留 staged_allocations 标记。
+  // 失败/边界：candidate 为空、类型/状态错误、缺少 CQC、CQC 身份不匹配、
+  // validate 失败、registry 非 staged ALLOCATED、已有 CQC 或 publication
+  // identity 改变时返回错误，失败不修改 registry。
+  virtual function rdma_status attach_cq_programming(rdma_cq candidate);
+    rdma_resource authoritative;
+    rdma_resource projected;
+    rdma_cq replacement;
+    rdma_cq authoritative_cq;
+    rdma_cqc_model cqc;
+    rdma_status status;
+    string key;
+
+    if (candidate == null || candidate.handle == null ||
+        candidate.handle.kind != RDMA_RESOURCE_CQ)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQ programming candidate is invalid"
+      );
+    if (candidate.state != RDMA_RESOURCE_ALLOCATED ||
+        candidate.programmed_cqc == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ programming requires an ALLOCATED candidate with CQC"
+      );
+
+    status = project_public_resource_value(
+      candidate, "attach CQ programming", projected
+    );
+    if (!status.ok() || !$cast(replacement, projected))
+      return status.ok() ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ programming candidate projection failed"
+      ) : status;
+
+    if (!$cast(cqc, replacement.programmed_cqc) || cqc == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQ programming candidate CQC type is invalid"
+      );
+    status = cqc.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ programming candidate CQC validation returned null"
+      ) : status;
+    if (cqc.cq_h == null ||
+        cqc.cq_h.kind != RDMA_RESOURCE_CQ ||
+        cqc.cq_h.object_id != replacement.local_cq_id ||
+        cqc.cq_h.function_uid != replacement.handle.function_uid ||
+        cqc.cq_h.generation != replacement.handle.generation)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQ programming candidate CQC identity does not match"
+      );
+
+    status = lookup(replacement.handle, authoritative);
+    if (!status.ok())
+      return status;
+    if (!$cast(authoritative_cq, authoritative) || authoritative_cq == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ programming target type is invalid"
+      );
+
+    key = resource_key(authoritative.handle);
+    if (!registry.exists(key) || registry[key] == null ||
+        registry[key].state != RDMA_RESOURCE_ALLOCATED ||
+        !staged_allocations.exists(key))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ programming target is not a staged ALLOCATED resource"
+      );
+    if (authoritative_cq.programmed_cqc != null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ programming target already has a CQC"
+      );
+
+    status = publication_identity_status(replacement, authoritative);
+    if (!status.ok())
+      return status;
+    status = replacement.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ programming replacement validation returned null"
+      ) : status;
+
+    registry[key] = replacement;
     return rdma_status::success();
   endfunction
 
@@ -5301,11 +5717,14 @@ class rdma_resource_manager extends uvm_object;
             status = rdma_qp_partial_plan_authority(
               recovery_copy.qp_plan, recovery_owner, recovery_qp_h
             );
+          // 设计：partial-plan authority 成功后仍要求 recovery_qp_h、
+          // recovery_owner 与 registry owner 非空；只有同一 Function
+          // incarnation 才能放宽 stale-generation recovery gate。
           stale_recovery_allowed = status != null && status.ok() &&
             recovery_qp_h != null && recovery_owner != null &&
             same_handle_instance(recovery_qp_h, registry[key].handle) &&
             registry[key].owner != null &&
-            recovery_owner.same_instance(registry[key].owner);
+            same_handle_instance(recovery_owner, registry[key].owner);
         end
         else if (recovery.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
                  recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
@@ -5415,10 +5834,14 @@ class rdma_resource_manager extends uvm_object;
         return status;
     end
     if (preprogram_publication) begin
+      // 设计：pre-program QP 尚无 QPC/plan 时，recovery_owner 与已登记
+      // authoritative owner 必须先通过非空门禁，再比较完整 handle identity；
+      // 失配继续走 INVALID_ARGUMENT authority-changed，后续 SRQ 检查与发布顺序不变。
       if (authoritative_qp.qp_plan != null ||
           authoritative_qp.programmed_qpc != null ||
           !same_handle_instance(recovery_qp_h, authoritative_qp.handle) ||
-          !recovery_owner.same_instance(authoritative_qp.owner) ||
+          recovery_owner == null || authoritative_qp.owner == null ||
+          !same_handle_instance(recovery_owner, authoritative_qp.owner) ||
           (authoritative_qp.srq_h == null) !=
             (recovery_copy.qp_plan.rq_source_h == null) ||
           (authoritative_qp.srq_h != null &&
@@ -5779,7 +6202,6 @@ class rdma_resource_manager extends uvm_object;
   // replace an established mapping identity.
   // 功能：执行 retain_qp_query_mapping 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：qp_h（输入）、query_mapping（输入）、b0（输入）；retain_qp_query_mapping 读取 qp_h、query_mapping、query_mapping_recovery_only 并使用字段 status、key、existing_record、recovery、qp_recovery.query_mapping、qp_recovery.query_mapping_recovery_only；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：retain_qp_query_mapping 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   virtual function rdma_status retain_qp_query_mapping(
     rdma_handle qp_h,
@@ -5949,7 +6371,6 @@ class rdma_resource_manager extends uvm_object;
 
   // 功能：在 rdma_resource_manager 中，qp_progress_snapshots 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
   // 输入/输出及副作用：qp_h（输入）、operation（输入）、key（输出）、resource_copy（输出）、recovery_copy（输出）、has_recovery（输出）；qp_progress_snapshots 读取 qp_h、operation、key、resource_copy、recovery_copy、has_recovery 并使用字段 key、resource_copy、recovery_copy、has_recovery、status，并写入 key、resource_copy、recovery_copy、has_recovery；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：qp_progress_snapshots 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status qp_progress_snapshots(
     rdma_handle qp_h,
@@ -6504,7 +6925,6 @@ class rdma_resource_manager extends uvm_object;
 
   // 功能：在 rdma_resource_manager 中，queue_progress_snapshots 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
   // 输入/输出及副作用：handle（输入）、operation（输入）、key（输出）、resource_copy（输出）、recovery_copy（输出）、has_recovery（输出）；queue_progress_snapshots 读取 handle、operation、key、resource_copy、recovery_copy、has_recovery 并使用字段 key、resource_copy、recovery_copy、has_recovery、status，并写入 key、resource_copy、recovery_copy、has_recovery；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：queue_progress_snapshots 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “queue progress requires QUIESCING or ERROR queue”；“queue progress resource plan is missing”；“queue progress plan validation returned null”；“ERROR queue has no recovery record”；“ERROR queue recovery schema is incomplete”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status queue_progress_snapshots(
     rdma_handle handle,
@@ -6525,8 +6945,7 @@ class rdma_resource_manager extends uvm_object;
     status = lookup(handle, authoritative);
     if (!status.ok()) return status;
     key = resource_key(authoritative.handle);
-    if (!(authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-                                            RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) ||
+    if (!lifecycle_queue_kind(authoritative.handle.kind) ||
         !(registry[key].state inside {RDMA_RESOURCE_QUIESCING,
                                       RDMA_RESOURCE_ERROR}))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -6598,10 +7017,80 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_resource_manager 中，record_queue_flush_complete 记录 record_queue_flush_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
-  // 输入/输出及副作用：handle（输入）、role（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
-  //   返回结果。
-  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
+  // 设计：queue progress 的 role 是逻辑身份，不是数组位置。调用方必须先
+  //   证明某个快照中该 role 恰好出现一次，才能把返回的索引用于后续
+  //   authority/完成位比较；这样 recovery 快照缺失或重复 role 时不会把
+  //   未初始化的索引误用为数组下标。
+  // 功能：queue_flush_role_count 只扫描给定 flush_targets，统计 role 的唯一性
+  //   并在命中时输出其索引，供 flush 事务在字段解引用前建立安全前置条件。
+  // 输入/输出及副作用：plan、role（输入）、target_index（输出）；函数读取
+  //   plan.flush_targets 及每个 target.role，不修改 plan、registry、recovery_records
+  //   或外部 backing；返回匹配 role 的数量。
+  // 失败/边界：plan 为空或没有非空 target 时返回 0，并把 target_index 置 0；出现多个
+  //   同 role target 时返回实际数量但索引只保留最后一次命中，调用方不得在返回值不等于
+  //   1 时使用该索引。
+  protected function int unsigned queue_flush_role_count(
+    rdma_queue_backing_plan plan,
+    rdma_queue_backing_role_e role,
+    output int unsigned target_index
+  );
+    int unsigned count;
+
+    count = 0;
+    target_index = 0;
+    if (plan == null)
+      return count;
+    foreach (plan.flush_targets[i]) begin
+      if (plan.flush_targets[i] != null &&
+          plan.flush_targets[i].role == role) begin
+        count++;
+        target_index = i;
+      end
+    end
+    return count;
+  endfunction
+
+  // 功能：queue_ref_role_count 只扫描给定 backing refs，统计 role 的唯一性并在命中
+  //   时输出其索引，供 cleanup 事务在 authority compare 前建立安全前置条件。
+  // 输入/输出及副作用：plan、role（输入）、ref_index（输出）；函数读取 plan.refs
+  //   及每个 ref.role，不修改 plan、registry、recovery_records 或外部 backing；返回
+  //   匹配 role 的数量。
+  // 失败/边界：plan 为空或没有非空 ref 时返回 0，并把 ref_index 置 0；出现多个同 role
+  //   ref 时返回实际数量但索引只保留最后一次命中，调用方不得在返回值不等于 1 时使用该索引。
+  protected function int unsigned queue_ref_role_count(
+    rdma_queue_backing_plan plan,
+    rdma_queue_backing_role_e role,
+    output int unsigned ref_index
+  );
+    int unsigned count;
+
+    count = 0;
+    ref_index = 0;
+    if (plan == null)
+      return count;
+    foreach (plan.refs[i]) begin
+      if (plan.refs[i] != null && plan.refs[i].role == role) begin
+        count++;
+        ref_index = i;
+      end
+    end
+    return count;
+  endfunction
+
+  // 设计：flush progress 同时存在于 authoritative queue 和 ERROR recovery 两份
+  //   detached plan；role 是两份快照之间的匹配键。先确认 authoritative role 恰好
+  //   唯一，再读取 recovery target，最后以 commit_queue_progress 一次性发布，避免
+  //   失败路径留下单侧 flush_complete。
+  // 功能：record_queue_flush_complete 为指定 queue backing role 记录一次完成的
+  //   flush，并按 plan 顺序验证所有前驱已完成；ERROR queue 还会核对 recovery
+  //   target 的 PD mapping authority，成功后原子更新两份进度快照。
+  // 输入/输出及副作用：handle、role（输入）；函数读取 queue registry/recovery 的
+  //   detached 快照，成功时只提交对应 flush_targets[*].flush_complete 位并返回 OK，
+  //   不取得外部 mapping 或 queue backing 的所有权。
+  // 失败/边界：handle 不存在、queue 不在 QUIESCING/ERROR、plan/recovery schema
+  //   无效时传播对应状态；authoritative role 缺失/重复/已完成返回 INVALID_ARGUMENT，
+  //   recovery role 缺失/重复、authority 不同或任一前驱未完成返回 INVALID_STATE；任一
+  //   拒绝分支都不发布 registry/recovery 的部分进度。
   virtual function rdma_status record_queue_flush_complete(
     rdma_handle handle,
     rdma_queue_backing_role_e role
@@ -6622,23 +7111,22 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok()) return status;
     if (!$cast(resource_queue, resource_copy))
       return rdma_status::make(RDMA_SC_INVALID_STATE, "queue resource cast failed");
-    role_count = 0;
-    foreach (resource_queue.queue_plan.flush_targets[i]) begin
-      if (resource_queue.queue_plan.flush_targets[i] != null &&
-          resource_queue.queue_plan.flush_targets[i].role == role) begin
-        role_count++;
-        target_index = i;
-      end
-    end
+    // Establish the authoritative snapshot's role cardinality before any
+    // recovery comparison can dereference target_index.  A missing or
+    // duplicated local role is an argument error and must not be masked by a
+    // malformed recovery snapshot.
+    role_count = queue_flush_role_count(resource_queue.queue_plan, role,
+                                         target_index);
+    if (role_count != 1)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "queue flush role is absent, duplicated, or complete"
+      );
     recovery_role_count = 0;
     if (has_recovery) begin
-      foreach (recovery_copy.queue_plan.flush_targets[i]) begin
-        if (recovery_copy.queue_plan.flush_targets[i] != null &&
-            recovery_copy.queue_plan.flush_targets[i].role == role) begin
-          recovery_role_count++;
-          recovery_target_index = i;
-        end
-      end
+      recovery_role_count = queue_flush_role_count(
+        recovery_copy.queue_plan, role, recovery_target_index
+      );
       if (recovery_role_count != 1 ||
           recovery_copy.queue_plan.flush_targets[recovery_target_index].flush_complete ||
           recovery_copy.queue_plan.flush_targets[recovery_target_index].pd_ref == null ||
@@ -6650,7 +7138,7 @@ class rdma_resource_manager extends uvm_object;
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "recovery flush role authority diverged");
     end
-    if (role_count != 1 || resource_queue.queue_plan.flush_targets[target_index].flush_complete)
+    if (resource_queue.queue_plan.flush_targets[target_index].flush_complete)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue flush role is absent, duplicated, or complete");
     foreach (resource_queue.queue_plan.flush_targets[i]) begin
@@ -6689,10 +7177,19 @@ class rdma_resource_manager extends uvm_object;
                                  "queue flush progress");
   endfunction
 
-  // 功能：在 rdma_resource_manager 中，record_queue_cleanup_complete 记录 record_queue_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
-  // 输入/输出及副作用：handle（输入）、role（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
-  //   返回结果。
-  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
+  // 设计：cleanup progress 以 backing role 为逻辑身份，而非 refs 数组位置；ERROR
+  //   recovery 必须与 authoritative ref 逐字段、逐 authority 对齐。先建立本地唯一
+  //   ref 索引，再做 recovery compare，才能保证异常 role 不会解引用未初始化下标。
+  // 功能：record_queue_cleanup_complete 为指定 queue backing role 记录 control-plane
+  //   cleanup，校验 ownership、recovery authority 及 SRQ SGB 所需的 SRFQ flush 前置，
+  //   成功后原子更新 authoritative/recovery 两份 cleanup_complete 位。
+  // 输入/输出及副作用：handle、role（输入）；函数读取并投影 queue progress 快照，
+  //   成功时通过 commit_queue_progress 发布对应 refs[*].cleanup_complete，未接管
+  //   mapping、segment 或其他外部 backing 的生命周期。
+  // 失败/边界：基础 queue/recovery 快照无效时传播其状态；authoritative role 缺失/重复、
+  //   已清理或非 CONTROL_PLANE 返回 INVALID_ARGUMENT；recovery role/authority 不唯一、
+  //   SRFQ flush 未完成或 predecessor 不满足返回 INVALID_STATE；所有拒绝均保持原
+  //   registry/recovery progress 不变。
   virtual function rdma_status record_queue_cleanup_complete(
     rdma_handle handle,
     rdma_queue_backing_role_e role
@@ -6717,23 +7214,22 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok()) return status;
     if (!$cast(resource_queue, resource_copy))
       return rdma_status::make(RDMA_SC_INVALID_STATE, "queue resource cast failed");
-    role_count = 0;
-    foreach (resource_queue.queue_plan.refs[i]) begin
-      if (resource_queue.queue_plan.refs[i] != null &&
-          resource_queue.queue_plan.refs[i].role == role) begin
-        role_count++;
-        ref_index = i;
-      end
-    end
+    // Establish the authoritative snapshot's role cardinality before any
+    // recovery comparison can dereference ref_index.  A missing or duplicated
+    // local role remains an argument error and cannot be converted into a
+    // recovery authority result by an uninitialized array index.
+    role_count = queue_ref_role_count(resource_queue.queue_plan, role,
+                                       ref_index);
+    if (role_count != 1)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "queue cleanup role is not uniquely owned and pending"
+      );
     recovery_role_count = 0;
     if (has_recovery) begin
-      foreach (recovery_copy.queue_plan.refs[i]) begin
-        if (recovery_copy.queue_plan.refs[i] != null &&
-            recovery_copy.queue_plan.refs[i].role == role) begin
-          recovery_role_count++;
-          recovery_ref_index = i;
-        end
-      end
+      recovery_role_count = queue_ref_role_count(
+        recovery_copy.queue_plan, role, recovery_ref_index
+      );
       if (recovery_role_count != 1 ||
           recovery_copy.queue_plan.refs[recovery_ref_index].cleanup_complete ||
           recovery_copy.queue_plan.refs[recovery_ref_index].ownership !=
@@ -6749,7 +7245,7 @@ class rdma_resource_manager extends uvm_object;
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "recovery cleanup role authority diverged");
     end
-    if (role_count != 1 || resource_queue.queue_plan.refs[ref_index].cleanup_complete ||
+    if (resource_queue.queue_plan.refs[ref_index].cleanup_complete ||
         resource_queue.queue_plan.refs[ref_index].ownership !=
           RDMA_OWNERSHIP_CONTROL_PLANE)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -6798,15 +7294,25 @@ class rdma_resource_manager extends uvm_object;
                                  "queue cleanup progress");
   endfunction
 
-  // 功能：在 rdma_resource_manager 中，record_queue_context_cleanup_complete 记录 record_queue_context_cleanup_complete 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
-  // 输入/输出及副作用：handle（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-  // 失败/边界：记录操作仅影响测试 trace；不得因注入记录故障改变生产状态或吞掉真实错误。
+  // 功能：record_queue_context_cleanup_complete 为 QUIESCING/ERROR 的 CQ、SRQ、
+  //   CEQ 或 AEQ queue 记录 context backing 的本地释放完成位；ERROR 路径同时
+  //   证明 authoritative 与 recovery context authority 对齐，再以双快照提交进度。
+  // 输入/输出及副作用：handle（输入）定位 queue registry；函数先读取 detached
+  //   resource/recovery snapshot，再在两份 candidate 的 context_ref 上置位
+  //   release_complete 并调用 commit_queue_progress；成功返回 OK，不取得 context、
+  //   HMC 或外部 backing 的生命周期所有权。
+  // 失败/边界：handle 不存在、queue 状态/plan 无效、authoritative context 缺失或已
+  //   完成返回 INVALID_ARGUMENT/INVALID_STATE；ERROR recovery context presence、
+  //   slot-token、completion_authority、owner/resource定位、shadow/HMC 值不一致或
+  //   任一 release_complete 已置位时拒绝，且所有拒绝均在 commit 前保持 registry 与
+  //   recovery progress 不变。
   virtual function rdma_status record_queue_context_cleanup_complete(
     rdma_handle handle
   );
     rdma_resource resource_copy;
     rdma_recovery_record recovery_copy;
     rdma_queue_resource resource_queue;
+    rdma_context_backing_ref recovery_context;
     rdma_status status;
     bit has_recovery;
     string key;
@@ -6815,17 +7321,27 @@ class rdma_resource_manager extends uvm_object;
                                       resource_copy, recovery_copy, has_recovery);
     if (!status.ok()) return status;
     if (!$cast(resource_queue, resource_copy) ||
-        resource_queue.queue_plan.context_ref == null ||
-        resource_queue.queue_plan.context_ref.release_complete)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "queue context cleanup is absent or complete");
-    // Context release is the first local action, so its completion bit must
-    // stand on its own.  In particular, SRQ payload roles are released after
-    // this call; requiring SGB progress here would either invert the recipe
-    // or leave an already-released context unrecorded during recovery.
+        resource_queue.queue_plan == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE, "queue resource plan is unavailable"
+      );
+    recovery_context = null;
+    if (has_recovery && recovery_copy != null &&
+        recovery_copy.queue_plan != null)
+      recovery_context = recovery_copy.queue_plan.context_ref;
+    status = queue_context_progress_authority_status(
+      resource_queue.queue_plan.context_ref,
+      recovery_context,
+      has_recovery
+    );
+    if (!status.ok()) return status;
+    // context release 是 queue cleanup recipe 的第一项本地动作，完成位必须
+    // 独立记录；SRQ payload role 在本调用之后才释放，因此这里不能要求 SGB
+    // progress，否则会倒置 recipe 顺序，或让已物理释放的 context 无法在 recovery
+    // 中留下可重放的证据。
     resource_queue.queue_plan.context_ref.release_complete = 1'b1;
     if (has_recovery) begin
-      recovery_copy.queue_plan.context_ref.release_complete = 1'b1;
+      recovery_context.release_complete = 1'b1;
     end
     return commit_queue_progress(key, resource_copy, recovery_copy, has_recovery,
                                  "queue context progress");
@@ -6854,17 +7370,319 @@ class rdma_resource_manager extends uvm_object;
   );
   endfunction
 
-  // 功能：在 rdma_resource_manager 中，restore_active 执行 restore_active 的restore_active 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：handle（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：restore_active 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+  // 设计：MR 进入 ERROR 后只能在硬件仍存在、没有待执行破坏性步骤，且
+  // registry 与 recovery 仍共享同一 backing/HMC authority 时恢复 ACTIVE。
+  // opaque release query 只在这里读取 adapter 封存的完成事实；helper 不写
+  // registry、recovery 或 mapping，调用方仍负责在成功后按原顺序发布状态。
+  // 功能：mr_restore_authority_status 按 restore_active 原有拒绝顺序校验 MR ERROR
+  // recovery 的硬件存在性、进度、backing/HMC cardinality、值 authority 及 owned
+  // mapping 的 opaque release 状态，返回可供 caller 继续恢复 ACTIVE 的 status。
+  // 输入/输出及副作用：authoritative（输入）是 registry 中仍由 manager 拥有的 MR
+  // 快照，recovery（输入）是对应 ERROR recovery 记录；函数只读两份快照并通过
+  // query_owned_release_completion 读取 adapter 封存完成证明，不修改 registry、
+  // recovery、mapping 或外部资源所有权，返回 rdma_status。
+  // 失败/边界：调用方必须先确认 key 存在、资源为 MR 且 recovery record 已登记；本
+  // helper 保留原有拒绝顺序和错误文本，覆盖 null/硬件状态/待处理步骤、reference
+  // cardinality、backing/HMC authority 变化以及 authoritative/recovery owned
+  // backing 已释放等分支；opaque query 返回 null/失败或 complete 时按原错误拒绝。
+  protected function rdma_status mr_restore_authority_status(
+    rdma_resource authoritative,
+    rdma_recovery_record recovery
+  );
+    rdma_status status;
+    bit authoritative_release_complete;
+    bit recovery_release_complete;
+
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.ambiguous_ticket != null ||
+        recovery.pending_steps.size() != 0 ||
+        !(recovery.completed_steps.size() == 0 ||
+          (recovery.completed_steps.size() == 1 &&
+           recovery.completed_steps[0] == RDMA_CTRL_STEP_HW_OCC_FLUSHED)))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR MR recovery is not safe to restore ACTIVE"
+      );
+    if (authoritative.backing_refs.size() != recovery.backing_refs.size() ||
+        authoritative.hmc_refs.size() != recovery.hmc_refs.size())
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR MR recovery reference cardinality changed"
+      );
+    foreach (authoritative.backing_refs[i]) begin
+      if (authoritative.backing_refs[i] == null ||
+          recovery.backing_refs[i] == null ||
+          authoritative.backing_refs[i].mapping == null ||
+          recovery.backing_refs[i].mapping == null ||
+          authoritative.backing_refs[i].ownership !=
+            recovery.backing_refs[i].ownership ||
+          authoritative.backing_refs[i].release_complete ||
+          recovery.backing_refs[i].release_complete ||
+          !same_mapping_value(
+            authoritative.backing_refs[i].mapping,
+            recovery.backing_refs[i].mapping
+          ) ||
+          authoritative.backing_refs[i].mapping.state != RDMA_MAPPING_ACTIVE)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "ERROR MR recovery backing authority changed"
+        );
+      if (authoritative.backing_refs[i].ownership ==
+            RDMA_OWNERSHIP_CONTROL_PLANE) begin
+        if (!same_owned_mapping_authority(
+              authoritative.backing_refs[i].mapping,
+              recovery.backing_refs[i].mapping
+            ))
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR MR owned backing release authority changed"
+          );
+        status = query_owned_release_completion(
+          authoritative.backing_refs[i].mapping,
+          authoritative_release_complete
+        );
+        if (status == null || !status.ok() ||
+            authoritative_release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR MR authoritative owned backing was released"
+          );
+        status = query_owned_release_completion(
+          recovery.backing_refs[i].mapping, recovery_release_complete
+        );
+        if (status == null || !status.ok() || recovery_release_complete)
+          return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "ERROR MR recovery owned backing was released"
+          );
+      end
+    end
+    foreach (authoritative.hmc_refs[i]) begin
+      if (authoritative.hmc_refs[i] == null ||
+          recovery.hmc_refs[i] == null ||
+          !same_mapping_handle_value(
+            authoritative.hmc_refs[i].owner,
+            recovery.hmc_refs[i].owner
+          ) ||
+          authoritative.hmc_refs[i].object_kind !=
+            recovery.hmc_refs[i].object_kind ||
+          authoritative.hmc_refs[i].address != recovery.hmc_refs[i].address ||
+          authoritative.hmc_refs[i].size != recovery.hmc_refs[i].size ||
+          authoritative.hmc_refs[i].first_pbl_index !=
+            recovery.hmc_refs[i].first_pbl_index ||
+          authoritative.hmc_refs[i].index_valid !=
+            recovery.hmc_refs[i].index_valid ||
+          authoritative.hmc_refs[i].ownership != recovery.hmc_refs[i].ownership ||
+          authoritative.hmc_refs[i].release_complete ||
+          recovery.hmc_refs[i].release_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "ERROR MR recovery HMC authority changed"
+        );
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 设计：queue 进入 ERROR 后只能在硬件仍存在、没有本地破坏性 cleanup，且
+  // registry 与 recovery 仍共享同一 queue backing/context authority 时恢复 ACTIVE。
+  // 该 helper 只做 recovery/authoritative plan 的只读证明；replacement 投影、SRQ
+  // flush-bit reset、validate 与 registry/recovery 发布仍由 restore_active 按原顺序负责。
+  // 功能：queue_restore_authority_status 按 restore_active 原有拒绝顺序校验 lifecycle
+  //   queue ERROR recovery 的 shape、backing role 唯一性、mapping/HMC authority 与
+  //   control-plane-owned opaque release completion，返回可继续构造 replacement 的 status。
+  // 输入/输出及副作用：authoritative（输入）是 registry 中仍由 manager 拥有的 queue
+  //   快照，recovery（输入）是对应 ERROR recovery 记录；函数只读两份快照，并通过
+  //   query_owned_release_completion 读取 adapter 封存完成证明，不修改 registry、
+  //   recovery、queue plan、mapping 或外部资源所有权，也不写 SRQ flush progress。
+  // 失败/边界：调用方必须先完成 staged/recovery-record 存在性门禁并传入 lifecycle
+  //   queue；本 helper 依次保留 recovery presence/ambiguity/plan、destructive cleanup、
+  //   authoritative plan shape、每个 backing role 的唯一匹配与 value/mapping 状态、
+  //   owned backing/segment release proof 以及 context/HMC authority 的原错误文本和
+  //   首错顺序；任一拒绝直接返回 INVALID_STATE，opaque query 为 null/失败或已完成
+  //   时同样拒绝，成功只返回 rdma_status::success()。
+  protected function rdma_status queue_restore_authority_status(
+    rdma_resource authoritative,
+    rdma_recovery_record recovery
+  );
+    rdma_queue_resource authoritative_queue;
+    rdma_status status;
+    bit destructive_cleanup;
+    int unsigned recovery_ref_count;
+    bit release_complete;
+
+    if (recovery == null || !recovery.queue_recovery_valid ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        recovery.ambiguous_ticket != null || recovery.queue_plan == null ||
+        recovery.queue_plan.resource_kind != authoritative.handle.kind)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR queue recovery is not present and unambiguous"
+      );
+    destructive_cleanup = recovery.queue_plan.context_ref != null &&
+                          recovery.queue_plan.context_ref.release_complete;
+    foreach (recovery.queue_plan.refs[i]) begin
+      if (recovery.queue_plan.refs[i] != null &&
+          recovery.queue_plan.refs[i].cleanup_complete)
+        destructive_cleanup = 1'b1;
+    end
+    if (destructive_cleanup)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR queue recovery includes destructive local cleanup"
+      );
+    if (!$cast(authoritative_queue, authoritative) ||
+        authoritative_queue.queue_plan == null ||
+        authoritative_queue.queue_plan.refs.size() !=
+          recovery.queue_plan.refs.size() ||
+        ((authoritative_queue.queue_plan.context_ref == null) !=
+         (recovery.queue_plan.context_ref == null)))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR queue authoritative plan diverged from recovery"
+      );
+    foreach (authoritative_queue.queue_plan.refs[i]) begin
+      recovery_ref_count = 0;
+      foreach (recovery.queue_plan.refs[j]) begin
+        if (recovery.queue_plan.refs[j] != null &&
+            authoritative_queue.queue_plan.refs[i] != null &&
+            recovery.queue_plan.refs[j].role ==
+              authoritative_queue.queue_plan.refs[i].role) begin
+          recovery_ref_count++;
+          if (recovery.queue_plan.refs[j].cleanup_complete ||
+              authoritative_queue.queue_plan.refs[i].cleanup_complete ||
+              !same_queue_backing_ref_value(
+                recovery.queue_plan.refs[j],
+                authoritative_queue.queue_plan.refs[i]
+              ) ||
+              recovery.queue_plan.refs[j].mapping == null ||
+              recovery.queue_plan.refs[j].mapping.state != RDMA_MAPPING_ACTIVE)
+            return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "ERROR queue backing cleanup or authority changed"
+            );
+          if (recovery.queue_plan.refs[j].ownership ==
+                RDMA_OWNERSHIP_CONTROL_PLANE) begin
+            if (!same_owned_queue_backing_ref_authority(
+                  authoritative_queue.queue_plan.refs[i],
+                  recovery.queue_plan.refs[j]
+                ))
+              return rdma_status::make(
+                RDMA_SC_INVALID_STATE,
+                "ERROR queue owned backing release authority changed"
+              );
+            status = query_owned_release_completion(
+              recovery.queue_plan.refs[j].mapping, release_complete
+            );
+            if (status == null || !status.ok() || release_complete)
+              return rdma_status::make(
+                RDMA_SC_INVALID_STATE,
+                "ERROR queue recovery backing was released"
+              );
+            status = query_owned_release_completion(
+              authoritative_queue.queue_plan.refs[i].mapping, release_complete
+            );
+            if (status == null || !status.ok() || release_complete)
+              return rdma_status::make(
+                RDMA_SC_INVALID_STATE,
+                "ERROR queue authoritative backing was released"
+              );
+            foreach (recovery.queue_plan.refs[j].additional_segments[k]) begin
+              if (recovery.queue_plan.refs[j].additional_segments[k] == null ||
+                  authoritative_queue.queue_plan.refs[i].
+                    additional_segments[k] == null ||
+                  recovery.queue_plan.refs[j].additional_segments[k].mapping ==
+                    null ||
+                  authoritative_queue.queue_plan.refs[i].
+                    additional_segments[k].mapping == null ||
+                  recovery.queue_plan.refs[j].additional_segments[k].
+                    mapping.state != RDMA_MAPPING_ACTIVE ||
+                  authoritative_queue.queue_plan.refs[i].
+                    additional_segments[k].mapping.state !=
+                      RDMA_MAPPING_ACTIVE)
+                return rdma_status::make(
+                  RDMA_SC_INVALID_STATE,
+                  "ERROR queue backing segment authority changed"
+                );
+              status = query_owned_release_completion(
+                recovery.queue_plan.refs[j].additional_segments[k].mapping,
+                release_complete
+              );
+              if (status == null || !status.ok() || release_complete)
+                return rdma_status::make(
+                  RDMA_SC_INVALID_STATE,
+                  "ERROR queue recovery backing segment was released"
+                );
+              status = query_owned_release_completion(
+                authoritative_queue.queue_plan.refs[i].
+                  additional_segments[k].mapping,
+                release_complete
+              );
+              if (status == null || !status.ok() || release_complete)
+                return rdma_status::make(
+                  RDMA_SC_INVALID_STATE,
+                  "ERROR queue authoritative backing segment was released"
+                );
+            end
+          end
+        end
+      end
+      if (recovery_ref_count != 1)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "ERROR queue backing role is not unique");
+    end
+    if (recovery.queue_plan.context_ref != null &&
+        (recovery.queue_plan.context_ref.release_complete ||
+         authoritative_queue.queue_plan.context_ref.release_complete ||
+         recovery.queue_plan.context_ref.hmc_ref == null ||
+         authoritative_queue.queue_plan.context_ref.hmc_ref == null ||
+         recovery.queue_plan.context_ref.hmc_ref.release_complete ||
+         authoritative_queue.queue_plan.context_ref.hmc_ref.release_complete ||
+         recovery.queue_plan.context_ref.hmc_ref.address !=
+           authoritative_queue.queue_plan.context_ref.hmc_ref.address ||
+         recovery.queue_plan.context_ref.hmc_ref.size !=
+           authoritative_queue.queue_plan.context_ref.hmc_ref.size ||
+         recovery.queue_plan.context_ref.hmc_ref.first_pbl_index !=
+           authoritative_queue.queue_plan.context_ref.hmc_ref.first_pbl_index ||
+         recovery.queue_plan.context_ref.hmc_ref.index_valid !=
+           authoritative_queue.queue_plan.context_ref.hmc_ref.index_valid))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "ERROR queue context cleanup or authority changed"
+      );
+    return rdma_status::success();
+  endfunction
+
+  // 设计：SRQ 从 ERROR 或 QUIESCING 恢复时，旧 destroy 尝试可能只完成了部分 flush。
+  // 只允许清理 detached recovery/resource candidate 上的进度位，registry 中的 authority
+  // 必须等 candidate validate 成功后一次性替换，不能在 admission 阶段原地回退。
+  // 功能：clear_srq_flush_progress 把 detached SRQ backing plan 的全部 flush target
+  //   重置为未完成，使下一次 destroy 从同一组冻结 target 重新执行完整 flush 序列。
+  // 输入/输出及副作用：plan（输入）为调用方拥有的 detached candidate；函数原地清零
+  //   plan.flush_targets[*].flush_complete，不改 refs/context、registry、recovery_records 或外部 backing。
+  // 失败/边界：调用方必须已证明 plan 与每个 flush target 非空且属于 SRQ candidate；
+  //   本 void helper 不分配、不校验、不返回 status，空/畸形 graph 的拒绝仍由原 caller 顺序负责。
+  protected function void clear_srq_flush_progress(
+    rdma_queue_backing_plan plan
+  );
+    foreach (plan.flush_targets[i])
+      plan.flush_targets[i].flush_complete = 1'b0;
+  endfunction
+
+  // 功能：restore_active 将安全的 QUIESCING 资源，或带完整 recovery authority 的 ERROR
+  //   MR/lifecycle queue，恢复为新的 detached ACTIVE registry snapshot。
+  // 输入/输出及副作用：handle（输入）是非拥有查找键；成功时以 replacement 覆盖
+  //   registry[key]，ERROR 路径在发布后删除 recovery_records[key]，SRQ candidate 的 flush
+  //   progress 被清零；不释放或接管外部 mapping/backing。queue observer 只接收候选快照。
+  // 失败/边界：lookup/schema、staged allocation、MR/queue authority、projection/cast、
+  //   candidate validate 或状态门禁任一失败即返回原 status/明确 INVALID_STATE；registry 和
+  //   recovery_records 在最终发布点前保持不变，非 MR/lifecycle queue 的 ERROR 资源被拒绝。
   virtual function rdma_status restore_active(rdma_handle handle);
     rdma_resource authoritative;
     rdma_resource replacement;
     rdma_recovery_record recovery;
     rdma_recovery_record recovery_replacement;
     rdma_status status;
-    bit authoritative_release_complete;
-    bit recovery_release_complete;
     string key;
 
     status = lookup(handle, authoritative);
@@ -6876,254 +7694,26 @@ class rdma_resource_manager extends uvm_object;
       if (!status.ok())
         return status;
       if (authoritative.handle.kind == RDMA_RESOURCE_MR) begin
-      if (staged_allocations.exists(key) || !recovery_records.exists(key))
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "ERROR restore requires an unstaged MR recovery record"
-        );
-      recovery = recovery_records[key];
-      if (recovery == null ||
-          recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
-          recovery.ambiguous_ticket != null ||
-          recovery.pending_steps.size() != 0 ||
-          !(recovery.completed_steps.size() == 0 ||
-            (recovery.completed_steps.size() == 1 &&
-             recovery.completed_steps[0] ==
-               RDMA_CTRL_STEP_HW_OCC_FLUSHED)))
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "ERROR MR recovery is not safe to restore ACTIVE"
-        );
-      if (registry[key].backing_refs.size() !=
-            recovery.backing_refs.size() ||
-          registry[key].hmc_refs.size() != recovery.hmc_refs.size())
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "ERROR MR recovery reference cardinality changed"
-        );
-      foreach (registry[key].backing_refs[i]) begin
-        if (registry[key].backing_refs[i] == null ||
-            recovery.backing_refs[i] == null ||
-            registry[key].backing_refs[i].mapping == null ||
-            recovery.backing_refs[i].mapping == null ||
-            registry[key].backing_refs[i].ownership !=
-              recovery.backing_refs[i].ownership ||
-            registry[key].backing_refs[i].release_complete ||
-            recovery.backing_refs[i].release_complete ||
-            !same_mapping_value(
-              registry[key].backing_refs[i].mapping,
-              recovery.backing_refs[i].mapping
-            ) ||
-            registry[key].backing_refs[i].mapping.state !=
-              RDMA_MAPPING_ACTIVE)
+        if (staged_allocations.exists(key) || !recovery_records.exists(key))
           return rdma_status::make(
             RDMA_SC_INVALID_STATE,
-            "ERROR MR recovery backing authority changed"
+            "ERROR restore requires an unstaged MR recovery record"
           );
-        if (registry[key].backing_refs[i].ownership ==
-              RDMA_OWNERSHIP_CONTROL_PLANE) begin
-          if (!same_owned_mapping_authority(
-                registry[key].backing_refs[i].mapping,
-                recovery.backing_refs[i].mapping
-              ))
-            return rdma_status::make(
-              RDMA_SC_INVALID_STATE,
-              "ERROR MR owned backing release authority changed"
-            );
-          status = query_owned_release_completion(
-            registry[key].backing_refs[i].mapping,
-            authoritative_release_complete
-          );
-          if (status == null || !status.ok() ||
-              authoritative_release_complete)
-            return rdma_status::make(
-              RDMA_SC_INVALID_STATE,
-              "ERROR MR authoritative owned backing was released"
-            );
-          status = query_owned_release_completion(
-            recovery.backing_refs[i].mapping, recovery_release_complete
-          );
-          if (status == null || !status.ok() || recovery_release_complete)
-            return rdma_status::make(
-              RDMA_SC_INVALID_STATE,
-              "ERROR MR recovery owned backing was released"
-            );
-        end
+        recovery = recovery_records[key];
+        status = mr_restore_authority_status(registry[key], recovery);
+        if (!status.ok())
+          return status;
       end
-      foreach (registry[key].hmc_refs[i]) begin
-        if (registry[key].hmc_refs[i] == null ||
-            recovery.hmc_refs[i] == null ||
-            !same_mapping_handle_value(
-              registry[key].hmc_refs[i].owner,
-              recovery.hmc_refs[i].owner
-            ) ||
-            registry[key].hmc_refs[i].object_kind !=
-              recovery.hmc_refs[i].object_kind ||
-            registry[key].hmc_refs[i].address !=
-              recovery.hmc_refs[i].address ||
-            registry[key].hmc_refs[i].size != recovery.hmc_refs[i].size ||
-            registry[key].hmc_refs[i].first_pbl_index !=
-              recovery.hmc_refs[i].first_pbl_index ||
-            registry[key].hmc_refs[i].ownership !=
-              recovery.hmc_refs[i].ownership ||
-            registry[key].hmc_refs[i].release_complete ||
-            recovery.hmc_refs[i].release_complete)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "ERROR MR recovery HMC authority changed"
-          );
-      end
-      end
-      else if (authoritative.handle.kind inside {RDMA_RESOURCE_CQ,
-                                                  RDMA_RESOURCE_SRQ,
-                                                  RDMA_RESOURCE_CEQ,
-                                                  RDMA_RESOURCE_AEQ}) begin
-        rdma_queue_resource authoritative_queue;
-        bit destructive_cleanup;
-        int unsigned recovery_ref_count;
-        bit release_complete;
-
+      else if (lifecycle_queue_kind(authoritative.handle.kind)) begin
         if (staged_allocations.exists(key) || !recovery_records.exists(key))
           return rdma_status::make(
             RDMA_SC_INVALID_STATE,
             "ERROR queue restore requires an unstaged queue recovery record"
           );
         recovery = recovery_records[key];
-        if (recovery == null || !recovery.queue_recovery_valid ||
-            recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
-            recovery.ambiguous_ticket != null || recovery.queue_plan == null ||
-            recovery.queue_plan.resource_kind != authoritative.handle.kind)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "ERROR queue recovery is not present and unambiguous"
-          );
-        destructive_cleanup = recovery.queue_plan.context_ref != null &&
-                              recovery.queue_plan.context_ref.release_complete;
-        foreach (recovery.queue_plan.refs[i]) begin
-          if (recovery.queue_plan.refs[i] != null &&
-              recovery.queue_plan.refs[i].cleanup_complete)
-            destructive_cleanup = 1'b1;
-        end
-        if (destructive_cleanup)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "ERROR queue recovery includes destructive local cleanup"
-          );
-        if (!$cast(authoritative_queue, registry[key]) ||
-            authoritative_queue.queue_plan == null ||
-            authoritative_queue.queue_plan.refs.size() !=
-              recovery.queue_plan.refs.size() ||
-            ((authoritative_queue.queue_plan.context_ref == null) !=
-             (recovery.queue_plan.context_ref == null)))
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "ERROR queue authoritative plan diverged from recovery"
-          );
-        foreach (authoritative_queue.queue_plan.refs[i]) begin
-          recovery_ref_count = 0;
-          foreach (recovery.queue_plan.refs[j]) begin
-            if (recovery.queue_plan.refs[j] != null &&
-                authoritative_queue.queue_plan.refs[i] != null &&
-                recovery.queue_plan.refs[j].role ==
-                  authoritative_queue.queue_plan.refs[i].role) begin
-              recovery_ref_count++;
-              if (recovery.queue_plan.refs[j].cleanup_complete ||
-                  authoritative_queue.queue_plan.refs[i].cleanup_complete ||
-                  !same_queue_backing_ref_value(
-                    recovery.queue_plan.refs[j],
-                    authoritative_queue.queue_plan.refs[i]
-                  ) ||
-                  recovery.queue_plan.refs[j].mapping == null ||
-                  recovery.queue_plan.refs[j].mapping.state != RDMA_MAPPING_ACTIVE)
-                return rdma_status::make(
-                  RDMA_SC_INVALID_STATE,
-                  "ERROR queue backing cleanup or authority changed"
-                );
-              if (recovery.queue_plan.refs[j].ownership ==
-                    RDMA_OWNERSHIP_CONTROL_PLANE) begin
-                if (!same_owned_queue_backing_ref_authority(
-                      authoritative_queue.queue_plan.refs[i],
-                      recovery.queue_plan.refs[j]
-                    ))
-                  return rdma_status::make(
-                    RDMA_SC_INVALID_STATE,
-                    "ERROR queue owned backing release authority changed"
-                  );
-                status = query_owned_release_completion(
-                  recovery.queue_plan.refs[j].mapping, release_complete
-                );
-                if (status == null || !status.ok() || release_complete)
-                  return rdma_status::make(
-                    RDMA_SC_INVALID_STATE,
-                    "ERROR queue recovery backing was released"
-                  );
-                status = query_owned_release_completion(
-                  authoritative_queue.queue_plan.refs[i].mapping, release_complete
-                );
-                if (status == null || !status.ok() || release_complete)
-                  return rdma_status::make(
-                    RDMA_SC_INVALID_STATE,
-                    "ERROR queue authoritative backing was released"
-                  );
-                foreach (recovery.queue_plan.refs[j].additional_segments[k]) begin
-                  if (recovery.queue_plan.refs[j].additional_segments[k] == null ||
-                      authoritative_queue.queue_plan.refs[i].
-                        additional_segments[k] == null ||
-                      recovery.queue_plan.refs[j].additional_segments[k].mapping ==
-                        null ||
-                      authoritative_queue.queue_plan.refs[i].
-                        additional_segments[k].mapping == null ||
-                      recovery.queue_plan.refs[j].additional_segments[k].
-                        mapping.state != RDMA_MAPPING_ACTIVE ||
-                      authoritative_queue.queue_plan.refs[i].
-                        additional_segments[k].mapping.state !=
-                          RDMA_MAPPING_ACTIVE)
-                    return rdma_status::make(
-                      RDMA_SC_INVALID_STATE,
-                      "ERROR queue backing segment authority changed"
-                    );
-                  status = query_owned_release_completion(
-                    recovery.queue_plan.refs[j].additional_segments[k].mapping,
-                    release_complete
-                  );
-                  if (status == null || !status.ok() || release_complete)
-                    return rdma_status::make(
-                      RDMA_SC_INVALID_STATE,
-                      "ERROR queue recovery backing segment was released"
-                    );
-                  status = query_owned_release_completion(
-                    authoritative_queue.queue_plan.refs[i].
-                      additional_segments[k].mapping,
-                    release_complete
-                  );
-                  if (status == null || !status.ok() || release_complete)
-                    return rdma_status::make(
-                      RDMA_SC_INVALID_STATE,
-                      "ERROR queue authoritative backing segment was released"
-                    );
-                end
-              end
-            end
-          end
-          if (recovery_ref_count != 1)
-            return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                     "ERROR queue backing role is not unique");
-        end
-        if (recovery.queue_plan.context_ref != null &&
-            (recovery.queue_plan.context_ref.release_complete ||
-             authoritative_queue.queue_plan.context_ref.release_complete ||
-             recovery.queue_plan.context_ref.hmc_ref == null ||
-             authoritative_queue.queue_plan.context_ref.hmc_ref == null ||
-             recovery.queue_plan.context_ref.hmc_ref.release_complete ||
-             authoritative_queue.queue_plan.context_ref.hmc_ref.release_complete ||
-             recovery.queue_plan.context_ref.hmc_ref.address !=
-               authoritative_queue.queue_plan.context_ref.hmc_ref.address ||
-             recovery.queue_plan.context_ref.hmc_ref.size !=
-               authoritative_queue.queue_plan.context_ref.hmc_ref.size))
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "ERROR queue context cleanup or authority changed"
-          );
+        status = queue_restore_authority_status(registry[key], recovery);
+        if (!status.ok())
+          return status;
         status = project_recovery_value(recovery, "restore queue recovery",
                                         recovery_replacement);
         if (!status.ok() || recovery_replacement == null)
@@ -7133,10 +7723,8 @@ class rdma_resource_manager extends uvm_object;
         recovery_replacement.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
         recovery_replacement.ambiguous_role = RDMA_QUEUE_ROLE_CQ_RING;
         recovery_replacement.ambiguous_ticket = null;
-        if (authoritative.handle.kind == RDMA_RESOURCE_SRQ) begin
-          foreach (recovery_replacement.queue_plan.flush_targets[i])
-            recovery_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
-        end
+        if (authoritative.handle.kind == RDMA_RESOURCE_SRQ)
+          clear_srq_flush_progress(recovery_replacement.queue_plan);
         status = recovery_replacement.validate();
         if (status == null)
           return rdma_status::make(
@@ -7160,8 +7748,7 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     if (authoritative.state == RDMA_RESOURCE_ERROR &&
-        authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-                                          RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) begin
+        lifecycle_queue_kind(authoritative.handle.kind)) begin
       rdma_queue_resource queue_replacement;
       rdma_queue_backing_plan restored_plan;
 
@@ -7176,10 +7763,8 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_STATE, "restored queue plan is missing"
         ) : status;
       queue_replacement.queue_plan = restored_plan;
-      if (authoritative.handle.kind == RDMA_RESOURCE_SRQ) begin
-        foreach (queue_replacement.queue_plan.flush_targets[i])
-          queue_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
-      end
+      if (authoritative.handle.kind == RDMA_RESOURCE_SRQ)
+        clear_srq_flush_progress(queue_replacement.queue_plan);
       replacement = queue_replacement;
     end
     // A failed pre-delete SRQ flush may leave the first progress bit set;
@@ -7193,14 +7778,12 @@ class rdma_resource_manager extends uvm_object;
           queue_replacement.queue_plan == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "restored SRQ plan is missing");
-      foreach (queue_replacement.queue_plan.flush_targets[i])
-        queue_replacement.queue_plan.flush_targets[i].flush_complete = 1'b0;
+      clear_srq_flush_progress(queue_replacement.queue_plan);
       replacement = queue_replacement;
     end
     replacement.state = RDMA_RESOURCE_ACTIVE;
     if (authoritative.state == RDMA_RESOURCE_ERROR &&
-        authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-                                          RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ})
+        lifecycle_queue_kind(authoritative.handle.kind))
       queue_restore_pre_validate_observer(replacement);
     status = replacement.validate();
     if (status == null)
@@ -7209,8 +7792,7 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     if (authoritative.state == RDMA_RESOURCE_ERROR &&
-        authoritative.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-                                          RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ})
+        lifecycle_queue_kind(authoritative.handle.kind))
       queue_restore_pre_publish_observer(recovery_replacement);
     registry[key] = replacement;
     if (authoritative.state == RDMA_RESOURCE_ERROR)
@@ -7218,12 +7800,16 @@ class rdma_resource_manager extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // Compare the durable progress portion of two recovery snapshots.  Calls
-  // that merely re-publish an identical ERROR snapshot are rejected, while a
-  // changed pending/completed bit or cleanup proof is accepted atomically.
-  // 功能：在 rdma_resource_manager 中由 same_queue_recovery_progress 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_queue_recovery_progress 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 设计：ERROR 重发布只接受可观察的 durable progress 变化；identity/authority 已由
+  // caller 单独校验，因此这里不能把完整 recovery snapshot 比较误作资源等价判断。
+  // 功能：same_queue_recovery_progress 比较 completed/pending step 序列、rollback
+  //   cardinality，以及 queue refs/flush/context 的 cleanup completion 位，判断两份 ERROR
+  //   snapshot 是否携带相同持久进度。
+  // 输入/输出及副作用：lhs、rhs（输入）为只读 recovery 引用；返回 bit，不更新 registry、
+  //   recovery_records、queue plan 或外部 adapter；rollback status 的内容刻意不参与比较。
+  // 失败/边界：任一 recovery 为 null、step/rollback 数量或 step 内容不同、plan 单边为空、
+  //   refs/flush 数量或 completion 位不同、嵌套 ref/target 单边为空、context presence/release
+  //   不同均返回 0；两侧 plan 同时为 null 时在已比较 step cardinality 后返回 1。
   protected function bit same_queue_recovery_progress(
     rdma_recovery_record lhs,
     rdma_recovery_record rhs
@@ -7400,8 +7986,7 @@ class rdma_resource_manager extends uvm_object;
         "ALLOCATED MR requires staged key authority before ERROR"
       );
     end
-    if (replacement.handle.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-                                        RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) begin
+    if (lifecycle_queue_kind(replacement.handle.kind)) begin
       rdma_queue_resource queue_replacement;
       rdma_queue_backing_plan authoritative_plan;
       rdma_queue_backing_plan recovery_plan;

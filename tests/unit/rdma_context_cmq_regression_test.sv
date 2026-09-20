@@ -367,7 +367,7 @@ class rdma_context_cmq_regression_test extends uvm_test;
     mrt = rdma_mrt_model::type_id::create(name);
     mrt.mr_h = make_handle({name, "_mr"}, RDMA_RESOURCE_MR, 24'hff_ffff);
     mrt.pd_h = make_handle({name, "_pd"}, RDMA_RESOURCE_PD, 16'hffff);
-    mrt.state = RDMA_CONTEXT_VALID;
+    mrt.state = RDMA_MR_STATE_VALID;
     mrt.iova.value = 64'hffff_ffff_ffff_ffff;
     mrt.length = 64'h0000_3fff_ffff_ffff;
     mrt.lkey = 32'hffff_ffff;
@@ -391,8 +391,13 @@ class rdma_context_cmq_regression_test extends uvm_test;
         mrt.page_layout.pba0.value = 64'hffff_ffff_ffff_f000;
         mrt.page_layout.pba1.value = 64'hffff_ffff_ffff_f000;
       end
-      RDMA_MR_PBL2:
+      RDMA_MR_PBL2: begin
         mrt.page_layout.first_pbl_index = 28'hfff_ffff;
+        mrt.page_layout.first_pbl_index_valid = 1'b1;
+      end
+      default: begin
+        // Keep the fixture total for an invalid or future PBL mode.
+      end
     endcase
     return mrt;
   endfunction
@@ -468,7 +473,6 @@ class rdma_context_cmq_regression_test extends uvm_test;
 
   // 功能：在 rdma_context_cmq_regression_test 中，body_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
   // 输入/输出及副作用：image_kind（输入）、object_type（输入）、variant（输入）、opcode（输入）；body_key 读取 image_kind、object_type、variant、opcode 并使用字段 key.hw_version、key.image_kind、key.object_type、key.variant、key.opcode；函数返回 rdma_codec_key，不取得调用方资源所有权。
-
 // 失败/边界：body_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   function automatic rdma_codec_key body_key(
     rdma_image_kind_e image_kind,
@@ -586,6 +590,7 @@ class rdma_context_cmq_regression_test extends uvm_test;
            lhs.pba0.value == rhs.pba0.value &&
            lhs.pba1.value == rhs.pba1.value &&
            lhs.first_pbl_index == rhs.first_pbl_index &&
+           lhs.first_pbl_index_valid == rhs.first_pbl_index_valid &&
            lhs.address_mode == rhs.address_mode && lhs.odp == rhs.odp &&
            lhs.invalidate_enable == rhs.invalidate_enable &&
            lhs.payload_vf_enable == rhs.payload_vf_enable &&
@@ -1164,7 +1169,6 @@ class rdma_context_cmq_regression_test extends uvm_test;
 
   // 功能：在 rdma_context_cmq_regression_test 中，literal_qpc_signature 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
   // 输入/输出及副作用：opcode（输入）、alternate_vf（输入）、command（输入）、qpc_source（输入）；literal_qpc_signature 读取 opcode、alternate_vf、command、qpc_source 并使用字段 signature、q、unsigned_word；函数返回 byte unsigned，不取得调用方资源所有权。
-
   // 失败/边界：literal_qpc_signature 先检查 q == 1，再返回 ~signature；拒绝分支不提交部分状态，也不隐式重试。
   function automatic byte unsigned literal_qpc_signature(
     bit [7:0] opcode,
@@ -1531,7 +1535,6 @@ class rdma_context_cmq_regression_test extends uvm_test;
 
   // 功能：在 rdma_context_cmq_regression_test 中，run_qpc_workflow 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：label（输入）、variant（输入）、source（输入）、golden（输入）、context_image（输出）、command_body（输出）、request（输出）；run_qpc_workflow 读取 label、variant、source、golden、context_image、command_body、request 并使用字段 context_image、command_body、request、source_snapshot、status、context_snapshot、decoded、decode_input_snapshot，并写入 context_image、command_body、request；函数返回 bit，不取得调用方资源所有权。
-
   // 失败/边界：run_qpc_workflow 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   function automatic bit run_qpc_workflow(
     string label,
@@ -1673,7 +1676,6 @@ class rdma_context_cmq_regression_test extends uvm_test;
 
   // 功能：在 rdma_context_cmq_regression_test 中，run_context_workflow 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：label（输入）、opcode（输入）、body_case（输入）、expected_kind（输入）、expected_generation（输入）、codec（输入）、source（输入）、golden（输入）、body（输出）、request（输出）；run_context_workflow 读取 label、opcode、body_case、expected_kind、expected_generation、codec、source、golden、body、request 并使用字段 body、request、source_snapshot、status、direct_body_snapshot、decoded、decode_input_snapshot、equal_source_snapshot，并写入 body、request；函数返回 bit，不取得调用方资源所有权。
-
   // 失败/边界：run_context_workflow 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   function automatic bit run_context_workflow(
     string label,

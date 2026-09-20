@@ -50,9 +50,26 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
+  // 功能：qpc_status_or_error 统一处理 QPC codec 与 builder 边界返回的状态，
+  //       把 null 转成可诊断的确定性失败。
+  // 输入/输出及副作用：status 和 label 为输入；非空状态原样返回，null 状态
+  //       转换为 INVALID_STATE；不修改 QPC、image、builder 或外部资源。
+  // 失败/边界：派生 codec、模型 validator 或后端 builder 违反非空状态契约时，
+  //       调用方必须停止当前阶段，不能继续访问 status.ok() 或 status.message。
+  protected function rdma_status qpc_status_or_error(
+    rdma_status status,
+    string label
+  );
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {label, " returned null status"}
+      );
+    return status;
+  endfunction
+
   // 功能：在 rdma_hw_qpc_codec_base 中，put 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
   // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输入）；put 读取 builder、word_byte_offset、lsb、width、value 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：put 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   protected function rdma_status put(
     rdma_hw_qword_builder builder,
@@ -62,7 +79,13 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     bit [63:0] value
   );
     rdma_status status;
+
+    if (builder == null)
+      return codec_error("QPC field authorship builder is null");
+
     status = builder.put_field(word_byte_offset, lsb, width, value);
+    status = qpc_status_or_error(status, "QPC field authorship");
+
     if (!status.ok())
       return codec_error({"QPC field authorship failed: ", status.message});
     return status;
@@ -80,16 +103,24 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     inout bit [63:0] value
   );
     rdma_status status;
+
+    if (builder == null)
+      return codec_error("QPC field extraction builder is null");
+
     status = builder.get_field(word_byte_offset, lsb, width, value);
+    status = qpc_status_or_error(status, "QPC field extraction");
+
     if (!status.ok())
       return codec_error({"QPC field extraction failed: ", status.message});
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，add_allowed_field 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：qword_index（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、mask（输入输出）；add_allowed_field 可能更新本对象明确拥有的状态，并写入 mask；函数返回 void，不取得调用方资源所有权。
-
-  // 失败/边界：add_allowed_field 无返回值，仅执行 width_mask=(width == 64) ? '1 : ((64'h1 << width) - 1)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：add_allowed_field 在 qpc_allowed_mask 构造阶段把一个 profile 字段的位范围并入
+  //   当前 qword 的软件可写掩码。
+  // 输入/输出及副作用：qword_index、word_byte_offset、lsb、width（输入），mask（inout）；
+  //   当 word_byte_offset 对应 qword 时只更新 mask，不创建对象或取得外部资源。
+  // 失败/边界：qword 不匹配时无操作；该 void helper 不报告错误，调用方必须提供 1..64 的
+  //   width 和有效 lsb，否则位移结果不具备协议意义。
   protected function void add_allowed_field(
     int unsigned qword_index,
     int unsigned word_byte_offset,
@@ -289,7 +320,7 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     foreach (words[i]) begin
       if (!qpc_decode_allowed_mask(transport, i, allowed))
         return codec_error("QPC decode mask lookup failed");
-      if ((words[i] & ~allowed) != 0)
+      if (!rdma_raw_qword_mask_is_valid(words[i], allowed))
         return codec_error($sformatf(
           "QPC qword %0d contains private reserved bits 0x%016x",
           i, words[i] & ~allowed));
@@ -442,7 +473,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
 
     if (qpc == null)
       return invalid_argument("QPC model is null");
-    status = qpc.validate();
+    status = qpc_status_or_error(
+      qpc.validate(), "QPC model validation"
+    );
     if (!status.ok())
       return invalid_argument({"QPC model is invalid: ", status.message});
     if (qpc.transport != expected_transport())
@@ -508,7 +541,14 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     payload = new[RDMA_QPC_BYTES];
     foreach (payload[i]) payload[i] = image.bytes[i];
     builder = new("qpc_validate_builder");
+    if (builder == null)
+      return codec_error("QPC image validation builder is null");
+
     status = builder.deserialize(payload);
+    status = qpc_status_or_error(
+      status, "QPC image deserialization"
+    );
+
     if (!status.ok()) return codec_error(status.message);
     return validate_qpc_decode_mask(builder, expected_transport());
   endfunction
@@ -559,6 +599,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     int unsigned sq_size;
     int unsigned rq_size;
     byte unsigned ip[];
+
+    if (qpc == null || builder == null)
+      return codec_error("QPC common encoder received a null input");
 
     case (qpc.transport)
       RDMA_TRANSPORT_RC: service_type = 0;
@@ -620,6 +663,8 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     ip = new[RDMA_QPC_DEST_IP_BYTES];
     foreach (ip[i]) ip[i] = qpc.address_vector.destination_ip[i];
     status = builder.put_memcpy(RDMA_QPC_DEST_IP_BYTE_OFFSET, ip);
+    status = qpc_status_or_error(status, "QPC destination IP authorship");
+
     if (!status.ok()) return codec_error(status.message);
     `QPC_PUT(RDMA_QPC_SQ_PBA, sq_page)
     `QPC_PUT(RDMA_QPC_SQ_SIZE, sq_size)
@@ -651,6 +696,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     int unsigned rq_size;
     int unsigned fwd_code;
     int unsigned icos;
+
+    if (builder == null || qpc == null)
+      return codec_error("QPC common decoder received a null input");
 
     case (expected_transport())
       RDMA_TRANSPORT_RC: service_expected = 0;
@@ -688,9 +736,13 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     `QPC_GET(RDMA_QPC_FC_EN, qpc.tx_flow_control)
     qpc.rx_flow_control = qpc.tx_flow_control;
     `QPC_GET(RDMA_QPC_QP_ST, state_code)
-    status = decode_state(state_code, qpc.state); if (!status.ok()) return status;
+    status = decode_state(state_code, qpc.state);
+    if (!status.ok())
+      return status;
     `QPC_GET(RDMA_QPC_PMTU, pmtu_code)
-    status = decode_pmtu(pmtu_code, qpc.path_mtu_bytes); if (!status.ok()) return status;
+    status = decode_pmtu(pmtu_code, qpc.path_mtu_bytes);
+    if (!status.ok())
+      return status;
     `QPC_GET(RDMA_QPC_QP_SN, qpc.qp_sequence)
     `QPC_GET(RDMA_QPC_PD_IDX, sq_size)
     qpc.pd_h = projected_handle("decoded_pd", RDMA_RESOURCE_PD, sq_size);
@@ -722,7 +774,8 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     value = '0;
     status = get(builder, RDMA_QPC_ECN_WORD_BYTE_OFFSET,
                  RDMA_QPC_ECN_LSB, RDMA_QPC_ECN_WIDTH, value);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
     qpc.address_vector.traffic_class |= value[1:0];
     if (icos != qpc.address_vector.traffic_class[7:5])
       return codec_error("QPC ICOS does not mirror traffic class");
@@ -738,7 +791,8 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     value = '0;
     status = get(builder, RDMA_QPC_SQ_OM_WORD_BYTE_OFFSET,
                  RDMA_QPC_SQ_OM_LSB, RDMA_QPC_SQ_OM_WIDTH, value);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
     qpc.sq_mode = rdma_object_mode_e'(value[1:0]);
     `QPC_GET(RDMA_QPC_SQ_CQN, sq_size)
     qpc.send_cq_h = projected_handle("decoded_send_cq", RDMA_RESOURCE_CQ, sq_size);
@@ -751,7 +805,8 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     value = '0;
     status = get(builder, RDMA_QPC_RQ_OM_WORD_BYTE_OFFSET,
                  RDMA_QPC_RQ_OM_LSB, RDMA_QPC_RQ_OM_WIDTH, value);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
     qpc.rq_mode = rdma_object_mode_e'(value[1:0]);
 `undef QPC_GET
     return rdma_status::success();
@@ -772,18 +827,36 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
 
     image = null;
     status = validate_model(model);
-    if (!status.ok()) return status;
+    status = qpc_status_or_error(status, "QPC model validation");
+
+    if (!status.ok())
+      return status;
     if (!$cast(qpc, model))
       return invalid_argument("rdma QPC model cast failed");
     builder = new("qpc_encode_builder");
+    if (builder == null)
+      return codec_error("QPC encode builder is null");
+
     status = builder.reset(RDMA_QPC_BYTES);
+    status = qpc_status_or_error(status, "QPC encode builder reset");
+
     if (!status.ok()) return codec_error(status.message);
-    status = encode_common(qpc, builder); if (!status.ok()) return status;
-    status = encode_extension(qpc, builder); if (!status.ok()) return status;
+    status = encode_common(qpc, builder);
+    status = qpc_status_or_error(status, "QPC common encoder");
+    if (!status.ok())
+      return status;
+    status = encode_extension(qpc, builder);
+    status = qpc_status_or_error(status, "QPC extension encoder");
+    if (!status.ok())
+      return status;
     status = validate_qpc_encode_mask(builder, qpc.transport);
+    status = qpc_status_or_error(status, "QPC encode mask validation");
+
     if (!status.ok()) return status;
     payload = new[0];
     status = builder.serialize(payload);
+    status = qpc_status_or_error(status, "QPC image serialization");
+
     if (!status.ok()) return codec_error(status.message);
 
     candidate = rdma_hw_image::type_id::create("rdma_qpc_image");
@@ -813,19 +886,37 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
 
     model = null;
     status = validate_image(image);
-    if (!status.ok()) return status;
+    status = qpc_status_or_error(status, "QPC image validation");
+
+    if (!status.ok())
+      return status;
     payload = new[RDMA_QPC_BYTES];
     foreach (payload[i]) payload[i] = image.bytes[i];
     builder = new("qpc_decode_builder");
+    if (builder == null)
+      return codec_error("QPC decode builder is null");
+
     status = builder.deserialize(payload);
+    status = qpc_status_or_error(status, "QPC image deserialization");
+
     if (!status.ok()) return codec_error(status.message);
     qpc = rdma_qpc_model::type_id::create("decoded_rdma_qpc");
-    status = decode_common(builder, payload, qpc); if (!status.ok()) return status;
-    status = decode_extension(builder, qpc); if (!status.ok()) return status;
-    status = qpc.validate();
+    status = decode_common(builder, payload, qpc);
+    status = qpc_status_or_error(status, "QPC common decoder");
+    if (!status.ok())
+      return status;
+    status = decode_extension(builder, qpc);
+    status = qpc_status_or_error(status, "QPC extension decoder");
+    if (!status.ok())
+      return status;
+    status = qpc_status_or_error(
+      qpc.validate(), "decoded QPC model validation"
+    );
     if (!status.ok())
       return codec_error({"decoded QPC semantics are invalid: ", status.message});
     status = validate_profile_model(qpc);
+    status = qpc_status_or_error(status, "decoded QPC profile validation");
+
     if (!status.ok())
       return codec_error({"decoded QPC profile is invalid: ", status.message});
     model = qpc;
@@ -988,14 +1079,18 @@ endclass
 class rdma_hw_qpc_rc_codec extends rdma_hw_qpc_codec_base;
   `uvm_object_utils(rdma_hw_qpc_rc_codec)
 
-  // 功能：构造 rdma_hw_qpc_rc_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_qpc_rc_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name = "rdma_hw_qpc_rc_codec"); super.new(name); endfunction
-  // 功能：在 rdma_hw_qpc_rc_codec 中，expected_transport 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_transport 返回 RC codec 固定的 RDMA_TRANSPORT_RC，不读取可变对象字段；函数返回 rdma_transport_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_transport 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
-  protected virtual function rdma_transport_e expected_transport(); return RDMA_TRANSPORT_RC; endfunction
+  // 功能：构造 RC QPC codec，初始化 UVM 对象身份并复用基础 QPC 布局工具。
+  // 输入/输出及副作用：name 是 UVM 实例名；new 只调用 super.new，不创建 QPC image、QP handle 或 backing 资源。
+  // 失败/边界：构造不验证 RC extension；缺失或类型错误的 extension 由 validate_model 在 encode 前拒绝。
+  function new(string name = "rdma_hw_qpc_rc_codec");
+    super.new(name);
+  endfunction
+  // 功能：返回该派生 codec 支持的固定 RC transport，供基础 QPC 校验选择对应字段图。
+  // 输入/输出及副作用：无显式参数；返回 RDMA_TRANSPORT_RC，不读取或修改 model、image、builder 或资源账本。
+  // 失败/边界：该访问器没有运行时失败分支；若调用方传入非 RC model，validate_model 会返回 INVALID_ARGUMENT。
+  protected virtual function rdma_transport_e expected_transport();
+    return RDMA_TRANSPORT_RC;
+  endfunction
 
   // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“RC QPC extension type is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
@@ -1004,7 +1099,10 @@ class rdma_hw_qpc_rc_codec extends rdma_hw_qpc_codec_base;
     rdma_status status;
     rdma_qpc_model qpc;
     rdma_qpc_rc_ext ext;
-    status = super.validate_model(model); if (!status.ok()) return status;
+    status = super.validate_model(model);
+    status = qpc_status_or_error(status, "RC QPC base model validation");
+    if (!status.ok())
+      return status;
     if (!$cast(qpc, model) || !$cast(ext, qpc.transport_ext))
       return invalid_argument("RC QPC extension type is invalid");
     if (ext.retry_count > 7 || ext.rnr_retry_count > 7)
@@ -1094,14 +1192,18 @@ endclass
 class rdma_hw_qpc_ud_codec extends rdma_hw_qpc_codec_base;
   `uvm_object_utils(rdma_hw_qpc_ud_codec)
 
-  // 功能：构造 rdma_hw_qpc_ud_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_qpc_ud_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name = "rdma_hw_qpc_ud_codec"); super.new(name); endfunction
-  // 功能：在 rdma_hw_qpc_ud_codec 中，expected_transport 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_transport 返回 UD codec 固定的 RDMA_TRANSPORT_UD，不读取可变对象字段；函数返回 rdma_transport_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_transport 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
-  protected virtual function rdma_transport_e expected_transport(); return RDMA_TRANSPORT_UD; endfunction
+  // 功能：构造 UD QPC codec，初始化 UVM 对象身份并复用基础 QPC 布局工具。
+  // 输入/输出及副作用：name 是 UVM 实例名；new 只调用 super.new，不创建 QPC image、QP handle 或 backing 资源。
+  // 失败/边界：构造不验证 UD extension；缺失或类型错误的 extension 由 validate_model 在 encode 前拒绝。
+  function new(string name = "rdma_hw_qpc_ud_codec");
+    super.new(name);
+  endfunction
+  // 功能：返回该派生 codec 支持的固定 UD transport，供基础 QPC 校验选择对应字段图。
+  // 输入/输出及副作用：无显式参数；返回 RDMA_TRANSPORT_UD，不读取或修改 model、image、builder 或资源账本。
+  // 失败/边界：该访问器没有运行时失败分支；若调用方传入非 UD model，validate_model 会返回 INVALID_ARGUMENT。
+  protected virtual function rdma_transport_e expected_transport();
+    return RDMA_TRANSPORT_UD;
+  endfunction
 
   // 功能：在 rdma_hw_qpc_ud_codec 中，encode_extension 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：qpc（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
@@ -1157,14 +1259,18 @@ endclass
 class rdma_hw_qpc_urc_codec extends rdma_hw_qpc_codec_base;
   `uvm_object_utils(rdma_hw_qpc_urc_codec)
 
-  // 功能：构造 rdma_hw_qpc_urc_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_qpc_urc_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name = "rdma_hw_qpc_urc_codec"); super.new(name); endfunction
-  // 功能：在 rdma_hw_qpc_urc_codec 中，expected_transport 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_transport 返回 URC codec 固定的 RDMA_TRANSPORT_URC，不读取可变对象字段；函数返回 rdma_transport_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_transport 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
-  protected virtual function rdma_transport_e expected_transport(); return RDMA_TRANSPORT_URC; endfunction
+  // 功能：构造 URC QPC codec，初始化 UVM 对象身份并复用基础 QPC 布局工具。
+  // 输入/输出及副作用：name 是 UVM 实例名；new 只调用 super.new，不创建 QPC image、QP handle 或 backing 资源。
+  // 失败/边界：构造不验证 URC queue extension；缺失或类型错误的 extension 由 validate_model 在 encode 前拒绝。
+  function new(string name = "rdma_hw_qpc_urc_codec");
+    super.new(name);
+  endfunction
+  // 功能：返回该派生 codec 支持的固定 URC transport，供基础 QPC 校验选择对应字段图。
+  // 输入/输出及副作用：无显式参数；返回 RDMA_TRANSPORT_URC，不读取或修改 model、image、builder 或资源账本。
+  // 失败/边界：该访问器没有运行时失败分支；若调用方传入非 URC model，validate_model 会返回 INVALID_ARGUMENT。
+  protected virtual function rdma_transport_e expected_transport();
+    return RDMA_TRANSPORT_URC;
+  endfunction
 
   // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“URC QPC queue extension is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
@@ -1193,7 +1299,8 @@ class rdma_hw_qpc_urc_codec extends rdma_hw_qpc_codec_base;
                               "URC SQ threshold", code); if (!status.ok()) return status;
     if ((ext.queues.dsq_backing.value >> 12) == 52'hfff_ffff_fffff)
       return invalid_argument("URC DSQ next page overflows 52 bits");
-    return super.validate_model(model);
+    status = super.validate_model(model);
+    return qpc_status_or_error(status, "URC QPC base model validation");
   endfunction
 
   // 功能：在 rdma_hw_qpc_urc_codec 中，encode_extension 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。

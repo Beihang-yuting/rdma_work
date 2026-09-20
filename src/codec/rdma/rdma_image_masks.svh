@@ -121,6 +121,20 @@ localparam bit [63:0] RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP [0:7] = '{
   64'h00000000001fffff, 64'h0, 64'h0, 64'h0,
   64'h0, 64'h0, 64'h0, 64'h0
 };
+// CQC_DELETE copies the first 56 bytes of the live CQC context into the
+// request body (cmq.c:489-505).  The request qword coordinates therefore map
+// qword1..7 to context qword0..6; context qword7 contains arm-only state and
+// is intentionally outside the delete wire contract.
+localparam bit [63:0] RDMA_CQC_DELETE_BODY_OWNERSHIP [0:7] = '{
+  64'h00000000001fffff,
+  64'hff0fffffffffffff,
+  64'hfffffffffffff8ff,
+  64'hfffffffffff8c701,
+  64'hf000000000ffffff,
+  64'h0000000000000fff,
+  64'hffffffffffffffc0,
+  64'h0000000f00ffffff
+};
 localparam bit [63:0] RDMA_EQ_OBJECT_ID_BODY_OWNERSHIP [0:7] = '{
   64'h0000000000000fff, 64'h0, 64'h0, 64'h0,
   64'h0, 64'h0, 64'h0, 64'h0
@@ -146,31 +160,31 @@ localparam bit [63:0] RDMA_SQ_WQE_INLINE_HEADER_MASK [0:7] = '{
   64'h0, 64'h0, 64'h0, 64'h0
 };
 localparam bit [63:0] RDMA_SQ_WQE_RC_BODY_MASK [0:7] = '{
-  64'h0, 64'hffffffffffffffff, 64'hff00ffff00000000,
+  64'h0, 64'hffffffffffffffff, 64'hffff0000ffffffff,
   64'hffffffffffffffff, 64'hfffffffffffffe00, 64'h0, 64'h0, 64'h0
 };
 localparam bit [63:0] RDMA_SQ_WQE_RC_INLINE_BODY_MASK [0:7] = '{
-  64'h0, 64'hffffffffffffffff, 64'hff00ffff00000000,
+  64'h0, 64'hffffffffffffffff, 64'hffff0000ffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff
 };
 localparam bit [63:0] RDMA_SQ_WQE_RC_DIRECT_SGE_BODY_MASK [0:7] = '{
-  64'h0, 64'hffffffffffffffff, 64'hff00ffff00000000,
+  64'h0, 64'hffffffffffffffff, 64'hffff0000ffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff
 };
 localparam bit [63:0] RDMA_SQ_WQE_UD_BODY_MASK [0:7] = '{
-  64'h0, 64'hfffffffffeffffff, 64'hffffffffffffffff,
+  64'h0, 64'hfffffffffdffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff
 };
 localparam bit [63:0] RDMA_SQ_WQE_ATOMIC_BODY_MASK [0:7] = '{
-  64'h0, 64'h00000000ffffffff, 64'hff00ffff00000000,
+  64'h0, 64'h00000000ffffffff, 64'hffff0000ffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff
 };
 localparam bit [63:0] RDMA_SQ_WQE_ATOMIC_FAA_BODY_MASK [0:7] = '{
-  64'h0, 64'h00000000ffffffff, 64'hff00ffff00000000,
+  64'h0, 64'h00000000ffffffff, 64'hffff0000ffffffff,
   64'hffffffffffffffff, 64'hffffffffffffffff, 64'hffffffffffffffff,
   64'hffffffffffffffff, 64'h0
 };
@@ -215,7 +229,9 @@ function automatic bit body_mask(
           mask = RDMA_MR_DEREGISTER_BODY_OWNERSHIP[qword_index];
         RDMA_OP_OCC_FLUSH:
           mask = RDMA_OCC_FLUSH_BODY_OWNERSHIP[qword_index];
-        RDMA_OP_CQC_DELETE, RDMA_OP_CQC_QUERY:
+        RDMA_OP_CQC_DELETE:
+          mask = RDMA_CQC_DELETE_BODY_OWNERSHIP[qword_index];
+        RDMA_OP_CQC_QUERY:
           mask = RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP[qword_index];
         RDMA_OP_CEQC_DELETE, RDMA_OP_CEQC_QUERY,
         RDMA_OP_AEQC_DELETE, RDMA_OP_AEQC_QUERY:

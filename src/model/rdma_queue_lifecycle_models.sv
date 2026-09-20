@@ -46,6 +46,24 @@ typedef enum bit [1:0] { RDMA_QUEUE_AMBIG_NONE,
                          RDMA_QUEUE_AMBIG_OCC_FLUSH }
   rdma_queue_ambiguous_operation_e;
 
+// 功能：rdma_queue_nested_status 将 queue lifecycle 模型依赖的嵌套 virtual
+//       validator 结果归一化为可安全消费的 rdma_status。
+// 输入/输出及副作用：status（输入）和 label（输入）；非空 status 原样返回，
+//       null status 转换为 INVALID_STATE，不修改任何 queue/backing 账本。
+// 失败/边界：null 表示下游扩展违反状态返回契约；调用方收到确定失败后不得
+//       继续读取嵌套对象或发布 ring/context authority。
+function automatic rdma_status rdma_queue_nested_status(
+  rdma_status status,
+  string label
+);
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      {label, " validation returned null status"}
+    );
+  return status;
+endfunction
+
 // 功能：rdma_queue_role_is_payload 根据 role 的 函数体条件 判断队列/角色/依赖条件，返回 bit 供上层选择分支；不修改运行时账本。
 // 输入/输出及副作用：role（输入）；rdma_queue_role_is_payload 读取 role 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
 // 失败/边界：rdma_queue_role_is_payload 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
@@ -120,9 +138,7 @@ endfunction
 
 // 功能：rdma_queue_queue_range_status 校验 mapping、offset、length、alignment 与当前对象状态的一致性，并显式处理“mapping is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：mapping（输入）、offset（输入）、length（输入）、alignment（输入）；rdma_queue_queue_range_status 读取 mapping、offset、length、alignment 并使用字段 rdma_status、value；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_queue_queue_range_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“mapping is null”“mapping is not active”；失败路径不提交部分状态或转移未声明资源。
-
 function automatic rdma_status rdma_queue_queue_range_status(
     rdma_dma_mapping mapping, longint unsigned offset, longint unsigned length,
     longint unsigned alignment);
@@ -217,7 +233,9 @@ class rdma_queue_slot_token_contract extends uvm_object;
   virtual function rdma_status validate();
     if (completion_authority == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "slot token authority missing");
-    return completion_authority.validate();
+    return rdma_queue_nested_status(
+      completion_authority.validate(), "slot token completion authority"
+    );
   endfunction
 endclass
 
@@ -348,7 +366,9 @@ class rdma_queue_backing_spec extends uvm_object;
       if (slices[i] == null || !rdma_queue_role_is_payload(slices[i].role))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "invalid borrowed payload role");
-      s = slices[i].validate();
+      s = rdma_queue_nested_status(
+        slices[i].validate(), "backing spec slice"
+      );
       if (!s.ok())
         return s;
     end
@@ -534,7 +554,9 @@ class rdma_queue_ring_layout extends uvm_object;
       if (pages[i].role != role)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "page role does not match ring role");
-      s = pages[i].validate();
+      s = rdma_queue_nested_status(
+        pages[i].validate(), "ring page"
+      );
       if (!s.ok())
         return s;
     end
@@ -725,7 +747,9 @@ class rdma_queue_backing_ref extends uvm_object;
           RDMA_SC_INVALID_ARGUMENT,
           "additional backing segment ownership mismatch"
         );
-      s = additional_segments[i].validate();
+      s = rdma_queue_nested_status(
+        additional_segments[i].validate(), "backing segment"
+      );
       if (!s.ok())
         return s;
       if (additional_segments[i].logical_queue_offset != next_logical_offset)
@@ -841,10 +865,14 @@ class rdma_context_backing_ref extends uvm_object;
     if (!$cast(token, slot_token))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "slot token contract invalid");
-    s = token.validate();
+    s = rdma_queue_nested_status(
+      token.validate(), "context slot token"
+    );
     if (!s.ok())
       return s;
-    s = hmc_ref.validate();
+    s = rdma_queue_nested_status(
+      hmc_ref.validate(), "context HMC reference"
+    );
     if (!s.ok())
       return s;
     if (slot_length == 0 || shadow_view_length == 0 ||
@@ -919,7 +947,9 @@ class rdma_queue_flush_target extends uvm_object;
     if (!rdma_queue_role_is_pd(role) || pd_ref == null ||
         pd_ref.role != role)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "flush PD invalid");
-    s = pd_ref.validate();
+    s = rdma_queue_nested_status(
+      pd_ref.validate(), "flush PD reference"
+    );
     if (!s.ok())
       return s;
     if (!(phase inside {RDMA_QUEUE_FLUSH_PRE_DELETE,
@@ -1005,7 +1035,9 @@ class rdma_queue_backing_plan extends uvm_object;
     foreach (rings[i]) begin
       if (rings[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null ring");
-      s = rings[i].validate();
+      s = rdma_queue_nested_status(
+        rings[i].validate(), "queue backing plan ring"
+      );
       if (!s.ok())
         return s;
       if (!rdma_queue_role_is_ring(rings[i].role) ||
@@ -1016,7 +1048,9 @@ class rdma_queue_backing_plan extends uvm_object;
     foreach (refs[i]) begin
       if (refs[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null backing ref");
-      s = refs[i].validate();
+      s = rdma_queue_nested_status(
+        refs[i].validate(), "queue backing plan reference"
+      );
       if (!s.ok())
         return s;
       if (ref_seen[refs[i].role])
@@ -1028,7 +1062,9 @@ class rdma_queue_backing_plan extends uvm_object;
       if (flush_targets[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "null flush target");
-      s = flush_targets[i].validate();
+      s = rdma_queue_nested_status(
+        flush_targets[i].validate(), "queue backing plan flush target"
+      );
       if (!s.ok())
         return s;
     end
@@ -1075,7 +1111,9 @@ class rdma_queue_backing_plan extends uvm_object;
       end
     endcase
     if (context_ref != null) begin
-      s = context_ref.validate();
+      s = rdma_queue_nested_status(
+        context_ref.validate(), "queue backing plan context"
+      );
       if (!s.ok())
         return s;
     end
@@ -1150,7 +1188,6 @@ endclass
 
 // 功能：在 rdma_qp_ring_layout 中，rdma_qp_sq_sgb_geometry 根据 QP transport/depth/stride 计算 SQ SGB 页布局、长度和对齐约束。
 // 输入/输出及副作用：depth（输入）、logical_bytes（输出）、storage_bytes（输出）；rdma_qp_sq_sgb_geometry 读取 depth、logical_bytes、storage_bytes 并使用字段 logical_bytes、storage_bytes，并写入 logical_bytes、storage_bytes；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_sq_sgb_geometry 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“SQ SGB depth invalid”；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_sq_sgb_geometry(
   int unsigned depth, output longint unsigned logical_bytes,
@@ -1293,8 +1330,11 @@ class rdma_qp_backing_ref extends uvm_object;
             additional_segments[i].logical_queue_offset != next_logical_offset)
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "QP backing segments are not contiguous");
-        status = additional_segments[i].validate();
-        if (!status.ok()) return status;
+        status = rdma_queue_nested_status(
+          additional_segments[i].validate(), "QP backing segment"
+        );
+        if (!status.ok())
+          return status;
         next_logical_offset += additional_segments[i].length;
       end
     end
@@ -1434,11 +1474,23 @@ class rdma_qp_backing_plan extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP plan transport/depth invalid");
     if (sq_ring == null || sq_ref == null || sq_pd_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ authority missing");
-    status = sq_ring.validate(); if (!status.ok()) return status;
+    status = rdma_queue_nested_status(
+      sq_ring.validate(), "QP SQ ring"
+    );
+    if (!status.ok())
+      return status;
     if (sq_ring.role != RDMA_QUEUE_ROLE_QP_SQ_RING || sq_ring.depth != sq_depth)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP SQ ring does not match plan");
-    status = sq_ref.validate(); if (!status.ok()) return status;
-    status = sq_pd_ref.validate(); if (!status.ok()) return status;
+    status = rdma_queue_nested_status(
+      sq_ref.validate(), "QP SQ backing reference"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_queue_nested_status(
+      sq_pd_ref.validate(), "QP SQ PD reference"
+    );
+    if (!status.ok())
+      return status;
     if (sq_ref.recovery_only || sq_pd_ref.recovery_only)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
@@ -1449,7 +1501,11 @@ class rdma_qp_backing_plan extends uvm_object;
     // RC/URC normally do not require an SGB, but a present optional SGB is
     // still part of the published authority and must carry canonical geometry.
     if (sq_sgb_ref != null) begin
-      status = sq_sgb_ref.validate(); if (!status.ok()) return status;
+      status = rdma_queue_nested_status(
+        sq_sgb_ref.validate(), "QP SQ SGB reference"
+      );
+      if (!status.ok())
+        return status;
       status = rdma_qp_backing_total_length(sq_sgb_ref, total_length);
       if (!status.ok()) return status;
       if (sq_sgb_ref.role != RDMA_QUEUE_ROLE_QP_SQ_SGB ||
@@ -1466,9 +1522,21 @@ class rdma_qp_backing_plan extends uvm_object;
     if (rq_source_h == null) begin
       if (rq_ring == null || rq_ref == null || rq_pd_ref == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE, "QP private RQ authority missing");
-      status = rq_ring.validate(); if (!status.ok()) return status;
-      status = rq_ref.validate(); if (!status.ok()) return status;
-      status = rq_pd_ref.validate(); if (!status.ok()) return status;
+      status = rdma_queue_nested_status(
+        rq_ring.validate(), "QP RQ ring"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_queue_nested_status(
+        rq_ref.validate(), "QP RQ backing reference"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_queue_nested_status(
+        rq_pd_ref.validate(), "QP RQ PD reference"
+      );
+      if (!status.ok())
+        return status;
       if (rq_ref.recovery_only || rq_pd_ref.recovery_only)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
@@ -1488,7 +1556,11 @@ class rdma_qp_backing_plan extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP SRQ RQ authority invalid");
     if (context_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP context authority missing");
-    status = context_ref.validate(); if (!status.ok()) return status;
+    status = rdma_queue_nested_status(
+      context_ref.validate(), "QP context reference"
+    );
+    if (!status.ok())
+      return status;
     if (context_ref.resource_kind != RDMA_RESOURCE_QP ||
         context_ref.hmc_ref.ownership != RDMA_OWNERSHIP_CONTROL_PLANE)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -1500,7 +1572,11 @@ class rdma_qp_backing_plan extends uvm_object;
           RDMA_SC_INVALID_STATE,
           "recovery-only QP backing cannot enter a normal plan"
         );
-      status = urc_refs[i].validate(); if (!status.ok()) return status;
+      status = rdma_queue_nested_status(
+        urc_refs[i].validate(), "QP URC backing reference"
+      );
+      if (!status.ok())
+        return status;
       case (urc_refs[i].role)
         RDMA_QUEUE_ROLE_QP_URC_RSQ: seen_urc[0] = 1;
         RDMA_QUEUE_ROLE_QP_URC_RDSQ: seen_urc[1] = 1;
@@ -1595,7 +1671,9 @@ class rdma_queue_preflight extends uvm_object;
     if (depth == 0 || backing_spec == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "preflight fields missing");
-    s = backing_spec.validate();
+    s = rdma_queue_nested_status(
+      backing_spec.validate(), "preflight backing spec"
+    );
     if (!s.ok())
       return s;
     foreach (required_rings[i]) begin
@@ -1603,9 +1681,13 @@ class rdma_queue_preflight extends uvm_object;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "null required ring");
       if (required_rings[i].pages.size() == 0)
-        s = required_rings[i].validate_metadata();
+        s = rdma_queue_nested_status(
+          required_rings[i].validate_metadata(), "preflight ring metadata"
+        );
       else
-        s = required_rings[i].validate();
+        s = rdma_queue_nested_status(
+          required_rings[i].validate(), "preflight ring"
+        );
       if (!s.ok())
         return s;
     end

@@ -92,6 +92,57 @@ class ChangedSvStyleTest(unittest.TestCase):
             result = self.invoke(root, base)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_pure_and_extern_qualified_methods_are_checked(self) -> None:
+        """功能：确认 pure virtual 与 extern static 声明也进入方法注释检查。
+        输入输出及副作用：向临时 SV 追加两个缺少注释的限定方法声明，运行 checker 并读取硬诊断；只写 fixture。
+        失败边界：若方法识别器漏掉 pure 或 extern，checker 会错误返回零；识别后每个声明都必须报告邻接注释缺失。
+        """
+
+        base_source = self.valid_source()
+        addition = (
+            "  pure virtual function void abstract_method();\n"
+            "  extern static function void external_method();\n"
+        )
+        holder, root, base = self.create_repo(base_source)
+        with holder:
+            (root / "sample.sv").write_text(
+                base_source.replace("endclass\n", addition + "endclass\n"),
+                encoding="utf-8",
+            )
+            result = self.invoke(root, base)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr.count("lacks adjacent"), 2, result.stderr)
+
+    def test_declaration_only_qualified_methods_do_not_absorb_later_changes(self) -> None:
+        """功能：确认 pure virtual 声明的无体范围不会吞并后续已变更方法。
+        输入输出及副作用：基线含无注释的 declaration-only pure virtual，再只修改带合法注释的 update 方法；checker 应通过。
+        失败边界：若声明被错误延伸到文件末尾，后续变更会让无关声明触发邻接注释错误。
+        """
+
+        source = (
+            "// 目录：src/；层次：测试层。\n"
+            "// 职责：验证 declaration-only method 范围。\n"
+            "// 依赖：无。\n"
+            "// 所有权与生命周期：fixture 持有，测试结束释放。\n"
+            "class sample;\n"
+            "  pure virtual function void abstract_method();\n"
+            "  // 功能：更新样例状态。\n"
+            "  // 输入/输出及副作用：写入 value 并保持对象状态。\n"
+            "  // 失败/边界：输入不可用时保持原值。\n"
+            "  function void update();\n"
+            "    value = 0;\n"
+            "  endfunction\n"
+            "endclass\n"
+        )
+        holder, root, base = self.create_repo(source)
+        with holder:
+            (root / "sample.sv").write_text(
+                source.replace("value = 0;", "value = 1;"),
+                encoding="utf-8",
+            )
+            result = self.invoke(root, base)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_multiline_block_comment_is_ignored_by_all_scans(self) -> None:
         """功能：确认跨行块注释中的分号、case 和伪 function 文本不会污染变更行检查。
         输入输出及副作用：在临时 SV 的跨行注释内修改伪代码行，输出零诊断；仅写临时 fixture。
@@ -234,6 +285,27 @@ class ChangedSvStyleTest(unittest.TestCase):
                 result = self.invoke(root, base)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
+
+    def test_case_scope_operator_is_not_a_case_label(self) -> None:
+        """功能：确认 case 分支中的类作用域调用不会被误判为隐式 case label。
+        输入输出及副作用：写入带 `rdma_status::make` 的显式 begin/end case，期望 checker 无诊断。
+        失败边界：若 scope operator 被当作分支标签，fixture 应暴露 multi-statement 误报。"""
+
+        body = """  case (value)
+    1: begin
+      value = rdma_status::make(1, \"invalid\");
+      value = 2;
+    end
+    default: begin
+      value = 0;
+    end
+  endcase
+"""
+        holder, root, base = self.create_repo(self.valid_source())
+        with holder:
+            (root / "sample.sv").write_text(self.valid_source(body), encoding="utf-8")
+            result = self.invoke(root, base)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_untracked_invalid_base_and_head_reads_committed_blob(self) -> None:
         """功能：覆盖未跟踪 SV、无效 base，以及 --head 不读取当前工作树的提交 blob 契约。

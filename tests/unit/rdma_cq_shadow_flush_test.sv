@@ -8,14 +8,14 @@ class rdma_cq_shadow_flush_test extends uvm_test;
 
   // 功能：创建 CQ shadow 测试组件并建立 UVM 父子关系，不触碰外部设备资源。
   // 输入/输出及副作用：name、parent 为输入；构造函数仅初始化 UVM 组件状态并返回 void。
-  // 失败边界：构造不执行配置；任何依赖缺失由测试任务显式报告，不能伪造通过结果。
+  // 失败/边界：构造不执行配置；任何依赖缺失由测试任务显式报告，不能伪造通过结果。
   function new(string name = "rdma_cq_shadow_flush_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
   // 功能：构造带指定 Function UID、generation 的本地句柄，用于模拟 CQ/QP authority。
   // 输入/输出及副作用：kind、uid、generation 为输入；返回新建句柄，不修改外部对象。
-  // 失败边界：kind 必须是合法资源类型；句柄字段为零时由被测配置入口拒绝。
+  // 失败/边界：kind 必须是合法资源类型；句柄字段为零时由被测配置入口拒绝。
   function rdma_handle make_handle(rdma_resource_kind_e kind,
                                     longint unsigned uid,
                                     int unsigned generation,
@@ -31,7 +31,7 @@ class rdma_cq_shadow_flush_test extends uvm_test;
 
   // 功能：运行 shared/URC shadow flush 主场景，断言首次 flush 捕获 SQ/RQ CI 并清除，重复调用保持同一结果且只计数一次。
   // 输入/输出及副作用：phase 为 UVM phase 输入；任务创建本地 CQ/QP/Function 快照并调用被测接口，向日志发布断言结果。
-  // 失败边界：配置、flush 返回非 OK、快照字段不符或 flush 计数非 1 均报告错误并结束本场景。
+  // 失败/边界：配置、flush 返回非 OK、快照字段不符或 flush 计数非 1 均报告错误并结束本场景。
   task automatic test_shared_urc_shadow_flush_is_exactly_once(uvm_phase phase);
     rdma_cq_engine cq;
     rdma_cq_shadow_snapshot shadow;
@@ -75,16 +75,17 @@ class rdma_cq_shadow_flush_test extends uvm_test;
         data_engine.last_urc_evidence.urc_arm_state != 2'b1 ||
         data_engine.last_urc_evidence.urc_sequence != 64'h55)
       `uvm_error("CQ_SHADOW", "URC shadow was not captured as recovery evidence")
+    // reset/recovery 后没有新的 authority 输入时，禁止把旧快照重新发布。
     shadow.sq_ci = 99;
     shadow = null;
     status = cq.flush_shadow(shadow);
-    if (status == null || !status.ok() || shadow == null || shadow.sq_ci != 12)
-      `uvm_error("CQ_SHADOW", "null replay did not return detached cached shadow")
+    if (status == null || status.code != RDMA_SC_STALE_GENERATION || shadow != null)
+      `uvm_error("CQ_SHADOW", "null replay incorrectly returned stale cached shadow")
   endtask
 
   // 功能：验证 stale/cross-function shadow 在 flush 前被拒绝且不改变内部 shadow 状态。
   // 输入/输出及副作用：phase 为 UVM phase 输入；任务使用错误代际和错误 Function UID 快照调用 flush_shadow。
-  // 失败边界：任一拒绝未返回 RDMA_SC_STALE_GENERATION，或拒绝后内部状态被清除，均报告错误。
+  // 失败/边界：任一拒绝未返回 RDMA_SC_STALE_GENERATION，或拒绝后内部状态被清除，均报告错误。
   task automatic test_shadow_flush_rejects_stale_or_cross_function(uvm_phase phase);
     rdma_cq_engine cq;
     rdma_cq_shadow_snapshot stale;
@@ -201,7 +202,8 @@ class rdma_cq_shadow_flush_test extends uvm_test;
       return;
     end
 
-    shadow = null;
+    // 保留调用方携带的原 authority 快照才能合法重放；无快照的拒绝边界
+    // 由 shared/URC 场景覆盖。
     status = cq.flush_shadow(shadow);
     if (status == null || !status.ok() || shadow == null ||
         shadow.cq_h == null || shadow.cq_h.object_id != 12 ||

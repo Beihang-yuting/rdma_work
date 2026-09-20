@@ -221,6 +221,23 @@ class rdma_abi_v5_api extends uvm_object;
   int unsigned context_id;
   rdma_abi_v5_mapping_record mappings[longint unsigned];
 
+  // 功能：把 context/host-memory 后端返回的状态统一转换为可安全消费的对象。
+  // 输入/输出及副作用：candidate、operation 为输入；非空状态原样返回，null 状态
+  //       转换为带 ABI 边界诊断的 INVALID_STATE；不修改 mapping 账本或后端资源。
+  // 失败/边界：null 表示外部 virtual boundary 违反状态返回契约；调用方必须在继续
+  //       读取 output 或推进 ID 前停止，并保留当前 mapping 记录供重试/诊断。
+  protected function automatic rdma_status normalize_status(
+    rdma_status candidate,
+    string operation
+  );
+    if (candidate == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {"ABI ", operation, " returned null status"}
+      );
+    return candidate;
+  endfunction
+
   // 功能：构造 ABI v5 API 对象并建立空 mapping 账本。
   // 输入/输出及副作用：name 为 UVM 对象名；不会自动绑定 Function 或外部 host-mem/context backing。
   // 失败/边界：未 configure 和 negotiate 前，所有 alloc/map 入口返回 INVALID_STATE。
@@ -336,19 +353,30 @@ class rdma_abi_v5_api extends uvm_object;
 
     response = rdma_abi_v5_response::type_id::create("abi_context_response");
     status = ready_status();
-    if (!status.ok()) return status;
+    status = normalize_status(status, "ready_status");
+    if (!status.ok())
+      return status;
     if (context_backing != null) begin
       context_ref = null;
       status = context_backing.acquire(binding, RDMA_RESOURCE_QP,
                                        context_id, context_ref);
-      if (!status.ok() || context_ref == null)
-        return status.ok() ? rdma_status::make(
-          RDMA_SC_INVALID_STATE, "context backing returned null") : status;
+      status = normalize_status(status, "context backing acquire");
+      if (!status.ok()) begin
+        context_ref = null;
+        return status;
+      end
+      if (context_ref == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "context backing returned success with null reference"
+        );
     end
     status = publish_mapping(RDMA_ABI_REGION_CONTEXT, 512,
                              RDMA_ABI_MAPPING_OWNED, context_ref, null,
                              response);
-    if (status.ok()) context_id++;
+    status = normalize_status(status, "context mapping publish");
+    if (status.ok())
+      context_id++;
     return status;
   endfunction
 
@@ -384,9 +412,13 @@ class rdma_abi_v5_api extends uvm_object;
 
     response = rdma_abi_v5_response::type_id::create("abi_region_response");
     status = ready_status();
-    if (!status.ok()) return status;
+    status = normalize_status(status, "ready_status");
+    if (!status.ok())
+      return status;
     status = validate_region(region_kind, length);
-    if (!status.ok()) return status;
+    status = normalize_status(status, "region validation");
+    if (!status.ok())
+      return status;
     if (ownership == RDMA_ABI_MAPPING_BORROWED &&
         borrowed_mapping == null && borrowed_context == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -421,16 +453,23 @@ class rdma_abi_v5_api extends uvm_object;
       status = host_mem.allocate(request_context, int'(length),
                                  int'(region_alignment(region_kind)),
                                  RDMA_DMA_BIDIRECTIONAL, mapped_dma);
-      if (!status.ok() || mapped_dma == null)
-        return status.ok() ? rdma_status::make(
-          RDMA_SC_INVALID_STATE, "host memory returned null mapping") : status;
+      status = normalize_status(status, "host memory allocation");
+      if (!status.ok()) begin
+        mapped_dma = null;
+        return status;
+      end
+      if (mapped_dma == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "host memory returned success with null mapping"
+        );
     end
     else begin
       base.value = SYNTHETIC_BASE + next_mapping_id * 64'h10000;
     end
     status = publish_mapping(region_kind, length, ownership, null,
                              mapped_dma, response);
-    return status;
+    return normalize_status(status, "region mapping publish");
   endfunction
 
   // 功能：按 mapping ID 释放一个 ABI region，并保证同一 ID 的重复 unmap 幂等且不重复调用后端。
@@ -454,11 +493,15 @@ class rdma_abi_v5_api extends uvm_object;
     end
     if (record.context_ref != null && context_backing != null) begin
       status = context_backing.\release (record.context_ref);
-      if (!status.ok()) return status;
+      status = normalize_status(status, "context backing release");
+      if (!status.ok())
+        return status;
     end
     if (record.dma_mapping != null && host_mem != null) begin
       status = host_mem.\release (record.dma_mapping);
-      if (!status.ok()) return status;
+      status = normalize_status(status, "host memory release");
+      if (!status.ok())
+        return status;
     end
     record.released = 1'b1;
     record.refcount = 0;

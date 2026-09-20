@@ -26,8 +26,10 @@ class rdma_env_config extends uvm_object;
   rdma_function_binding function_binding;
 
   // 功能：构造默认 core-only 配置，关闭全部外部适配器并建立确定的超时/profile。
-  // 输入输出及副作用：name 为 UVM 对象名；初始化标量、队列能力和空 region 列表，不取得外部资源所有权。
-  // 失败边界：构造不会验证 route/region；调用 validate() 或 env.configure() 时才报告非法配置。
+  // 输入/输出及副作用：name 为 UVM 对象名；初始化标量、队列能力和空 region 列表，
+  //   不取得外部 adapter、responder 或 Function snapshot 的所有权。
+  // 失败/边界：构造不会验证 mode、route 或 region；调用 validate() 或 env.configure()
+  //   时才报告非法配置，默认 core-only 模式不启用任何 adapter。
   function new(string name = "rdma_env_config");
     super.new(name);
     mode = RDMA_ENV_CORE_ONLY;
@@ -123,8 +125,10 @@ class rdma_env_config extends uvm_object;
   endfunction
 
   // 功能：深拷贝配置对象，尤其是 responder value region 和 Function identity，形成 detached snapshot。
-  // 输入输出及副作用：rhs 为源 uvm_object；覆盖当前对象字段，源配置和其中的 region 句柄不被修改。
-  // 失败边界：rhs 类型错误或 region/identity clone 失败时触发 UVM fatal，避免发布半成品配置。
+  // 输入/输出及副作用：rhs 为源 uvm_object；函数覆盖当前对象的标量、queue profile、
+  //   detached responder region 和 Function identity/binding clone，源配置及其句柄不被修改。
+  // 失败/边界：rhs 不能 cast 为 rdma_env_config、region/identity/binding clone 或 region
+  //   factory 失败时触发 UVM fatal；本函数不返回 status，fatal 前的部分写入不应被发布。
   virtual function void do_copy(uvm_object rhs);
     rdma_env_config source;
     uvm_object clone_obj;

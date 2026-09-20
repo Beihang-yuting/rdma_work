@@ -6,6 +6,90 @@
 // 中文说明：rdma_request_model_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 功能：构造返回空状态的 QP address-vector 校验夹具，注入 rdma_qp_context_attributes.validate() 的可覆写边界。
+// 输入/输出及副作用：name（输入）；构造函数只初始化本地 address-vector 值，不访问外部资源；validate() 返回 null。
+// 失败/边界：该夹具只用于验证上层将 null 状态归一化为 INVALID_STATE，不能作为真实 QPC authority 发布。
+class rdma_null_request_address_vector_validate extends rdma_address_vector;
+  `uvm_object_utils(rdma_null_request_address_vector_validate)
+
+  // 功能：创建空状态 address-vector 故障夹具并沿用基类字段默认值。
+  // 输入/输出及副作用：name（输入）；new 不修改外部对象或资源所有权。
+  // 失败/边界：构造成功不代表校验成功；本夹具的 validate() 始终返回 null。
+  function new(string name = "rdma_null_request_address_vector_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 address-vector 扩展校验器丢失 rdma_status，验证 QP context 校验的 fail-closed 契约。
+  // 输入/输出及副作用：无显式输入；不修改 address-vector 字段，返回 null 状态句柄。
+  // 失败/边界：null 是刻意注入的异常；调用方不得继续调用 status.ok()。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回空状态的 QPC behavior 校验夹具，注入第二个嵌套 virtual validate seam。
+// 输入/输出及副作用：name（输入）；构造函数只初始化本地 behavior 值，不访问外部资源；validate() 返回 null。
+// 失败/边界：该夹具仅用于边界测试，不能作为已验证 QPC 行为发布。
+class rdma_null_request_behavior_validate extends rdma_qpc_behavior;
+  `uvm_object_utils(rdma_null_request_behavior_validate)
+
+  // 功能：创建空状态 behavior 故障夹具并沿用基类字段默认值。
+  // 输入/输出及副作用：name（输入）；new 不修改外部对象或资源所有权。
+  // 失败/边界：构造成功不代表校验成功；本夹具的 validate() 始终返回 null。
+  function new(string name = "rdma_null_request_behavior_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 behavior 扩展校验器丢失 rdma_status，验证 QP context 校验的 fail-closed 契约。
+  // 输入/输出及副作用：无显式输入；不修改 behavior 字段，返回 null 状态句柄。
+  // 失败/边界：null 是刻意注入的异常；调用方不得继续调用 status.ok()。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回空状态的 QPC transport-extension 校验夹具，保持 RC transport identity 不变。
+// 输入/输出及副作用：name（输入）；构造函数建立 RC extension 默认值；validate() 返回 null。
+// 失败/边界：该夹具只用于测试 status 边界，不代表驱动可编码的 transport extension。
+class rdma_null_request_transport_validate extends rdma_qpc_rc_ext;
+  `uvm_object_utils(rdma_null_request_transport_validate)
+
+  // 功能：创建空状态 RC transport extension 并沿用基类的字段初始化。
+  // 输入/输出及副作用：name（输入）；new 不接管 QP、CMQ 或 backing 生命周期。
+  // 失败/边界：构造成功不代表 RC extension 已通过校验；本夹具的 validate() 始终返回 null。
+  function new(string name = "rdma_null_request_transport_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 transport extension 校验器丢失 rdma_status，验证上层不会解引用空状态。
+  // 输入/输出及副作用：无显式输入；不修改 RC 字段，返回 null 状态句柄。
+  // 失败/边界：null 是刻意注入的异常；调用方必须把它转换为确定失败。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回空状态的 queue backing specification 校验夹具，覆盖 CQ/SRQ/CEQ/AEQ 请求的共享 backing seam。
+// 输入/输出及副作用：name（输入）；构造函数只初始化本地 backing 值，不访问 Host-memory；validate() 返回 null。
+// 失败/边界：该夹具不得被当作真实 backing 提交；调用方必须在发布前 fail closed。
+class rdma_null_request_backing_spec_validate extends rdma_queue_backing_spec;
+  `uvm_object_utils(rdma_null_request_backing_spec_validate)
+
+  // 功能：创建空状态 queue backing specification 故障夹具并沿用基类默认 mode/slices。
+  // 输入/输出及副作用：name（输入）；new 不修改外部 mapping 或 queue ledger。
+  // 失败/边界：构造成功不代表 backing 可用；本夹具的 validate() 始终返回 null。
+  function new(string name = "rdma_null_request_backing_spec_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 backing specification 校验器丢失 rdma_status，验证请求模型的共享边界防护。
+  // 输入/输出及副作用：无显式输入；不修改 slices 或 ownership，返回 null 状态句柄。
+  // 失败/边界：null 是刻意注入的异常；上层不得继续调用 status.ok() 或发布 request。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
 class rdma_request_model_test extends uvm_test;
   `uvm_component_utils(rdma_request_model_test)
 
@@ -149,6 +233,7 @@ class rdma_request_model_test extends uvm_test;
     context_ref.hmc_ref.object_kind = RDMA_RESOURCE_MR;
     context_ref.hmc_ref.size = 4096;
     context_ref.hmc_ref.first_pbl_index = 1;
+    context_ref.hmc_ref.index_valid = 1'b1;
     context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     context_ref.shadow_pointer_base.value = 64'h8000_0000;
     context_ref.slot_length = 64;
@@ -495,6 +580,13 @@ class rdma_request_model_test extends uvm_test;
     rdma_create_qp_req req;
     rdma_create_qp_req req_clone;
     rdma_qp_context_attributes context_attrs;
+    rdma_address_vector saved_address_vector;
+    rdma_qpc_behavior saved_behavior;
+    rdma_qpc_transport_ext saved_transport_ext;
+    rdma_null_request_address_vector_validate null_address_vector;
+    rdma_null_request_behavior_validate null_behavior;
+    rdma_null_request_transport_validate null_transport_ext;
+    rdma_null_request_backing_spec_validate null_backing_spec;
     rdma_queue_capabilities qp_caps;
     rdma_function_handle function_h;
     rdma_handle pd_h;
@@ -630,6 +722,31 @@ class rdma_request_model_test extends uvm_test;
     context_attrs.transport_ext = rc_ext;
     req.context_attrs = context_attrs;
     expect_status("CREATE_QP", req.validate(), RDMA_SC_OK);
+
+    // Nested semantic validators are virtual seams.  A null status from any
+    // one of them must become a deterministic INVALID_STATE, not a simulator
+    // null-handle dereference and not a partially accepted QPC request.
+    saved_address_vector = context_attrs.address_vector;
+    null_address_vector = new("null_request_av");
+    context_attrs.address_vector = null_address_vector;
+    expect_status("CREATE_QP_NULL_AV_STATUS", req.validate(),
+                  RDMA_SC_INVALID_STATE);
+    context_attrs.address_vector = saved_address_vector;
+
+    saved_behavior = context_attrs.behavior;
+    null_behavior = new("null_request_behavior");
+    context_attrs.behavior = null_behavior;
+    expect_status("CREATE_QP_NULL_BEHAVIOR_STATUS", req.validate(),
+                  RDMA_SC_INVALID_STATE);
+    context_attrs.behavior = saved_behavior;
+
+    saved_transport_ext = context_attrs.transport_ext;
+    null_transport_ext = new("null_request_transport_ext");
+    null_transport_ext.remote_qpn = 24'h101;
+    context_attrs.transport_ext = null_transport_ext;
+    expect_status("CREATE_QP_NULL_TRANSPORT_STATUS", req.validate(),
+                  RDMA_SC_INVALID_STATE);
+    context_attrs.transport_ext = saved_transport_ext;
     qp_caps = '{default:'0};
     qp_caps.max_wq_sge = 4;
     qp_caps.max_queue_ring_bytes = 8192;
@@ -888,6 +1005,15 @@ class rdma_request_model_test extends uvm_test;
     expect_status("CREATE_CQ_DEPTH", create_cq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     create_cq.depth = 256;
+    null_backing_spec = new("null_create_cq_backing");
+    begin
+      rdma_queue_backing_spec saved_cq_backing;
+      saved_cq_backing = create_cq.ring_backing;
+      create_cq.ring_backing = null_backing_spec;
+      expect_status("CREATE_CQ_NULL_BACKING_STATUS", create_cq.validate(),
+                    RDMA_SC_INVALID_STATE);
+      create_cq.ring_backing = saved_cq_backing;
+    end
     create_cq.ring_backing = null;
     expect_status("CREATE_CQ_BACKING", create_cq.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -1547,12 +1673,66 @@ class rdma_request_model_test extends uvm_test;
     post_send.inline_data = 1'b0;
     post_send.sges.delete();
     expect_status("POST_SEND_EMPTY", post_send.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_OK);
     post_send.sges.push_back(sge);
     sge.length = 0;
     expect_status("POST_SEND_ZERO_SGE", post_send.validate(),
-                  RDMA_SC_INVALID_ARGUMENT);
+                  RDMA_SC_OK);
     sge.length = 32'h345;
+
+    // RED：混合零长度/有效 SGE 必须沿驱动过滤规则通过 request facade；
+    // 只保留 null handle 作为结构错误，不能把零长度条目当成 malformed。
+    post_send.opcode = RDMA_WR_SEND;
+    post_send.remote_access_valid = 1'b0;
+    post_send.rkey_valid = 1'b0;
+    post_send.remote_addr.value = '0;
+    post_send.rkey = '0;
+    post_send.sges.delete();
+    begin
+      rdma_sge zero_sge;
+      rdma_sge valid_sge;
+
+      zero_sge = rdma_sge::type_id::create("post_send_zero_sge");
+      zero_sge.length = 0;
+      valid_sge = rdma_sge::type_id::create("post_send_valid_sge");
+      valid_sge.length = 32'h345;
+      post_send.sges.push_back(zero_sge);
+      post_send.sges.push_back(valid_sge);
+    end
+    expect_status("POST_SEND_MIXED_ZERO_SGE", post_send.validate(), RDMA_SC_OK);
+
+    // 驱动按原始 num_sge 限制发送描述符数量；即使第 33 项长度为零，
+    // 也必须在 request facade 边界拒绝，不能等 codec 过滤后错误放行。
+    post_send.sges.delete();
+    for (int unsigned send_sge_index = 0;
+         send_sge_index < 33;
+         send_sge_index++) begin
+      rdma_sge overflow_sge;
+
+      overflow_sge = rdma_sge::type_id::create(
+          $sformatf("send_overflow_sge_%0d", send_sge_index));
+      overflow_sge.length = send_sge_index == 32 ? 0 : 1;
+      overflow_sge.lkey = send_sge_index;
+      overflow_sge.iova.value = 64'h6000 + send_sge_index;
+      post_send.sges.push_back(overflow_sge);
+    end
+    expect_status("POST_SEND_SGE_LIMIT_ZERO_TAIL", post_send.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+
+    // RED：wr.c 允许新 SQ slot 上的 IB_SEND_INLINE/zero-byte 请求；请求
+    // 层不能把空 payload 错判成 inline shape 错误。
+    post_send.sges.delete();
+    post_send.inline_data = 1'b1;
+    post_send.payload.delete();
+    expect_status("POST_SEND_INLINE_ZERO", post_send.validate(), RDMA_SC_OK);
+
+    post_send.inline_data = 1'b0;
+    post_send.opcode = RDMA_WR_RDMA_WRITE;
+    post_send.remote_access_valid = 1'b1;
+    post_send.rkey_valid = 1'b1;
+    post_send.remote_addr.value = 64'h1234_0000;
+    post_send.rkey = 32'h1357_2468;
+    post_send.sges.push_back(sge);
 
     atomic_sge = rdma_sge::type_id::create("atomic_sge");
     atomic_sge.iova.value = 64'h2222_0000;
@@ -1627,6 +1807,33 @@ class rdma_request_model_test extends uvm_test;
     post_recv.sges.push_back(recv_sge);
     post_recv.completion_qp_h = qp_h;
     expect_status("POST_RECV", post_recv.validate(), RDMA_SC_OK);
+
+    // 驱动 wr.c 对 num_sge=0 的 receive 仍生成合法空 RQE；请求层不能把
+    // “没有 SGE”误判为 malformed。保留 SRQ completion route，验证空请求
+    // 在进入 queue-data engine 前即可通过基础形状校验。
+    post_recv.sges.delete();
+    expect_status("POST_RECV_EMPTY", post_recv.validate(), RDMA_SC_OK);
+
+    // wr.c rejects the original ib_recv_wr->num_sge before it filters
+    // zero-length entries.  Keep the request boundary fail-closed at the
+    // driver's 32-entry limit, even when the later codec would compress SGE
+    // descriptors for the wire image.
+    for (int unsigned recv_sge_index = 0;
+         recv_sge_index < 33;
+         recv_sge_index++) begin
+      rdma_sge overflow_sge;
+
+      overflow_sge = rdma_sge::type_id::create(
+          $sformatf("recv_overflow_sge_%0d", recv_sge_index));
+      overflow_sge.length = 1;
+      overflow_sge.lkey = recv_sge_index;
+      overflow_sge.iova.value = 64'h5000 + recv_sge_index;
+      post_recv.sges.push_back(overflow_sge);
+    end
+    expect_status("POST_RECV_SGE_LIMIT", post_recv.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    post_recv.sges.delete();
+
     post_recv.target_h = null;
     expect_status("POST_RECV_NULL", post_recv.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
@@ -1940,6 +2147,7 @@ class rdma_request_model_test extends uvm_test;
     hmc_ref.address.value = 64'h6000_0000;
     hmc_ref.size = 64'h1000;
     hmc_ref.first_pbl_index = 32'h80;
+    hmc_ref.index_valid = 1'b1;
     hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     qp_resource.hmc_refs.push_back(hmc_ref);
     qp_resource.qp_plan = make_qp_plan("qp_resource_plan", 1024, 512,
@@ -2383,7 +2591,7 @@ class rdma_request_model_test extends uvm_test;
     mrt = rdma_mrt_model::type_id::create("mrt");
     mrt.mr_h = mr_h;
     mrt.pd_h = pd_h;
-    mrt.state = RDMA_CONTEXT_VALID;
+    mrt.state = RDMA_MR_STATE_VALID;
     mrt.iova.value = 64'h8000_0000;
     mrt.length = 64'h1000;
     mrt.lkey = 32'h0002_025a;

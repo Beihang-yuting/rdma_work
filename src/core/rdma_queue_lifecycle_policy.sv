@@ -22,7 +22,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：基类 preflight 接口要求实现方校验 binding、request 和 manager，并将资源预检结果写入 result。
   // 输入/输出及副作用：binding（输入）、request（输入）、manager（输入）、result（输出）；preflight 校验 Function identity、请求 opcode 和 manager 容量并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   pure virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
@@ -74,7 +73,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
   // UNKNOWN/0，并返回允许 recovery 继续推进的 status。
   // 功能：classify_query_completion 验证 QUERY completion 的 opcode、owner 和 payload，将硬件存在性写入 presence，并把证据是否充分写入 conclusive。
   // 输入/输出及副作用：resource（输入）、completion（输入）、presence（输出）、conclusive（输出）；函数读取 resource.handle、completion.status 和 completion.image，并写入 presence、conclusive；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：classify_query_completion 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   pure virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
@@ -84,7 +82,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：在 rdma_queue_lifecycle_policy 中，hardware_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：flush_roles（输出）、flush_phases（输出）、delete_before_flush（输出）；hardware_cleanup_roles 按资源类型写入 flush_roles、flush_phases 和 delete_before_flush 的清理顺序；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：hardware_cleanup_roles 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   pure virtual function void hardware_cleanup_roles(
     output rdma_queue_backing_role_e flush_roles[$],
@@ -159,7 +156,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：command_resource_owner_status 校验 owner、resource、expected_kind 与当前对象状态的一致性，并显式处理“queue command owner does not match resource”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：owner（输入）、resource（输入）、expected_kind（输入）；command_resource_owner_status 读取 owner、resource、expected_kind 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：command_resource_owner_status 返回 函数体规定的失败状态；具体拒绝条件包括 “queue command owner does not match resource”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status command_resource_owner_status(
     rdma_function_handle owner,
@@ -178,7 +174,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：command_owner_status 校验 owner、resource、context_h、expected_kind 与当前对象状态的一致性，并显式处理“queue command context handle is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：owner（输入）、resource（输入）、context_h（输入）、expected_kind（输入）；command_owner_status 读取 owner、resource、context_h、expected_kind 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：command_owner_status 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“queue command context handle is invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status command_owner_status(
     rdma_function_handle owner,
@@ -213,7 +208,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：common_preflight_status 校验 binding、request、manager、owner 与当前对象状态的一致性，并显式处理“queue policy preflight input is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：binding（输入）、request（输入）、manager（输入）、owner（输出）；common_preflight_status 读取 binding、request、manager、owner 并使用字段 owner、status，并写入 owner；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：common_preflight_status 返回 函数体规定的失败状态；具体拒绝条件包括 “queue policy preflight input is null”；“queue policy requires an ACTIVE Function binding”；“queue request owner does not match binding”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status common_preflight_status(
     rdma_function_binding binding,
@@ -228,6 +222,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     if (binding == null || request == null || manager == null)
       return invalid_argument("queue policy preflight input is null");
     status = binding.validate();
+    if (status == null)
+      return invalid_state(
+        "queue policy Function binding validation returned null"
+      );
     if (!status.ok())
       return status;
     if (binding.state != RDMA_BIND_ACTIVE || binding.owner_h == null ||
@@ -237,6 +235,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
                                                  request.owner))
       return invalid_argument("queue request owner does not match binding");
     status = request.validate();
+    if (status == null)
+      return invalid_state(
+        "queue policy request validation returned null"
+      );
     if (!status.ok())
       return status;
     owner = binding_owner;
@@ -245,7 +247,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：dependency_status 校验 manager、owner、dependency、expected_kind、allow_null 与当前对象状态的一致性，并显式处理“required queue dependency is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：manager（输入）、owner（输入）、dependency（输入）、expected_kind（输入）、allow_null（输入）；dependency_status 读取 manager、owner、dependency、expected_kind、allow_null 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：dependency_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“required queue dependency is null”“queue dependency kind is invalid”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status dependency_status(
     rdma_resource_manager manager,
@@ -318,7 +319,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：checked_ring_layout 根据 name、role、depth、entry_size_bytes、initial_polarity、capability_limit、layout 执行 rdma_status 结果转换，具体更新字段 layout、logical_bytes、storage_bytes、candidate、candidate.role、candidate.entry_size_bytes、candidate.depth、candidate.logical_bytes；失败时返回 RDMA_SC_INVALID_ARGUMENT，保持已登记资源和输出不变。
   // 输入/输出及副作用：name（输入）、role（输入）、depth（输入）、entry_size_bytes（输入）、initial_polarity（输入）、capability_limit（输入）、layout（输出）；checked_ring_layout 读取 name、role、depth、entry_size_bytes、initial_polarity、capability_limit、layout 并使用字段 layout、logical_bytes、storage_bytes、candidate、candidate.role、candidate.entry_size_bytes、candidate.depth、candidate.logical_bytes，并写入 layout；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_ring_layout 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“queue ring depth or entry size is zero”“queue ring logical size overflows”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status checked_ring_layout(
     string name,
@@ -389,7 +389,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：在 rdma_queue_lifecycle_policy 中，projected_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
   // 输入/输出及副作用：name（输入）、lifecycle_source（输入）、kind（输入）、local_id（输入）、width（输入）、handle（输出）；projected_handle 读取 name、lifecycle_source、kind、local_id、width、handle 并使用字段 handle、limit、candidate、candidate.kind、candidate.function_uid、candidate.generation、candidate.object_id，并写入 handle；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：projected_handle 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“typed queue resource handle is invalid”“queue local ID exceeds context field width”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status projected_handle(
     string name,
@@ -419,7 +418,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：projected_dependency_status 校验 dependency、lifecycle_source、expected_kind、width、allow_null 与当前对象状态的一致性，并显式处理“projected context dependency is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：dependency（输入）、lifecycle_source（输入）、expected_kind（输入）、width（输入）、allow_null（输入）；projected_dependency_status 读取 dependency、lifecycle_source、expected_kind、width、allow_null 并使用字段 limit；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：projected_dependency_status 返回 RDMA_SC_STALE_GENERATION；具体拒绝条件包括 “projected context dependency is invalid”；“projected dependency Function does not match”；“projected dependency ID exceeds field width”；“projected dependency generation does not match”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status projected_dependency_status(
     rdma_handle dependency,
@@ -527,7 +525,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：context_ref_status 校验 plan、owner、kind、local_id、view_offset 等参数 与当前对象状态的一致性，并显式处理“queue context backing reference is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：plan（输入）、owner（输入）、kind（输入）、local_id（输入）、view_offset（输入）、view_length（输入）、shadow_base（输出）；context_ref_status 读取 plan、owner、kind、local_id、view_offset、view_length、shadow_base 并使用字段 shadow_base、context_ref，并写入 shadow_base；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：context_ref_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue context backing reference is missing”“queue context belongs to another Function”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status context_ref_status(
     rdma_queue_backing_plan plan,
@@ -855,7 +852,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 
   // 功能：classify_query_common 根据 resource、completion、expected_query_opcode、expected_create_opcode、image_kind、object_type、payload_offset、payload_length、absent_ecode、absent_ecode_valid、presence、conclusive 执行 rdma_status 结果转换，具体更新字段 presence、conclusive、plan、status、query_image、query_image.length、query_image.alignment、query_image.endian；失败时返回 RDMA_SC_TIMEOUT、RDMA_SC_RESET_CANCELLED，保持已登记资源和输出不变。
   // 输入/输出及副作用：resource（输入）、completion（输入）、expected_query_opcode（输入）、expected_create_opcode（输入）、image_kind（输入）、object_type（输入）、payload_offset（输入）、payload_length（输入）、absent_ecode（输入）、absent_ecode_valid（输入）、presence（输出）、conclusive（输出）；classify_query_common 读取 resource、completion、expected_query_opcode、expected_create_opcode、image_kind、object_type、payload_offset、payload_length、absent_ecode、absent_ecode_valid、presence、conclusive 并使用字段 presence、conclusive、plan、status、query_image、query_image.length、query_image.alignment、query_image.endian，并写入 presence、conclusive；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：classify_query_common 返回 RDMA_SC_TIMEOUT、RDMA_SC_RESET_CANCELLED；具体拒绝条件包括 “query classification resource identity is incomplete”；“query CQC image kind is inconsistent”；“query SRQC image kind is inconsistent”；“query CEQC image kind is inconsistent”；“query AEQC image kind is inconsistent”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status classify_query_common(
     rdma_queue_resource resource,
@@ -1069,7 +1065,6 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：CQ preflight 校验 CQ depth、CQE 大小、CEQ 依赖和 Function 归属，并将规范化结果写入 result。
   // 输入/输出及副作用：binding（输入）、request（输入）、manager（输入）、result（输出）；preflight 读取 binding、request、manager、result 并使用字段 result、status、candidate、candidate.resource_kind、candidate.depth、candidate.cqe_size_bytes，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
@@ -1231,15 +1226,53 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     rdma_queue_resource resource, time timeout,
     output rdma_cmq_command_desc command);
     rdma_cq cq;
+    rdma_hw_cqc_delete_body delete_body;
+    rdma_cqc_model delete_context;
+    uvm_object cloned_object;
     rdma_status status;
+
     command = null;
     if (!$cast(cq, resource))
       return invalid_argument("CQ object command requires rdma_cq");
     status = command_resource_owner_status(owner, cq, RDMA_RESOURCE_CQ);
-    if (!status.ok()) return status;
+    if (!status.ok())
+      return status;
+
+    if (opcode == RDMA_OP_CQC_DELETE) begin
+      if (cq.programmed_cqc == null)
+        return invalid_state(
+          "CQC delete requires the programmed CQC context snapshot"
+        );
+
+      delete_context = cq.programmed_cqc;
+      if (delete_context.cq_h == null ||
+          delete_context.cq_h.object_id != cq.local_cq_id)
+        return invalid_state(
+          "CQC delete context does not match CQ local ID"
+        );
+      status = rdma_handle_owner_status(delete_context.cq_h, owner);
+      if (!status.ok())
+        return status;
+
+      cloned_object = delete_context.clone();
+      if (cloned_object == null || !$cast(delete_context, cloned_object) ||
+          delete_context == cq.programmed_cqc)
+        return invalid_state("CQC delete context clone failed");
+
+      delete_body = rdma_hw_cqc_delete_body::type_id::create(
+        "cq_delete_body");
+      delete_body.cqc_context = delete_context;
+      return build_command_desc(owner, opcode, "delete", delete_body,
+                                timeout, command);
+    end
+
+    if (opcode != RDMA_OP_CQC_QUERY)
+      return unsupported("CQ object command opcode is not supported");
+
     return build_object_desc(opcode, RDMA_OP_CQC_DELETE,
-      RDMA_OP_CQC_QUERY, owner, cq.handle, RDMA_RESOURCE_CQ,
-      cq.local_cq_id, 21, timeout, command);
+                             RDMA_OP_CQC_QUERY, owner, cq.handle,
+                             RDMA_RESOURCE_CQ, cq.local_cq_id, 21, timeout,
+                             command);
   endfunction
 
   // 功能：build_flush_command 创建独立的 rdma_status；根据 owner、target、timeout、command 设置字段 command，返回对象仅由调用方持有，不转移外部资源所有权。
@@ -1257,7 +1290,6 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：classify_query_completion 根据 resource、completion、presence、conclusive 执行 rdma_status 结果转换，具体更新字段 输出参数 presence、conclusive；失败分支保持已登记资源和输出不变，并将错误状态返回调用方。
   // 输入/输出及副作用：resource（输入）、completion（输入）、presence（输出）、conclusive（输出）；classify_query_completion 读取 resource、completion、presence、conclusive 并使用输入参数和固定枚举/常量，并写入 presence、conclusive；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：classify_query_completion 只读输入并返回 rdma_status；边界由函数体现有分支决定，不修改状态或转移资源。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
@@ -1272,14 +1304,31 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：在 rdma_cq_lifecycle_policy 中，hardware_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：flush_roles（输出）、flush_phases（输出）、delete_before_flush（输出）；hardware_cleanup_roles 读取 flush_roles、flush_phases、delete_before_flush 并使用字段 delete_before_flush，并写入 flush_roles、flush_phases、delete_before_flush；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：hardware_cleanup_roles 无返回值，仅执行 delete_before_flush=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; flush_roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_POST_DELETE); endfunction
+  virtual function void hardware_cleanup_roles(
+    output rdma_queue_backing_role_e flush_roles[$],
+    output rdma_queue_flush_phase_e flush_phases[$],
+    output bit delete_before_flush
+  );
+    flush_roles.delete();
+    flush_phases.delete();
+    delete_before_flush = 1'b1;
+    flush_roles.push_back(RDMA_QUEUE_ROLE_CQ_PD);
+    flush_phases.push_back(RDMA_QUEUE_FLUSH_POST_DELETE);
+  endfunction
 
   // 功能：在 rdma_cq_lifecycle_policy 中，local_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：roles（输出）、release_context_first（输出）；local_cleanup_roles 读取 roles、release_context_first 并使用字段 release_context_first，并写入 roles、release_context_first；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：local_cleanup_roles 无返回值，仅执行 release_context_first=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_CQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CQ_RING); endfunction
+  virtual function void local_cleanup_roles(
+    output rdma_queue_backing_role_e roles[$],
+    output bit release_context_first
+  );
+    roles.delete();
+    release_context_first = 1'b1;
+    roles.push_back(RDMA_QUEUE_ROLE_CQ_PD);
+    roles.push_back(RDMA_QUEUE_ROLE_CQ_RING);
+  endfunction
 endclass
 
 class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
@@ -1323,7 +1372,6 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：SRQ preflight 校验 SRQ depth、max_sge、阈值和 SGB backing 需求，并将规范化结果写入 result。
   // 输入/输出及副作用：binding（输入）、request（输入）、manager（输入）、result（输出）；preflight 读取 binding、request、manager、result 并使用字段 result、status、need_sgb、candidate、candidate.resource_kind、candidate.depth、candidate.max_sge、candidate.limit_threshold，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
@@ -1544,7 +1592,6 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：classify_query_completion 根据 resource、completion、presence、conclusive 执行 rdma_status 结果转换，具体更新字段 输出参数 presence、conclusive；失败分支保持已登记资源和输出不变，并将错误状态返回调用方。
   // 输入/输出及副作用：resource（输入）、completion（输入）、presence（输出）、conclusive（输出）；classify_query_completion 读取 resource、completion、presence、conclusive 并使用字段 hff，并写入 presence、conclusive；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：classify_query_completion 只读输入并返回 rdma_status；边界由函数体现有分支决定，不修改状态或转移资源。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
@@ -1559,14 +1606,36 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：在 rdma_srq_lifecycle_policy 中，hardware_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：flush_roles（输出）、flush_phases（输出）、delete_before_flush（输出）；hardware_cleanup_roles 读取 flush_roles、flush_phases、delete_before_flush 并使用字段 delete_before_flush，并写入 flush_roles、flush_phases、delete_before_flush；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：hardware_cleanup_roles 无返回值，仅执行 delete_before_flush=1'b0；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b0; flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE); endfunction
+  virtual function void hardware_cleanup_roles(
+    output rdma_queue_backing_role_e flush_roles[$],
+    output rdma_queue_flush_phase_e flush_phases[$],
+    output bit delete_before_flush
+  );
+    flush_roles.delete();
+    flush_phases.delete();
+    delete_before_flush = 1'b0;
+    flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
+    flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
+    flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
+    flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
+  endfunction
 
   // 功能：在 rdma_srq_lifecycle_policy 中，local_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：roles（输出）、release_context_first（输出）；local_cleanup_roles 读取 roles、release_context_first 并使用字段 release_context_first，并写入 roles、release_context_first；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：local_cleanup_roles 无返回值，仅执行 release_context_first=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b1; roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD); roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB); roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING); roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING); endfunction
+  virtual function void local_cleanup_roles(
+    output rdma_queue_backing_role_e roles[$],
+    output bit release_context_first
+  );
+    roles.delete();
+    release_context_first = 1'b1;
+    roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
+    roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
+    roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB);
+    roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING);
+    roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING);
+  endfunction
 endclass
 
 class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
@@ -1610,7 +1679,6 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：CEQ preflight 校验 CEQ depth、vector 绑定和环形 backing 需求，并将规范化结果写入 result。
   // 输入/输出及副作用：binding（输入）、request（输入）、manager（输入）、result（输出）；preflight 读取 binding、request、manager、result 并使用字段 result、status、found_vector、vector、candidate、candidate.resource_kind、candidate.depth、candidate.local_vector，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
@@ -1786,7 +1854,6 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：classify_query_completion 根据 resource、completion、presence、conclusive 执行 rdma_status 结果转换，具体更新字段 输出参数 presence、conclusive；失败分支保持已登记资源和输出不变，并将错误状态返回调用方。
   // 输入/输出及副作用：resource（输入）、completion（输入）、presence（输出）、conclusive（输出）；classify_query_completion 读取 resource、completion、presence、conclusive 并使用输入参数和固定枚举/常量，并写入 presence、conclusive；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：classify_query_completion 只读输入并返回 rdma_status；边界由函数体现有分支决定，不修改状态或转移资源。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
@@ -1801,14 +1868,29 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：在 rdma_ceq_lifecycle_policy 中，hardware_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：flush_roles（输出）、flush_phases（输出）、delete_before_flush（输出）；hardware_cleanup_roles 读取 flush_roles、flush_phases、delete_before_flush 并使用字段 delete_before_flush，并写入 flush_roles、flush_phases、delete_before_flush；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：hardware_cleanup_roles 无返回值，仅执行 delete_before_flush=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
+  virtual function void hardware_cleanup_roles(
+    output rdma_queue_backing_role_e flush_roles[$],
+    output rdma_queue_flush_phase_e flush_phases[$],
+    output bit delete_before_flush
+  );
+    flush_roles.delete();
+    flush_phases.delete();
+    delete_before_flush = 1'b1;
+  endfunction
 
   // 功能：在 rdma_ceq_lifecycle_policy 中，local_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：roles（输出）、release_context_first（输出）；local_cleanup_roles 读取 roles、release_context_first 并使用字段 release_context_first，并写入 roles、release_context_first；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：local_cleanup_roles 无返回值，仅执行 release_context_first=1'b0；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_CEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_CEQ_RING); endfunction
+  virtual function void local_cleanup_roles(
+    output rdma_queue_backing_role_e roles[$],
+    output bit release_context_first
+  );
+    roles.delete();
+    release_context_first = 1'b0;
+    roles.push_back(RDMA_QUEUE_ROLE_CEQ_PD);
+    roles.push_back(RDMA_QUEUE_ROLE_CEQ_RING);
+  endfunction
 endclass
 
 class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
@@ -1852,7 +1934,6 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：AEQ preflight 校验 AEQ depth、vector 绑定和环形 backing 需求，并将规范化结果写入 result。
   // 输入/输出及副作用：binding（输入）、request（输入）、manager（输入）、result（输出）；preflight 读取 binding、request、manager、result 并使用字段 result、status、found_vector、vector、candidate、candidate.resource_kind、candidate.depth、candidate.local_vector，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   virtual function rdma_status preflight(
     rdma_function_binding binding, rdma_semantic_request request,
@@ -2028,7 +2109,6 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：classify_query_completion 根据 resource、completion、presence、conclusive 执行 rdma_status 结果转换，具体更新字段 输出参数 presence、conclusive；失败分支保持已登记资源和输出不变，并将错误状态返回调用方。
   // 输入/输出及副作用：resource（输入）、completion（输入）、presence（输出）、conclusive（输出）；classify_query_completion 读取 resource、completion、presence、conclusive 并使用输入参数和固定枚举/常量，并写入 presence、conclusive；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：classify_query_completion 只读输入并返回 rdma_status；边界由函数体现有分支决定，不修改状态或转移资源。
   virtual function rdma_status classify_query_completion(
     rdma_queue_resource resource,
@@ -2043,12 +2123,27 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 
   // 功能：在 rdma_aeq_lifecycle_policy 中，hardware_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：flush_roles（输出）、flush_phases（输出）、delete_before_flush（输出）；hardware_cleanup_roles 读取 flush_roles、flush_phases、delete_before_flush 并使用字段 delete_before_flush，并写入 flush_roles、flush_phases、delete_before_flush；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：hardware_cleanup_roles 无返回值，仅执行 delete_before_flush=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void hardware_cleanup_roles(output rdma_queue_backing_role_e flush_roles[$], output rdma_queue_flush_phase_e flush_phases[$], output bit delete_before_flush); flush_roles.delete(); flush_phases.delete(); delete_before_flush=1'b1; endfunction
+  virtual function void hardware_cleanup_roles(
+    output rdma_queue_backing_role_e flush_roles[$],
+    output rdma_queue_flush_phase_e flush_phases[$],
+    output bit delete_before_flush
+  );
+    flush_roles.delete();
+    flush_phases.delete();
+    delete_before_flush = 1'b1;
+  endfunction
 
   // 功能：在 rdma_aeq_lifecycle_policy 中，local_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
   // 输入/输出及副作用：roles（输出）、release_context_first（输出）；local_cleanup_roles 读取 roles、release_context_first 并使用字段 release_context_first，并写入 roles、release_context_first；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：local_cleanup_roles 无返回值，仅执行 release_context_first=1'b0；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  virtual function void local_cleanup_roles(output rdma_queue_backing_role_e roles[$], output bit release_context_first); roles.delete(); release_context_first=1'b0; roles.push_back(RDMA_QUEUE_ROLE_AEQ_PD); roles.push_back(RDMA_QUEUE_ROLE_AEQ_RING); endfunction
+  virtual function void local_cleanup_roles(
+    output rdma_queue_backing_role_e roles[$],
+    output bit release_context_first
+  );
+    roles.delete();
+    release_context_first = 1'b0;
+    roles.push_back(RDMA_QUEUE_ROLE_AEQ_PD);
+    roles.push_back(RDMA_QUEUE_ROLE_AEQ_RING);
+  endfunction
 endclass

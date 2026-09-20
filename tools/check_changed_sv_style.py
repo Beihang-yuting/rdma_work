@@ -15,7 +15,13 @@ import sys
 
 
 LABELS = ("功能：", "输入/输出及副作用：", "失败/边界：")
-METHOD_RE = re.compile(r"^\s*(?:(?:virtual|automatic|protected|local|static)\s+)*(function|task)\b")
+# SystemVerilog allows declaration qualifiers such as ``pure virtual`` and
+# ``extern static`` before the function/task keyword.  Keep the recognizer
+# deliberately qualifier-only so it cannot mistake arbitrary identifiers for
+# methods; the body/termination scan remains responsible for the range.
+METHOD_RE = re.compile(
+    r"^\s*(?:(?:pure|virtual|automatic|protected|local|static|extern)\s+)*(function|task)\b"
+)
 END_RE = re.compile(r"^\s*end(function|task)\b")
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -244,6 +250,23 @@ def method_ranges(cleaned_lines: list[str]) -> list[tuple[int, int, int]]:
     for index, line in enumerate(cleaned_lines):
         if not METHOD_RE.match(line):
             continue
+
+        # `pure`/`extern` declarations end at a prototype semicolon and do not
+        # own an endfunction/endtask body.  Treating them as body-bearing
+        # methods would extend their range to EOF and make an unrelated later
+        # change appear to require comments on an untouched declaration.
+        keyword_match = re.search(r"\b(function|task)\b", line)
+        qualifier_prefix = line[:keyword_match.start()] if keyword_match else ""
+        declaration_only = bool(re.search(r"\b(?:pure|extern)\b", qualifier_prefix))
+        if declaration_only:
+            end = len(cleaned_lines)
+            for cursor in range(index, len(cleaned_lines)):
+                if ";" in cleaned_lines[cursor]:
+                    end = cursor + 1
+                    break
+            methods.append((index + 1, end, index))
+            continue
+
         end = len(cleaned_lines)
         for cursor in range(index + 1, len(cleaned_lines)):
             if END_RE.match(cleaned_lines[cursor]):
@@ -378,7 +401,12 @@ def check_cases(
                 token = cleaned[offset]
                 if re.search(r"\bendcase\b", token):
                     break
-                label = re.match(r"^\s*(?:default|[^:]+):", token)
+                # A class/package scope operator (`::`) is not a case-item
+                # delimiter.  Keep the lightweight case parser, but require
+                # the matched colon to have neither colon neighbour.
+                label = re.match(
+                    r"^\s*(?:default\s*:|[^:]+(?<!:):(?!:))", token
+                )
                 if label:
                     if branch_start is not None and branch_statements > 1 and not branch_has_begin:
                         diagnostics.append(Diagnostic(path, branch_start, "multi-statement case branch requires begin/end"))

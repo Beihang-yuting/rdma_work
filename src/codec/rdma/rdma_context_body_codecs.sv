@@ -65,9 +65,26 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
+  // 功能：context_status_or_error 将 context-body 编码链中来自 virtual 或
+  //       后端 builder 的状态统一归一化，给调用方一个可安全解引用的结果。
+  // 输入/输出及副作用：status 和 label 为输入；非空 status 原样返回，null
+  //       status 转为 INVALID_STATE；不修改 model、image、builder 或资源账本。
+  // 失败/边界：下游违反“状态必须非空”的契约时返回带 label 的确定性错误，调用
+  //       方必须停止当前 encode/decode 阶段，不能继续读取 status.message。
+  protected function rdma_status context_status_or_error(
+    rdma_status status,
+    string label
+  );
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {label, " returned null status"}
+      );
+    return status;
+  endfunction
+
   // 功能：在 rdma_hw_context_body_codec_base 中，put 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
   // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输入）；put 读取 builder、word_byte_offset、lsb、width、value 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：put 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   protected function rdma_status put(
     rdma_hw_qword_builder builder,
@@ -77,7 +94,15 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     bit [63:0] value
   );
     rdma_status status;
+
+    if (builder == null)
+      return codec_error("context-body field authorship builder is null");
+
     status = builder.put_field(word_byte_offset, lsb, width, value);
+    status = context_status_or_error(
+      status, "context-body field authorship"
+    );
+
     if (!status.ok())
       return codec_error({"context-body field authorship failed: ",
                           status.message});
@@ -96,7 +121,15 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     inout bit [63:0] value
   );
     rdma_status status;
+
+    if (builder == null)
+      return codec_error("context-body field extraction builder is null");
+
     status = builder.get_field(word_byte_offset, lsb, width, value);
+    status = context_status_or_error(
+      status, "context-body field extraction"
+    );
+
     if (!status.ok())
       return codec_error({"context-body field extraction failed: ",
                           status.message});
@@ -212,8 +245,15 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     bit [63:0] allowed;
     rdma_status status;
 
+    if (builder == null)
+      return codec_error("context-body encode mask builder is null");
+
     status = builder.validate_allowed_mask(expected_image_kind(),
                                            expected_opcode(), pbl_mode);
+    status = context_status_or_error(
+      status, "context-body encode mask validation"
+    );
+
     if (!status.ok())
       return codec_error({"context-body encode mask validation failed: ",
                           status.message});
@@ -235,7 +275,6 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
 
   // 功能：在 rdma_hw_context_body_codec_base 中，finish_body 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
   // 输入/输出及副作用：builder（输入）、pbl_mode（输入）、owner_generation（输入）、image（输出）；finish_body 读取 builder、pbl_mode、owner_generation、image 并使用字段 image、status、payload、candidate、candidate.length、candidate.alignment、candidate.endian、candidate.image_kind，并写入 image；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：finish_body 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status finish_body(
     rdma_hw_qword_builder builder,
@@ -248,10 +287,21 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     rdma_hw_image candidate;
 
     image = null;
+    if (builder == null)
+      return codec_error("context-body finish builder is null");
+
     status = validate_encode_mask(builder, pbl_mode);
+    status = context_status_or_error(
+      status, "context-body encode mask validation"
+    );
+
     if (!status.ok()) return status;
     payload = new[0];
     status = builder.serialize(payload);
+    status = context_status_or_error(
+      status, "context-body serialization"
+    );
+
     if (!status.ok())
       return codec_error({"context-body serialization failed: ",
                           status.message});
@@ -284,12 +334,26 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
 
     image = null;
     status = validate_model(model);
-    if (!status.ok()) return status;
+    status = context_status_or_error(
+      status, "context-body model validation"
+    );
+
+    if (!status.ok())
+      return status;
     builder = new("context_body_encode_builder");
     status = builder.reset(BODY_BYTES);
+    status = context_status_or_error(
+      status, "context-body encode builder reset"
+    );
+
     if (!status.ok()) return codec_error(status.message);
     status = encode_body(model, builder);
-    if (!status.ok()) return status;
+    status = context_status_or_error(
+      status, "context-body body encoder"
+    );
+
+    if (!status.ok())
+      return status;
     return finish_body(builder, model_pbl_mode(model),
                        owner_generation(model), image);
   endfunction
@@ -318,11 +382,23 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     foreach (payload[i]) payload[i] = image.bytes[i];
     builder = new("context_body_validate_builder");
     status = builder.deserialize(payload);
+    status = context_status_or_error(
+      status, "context-body image deserialization"
+    );
+
     if (!status.ok()) return codec_error(status.message);
     status = image_pbl_mode(builder, pbl_mode);
+    status = context_status_or_error(
+      status, "context-body image PBL mode"
+    );
+
     if (!status.ok()) return codec_error(status.message);
     status = builder.validate_allowed_mask(expected_image_kind(),
                                            expected_opcode(), pbl_mode);
+    status = context_status_or_error(
+      status, "context-body image mask validation"
+    );
+
     if (!status.ok())
       return codec_error({"context-body reserved/mask validation failed: ",
                           status.message});
@@ -343,18 +419,36 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
 
     model = null;
     status = validate_image(image);
-    if (!status.ok()) return status;
+    status = context_status_or_error(
+      status, "context-body image validation"
+    );
+
+    if (!status.ok())
+      return status;
     payload = new[BODY_BYTES];
     foreach (payload[i]) payload[i] = image.bytes[i];
     builder = new("context_body_decode_builder");
     status = builder.deserialize(payload);
+    status = context_status_or_error(
+      status, "context-body decode deserialization"
+    );
+
     if (!status.ok()) return codec_error(status.message);
     candidate = null;
     status = decode_body(builder, candidate);
-    if (!status.ok()) return status;
+    status = context_status_or_error(
+      status, "context-body body decoder"
+    );
+
+    if (!status.ok())
+      return status;
     if (candidate == null)
       return codec_error("context-body decoder produced a null candidate");
     status = validate_model(candidate);
+    status = context_status_or_error(
+      status, "decoded context-body model validation"
+    );
+
     if (!status.ok())
       return codec_error({"decoded context-body semantics are invalid: ",
                           status.message});
@@ -378,11 +472,19 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     equal = 1'b0;
     mismatch = "";
     status = encode(lhs, left_image);
+    status = context_status_or_error(
+      status, "left context-body serialization"
+    );
+
     if (!status.ok()) begin
       mismatch = {"left model: ", status.message};
       return status;
     end
     status = encode(rhs, right_image);
+    status = context_status_or_error(
+      status, "right context-body serialization"
+    );
+
     if (!status.ok()) begin
       mismatch = {"right model: ", status.message};
       return status;
@@ -503,7 +605,9 @@ class rdma_hw_cqc_create_body_codec
 
     if (!$cast(cqc, model))
       return invalid_argument("rdma CQC codec requires rdma_cqc_model");
-    status = cqc.validate();
+    status = context_status_or_error(
+      cqc.validate(), "CQC model validation"
+    );
     if (!status.ok())
       return invalid_argument({"CQC model is invalid: ", status.message});
     if (!(cqc.page_layout.mode inside {
@@ -731,31 +835,35 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，encode_mr_state 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：state（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_mr_state 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：在 rdma_hw_mrt_body_codec_base 中，encode_mr_state 将 MRT 专用
+  //       INVLD/FREE/VLD 枚举映射为驱动 mr.h 的 0/1/2 状态码。
+  // 输入/输出及副作用：state（输入）、code（输出）；只读取 state 并写入 output code，不修改 MRT、image 或外部资源。
+  // 失败/边界：state 为未定义的 2'b11 时返回 INVALID_ARGUMENT；合法三态均成功，调用方负责在写 image 前处理失败。
   protected function rdma_status encode_mr_state(
-    rdma_context_state_e state,
+    rdma_mr_state_e state,
     output bit [1:0] code
   );
     case (state)
-      RDMA_CONTEXT_INVALID: code = RDMA_MR_ST_INVALID;
-      RDMA_CONTEXT_VALID:   code = RDMA_MR_ST_VALID;
+      RDMA_MR_STATE_INVALID: code = RDMA_MR_ST_INVALID;
+      RDMA_MR_STATE_FREE:    code = RDMA_MR_ST_FREE;
+      RDMA_MR_STATE_VALID:   code = RDMA_MR_ST_VALID;
       default: return invalid_argument("rdma MRT state is unsupported");
     endcase
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，decode_mr_state 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：code（输入）、state（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_mr_state 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：在 rdma_hw_mrt_body_codec_base 中，decode_mr_state 将硬件 0/1/2
+  //       状态码还原为 MRT 专用 INVALID/FREE/VALID 枚举。
+  // 输入/输出及副作用：code（输入）、state（输出）；只读取 code 并写入 output state，不接管 image 或外部资源。
+  // 失败/边界：code 为 2'b11 或驱动未定义值时返回 CODEC_ERROR，禁止发布一个伪造的 MRT 状态。
   protected function rdma_status decode_mr_state(
     bit [1:0] code,
-    output rdma_context_state_e state
+    output rdma_mr_state_e state
   );
     case (code)
-      RDMA_MR_ST_INVALID: state = RDMA_CONTEXT_INVALID;
-      RDMA_MR_ST_VALID:   state = RDMA_CONTEXT_VALID;
+      RDMA_MR_ST_INVALID: state = RDMA_MR_STATE_INVALID;
+      RDMA_MR_ST_FREE:    state = RDMA_MR_STATE_FREE;
+      RDMA_MR_ST_VALID:   state = RDMA_MR_STATE_VALID;
       default: return codec_error("rdma MRT state code is invalid");
     endcase
     return rdma_status::success();
@@ -851,7 +959,9 @@ virtual class rdma_hw_mrt_body_codec_base
 
     if (!$cast(mrt, model))
       return invalid_argument("rdma MRT codec requires rdma_mrt_model");
-    status = mrt.validate();
+    status = context_status_or_error(
+      mrt.validate(), "MRT model validation"
+    );
     if (!status.ok())
       return invalid_argument({"MRT model is invalid: ", status.message});
     status = encode_mr_state(mrt.state, state_code);
@@ -1165,7 +1275,9 @@ class rdma_hw_srqc_create_body_codec
     bit [51:0] page;
     if (!$cast(srqc, model))
       return invalid_argument("rdma SRQC codec requires rdma_srqc_model");
-    status = srqc.validate();
+    status = context_status_or_error(
+      srqc.validate(), "SRQC model validation"
+    );
     if (!status.ok())
       return invalid_argument({"SRQC model is invalid: ", status.message});
     status = encode_log2(srqc.depth, 4, "SRQC depth", depth_code);
@@ -1283,10 +1395,12 @@ virtual class rdma_hw_eq_create_body_codec_base
     super.new(name);
   endfunction
 
-  // 功能：validate_eq_layout 校验 depth、vector_id、layout、producer、consumer 与当前对象状态的一致性，并显式处理“rdma EQC object mode is unsupported”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：depth（输入）、vector_id（输入）、layout（输入）、producer（输入）、consumer（输入）；validate_eq_layout 读取 depth、vector_id、layout、producer、consumer 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：validate_eq_layout 校验 EQC 的 page-table mode、next backing、depth 编码、page
+  //   对齐以及 MSI/vector、producer/consumer 字段宽度。
+  // 输入/输出及副作用：depth、vector_id、layout、producer、consumer（输入）；只读布局和值
+  //   字段，不写 image、model 或 backing owner，返回规范化 rdma_status。
+  // 失败/边界：mode 不支持、next_valid 为假、depth/page 编码失败或 vector/环指针超出硬件
+  //   位宽时返回 INVALID_ARGUMENT/相应 helper 错误；失败不得继续 encode_eq_layout。
   protected function rdma_status validate_eq_layout(
     int unsigned depth,
     int unsigned vector_id,
@@ -1460,7 +1574,9 @@ class rdma_hw_ceqc_create_body_codec
     rdma_status status;
     if (!$cast(ceqc, model))
       return invalid_argument("rdma CEQC codec requires rdma_ceqc_model");
-    status = ceqc.validate();
+    status = context_status_or_error(
+      ceqc.validate(), "CEQC model validation"
+    );
     if (!status.ok())
       return invalid_argument({"CEQC model is invalid: ", status.message});
     return validate_eq_layout(ceqc.depth, ceqc.vector_id, ceqc.page_layout,
@@ -1543,7 +1659,9 @@ class rdma_hw_aeqc_create_body_codec
     rdma_status status;
     if (!$cast(aeqc, model))
       return invalid_argument("rdma AEQC codec requires rdma_aeqc_model");
-    status = aeqc.validate();
+    status = context_status_or_error(
+      aeqc.validate(), "AEQC model validation"
+    );
     if (!status.ok())
       return invalid_argument({"AEQC model is invalid: ", status.message});
     return validate_eq_layout(aeqc.depth, aeqc.vector_id, aeqc.page_layout,
@@ -1606,7 +1724,13 @@ function automatic rdma_status rdma_register_context_body_codecs(
   status = registry.register_codec(
     key, rdma_hw_cqc_create_body_codec::type_id::create(
       "rdma_cqc_create_body_codec"));
-  if (!status.ok()) return status;
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "CQC codec registration returned null status"
+    );
+  if (!status.ok())
+    return status;
 
   key.image_kind = RDMA_IMAGE_MRT;
   key.object_type = "mrt";
@@ -1615,14 +1739,26 @@ function automatic rdma_status rdma_register_context_body_codecs(
   status = registry.register_codec(
     key, rdma_hw_mrt_key_alloc_body_codec::type_id::create(
       "rdma_mrt_key_alloc_body_codec"));
-  if (!status.ok()) return status;
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "MRT key-alloc codec registration returned null status"
+    );
+  if (!status.ok())
+    return status;
 
   key.variant = "register";
   key.opcode = RDMA_OP_MR_REGISTER;
   status = registry.register_codec(
     key, rdma_hw_mrt_register_body_codec::type_id::create(
       "rdma_mrt_register_body_codec"));
-  if (!status.ok()) return status;
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "MRT register codec registration returned null status"
+    );
+  if (!status.ok())
+    return status;
 
   key.image_kind = RDMA_IMAGE_SRQC;
   key.object_type = "srqc";
@@ -1631,7 +1767,13 @@ function automatic rdma_status rdma_register_context_body_codecs(
   status = registry.register_codec(
     key, rdma_hw_srqc_create_body_codec::type_id::create(
       "rdma_srqc_create_body_codec"));
-  if (!status.ok()) return status;
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "SRQC codec registration returned null status"
+    );
+  if (!status.ok())
+    return status;
 
   key.image_kind = RDMA_IMAGE_CEQC;
   key.object_type = "ceqc";
@@ -1639,12 +1781,24 @@ function automatic rdma_status rdma_register_context_body_codecs(
   status = registry.register_codec(
     key, rdma_hw_ceqc_create_body_codec::type_id::create(
       "rdma_ceqc_create_body_codec"));
-  if (!status.ok()) return status;
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "CEQC codec registration returned null status"
+    );
+  if (!status.ok())
+    return status;
 
   key.image_kind = RDMA_IMAGE_AEQC;
   key.object_type = "aeqc";
   key.opcode = RDMA_OP_AEQC_CREATE;
-  return registry.register_codec(
+  status = registry.register_codec(
     key, rdma_hw_aeqc_create_body_codec::type_id::create(
       "rdma_aeqc_create_body_codec"));
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      "AEQC codec registration returned null status"
+    );
+  return status;
 endfunction

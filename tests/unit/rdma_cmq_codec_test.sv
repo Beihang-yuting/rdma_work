@@ -239,6 +239,22 @@ class rdma_cmq_codec_test extends uvm_test;
     return cqc;
   endfunction
 
+  // 功能：make_cqc_delete_body 构造携带完整 CQC context 的 typed CQC_DELETE
+  //   body，确保测试不会退化为仅填充 CQN 的 legacy fixture。
+  // 输入/输出及副作用：name 为输入；返回新建 body 及其独立 CQC context，
+  //   不修改其他 fixture 或真实资源账本。
+  // 失败/边界：helper 始终绑定 make_cqc() 的有效 context；需要测试缺失 context
+  //   时由调用方显式置 null，生产 codec 应拒绝该输入。
+  function automatic rdma_hw_cqc_delete_body make_cqc_delete_body(
+    string name
+  );
+    rdma_hw_cqc_delete_body body;
+
+    body = rdma_hw_cqc_delete_body::type_id::create(name);
+    body.cqc_context = make_cqc();
+    return body;
+  endfunction
+
   // 功能：make_mrt 创建独立的 rdma_mrt_model；根据 name、stag_index、pbl_mode 设置字段 mrt、mrt.mr_h、mrt.pd_h、mrt.state、iova.value、mrt.length、mrt.lkey、mrt.rkey、mrt.access、mrt.object_type，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：name（输入）、stag_index（输入）、RDMA_MR_PBL0（输入）；make_mrt 读取 name、stag_index、pbl_mode 并使用字段 mrt、mrt.mr_h、mrt.pd_h、mrt.state、iova.value、mrt.length、mrt.lkey、mrt.rkey；函数返回 rdma_mrt_model，不取得调用方资源所有权。
   // 失败/边界：make_mrt 先检查 pbl_mode == RDMA_MR_PBL1；pbl_mode == RDMA_MR_PBL2，再返回 mrt；拒绝分支不提交部分状态，也不隐式重试。
@@ -251,7 +267,7 @@ class rdma_cmq_codec_test extends uvm_test;
     mrt = rdma_mrt_model::type_id::create(name);
     mrt.mr_h = make_handle({name, "_mr"}, RDMA_RESOURCE_MR, stag_index);
     mrt.pd_h = make_handle({name, "_pd"}, RDMA_RESOURCE_PD, 16'h3456);
-    mrt.state = RDMA_CONTEXT_VALID;
+    mrt.state = RDMA_MR_STATE_VALID;
     mrt.iova.value = 64'h0000_1000_2000_3000;
     mrt.length = 64'h12345;
     mrt.lkey = {stag_index[23:0], 8'ha5};
@@ -269,6 +285,7 @@ class rdma_cmq_codec_test extends uvm_test;
     else if (pbl_mode == RDMA_MR_PBL2) begin
       mrt.page_layout.pba0.value = 0;
       mrt.page_layout.first_pbl_index = 28'h123_4567;
+      mrt.page_layout.first_pbl_index_valid = 1'b1;
     end
     mrt.page_layout.payload_vf_enable = 1'b1;
     mrt.page_layout.payload_vf_id = 8'h5a;
@@ -442,7 +459,6 @@ class rdma_cmq_codec_test extends uvm_test;
 
   // 功能：在 rdma_cmq_codec_test 中，image_field 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
   // 输入/输出及副作用：image（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）；image_field 读取 image、word_byte_offset、lsb、width 并使用字段 mask；函数返回 bit [63:0]，不取得调用方资源所有权。
-
   // 失败/边界：image_field 的结果直接由 return (image_word(image, word_byte_offset >> 3) >> lsb) & mask 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic bit [63:0] image_field(
     rdma_hw_image image,
@@ -962,6 +978,315 @@ class rdma_cmq_codec_test extends uvm_test;
       `uvm_error(label, "failed light encode published an image")
   endfunction
 
+  // 功能：make_occ_completion_image 构造一份带 OCC 查询返回字段的 64B CMQ CQE，
+  //   用于验证驱动 cmq.c 对 qword0/qword1/qword3 的三段读取契约。
+  // 输入/输出及副作用：opcode、return_index、occ_num、start_index、occ_key 和
+  //   buffer_addr 为输入；返回新建 CQE 镜像，不修改调用方对象或 CMQ 账本。
+  // 失败/边界：该 fixture 只接受 20 个 OCC/IDX 查询 opcode；调用者若传入其他
+  //   opcode 仍会得到原始镜像，实际合法性由 completion codec 负责拒绝。
+  function automatic rdma_hw_image make_occ_completion_image(
+    bit [7:0] opcode,
+    bit [11:0] return_index,
+    bit [7:0] occ_num,
+    bit [11:0] start_index,
+    bit [39:0] occ_key,
+    bit [63:0] buffer_addr
+  );
+    rdma_hw_image image;
+    bit [63:0] qword0;
+
+    image = rdma_hw_image::type_id::create("cmq_occ_completion_image");
+    repeat (RDMA_CMQE_BYTES) image.bytes.push_back(8'h00);
+    image.length = RDMA_CMQE_BYTES;
+    image.alignment = RDMA_CMQE_BYTES;
+    image.endian = RDMA_ENDIAN_BIG;
+    image.image_kind = RDMA_IMAGE_CMQ_CQE;
+    image.hardware_version = RDMA_HW_VERSION;
+    image.function_generation = 0;
+    image.write_target_kind = RDMA_HW_TARGET_NONE;
+    image.backing_target = '0;
+    image.hmc_target = '0;
+    image.bar_target = '0;
+
+    qword0 = 64'h8000_0000_0000_0000 |
+             (64'(opcode) << RDMA_CMQ_OPCODE_LSB) |
+             (64'(8'h00) << RDMA_CMQ_CMD_ECODE_LSB) |
+             (64'(5'h03) << RDMA_CMQ_WQE_INDEX_LSB) |
+             (64'(1'b1) << RDMA_CMQ_WRAP_LSB) |
+             (64'(return_index) << RDMA_CMQ_COMPLETION_RETURN_OCC_IDX_LSB) |
+             (64'(occ_num) << 16) |
+             start_index;
+    set_occ_image_word(image, 0, qword0);
+    set_occ_image_word(image, 1, occ_key);
+    set_occ_image_word(image, 3, buffer_addr);
+    return image;
+  endfunction
+
+  // 功能：set_occ_image_word 将一个逻辑大端 qword 写入 OCC CQE 镜像，供测试 fixture
+  //   精确构造驱动可观察的 raw bytes。
+  // 输入/输出及副作用：image、qword_index 和 value 为输入；函数只写 image.bytes
+  //   对应的八个字节，不修改 metadata、源值或生产 codec 状态。
+  // 失败/边界：image 为空或 qword_index 超过 7 时不写入；越界不会隐式扩展镜像。
+  function automatic void set_occ_image_word(
+    rdma_hw_image image,
+    int unsigned qword_index,
+    bit [63:0] value
+  );
+    if (image == null || qword_index > 7)
+      return;
+    for (int unsigned i = 0; i < 8; i++)
+      image.bytes[(qword_index * 8) + i] = value[63 - (i * 8) -: 8];
+  endfunction
+
+  // 功能：make_query_completion_image 构造 CEQC/AEQC、SRFQC 或 IFA query 的
+  //   最小真实 CQE，保留驱动在 qword0/qword1 读取的字段。
+  // 输入/输出及副作用：opcode、qword0_payload、qword1_payload 为输入；返回
+  //   独立的 64-byte 大端 CMQ CQE，不修改调用方对象或 completion codec。
+  // 失败/边界：该 helper 只负责构造 raw image；opcode 与 payload 的语义/保留位
+  //   仍由 inspect_completion() 校验，未声明的 qword 保持零值。
+  function automatic rdma_hw_image make_query_completion_image(
+    bit [7:0] opcode,
+    bit [63:0] qword0_payload,
+    bit [63:0] qword1_payload
+  );
+    rdma_hw_image image;
+    bit [63:0] qword0;
+
+    image = rdma_hw_image::type_id::create("cmq_query_completion_image");
+    repeat (RDMA_CMQE_BYTES)
+      image.bytes.push_back(8'h00);
+    image.length = RDMA_CMQE_BYTES;
+    image.alignment = RDMA_CMQE_BYTES;
+    image.endian = RDMA_ENDIAN_BIG;
+    image.image_kind = RDMA_IMAGE_CMQ_CQE;
+    image.hardware_version = RDMA_HW_VERSION;
+    image.function_generation = 0;
+    image.write_target_kind = RDMA_HW_TARGET_NONE;
+    image.backing_target = '0;
+    image.hmc_target = '0;
+    image.bar_target = '0;
+
+    qword0 = 64'h8000_0000_0000_0000 |
+             (64'(opcode) << RDMA_CMQ_OPCODE_LSB) |
+             (64'(5'h03) << RDMA_CMQ_WQE_INDEX_LSB) |
+             (64'(1'b1) << RDMA_CMQ_WRAP_LSB) |
+             qword0_payload;
+    set_occ_image_word(image, 0, qword0);
+    set_occ_image_word(image, 1, qword1_payload);
+    return image;
+  endfunction
+
+  // 功能：check_driver_body_mask_contracts 对照 cmq.h/cmq.c 冻结 CQC_DELETE 与
+  //   OCC search 的请求/完成字段所有权，并验证真实 OCC CQE 能被接收。
+  // 输入/输出及副作用：无显式输入；读取静态 opcode registry 和 completion codec，
+  //   仅产生 UVM 断言，不修改 registry、镜像或运行时资源。
+  // 失败/边界：缺失 CQC qword1..7、OCC qword3 buffer 地址、OCC CQE 返回字段或
+  //   opcode admission 均报告 UVM_ERROR；测试不会把缺陷降级为 warning。
+  function automatic void check_driver_body_mask_contracts();
+    rdma_cmq_opcode_descriptor descriptor;
+    rdma_hw_cmq_completion_codec completion_codec;
+    rdma_hw_image image;
+    rdma_hw_cmq_completion completion;
+    rdma_status status;
+    bit ready;
+    bit [7:0] query_opcodes[4] = '{
+      RDMA_OP_CEQC_QUERY,
+      RDMA_OP_AEQC_QUERY,
+      RDMA_OP_SRFQC_QUERY,
+      RDMA_OP_IFA_QUERY
+    };
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_CQC_DELETE,
+                                             descriptor);
+    expect_ok("CQC_DELETE_DESCRIPTOR", status);
+    if (descriptor != null &&
+        (descriptor.request_qword_masks[0] != 64'h0000_0000_001f_ffff ||
+         descriptor.request_qword_masks[1] != 64'hff0f_ffff_ffff_ffff ||
+         descriptor.request_qword_masks[2] != 64'hffff_ffff_ffff_f8ff ||
+         descriptor.request_qword_masks[3] != 64'hffff_ffff_fff8_c701 ||
+         descriptor.request_qword_masks[4] != 64'hf000_0000_00ff_ffff ||
+         descriptor.request_qword_masks[5] != 64'h0000_0000_0000_0fff ||
+         descriptor.request_qword_masks[6] != 64'hffff_ffff_ffff_ffc0 ||
+         descriptor.request_qword_masks[7] != 64'h0000_000f_00ff_ffff))
+      `uvm_error("CQC_DELETE_DESCRIPTOR",
+                 "CQC_DELETE mask does not map qword1..7 to context qword0..6")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_OCC_QPC, descriptor);
+    expect_ok("OCC_QPC_DESCRIPTOR", status);
+    if (descriptor != null && descriptor.request_qword_masks[3] == 0)
+      `uvm_error("OCC_QPC_DESCRIPTOR",
+                 "OCC key search must own qword3 buffer address")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_IDX_OCC_QPC,
+                                             descriptor);
+    expect_ok("IDX_OCC_QPC_DESCRIPTOR", status);
+    if (descriptor != null && descriptor.request_qword_masks[3] == 0)
+      `uvm_error("IDX_OCC_QPC_DESCRIPTOR",
+                 "OCC index search must own qword3 buffer address")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_MW_ALLOC,
+                                             descriptor);
+    expect_ok("MW_ALLOC_DESCRIPTOR", status);
+    if (descriptor != null &&
+        descriptor.request_qword_masks[2] !=
+          64'he0c1_ffff_ff00_0000)
+      `uvm_error("MW_ALLOC_DESCRIPTOR",
+                 "MW_ALLOC qword2 ownership does not match cmq.c")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_MW_DEALLOC,
+                                             descriptor);
+    expect_ok("MW_DEALLOC_DESCRIPTOR", status);
+    if (descriptor != null &&
+        descriptor.request_qword_masks[2] !=
+          64'hc001_ffff_ff00_0000)
+      `uvm_error("MW_DEALLOC_DESCRIPTOR",
+                 "MW_DEALLOC qword2 overclaims alloc-only fields")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_CQC_MODIFY,
+                                             descriptor);
+    expect_ok("CQC_MODIFY_DESCRIPTOR", status);
+    if (descriptor != null &&
+        descriptor.request_qword_masks[0] !=
+          64'h7000_0000_ffdf_ffff)
+      `uvm_error("CQC_MODIFY_DESCRIPTOR",
+                 "CQC_MODIFY qword0 includes reserved bit 21")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_SD_UPDATE,
+                                             descriptor);
+    expect_ok("SD_UPDATE_DESCRIPTOR", status);
+    if (descriptor != null &&
+        (descriptor.request_qword_masks[0] != 64'h0000_0000_0000_00ff ||
+         descriptor.request_qword_masks[1] != 64'h0000_0001_ff00_0000 ||
+         descriptor.request_qword_masks[2] != 64'h0000_0000_0000_0000 ||
+         descriptor.request_qword_masks[3] != 64'hffff_ffff_ffff_fe00 ||
+         descriptor.request_qword_masks[4] != 64'h0000_0000_0000_0fff ||
+         descriptor.request_qword_masks[5] != 64'hffff_ffff_ffff_fff1 ||
+         descriptor.request_qword_masks[6] != 64'h0000_0000_0000_0fff ||
+         descriptor.request_qword_masks[7] != 64'hffff_ffff_ffff_fff1))
+      `uvm_error("SD_UPDATE_DESCRIPTOR",
+                 "SD_UPDATE ownership differs from cmq.c field writes")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_IFA_UPDATE,
+                                             descriptor);
+    expect_ok("IFA_UPDATE_DESCRIPTOR", status);
+    if (descriptor != null &&
+        (descriptor.request_qword_masks[0] != 64'h3000_0000_0000_0000 ||
+         descriptor.request_qword_masks[1] != 64'h03ff_ffff_ffff_ffff ||
+         descriptor.request_qword_masks[2] != 64'h0 ||
+         descriptor.request_qword_masks[3] != 64'h0 ||
+         descriptor.request_qword_masks[4] != 64'h0 ||
+         descriptor.request_qword_masks[5] != 64'h0 ||
+         descriptor.request_qword_masks[6] != 64'h0 ||
+         descriptor.request_qword_masks[7] != 64'h0))
+      `uvm_error("IFA_UPDATE_DESCRIPTOR",
+                 "IFA_UPDATE ownership includes untouched qwords")
+
+    // cmq.h 的请求布局只声明 qword1[57:0]；bit58 属于保留位，不能因为
+    // IFA_QUERY 的响应布局允许 bit58 就被错误复制到 UPDATE 请求。
+    if (descriptor != null) begin
+      if (descriptor.request_qword_masks[1][58])
+        `uvm_error("IFA_UPDATE_DESCRIPTOR",
+                   "IFA_UPDATE qword1 bit58 is incorrectly admitted")
+      if (!rdma_raw_qword_mask_is_valid(
+            64'h03ff_ffff_ffff_ffff,
+            descriptor.request_qword_masks[1]))
+        `uvm_error("IFA_UPDATE_DESCRIPTOR",
+                   "IFA_UPDATE qword1 bits57:0 are not fully admitted")
+      if (rdma_raw_qword_mask_is_valid(
+            64'h07ff_ffff_ffff_ffff,
+            descriptor.request_qword_masks[1]))
+        `uvm_error("IFA_UPDATE_DESCRIPTOR",
+                   "IFA_UPDATE qword1 reserved bit58 was accepted")
+    end
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_CEQC_QUERY,
+                                             descriptor);
+    expect_ok("CEQC_QUERY_DESCRIPTOR", status);
+    if (descriptor != null && descriptor.response_qword_masks[0] !=
+                               64'h8000_3fff_ff00_0fff)
+      `uvm_error("CEQC_QUERY_DESCRIPTOR",
+                 "CEQC_QUERY EQN low field is not admitted")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_SRFQC_QUERY,
+                                             descriptor);
+    expect_ok("SRFQC_QUERY_DESCRIPTOR", status);
+    if (descriptor != null && descriptor.response_qword_masks[0] !=
+                               64'h8000_3fff_ff00_ffff)
+      `uvm_error("SRFQC_QUERY_DESCRIPTOR",
+                 "SRFQC_QUERY SRFQN field is not admitted")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_IFA_QUERY,
+                                             descriptor);
+    expect_ok("IFA_QUERY_DESCRIPTOR", status);
+    if (descriptor != null && descriptor.response_qword_masks[0] !=
+                               64'hb000_3fff_ff00_0000)
+      `uvm_error("IFA_QUERY_DESCRIPTOR",
+                 "IFA_QUERY object type is not admitted")
+    if (descriptor != null) begin
+      if (!descriptor.response_qword_masks[1][58] ||
+          !rdma_raw_qword_mask_is_valid(
+            64'h07ff_ffff_ffff_ffff,
+            descriptor.response_qword_masks[1]))
+        `uvm_error("IFA_QUERY_DESCRIPTOR",
+                   "IFA_QUERY response qword1 bit58 is not admitted")
+    end
+
+    completion_codec = rdma_hw_cmq_completion_codec::type_id::create(
+      "cmq_query_completion_codec");
+    foreach (query_opcodes[query_index]) begin
+      bit [7:0] query_opcode;
+      bit query_ready;
+      rdma_hw_cmq_completion query_completion;
+      rdma_hw_image query_image;
+      bit [63:0] query_qword0;
+      bit [63:0] query_qword1;
+
+      query_opcode = query_opcodes[query_index];
+
+      query_qword0 = (query_opcode inside {
+        RDMA_OP_CEQC_QUERY, RDMA_OP_AEQC_QUERY
+      }) ? 64'h0000_0000_0000_0abc :
+        (query_opcode == RDMA_OP_SRFQC_QUERY) ? 64'h0000_0000_0000_cdef :
+        64'h1000_0000_0000_0000;
+      query_qword1 = (query_opcode == RDMA_OP_IFA_QUERY) ?
+        64'h0000_0000_0012_3456 : 64'h0000_0000_0000_0000;
+      query_image = make_query_completion_image(
+        query_opcode, query_qword0, query_qword1
+      );
+      query_completion = null;
+      query_ready = 1'b0;
+      status = completion_codec.inspect_completion(
+        query_image, 1'b1, query_ready, query_completion
+      );
+      expect_ok($sformatf("QUERY_COMPLETION_%02x", query_opcode), status);
+      if (!query_ready || query_completion == null)
+        `uvm_error("QUERY_COMPLETION_PAYLOAD",
+                   "driver query payload was not published")
+    end
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_OCC_QPC,
+                                             descriptor);
+    expect_ok("OCC_QPC_RESPONSE_DESCRIPTOR", status);
+    if (descriptor != null && descriptor.response_qword_masks[0] !=
+                               64'h83ff_ffff_ffff_0fff)
+      `uvm_error("OCC_QPC_RESPONSE_DESCRIPTOR",
+                 "OCC response return index is not a 12-bit field")
+
+    completion_codec = rdma_hw_cmq_completion_codec::type_id::create(
+      "cmq_occ_completion_codec");
+    image = make_occ_completion_image(
+      RDMA_OP_OCC_QPC, 12'h345, 8'h07, 12'h234,
+      40'h12_3456_789a, 64'h0000_0000_0040_0000);
+    completion = null;
+    ready = 1'b0;
+    status = completion_codec.inspect_completion(image, 1'b1, ready,
+                                                 completion);
+    expect_ok("OCC_QPC_COMPLETION", status);
+    if (!ready || completion == null)
+      `uvm_error("OCC_QPC_COMPLETION",
+                 "driver OCC completion payload was not published")
+  endfunction
+
   // 功能：在测试辅助 rdma_cmq_codec_test.check_envelope_oracle 中构造或驱动“envelope oracle”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
   // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
@@ -1020,7 +1345,7 @@ class rdma_cmq_codec_test extends uvm_test;
     string labels[12] = '{
       "QPC create", "QPC modify", "QPC delete", "QPC query",
       "MRT key allocate", "MRT register", "MR deregister", "OCC flush",
-      "CQ object ID",
+      "CQC context",
       "EQ object ID", "SRQ object ID", "empty body"
     };
     bit [63:0] expected_masks[12][8] = '{
@@ -1056,10 +1381,10 @@ class rdma_cmq_codec_test extends uvm_test;
         64'hfffffffffffff000, 64'h0000000000000000,
         64'h0000000000000000, 64'h0000000000000000,
         64'h0000000000000000, 64'h0000000000000000},
-      '{64'h00000000001fffff, 64'h0000000000000000,
-        64'h0000000000000000, 64'h0000000000000000,
-        64'h0000000000000000, 64'h0000000000000000,
-        64'h0000000000000000, 64'h0000000000000000},
+      '{64'h00000000001fffff, 64'hff0fffffffffffff,
+        64'hfffffffffffff8ff, 64'hfffffffffff8c701,
+        64'hf000000000ffffff, 64'h0000000000000fff,
+        64'hffffffffffffffc0, 64'h0000000f00ffffff},
       '{64'h0000000000000fff, 64'h0000000000000000,
         64'h0000000000000000, 64'h0000000000000000,
         64'h0000000000000000, 64'h0000000000000000,
@@ -1282,6 +1607,7 @@ class rdma_cmq_codec_test extends uvm_test;
   // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
   function automatic void check_all_supported();
     rdma_hw_qpc_command_body qpc_body;
+    rdma_hw_cqc_delete_body cqc_delete_body;
     rdma_hw_object_id_command_body object_body;
     rdma_hw_mr_deregister_body dereg_body;
     rdma_hw_occ_flush_body occ_body;
@@ -1292,10 +1618,12 @@ class rdma_cmq_codec_test extends uvm_test;
     rdma_hw_image key_pbl1_image;
     rdma_hw_image key_pbl2_image;
     rdma_hw_image qpc_source;
+    rdma_hw_image cqc_context_image;
     rdma_hw_image result;
     rdma_status status;
     rdma_hw_cmq_envelope envelope;
     rdma_mrt_model mrt_zero;
+    rdma_cqc_model cqc_context;
 
     qpc_source = make_qpc_signature_source();
 
@@ -1485,15 +1813,26 @@ class rdma_cmq_codec_test extends uvm_test;
     expect_word("OCC_PD_FLUSH", body, 2, 64'h0000_0000_0600_0000);
     void'(compose_ok("OCC_PD_FLUSH", RDMA_OP_OCC_FLUSH, body));
 
-    body = encode_context("CQC_CREATE", RDMA_OP_CQC_CREATE, make_cqc());
+    cqc_context = make_cqc();
+    cqc_context_image = encode_context(
+      "CQC_CREATE", RDMA_OP_CQC_CREATE, cqc_context
+    );
+    body = cqc_context_image;
     void'(compose_ok("CQC_CREATE", RDMA_OP_CQC_CREATE, body));
-    object_body = make_object_body("cqc_delete", RDMA_RESOURCE_CQ,
-                                   21'h12345);
-    body = encode_light("CQC_DELETE", RDMA_OP_CQC_DELETE, object_body);
+    cqc_delete_body = make_cqc_delete_body("cqc_delete");
+    cqc_delete_body.cqc_context = cqc_context;
+    body = encode_light("CQC_DELETE", RDMA_OP_CQC_DELETE,
+                        cqc_delete_body);
     expect_word("CQC_DELETE_BODY", body, 0, 64'h12345);
     for (int unsigned q = 1; q < 8; q++)
-      expect_word("CQC_DELETE_BODY", body, q, 0);
+      expect_word("CQC_DELETE_BODY", body, q,
+                  image_word(cqc_context_image, q));
     void'(compose_ok("CQC_DELETE", RDMA_OP_CQC_DELETE, body));
+    object_body = make_object_body("cqc_delete", RDMA_RESOURCE_CQ,
+                                   21'h12345);
+    expect_light_failure("CQC_DELETE_REJECTS_GENERIC_BODY",
+                         RDMA_OP_CQC_DELETE, object_body,
+                         RDMA_SC_INVALID_ARGUMENT);
     body = encode_light("CQC_QUERY", RDMA_OP_CQC_QUERY, object_body);
     void'(compose_ok("CQC_QUERY", RDMA_OP_CQC_QUERY, body));
 
@@ -2273,8 +2612,36 @@ class rdma_cmq_codec_test extends uvm_test;
       8'h40, 8'h41, 8'h42, 8'h43, 8'h44, 8'h46,
       8'h47, 8'h48
     };
+    bit [7:0] request_opcodes[] = '{
+      RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
+      RDMA_OP_QPC_DELETE, RDMA_OP_QPC_QUERY,
+      RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
+      RDMA_OP_MR_DEREGISTER, RDMA_OP_OCC_FLUSH,
+      RDMA_OP_CQC_CREATE, RDMA_OP_CQC_DELETE,
+      RDMA_OP_CQC_QUERY, RDMA_OP_CEQC_CREATE,
+      RDMA_OP_CEQC_DELETE, RDMA_OP_CEQC_QUERY,
+      RDMA_OP_AEQC_CREATE, RDMA_OP_AEQC_DELETE,
+      RDMA_OP_AEQC_QUERY, RDMA_OP_TQ_FLUSH,
+      RDMA_OP_SRFQC_CREATE, RDMA_OP_SRFQC_DELETE,
+      RDMA_OP_SRFQC_QUERY
+    };
     rdma_cmq_opcode_descriptor descriptor;
     rdma_status status;
+    bit [7:0] listed_request_opcodes[$];
+
+    rdma_cmq_codec_registry::list_request_supported(listed_request_opcodes);
+    if (listed_request_opcodes.size() != request_opcodes.size())
+      `uvm_error("CMQ_REQUEST_CAPABILITY",
+                 $sformatf("expected %0d request encoders, got %0d",
+                           request_opcodes.size(),
+                           listed_request_opcodes.size()))
+    foreach (request_opcodes[i]) begin
+      if (i >= listed_request_opcodes.size() ||
+          listed_request_opcodes[i] != request_opcodes[i])
+        `uvm_error("CMQ_REQUEST_CAPABILITY",
+                   $sformatf("request encoder list mismatch at index %0d",
+                             i))
+    end
 
     foreach (new_opcodes[i]) begin
       if (!rdma_cmq_codec_registry::is_supported(new_opcodes[i]))
@@ -2287,12 +2654,83 @@ class rdma_cmq_codec_test extends uvm_test;
         continue;
       if (descriptor.request_bytes != RDMA_CMQE_BYTES ||
           descriptor.response_bytes != RDMA_CMQE_BYTES ||
-          !descriptor.request_allowed || !descriptor.response_allowed ||
+          !descriptor.response_allowed ||
           !descriptor.valid())
         `uvm_error("CMQ_REGISTRY_034",
                    $sformatf("invalid descriptor for opcode 0x%02x",
                              new_opcodes[i]))
     end
+
+    foreach (request_opcodes[i]) begin
+      if (!rdma_cmq_codec_registry::is_request_supported(
+            request_opcodes[i]))
+        `uvm_error("CMQ_REQUEST_CAPABILITY",
+                   $sformatf("body encoder opcode 0x%02x is not request-supported",
+                             request_opcodes[i]))
+      status = rdma_cmq_codec_registry::lookup(request_opcodes[i],
+                                                descriptor);
+      expect_ok($sformatf("CMQ_REQUEST_DESC_%02x", request_opcodes[i]),
+                status);
+      if (descriptor != null && !descriptor.request_allowed)
+        `uvm_error("CMQ_REQUEST_CAPABILITY",
+                   $sformatf("body encoder opcode 0x%02x is denied",
+                             request_opcodes[i]))
+    end
+
+    // OCC_FLUSH 与 TQ_FLUSH 的 body 在驱动 ABI 中不携带 Function
+    // generation；generation 只保留在最终定址 SQE 的 authority metadata。
+    // 直接检查 registry，避免 compose/profile 的补偿分支掩盖静态表遗漏。
+    if (!rdma_cmq_codec_registry::is_generationless(RDMA_OP_OCC_FLUSH))
+      `uvm_error("CMQ_GENERATIONLESS_REGISTRY",
+                 "OCC_FLUSH must be generationless in the opcode registry")
+    if (!rdma_cmq_codec_registry::is_generationless(RDMA_OP_TQ_FLUSH))
+      `uvm_error("CMQ_GENERATIONLESS_REGISTRY",
+                 "TQ_FLUSH must be generationless in the opcode registry")
+
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_IFA_UPDATE,
+                                             descriptor);
+    expect_ok("CMQ_IFA_UPDATE_RESPONSE_ONLY", status);
+    if (descriptor != null && descriptor.request_allowed)
+      `uvm_error("CMQ_REQUEST_CAPABILITY",
+                 "IFA_UPDATE has no body encoder but is request-supported")
+    if (rdma_cmq_codec_registry::is_request_supported(RDMA_OP_IFA_UPDATE))
+      `uvm_error("CMQ_REQUEST_CAPABILITY",
+                 "IFA_UPDATE incorrectly appears in request capability")
+
+    begin
+      rdma_hw_image unsupported_body;
+      rdma_hw_image forged_body;
+      rdma_hw_image forged_result;
+      rdma_hw_cmq_envelope response_only_envelope;
+      unsupported_body = null;
+      status = composer.build_body(RDMA_OP_IFA_UPDATE, null,
+                                   unsupported_body);
+      expect_status("CMQ_IFA_UPDATE_BUILD_REJECTED", status,
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      if (status != null &&
+          status.message !=
+            "CMQ request opcode 0x39 has no body encoder")
+        `uvm_error("CMQ_REQUEST_CAPABILITY",
+                   {"unexpected response-only rejection: ",
+                    status.message})
+      if (unsupported_body != null)
+        `uvm_error("CMQ_REQUEST_CAPABILITY",
+                   "response-only build published a body image")
+
+      forged_body = null;
+      status = composer.build_body(RDMA_OP_TQ_FLUSH, null, forged_body);
+      expect_ok("CMQ_FORGED_RESPONSE_ONLY_BODY", status);
+      response_only_envelope = make_envelope(RDMA_OP_IFA_UPDATE);
+      forged_result = null;
+      status = composer.compose_request(response_only_envelope, forged_body,
+                                        null, forged_result);
+      expect_status("CMQ_RESPONSE_ONLY_COMPOSE_REJECTED", status,
+                    RDMA_SC_UNSUPPORTED_OPCODE);
+      if (forged_result != null)
+        `uvm_error("CMQ_REQUEST_CAPABILITY",
+                   "response-only opcode accepted a forged body")
+    end
+
     if (rdma_cmq_codec_registry::is_supported(8'hff))
       `uvm_error("CMQ_REGISTRY_UNKNOWN", "unknown opcode 0xff was accepted")
     status = rdma_cmq_codec_registry::lookup(8'hff, descriptor);
@@ -2487,6 +2925,7 @@ class rdma_cmq_codec_test extends uvm_test;
     check_registry_contract();
     check_driver_034_opcode_registry();
     check_driver_034_golden_vectors();
+    check_driver_body_mask_contracts();
     check_cqc_raw_word_baseline();
     check_injected_registry_snapshot();
     check_envelope_oracle();

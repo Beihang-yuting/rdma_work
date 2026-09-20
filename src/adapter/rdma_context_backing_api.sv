@@ -3,7 +3,8 @@
 // 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
-// 中文说明：rdma_context_backing_api.sv 属于适配器接口层，定义主机内存、PCIe、网络及上下文后端接口。
+// 中文说明：rdma_context_backing_api.sv 属于适配器接口层，定义主机内存、PCIe、网络及上下文后端接口；
+//   read 是可选的 host-visible runtime shadow 观察能力，不改变原有生命周期 ABI。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 virtual class rdma_context_backing_api extends uvm_object;
@@ -39,6 +40,26 @@ virtual class rdma_context_backing_api extends uvm_object;
     longint unsigned offset,
     byte unsigned data[]
   );
+
+  // 功能：read 从指定 context backing 读取固定范围的 host-visible bytes，供
+  //   QPC runtime shadow 等硬件写回观察路径使用；默认实现不宣称所有 context
+  //   adapter 都具备读能力。
+  // 输入/输出及副作用：context_ref、offset、size 为输入，data 为输出；成功时
+  //   data 是 detached byte 快照，不修改 context authority、生命周期或 owner。
+  // 失败/边界：基类默认返回 UNSUPPORTED_OPCODE 且 data 为空；具体 adapter 必须
+  //   自行校验完整 handle/generation、范围和释放状态，不能把缺失读能力伪装成零。
+  virtual function rdma_status read(
+    rdma_context_backing_ref context_ref,
+    longint unsigned offset,
+    int unsigned size,
+    output byte unsigned data[]
+  );
+    data = new[0];
+    return rdma_status::make(
+      RDMA_SC_UNSUPPORTED_OPCODE,
+      "context backing read is not supported by this adapter"
+    );
+  endfunction
 
   // 功能：在 rdma_context_backing_api 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
   // 输入/输出及副作用：context_ref（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。

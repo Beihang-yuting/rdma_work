@@ -357,7 +357,6 @@ class rdma_qpc_codec_test extends uvm_test;
 
   // 功能：在 rdma_qpc_codec_test 中，image_field 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
   // 输入/输出及副作用：image（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）；image_field 读取 image、word_byte_offset、lsb、width 并使用字段 word、mask；函数返回 bit [63:0]，不取得调用方资源所有权。
-
   // 失败/边界：image_field 的结果直接由 return (word >> lsb) & mask 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic bit [63:0] image_field(
     rdma_hw_image image,

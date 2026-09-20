@@ -1,4 +1,4 @@
-// 目录：tests/integration/，验证 rdma_device_env 对 dpu_common Function 的枚举索引。
+// 目录/层次：tests/integration/ 集成测试层，验证 rdma_device_env 对 dpu_common Function 的枚举索引。
 // 职责：确保每个冻结 Function 都建立独立 context，并可按完整 identity 或 Function
 //       handle 查询；不验证队列编码，也不连接真实 PCIe/Host-memory 数据面。
 // 依赖：rdma_dpu_env_pkg、现有 dpu snapshot fixture、dpu_resource_manager 和 UVM。

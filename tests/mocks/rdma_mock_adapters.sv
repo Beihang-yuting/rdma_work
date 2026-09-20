@@ -643,7 +643,6 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
 
   // 功能：request_role 使用 request_context、size、alignment 计算并返回 rdma_queue_backing_role_e 结果；不修改对象字段或外部资源。
   // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）；request_role 读取 request_context、size、alignment 并使用字段 kind、ordinal；函数返回 rdma_queue_backing_role_e，不取得调用方资源所有权。
-
   // 失败/边界：request_role 是只读访问器，返回 rdma_queue_backing_role_e'(request_context.queue_role)；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   function automatic rdma_queue_backing_role_e request_role(
     rdma_dma_request_context request_context,
@@ -1345,7 +1344,6 @@ class rdma_mock_pcie extends rdma_pcie_api;
 
   // 功能：在 rdma_mock_pcie 中，cfg_write32 把 cfg_write32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
   // 输入/输出及副作用：target（输入）、offset（输入）、data（输入）、byte_enable（输入）、status（输出）；cfg_write32 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：cfg_write32 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task cfg_write32(
     rdma_bdf_t target,

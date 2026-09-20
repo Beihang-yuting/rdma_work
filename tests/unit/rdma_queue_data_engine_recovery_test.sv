@@ -9,6 +9,143 @@
 // 设计说明：把纯 runtime value-copy、通用 producer replay 和 Task 8 consumer
 // release-only recovery 放在同一测试组件，可同时约束 pending 证据格式和 engine 对
 // 该证据的消费策略；所有断言只经公开 API 观察状态，避免形成第二份恢复账本。
+
+// 设计说明：make_pending 是 legacy host-producer 失败路径的兼容工厂；它接收
+// semantic request/image 的多态引用，因此 clone() 是必须显式验证的 value-boundary。
+// 下面的 probe 与 hostile value 只暴露这一边界供 focused regression 使用，不改变
+// 生产 engine 的可见接口，也不把测试故障注入 runtime 或外部 backing。
+class rdma_pending_clone_fault_request extends rdma_post_send_req;
+  `uvm_object_utils(rdma_pending_clone_fault_request)
+
+  bit return_wrong_type;
+
+  // 功能：构造可选择返回 null 或错误类型 clone 的 hostile post-send request。
+  // 输入/输出及副作用：name 设置 UVM 对象名；return_wrong_type 默认清零，除本地
+  //   故障开关外不申请 queue、mapping、Host-memory 或 scheduler 资源。
+  // 失败/边界：对象只用于 recovery evidence 负例，不能送入正常 post_send；clone
+  //   故障不会修改源 request 或任何 runtime 状态。
+  function new(string name = "rdma_pending_clone_fault_request");
+    super.new(name);
+    return_wrong_type = 1'b0;
+  endfunction
+
+  // 功能：在 make_pending 的 request snapshot 边界注入 null 或不可转换对象，
+  //   模拟多态 clone 实现失效。
+  // 输入/输出及副作用：无显式输入；返回 null 或 rdma_hw_image 错误类型，不修改
+  //   request 字段，也不触碰 runtime/ledger。
+  // 失败/边界：return_wrong_type=1 时故意触发 $cast 失败；否则返回 null；生产
+  //   make_pending 必须把两种结果都视为 evidence 构造失败。
+  virtual function uvm_object clone();
+    rdma_hw_image wrong_type;
+
+    if (!return_wrong_type)
+      return null;
+    wrong_type = new("pending_wrong_request_clone");
+    return wrong_type;
+  endfunction
+endclass
+
+// 设计说明：image clone 也属于 recovery evidence 的不可变值边界；单独的 hostile
+// 子类确保 request clone 成功时仍能隔离 image 失败，不让测试只覆盖一个字段。
+class rdma_pending_clone_fault_image extends rdma_hw_image;
+  `uvm_object_utils(rdma_pending_clone_fault_image)
+
+  bit return_wrong_type;
+
+  // 功能：构造可选择返回 null 或错误类型 clone 的 hostile hardware image。
+  // 输入/输出及副作用：name 设置 UVM 对象名；return_wrong_type 默认清零，只保留
+  //   本地故障开关，不取得 backing 或 DMA mapping 所有权。
+  // 失败/边界：该 image 仅供 make_pending focused test 使用；正常 codec/write 路径
+  //   不应消费此类对象，clone 失败不能被当作可恢复 image。
+  function new(string name = "rdma_pending_clone_fault_image");
+    super.new(name);
+    return_wrong_type = 1'b0;
+  endfunction
+
+  // 功能：在 make_pending 的 image snapshot 边界返回 null 或不可转换对象，覆盖
+  //   request 已可复制但 image value 失效的 recovery 分支。
+  // 输入/输出及副作用：无显式输入；返回 null 或 rdma_queue_cursor_snapshot，不修改
+  //   源 image、runtime cursor 或 Host-memory。
+  // 失败/边界：return_wrong_type=1 时故意触发 image $cast 失败；否则返回 null；
+  //   调用方必须拒绝整个 pending，而不能保留 request-only evidence。
+  virtual function uvm_object clone();
+    rdma_queue_cursor_snapshot wrong_type;
+
+    if (!return_wrong_type)
+      return null;
+    wrong_type = new("pending_wrong_image_clone");
+    return wrong_type;
+  endfunction
+endclass
+
+// 设计说明：handle clone 失败不能沿用全局 fatal 复制 helper；legacy pending
+//   必须把它当作 recovery evidence 构造失败，避免 runtime 接管空 authority。
+class rdma_pending_clone_fault_handle extends rdma_handle;
+  `uvm_object_utils(rdma_pending_clone_fault_handle)
+
+  bit return_wrong_type;
+
+  // 功能：构造可选择返回 null 或错误类型 clone 的 hostile queue/route handle。
+  // 输入/输出及副作用：name 设置 UVM 对象名；return_wrong_type 默认清零，不申请
+  //   manager、mapping、Host-memory 或 scheduler 资源。
+  // 失败/边界：对象只用于 make_pending 的 detached handle 负例；clone 故障不得
+  //   触发 UVM fatal，也不得修改源 handle 或 runtime。
+  function new(string name = "rdma_pending_clone_fault_handle");
+    super.new(name);
+    return_wrong_type = 1'b0;
+  endfunction
+
+  // 功能：在 pending handle value-boundary 返回 null 或不可转换对象，覆盖 queue_h
+  //   与 routed_qp_h 两个可选 detached identity 的失败分支。
+  // 输入/输出及副作用：无显式输入；返回 null 或 rdma_hw_image 错误类型，不修改
+  //   handle identity、pending ledger 或外部 backing。
+  // 失败/边界：return_wrong_type=1 时故意触发 make_pending 的 $cast 失败；否则
+  //   返回 null；两种结果都必须使整个 pending 返回 null。
+  virtual function uvm_object clone();
+    rdma_hw_image wrong_type;
+
+    if (!return_wrong_type)
+      return null;
+    wrong_type = new("pending_wrong_handle_clone");
+    return wrong_type;
+  endfunction
+endclass
+
+// 设计说明：probe 只把 production make_pending 暴露为测试可调用的 value-boundary，
+// 让 focused test 不必经过 post_send 前置 snapshot.copy（该步骤会抹掉 hostile
+// request 的动态类型）。probe 不持有 runtime、backing 或任何外部资源。
+class rdma_queue_pending_clone_probe extends rdma_queue_data_engine;
+  `uvm_object_utils(rdma_queue_pending_clone_probe)
+
+  // 功能：构造 pending clone probe，沿用生产 engine 的未配置默认状态。
+  // 输入/输出及副作用：name 传给基类；只建立本地索引和 locks，不配置 attachment、
+  //   Host-memory、PCIe 或 scheduler。
+  // 失败/边界：probe 不能替代已配置 engine 执行公开 post/poll；仅用于调用受保护
+  //   make_pending 观察其返回的 detached evidence。
+  function new(string name = "rdma_queue_pending_clone_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：build_pending 透传 production make_pending，供测试验证 nested clone/cast
+  //   失败是否会产生可进入 recovery 的对象。
+  // 输入/输出及副作用：cursor、queue_h、image、request_snapshot 等为输入；返回
+  //   detached pending 或 null，不修改任何输入、runtime、backing 或 ledger。
+  // 失败/边界：任一 nested clone/cast 失败都应返回 null；测试会把返回值交给公开
+  //   runtime.enter_recovery，确认不完整 evidence 不能安装。
+  function rdma_queue_pending_operation build_pending(
+    rdma_queue_cursor_snapshot cursor,
+    rdma_handle queue_h,
+    rdma_hw_image image,
+    rdma_semantic_request request_snapshot,
+    rdma_handle routed_qp_h = null
+  );
+    return make_pending(
+      cursor, queue_h, RDMA_QUEUE_RUNTIME_SQ, 1'b1,
+      0, image, request_snapshot, 1'b1,
+      0, 1'b0, 1'b0, 1'b0, routed_qp_h);
+  endfunction
+endclass
+
 class rdma_queue_data_engine_recovery_test extends uvm_test;
   `uvm_component_utils(rdma_queue_data_engine_recovery_test)
 
@@ -105,8 +242,10 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
                  status.convert2string())
   endtask
 
-  // 功能：check_consumer_local_stage_gates 构造 MMIO SUCCESS 的真实 CQ consumer
+  // 功能：check_consumer_local_stage_gates 构造 legacy runtime-only consumer
   //   pending，验证 no-allocation CI commit 与 WQE release marker 均经过显式 gate。
+  //   这里的 MMIO_SUCCESS 是兼容路径的合成 evidence，不代表 0.1.34 CQC shadow
+  //   写；真实驱动 shadow ABI 由 check_success_consumer_recovery_skips_mmio 覆盖。
   // 输入/输出及副作用：无显式参数；创建独立 CQ runtime/handle/cursor/image/status，
   //   真实提交一项 device entry，调用 recover/commit/begin/finalize 并查询 pending。
   // 失败/边界：未 enable 的 commit 必须零 mutation；release begin 竞争必须 BUSY，
@@ -198,6 +337,10 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     end
     pending.queue_h.kind = RDMA_RESOURCE_CQ;
     pending.kind = RDMA_QUEUE_RUNTIME_CQ;
+    // 中文设计：该 focused task 不编码真实 CQC context shadow。保持
+    // consumer_shadow_required=0，专门覆盖旧的 generic consumer-doorbell
+    // runtime gate；任何 shadow offset/CI payload 断言都属于真实 fixture。
+    pending.consumer_shadow_required = 1'b0;
     pending.cursor = rdma_queue_cursor_snapshot::type_id::create(
       "consumer_gate_cursor");
     pending.next_cursor = rdma_queue_cursor_snapshot::type_id::create(
@@ -224,6 +367,8 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     pending.image.image_kind = RDMA_IMAGE_CQE;
     for (i = 0; i < pending.entry_size; i++)
       pending.image.bytes.push_back(byte'(i));
+    // 中文设计：SUCCESS 只描述 legacy runtime 的已完成 consumer marker；它
+    // 不对应驱动 BAR 写，也不应被复用到 CQC shadow-backed fixture。
     pending.mmio_evidence = RDMA_QUEUE_MMIO_SUCCESS;
     pending.completion_index = 0;
     pending.completion_wrap = 1'b0;
@@ -413,16 +558,17 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
                  status.convert2string())
   endtask
 
-  // 功能：验证真实 CQ poll 在 release 一次性失败后留下 consumer MMIO SUCCESS
-  //   pending；未确认 recovery 不推进，确认后只补 WQE release 而不重发 doorbell/CI。
+  // 功能：验证真实 CQ poll 在 CQC shadow 已发布、WQE release 一次性失败后留下
+  //   consumer shadow pending；未确认 recovery 不推进，确认后只补 WQE release，
+  //   不重发 shadow write、CQ CI 或 consumer doorbell。
   // 输入/输出及副作用：无显式参数；建立 ordering-fault fixture，执行真实
   //   post_send、publish_cqe、poll_cqe 与 public recover_queue，并观测 trace、公开
   //   detached pending、CQ/SQ occupancy、factory guard 与 CQE codec guard；成功最终
   //   各消费一份 CQE/WQE credit。
   // 失败/边界：setup/post/publish/poll 或 pending 查询失败即报告并返回；首次 poll
-  //   必须在 doorbell→commit 后只失败一次 release，未确认 retry 必须拒绝且零副作用，
-  //   确认 retry 只能再调用一次 release，禁止重复 MMIO、CI decrement、codec lookup/
-  //   decode、factory allocation 或 ledger 释放。
+  //   必须在 shadow→commit 后只失败一次 release，未确认 retry 必须拒绝且零副作用，
+  //   确认 retry 只能再调用一次 release，禁止重复 shadow write、CQ CI decrement、
+  //   PCIe MMIO、codec lookup/decode、factory allocation 或 ledger 释放。
   task automatic check_success_consumer_recovery_skips_mmio();
     rdma_queue_data_engine_fixture fixture;
     rdma_queue_data_engine_ordering_fault ordering;
@@ -449,6 +595,13 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     int unsigned occupancy;
     int unsigned trace_before_retry;
     int unsigned guarded_creates;
+    int unsigned shadow_writes_before_poll;
+    int unsigned shadow_writes_after_poll;
+    int unsigned shadow_invocations_before_poll;
+    int unsigned shadow_invocations_after_poll;
+    int unsigned mmio_writes_before_poll;
+    int unsigned mmio_writes_after_poll;
+    int unsigned i;
     string first_guarded_create;
     bit has_pending;
     bit polarity;
@@ -462,7 +615,10 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
       rdma_queue_consumer_fault_registry::get_type(), 1'b1);
     fixture = rdma_queue_data_engine_fixture::type_id::create(
       "success_consumer_fixture");
-    fixture.setup(status);
+    // 中文设计：0.1.34 驱动的 CQ consumer 只通过 CQC context shadow
+    // offset +4 发布 CI/wrap；该 SUCCESS recovery 场景必须显式提供同一
+    // authority，不能依赖已被生产路径移除的 CQ consumer MMIO fallback。
+    fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1, 1'b0);
     if (status == null || !status.ok() ||
         !$cast(ordering, fixture.engine) ||
         !$cast(fault_registry, fixture.registry)) begin
@@ -518,6 +674,14 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
       return;
     end
 
+    shadow_writes_before_poll = ordering.shadow_write_calls;
+    shadow_invocations_before_poll = ordering.shadow_invocation_calls;
+    mmio_writes_before_poll = 0;
+    foreach (fixture.pcie.calls[i]) begin
+      if (fixture.pcie.calls[i] != null &&
+          fixture.pcie.calls[i].method_name == "mmio_write")
+        mmio_writes_before_poll++;
+    end
     ordering.fail_release_once = 1'b1;
     completion = null;
     fixture.engine.poll_cqe(
@@ -529,11 +693,10 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
                  status.convert2string())
       return;
     end
-    if (ordering.trace.size() != 3 ||
-        ordering.trace[0] != "doorbell" ||
-        ordering.trace[1] != "commit" ||
-        ordering.trace[2] != "release" ||
-        ordering.doorbell_calls != 1 || ordering.commit_calls != 1 ||
+    if (ordering.trace.size() != 2 ||
+        ordering.trace[0] != "commit" ||
+        ordering.trace[1] != "release" ||
+        ordering.doorbell_calls != 0 || ordering.commit_calls != 1 ||
         ordering.release_calls != 1)
       `uvm_error("SUCCESS_CONSUMER_INITIAL_ORDER", $sformatf(
         "trace=%p calls=%0d/%0d/%0d", ordering.trace,
@@ -543,8 +706,12 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     status = fixture.engine.query_runtime_pending(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, pending);
     if (status == null || !status.ok() || pending == null ||
-        pending.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
-        !pending.consumer_doorbell_succeeded || !pending.consumer_committed ||
+        pending.mmio_evidence != RDMA_QUEUE_MMIO_NO_SUBMIT ||
+        !pending.consumer_shadow_required ||
+        pending.consumer_shadow_urc ||
+        !pending.consumer_shadow_attempted ||
+        !pending.consumer_shadow_published ||
+        pending.consumer_doorbell_succeeded || !pending.consumer_committed ||
         !pending.cq_consumer_committed || pending.completion_released ||
         pending.committed_consumer_cursor == null ||
         pending.next_cursor == null ||
@@ -557,6 +724,20 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
                  status.convert2string())
       return;
     end
+    shadow_writes_after_poll = ordering.shadow_write_calls;
+    shadow_invocations_after_poll = ordering.shadow_invocation_calls;
+    mmio_writes_after_poll = 0;
+    foreach (fixture.pcie.calls[i]) begin
+      if (fixture.pcie.calls[i] != null &&
+          fixture.pcie.calls[i].method_name == "mmio_write")
+        mmio_writes_after_poll++;
+    end
+    if (shadow_writes_after_poll != shadow_writes_before_poll + 1 ||
+        mmio_writes_after_poll != mmio_writes_before_poll)
+      `uvm_error("SUCCESS_CONSUMER_SHADOW",
+                 $sformatf("shadow writes=%0d->%0d mmio writes=%0d->%0d",
+                   shadow_writes_before_poll, shadow_writes_after_poll,
+                   mmio_writes_before_poll, mmio_writes_after_poll))
 
     occupancy = 32'hffff_ffff;
     has_pending = 1'b0;
@@ -576,7 +757,7 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
       fixture.cq.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b0, status);
     if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
         ordering.trace.size() != trace_before_retry ||
-        ordering.doorbell_calls != 1 || ordering.commit_calls != 1 ||
+        ordering.doorbell_calls != 0 || ordering.commit_calls != 1 ||
         ordering.release_calls != 1)
       `uvm_error("SUCCESS_CONSUMER_CONFIRM",
                  "unconfirmed retry changed a completed transaction stage")
@@ -650,11 +831,18 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
         guarded_creates, first_guarded_create))
     if (ordering.trace.size() != trace_before_retry + 1 ||
         ordering.trace[trace_before_retry] != "release" ||
-        ordering.doorbell_calls != 1 || ordering.commit_calls != 1 ||
+        ordering.doorbell_calls != 0 || ordering.commit_calls != 1 ||
         ordering.release_calls != 2)
       `uvm_error("SUCCESS_CONSUMER_RELEASE_ONLY", $sformatf(
         "trace=%p calls=%0d/%0d/%0d", ordering.trace,
         ordering.doorbell_calls, ordering.commit_calls, ordering.release_calls))
+
+    if (ordering.shadow_write_calls != shadow_writes_after_poll ||
+        ordering.shadow_invocation_calls != shadow_invocations_after_poll)
+      `uvm_error("SUCCESS_CONSUMER_SHADOW_RETRY", $sformatf(
+        "shadow writes=%0d invocations=%0d attempts=%0d",
+        ordering.shadow_write_calls, ordering.shadow_invocation_calls,
+        ordering.shadow_calls))
 
     occupancy = 32'hffff_ffff;
     has_pending = 1'b1;
@@ -672,6 +860,176 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
                  status.convert2string())
   endtask
 
+  // 功能：check_pending_clone_fail_closed 为 request/image 的 null 与错误类型
+  //   clone 各建立一笔 legacy SQ recovery，验证不完整 evidence 不会被 runtime
+  //   接受为 RECOVERY_REQUIRED。
+  // 输入/输出及副作用：label、request、image 为输入；每次调用创建独立 QP handle、
+  //   cursor 和 ACTIVE host runtime，调用 probe.make_pending 与 runtime recovery/query
+  //   API；不访问 Host-memory、PCIe 或 resource manager。
+  // 失败/边界：pending 必须保持 null，enter_recovery 必须拒绝并保持 ACTIVE，query
+  //   pending 必须为空；任何半成品 evidence、成功 recovery 或状态迁移都报告错误。
+  task automatic check_pending_clone_fail_closed_case(
+    string label,
+    rdma_semantic_request request,
+    rdma_hw_image image
+  );
+    rdma_queue_pending_clone_probe probe;
+    rdma_queue_runtime runtime;
+    rdma_handle queue_h;
+    rdma_queue_cursor_snapshot cursor;
+    rdma_queue_pending_operation pending;
+    rdma_queue_pending_operation observed_pending;
+    rdma_queue_runtime_state_e runtime_state;
+    rdma_status status;
+
+    probe = new({label, "_probe"});
+    runtime = new({label, "_runtime"});
+    queue_h = new({label, "_queue"});
+    cursor = new({label, "_cursor"});
+    if (probe == null || runtime == null || queue_h == null || cursor == null ||
+        request == null || image == null) begin
+      `uvm_error({label, "_SETUP"},
+                 "pending clone fault fixture allocation failed")
+      return;
+    end
+    queue_h.kind = RDMA_RESOURCE_QP;
+    queue_h.function_uid = 64'hca11_0000_0000_0001;
+    queue_h.object_id = 32'h71;
+    queue_h.generation = 3;
+    cursor.index = 0;
+    cursor.wrap = 1'b0;
+    status = runtime.configure(queue_h, RDMA_QUEUE_RUNTIME_SQ,
+                               4, 0, 1'b0, 0, 1'b0, 1'b1);
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_CONFIGURE"}, status == null ?
+                 "runtime configure returned null" : status.convert2string())
+      return;
+    end
+    status = runtime.activate();
+    if (status == null || !status.ok()) begin
+      `uvm_error({label, "_ACTIVATE"}, status == null ?
+                 "runtime activate returned null" : status.convert2string())
+      return;
+    end
+
+    pending = probe.build_pending(cursor, queue_h, image, request);
+    if (pending != null)
+      `uvm_error({label, "_PENDING"},
+                 "clone/cast failure returned a partial pending evidence")
+
+    status = runtime.enter_recovery(pending, 1'b0);
+    if (status == null || status.ok())
+      `uvm_error({label, "_ENTER"},
+                 "runtime accepted incomplete pending evidence")
+
+    status = runtime.query_state(runtime_state);
+    if (status == null || !status.ok() ||
+        runtime_state != RDMA_QUEUE_RUNTIME_ACTIVE)
+      `uvm_error({label, "_STATE"},
+                 "incomplete pending changed runtime state")
+
+    observed_pending = null;
+    status = runtime.query_pending(observed_pending);
+    if (status == null || status.ok() || observed_pending != null)
+      `uvm_error({label, "_QUERY"},
+                 "incomplete pending became observable recovery evidence")
+  endtask
+
+  // 功能：check_pending_clone_fail_closed 运行 request/image 两个 nested value
+  //   的 null/cast-failure 矩阵，确保 make_pending 的所有 clone 边界统一 fail closed。
+  // 输入/输出及副作用：无显式输入；构造四组 hostile UVM value 并逐项调用上述
+  //   case helper，所有 runtime 均为独立本地对象。
+  // 失败/边界：任一矩阵项允许 partial pending 或 RECOVERY_REQUIRED 都通过 UVM_ERROR
+  //   暴露；正常 clone 成功路径不在本 focused test 中代替失败覆盖。
+  task automatic check_pending_clone_fail_closed();
+    rdma_pending_clone_fault_request request_fault;
+    rdma_pending_clone_fault_image image_fault;
+    rdma_hw_image image;
+
+    request_fault = new("pending_request_null_clone");
+    image = new("pending_image_for_request_null");
+    check_pending_clone_fail_closed_case(
+      "PENDING_REQUEST_NULL_CLONE", request_fault, image);
+
+    request_fault = new("pending_request_wrong_clone");
+    request_fault.return_wrong_type = 1'b1;
+    image = new("pending_image_for_request_wrong");
+    check_pending_clone_fail_closed_case(
+      "PENDING_REQUEST_WRONG_CLONE", request_fault, image);
+
+    image_fault = new("pending_image_null_clone");
+    request_fault = new("pending_request_for_image_null");
+    image = image_fault;
+    check_pending_clone_fail_closed_case(
+      "PENDING_IMAGE_NULL_CLONE", request_fault, image);
+
+    image_fault = new("pending_image_wrong_clone");
+    image_fault.return_wrong_type = 1'b1;
+    request_fault = new("pending_request_for_image_wrong");
+    image = image_fault;
+    check_pending_clone_fail_closed_case(
+      "PENDING_IMAGE_WRONG_CLONE", request_fault, image);
+  endtask
+
+  // 功能：check_pending_shape_fail_closed 验证 make_pending 的非多态结构边界，
+  //   覆盖空 cursor、通用 semantic request 以及 queue/route handle clone 失败。
+  // 输入/输出及副作用：无显式输入；每个 case 只创建 detached fixture 对象并调用
+  //   probe，不配置 runtime、Host-memory、PCIe 或 scheduler。
+  // 失败/边界：cursor 缺失、request 不是 post-send/post-recv，或任一提供的 handle
+  //   clone 返回 null/错误类型时，必须返回 null；任何半成品 pending 都报告错误。
+  task automatic check_pending_shape_fail_closed();
+    rdma_queue_pending_clone_probe probe;
+    rdma_queue_cursor_snapshot cursor;
+    rdma_hw_image image;
+    rdma_post_send_req request;
+    rdma_semantic_request generic_request;
+    rdma_handle queue_h;
+    rdma_pending_clone_fault_handle handle_fault;
+    rdma_queue_pending_operation pending;
+
+    probe = new("pending_shape_probe");
+    cursor = new("pending_shape_cursor");
+    image = new("pending_shape_image");
+    request = new("pending_shape_request");
+    queue_h = new("pending_shape_queue");
+    if (probe == null || cursor == null || image == null || request == null ||
+        queue_h == null) begin
+      `uvm_error("PENDING_SHAPE_SETUP", "shape fixture allocation failed")
+      return;
+    end
+    queue_h.kind = RDMA_RESOURCE_QP;
+
+    pending = probe.build_pending(null, queue_h, image, request);
+    if (pending != null)
+      `uvm_error("PENDING_NULL_CURSOR", "null cursor produced pending evidence")
+
+    generic_request = new("pending_generic_request");
+    pending = probe.build_pending(cursor, queue_h, image, generic_request);
+    if (pending != null)
+      `uvm_error("PENDING_GENERIC_REQUEST", "generic request produced pending evidence")
+
+    handle_fault = new("pending_queue_null_clone");
+    pending = probe.build_pending(cursor, handle_fault, image, request);
+    if (pending != null)
+      `uvm_error("PENDING_QUEUE_NULL_CLONE",
+                 "queue handle null clone produced pending evidence")
+
+    handle_fault = new("pending_queue_wrong_clone");
+    handle_fault.return_wrong_type = 1'b1;
+    pending = probe.build_pending(cursor, handle_fault, image, request);
+    if (pending != null)
+      `uvm_error("PENDING_QUEUE_WRONG_CLONE",
+                 "queue handle wrong clone produced pending evidence")
+
+    handle_fault = new("pending_route_wrong_clone");
+    handle_fault.return_wrong_type = 1'b1;
+    pending = probe.build_pending(cursor, queue_h, image, request,
+                                  handle_fault);
+    if (pending != null)
+      `uvm_error("PENDING_ROUTE_WRONG_CLONE",
+                 "routed QP wrong clone produced pending evidence")
+  endtask
+
   // 功能：run_phase 顺序执行 pending 深复制、producer policy 与 consumer
   //   release-only recovery 三组独立断言，并用 objection 覆盖全部异步 test 时间。
   // 输入/输出及副作用：phase 由 UVM 输入；raise 后调用三个检查 task，最后 drop；
@@ -684,6 +1042,8 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     check_consumer_local_stage_gates();
     check_engine_recovery_policy();
     check_success_consumer_recovery_skips_mmio();
+    check_pending_clone_fail_closed();
+    check_pending_shape_fail_closed();
     phase.drop_objection(this);
   endtask
 endclass

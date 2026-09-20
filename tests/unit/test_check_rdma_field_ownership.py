@@ -964,6 +964,36 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
             for item in ranges
         ))
 
+    def test_accepts_canonical_raw_qword_mask_helper(self):
+        """功能：接受生产 composer 使用 rdma_raw_qword_mask_is_valid 的规范 ownership 检查。
+        输入输出及副作用：把 fixture 的旧按位表达式替换为 helper 调用并执行 source-walk；只读扫描文本，不写生产源码。
+        失败边界：helper 必须同时接收 merged_word 与 request_envelope_mask(q)|masks[q]；参数漂移或缺失仍应被拒绝。
+        """
+        module = self.require_checker()
+        source = self.complete_production_compose_source().replace(
+            "if ((merged_word & ~(request_envelope_mask(q) | masks[q])) != 0)",
+            "if (!rdma_raw_qword_mask_is_valid(merged_word, "
+            "request_envelope_mask(q) | masks[q]))",
+        )
+
+        ranges = module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
+        self.assertTrue(ranges)
+
+    def test_rejects_noncanonical_raw_qword_mask_helper_arguments(self):
+        """功能：拒绝 raw qword ownership helper 缺少 envelope 或 body mask 的绕过写法。
+        输入输出及副作用：将规范 helper 的第二参数改成单一 mask 后执行 source-walk；不执行 SV 或修改文件。
+        失败边界：只验证 merged_word 而不合并两类 C-derived mask 时必须抛 ContractError。
+        """
+        module = self.require_checker()
+        source = self.complete_production_compose_source().replace(
+            "if ((merged_word & ~(request_envelope_mask(q) | masks[q])) != 0)",
+            "if (!rdma_raw_qword_mask_is_valid(merged_word, masks[q]))",
+        )
+
+        with self.assertRaises(module.ContractError):
+            module._scan_sv_writer_ranges({"fixture.sv": source}, {})
+
     def test_rejects_malformed_production_macro_in_source_walk(self):
         """功能：source-walk 遇到残缺的生产宏续行时必须立即拒绝。
         输入输出及副作用：传入未闭合 CMQ_QPC_PUT 定义；不写入任何

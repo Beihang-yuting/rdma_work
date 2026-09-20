@@ -184,6 +184,32 @@ class rdma_failure_atomic_release_identity
   endfunction
 endclass
 
+// 设计说明：normalize_adapter_status 是 adapter 自己拥有的 fail-closed 边界，
+// 不应通过全局 rdma_status factory 注入来测试。factory override 会在
+// rdma_status::make() 写字段前返回 null，反而把故障点移到状态工厂内部。
+class rdma_host_mem_status_normalization_probe extends rdma_host_mem_adapter;
+  `uvm_object_utils(rdma_host_mem_status_normalization_probe)
+
+  // 功能：构造只暴露 adapter 状态规范化契约的测试 probe，不绑定 host_mem 或
+  //       创建 allocation ledger。
+  // 输入/输出及副作用：name 传给基类构造；只建立本地 UVM 对象，不取得外部资源。
+  // 失败/边界：probe 不能替代真实 adapter 进行释放或 DMA 测试；调用方必须单独
+  //       配置 backend 才能测试其它公开入口。
+  function new(string name = "rdma_host_mem_status_normalization_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：把 null candidate 注入 normalize_adapter_status，验证下游违反非空
+  //       status 契约时 adapter 仍返回确定的 INVALID_STATE。
+  // 输入/输出及副作用：operation 为诊断标签输入；不修改 ledger、mapping 或
+  //       host_mem，只返回 normalize_adapter_status 的新建错误快照。
+  // 失败/边界：返回 null 或 OK 都表示 fail-open；其它错误码表示边界契约漂移，
+  //       测试调用方应报告具体 operation 标签。
+  function rdma_status normalize_null(string operation);
+    return normalize_adapter_status(null, operation);
+  endfunction
+endclass
+
 class rdma_host_mem_adapter_test extends uvm_test;
   `uvm_component_utils(rdma_host_mem_adapter_test)
 
@@ -518,6 +544,43 @@ class rdma_host_mem_adapter_test extends uvm_test;
                  $sformatf("failed read returned %0d bytes", data.size()))
   endfunction
 
+  // 功能：check_status_normalization_boundary 通过受控 protected probe 注入
+  //       null status，确认 adapter 的公共 fail-closed fallback 非空且不成功。
+  // 输入/输出及副作用：无显式参数；task 只创建本地 probe/status 并产生 UVM
+  //       assertion，不访问 Host-memory、DMA ledger 或原始驱动数据结构。
+  // 失败/边界：null output、RDMA_SC_OK 或缺失 operation 诊断均报告错误；该测试
+  //       不使用全局 factory override，避免在 rdma_status::make() 内部制造 NOA。
+  task automatic check_status_normalization_boundary();
+    rdma_host_mem_status_normalization_probe probe;
+    rdma_status status;
+
+    probe = rdma_host_mem_status_normalization_probe::type_id::create(
+      "status_normalization_probe"
+    );
+    status = probe.normalize_null("explicit null-status injection");
+    if (status == null)
+      `uvm_error(
+        "NULL_STATUS_NORMALIZATION",
+        "adapter normalization returned a null status"
+      )
+    else begin
+      if (status.code != RDMA_SC_INVALID_STATE)
+        `uvm_error(
+          "NULL_STATUS_NORMALIZATION",
+          $sformatf(
+            "expected INVALID_STATE, got %s",
+            status.code.name()
+          )
+        )
+      if (status.message !=
+          "Host-memory adapter explicit null-status injection returned null status")
+        `uvm_error(
+          "NULL_STATUS_NORMALIZATION",
+          $sformatf("unexpected diagnostic: %s", status.message)
+        )
+    end
+  endtask
+
   // 功能：在 rdma_host_mem_adapter_test 中，run_queue_host_mem_fixture 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：无显式参数；run_queue_host_mem_fixture 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：run_queue_host_mem_fixture 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -814,6 +877,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
     byte atomic_rd[];
 
     phase.raise_objection(this);
+
+    check_status_normalization_boundary();
 
     run_queue_host_mem_fixture();
 

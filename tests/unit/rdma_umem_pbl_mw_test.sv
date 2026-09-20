@@ -41,23 +41,277 @@ class rdma_umem_pbl_mw_test extends uvm_test;
                            status == null ? "" : status.message))
   endfunction
 
-  // 功能：构造一个 2 MiB、4 KiB 页粒度且带 Function authority 的 UMEM。
+  // 功能：构造一个指定长度、4 KiB 页粒度且带 Function authority 的 UMEM。
   // 输入/输出及副作用：返回新 UMEM 值对象；仅填充本地字段，不接管 host-mem。
-  // 失败/边界：长度必须是 page_size 的整数倍；非法长度由 pin_pages() 拒绝。
+  // 失败/边界：零长度、地址溢出或非法页大小由 pin_pages() 拒绝；非页对齐起始 VA/长度用于覆盖 Linux ib_umem 对齐语义。
   function automatic rdma_umem make_umem(string name,
                                           longint unsigned length,
-                                          rdma_function_handle function_h);
+                                          rdma_function_handle function_h,
+                                          longint unsigned start_va =
+                                            64'h0000_4000_0000_0000);
     rdma_umem umem;
 
     umem = rdma_umem::type_id::create(name);
     umem.function_h = function_h;
-    umem.user_va = 64'h0000_4000_0000_0000;
+    umem.user_va = start_va;
     umem.length = length;
     umem.page_size = 4096;
     umem.permissions = '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
     umem.generation = function_h.generation;
     return umem;
   endfunction
+
+  // 功能：创建代表驱动 HMC/PBLE allocator 返回值的非拥有引用，供 PBL2 显式绑定目录索引。
+  // 输入/输出及副作用：name、function_h、first_index 为输入；返回值仅是本地 fixture，不分配或释放真实 HMC backing。
+  // 失败/边界：first_index 为零的引用故意保留为无效 fixture，PBL builder 必须拒绝而不能自行猜测目录位置。
+  function automatic rdma_hmc_ref make_hmc_ref(
+    string name,
+    rdma_function_handle function_h,
+    int unsigned first_index,
+    bit index_valid = 1'b1
+  );
+    rdma_hmc_ref hmc_ref;
+
+    hmc_ref = rdma_hmc_ref::type_id::create(name);
+    hmc_ref.owner = function_h;
+    hmc_ref.object_kind = RDMA_RESOURCE_MR;
+    hmc_ref.address.value = 64'h0000_0000_0800_0000;
+    hmc_ref.size = 4096;
+    hmc_ref.first_pbl_index = first_index;
+    hmc_ref.index_valid = index_valid;
+    hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
+    return hmc_ref;
+  endfunction
+
+  // 功能：验证真实 PBLE allocator 允许从索引零开始分配，同时要求 HMC 快照显式携带有效性证据。
+  // 输入/输出及副作用：创建同一 Function 下的零索引有效引用和未声明有效性
+  //       的伪造引用，分别调用 validate；只读取返回状态。
+  // 失败/边界：index_valid=1 的零索引必须返回 RDMA_SC_OK；index_valid=0
+  //       无论索引为零还是非零都必须返回 RDMA_SC_INVALID_ARGUMENT，不能把
+  //       数值本身当作 lease 证明。
+  task automatic test_hmc_index_zero_requires_explicit_validity();
+    rdma_function_handle function_h;
+    rdma_hmc_ref zero_index;
+    rdma_hmc_ref forged_zero;
+    rdma_hmc_ref forged_nonzero;
+
+    function_h = make_function("hmc_index_function");
+    zero_index = make_hmc_ref("hmc_index_zero", function_h, 0, 1'b1);
+    expect_status("HMC_INDEX_ZERO_VALID", zero_index.validate(), RDMA_SC_OK);
+
+    forged_zero = make_hmc_ref("hmc_index_zero_forged", function_h, 0,
+                               1'b0);
+    expect_status("HMC_INDEX_ZERO_UNMARKED", forged_zero.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+
+    forged_nonzero = make_hmc_ref("hmc_index_nonzero_forged", function_h,
+                                  32'h80, 1'b0);
+    expect_status("HMC_INDEX_NONZERO_UNMARKED", forged_nonzero.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+  endtask
+
+  // 功能：验证 UMEM 接受 Linux ib_umem 语义中的非页对齐起始 VA，并按对齐区间创建完整 DMA 页序列。
+  // 输入/输出及副作用：创建本地 Function/UMEM，调用 validate() 与 pin_pages()，读取首页 offset、对齐页地址和页数；不访问外部 host-mem。
+  // 失败/边界：起始 VA 或长度未对齐本身不应被拒绝；溢出、零长度和非法页大小仍必须返回明确错误，失败时不得留下部分 pinned 页。
+  task automatic test_umem_unaligned_range_uses_aligned_dma_span();
+    rdma_function_handle function_h;
+    rdma_umem umem;
+    rdma_status status;
+
+    function_h = make_function("unaligned_function");
+    umem = make_umem("unaligned_umem", 64'h1001, function_h,
+                     64'h0000_4000_0000_1003);
+
+    status = umem.validate();
+    expect_status("UNALIGNED_VALIDATE", status, RDMA_SC_OK);
+
+    status = umem.pin_pages();
+    expect_status("UNALIGNED_PIN", status, RDMA_SC_OK);
+    if (umem.first_page_offset != 3)
+      `uvm_error("UNALIGNED_PAGE_OFFSET",
+                 "UMEM must preserve the original first-page offset")
+    if (umem.pages.size() != 2)
+      `uvm_error("UNALIGNED_PAGE_COUNT",
+                 "UMEM must cover both aligned DMA blocks")
+    if (umem.pages.size() >= 2 &&
+        (umem.pages[0].host_va != 64'h0000_4000_0000_1000 ||
+         umem.pages[1].host_va != 64'h0000_4000_0000_2000))
+      `uvm_error("UNALIGNED_PAGE_BASE",
+                 "UMEM page descriptors must use aligned page bases")
+    if (umem.pages.size() >= 2 &&
+        (umem.pages[0].iova.value != 64'h0000_4000_0000_1000 ||
+         umem.pages[1].iova.value != 64'h0000_4000_0000_2000))
+      `uvm_error("UNALIGNED_PAGE_IOVA",
+                 "UMEM DMA blocks must retain aligned IOVA bases")
+  endtask
+
+  // 功能：验证 UMEM 的范围检查不会把非连续 DMA block 之间的空洞误当成可访问覆盖。
+  // 输入/输出及副作用：创建并 pin 三页 UMEM，篡改第二页 IOVA 形成 gap，再调用 check_range；只读取返回状态，不改变 pin 账本。
+  // 失败/边界：首尾页边界合法但中间存在 gap 时必须返回 RDMA_SC_DMA_TRANSLATION，不能仅凭首尾地址通过检查。
+  task automatic test_umem_range_rejects_dma_gap();
+    rdma_function_handle function_h;
+    rdma_umem umem;
+    rdma_iova_t first_iova;
+    rdma_status status;
+
+    function_h = make_function("gap_function");
+    umem = make_umem("gap_umem", 3 * 4096, function_h);
+    expect_status("GAP_PIN", umem.pin_pages(), RDMA_SC_OK);
+
+    if (umem.pages.size() >= 2)
+      umem.pages[1].iova.value += 2 * umem.page_size;
+
+    first_iova = umem.pages[0].iova;
+    status = umem.check_range(first_iova, 3 * umem.page_size);
+    expect_status("GAP_RANGE_REJECT", status, RDMA_SC_DMA_TRANSLATION);
+    if (!umem.pinned || umem.unpin_count != 0)
+      `uvm_error("GAP_RANGE_SIDE_EFFECT",
+                 "range rejection must not change UMEM pin ownership")
+  endtask
+
+  // 功能：验证非页对齐 UMEM 只暴露原始用户范围，而不是把首尾整页的 padding 当成 DMA payload。
+  // 输入/输出及副作用：创建非对齐 UMEM，分别检查合法跨页区间、首部 padding 和尾部越界；只读取状态，不修改页账本。
+  // 失败/边界：从首个 DMA 页基址开始的 prefix、超过 user_va+length-1 的 suffix 都必须拒绝，原始范围内的访问必须成功。
+  task automatic test_umem_unaligned_range_is_bounded();
+    rdma_function_handle function_h;
+    rdma_umem umem;
+    rdma_iova_t first_iova;
+    rdma_status status;
+
+    function_h = make_function("bounded_function");
+    umem = make_umem("bounded_umem", 64'h1001, function_h,
+                     64'h0000_4000_0000_1003);
+    expect_status("BOUNDED_PIN", umem.pin_pages(), RDMA_SC_OK);
+    first_iova = umem.pages[0].iova;
+    first_iova.value += umem.first_page_offset;
+
+    status = umem.check_range(first_iova, umem.length);
+    expect_status("BOUNDED_VALID", status, RDMA_SC_OK);
+
+    status = umem.check_range(umem.pages[0].iova, 1);
+    expect_status("BOUNDED_PREFIX", status, RDMA_SC_DMA_TRANSLATION);
+
+    first_iova.value += umem.length;
+    status = umem.check_range(first_iova, 1);
+    expect_status("BOUNDED_SUFFIX", status, RDMA_SC_DMA_TRANSLATION);
+  endtask
+
+  // 功能：验证 PBL mode 由 DMA block 的真实连续性决定，而不是由页数阈值猜测。
+  // 输入/输出及副作用：创建并 pin 三组本地 UMEM，构建 PBL 后读取 mode、level 和目录索引；只修改本地页映射快照。
+  // 失败/边界：连续一页或多页必须使用 PBL0；恰好两个非连续 block 使用 PBL1；三个非连续 block 使用 PBL2 且携带真实的非零目录索引。
+  task automatic test_pbl_mode_follows_dma_contiguity();
+    rdma_function_handle function_h;
+    rdma_umem one_page;
+    rdma_umem contiguous_pages;
+    rdma_umem two_sparse_pages;
+    rdma_umem three_sparse_pages;
+    rdma_hmc_ref hmc_ref;
+    rdma_pbl pbl;
+    rdma_status status;
+
+    function_h = make_function("pbl_mode_function");
+
+    one_page = make_umem("pbl_one_page", 4096, function_h);
+    expect_status("PBL0_ONE_PIN", one_page.pin_pages(), RDMA_SC_OK);
+    pbl = null;
+    status = rdma_pbl_builder::build_multilevel(one_page, pbl);
+    expect_status("PBL0_ONE_BUILD", status, RDMA_SC_OK);
+    if (pbl == null || pbl.mode != RDMA_MR_PBL0)
+      `uvm_error("PBL0_ONE_MODE", "one contiguous block must use PBL0")
+
+    contiguous_pages = make_umem("pbl_contiguous", 3 * 4096, function_h);
+    expect_status("PBL0_CONTIG_PIN", contiguous_pages.pin_pages(), RDMA_SC_OK);
+    pbl = null;
+    status = rdma_pbl_builder::build_multilevel(contiguous_pages, pbl);
+    expect_status("PBL0_CONTIG_BUILD", status, RDMA_SC_OK);
+    if (pbl == null || pbl.mode != RDMA_MR_PBL0)
+      `uvm_error("PBL0_CONTIG_MODE",
+                 "contiguous blocks must use PBL0 regardless of count")
+
+    two_sparse_pages = make_umem("pbl_two_sparse", 2 * 4096, function_h);
+    expect_status("PBL1_SPARSE_PIN", two_sparse_pages.pin_pages(), RDMA_SC_OK);
+    if (two_sparse_pages.pages.size() >= 2)
+      two_sparse_pages.pages[1].iova.value += 2 * 4096;
+    pbl = null;
+    status = rdma_pbl_builder::build_multilevel(two_sparse_pages, pbl);
+    expect_status("PBL1_SPARSE_BUILD", status, RDMA_SC_OK);
+    if (pbl == null || pbl.mode != RDMA_MR_PBL1)
+      `uvm_error("PBL1_SPARSE_MODE",
+                 "two non-contiguous blocks must use PBL1")
+
+    three_sparse_pages = make_umem("pbl_three_sparse", 3 * 4096, function_h);
+    expect_status("PBL2_SPARSE_PIN", three_sparse_pages.pin_pages(), RDMA_SC_OK);
+    if (three_sparse_pages.pages.size() >= 2)
+      three_sparse_pages.pages[1].iova.value += 2 * 4096;
+    if (three_sparse_pages.pages.size() >= 3)
+      three_sparse_pages.pages[2].iova.value += 4 * 4096;
+    pbl = null;
+    status = rdma_pbl_builder::build_multilevel(three_sparse_pages, pbl);
+    expect_status("PBL2_MISSING_HMC", status, RDMA_SC_INVALID_STATE);
+    if (pbl != null)
+      `uvm_error("PBL2_MISSING_HMC_OBJECT",
+                 "failed PBL2 build must not publish a partial object")
+    hmc_ref = make_hmc_ref("pbl_hmc_ref", function_h, 32'h1234);
+    pbl = null;
+    status = rdma_pbl_builder::build_multilevel(three_sparse_pages, pbl,
+                                                hmc_ref);
+    expect_status("PBL2_SPARSE_BUILD", status, RDMA_SC_OK);
+    if (pbl == null || pbl.mode != RDMA_MR_PBL2)
+      `uvm_error("PBL2_SPARSE_MODE",
+                 "more than two non-contiguous blocks must use PBL2")
+    if (pbl != null && pbl.mode == RDMA_MR_PBL2 &&
+        (pbl.hmc_ref == null ||
+         pbl.hmc_ref.first_pbl_index != hmc_ref.first_pbl_index))
+      `uvm_error("PBL2_DIRECTORY_INDEX",
+                 "PBL2 must carry the allocator-provided HMC/PBLE index")
+  endtask
+
+  // 功能：验证 PBL.validate 会拒绝 page_iovas、PBA 和 PBL2 目录 authority 被篡改的快照。
+  // 输入/输出及副作用：分别构建本地 PBL0/PBL2，修改一个镜像字段后调用 validate；只修改测试快照，不触碰 UMEM/HMC 的外部所有权。
+  // 失败/边界：页引用不一致、PBA 不匹配、目录地址不匹配或 HMC 容量不足必须返回 RDMA_SC_INVALID_ARGUMENT，不能继续发布伪造布局。
+  task automatic test_pbl_validate_rejects_inconsistent_snapshots();
+    rdma_function_handle function_h;
+    rdma_umem contiguous_umem;
+    rdma_umem sparse_umem;
+    rdma_hmc_ref hmc_ref;
+    rdma_pbl pbl;
+    rdma_status status;
+
+    function_h = make_function("pbl_validate_function");
+
+    contiguous_umem = make_umem("pbl_validate_contiguous", 4096,
+                                function_h);
+    expect_status("PBL_VALIDATE_PIN", contiguous_umem.pin_pages(), RDMA_SC_OK);
+    expect_status("PBL_VALIDATE_BUILD",
+                  rdma_pbl_builder::build_multilevel(contiguous_umem, pbl),
+                  RDMA_SC_OK);
+    pbl.page_iovas[0].value += pbl.page_size;
+    expect_status("PBL_VALIDATE_PAGE_IOVA",
+                  pbl.validate(), RDMA_SC_INVALID_ARGUMENT);
+
+    pbl = null;
+    expect_status("PBL_VALIDATE_REBUILD",
+                  rdma_pbl_builder::build_multilevel(contiguous_umem, pbl),
+                  RDMA_SC_OK);
+    pbl.page_layout.pba0.value += pbl.page_size;
+    expect_status("PBL_VALIDATE_PBA",
+                  pbl.validate(), RDMA_SC_INVALID_ARGUMENT);
+
+    sparse_umem = make_umem("pbl_validate_sparse", 3 * 4096, function_h);
+    expect_status("PBL_VALIDATE_SPARSE_PIN", sparse_umem.pin_pages(),
+                  RDMA_SC_OK);
+    sparse_umem.pages[1].iova.value += 2 * sparse_umem.page_size;
+    sparse_umem.pages[2].iova.value += 4 * sparse_umem.page_size;
+    hmc_ref = make_hmc_ref("pbl_validate_hmc", function_h, 32'h1234);
+    pbl = null;
+    expect_status("PBL_VALIDATE_PBL2_BUILD",
+                  rdma_pbl_builder::build_multilevel(sparse_umem, pbl,
+                                                      hmc_ref),
+                  RDMA_SC_OK);
+    pbl.directory_iova.value += pbl.page_size;
+    expect_status("PBL_VALIDATE_DIRECTORY",
+                  pbl.validate(), RDMA_SC_INVALID_ARGUMENT);
+  endtask
 
   // 功能：验证多级 PBL、MW 绑定和 exactly-once invalidate 会释放 UMEM pin。
   // 输入/输出及副作用：创建本地 UMEM/PBL/MW 并更新其生命周期计数；不访问外部 host-mem。
@@ -76,7 +330,7 @@ class rdma_umem_pbl_mw_test extends uvm_test;
 
     expect_status("PBL_BUILD", rdma_pbl_builder::build_multilevel(umem, pbl),
                   RDMA_SC_OK);
-    if (pbl == null || !pbl.active || pbl.level_count < 2 ||
+    if (pbl == null || !pbl.active || pbl.mode != RDMA_MR_PBL0 ||
         pbl.page_count != umem.pages.size())
       `uvm_error("PBL_BUILD", "multilevel PBL directory is incomplete")
 
@@ -157,6 +411,12 @@ class rdma_umem_pbl_mw_test extends uvm_test;
     test_multilevel_pbl_and_mw_invalidate();
     test_borrowed_mapping_detaches_without_unpin();
     test_mw_authority_rejection();
+    test_umem_unaligned_range_uses_aligned_dma_span();
+    test_umem_range_rejects_dma_gap();
+    test_umem_unaligned_range_is_bounded();
+    test_pbl_mode_follows_dma_contiguity();
+    test_pbl_validate_rejects_inconsistent_snapshots();
+    test_hmc_index_zero_requires_explicit_validity();
     phase.drop_objection(this);
   endtask
 endclass

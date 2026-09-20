@@ -138,6 +138,14 @@
 - [ ] Run `scripts/run_vcs53.sh core rdma_queue_codec_test`.
 - [ ] Run `scripts/run_vcs53.sh core rdma_doorbell_codec_test`.
 - [ ] Run `scripts/run_vcs53.sh core rdma_qpc_codec_test`.
-- [ ] Run `scripts/run_vcs53.sh core rdma_eq_engine_test` and `scripts/run_vcs53.sh core rdma_queue_data_engine_final_fix_test`.
+- [ ] Run `scripts/run_vcs53.sh core rdma_eq_engine_test` and the seven concrete
+  tests registered by `tests/unit/rdma_queue_data_engine_final_fix_test.sv`:
+  `rdma_queue_host_codec_final_fix_test`,
+  `rdma_queue_producer_doorbell_final_fix_test`,
+  `rdma_queue_cqe_codec_final_fix_test`,
+  `rdma_queue_entry_image_final_fix_test`,
+  `rdma_queue_ceqe_codec_final_fix_test`,
+  `rdma_queue_aeqe_codec_final_fix_test`, and
+  `rdma_queue_recovery_lifecycle_final_fix_test`. The source filename is not a
+  registered UVM test name and must not be passed as `+UVM_TESTNAME`.
 - [ ] Run `git diff --check` and the repository SV style checker against changed files; inspect file headers and every function's Chinese three-part comments.
-

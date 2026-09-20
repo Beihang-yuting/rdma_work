@@ -15,7 +15,7 @@ import hashlib
 from pathlib import Path
 import re
 import sys
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 try:
     from .rdma_driver_contract import (
@@ -176,6 +176,16 @@ CMQ_BODY_OWNERSHIP = {
     ),
     "RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP": (
         0x00000000001FFFFF, 0, 0, 0, 0, 0, 0, 0,
+    ),
+    "RDMA_CQC_DELETE_BODY_OWNERSHIP": (
+        0x00000000001FFFFF,
+        0xFF0FFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFF8FF,
+        0xFFFFFFFFFFF8C701,
+        0xF000000000FFFFFF,
+        0x0000000000000FFF,
+        0xFFFFFFFFFFFFFFC0,
+        0x0000000F00FFFFFF,
     ),
     "RDMA_EQ_OBJECT_ID_BODY_OWNERSHIP": (
         0x0000000000000FFF, 0, 0, 0, 0, 0, 0, 0,
@@ -698,6 +708,9 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_KEY", "RDMA_SQ_WQE_RC_REMOTE_KEY", 16),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_VA", "RDMA_SQ_WQE_RC_REMOTE_VA", 24),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_SGB_PA", "RDMA_SQ_WQE_SGB_PA", 32, -0),
+    # wr.h:23,46 and wr.c:243: URC external-SGB RDMA_READ stores the
+    # packet count in qword byte 0x28, bits [63:40].
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_URC_TOTAL_PKT_NUM", "RDMA_SQ_WQE_URC_TOTAL_PKT_NUM", 40),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_IMMDT_INVLD_RKEY", "RDMA_SQ_WQE_RC_IMMEDIATE", 8),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_LOCAL_INVLD_STAG", "RDMA_SQ_WQE_LOCAL_INVLD_STAG", 8),
@@ -738,6 +751,9 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_QP_RQ_WQE_OP", "RDMA_RQE_OPCODE", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_WQE_IDX", "RDMA_RQE_INDEX", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_WQE_IDX_WRAP", "RDMA_RQE_WRAP", 0),
+    # wr.h:179: external/inline RQE signature selector at qword0 bit 56.
+    # xtrdma_post_receive_uk() forces this wire bit for an external SGB.
+    FieldMapping("wr.h", "XTRDMA_QP_RQ_SIGN_EN", "RDMA_RQE_SIGN_EN", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_VALID", "RDMA_RQE_VALID", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_TPL", "RDMA_RQE_PAYLOAD_LEN", 8),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_SIGNATURE", "RDMA_RQE_SIGNATURE", 16),
@@ -1089,22 +1105,179 @@ def parse_value_expression(expression: str) -> int:
     return int(expr, 0)
 
 
-def parse_sv_value(expression: str) -> int:
+def parse_sv_value(
+    expression: str,
+    symbol_resolver: Callable[[str], int] | None = None,
+) -> int:
     """
-    功能：在 RDMA profile checker 的 parse_sv_value 中将无运算的 SystemVerilog based
-    literal 转换为整数。
-    输入输出及副作用：expression 为 SV localparam 右值；返回 h/d based literal
-    或 0x/十进制字面量对应的整数。
-    失败边界：允许下划线和 h/d 大小写；包含运算、二进制/
-    八进制或空值时抛 ValidationError，解析不会截断超宽值。
+    功能：在 RDMA profile checker 的 parse_sv_value 中解析受限的 SystemVerilog
+    常量表达式，支持 based literal、十进制 literal、已登记符号和整数运算。
+    输入输出及副作用：expression 为 SV localparam 右值；symbol_resolver 可按
+    名称返回同一份 localparam 表中的值；返回精确整数，不执行 Python eval，也不
+    修改调用方的常量表。
+    失败边界：只接受明确的 token、括号和 + - * / % << >> | & ^ 运算；二进制/
+    八进制 literal、未知符号、除零、负结果、残余 token 或空值抛 ValidationError，
+    解析不会截断超宽值。
     """
-    expr = expression.strip().replace("_", "")
-    match = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", expr)
+    expr = expression.strip()
+    compact = expr.replace("_", "")
+    match = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", compact)
     if match:
         return int(match.group(2), 16 if match.group(1).lower() == "h" else 10)
-    if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", expr):
-        return int(expr, 0)
-    raise ValidationError(f"unsupported SV constant expression: {expression}")
+    if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", compact):
+        return int(compact, 0)
+
+    token_pattern = re.compile(
+        r"(?:\d+'[hHdD][0-9a-fA-F_]+|0[xX][0-9a-fA-F_]+|"
+        r"[0-9][0-9_]*|[A-Za-z_][A-Za-z0-9_]*|<<|>>|"
+        r"[()+\-*/%|&^])"
+    )
+    tokens: list[str] = []
+    cursor = 0
+    while cursor < len(expr):
+        if expr[cursor].isspace():
+            cursor += 1
+            continue
+        token = token_pattern.match(expr, cursor)
+        if token is None:
+            raise ValidationError(
+                f"unsupported SV constant expression: {expression}"
+            )
+        tokens.append(token.group(0))
+        cursor = token.end()
+
+    position = 0
+
+    def peek() -> str | None:
+        return tokens[position] if position < len(tokens) else None
+
+    def consume(expected: str | None = None) -> str:
+        nonlocal position
+        token = peek()
+        if token is None or (expected is not None and token != expected):
+            raise ValidationError(
+                f"unsupported SV constant expression: {expression}"
+            )
+        position += 1
+        return token
+
+    def literal(token: str) -> int | None:
+        normalized = token.replace("_", "")
+        based = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", normalized)
+        if based:
+            return int(
+                based.group(2),
+                16 if based.group(1).lower() == "h" else 10,
+            )
+        if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", normalized):
+            return int(normalized, 0)
+        return None
+
+    def parse_primary() -> int:
+        token = peek()
+        if token is None:
+            raise ValidationError(
+                f"unsupported SV constant expression: {expression}"
+            )
+        if token == "(":
+            consume("(")
+            value = parse_bit_or()
+            consume(")")
+            return value
+        value = literal(token)
+        if value is not None:
+            consume()
+            return value
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
+            consume()
+            if symbol_resolver is None:
+                raise ValidationError(
+                    f"unknown SV constant symbol: {token}"
+                )
+            try:
+                return symbol_resolver(token)
+            except ValidationError:
+                raise
+            except Exception as error:
+                raise ValidationError(
+                    f"unknown SV constant symbol: {token}"
+                ) from error
+        raise ValidationError(
+            f"unsupported SV constant expression: {expression}"
+        )
+
+    def parse_unary() -> int:
+        token = peek()
+        if token == "+":
+            consume("+")
+            return parse_unary()
+        if token == "-":
+            consume("-")
+            return -parse_unary()
+        return parse_primary()
+
+    def parse_multiplicative() -> int:
+        value = parse_unary()
+        while peek() in {"*", "/", "%"}:
+            operator = consume()
+            rhs = parse_unary()
+            if operator == "*":
+                value *= rhs
+            elif rhs == 0:
+                raise ValidationError(
+                    f"invalid SV constant expression: division by zero: {expression}"
+                )
+            elif operator == "/":
+                value //= rhs
+            else:
+                value %= rhs
+        return value
+
+    def parse_additive() -> int:
+        value = parse_multiplicative()
+        while peek() in {"+", "-"}:
+            operator = consume()
+            rhs = parse_multiplicative()
+            value = value + rhs if operator == "+" else value - rhs
+        return value
+
+    def parse_shift() -> int:
+        value = parse_additive()
+        while peek() in {"<<", ">>"}:
+            operator = consume()
+            rhs = parse_additive()
+            if rhs < 0:
+                raise ValidationError(
+                    f"invalid SV constant expression: negative shift: {expression}"
+                )
+            value = value << rhs if operator == "<<" else value >> rhs
+        return value
+
+    def parse_bit_and() -> int:
+        value = parse_shift()
+        while peek() == "&":
+            consume("&")
+            value &= parse_shift()
+        return value
+
+    def parse_bit_xor() -> int:
+        value = parse_bit_and()
+        while peek() == "^":
+            consume("^")
+            value ^= parse_bit_and()
+        return value
+
+    def parse_bit_or() -> int:
+        value = parse_bit_xor()
+        while peek() == "|":
+            consume("|")
+            value |= parse_bit_xor()
+        return value
+
+    value = parse_bit_or()
+    if position != len(tokens) or value < 0:
+        raise ValidationError(f"unsupported SV constant expression: {expression}")
+    return value
 
 
 def strip_sv_comments(text: str) -> str:
@@ -1540,6 +1713,7 @@ def parse_sv_constants(text: str) -> dict[str, int]:
     """
     text = mask_sv_strings(strip_sv_comments(text))
     constants: dict[str, int] = {}
+    raw_constants: dict[str, str] = {}
 
     def add(name: str, value: int) -> None:
         """
@@ -1560,7 +1734,36 @@ def parse_sv_constants(text: str) -> dict[str, int]:
     )
     for match in pattern.finditer(text):
         name = match.group(1)
-        add(name, parse_sv_value(match.group(2)))
+        if name in raw_constants:
+            raise ValidationError(f"duplicate SV constant: {name}")
+        raw_constants[name] = match.group(2)
+
+    resolving: set[str] = set()
+
+    def resolve(name: str) -> int:
+        """
+        功能：按 localparam 名称递归解析原始表达式，并缓存已求值结果。
+        输入输出及副作用：name 为待解析符号；读取 raw_constants，成功时把值
+        写入 constants；不修改 SV 文本或外部文件。
+        失败边界：未知名称、循环引用或表达式非法时抛 ValidationError，禁止用
+        零值或前一个常量替代缺失的驱动坐标。
+        """
+        if name in constants:
+            return constants[name]
+        if name not in raw_constants:
+            raise ValidationError(f"unknown SV constant symbol: {name}")
+        if name in resolving:
+            raise ValidationError(f"cyclic SV constant reference: {name}")
+        resolving.add(name)
+        try:
+            value = parse_sv_value(raw_constants[name], resolve)
+        finally:
+            resolving.remove(name)
+        constants[name] = value
+        return value
+
+    for name in raw_constants:
+        resolve(name)
     field_pattern = re.compile(
         r"`RDMA_FIELD\(\s*(RDMA_[A-Za-z0-9_]+)\s*,\s*(\d+)\s*,"
         r"\s*(\d+)\s*,\s*(\d+)\s*\)"
@@ -2869,6 +3072,9 @@ REFERENCE_FIELDS = (
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_VA", "RDMA_SQ_WQE_RC_REMOTE_VA", 24, 0, 64),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_INLINE_LOCAL_QPC_RD", "RDMA_SQ_WQE_INLINE_LOCAL_QPC_RD", 0, 60, 1),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_SGB_PA", "RDMA_SQ_WQE_SGB_PA", 32, 9, 55),
+    # Independent coordinate evidence from wr.h:46.  The driver writes this
+    # only for URC RDMA_READ external-SGB WQEs; qword5 bits [39:0] stay reserved.
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_URC_TOTAL_PKT_NUM", "RDMA_SQ_WQE_URC_TOTAL_PKT_NUM", 40, 40, 24),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8, 0, 32),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_IMMDT_INVLD_RKEY", "RDMA_SQ_WQE_RC_IMMEDIATE", 8, 32, 32),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_LOCAL_INVLD_STAG", "RDMA_SQ_WQE_LOCAL_INVLD_STAG", 8, 32, 32),
@@ -2910,6 +3116,9 @@ REFERENCE_FIELDS = (
     ReferenceField("wr.h", "XTRDMA_QP_RQ_QP_SN", "RDMA_RQE_QP_SN", 0, 24, 8),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_OP", "RDMA_RQE_OPCODE", 0, 32, 4),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_IDX_WRAP", "RDMA_RQE_WRAP", 0, 55, 1),
+    # Independent raw coordinate evidence from wr.h:179.  Keep this separate
+    # from the codec implementation so a qword0 mask drift cannot self-approve.
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_SIGN_EN", "RDMA_RQE_SIGN_EN", 0, 56, 1),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_VALID", "RDMA_RQE_VALID", 0, 63, 1),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_SIGNATURE", "RDMA_RQE_SIGNATURE", 16, 56, 8),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_SGE_NUM", "RDMA_RQE_SGE_NUM", 16, 48, 8),
@@ -3865,6 +4074,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("RDMA_RQE_QP_SN", 0x5A, "qp_sn=0x5a"),
         ("RDMA_RQE_OPCODE", 9, "opcode=9"),
         ("RDMA_RQE_WRAP", 1, "wrap=1"),
+        ("RDMA_RQE_SIGN_EN", 0, "sign_en=0"),
         ("RDMA_RQE_VALID", 1, "valid=1"),
         ("RDMA_RQE_SIGNATURE", 0x96, "signature=0x96"),
         ("RDMA_RQE_SGE_NUM", 2, "sge_num=2"),
@@ -4859,12 +5069,12 @@ def validate(
         "RDMA_AEQC_CREATE_BODY_MASK": BODY_MASKS["aeqc_create"],
         "RDMA_SQ_WQE_HEADER_MASK": (0xEFFFFFFFFFFFFFFF,) + (0,) * 7,
         "RDMA_SQ_WQE_INLINE_HEADER_MASK": (0xFFFFFFFFFFFFFFFF,) + (0,) * 7,
-        "RDMA_SQ_WQE_RC_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFE00, 0, 0, 0),
-        "RDMA_SQ_WQE_RC_INLINE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_RC_DIRECT_SGE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_UD_BODY_MASK": (0, 0xFFFFFFFFFEFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_ATOMIC_BODY_MASK": (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_ATOMIC_FAA_BODY_MASK": (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0),
+        "RDMA_SQ_WQE_RC_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFE00, 0, 0, 0),
+        "RDMA_SQ_WQE_RC_INLINE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_RC_DIRECT_SGE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_UD_BODY_MASK": (0, 0xFFFFFFFFFDFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_ATOMIC_BODY_MASK": (0, 0xFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_ATOMIC_FAA_BODY_MASK": (0, 0xFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0),
     }
     if sv_masks != expected_masks:
         raise ValidationError("SV image mask lookup differs from independent reference")

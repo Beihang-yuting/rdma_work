@@ -41,6 +41,32 @@ class rdma_hw_queue_pd_fault_codec extends rdma_hw_queue_pd_codec;
   endfunction
 endclass
 
+class rdma_hw_queue_pd_null_status_codec extends rdma_hw_queue_pd_codec;
+  `uvm_object_utils(rdma_hw_queue_pd_null_status_codec)
+
+  // 功能：构造返回空状态的 PD codec fixture，用于验证表编码器对 virtual
+  //       encode_entry 边界的 fail-closed 处理。
+  // 输入/输出及副作用：name 是 UVM 对象名；new 只初始化父类，不创建或拥有
+  //       页面、DMA 映射或输出缓冲区。
+  // 失败/边界：该 fixture 的 encode_entry 有意返回 null；只有被测
+  //       encode_table 正确归一化状态后，测试才能得到 INVALID_STATE 而不是崩溃。
+  function new(string name = "rdma_hw_queue_pd_null_status_codec");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟派生 codec 在第一个表项编码时错误地返回 null status。
+  // 输入/输出及副作用：entry 只读，bytes 不写入；返回 null 以注入 virtual
+  //       边界故障，不改变 caller 的 sentinel 缓冲区。
+  // 失败/边界：无论 entry 是否有效都返回 null；生产代码必须将其转换为
+  //       INVALID_STATE 并保持 encode_table 的原子输出契约。
+  virtual function rdma_status encode_entry(
+    rdma_hw_queue_pd_entry entry,
+    inout byte unsigned bytes[]
+  );
+    return null;
+  endfunction
+endclass
+
 class rdma_queue_page_codec_test extends uvm_test;
   `uvm_component_utils(rdma_queue_page_codec_test)
 
@@ -120,6 +146,7 @@ class rdma_queue_page_codec_test extends uvm_test;
   task run_phase(uvm_phase phase);
     rdma_hw_queue_pd_entry entry;
     rdma_hw_queue_pd_fault_codec fault_codec;
+    rdma_hw_queue_pd_null_status_codec null_status_codec;
     rdma_queue_dma_page_ref pages[$];
     byte unsigned bytes[];
     byte unsigned expected[];
@@ -252,6 +279,16 @@ class rdma_queue_page_codec_test extends uvm_test;
     if (bytes != expected)
       `uvm_error("TABLE_LATE_ENTRY_ATOMIC",
                  "later entry failure changed caller table output")
+
+    pages.delete();
+    pages.push_back(make_page("null_status_page", 64'h0000_0002_3000_0000, 0));
+    null_status_codec = rdma_hw_queue_pd_null_status_codec::type_id::create(
+        "null_status_codec");
+    reset_sentinel(bytes);
+    expect_status("TABLE_NULL_STATUS",
+                  null_status_codec.encode_table(pages, 8'h05, bytes),
+                  RDMA_SC_INVALID_STATE);
+    expect_sentinel("TABLE_NULL_STATUS_ATOMIC", bytes);
 
     pages.delete();
     pages.push_back(make_page("gap0", 64'h0000_0003_0000_0000, 0));

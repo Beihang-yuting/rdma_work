@@ -141,7 +141,6 @@ virtual class rdma_sq_payload_writer extends uvm_object;
 
   // 功能：在 rdma_sq_payload_write_receipt 中，stage_and_verify 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
   // 输入/输出及副作用：request_context（输入）、sges（输入）、payload（输入）、receipt（输出）；stage_and_verify 读取 request_context、sges、payload、receipt 并使用字段 name、next_id、api、binding、timeout，并写入 receipt；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：stage_and_verify 无返回值，仅执行 name="rdma_host_mem_sq_payload_writer")、next_id=1、api=null、binding=null；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   pure virtual function rdma_status stage_and_verify(
     rdma_dma_request_context request_context,
@@ -283,7 +282,6 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   // 功能：identity_status 校验 request_context 与当前对象状态的一致性，并显式处理“writer binding is not configured”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：request_context（输入）；identity_status 读取 request_context 并使用字段 expected；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：identity_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION、RDMA_SC_STALE_GENERATION；典型拒绝条件为“writer binding is not configured”“request Function does not match binding”；失败路径不提交部分状态或转移未声明资源。
-
   function automatic rdma_status identity_status(
     rdma_dma_request_context request_context
   );
@@ -315,10 +313,116 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::success();
   endfunction
 
-  // 先完成 context、长度、注册项、权限和地址范围检查，再产生任何 host 写入。
+  // 功能：build_receipt_candidate 依据已通过权限/范围预检的请求数据建立
+  // receipt 值快照，一次性完成 receipt、Function、SGE 和 mapping 的
+  // 工厂/clone 检查。
+  // 输入/输出及副作用：request_context、sges、payload、registration_ids
+  // （输入）；candidate（输出）；函数只创建本地 detached 对象，不修改
+  // regs.ref、Host-memory 或调用方输入；成功时返回含 payload、registration_ids、
+  // function_h、sges、mappings 和 release owner 的候选 receipt。
+  // 失败/边界：request_context/Function/SGE/mapping 为空、registration_ids
+  // 为空、任一 UVM 工厂返回 null、copy/clone 失败或映射查找失败时返回明确
+  // 失败；candidate 在任何失败分支保持 null，调用方不得在该阶段发布引用或
+  // 写入 Host-memory。
+  function rdma_status build_receipt_candidate(
+    rdma_dma_request_context request_context,
+    rdma_sge sges[$],
+    byte unsigned payload[$],
+    longint unsigned registration_ids[$],
+    output rdma_sq_payload_write_receipt candidate
+  );
+    rdma_sq_payload_write_receipt staged;
+    rdma_function_handle function_copy;
+    rdma_sge sge_copy;
+    rdma_dma_mapping mapping_copy;
+    uvm_object cloned;
+    bit found;
+
+    candidate = null;
+    if (request_context == null)
+      return rdma_status::make_direct(
+          RDMA_SC_INVALID_ARGUMENT,
+          "receipt candidate request context is null");
+    if (request_context.function_h == null)
+      return rdma_status::make_direct(
+          RDMA_SC_INVALID_ARGUMENT,
+          "receipt candidate Function is null");
+    if (registration_ids.size() == 0)
+      return rdma_status::make_direct(
+          RDMA_SC_INVALID_ARGUMENT,
+          "receipt candidate has no registration ids");
+
+    staged = rdma_sq_payload_write_receipt::type_id::create(
+      "receipt_candidate"
+    );
+    if (staged == null)
+      return rdma_status::make_direct(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "receipt candidate allocation failed");
+    staged.verified = 1'b1;
+    staged.released = 1'b0;
+    staged.payload = payload;
+    staged.registration_ids = registration_ids;
+    staged.function_generation = request_context.function_h.generation;
+    staged.bind_release_owner(this);
+
+    function_copy = rdma_function_handle::type_id::create(
+      "receipt_candidate_function"
+    );
+    if (function_copy == null)
+      return rdma_status::make_direct(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "receipt candidate Function allocation failed");
+    function_copy.copy(request_context.function_h);
+    staged.function_h = function_copy;
+
+    foreach (sges[i]) begin
+      if (sges[i] == null)
+        return rdma_status::make_direct(
+            RDMA_SC_INVALID_ARGUMENT,
+            "receipt candidate SGE is null");
+      sge_copy = rdma_sge::type_id::create(
+        $sformatf("receipt_candidate_sge_%0d", i)
+      );
+      if (sge_copy == null)
+        return rdma_status::make_direct(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "receipt candidate SGE allocation failed");
+      sge_copy.copy(sges[i]);
+      staged.sges.push_back(sge_copy);
+    end
+
+    foreach (registration_ids[i]) begin
+      found = 1'b0;
+      foreach (regs[j]) begin
+        if (regs[j].id != registration_ids[i])
+          continue;
+        found = 1'b1;
+        if (regs[j].mapping == null)
+          return rdma_status::make_direct(
+              RDMA_SC_INVALID_STATE,
+              "receipt candidate mapping is null");
+        cloned = regs[j].mapping.clone();
+        if (cloned == null || !$cast(mapping_copy, cloned))
+          return rdma_status::make_direct(
+              RDMA_SC_INVALID_STATE,
+              "receipt candidate mapping snapshot failed");
+        staged.mappings.push_back(mapping_copy);
+        break;
+      end
+      if (!found)
+        return rdma_status::make_direct(
+            RDMA_SC_INVALID_STATE,
+            "receipt candidate registration disappeared");
+    end
+
+    candidate = staged;
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 rdma_host_mem_sq_payload_writer 中，stage_and_verify 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
   // 输入/输出及副作用：request_context（输入）、sges（输入）、payload（输入）、receipt（输出）；stage_and_verify 读取 request_context、sges、payload、receipt 并使用字段 receipt、status、total、permissions、permissions.device_read、map_index、access_failure、payload_offset，并写入 receipt；函数返回 rdma_status，不取得调用方资源所有权。
-
+  // 设计约束：先完成 context、长度、注册项、权限和地址范围检查，再产生任何 host 写入。
   // 失败/边界：stage_and_verify 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“writer is not configured”“request context is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status stage_and_verify(
     rdma_dma_request_context request_context,
@@ -347,10 +451,20 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     if (request_context == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "request context is null");
+
     status = request_context.validate();
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "DMA request context validation returned null status");
     if (!status.ok())
       return status;
+
     status = identity_status(request_context);
+    if (status == null)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "writer identity validation returned null status");
     if (!status.ok())
       return status;
     if (sges.size() == 0)
@@ -389,6 +503,11 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
           RDMA_DMA_DEVICE_READ,
           permissions
         );
+        if (status == null) begin
+          status = rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "DMA mapping access check returned null status");
+        end
         if (status.ok()) begin
           map_index = j;
           break;
@@ -410,9 +529,24 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
         registration_ids.push_back(regs[map_index].id);
     end
 
-    // 上面的预检全部完成后才触碰 host memory，并发布 registration 引用。
-    // All checks above are intentionally complete before touching host memory
-    // or publishing reference counts.
+    // 上面的预检和 receipt 快照构建全部完成后才触碰 host memory，并发布
+    // registration 引用；这样 late factory/clone 失败不会留下引用或写入。
+    status = build_receipt_candidate(
+      request_context,
+      sges,
+      payload,
+      registration_ids,
+      candidate
+    );
+    if (status == null)
+      return rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "receipt candidate staging returned null status");
+    if (!status.ok())
+      return status;
+
+    // All candidate factories/clones are complete before any host-memory I/O
+    // or registration reference publication.
     foreach (registration_ids[k]) begin
       foreach (regs[j])
         if (regs[j].id == registration_ids[k])
@@ -433,6 +567,12 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
         sges[i].iova.value - regs[map_index].mapping.iova.value,
         chunk
       );
+      if (status == null) begin
+        release_ids(registration_ids);
+        return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "Host-memory write returned null status");
+      end
       if (!status.ok()) begin
         release_ids(registration_ids);
         return status;
@@ -445,6 +585,12 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
         sges[i].length,
         readback
       );
+      if (status == null) begin
+        release_ids(registration_ids);
+        return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "Host-memory read returned null status");
+      end
       if (!status.ok()) begin
         release_ids(registration_ids);
         return status;
@@ -462,38 +608,6 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
         end
       end
       payload_offset += sges[i].length;
-    end
-
-    candidate = rdma_sq_payload_write_receipt::type_id::create("receipt");
-    candidate.verified = 1'b1;
-    candidate.released = 1'b0;
-    candidate.payload = payload;
-    candidate.registration_ids = registration_ids;
-    candidate.function_generation = request_context.function_h.generation;
-    candidate.bind_release_owner(this);
-    candidate.function_h = rdma_function_handle::type_id::create(
-      "receipt_function");
-    candidate.function_h.copy(request_context.function_h);
-    foreach (sges[i]) begin
-      rdma_sge sge_copy;
-      sge_copy = rdma_sge::type_id::create($sformatf("receipt_sge_%0d", i));
-      sge_copy.copy(sges[i]);
-      candidate.sges.push_back(sge_copy);
-    end
-    foreach (registration_ids[i]) begin
-      foreach (regs[j]) begin
-        if (regs[j].id == registration_ids[i]) begin
-          uvm_object cloned;
-          rdma_dma_mapping mapping_copy;
-          cloned = regs[j].mapping.clone();
-          if (cloned == null || !$cast(mapping_copy, cloned)) begin
-            release_ids(registration_ids);
-            return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                     "receipt mapping snapshot failed");
-          end
-          candidate.mappings.push_back(mapping_copy);
-        end
-      end
     end
     receipt = candidate;
     return rdma_status::success();

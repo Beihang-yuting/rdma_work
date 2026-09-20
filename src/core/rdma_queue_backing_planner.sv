@@ -484,7 +484,6 @@ class rdma_queue_backing_planner extends uvm_object;
 
   // 功能：在 rdma_queue_backing_planner 中，allocated_mapping_status 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
   // 输入/输出及副作用：binding（输入）、resource_h（输入）、mapping（输入）、length（输入）、alignment（输入）、direction（输入）；allocated_mapping_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：allocated_mapping_status 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“host allocation returned a null mapping”“allocated queue mapping is too short”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status allocated_mapping_status(
     rdma_function_binding binding,
@@ -794,7 +793,6 @@ class rdma_queue_backing_planner extends uvm_object;
 
   // 功能：在 rdma_queue_backing_planner 中，add_page 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
   // 输入/输出及副作用：ring（输入）、mapping（输入）、mapping_offset（输入）、logical_offset（输入）；add_page 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：add_page 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“queue page IOVA projection overflows”“queue page reference creation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status add_page(
     rdma_queue_ring_layout ring,
@@ -1110,7 +1108,6 @@ class rdma_queue_backing_planner extends uvm_object;
 
   // 功能：在 rdma_queue_backing_planner 中，materialize 把已验证的 backing 规格落实为 Host-memory 映射/队列计划，并登记释放责任。
   // 输入/输出及副作用：binding（输入）、preflight（输入）、resource_h（输入）、plan（输出）；materialize 读取 binding、preflight、resource_h、plan 并使用字段 plan、status、owner、candidate、candidate.resource_kind、candidate.context_ref，并写入 plan；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：materialize 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue backing planner is not configured”“queue resource handle is invalid”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status materialize(
     rdma_function_binding binding,

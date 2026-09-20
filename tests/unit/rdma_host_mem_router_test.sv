@@ -179,6 +179,9 @@ class rdma_failure_atomic_router_mgr extends rdma_mock_host_mem;
   int unsigned opaque_release_calls;
   bit return_null_validation_once;
   bit return_null_release_once;
+  bit return_null_write_once;
+  bit return_null_read_once;
+  bit return_null_plain_release_once;
   rdma_status next_validation_failure;
 
   // 功能：构造 failure-atomic router manager，并清零一次性故障和调用计数。
@@ -190,6 +193,9 @@ class rdma_failure_atomic_router_mgr extends rdma_mock_host_mem;
     opaque_release_calls = 0;
     return_null_validation_once = 1'b0;
     return_null_release_once = 1'b0;
+    return_null_write_once = 1'b0;
+    return_null_read_once = 1'b0;
+    return_null_plain_release_once = 1'b0;
     next_validation_failure = null;
   endfunction
 
@@ -224,6 +230,49 @@ class rdma_failure_atomic_router_mgr extends rdma_mock_host_mem;
       return null;
     end
     return super.release_opaque(mapping);
+  endfunction
+
+  // 功能：在 router 普通 write 边界注入一次 null status，验证数据写入失败时不崩溃。
+  // 输入/输出及副作用：mapping、offset、data 为输入；故障时不修改 mock backing，随后恢复父类行为。
+  // 失败/边界：null 返回必须由 router 转换为 INVALID_STATE，不能被当成成功或继续推进 ledger。
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    byte data[]
+  );
+    if (return_null_write_once) begin
+      return_null_write_once = 1'b0;
+      return null;
+    end
+    return super.write(mapping, offset, data);
+  endfunction
+
+  // 功能：在 router 普通 read 边界注入一次 null status，验证输出数据会被清空。
+  // 输入/输出及副作用：mapping、offset、size 为输入，data 为输出；故障时清空 data 并不改 backing。
+  // 失败/边界：null 返回必须转换为 INVALID_STATE，调用方不得消费旧的 read buffer。
+  virtual function rdma_status read(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    int unsigned size,
+    output byte data[]
+  );
+    if (return_null_read_once) begin
+      return_null_read_once = 1'b0;
+      data = new[0];
+      return null;
+    end
+    return super.read(mapping, offset, size, data);
+  endfunction
+
+  // 功能：在 router 普通 release 边界注入一次 null status，验证 authority row 保留可重试。
+  // 输入/输出及副作用：mapping 为释放输入；故障时不修改 mock allocation 或 release seal。
+  // 失败/边界：null 返回必须转换为 INVALID_STATE，router 不得删除自身 parallel ledger。
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    if (return_null_plain_release_once) begin
+      return_null_plain_release_once = 1'b0;
+      return null;
+    end
+    return super.\release (mapping);
   endfunction
 endclass
 
@@ -472,6 +521,37 @@ class rdma_host_mem_router_test extends uvm_test;
     );
     if (status == null || !status.ok() || atomic_mapping == null)
       `uvm_fatal("FAILURE_ATOMIC_ROUTE", "router allocation failed")
+
+    // 普通转发路径同样必须把 manager 的 null status 归一化；写失败不能
+    // 推进 router ledger，读失败还必须丢弃调用方可能保留的旧 buffer。
+    atomic_manager.return_null_write_once = 1'b1;
+    status = atomic_router.write(atomic_mapping, 0, atomic_bytes);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        atomic_router.ledger_count() != 1 ||
+        atomic_manager.live_allocations() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_NULL_WRITE",
+        "null manager write status was not fail-closed"
+      )
+    data = '{8'hde, 8'had};
+    atomic_manager.return_null_read_once = 1'b1;
+    status = atomic_router.read(atomic_mapping, 0, atomic_bytes.size(), data);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        data.size() != 0 || atomic_router.ledger_count() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_NULL_READ",
+        "null manager read status retained stale output or changed ledger"
+      )
+    atomic_manager.return_null_plain_release_once = 1'b1;
+    status = atomic_router.\release (atomic_mapping);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        atomic_router.ledger_count() != 1 ||
+        atomic_manager.live_allocations() != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_ROUTE_NULL_RELEASE",
+        "null manager release status retired the router row"
+      )
+
     status = atomic_router.write(atomic_mapping, 0, atomic_bytes);
     if (status == null || !status.ok())
       `uvm_fatal("FAILURE_ATOMIC_ROUTE", "router seed write failed")

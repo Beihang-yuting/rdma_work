@@ -2722,10 +2722,18 @@ def _validate_compose_request_writer(
         "candidate allocation",
     )
     require_fragment(r"result=candidate;", "output publication")
-    require_fragment(
+    # Keep accepting the original explicit complement while also recognizing
+    # the shared helper used by the production composer.  Both spellings must
+    # prove the same merged-word predicate; accepting only the helper name (or
+    # either mask in isolation) would let a writer bypass the C-derived
+    # envelope/body ownership contract.
+    ownership_check_patterns = (
         r"merged_word&~\(request_envelope_mask\(q\)\|masks\[q\]\)",
-        "C-derived ownership check",
+        r"rdma_raw_qword_mask_is_valid\(merged_word,"
+        r"request_envelope_mask\(q\)\|masks\[q\]\)",
     )
+    if not any(re.search(pattern, compact) for pattern in ownership_check_patterns):
+        raise ContractError("compose_request is missing C-derived ownership check")
 
     q_loop_pattern = re.compile(
         r"for\s*\(\s*int\s+unsigned\s+q\s*=\s*0\s*;"

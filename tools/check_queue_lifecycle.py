@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Fail-closed static checks for queue lifecycle source boundaries."""
+import hashlib
 from pathlib import Path
 import re
 import subprocess
@@ -117,26 +118,94 @@ FROZEN_ABI_CURRENT = (
     "src/codec/rdma/rdma_cmq_codecs.sv",
 )
 
+FROZEN_ABI_MANIFEST = "hw/rdma/frozen_abi_manifest.txt"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
-def validate_frozen_queue_abi(repo_root: Path) -> None:
+
+def _load_frozen_abi_manifest(path: Path) -> dict[str, str]:
+    """
+    功能：读取 frozen ABI 逐文件摘要清单，建立路径到 SHA-256 的唯一映射。
+    输入输出及副作用：path 为受版本控制的 manifest；返回新建字典，不修改清单或
+    工作树；每行格式为 `relative/path<TAB>64 位小写 sha256`。
+    失败边界：文件不可读、列数错误、路径不在 FROZEN_ABI_CURRENT、摘要格式错误、
+    重复路径或清单集合不完整时抛出 ValidationError，禁止使用默认值或旧 Git 基线。
+    """
     try:
-        result = subprocess.run(
-            ["git", "diff", "--name-status", "-M", "a0abd95", "--",
-             *FROZEN_ABI, *FROZEN_ABI_CURRENT],
-            cwd=repo_root, check=True, capture_output=True, text=True,
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValidationError(f"frozen ABI manifest is unreadable: {path}") from exc
+
+    manifest: dict[str, str] = {}
+    allowed = set(FROZEN_ABI_CURRENT)
+
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        columns = line.split()
+        if len(columns) != 2:
+            raise ValidationError(
+                f"frozen ABI manifest {path}:{line_number} must contain path and sha256"
+            )
+
+        relative, digest = columns
+        if relative not in allowed:
+            raise ValidationError(
+                f"frozen ABI manifest contains unexpected path: {relative}"
+            )
+        if relative in manifest:
+            raise ValidationError(
+                f"frozen ABI manifest contains duplicate path: {relative}"
+            )
+        if _SHA256_RE.fullmatch(digest) is None:
+            raise ValidationError(
+                f"frozen ABI manifest has invalid sha256: {relative}"
+            )
+
+        manifest[relative] = digest
+
+    if set(manifest) != allowed:
+        missing = sorted(allowed - set(manifest))
+        extra = sorted(set(manifest) - allowed)
+        raise ValidationError(
+            f"frozen ABI manifest coverage mismatch: missing={missing} extra={extra}"
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValidationError("frozen ABI differs from baseline or git unavailable") from exc
-    for line in result.stdout.splitlines():
-        fields = line.split("\t")
-        status = fields[0] if fields else ""
-        # A pure R100 rename preserves the frozen bytes.  Any modification,
-        # lower-similarity rename, addition, or deletion is an ABI violation.
-        if status == "R100" and len(fields) == 3:
-            old_path, new_path = fields[1], fields[2]
-            if (old_path, new_path) in zip(FROZEN_ABI, FROZEN_ABI_CURRENT):
-                continue
-        raise ValidationError("frozen ABI differs from baseline or git unavailable")
+
+    return manifest
+
+
+def validate_frozen_queue_abi(
+    repo_root: Path,
+    manifest_path: Path | None = None,
+) -> None:
+    """
+    功能：按受版本控制的逐文件 SHA-256 manifest 验证 queue codec ABI 内容，作为
+    queue lifecycle 边界的 fail-closed gate。
+    输入输出及副作用：repo_root 是源码根目录；manifest_path 可指定 synthetic 或
+    外部只读清单，省略时使用 repo_root/FROZEN_ABI_MANIFEST；仅读取四个当前 ABI 文件，
+    不执行 Git、不修改文件，也不解析驱动字段坐标。
+    失败边界：manifest 缺失/非法、ABI 文件缺失或任一摘要不匹配时抛出
+    ValidationError；符号链接、目录和非 regular file 不得被当作有效 ABI 输入。
+    """
+    manifest = _load_frozen_abi_manifest(
+        manifest_path if manifest_path is not None else repo_root / FROZEN_ABI_MANIFEST
+    )
+
+    for relative in FROZEN_ABI_CURRENT:
+        path = repo_root / relative
+        if not path.is_file() or path.is_symlink():
+            raise ValidationError(
+                f"frozen ABI file is missing or not regular: {relative}"
+            )
+
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, UnicodeError) as exc:
+            raise ValidationError(f"frozen ABI file is unreadable: {relative}") from exc
+
+        if digest != manifest[relative]:
+            raise ValidationError(f"frozen ABI differs from manifest: {relative}")
 
 
 def main() -> int:

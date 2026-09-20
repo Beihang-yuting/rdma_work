@@ -163,7 +163,6 @@ class rdma_dma_mapping extends uvm_object;
 
   // 功能：check_access 校验 requested_function、requested_requester_bdf、requested_pasid_valid、requested_pasid、requested_dma_domain_valid 等参数 与当前对象状态的一致性，并显式处理“DMA mapping is not ACTIVE”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：requested_function（输入）、requested_requester_bdf（输入）、requested_pasid_valid（输入）、requested_pasid（输入）、requested_dma_domain_valid（输入）、requested_dma_domain_id（输入）、first_iova（输入）、length（输入）、requested_direction（输入）、requested_permissions（输入）；check_access 读取 requested_function、requested_requester_bdf、requested_pasid_valid、requested_pasid、requested_dma_domain_valid、requested_dma_domain_id、first_iova、length、requested_direction、requested_permissions 并使用字段 mapping_last、request_last；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   function rdma_status check_access(
     rdma_function_handle requested_function,

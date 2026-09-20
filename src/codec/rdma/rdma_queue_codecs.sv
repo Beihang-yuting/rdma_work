@@ -1,17 +1,20 @@
-// 目录：硬件编解码层 codec/rdma/rdma_queue_codecs.sv。
-// 职责：实现 rdma_hw_queue_codecs 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_queue_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 目录：硬件编解码层 src/codec/rdma。
+// 职责：定义 XTR v1 队列项硬件模型，并实现 SQE/RQE/CQE/CEQE/AEQE 的
+//   固定布局编解码、reserved/signature 校验及 post-send facade。
+// 依赖：消费 rdma_queue_models 的语义快照、rdma_defs.svh 的冻结字段坐标、
+//   rdma_hw_qword_builder 的大端 qword 操作和公共 handle/status 类型。
+// 所有权与生命周期：codec 只拥有本地 builder、候选模型和 image 值快照；QP、
+//   AV、SGB/Host-memory 与外部 handle 均为非拥有输入，生命周期由上层环境管理。
 
 // XTR v1 fixed-size queue data entry codecs.  Queue fields are authored in
 // logical qwords and serialized big-endian by rdma_hw_qword_builder.
 
-// 功能：在 rdma_hw_queue_codecs 中，rdma_hw_queue_projected_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
-// 输入/输出及副作用：name（输入）、kind（输入）、id（输入）、generation（输入）；rdma_hw_queue_projected_handle 读取 name、kind、id、generation 并使用字段 h、h.kind、h.object_id、h.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-// 失败/边界：rdma_hw_queue_projected_handle 的结果直接由 return h 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+// 功能：为 raw queue-image decode 构造仅含 kind/object_id/generation 的投影
+//   handle，使 detached 模型可保留 wire identity，而不伪造 Function authority。
+// 输入/输出及副作用：name、kind、id、generation 为输入；返回新建 rdma_handle，
+//   function_uid 保持构造默认值，不修改调用方句柄或资源账本。
+// 失败/边界：函数不校验 kind/id，也不把投影结果认证为可路由句柄；id=0 或
+//   generation=0 仍按原值返回，后续 authoring/route gate 必须独立拒绝无效 authority。
 function automatic rdma_handle rdma_hw_queue_projected_handle(
     string name, rdma_resource_kind_e kind, int unsigned id,
     int unsigned generation = 1);
@@ -192,11 +195,120 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     atomic_compare = x.atomic_compare;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“SQE requires QP handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、qp_h、qp_h.kind、qpn、icos、index、transport_ext、payload_mode 并使用字段 rdma_status、qp_h、qp_h.kind、qpn、icos、index、transport_ext、payload_mode；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“SQE requires QP handle”“SQE field width overflow”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：derive_payload_authority 一次归一 payload mode、唯一有效 SGE 数、
+  //   inline 实际字节源/长度和最终 hardware SGE_NUM，供 validation 与 writer 共用。
+  // 输入/输出及副作用：只读 payload_mode、inline_data、inline_bytes、payload、
+  //   opcode、sges；五个 output 返回本次 authority，不修改模型、数组或 SGE。
+  // 失败/边界：null/zero-length SGE 不进入数值计数，null 仍由 shape gate 拒绝；
+  //   显式 SGE mode 无有效项归一为 NONE，未知显式 mode 原样交给 validate 拒绝，
+  //   total_payload_len 不参与 byte-source 选择，避免用声明长度伪造 payload。
+  function automatic void derive_payload_authority(
+      output rdma_sq_payload_mode_e mode,
+      output int unsigned valid_sge_count,
+      output int unsigned inline_payload_bytes,
+      output bit inline_bytes_are_authority,
+      output int unsigned canonical_sge_num);
+    valid_sge_count = 0;
+    foreach (sges[i]) begin
+      if (sges[i] != null && sges[i].length != 0)
+        valid_sge_count++;
+    end
+
+    inline_bytes_are_authority = inline_bytes.size() != 0;
+    inline_payload_bytes = inline_bytes_are_authority ?
+                           inline_bytes.size() : payload.size();
+
+    if (payload_mode != RDMA_SQ_PAYLOAD_NONE) begin
+      if (payload_mode inside {RDMA_SQ_PAYLOAD_SGE_WQE,
+                               RDMA_SQ_PAYLOAD_SGE_SGB} &&
+          valid_sge_count == 0)
+        mode = RDMA_SQ_PAYLOAD_NONE;
+      else
+        mode = payload_mode;
+    end
+    else if (inline_data || inline_payload_bytes != 0) begin
+      mode = inline_payload_bytes > 32 ? RDMA_SQ_PAYLOAD_INLINE_SGB :
+                                        RDMA_SQ_PAYLOAD_INLINE_WQE;
+    end
+    else if (opcode inside {RDMA_WR_ATOMIC_CMP_SWAP,
+                            RDMA_WR_ATOMIC_FETCH_ADD}) begin
+      mode = RDMA_SQ_PAYLOAD_ATOMIC_FIXED;
+    end
+    else if (valid_sge_count > 2) begin
+      mode = RDMA_SQ_PAYLOAD_SGE_SGB;
+    end
+    else if (valid_sge_count != 0) begin
+      mode = RDMA_SQ_PAYLOAD_SGE_WQE;
+    end
+    else begin
+      mode = RDMA_SQ_PAYLOAD_NONE;
+    end
+
+    case (mode)
+      RDMA_SQ_PAYLOAD_INLINE_WQE,
+      RDMA_SQ_PAYLOAD_INLINE_SGB:
+        canonical_sge_num = (inline_payload_bytes + 15) / 16;
+      RDMA_SQ_PAYLOAD_SGE_WQE,
+      RDMA_SQ_PAYLOAD_SGE_SGB:
+        canonical_sge_num = valid_sge_count;
+      RDMA_SQ_PAYLOAD_ATOMIC_FIXED:
+        canonical_sge_num = 1;
+      default:
+        canonical_sge_num = 0;
+    endcase
+  endfunction
+
+  // 功能：derive_payload_mode 为既有调用方返回共享 payload authority 的 mode。
+  // 输入/输出及副作用：无显式参数；只读当前模型并返回 mode，不修改模型；其余
+  //   authority output 仅为兼容 wrapper 的局部临时值。
+  // 失败/边界：未知显式 mode 原样返回供 validate 拒绝；null SGE 不在此函数放行，
+  //   后续 shape gate 仍返回 INVALID_ARGUMENT。
+  function automatic rdma_sq_payload_mode_e derive_payload_mode();
+    rdma_sq_payload_mode_e mode;
+    int unsigned valid_sge_count;
+    int unsigned inline_payload_bytes;
+    int unsigned canonical_sge_num;
+    bit inline_bytes_are_authority;
+
+    derive_payload_authority(mode, valid_sge_count, inline_payload_bytes,
+                             inline_bytes_are_authority,
+                             canonical_sge_num);
+    return mode;
+  endfunction
+
+  // 功能：derive_sge_num 为既有调用方返回共享 payload authority 的 canonical
+  //   SGE_NUM：empty=0、inline=ceil(bytes/16)、SGE=有效项数、atomic=1。
+  // 输入/输出及副作用：无显式参数；只读当前模型，返回未截断计数，不写 sge_num
+  //   或调用方数组；其余 authority output 仅为局部临时值。
+  // 失败/边界：null/zero-length SGE 不计数，但 null 仍由 shape gate 拒绝；长度
+  //   超过 wire 宽度时返回完整 int，由 validate/writer fail closed 而不截断。
+  function automatic int unsigned derive_sge_num();
+    rdma_sq_payload_mode_e mode;
+    int unsigned valid_sge_count;
+    int unsigned inline_payload_bytes;
+    int unsigned canonical_sge_num;
+    bit inline_bytes_are_authority;
+
+    derive_payload_authority(mode, valid_sge_count, inline_payload_bytes,
+                             inline_bytes_are_authority,
+                             canonical_sge_num);
+    return canonical_sge_num;
+  endfunction
+
+  // 功能：validate 校验 SQE handle、字段宽度、payload shape 与 canonical
+  //   SGE_NUM 一致性，防止 caller-visible model 和最终 wire count 分叉。
+  // 输入/输出及副作用：无显式参数；只读 qp_h、qpn、transport_ext、
+  //   payload_mode、payload/SGE 与 sge_num，返回 rdma_status，不修改模型。
+  // 失败/边界：按 shape、QP handle、字段宽度、transport extension、mode、
+  //   canonical count 的既有优先级拒绝；null SGE、count 超出 8 bit 或 sge_num
+  //   不等于 derive_sge_num 时返回 INVALID_ARGUMENT，不发布 image 或转移资源。
   virtual function rdma_status validate();
     rdma_status shape_status;
+    rdma_sq_payload_mode_e canonical_mode;
+    int unsigned valid_sge_count;
+    int unsigned inline_payload_bytes;
+    int unsigned canonical_sge_num;
+    bit inline_bytes_are_authority;
 
     shape_status = validate_payload_shape();
     if (!shape_status.ok())
@@ -222,6 +334,15 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
       return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
           "SQE payload mode is invalid");
+
+    derive_payload_authority(canonical_mode, valid_sge_count,
+                             inline_payload_bytes,
+                             inline_bytes_are_authority,
+                             canonical_sge_num);
+    if (canonical_sge_num > 8'hff || sge_num != canonical_sge_num)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "SQE SGE_NUM does not match canonical payload count");
 
     return rdma_status::success();
   endfunction
@@ -1077,14 +1198,19 @@ virtual class rdma_hw_queue_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_image 校验 image 与当前对象状态的一致性，并显式处理“queue image is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：image（输入）；validate_image 读取 image 并使用字段 p、b、s；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
-  virtual function rdma_status validate_image(rdma_hw_image image);
-    rdma_hw_qword_builder b;
-    byte unsigned p[];
-    rdma_status s;
-
+  // 功能：validate_queue_image_metadata 按 queue codec 的固定布局校验 image
+  //   的空值、generation 和完整 metadata 前置条件，供不同 image 校验入口复用。
+  // 输入/输出及副作用：image、expected_length 为只读输入；函数读取 image 的
+  //   function_generation、length、bytes、alignment、endian、image_kind、硬件版本及
+  //   各写入目标字段，返回 rdma_status，不修改 image、codec、builder 或外部资源。
+  // 失败/边界：image 为空返回“queue image is null”；generation 为零返回原有
+  //   stale 状态；length/bytes、对齐、端序、image kind、硬件版本或 backing/HMC/BAR/
+  //   write target 任一不符 expected_length/queue profile 时返回“queue image metadata
+  //   is invalid”，并保持 null→generation→metadata 的拒绝顺序。
+  protected function rdma_status validate_queue_image_metadata(
+      rdma_hw_image image,
+      int unsigned expected_length
+  );
     if (image == null)
       return err("queue image is null");
 
@@ -1093,9 +1219,9 @@ virtual class rdma_hw_queue_codec_base extends rdma_codec_base;
           RDMA_SC_STALE_GENERATION,
           "queue image generation is stale");
 
-    if (image.length != image_bytes() ||
-        image.bytes.size() != image_bytes() ||
-        image.alignment != image_bytes() ||
+    if (image.length != expected_length ||
+        image.bytes.size() != expected_length ||
+        image.alignment != expected_length ||
         image.endian != RDMA_ENDIAN_BIG ||
         image.image_kind != image_kind_expected() ||
         image.hardware_version != RDMA_HW_VERSION ||
@@ -1104,6 +1230,25 @@ virtual class rdma_hw_queue_codec_base extends rdma_codec_base;
         image.hmc_target.value != 0 ||
         image.bar_target.value != 0)
       return err("queue image metadata is invalid");
+
+    return rdma_status::success();
+  endfunction
+
+  // 功能：validate_image 先校验 queue image 的固定 metadata，再反序列化 bytes
+  //   并执行派生 codec 的 reserved-bit 检查，确认镜像可安全进入字段解码路径。
+  // 输入/输出及副作用：image 为只读输入；函数使用 image_bytes、临时 byte 数组 p、
+  //   qword builder b 和状态 s，返回 rdma_status，不修改 image 或取得外部资源所有权。
+  // 失败/边界：metadata helper 拒绝空镜像、stale generation 或布局/目标不符，
+  //   deserialize 失败会保留其消息并包装为 codec error，reserved 检查失败原样返回；
+  //   任一失败都不发布部分解码模型。
+  virtual function rdma_status validate_image(rdma_hw_image image);
+    rdma_hw_qword_builder b;
+    byte unsigned p[];
+    rdma_status s;
+
+    s = validate_queue_image_metadata(image, image_bytes());
+    if (!s.ok())
+      return s;
 
     p = new[image_bytes()];
     foreach (p[i])
@@ -1273,6 +1418,26 @@ class rdma_hw_sqe_codec_base extends rdma_hw_queue_codec_base;
     return RDMA_WQE_BYTES;
   endfunction
 
+  // 功能：validate_model 在任何 RC/UD/URC builder 写入前统一校验 SQE
+  //   generation、hardware-model shape 与 canonical SGE_NUM，避免派生 writer 漏 gate。
+  // 输入/输出及副作用：model 为只读输入；先调用 queue 基类校验 handle
+  //   generation，再 cast 并调用 rdma_hw_sqe_model::validate，不修改模型或 image。
+  // 失败/边界：空/stale handle、模型类型不符、null SGE 或 count mismatch 均
+  //   返回非成功状态；encode 已先把 image 置 null，raw decode 不经过本 authoring gate。
+  virtual function rdma_status validate_model(rdma_hw_model model);
+    rdma_hw_sqe_model sqe;
+    rdma_status status;
+
+    status = super.validate_model(model);
+    if (status == null || !status.ok())
+      return status;
+    if (!$cast(sqe, model))
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "SQE model type mismatch");
+    return sqe.validate();
+  endfunction
+
   // 功能：把一个已解析的 SQE 字段写入 qword builder，并把底层失败归类为 CODEC_ERROR。
   // 输入/输出及副作用：b 为可变 builder，o/l/w/v 分别是字节偏移、LSB、宽度和值；成功只更新 b，不取得外部 backing 所有权。
   // 失败/边界：put_field 拒绝越界、宽度非法或已有冲突位时返回 CODEC_ERROR，并保留原始错误消息；失败后调用方不得继续发布 image。
@@ -1323,21 +1488,147 @@ class rdma_hw_sqe_codec_base extends rdma_hw_queue_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_sqe_codec_base 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、b（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b); rdma_hw_sqe_model x; rdma_status s; if(!$cast(x,model)) return err("SQE model type mismatch"); s=x.validate(); if(!s.ok()) return s;
-    `define SQPUT(S,V) s=put(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return s;
-    `SQPUT(RDMA_SQ_WQE_QPN,x.qpn) `SQPUT(RDMA_SQ_WQE_ICOS,x.icos) `SQPUT(RDMA_SQ_WQE_QP_SN,x.qp_sn) `SQPUT(RDMA_SQ_WQE_OPCODE,x.hw_opcode) `SQPUT(RDMA_SQ_WQE_DST_PORT,x.dst_port) `SQPUT(RDMA_SQ_WQE_INDEX,x.index) `SQPUT(RDMA_SQ_WQE_WRAP,x.wrap) `SQPUT(RDMA_SQ_WQE_SIGN_EN,x.sign_en) `SQPUT(RDMA_SQ_WQE_SE,x.se) `SQPUT(RDMA_SQ_WQE_FENCE,x.fence) `SQPUT(RDMA_SQ_WQE_CE,x.ce) `SQPUT(RDMA_SQ_WQE_VALID,x.valid) `SQPUT(RDMA_SQ_WQE_SIGNATURE,x.signature) `SQPUT(RDMA_SQ_WQE_RC_SGE_NUM,x.sge_num)
-    if (x.transport!=RDMA_TRANSPORT_RC) return rdma_status::success();
-    `SQPUT(RDMA_SQ_WQE_RC_REMOTE_KEY,x.rkey) `SQPUT(RDMA_SQ_WQE_RC_REMOTE_VA,x.remote_va.value) `undef SQPUT return rdma_status::success();
+  // 功能：encode_fields 把已由统一 authoring gate 校验的 SQE 公共 header
+  //   写入 builder；RC 模型还写入 remote key/VA，供基础 codec 的简单布局使用。
+  // 输入/输出及副作用：model 为只读输入，b 接收固定 raw 坐标字段；函数不再
+  //   重复调用 model.validate，也不修改 handle、payload 或资源生命周期。
+  // 失败/边界：model 不是 rdma_hw_sqe_model，或任一 put 因坐标/重叠失败时
+  //   返回非 OK；非 RC transport 只写公共 header 后成功返回。
+  protected virtual function rdma_status encode_fields(
+      rdma_hw_model model,
+      rdma_hw_qword_builder b);
+    rdma_hw_sqe_model x;
+    rdma_status s;
+
+    if (!$cast(x, model))
+      return err("SQE model type mismatch");
+
+    s = put(b, RDMA_SQ_WQE_QPN_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_QPN_LSB, RDMA_SQ_WQE_QPN_WIDTH, x.qpn);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_ICOS_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_ICOS_LSB, RDMA_SQ_WQE_ICOS_WIDTH, x.icos);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_QP_SN_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_QP_SN_LSB, RDMA_SQ_WQE_QP_SN_WIDTH, x.qp_sn);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_OPCODE_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_OPCODE_LSB, RDMA_SQ_WQE_OPCODE_WIDTH, x.hw_opcode);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_DST_PORT_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_DST_PORT_LSB, RDMA_SQ_WQE_DST_PORT_WIDTH, x.dst_port);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_INDEX_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_INDEX_LSB, RDMA_SQ_WQE_INDEX_WIDTH, x.index);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_WRAP_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_WRAP_LSB, RDMA_SQ_WQE_WRAP_WIDTH, x.wrap);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_SIGN_EN_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_SIGN_EN_LSB, RDMA_SQ_WQE_SIGN_EN_WIDTH, x.sign_en);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_SE_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_SE_LSB, RDMA_SQ_WQE_SE_WIDTH, x.se);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_FENCE_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_FENCE_LSB, RDMA_SQ_WQE_FENCE_WIDTH, x.fence);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_CE_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_CE_LSB, RDMA_SQ_WQE_CE_WIDTH, x.ce);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_VALID_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_VALID_LSB, RDMA_SQ_WQE_VALID_WIDTH, x.valid);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_SIGNATURE_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_SIGNATURE_LSB, RDMA_SQ_WQE_SIGNATURE_WIDTH,
+            x.signature);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_RC_SGE_NUM_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_RC_SGE_NUM_LSB, RDMA_SQ_WQE_RC_SGE_NUM_WIDTH,
+            x.sge_num);
+    if (!s.ok())
+      return s;
+
+    if (x.transport != RDMA_TRANSPORT_RC)
+      return rdma_status::success();
+
+    s = put(b, RDMA_SQ_WQE_RC_REMOTE_KEY_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_RC_REMOTE_KEY_LSB, RDMA_SQ_WQE_RC_REMOTE_KEY_WIDTH,
+            x.rkey);
+    if (!s.ok())
+      return s;
+    s = put(b, RDMA_SQ_WQE_RC_REMOTE_VA_WORD_BYTE_OFFSET,
+            RDMA_SQ_WQE_RC_REMOTE_VA_LSB, RDMA_SQ_WQE_RC_REMOTE_VA_WIDTH,
+            x.remote_va.value);
+    if (!s.ok())
+      return s;
+    return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_sqe_codec_base 中，decode_fields 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：b（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
-  protected virtual function rdma_status decode_fields(rdma_hw_qword_builder b, output rdma_hw_model model); rdma_hw_sqe_model x; rdma_sqe_rc_ext ext; bit [63:0] v; rdma_status s; x=rdma_hw_sqe_model::type_id::create("decoded_sqe"); x.transport=RDMA_TRANSPORT_RC; x.opcode=RDMA_WR_SEND; x.inline_data=1; x.payload.push_back(0); x.qp_h=rdma_hw_queue_projected_handle("decoded_qp",RDMA_RESOURCE_QP,0); ext=rdma_sqe_rc_ext::type_id::create("decoded_rc_ext"); x.transport_ext=ext; `define SQGET(S,T) v='0; s=get(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,v); if(!s.ok()) return s; T=v;
-    `SQGET(RDMA_SQ_WQE_QPN,x.qpn) `SQGET(RDMA_SQ_WQE_ICOS,x.icos) `SQGET(RDMA_SQ_WQE_QP_SN,x.qp_sn) `SQGET(RDMA_SQ_WQE_OPCODE,x.hw_opcode) `SQGET(RDMA_SQ_WQE_DST_PORT,x.dst_port) `SQGET(RDMA_SQ_WQE_INDEX,x.index) `SQGET(RDMA_SQ_WQE_WRAP,x.wrap) `SQGET(RDMA_SQ_WQE_SIGN_EN,x.sign_en) `SQGET(RDMA_SQ_WQE_SE,x.se) `SQGET(RDMA_SQ_WQE_FENCE,x.fence) `SQGET(RDMA_SQ_WQE_CE,x.ce) `SQGET(RDMA_SQ_WQE_VALID,x.valid) `SQGET(RDMA_SQ_WQE_SIGNATURE,x.signature) `SQGET(RDMA_SQ_WQE_RC_SGE_NUM,x.sge_num) `SQGET(RDMA_SQ_WQE_RC_REMOTE_KEY,x.rkey) `SQGET(RDMA_SQ_WQE_RC_REMOTE_VA,x.remote_va.value) `undef SQGET model=x; return rdma_status::success(); endfunction
+  // 功能：decode_fields 解码 SQE 基类公共 header 与 RC remote 坐标，生成
+  //   可供通用 codec round-trip 的 detached RC SEND 模型。
+  // 输入/输出及副作用：b 为已通过 raw/layout 校验的只读 builder，model 为输出；
+  //   成功时发布新建模型和投影 QP handle，不修改原 image 或取得外部资源所有权。
+  // 失败/边界：任一字段读取失败立即返回 CODEC_ERROR 且不发布 model；投影 handle
+  //   仅保留 raw identity，不构成 Function/route authority，业务路径不得直接提交。
+  protected virtual function rdma_status decode_fields(
+      rdma_hw_qword_builder b,
+      output rdma_hw_model model);
+    rdma_hw_sqe_model x;
+    rdma_sqe_rc_ext ext;
+    bit [63:0] v;
+    rdma_status s;
+
+    model = null;
+    x = rdma_hw_sqe_model::type_id::create("decoded_sqe");
+    x.transport = RDMA_TRANSPORT_RC;
+    x.opcode = RDMA_WR_SEND;
+    x.inline_data = 1'b1;
+    x.payload.push_back(0);
+    x.qp_h = rdma_hw_queue_projected_handle(
+        "decoded_qp", RDMA_RESOURCE_QP, 0);
+    ext = rdma_sqe_rc_ext::type_id::create("decoded_rc_ext");
+    x.transport_ext = ext;
+
+    `define SQGET(S,T) \
+      v = '0; \
+      s = get(b, S``_WORD_BYTE_OFFSET, S``_LSB, S``_WIDTH, v); \
+      if (!s.ok()) return s; \
+      T = v;
+    `SQGET(RDMA_SQ_WQE_QPN, x.qpn)
+    `SQGET(RDMA_SQ_WQE_ICOS, x.icos)
+    `SQGET(RDMA_SQ_WQE_QP_SN, x.qp_sn)
+    `SQGET(RDMA_SQ_WQE_OPCODE, x.hw_opcode)
+    `SQGET(RDMA_SQ_WQE_DST_PORT, x.dst_port)
+    `SQGET(RDMA_SQ_WQE_INDEX, x.index)
+    `SQGET(RDMA_SQ_WQE_WRAP, x.wrap)
+    `SQGET(RDMA_SQ_WQE_SIGN_EN, x.sign_en)
+    `SQGET(RDMA_SQ_WQE_SE, x.se)
+    `SQGET(RDMA_SQ_WQE_FENCE, x.fence)
+    `SQGET(RDMA_SQ_WQE_CE, x.ce)
+    `SQGET(RDMA_SQ_WQE_VALID, x.valid)
+    `SQGET(RDMA_SQ_WQE_SIGNATURE, x.signature)
+    `SQGET(RDMA_SQ_WQE_RC_SGE_NUM, x.sge_num)
+    `SQGET(RDMA_SQ_WQE_RC_REMOTE_KEY, x.rkey)
+    `SQGET(RDMA_SQ_WQE_RC_REMOTE_VA, x.remote_va.value)
+    `undef SQGET
+
+    model = x;
+    return rdma_status::success();
+  endfunction
 
 endclass
 
@@ -1419,66 +1710,27 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：mode_of 按函数体读取当前字段并生成 rdma_sq_payload_mode_e 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：x（输入）；mode_of 读取 x 并使用输入参数和固定枚举/常量；函数返回 rdma_sq_payload_mode_e，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
-  protected function rdma_sq_payload_mode_e mode_of(rdma_hw_sqe_model x);
-    int unsigned valid_sge_count;
-
-    valid_sge_count = 0;
-    foreach (x.sges[i]) begin
-      if (x.sges[i] != null && x.sges[i].length != 0)
-        valid_sge_count++;
-    end
-
-    if (x.payload_mode != RDMA_SQ_PAYLOAD_NONE) begin
-      // wr.c drops zero-length SGE entries before selecting direct/SGB mode.
-      // A stale explicit SGE mode must not turn an otherwise legal empty
-      // SEND/WRITE into a rejected wire shape.
-      if (x.payload_mode inside {RDMA_SQ_PAYLOAD_SGE_WQE,
-                                 RDMA_SQ_PAYLOAD_SGE_SGB} &&
-          valid_sge_count == 0)
-        return RDMA_SQ_PAYLOAD_NONE;
-      return x.payload_mode;
-    end
-    if (x.inline_data || x.inline_bytes.size() != 0 || x.payload.size() != 0)
-      return (x.inline_bytes.size() > 32 || x.payload.size() > 32) ?
-             RDMA_SQ_PAYLOAD_INLINE_SGB : RDMA_SQ_PAYLOAD_INLINE_WQE;
-    if (x.opcode inside {RDMA_WR_ATOMIC_CMP_SWAP, RDMA_WR_ATOMIC_FETCH_ADD})
-      return RDMA_SQ_PAYLOAD_ATOMIC_FIXED;
-    if (valid_sge_count > 2)
-      return RDMA_SQ_PAYLOAD_SGE_SGB;
-    if (valid_sge_count != 0)
-      return RDMA_SQ_PAYLOAD_SGE_WQE;
-    return RDMA_SQ_PAYLOAD_NONE;
-  endfunction
-
-  // 功能：payload_length 根据 x.total_payload_len、inline_bytes、payload 和 mode 计算实际 payload 字节数，供 SQE 编码检查使用。
-  // 输入/输出及副作用：x（输入）、mode（输入）；payload_length 读取 x、mode 并使用字段 value；函数返回 longint unsigned，不取得调用方资源所有权。
-  // 失败/边界：payload_length 先检查 value != 0；x.inline_bytes.size(；mode == RDMA_SQ_PAYLOAD_ATOMIC_FIXED，再返回 value；x.inline_bytes.size()；x.payload.size()；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：payload_length 将调用方声明长度与共享 authority 的 inline byte count
+  //   合成为 RC writer 的候选长度；SGE 实长随后由 descriptor 遍历覆盖。
+  // 输入/输出及副作用：x、mode、inline_payload_bytes 为只读输入；返回候选长度，
+  //   不扫描/计数 SGE，也不修改模型、builder 或外部 backing。
+  // 失败/边界：非零 total_payload_len 保持调用方声明供后续一致性检查；atomic
+  //   缺省为 8，NONE/SGE 缺省为 0；本 helper 不单独判错或截断长度。
   protected function automatic longint unsigned payload_length(
       rdma_hw_sqe_model x,
-      rdma_sq_payload_mode_e mode);
+      rdma_sq_payload_mode_e mode,
+      int unsigned inline_payload_bytes);
     longint unsigned value;
+
     value = x.total_payload_len;
     if (value != 0)
       return value;
     if (mode inside {RDMA_SQ_PAYLOAD_INLINE_WQE,
-                     RDMA_SQ_PAYLOAD_INLINE_SGB}) begin
-      if (x.inline_bytes.size() != 0) return x.inline_bytes.size();
-      return x.payload.size();
-    end
-    if (mode inside {RDMA_SQ_PAYLOAD_SGE_WQE,
-                     RDMA_SQ_PAYLOAD_SGE_SGB}) begin
-      value = 0;
-      foreach (x.sges[i]) begin
-        if (x.sges[i] != null && x.sges[i].length != 0)
-          value += x.sges[i].length;
-      end
-    end
+                     RDMA_SQ_PAYLOAD_INLINE_SGB})
+      return inline_payload_bytes;
     if (mode == RDMA_SQ_PAYLOAD_ATOMIC_FIXED)
-      value = 8;
-    return value;
+      return 8;
+    return 0;
   endfunction
 
   // 功能：在 rdma_hw_sqe_rc_codec 中，put_header 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
@@ -1546,9 +1798,15 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     return put(b, 40 + slot * 16, 0, 64, sge.iova.value);
   endfunction
 
-  // 功能：在 rdma_hw_sqe_rc_codec 中，body_and_header 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
-  // 输入/输出及副作用：x（输入）、b（输入）、mode（输出）、signature_sgb（输出）；body_and_header 读取 x、b、mode、signature_sgb 并使用字段 s、mode、length、sge_length、encoded_length、raw、descriptor_length、descriptor_lkey，并写入 mode、signature_sgb；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：body_and_header 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “local invalidate uses a payload mode”；“atomic opcode uses a non-atomic payload mode”；“non-atomic opcode uses atomic payload mode”；“ordinary RC SQE has no payload shape”；“RDMA read requires an SGE payload mode”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：body_and_header 按共享 mode/count derivation 校验 RC payload shape，
+  //   把 inline、direct SGE、external SGB 或 atomic fixed body 写入 builder，
+  //   并生成签名覆盖所需的外部 SGB bytes 与公共 header 字段。
+  // 输入/输出及副作用：x 为只读 hardware model，b 接收已校验字段；mode
+  //   返回最终 payload mode，signature_sgb 返回 detached 外部 payload/descriptor
+  //   字节；成功会更新 b，但不修改 x、SGE 或外部 Host-memory。
+  // 失败/边界：opcode/mode 不相容、READ 无 SGE、长度/保留位/SGE 阈值非法、
+  //   SGB IOVA 未按 512-byte 对齐或 builder 写入失败时返回非 OK；null SGE
+  //   即使不参与 canonical 数值计数仍明确拒绝，失败结果不得发布 image。
   protected function rdma_status body_and_header(
       rdma_hw_sqe_model x,
       rdma_hw_qword_builder b,
@@ -1560,14 +1818,16 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     bit [31:0] encoded_length;
     byte unsigned raw[];
     int unsigned valid_sge_count;
+    int unsigned inline_payload_bytes;
+    int unsigned canonical_sge_num;
+    bit inline_bytes_are_authority;
+
     s = rdma_status::success();
-    mode = mode_of(x);
+    x.derive_payload_authority(mode, valid_sge_count,
+                               inline_payload_bytes,
+                               inline_bytes_are_authority,
+                               canonical_sge_num);
     signature_sgb.delete();
-    valid_sge_count = 0;
-    foreach (x.sges[i]) begin
-      if (x.sges[i] != null && x.sges[i].length != 0)
-        valid_sge_count++;
-    end
     if (x.opcode == RDMA_WR_LOCAL_INVALIDATE &&
         mode != RDMA_SQ_PAYLOAD_NONE)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1591,7 +1851,7 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "RDMA read requires an SGE payload mode");
 
-    length = payload_length(x, mode);
+    length = payload_length(x, mode, inline_payload_bytes);
     if (mode inside {RDMA_SQ_PAYLOAD_SGE_WQE,
                      RDMA_SQ_PAYLOAD_SGE_SGB}) begin
       sge_length = 0;
@@ -1627,10 +1887,14 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     encoded_length = length == 64'h8000_0000 ? 32'h0 : length[31:0];
     if (mode inside {RDMA_SQ_PAYLOAD_INLINE_WQE,
                      RDMA_SQ_PAYLOAD_INLINE_SGB}) begin
-      if (x.inline_bytes.size() != 0) begin
-        raw = new[x.inline_bytes.size()]; foreach (raw[i]) raw[i]=x.inline_bytes[i];
+      if (inline_bytes_are_authority) begin
+        raw = new[inline_payload_bytes];
+        foreach (raw[i])
+          raw[i] = x.inline_bytes[i];
       end else begin
-        raw = new[x.payload.size()]; foreach (raw[i]) raw[i]=x.payload[i];
+        raw = new[inline_payload_bytes];
+        foreach (raw[i])
+          raw[i] = x.payload[i];
       end
       if (raw.size() != length)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1666,13 +1930,13 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
       end
     end else if (mode inside {RDMA_SQ_PAYLOAD_SGE_WQE,
                               RDMA_SQ_PAYLOAD_SGE_SGB}) begin
-      if (valid_sge_count == 0 || valid_sge_count > 32)
+      if (canonical_sge_num == 0 || canonical_sge_num > 32)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RC SGE count is outside 1..32");
-      if (mode == RDMA_SQ_PAYLOAD_SGE_WQE && valid_sge_count > 2)
+      if (mode == RDMA_SQ_PAYLOAD_SGE_WQE && canonical_sge_num > 2)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "direct RC SGE count exceeds two");
-      if (mode == RDMA_SQ_PAYLOAD_SGE_SGB && valid_sge_count < 3)
+      if (mode == RDMA_SQ_PAYLOAD_SGE_SGB && canonical_sge_num < 3)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RC SGB SGE count is below three");
       if (mode == RDMA_SQ_PAYLOAD_SGE_SGB) begin
@@ -1789,13 +2053,7 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     s = put(b, RDMA_SQ_WQE_RC_SGE_NUM_WORD_BYTE_OFFSET,
             RDMA_SQ_WQE_RC_SGE_NUM_LSB,
             RDMA_SQ_WQE_RC_SGE_NUM_WIDTH,
-            mode inside {RDMA_SQ_PAYLOAD_INLINE_WQE,
-                         RDMA_SQ_PAYLOAD_INLINE_SGB} ?
-            ((length + 15) / 16) :
-            (mode inside {RDMA_SQ_PAYLOAD_SGE_WQE,
-                          RDMA_SQ_PAYLOAD_SGE_SGB,
-                          RDMA_SQ_PAYLOAD_ATOMIC_FIXED} ?
-             (mode == RDMA_SQ_PAYLOAD_ATOMIC_FIXED ? 1 : valid_sge_count) : 0));
+            canonical_sge_num);
     if (!s.ok()) return s;
     // RC 的 remote-key/remote-VA 与 UD 的 AV/DMAC 使用同一物理 qword，
     // UD 路径必须跳过 RC 字段写入，否则即使值为零也会触发 builder overlap。
@@ -2046,6 +2304,13 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
         if (raw[i] !== 8'h00)
           return err("RC inline WQE unused tail is nonzero");
     end else if (raw_mode == RDMA_SQ_PAYLOAD_INLINE_SGB) begin
+      // xtrdma_hw.h/wr.c 固定一个 SQ-SGB slot 为 512B，并以 16B chunk
+      // 编码 inline payload；因此 32B 以内必须留在 WQE，超过 512B 或
+      // 超过 32 个 chunk 的 raw image 都不能仅因 TPL/SGE_NUM 字段宽度
+      // 足够而被接受。先检查真实 slot 容量，再检查 count 与长度的几何
+      // 关系，避免把一个越过 backing slot 的 image 误判为合法 detached model。
+      if (length > RDMA_MAX_WQ_SGE * 16 || count > RDMA_MAX_WQ_SGE)
+        return err("RC inline SGB exceeds the fixed 512-byte/32-chunk capacity");
       if (length <= 32 || count != ((length + 15) / 16))
         return err("RC inline SGB length or chunk count is invalid");
     end else if (raw_mode == RDMA_SQ_PAYLOAD_SGE_WQE) begin
@@ -2133,36 +2398,57 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_sqe_rc_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、b（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：encode_fields 在 detached SQE candidate 上投影 RC extension，再编码
+  //   body/header/signature，避免 wire-effective remote 字段回写 caller model。
+  // 输入/输出及副作用：model 为只读输入，b 为待提交 builder；成功更新 b 与
+  //   codec 的 last_* 诊断状态；opcode 映射成功后即可能更新 last_hw_opcode，
+  //   即使后续 body 拒绝。源 model、extension、SGE、payload 和 handle 始终不变。
+  // 失败/边界：类型/clone/extension/opcode、payload 几何或 builder 写入失败时返回
+  //   非 OK；candidate 与局部 builder 内容被丢弃，源模型不需要回滚且 image 不发布。
   protected virtual function rdma_status encode_fields(
       rdma_hw_model model,
       rdma_hw_qword_builder b);
-    rdma_hw_sqe_model x;
+    rdma_hw_sqe_model source;
+    rdma_hw_sqe_model candidate;
     rdma_sqe_rc_ext ext;
+    uvm_object cloned_object;
     rdma_status s;
     rdma_sq_payload_mode_e mode;
     byte unsigned signature_sgb[$];
     byte unsigned serialized[];
     bit [7:0] signature;
     bit [3:0] hw_opcode;
-    if (!$cast(x, model)) return err("RC SQE model type mismatch");
-    s = x.validate(); if (!s.ok()) return s;
-    if (x.transport != RDMA_TRANSPORT_RC)
+
+    if (!$cast(source, model))
+      return err("RC SQE model type mismatch");
+    cloned_object = source.clone();
+    if (cloned_object == null || !$cast(candidate, cloned_object))
+      return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "RC SQE detached candidate allocation failed");
+    if (candidate.transport != RDMA_TRANSPORT_RC)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "RC codec received a non-RC SQE");
-    s = map_opcode(x.opcode, hw_opcode); if (!s.ok()) return s;
-    if (x.transport_ext != null) begin
-      if (!$cast(ext, x.transport_ext)) return err("RC extension type mismatch");
-      s = ext.validate(x.opcode); if (!s.ok()) return s;
-      if (ext.rkey_valid) x.rkey = ext.rkey;
-      if (ext.remote_access_valid) x.remote_va = ext.remote_addr;
-      if (x.opcode == RDMA_WR_LOCAL_INVALIDATE && ext.rkey_valid)
-        x.invalidate_key = ext.rkey;
+    s = map_opcode(candidate.opcode, hw_opcode);
+    if (!s.ok())
+      return s;
+    if (candidate.transport_ext != null) begin
+      if (!$cast(ext, candidate.transport_ext))
+        return err("RC extension type mismatch");
+      s = ext.validate(candidate.opcode);
+      if (!s.ok())
+        return s;
+      if (ext.rkey_valid)
+        candidate.rkey = ext.rkey;
+      if (ext.remote_access_valid)
+        candidate.remote_va = ext.remote_addr;
+      if (candidate.opcode == RDMA_WR_LOCAL_INVALIDATE && ext.rkey_valid)
+        candidate.invalidate_key = ext.rkey;
     end
     last_hw_opcode = hw_opcode;
-    s = body_and_header(x, b, mode, signature_sgb); if (!s.ok()) return s;
+    s = body_and_header(candidate, b, mode, signature_sgb);
+    if (!s.ok())
+      return s;
     last_mode = mode;
     s = b.serialize(serialized); if (!s.ok()) return err(s.message);
     signature = ~8'h00;
@@ -2174,9 +2460,14 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     return s;
   endfunction
 
-  // 功能：在 rdma_hw_sqe_rc_codec 中，decode_fields 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：b（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：decode_fields 将已通过结构校验的 RC SQE 解成 detached 模型；ordinary
+  //   opcode 先以 raw INLINE_LOCAL_QPC_RD 判 inline，再以非 inline count=0 判 NONE，
+  //   并恢复 inline_data 与 WQE 内 inline_bytes，保证零字节 inline 可原样重编码。
+  // 输入/输出及副作用：b 为只读 builder，model 为输出；成功发布新建 SQE、RC
+  //   extension、投影 QP handle 及 direct descriptor，不接管 image/backing 所有权。
+  // 失败/边界：字段读取失败时返回非 OK 且不发布 model；external-SGB
+  //   raw image 仅恢复 SGB 指针/count，因没有 detached 512B bytes 不伪造 payload，
+  //   后续需要 payload/signature authority 的调用方必须另行提供该 backing 快照。
   protected virtual function rdma_status decode_fields(
       rdma_hw_qword_builder b,
       output rdma_hw_model model);
@@ -2273,13 +2564,22 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
         ext.rkey = x.rkey;
       end
       b.get_words(words);
-      x.payload_mode = (count == 0) ? RDMA_SQ_PAYLOAD_NONE :
-                        (words[0][60] ?
-                         (x.total_payload_len <= 32 ?
-                          RDMA_SQ_PAYLOAD_INLINE_WQE :
-                          RDMA_SQ_PAYLOAD_INLINE_SGB) :
-                         (count <= 2 ? RDMA_SQ_PAYLOAD_SGE_WQE :
-                                       RDMA_SQ_PAYLOAD_SGE_SGB));
+      // INLINE_LOCAL_QPC_RD 是 ordinary opcode 的首要 raw mode authority；
+      // 即使 TPL/count 都为零也必须保留 inline 语义，才能 byte-exact 重编码。
+      // 非 inline 时 count==0 才表示 NONE，其余按 direct/external 阈值解析。
+      if (words[0][60])
+        x.payload_mode = x.total_payload_len <= 32 ?
+                         RDMA_SQ_PAYLOAD_INLINE_WQE :
+                         RDMA_SQ_PAYLOAD_INLINE_SGB;
+      else if (count == 0)
+        x.payload_mode = RDMA_SQ_PAYLOAD_NONE;
+      else
+        x.payload_mode = count <= 2 ? RDMA_SQ_PAYLOAD_SGE_WQE :
+                                      RDMA_SQ_PAYLOAD_SGE_SGB;
+      x.inline_data = x.payload_mode inside {
+          RDMA_SQ_PAYLOAD_INLINE_WQE,
+          RDMA_SQ_PAYLOAD_INLINE_SGB
+      };
       if (x.payload_mode inside {RDMA_SQ_PAYLOAD_INLINE_SGB,
                                  RDMA_SQ_PAYLOAD_SGE_SGB}) begin
         s = get(b, RDMA_SQ_WQE_SGB_PA_WORD_BYTE_OFFSET,
@@ -2373,27 +2673,33 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
     return rdma_status::success();
   endfunction
 
-  // 功能：把驱动 xtrdma_set_ud_wqe() 的 8..56 字节布局独立编码到 WQE。
-  // 输入/输出及副作用：model 为输入、b 为输出；仅生成 detached image，SGB 内容由 queue-data
-  // writer 另行写入，不在此函数取得 host-memory 所有权。
-  // 失败/边界：非 UD 扩展、内核 ABI 不支持的 tunnel 标志、payload 超过 14-bit、
-  // 非零 payload 缺失 512B 对齐 SGB IOVA、SGE/inline 长度不一致或字段写入重叠
-  // 时返回明确错误且不发布 image。
+  // 功能：把共享 payload authority 归一成驱动 xtrdma_set_ud_wqe() 的物理
+  //   8..56B 布局，并让 TPL、INLINE、SGE_NUM、SGB bytes 与 signature 同源。
+  // 输入/输出及副作用：model 为只读输入，b 为输出；成功更新 detached builder
+  //   及 last_* 诊断状态，SGB bytes 仅参与签名并由 queue-data writer 另行写入
+  //   Host-memory；opcode 映射后即可能更新 last_hw_opcode，即使后续 validation 拒绝。
+  // 失败/边界：非 UD 扩展、tunnel、mode/opcode 不相容、inline 超过 512B、
+  //   descriptor 超过 32、TPL 超过 14 bit、SGB IOVA 未对齐或长度不一致时，
+  //   均在首个字段/signature 写入前返回错误，不发布 image 或取得 backing 所有权。
   protected virtual function rdma_status encode_fields(rdma_hw_model model, rdma_hw_qword_builder b);
     rdma_hw_sqe_model x;
     rdma_sqe_ud_ext ext;
     rdma_address_vector av;
     rdma_status s;
+    rdma_sq_payload_mode_e authority_mode;
     rdma_sq_payload_mode_e mode;
     byte unsigned sgb[$];
     byte unsigned raw[];
     byte unsigned payload_bytes[];
     bit [3:0] op;
     bit [7:0] sig;
+    bit [31:0] encoded_sge_length;
     longint unsigned length;
-    int unsigned sge_count;
     int unsigned valid_sge_count;
-    rdma_sq_payload_mode_e header_mode;
+    int unsigned inline_payload_bytes;
+    int unsigned sge_count;
+    bit inline_bytes_are_authority;
+
     if (!$cast(x, model)) return err("UD SQE model type mismatch");
     if (x.transport != RDMA_TRANSPORT_UD) return err("UD codec received non-UD SQE");
     if (!$cast(ext, x.transport_ext)) return err("UD extension type mismatch");
@@ -2412,26 +2718,108 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
           RDMA_SC_UNSUPPORTED_OPCODE,
           "UD SQE tunnel flag is unsupported by kernel driver ABI");
 
-    // 驱动会过滤零长 SGE，再按有效长度计算 payload 和 SGE_NUM。
-    length = x.total_payload_len;
-    valid_sge_count = 0;
-    if (length == 0 && x.inline_data) length = x.payload.size();
-    if (!x.inline_data) begin
-      length = 0;
-      foreach (x.sges[i]) begin
-        if (x.sges[i] == null)
-          return err("UD SQE contains a null SGE");
-        if (x.sges[i].length == 0)
-          continue;
-        valid_sge_count++;
-        if (valid_sge_count > RDMA_MAX_WQ_SGE)
-          return err("UD external SGB SGE count exceeds driver limit of 32");
-        if (x.sges[i].length == 32'h8000_0000)
-          length += 32'h8000_0000;
-        else
-          length += x.sges[i].length;
+    // semantic mode、过滤后的 descriptor 数、inline 字节源/长度与 raw count
+    // 必须来自同一次 authority derivation。后续遍历只校验、累计 TPL 和序列化，
+    // 不再形成 UD 私有的 mode/count 公式。
+    x.derive_payload_authority(authority_mode, valid_sge_count,
+                               inline_payload_bytes,
+                               inline_bytes_are_authority,
+                               sge_count);
+    sgb.delete();
+    length = 0;
+    case (authority_mode)
+      RDMA_SQ_PAYLOAD_INLINE_WQE,
+      RDMA_SQ_PAYLOAD_INLINE_SGB: begin
+        length = inline_payload_bytes;
+        if (x.total_payload_len != 0 && x.total_payload_len != length)
+          return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "UD inline payload length is inconsistent");
+        if (inline_payload_bytes > 512)
+          return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "UD inline payload exceeds one 512-byte SGB slot");
+
+        mode = length == 0 ? RDMA_SQ_PAYLOAD_INLINE_WQE :
+                             RDMA_SQ_PAYLOAD_INLINE_SGB;
+        if (length != 0) begin
+          payload_bytes = new[inline_payload_bytes];
+          if (inline_bytes_are_authority) begin
+            foreach (payload_bytes[i])
+              payload_bytes[i] = x.inline_bytes[i];
+          end
+          else begin
+            foreach (payload_bytes[i])
+              payload_bytes[i] = x.payload[i];
+          end
+          foreach (payload_bytes[i])
+            sgb.push_back(payload_bytes[i]);
+          while (sgb.size() < 512)
+            sgb.push_back(0);
+        end
       end
-    end
+
+      RDMA_SQ_PAYLOAD_SGE_WQE,
+      RDMA_SQ_PAYLOAD_SGE_SGB: begin
+        if (valid_sge_count != sge_count)
+          return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "UD payload authority count is inconsistent");
+        if (sge_count > RDMA_MAX_WQ_SGE)
+          return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "UD external SGB SGE count exceeds driver limit of 32");
+
+        foreach (x.sges[i]) begin
+          if (x.sges[i] == null)
+            return rdma_status::make(
+                RDMA_SC_INVALID_ARGUMENT,
+                "UD SQE contains a null SGE");
+          if (x.sges[i].length == 0)
+            continue;
+          length += x.sges[i].length;
+          if (x.sges[i].length == 32'h8000_0000)
+            encoded_sge_length = 32'h0000_0000;
+          else
+            encoded_sge_length = x.sges[i].length;
+          for (int unsigned j = 0; j < 4; j++) begin
+            sgb.push_back(encoded_sge_length >> (24-j*8));
+          end
+          for (int unsigned j = 0; j < 4; j++) begin
+            sgb.push_back(x.sges[i].lkey >> (24-j*8));
+          end
+          for (int unsigned j = 0; j < 8; j++) begin
+            sgb.push_back(x.sges[i].iova.value >> (56-j*8));
+          end
+        end
+        if (x.total_payload_len != 0 && x.total_payload_len != length)
+          return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "UD total payload length does not match SGEs");
+        while (sgb.size() < 512)
+          sgb.push_back(0);
+        mode = RDMA_SQ_PAYLOAD_SGE_SGB;
+      end
+
+      RDMA_SQ_PAYLOAD_NONE: begin
+        if (x.total_payload_len != 0)
+          return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "empty UD payload mode has nonzero length");
+        mode = RDMA_SQ_PAYLOAD_NONE;
+      end
+
+      RDMA_SQ_PAYLOAD_ATOMIC_FIXED:
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "UD SEND does not support atomic payload mode");
+
+      default:
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "UD payload mode is invalid");
+    endcase
+
     if (length > 14'h3fff)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UD payload length exceeds 14-bit field");
@@ -2439,42 +2827,13 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
                         (x.sgb_iova.value & 64'h1ff) != 0))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UD nonzero payload requires aligned SGB IOVA");
-    mode = length == 0 ?
-           (x.inline_data ? RDMA_SQ_PAYLOAD_INLINE_WQE :
-                            RDMA_SQ_PAYLOAD_NONE) :
-           RDMA_SQ_PAYLOAD_INLINE_SGB;
-    if (!x.inline_data && length != 0) mode = RDMA_SQ_PAYLOAD_SGE_SGB;
     // UD driver 把非零 IB_SEND_INLINE payload 放进外部 SQ-SGB，但
     // xtrdma_get_inline_local_qpc_rd_flag() 仍将 INLINE_LOCAL_QPC_RD 置 1；
-    // 因此 header_mode 必须保留 INLINE_SGB，而不能仅按 SGB 的物理存储
-    // 位置改写成 SGE_SGB。只有非 inline SGE 才使用 SGE_SGB。
-    header_mode = mode;
+    // 因此 mode 必须保留 INLINE_SGB，而不能仅按 SGB 的物理存储位置改写成
+    // SGE_SGB。只有非 inline descriptor 使用 SGE_SGB。
     last_mode = mode;
-    sge_count = x.inline_data ? ((length + 15) / 16) : valid_sge_count;
     if (sge_count > 8'hff)
       return err("UD SGE count exceeds field width");
-    if (x.inline_data && length != 0) begin
-      payload_bytes = new[x.payload.size()];
-      foreach (payload_bytes[i]) payload_bytes[i] = x.payload[i];
-      if (payload_bytes.size() != length)
-        return err("UD inline payload length is inconsistent");
-      foreach (payload_bytes[i]) sgb.push_back(payload_bytes[i]);
-      while (sgb.size() < 512) sgb.push_back(0);
-    end
-    else if (length != 0) begin
-      foreach (x.sges[i]) begin
-        bit [31:0] enc_len;
-        if (x.sges[i] == null)
-          return err("UD SGE SGB contains a null SGE");
-        if (x.sges[i].length == 0)
-          continue;
-        enc_len = x.sges[i].length == 32'h8000_0000 ? 0 : x.sges[i].length;
-        for (int unsigned j = 0; j < 4; j++) sgb.push_back(enc_len[31-j*8 -: 8]);
-        for (int unsigned j = 0; j < 4; j++) sgb.push_back(x.sges[i].lkey[31-j*8 -: 8]);
-        for (int unsigned j = 0; j < 8; j++) sgb.push_back(x.sges[i].iova.value[63-j*8 -: 8]);
-      end
-      while (sgb.size() < 512) sgb.push_back(0);
-    end
 
     `define UDPUT(S,V) s=put(b,S``_WORD_BYTE_OFFSET,S``_LSB,S``_WIDTH,V); if(!s.ok()) return s;
     `UDPUT(RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN,length)
@@ -2514,8 +2873,12 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
             {av.destination_ip[8],av.destination_ip[9],av.destination_ip[10],av.destination_ip[11],
              av.destination_ip[12],av.destination_ip[13],av.destination_ip[14],av.destination_ip[15]});
     if (!s.ok()) return s;
-    s = put_header(x, header_mode, last_hw_opcode, b); if (!s.ok()) return s;
-    s = b.serialize(raw); if (!s.ok()) return err(s.message);
+    s = put_header(x, mode, last_hw_opcode, b);
+    if (!s.ok())
+      return s;
+    s = b.serialize(raw);
+    if (!s.ok())
+      return err(s.message);
     sig = ~8'h00;
     foreach (raw[i]) if (i != 16) sig ^= raw[i];
     foreach (sgb[i]) sig ^= sgb[i];
@@ -3276,6 +3639,37 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     return rdma_status::success();
   endfunction
 
+  // 功能：validate_cqe_image_metadata 集中校验显式 CQE profile 的镜像尺寸、代际、
+  //   端序、类型、硬件版本和写入目标，供解码与仅校验入口共用同一前置门禁。
+  // 输入/输出及副作用：image、entry_size（输入）；函数只读取 image metadata 和
+  //   image_kind_expected()，返回 rdma_status，不修改 image、codec、model、builder
+  //   或外部 ring/backing 的所有权。
+  // 失败/边界：entry_size 不属于 32/64/128 时返回 “CQE profile size is invalid”；
+  //   image 为空、generation 为零、length/bytes/alignment 不等于 entry_size、端序不为
+  //   BIG、image kind/硬件版本不匹配，或 backing/hmc/bar/write target 非空时，分别保留
+  //   两个调用方原有的 queue image null、stale generation 或 queue image metadata 错误。
+  protected function rdma_status validate_cqe_image_metadata(
+      rdma_hw_image image,
+      int unsigned entry_size
+  );
+    if (!(entry_size inside {32, 64, 128}))
+      return err("CQE profile size is invalid");
+    if (image == null)
+      return err("queue image is null");
+    if (image.function_generation == 0)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                               "queue image generation is stale");
+    if (image.length != entry_size || image.bytes.size() != entry_size ||
+        image.alignment != entry_size || image.endian != RDMA_ENDIAN_BIG ||
+        image.image_kind != image_kind_expected() ||
+        image.hardware_version != RDMA_HW_VERSION ||
+        image.write_target_kind != RDMA_HW_TARGET_NONE ||
+        image.backing_target.value != 0 || image.hmc_target.value != 0 ||
+        image.bar_target.value != 0)
+      return err("queue image metadata is invalid");
+    return rdma_status::success();
+  endfunction
+
   // 功能：cqe_signature_offset 按驱动 CQE header 的 profile-relative 起点，
   //       计算完整 entry 中 signature byte 的绝对位置。
   // 输入/输出及副作用：entry_size 为输入 profile 大小；函数只读取该值并返回
@@ -3514,21 +3908,9 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     int unsigned base_offset;
 
     model = null;
-    if (!(entry_size inside {32, 64, 128}))
-      return err("CQE profile size is invalid");
-    if (image == null)
-      return err("queue image is null");
-    if (image.function_generation == 0)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "queue image generation is stale");
-    if (image.length != entry_size || image.bytes.size() != entry_size ||
-        image.alignment != entry_size || image.endian != RDMA_ENDIAN_BIG ||
-        image.image_kind != image_kind_expected() ||
-        image.hardware_version != RDMA_HW_VERSION ||
-        image.write_target_kind != RDMA_HW_TARGET_NONE ||
-        image.backing_target.value != 0 || image.hmc_target.value != 0 ||
-        image.bar_target.value != 0)
-      return err("queue image metadata is invalid");
+    status = validate_cqe_image_metadata(image, entry_size);
+    if (!status.ok())
+      return status;
 
     p = new[entry_size];
     foreach (p[i]) p[i] = image.bytes[i];
@@ -3665,21 +4047,9 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
     bit [63:0] sign_value;
     int unsigned base_offset;
 
-    if (!(entry_size inside {32, 64, 128}))
-      return err("CQE profile size is invalid");
-    if (image == null)
-      return err("queue image is null");
-    if (image.function_generation == 0)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "queue image generation is stale");
-    if (image.length != entry_size || image.bytes.size() != entry_size ||
-        image.alignment != entry_size || image.endian != RDMA_ENDIAN_BIG ||
-        image.image_kind != image_kind_expected() ||
-        image.hardware_version != RDMA_HW_VERSION ||
-        image.write_target_kind != RDMA_HW_TARGET_NONE ||
-        image.backing_target.value != 0 || image.hmc_target.value != 0 ||
-        image.bar_target.value != 0)
-      return err("queue image metadata is invalid");
+    status = validate_cqe_image_metadata(image, entry_size);
+    if (!status.ok())
+      return status;
     p = new[entry_size];
     foreach (p[i]) p[i] = image.bytes[i];
     b = new("cqe_validate_profile");
@@ -4925,7 +5295,6 @@ function rdma_status rdma_queue_codec::encode_sqe(
   rdma_hw_queue_codec_base codec;
 
   rdma_sge copied_sge;
-  int unsigned valid_sge_count;
 
   image = new[0];
 
@@ -4981,13 +5350,6 @@ function rdma_status rdma_queue_codec::encode_sqe(
   model.ce = request.signaled;
   model.se = request.solicited;
 
-  valid_sge_count = 0;
-  foreach (request.sges[i]) begin
-    if (request.sges[i] != null && request.sges[i].length != 0)
-      valid_sge_count++;
-  end
-  model.sge_num = valid_sge_count;
-
   foreach (request.sges[i]) begin
     if (request.sges[i] == null)
       return rdma_status::make(
@@ -5002,6 +5364,9 @@ function rdma_status rdma_queue_codec::encode_sqe(
     copied_sge.copy(request.sges[i]);
     model.sges.push_back(copied_sge);
   end
+  // request facade 与三个 transport writer 共享 hardware model 的 canonical
+  // derivation；必须在 payload/SGE snapshot 完整后发布 wire-facing 字段。
+  model.sge_num = model.derive_sge_num();
 
   case (request.transport)
     RDMA_TRANSPORT_RC: begin

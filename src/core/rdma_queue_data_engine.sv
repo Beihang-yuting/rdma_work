@@ -596,6 +596,65 @@ class rdma_queue_data_engine extends uvm_object;
     return make_engine_status_nonfatal(RDMA_SC_OK, "");
   endfunction
 
+  // 功能：advance_queue_cursor_value 计算 queue-data 各类 producer/consumer
+  //   transaction 的下一槽位值，统一处理 ring 末项回到零号槽和 wrap 翻转。
+  // 输入/输出及副作用：depth、source_index、source_wrap 为输入；next_index、
+  //   next_wrap 为输出；函数只写输出标量，不分配 cursor、不访问 runtime、pending、
+  //   backing、ledger 或 scheduler，也不改变调用方保存的 source 值。
+  // 失败/边界：本纯值 helper 不返回 status；调用方须在需要拒绝时自行完成 depth/
+  //   index geometry 校验。对 depth=0 或越界 index 仍按原有算术规则给出确定输出，
+  //   以保留各入口原错误路径和失败优先级，不能把该结果当作已授权 cursor。
+  protected function void advance_queue_cursor_value(
+    int unsigned depth,
+    int unsigned source_index,
+    bit source_wrap,
+    output int unsigned next_index,
+    output bit next_wrap
+  );
+    next_index = source_index;
+    next_wrap = source_wrap;
+    if (next_index + 1 >= depth) begin
+      next_index = 0;
+      next_wrap = ~source_wrap;
+    end
+    else
+      next_index++;
+  endfunction
+
+  // 功能：make_next_poll_cursor_nonfatal 根据 runtime 的 ring depth 和已冻结的
+  //   consumer cursor 计算下一槽位，并复用 make_poll_cursor_nonfatal 物化 CQ/CEQ/AEQ
+  //   poll 使用的 detached cursor 快照，集中维护环回与 wrap 翻转规则。
+  // 输入/输出及副作用：runtime、cursor、label 为输入，copy 先置 null；函数只读取
+  //   runtime.depth、cursor.index 和 cursor.wrap，成功时透传底层 cursor factory 的
+  //   status，不修改 runtime、pending、backing、ledger 或 scheduler。
+  // 失败/边界：runtime/cursor 为空、depth 为零或 cursor.index 越界时返回
+  //   INVALID_ARGUMENT；index 到达 depth 边界时 next index 归零并翻转 wrap，其余
+  //   情况递增 index；底层 raw factory 返回 null/错误类型时原样返回其
+  //   RESOURCE_EXHAUSTED 语义且 copy 保持 null。
+  protected function rdma_status make_next_poll_cursor_nonfatal(
+    rdma_queue_runtime runtime,
+    rdma_queue_cursor_snapshot cursor,
+    string label,
+    output rdma_queue_cursor_snapshot copy
+  );
+    int unsigned next_index;
+    bit next_wrap;
+
+    copy = null;
+    if (runtime == null || cursor == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_ARGUMENT,
+        {label, " runtime or cursor is null"});
+    if (runtime.depth == 0 || cursor.index >= runtime.depth)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_ARGUMENT,
+        {label, " cursor geometry is invalid"});
+
+    advance_queue_cursor_value(runtime.depth, cursor.index, cursor.wrap,
+                               next_index, next_wrap);
+    return make_poll_cursor_nonfatal(next_index, next_wrap, label, copy);
+  endfunction
+
   // 功能：allocate_poll_status_nonfatal 为 prepared pending、CQ result、CQE 与
   //   released slot 预分配独立状态值，保证门铃前已物化全部 nested status。
   // 输入/输出及副作用：source/label 为输入、copy 先置 null；成功逐字段复制 source，
@@ -1206,6 +1265,87 @@ class rdma_queue_data_engine extends uvm_object;
            lhs.object_id == rhs.object_id;
   endfunction
 
+  // 功能：same_handle_instance 统一比较 queue-data engine 中两个资源句柄的完整
+  //   incarnation，供 CQE/CEQE/SQE authority 和 attachment 索引复用同一身份谓词。
+  // 输入/输出及副作用：lhs、rhs 为只读 rdma_handle；函数先检查空值，再转发
+  //   rdma_handle::same_instance，返回 kind、Function UID、object ID 与 generation
+  //   的比较结果，不修改 engine、attachment、runtime 或任何资源账本。
+  // 失败/边界：任一句柄为空时返回 0；非空句柄沿用 same_instance 的完整身份
+  //   语义。
+  //   本 helper 不验证 route、reset epoch、attachment 状态或对象 alias，调用方必须
+  //   保留各自的 valid/status 门禁及错误优先级。
+  protected function bit same_handle_instance(
+    rdma_handle lhs,
+    rdma_handle rhs
+  );
+    if (lhs == null || rhs == null)
+      return 1'b0;
+    return lhs.same_instance(rhs);
+  endfunction
+
+  // 功能：attachment_matches_queue_identity 判断 attachment 携带的 queue handle
+  //   是否与 recover_queue 当前目标句柄属于同一完整 incarnation，集中复用
+  //   unclaimed、claimed 和 reservation-only recovery 扫描的身份门禁。
+  // 输入/输出及副作用：attachment、queue_h 为只读输入；函数只读取
+  //   attachment.queue_h 并调用 same_handle_instance，返回 bit，不修改 attachment、
+  //   runtime、recovery、cursor 或任何资源账本，也不取得外部资源所有权。
+  // 失败/边界：attachment、attachment.queue_h 或 queue_h 任一为空返回 0；非空句柄
+  //   必须同时满足 kind、function_uid、object_id 和 generation 完整 identity。该
+  //   helper 不检查 runtime/state、pending/reservation、route 或 reset epoch，调用方
+  //   必须保留各 recovery 分支的状态门禁、错误码和首错顺序。
+  protected function bit attachment_matches_queue_identity(
+    rdma_queue_data_attachment attachment,
+    rdma_handle queue_h
+  );
+    if (attachment == null || attachment.queue_h == null || queue_h == null)
+      return 1'b0;
+    return same_handle_instance(attachment.queue_h, queue_h);
+  endfunction
+
+  // 功能：pending_queue_handle_matches_attachment 判断 recovery pending 携带的
+  //   queue handle 与 attachment.queue_h 是否属于同一完整 incarnation，供 device
+  //   producer 与 consumer replay 共用纯 queue-h identity 门禁。
+  // 输入/输出及副作用：pending、attachment 为只读输入；函数只读取两侧 queue_h，
+  //   委托 same_handle_instance 比较 kind、Function UID、object ID 和 generation，
+  //   返回 bit，不修改 pending、attachment、runtime、reservation、route 或 ledger。
+  // 失败/边界：pending、attachment 或任一 queue_h 为空返回 0；非空时只比较完整
+  //   handle incarnation，不比较 pending.kind、producer/device_producer、状态、
+  //   cursor、reservation、route/epoch 或 geometry，调用方必须保留这些阶段门禁及
+  //   原错误码和短路顺序。
+  protected function bit pending_queue_handle_matches_attachment(
+    rdma_queue_pending_operation pending,
+    rdma_queue_data_attachment attachment
+  );
+    if (pending == null || attachment == null ||
+        pending.queue_h == null || attachment.queue_h == null)
+      return 1'b0;
+    return same_handle_instance(pending.queue_h, attachment.queue_h);
+  endfunction
+
+  // 功能：qp_link_cq_route_matches 按 CQE 的 receive 标志选择 QP link 的唯一
+  //   CQ route，并集中执行 CQ handle 的空值与完整 incarnation 比较，供精确
+  //   QPN、超宽 QPN 投影和 poll 防御性重查共用同一方向谓词。
+  // 输入/输出及副作用：link、cq_h、rq_cqe 为只读输入；函数返回 bit，不修改
+  //   qp link、CQ handle、qp_links、attachment、runtime、cursor 或任何资源账本，
+  //   也不取得外部资源所有权。
+  // 失败/边界：link 或 cq_h 为空时返回 0；rq_cqe=0 只比较 send_cq_h，rq_cqe=1
+  //   只比较 recv_cq_h，所选 route 为空或完整 handle incarnation 不一致时返回 0。
+  //   helper 不检查 QPN 宽度、duplicate 命中、transport、SRQ、route/epoch 或
+  //   caller 的错误码，调用方必须保留这些门禁及其首错顺序。
+  protected function bit qp_link_cq_route_matches(
+    rdma_queue_data_qp_link link,
+    rdma_handle cq_h,
+    bit rq_cqe
+  );
+    if (link == null || cq_h == null)
+      return 1'b0;
+    if (rq_cqe)
+      return link.recv_cq_h != null &&
+             same_handle_instance(link.recv_cq_h, cq_h);
+    return link.send_cq_h != null &&
+           same_handle_instance(link.send_cq_h, cq_h);
+  endfunction
+
   // 功能：比较两个完整 route key 的 Host/root/segment/BDF 字段，确认 recovery
   // 仍位于原 Function 的 fabric 路径。
   // 输入/输出及副作用：lhs/rhs 为输入值；函数只读路由字段并返回 bit。
@@ -1215,6 +1355,90 @@ class rdma_queue_data_engine extends uvm_object;
     return lhs.host_topology_key == rhs.host_topology_key &&
            lhs.root_id == rhs.root_id && lhs.segment == rhs.segment &&
            rdma_bdf_same(lhs.bdf, rhs.bdf);
+  endfunction
+
+  // 功能：cqc_shadow_context_geometry_valid 集中校验 CQC shadow context
+  //   backing 的资源类型、CQ local ID、slot 大小以及 shadow view 的固定偏移和长度，
+  //   确认该 context_ref 可以作为驱动 CQC shadow ABI 的几何 authority。
+  // 输入/输出及副作用：context_ref、local_id 为只读输入；函数仅读取
+  //   resource_kind、local_id、slot_length、shadow_view_offset 和
+  //   shadow_view_length，返回 bit，不创建对象、不访问 runtime/backing、不修改
+  //   context_ref 或任何 engine 状态，也不取得外部资源所有权。
+  // 失败/边界：context_ref 为空，或五个几何字段任一不符合 CQ/固定 ABI 值时返回
+  //   0；本 helper 不检查 context_backing、attachment kind、pending 阶段、owner、
+  //   route/epoch 或 release authority，调用方必须保留这些门禁及各自错误优先级。
+  protected function bit cqc_shadow_context_geometry_valid(
+    rdma_context_backing_ref context_ref,
+    int unsigned local_id
+  );
+    if (context_ref == null)
+      return 1'b0;
+    return context_ref.resource_kind == RDMA_RESOURCE_CQ &&
+           context_ref.local_id == local_id &&
+           context_ref.slot_length == 64 &&
+           context_ref.shadow_view_offset == RDMA_CQC_SHADOW_AREA_OFFSET &&
+           context_ref.shadow_view_length == RDMA_CQC_SHADOW_AREA_SIZE;
+  endfunction
+
+  // 功能：cqc_shadow_context_owner_matches 比较 CQC shadow context 冻结的
+  //   Function owner 与当前 binding handle 的三项生命周期身份，统一 prepare
+  //   与 replay 两条 shadow 路径的 stale-owner 判定。
+  // 输入/输出及副作用：context_ref、function_h 为只读输入；函数读取 owner 的
+  //   function_uid、object_id 和 generation 并返回 bit，不创建或修改 handle、
+  //   context、runtime、pending、backing 或任何账本，也不取得资源所有权。
+  // 失败/边界：context_ref、context_ref.owner 或 function_h 为空时返回 0；任一
+  //   三字段不相等时返回 0。该 helper 刻意不比较 owner.kind、CQC 几何、route、
+  //   reset epoch、release authority 或 context_backing，调用方必须保留现有 null
+  //   短路、geometry/route/epoch 门禁以及 STALE_GENERATION 错误优先级。
+  protected function bit cqc_shadow_context_owner_matches(
+    rdma_context_backing_ref context_ref,
+    rdma_function_handle function_h
+  );
+    if (context_ref == null || context_ref.owner == null || function_h == null)
+      return 1'b0;
+    return context_ref.owner.function_uid == function_h.function_uid &&
+           context_ref.owner.object_id == function_h.object_id &&
+           context_ref.owner.generation == function_h.generation;
+  endfunction
+
+  // 功能：same_cursor_value 比较两个 reservation/cursor 快照的 index 与 wrap
+  //   值，供 device publish、device recovery 和 unclaimed abort 复用同一游标值判断。
+  // 输入/输出及副作用：lhs、rhs 为输入快照；函数只读取两个字段并返回 bit，不查询
+  //   runtime、不验证 reservation owner、不取得锁，也不修改 cursor、pending 或账本。
+  // 失败/边界：任一快照为空时返回 0；函数不判断 reservation_valid、queue identity、
+  //   route/epoch 或 runtime state，调用方必须先保留这些 authority/status 门禁，不能
+  //   将相同的 index/wrap 当作拥有同一 reservation 的证明。
+  protected function bit same_cursor_value(
+    rdma_queue_cursor_snapshot lhs,
+    rdma_queue_cursor_snapshot rhs
+  );
+    if (lhs == null || rhs == null)
+      return 1'b0;
+    return lhs.index == rhs.index && lhs.wrap == rhs.wrap;
+  endfunction
+
+  // 功能：pending_route_epoch_matches 对比 recovery pending 冻结的 route/epoch
+  //   与 runtime 当前查询结果，集中复用 device/consumer retry 的 authority 门禁。
+  // 输入/输出及副作用：pending、runtime_route、runtime_route_valid、runtime_epoch
+  //   和 runtime_epoch_valid 为输入；函数只读取 valid 位、route 与 reset_epoch，
+  //   返回 bit，不查询 runtime、不修改 pending/attachment，也不触碰 backing 或账本；
+  //   route 字段由 same_route 统一比较，避免各调用点重复展开 Host/root/segment/BDF
+  //   的完整路径语义。
+  // 失败/边界：pending 为空、任一 route/epoch valid 位为 0、或 same_route/epoch
+  //   比较失败时返回 0；函数不额外验证 route key 内容，调用方保留原有 status
+  //   和错误优先级，并负责在查询失败时先行返回。
+  protected function bit pending_route_epoch_matches(
+    rdma_queue_pending_operation pending,
+    rdma_route_key_t runtime_route,
+    bit runtime_route_valid,
+    rdma_reset_epoch_t runtime_epoch,
+    bit runtime_epoch_valid
+  );
+    if (pending == null || !runtime_route_valid || !runtime_epoch_valid ||
+        !pending.route_valid || !pending.epoch_valid)
+      return 1'b0;
+    return same_route(pending.route, runtime_route) &&
+           pending.reset_epoch == runtime_epoch;
   endfunction
 
   // 功能：record_candidate_cleanup_recovery 登记发布前候选 backing 的
@@ -1485,7 +1709,8 @@ class rdma_queue_data_engine extends uvm_object;
   // 输入/输出及副作用：attachment 为输入；函数只读取 runtime 与 binding snapshot，
   //   不预留 cursor、不访问 backing、不修改任何 ownership。
   // 失败/边界：attachment/binding/identity 缺失、query 返回 null、route/epoch 无效
-  //   或任一快照不相等时返回明确非成功 status，调用方必须在首次队列副作用前停止。
+  //   或 same_route/epoch 比较失败时返回明确非成功 status，调用方必须在首次队列
+  //   副作用前停止；same_route 只比较 route 字段，不替代 valid 位与身份校验。
   protected function rdma_status validate_attachment_route_epoch(
     rdma_queue_data_attachment attachment
   );
@@ -1517,7 +1742,8 @@ class rdma_queue_data_engine extends uvm_object;
       return status == null ?
         bad("attachment runtime route query returned null status",
             RDMA_SC_INVALID_STATE) : status;
-    if (!route_valid || !epoch_valid || route != identity.route_key() ||
+    if (!route_valid || !epoch_valid ||
+        !same_route(route, identity.route_key()) ||
         epoch != identity.reset_epoch)
       return bad("attachment route or reset epoch is stale",
                  RDMA_SC_STALE_GENERATION);
@@ -1640,6 +1866,68 @@ class rdma_queue_data_engine extends uvm_object;
     return status == null ?
       bad("device reservation query returned null status",
           RDMA_SC_INVALID_STATE) : status;
+  endfunction
+
+  // 功能：snapshot_attachment_recovery_state 在不取得 engine 锁的前提下，按
+  //   runtime state、pending evidence、device reservation 的固定顺序采集一个
+  //   attachment 的恢复前置快照，供 configure/detach 在 mutation 前共用。
+  // 输入/输出及副作用：attachment 为输入；runtime_state、has_pending、
+  //   reservation_valid、reservation、pending_queried 和 reservation_queried 为
+  //   输出并先置安全默认值；函数只读 attachment/runtime，不改变 state、pending、
+  //   reservation、索引或 backing 所有权，底层 query 的非成功 status 原样返回。
+  // 失败/边界：attachment/runtime 为空或任一 query 返回 null status 时返回
+  //   INVALID_STATE；runtime 已为 RECOVERY_REQUIRED 或已有 pending 时保留已采集
+  //   输出并提前返回对应 query 的成功 status，让调用者继续决定业务错误文本；
+  //   两个 queried 标记让调用者在 state/pending/reservation 查询失败时保留原失败
+  //   优先级和错误文本；只有无 recovery marker 的 CQ/CEQ/AEQ 才查询 reservation，
+  //   SQ/RQ/SRQ 不伪造 reservation 结果，也不在 helper 内获取/释放 resize_lock。
+  protected function rdma_status snapshot_attachment_recovery_state(
+    rdma_queue_data_attachment attachment,
+    output rdma_queue_runtime_state_e runtime_state,
+    output bit has_pending,
+    output bit reservation_valid,
+    output rdma_queue_cursor_snapshot reservation,
+    output bit pending_queried,
+    output bit reservation_queried
+  );
+    rdma_status status;
+
+    runtime_state = RDMA_QUEUE_RUNTIME_DETACHED;
+    has_pending = 1'b0;
+    reservation_valid = 1'b0;
+    reservation = null;
+    pending_queried = 1'b0;
+    reservation_queried = 1'b0;
+    if (attachment == null || attachment.runtime == null)
+      return bad("attachment recovery state is incomplete",
+                 RDMA_SC_INVALID_STATE);
+
+    status = attachment.runtime.query_state(runtime_state);
+    if (status == null)
+      return bad("attachment runtime state query returned null status",
+                 RDMA_SC_INVALID_STATE);
+    if (!status.ok() || runtime_state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)
+      return status;
+
+    pending_queried = 1'b1;
+    status = attachment.runtime.query_has_pending(has_pending);
+    if (status == null)
+      return bad("attachment pending query returned null status",
+                 RDMA_SC_INVALID_STATE);
+    if (!status.ok() || has_pending)
+      return status;
+
+    if (attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
+                                RDMA_QUEUE_RUNTIME_CEQ,
+                                RDMA_QUEUE_RUNTIME_AEQ}) begin
+      reservation_queried = 1'b1;
+      status = attachment.runtime.query_device_reservation(
+        reservation_valid, reservation);
+      if (status == null)
+        return bad("attachment reservation query returned null status",
+                   RDMA_SC_INVALID_STATE);
+    end
+    return status;
   endfunction
 
   // 功能：clone_publish_handle 为设备发布事务复制 queue/route handle 的全部
@@ -2193,8 +2481,7 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     if (!reservation_valid || current_reservation == null ||
-        current_reservation.index != reservation.index ||
-        current_reservation.wrap != reservation.wrap) begin
+        !same_cursor_value(current_reservation, reservation)) begin
       status = bad("device reservation is stale or not owned");
       return;
     end
@@ -2215,11 +2502,9 @@ class rdma_queue_data_engine extends uvm_object;
     end
     next.index = reservation.index;
     next.wrap = reservation.wrap;
-    if (next.index + 1 >= attachment.runtime.depth) begin
-      next.index = 0;
-      next.wrap = ~next.wrap;
-    end
-    else next.index++;
+    advance_queue_cursor_value(attachment.runtime.depth,
+                               reservation.index, reservation.wrap,
+                               next.index, next.wrap);
     status = prepare_device_pending(attachment, reservation, next, image,
                                     1'b0, pending);
     if (status == null || !status.ok() || pending == null) begin
@@ -2494,6 +2779,117 @@ class rdma_queue_data_engine extends uvm_object;
       bad("pending query returned null status", RDMA_SC_INVALID_STATE) : status;
   endfunction
 
+  // 设计说明：publish_cqe 的前半段只负责确认 CQ attachment、QP route、CQE
+  //   model 与 WQE release authority；reservation、codec、backing write 及 recovery
+  //   commit 必须继续由 task 独占，避免 helper 在校验阶段产生不可回滚的 runtime
+  //   mutation。输出句柄是 engine-owned registry 的非拥有引用，仅供同一次 task
+  //   调用后续阶段使用。
+  // 功能：按既有失败顺序校验 CQ handle/attachment/route、CQE model Function 与
+  //   generation、QP link、QPN wire 范围以及 routed SQ/RQ/SRQ 的 WQE release range，
+  //   成功返回后续 publish 所需的三个 canonical authority 引用。
+  // 输入/输出及副作用：cq_h、model 为只读输入；attachment、wqe_attachment、link
+  //   先清空，成功时分别返回 CQ、WQE 和 QP route 的非拥有引用；函数只查询 registry、
+  //   binding 与 runtime 校验，不 reserve producer、编码/写入 CQE、不推进 cursor，
+  //   不取得或转移 backing、QP、CQ 或 WQE 生命周期所有权。
+  // 失败/边界：null status 会被归一化为原有 INVALID_STATE/各阶段错误；handle、
+  //   attachment/route/epoch、model/status、Function UID/generation、link identity
+  //   （由 same_handle_instance 比较）、QPN 表示范围、WQE attachment 或 release
+  //   range 任一拒绝时返回首个具体错误，
+  //   输出引用保持 null，调用方不得进入 reservation 或 encode/write 阶段。
+  protected function rdma_status validate_cqe_publish_authority(
+    input rdma_handle cq_h,
+    input rdma_hw_cqe_model model,
+    output rdma_queue_data_attachment attachment,
+    output rdma_queue_data_attachment wqe_attachment,
+    output rdma_queue_data_qp_link link
+  );
+    rdma_status status;
+
+    attachment = null;
+    wqe_attachment = null;
+    link = null;
+    status = ensure_handle(cq_h, RDMA_RESOURCE_CQ);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("CQ handle validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return status;
+    end
+    status = lookup_attachment(cq_h, RDMA_QUEUE_RUNTIME_CQ, attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQ publish attachment lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (attachment == null || attachment.runtime == null ||
+        attachment.access == null || attachment.entry_size == 0)
+      return bad("CQ publish attachment is incomplete", RDMA_SC_INVALID_STATE);
+    status = validate_attachment_route_epoch(attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQ publish route validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (model == null || model.qp_h == null || model.status == null)
+      return bad("CQE model authority/status is incomplete");
+    status = model.validate();
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("CQE model validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return status;
+    end
+    if (binding == null || model.qp_h.function_uid != binding.function_uid)
+      return bad("CQE QP Function UID does not match CQ attachment");
+    if (model.qp_h.generation != binding.generation)
+      return bad("CQE QP generation is stale", RDMA_SC_STALE_GENERATION);
+    status = find_qp_link_for_cq(cq_h, model.qpn, model.rq_cqe, link);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQE QP route lookup returned null status", RDMA_SC_INVALID_STATE) :
+        status;
+      return status;
+    end
+    if (link == null || link.qp_h == null ||
+        !same_handle_instance(link.qp_h, model.qp_h))
+      return bad("CQE QP authority does not match CQ route",
+                 RDMA_SC_INVALID_STATE);
+    if (link.local_qp_id > 18'h3ffff)
+      return bad("CQE QPN cannot represent attached QP",
+                 RDMA_SC_INVALID_ARGUMENT);
+    if (model.rq_cqe) begin
+      if (link.srq_h != null)
+        status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
+                                   wqe_attachment);
+      else
+        status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_RQ,
+                                   wqe_attachment);
+    end
+    else begin
+      status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                                 wqe_attachment);
+    end
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQE WQE attachment lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (wqe_attachment == null || wqe_attachment.runtime == null)
+      return bad("CQE WQE attachment is incomplete", RDMA_SC_INVALID_STATE);
+    status = wqe_attachment.runtime.validate_release_range(
+      model.wqe_index, model.wqe_wrap);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQE WQE release validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    return rdma_status::success();
+  endfunction
+
   // 功能：publish_cqe 校验 CQE 的 Function/QP/WQE authority，随后经公共设备生产
   //   pipeline 写入 CQ backing 并提交 producer cursor。
   // 输入/输出及副作用：cq_h、model 为只读输入，result/status 为输出；成功时仅
@@ -2523,96 +2919,13 @@ class rdma_queue_data_engine extends uvm_object;
     wqe_attachment = null;
     image = null;
 
-    status = ensure_handle(cq_h, RDMA_RESOURCE_CQ);
+    status = validate_cqe_publish_authority(
+      cq_h, model, attachment, wqe_attachment, link
+    );
     if (status == null || !status.ok()) begin
       if (status == null)
-        status = bad("CQ handle validation returned null status",
+        status = bad("CQE publish authority validation returned null status",
                      RDMA_SC_INVALID_STATE);
-      return;
-    end
-    status = lookup_attachment(cq_h, RDMA_QUEUE_RUNTIME_CQ, attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("CQ publish attachment lookup returned null status",
-            RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (attachment == null || attachment.runtime == null ||
-        attachment.access == null || attachment.entry_size == 0) begin
-      status = bad("CQ publish attachment is incomplete", RDMA_SC_INVALID_STATE);
-      return;
-    end
-    status = validate_attachment_route_epoch(attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("CQ publish route validation returned null status",
-            RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (model == null || model.qp_h == null || model.status == null) begin
-      status = bad("CQE model authority/status is incomplete");
-      return;
-    end
-    status = model.validate();
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("CQE model validation returned null status",
-                     RDMA_SC_INVALID_STATE);
-      return;
-    end
-    if (binding == null || model.qp_h.function_uid != binding.function_uid)
-      begin
-        status = bad("CQE QP Function UID does not match CQ attachment");
-        return;
-      end
-    if (model.qp_h.generation != binding.generation) begin
-      status = bad("CQE QP generation is stale", RDMA_SC_STALE_GENERATION);
-      return;
-    end
-    status = find_qp_link_for_cq(cq_h, model.qpn, model.rq_cqe, link);
-    if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("CQE QP route lookup returned null status", RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (link == null || link.qp_h == null ||
-        !link.qp_h.same_instance(model.qp_h)) begin
-      status = bad("CQE QP authority does not match CQ route",
-                   RDMA_SC_INVALID_STATE);
-      return;
-    end
-    if (link.local_qp_id > 18'h3ffff) begin
-      status = bad("CQE QPN cannot represent attached QP", RDMA_SC_INVALID_ARGUMENT);
-      return;
-    end
-    if (model.rq_cqe) begin
-      if (link.srq_h != null)
-        status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
-                                   wqe_attachment);
-      else
-        status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_RQ,
-                                   wqe_attachment);
-    end
-    else begin
-      status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-                                  wqe_attachment);
-    end
-    if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("CQE WQE attachment lookup returned null status",
-            RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (wqe_attachment == null || wqe_attachment.runtime == null) begin
-      status = bad("CQE WQE attachment is incomplete", RDMA_SC_INVALID_STATE);
-      return;
-    end
-    status = wqe_attachment.runtime.validate_release_range(
-      model.wqe_index, model.wqe_wrap);
-    if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("CQE WQE release validation returned null status",
-            RDMA_SC_INVALID_STATE) : status;
       return;
     end
 
@@ -2672,6 +2985,197 @@ class rdma_queue_data_engine extends uvm_object;
     write_commit_device_entry(attachment, reservation, image, result, status);
   endtask
 
+  // 设计说明：CEQE 只有在 CEQ、来源 CQ、可选 QP route 和 profile authority
+  //   全部冻结后才能申请 producer reservation。该 helper 把 admission 与后续
+  //   transaction 分开，调用方拿到的 attachment 与 encode_model 都是本次 task
+  //   可继续使用的非拥有引用/值副本，不能借此改写 lifecycle 或 runtime 所有权。
+  // 功能：按既有失败顺序校验 CEQ handle/attachment、CQ route 与 generation、
+  //   CEQ→CQ dependency、可选 QP link、已提交 CQ cursor 以及 RC/URC profile，
+  //   并克隆一个绑定 CQ transport authority 的编码模型。
+  // 输入/输出及副作用：ceq_h、model 为只读输入；attachment、encode_model 先清空，
+  //   成功时分别返回 CEQ 的 engine-owned 非拥有 attachment 和 detached model；函数
+  //   只查询 registry/binding/runtime 并复制 model，不 reserve、编码、写 backing、
+  //   推进 cursor、cancel/commit/recovery 或取得任何外部资源所有权。
+  // 失败/边界：handle、CEQ/CQ route/epoch、model authority、Function UID/generation、
+  //   QP route、CQ producer PI 宽度或 RC cursor 一致性任一失败时返回首个具体错误；
+  //   same_handle_instance 只比较完整 handle incarnation，null status 仍归一化为
+  //   原有 INVALID_STATE/各阶段错误，输出保持 null，调用方不得
+  //   进入 reservation 或 codec 阶段。
+  protected function rdma_status validate_ceqe_publish_authority(
+    input rdma_handle ceq_h,
+    input rdma_hw_ceqe_model model,
+    output rdma_queue_data_attachment attachment,
+    output rdma_hw_ceqe_model encode_model
+  );
+    rdma_queue_data_attachment ceq_attachment;
+    rdma_queue_data_attachment cq_attachment;
+    rdma_queue_data_qp_link link;
+    rdma_handle routed_cq_h;
+    uvm_object raw_encode_model;
+    rdma_status status;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit producer_wrap;
+    bit consumer_wrap;
+
+    attachment = null;
+    ceq_attachment = null;
+    encode_model = null;
+    cq_attachment = null;
+    link = null;
+    routed_cq_h = null;
+    raw_encode_model = null;
+    producer_index = 0;
+    consumer_index = 0;
+    producer_wrap = 1'b0;
+    consumer_wrap = 1'b0;
+
+    status = ensure_handle(ceq_h, RDMA_RESOURCE_CEQ);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("CEQE handle validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return status;
+    end
+    status = lookup_attachment(ceq_h, RDMA_QUEUE_RUNTIME_CEQ, ceq_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE attachment lookup returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    status = validate_attachment_route_epoch(ceq_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE route validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (model == null || model.cq_h == null) begin
+      status = bad("CEQE model CQ authority is incomplete");
+      return status;
+    end
+    status = model.validate();
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE model validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (binding == null || model.cq_h.function_uid != binding.function_uid ||
+        model.cq_h.generation != binding.generation) begin
+      status = bad("CEQE CQ Function/generation authority is stale",
+                   model.cq_h != null && binding != null &&
+                   model.cq_h.generation != binding.generation ?
+                   RDMA_SC_STALE_GENERATION : RDMA_SC_INVALID_ARGUMENT);
+      return status;
+    end
+    status = find_cq_handle_for_local_id(model.cqn, routed_cq_h);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE CQ route lookup returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (routed_cq_h == null ||
+        !same_handle_instance(routed_cq_h, model.cq_h)) begin
+      status = bad("CEQE CQ authority does not match attached route",
+                   RDMA_SC_INVALID_STATE);
+      return status;
+    end
+    status = lookup_attachment(routed_cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                               cq_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE routed CQ attachment is null",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    status = validate_attachment_route_epoch(cq_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE CQ route validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+
+    // CEQE canonical authoring uses the live CQ attachment as the sole profile
+    // authority. Clone the caller's value before freezing that authority so the
+    // publish cannot mutate a model that may still be reused by a test or producer.
+    raw_encode_model = model.clone();
+    if (raw_encode_model == null || !$cast(encode_model, raw_encode_model)) begin
+      encode_model = null;
+      status = bad("CEQE encode model clone failed", RDMA_SC_RESOURCE_EXHAUSTED);
+      return status;
+    end
+    status = encode_model.set_profile_transport_authority(
+      cq_attachment.transport);
+    if (status == null || !status.ok()) begin
+      encode_model = null;
+      status = status == null ?
+        bad("CEQE profile authority setup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    // 设计说明：CEQ route 不由调用参数或 qpn 推断。attach_cq 已从 authoritative
+    // CQ 冻结 ceq_h 值快照；必须在 reserve 前对比完整 instance，才能让 qpn=0
+    // 的通用 CQ 通知也无法越过 CQ 创建时选择的 event queue/vector。
+    if (cq_attachment.ceq_h == null ||
+        !same_handle_instance(cq_attachment.ceq_h, ceq_h)) begin
+      encode_model = null;
+      status = bad("CEQE target CEQ does not match CQ dependency",
+                   RDMA_SC_INVALID_STATE);
+      return status;
+    end
+    // 设计说明：CEQE 的核心 route authority 是 cqn/cq_h；qpn=0 表示通知不绑定
+    // 某个 QP，属于协议允许的通用 CQ 通知。只有调用方显式给出非零 qpn 时才要求
+    // 它命中当前 Function 已 attach 的唯一 QP link，不能把 0 当成隐式 QP；send/
+    // recv CQ route 的空值与完整 identity 由 qp_link_cq_route_matches 统一判断。
+    if (model.qpn != 0) begin
+      status = find_qp_link_for_local_id(model.qpn, link);
+      if (status == null || !status.ok()) begin
+        status = status == null ? bad("CEQE QP route lookup returned null status",
+                                      RDMA_SC_INVALID_STATE) : status;
+        encode_model = null;
+        return status;
+      end
+      if (link == null ||
+          (!qp_link_cq_route_matches(link, routed_cq_h, 1'b0) &&
+           !qp_link_cq_route_matches(link, routed_cq_h, 1'b1))) begin
+        encode_model = null;
+        status = bad("CEQE QPN is not associated with routed CQ",
+                     RDMA_SC_INVALID_STATE);
+        return status;
+      end
+    end
+    status = query_runtime_cursors(routed_cq_h, RDMA_QUEUE_RUNTIME_CQ,
+                                   producer_index, producer_wrap,
+                                   consumer_index, consumer_wrap);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("CEQE CQ cursor query returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      encode_model = null;
+      return status;
+    end
+    if (producer_index > 16'hffff) begin
+      encode_model = null;
+      status = bad("CEQE CQ producer index cannot fit in 16 bits",
+                   RDMA_SC_INVALID_ARGUMENT);
+      return status;
+    end
+    // 设计说明：驱动 defs.h 将 CEQE qword1 复用为两种互斥布局。RC CEQE
+    // 发布 CQ consumer index，必须匹配已提交 CQ producer；URC CEQE 的同一
+    // qword1 改为 abnormal/WQE/SQ/RQ completion，不应被 RC cursor 规则拦截。
+    // 输入/输出及副作用：model.urc_flag 只决定校验分支；RC 分支只读
+    // producer_index/producer_wrap，URC 分支不修改任何 CQ runtime 状态。
+    // 失败/边界：仅 RC 的 cq_pi/cq_pi_wrap 不匹配返回 INVALID_ARGUMENT；URC
+    // 字段的位宽、互斥与保留位仍由 CEQE codec 逐位校验。
+    if (!encode_model.urc_flag &&
+        (encode_model.cq_pi != producer_index[15:0] ||
+         encode_model.cq_pi_wrap != producer_wrap)) begin
+      encode_model = null;
+      status = bad("CEQE CQ producer cursor is not committed cursor",
+                   RDMA_SC_INVALID_ARGUMENT);
+      return status;
+    end
+    attachment = ceq_attachment;
+    return rdma_status::success();
+  endfunction
+
   // 功能：publish_ceqe 在 CEQ backing 发布一个已经由 CQ producer 提交的通知，
   //   使 CEQ poll 只负责 route CQ 而不会替 CQ 生成或消费 completion。
   // 输入/输出及副作用：ceq_h、model 为只读输入，result/status 为输出；成功时写入
@@ -2687,168 +3191,28 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_status status
   );
     rdma_queue_data_attachment attachment;
-    rdma_queue_data_attachment cq_attachment;
-    rdma_queue_data_qp_link link;
     rdma_queue_cursor_snapshot reservation;
-    rdma_handle routed_cq_h;
     rdma_codec_key key;
     rdma_codec_base base_codec;
     rdma_hw_ceqe_codec ceqe_codec;
     rdma_hw_ceqe_model encode_model;
-    uvm_object raw_encode_model;
     rdma_hw_image image;
     rdma_status original_status;
-    int unsigned producer_index;
-    int unsigned consumer_index;
-    bit producer_wrap;
-    bit consumer_wrap;
     bit expected_polarity;
 
     result = null;
     status = null;
     attachment = null;
-    cq_attachment = null;
-    link = null;
     reservation = null;
-    routed_cq_h = null;
+    encode_model = null;
     image = null;
-    producer_index = 0;
-    consumer_index = 0;
-    producer_wrap = 1'b0;
-    consumer_wrap = 1'b0;
-
-    status = ensure_handle(ceq_h, RDMA_RESOURCE_CEQ);
+    status = validate_ceqe_publish_authority(
+      ceq_h, model, attachment, encode_model
+    );
     if (status == null || !status.ok()) begin
       if (status == null)
-        status = bad("CEQE handle validation returned null status",
+        status = bad("CEQE authority validation returned null status",
                      RDMA_SC_INVALID_STATE);
-      return;
-    end
-    status = lookup_attachment(ceq_h, RDMA_QUEUE_RUNTIME_CEQ, attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("CEQE attachment lookup returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    status = validate_attachment_route_epoch(attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("CEQE route validation returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (model == null || model.cq_h == null) begin
-      status = bad("CEQE model CQ authority is incomplete");
-      return;
-    end
-    status = model.validate();
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("CEQE model validation returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (binding == null || model.cq_h.function_uid != binding.function_uid ||
-        model.cq_h.generation != binding.generation) begin
-      status = bad("CEQE CQ Function/generation authority is stale",
-                   model.cq_h != null && binding != null &&
-                   model.cq_h.generation != binding.generation ?
-                   RDMA_SC_STALE_GENERATION : RDMA_SC_INVALID_ARGUMENT);
-      return;
-    end
-    status = find_cq_handle_for_local_id(model.cqn, routed_cq_h);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("CEQE CQ route lookup returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (routed_cq_h == null || !routed_cq_h.same_instance(model.cq_h)) begin
-      status = bad("CEQE CQ authority does not match attached route",
-                   RDMA_SC_INVALID_STATE);
-      return;
-    end
-    status = lookup_attachment(routed_cq_h, RDMA_QUEUE_RUNTIME_CQ,
-                               cq_attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("CEQE routed CQ attachment is null",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    status = validate_attachment_route_epoch(cq_attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("CEQE CQ route validation returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-
-    // CEQE canonical authoring uses the live CQ attachment as the sole profile
-    // authority.  Clone the caller's value before freezing that authority so a
-    // publish cannot mutate a model that may still be reused by a test or producer.
-    raw_encode_model = model.clone();
-    if (raw_encode_model == null || !$cast(encode_model, raw_encode_model)) begin
-      status = bad("CEQE encode model clone failed", RDMA_SC_RESOURCE_EXHAUSTED);
-      return;
-    end
-    status = encode_model.set_profile_transport_authority(
-      cq_attachment.transport);
-    if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("CEQE profile authority setup returned null status",
-            RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    // 设计说明：CEQ route 不由调用参数或 qpn 推断。attach_cq 已从 authoritative
-    // CQ 冻结 ceq_h 值快照；必须在 reserve 前对比完整 instance，才能让 qpn=0
-    // 的通用 CQ 通知也无法越过 CQ 创建时选择的 event queue/vector。
-    if (cq_attachment.ceq_h == null ||
-        !cq_attachment.ceq_h.same_instance(ceq_h)) begin
-      status = bad("CEQE target CEQ does not match CQ dependency",
-                   RDMA_SC_INVALID_STATE);
-      return;
-    end
-    // 设计说明：CEQE 的核心 route authority 是 cqn/cq_h；qpn=0 表示通知不绑定
-    // 某个 QP，属于协议允许的通用 CQ 通知。只有调用方显式给出非零 qpn 时才要求
-    // 它命中当前 Function 已 attach 的唯一 QP link，不能把 0 当成隐式 QP。
-    if (model.qpn != 0) begin
-      status = find_qp_link_for_local_id(model.qpn, link);
-      if (status == null || !status.ok()) begin
-        status = status == null ? bad("CEQE QP route lookup returned null status",
-                                      RDMA_SC_INVALID_STATE) : status;
-        return;
-      end
-      if (link == null ||
-          ((link.send_cq_h == null ||
-            !link.send_cq_h.same_instance(routed_cq_h)) &&
-           (link.recv_cq_h == null ||
-            !link.recv_cq_h.same_instance(routed_cq_h)))) begin
-        status = bad("CEQE QPN is not associated with routed CQ",
-                     RDMA_SC_INVALID_STATE);
-        return;
-      end
-    end
-    status = query_runtime_cursors(routed_cq_h, RDMA_QUEUE_RUNTIME_CQ,
-                                   producer_index, producer_wrap,
-                                   consumer_index, consumer_wrap);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("CEQE CQ cursor query returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (producer_index > 16'hffff) begin
-      status = bad("CEQE CQ producer index cannot fit in 16 bits",
-                   RDMA_SC_INVALID_ARGUMENT);
-      return;
-    end
-    // 设计说明：驱动 defs.h 将 CEQE qword1 复用为两种互斥布局。RC CEQE
-    // 发布 CQ consumer index，必须匹配已提交 CQ producer；URC CEQE 的同一
-    // qword1 改为 abnormal/WQE/SQ/RQ completion，不应被 RC cursor 规则拦截。
-    // 输入/输出及副作用：model.urc_flag 只决定校验分支；RC 分支只读
-    // producer_index/producer_wrap，URC 分支不修改任何 CQ runtime 状态。
-    // 失败/边界：仅 RC 的 cq_pi/cq_pi_wrap 不匹配返回 INVALID_ARGUMENT；URC
-    // 字段的位宽、互斥与保留位仍由 CEQE codec 逐位校验。
-    if (!encode_model.urc_flag &&
-        (encode_model.cq_pi != producer_index[15:0] ||
-         encode_model.cq_pi_wrap != producer_wrap)) begin
-      status = bad("CEQE CQ producer cursor is not committed cursor",
-                   RDMA_SC_INVALID_ARGUMENT);
       return;
     end
     status = attachment.runtime.reserve_device_producer(reservation);
@@ -2895,6 +3259,179 @@ class rdma_queue_data_engine extends uvm_object;
     end
     write_commit_device_entry(attachment, reservation, image, result, status);
   endtask
+
+  // 设计说明：publish_aeqe 的 admission 只冻结 AEQ attachment、wire class 以及
+  //   ecode 派生的 primary/secondary route；codec 所需的 model clone、profile
+  //   authority 和 backing transaction 仍由调用 task 独占，避免校验层提前产生
+  //   reservation 或不可回滚的设备副作用。
+  // 功能：按既有失败顺序校验 AEQ handle/attachment/epoch、AEQE wire 字段和
+  //   Function binding，并解析普通事件或 CQ flush 的完整 caller authority，返回
+  //   后续编码与发布阶段所需的 route 快照和 CQ-flush 判定。
+  // 输入/输出及副作用：aeq_h、model、secondary_target_h 为只读输入；attachment、
+  //   event_class、primary_route_h、secondary_route_h、found bits 与 is_cq_flush
+  //   先清空，成功时返回 engine-owned attachment 引用和 detached route 快照。函数
+  //   只读取 manager/binding、校验 route epoch 并克隆句柄值，不修改 model、
+  //   runtime、cursor、backing 或外部资源生命周期，也不 reserve/编码/write/commit。
+  // 失败/边界：handle、attachment/epoch、model/wire、binding、route lookup、CQ flush
+  //   双 caller kind/instance/Function/generation，或普通事件 secondary/target 一致性
+  //   任一拒绝均返回原有首个具体状态；null status 归一化为 INVALID_STATE，输出保留
+  //   清空值，调用方不得进入 clone、codec 或 reservation 阶段。
+  protected function rdma_status validate_aeqe_publish_authority(
+    input rdma_handle aeq_h,
+    input rdma_hw_aeqe_model model,
+    input rdma_handle secondary_target_h,
+    output rdma_queue_data_attachment attachment,
+    output rdma_aeqe_event_class_e event_class,
+    output rdma_handle primary_route_h,
+    output rdma_handle secondary_route_h,
+    output bit primary_found,
+    output bit secondary_found,
+    output bit is_cq_flush
+  );
+    rdma_status status;
+    rdma_queue_data_attachment candidate_attachment;
+    rdma_aeqe_event_class_e candidate_event_class;
+    rdma_handle candidate_primary_route_h;
+    rdma_handle candidate_secondary_route_h;
+    bit candidate_primary_found;
+    bit candidate_secondary_found;
+    bit candidate_is_cq_flush;
+
+    attachment = null;
+    event_class = RDMA_AEQE_EVENT_QP;
+    primary_route_h = null;
+    secondary_route_h = null;
+    primary_found = 1'b0;
+    secondary_found = 1'b0;
+    is_cq_flush = 1'b0;
+    candidate_attachment = null;
+    candidate_event_class = RDMA_AEQE_EVENT_QP;
+    candidate_primary_route_h = null;
+    candidate_secondary_route_h = null;
+    candidate_primary_found = 1'b0;
+    candidate_secondary_found = 1'b0;
+    candidate_is_cq_flush = 1'b0;
+
+    status = ensure_handle(aeq_h, RDMA_RESOURCE_AEQ);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("AEQE handle validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return status;
+    end
+    status = lookup_attachment(
+      aeq_h, RDMA_QUEUE_RUNTIME_AEQ, candidate_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("AEQE attachment lookup returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    status = validate_attachment_route_epoch(candidate_attachment);
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("AEQE route validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (model == null)
+      return bad("AEQE model is null", RDMA_SC_INVALID_ARGUMENT);
+
+    // 设计说明：wire 字段与 owner route 是两类不同 authority。先检查不依赖
+    // target_h 的 qp_state/severity 等物理约束，再让 event.c 对 ecode 的分派
+    // 决定 primary owner；这样 SRQ/CQ/EQ/Function 事件不必伪造 QP handle。
+    status = model.validate_wire_fields();
+    if (status == null || !status.ok()) begin
+      status = status == null ? bad("AEQE wire validation returned null status",
+                                    RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
+    if (binding == null)
+      return bad("AEQE Function binding is unavailable", RDMA_SC_INVALID_STATE);
+
+    // 设计说明：route 是唯一的 owner authority。resolve_aeqe_routes 只读取
+    // ecode、QPN/SRFQN/CQN/EQN wire 坐标和当前 Function manager，不读取
+    // srfq_en，也不把 caller 的 target_h 当作分类器。
+    status = resolve_aeqe_routes(
+      model, candidate_event_class, candidate_primary_route_h,
+      candidate_secondary_route_h, candidate_primary_found,
+      candidate_secondary_found
+    );
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("AEQE route resolver returned null status",
+                     RDMA_SC_INVALID_STATE);
+      return status;
+    end
+    candidate_is_cq_flush = candidate_event_class == RDMA_AEQE_EVENT_CQ &&
+                            model.packet_opcode[4:0] == 5'h1d;
+
+    // 设计说明：CQ flush 的 split CQN 与 QPN 是并列 wire authority，sibling caller
+    // 必须显式提供 CQ/QP 两个 live handle。双路由与双 caller 的 kind、实例、
+    // 当前 Function UID/generation 在 clone/codec/reserve 前校验；instance 比较在
+    // 这些非空/代际门禁后通过 same_handle_instance 完成，任何不一致都不能退化为
+    // 单 owner publish，普通事件保留 primary 错误码与 null-target 兼容。
+    if (candidate_is_cq_flush) begin
+      if (model.target_h == null || secondary_target_h == null) begin
+        return bad("AEQE CQ flush requires primary and secondary caller authority",
+                   RDMA_SC_INVALID_ARGUMENT);
+      end
+      if (!candidate_primary_found || !candidate_secondary_found ||
+          candidate_primary_route_h == null ||
+          candidate_secondary_route_h == null ||
+          model.target_h.kind != RDMA_RESOURCE_CQ ||
+          secondary_target_h.kind != RDMA_RESOURCE_QP ||
+          candidate_primary_route_h.function_uid != binding.function_uid ||
+          candidate_secondary_route_h.function_uid != binding.function_uid ||
+          model.target_h.function_uid != binding.function_uid ||
+          secondary_target_h.function_uid != binding.function_uid ||
+          candidate_primary_route_h.generation != binding.generation ||
+          candidate_secondary_route_h.generation != binding.generation ||
+          model.target_h.generation != binding.generation ||
+          secondary_target_h.generation != binding.generation ||
+          !same_handle_instance(candidate_primary_route_h, model.target_h) ||
+          !same_handle_instance(candidate_secondary_route_h,
+                                secondary_target_h)) begin
+        return bad("AEQE CQ flush caller authority does not match live routes",
+                   RDMA_SC_INVALID_STATE);
+      end
+    end
+    else begin
+      if (secondary_target_h != null)
+        return bad("AEQE non-flush event cannot carry secondary caller authority",
+                   RDMA_SC_INVALID_ARGUMENT);
+      if (!candidate_primary_found || candidate_primary_route_h == null)
+        return bad("AEQE owner route is not present", RDMA_SC_INVALID_STATE);
+      if (candidate_primary_route_h.function_uid != binding.function_uid)
+        return bad("AEQE resolved owner Function UID is stale",
+                   RDMA_SC_INVALID_ARGUMENT);
+      if (candidate_primary_route_h.generation != binding.generation)
+        return bad("AEQE resolved owner generation is stale",
+                   RDMA_SC_STALE_GENERATION);
+
+      // caller 的 target_h 只作额外一致性证据，不能替代 route lookup。
+      // 这保留旧 API 的 stale/foreign 检查，同时允许真实驱动的非 QP ecode
+      // 以 null target 进入 publish。
+      if (model.target_h != null) begin
+        if (model.target_h.function_uid != binding.function_uid)
+          return bad("AEQE target Function UID does not match AEQ attachment",
+                     RDMA_SC_INVALID_ARGUMENT);
+        if (model.target_h.generation != binding.generation)
+          return bad("AEQE target generation is stale",
+                     RDMA_SC_STALE_GENERATION);
+        if (!same_handle_instance(candidate_primary_route_h, model.target_h))
+          return bad("AEQE target authority does not match ecode route",
+                     RDMA_SC_INVALID_STATE);
+      end
+    end
+
+    attachment = candidate_attachment;
+    event_class = candidate_event_class;
+    primary_route_h = candidate_primary_route_h;
+    secondary_route_h = candidate_secondary_route_h;
+    primary_found = candidate_primary_found;
+    secondary_found = candidate_secondary_found;
+    is_cq_flush = candidate_is_cq_flush;
+    return rdma_status::success();
+  endfunction
 
   // 功能：publish_aeqe 保留四参数 legacy ABI，并把无 secondary caller
   //   authority 的请求交给共享实现；普通事件兼容，CQ flush 明确拒绝缺权。
@@ -2965,131 +3502,16 @@ class rdma_queue_data_engine extends uvm_object;
     attachment = null;
     reservation = null;
     image = null;
-    status = ensure_handle(aeq_h, RDMA_RESOURCE_AEQ);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("AEQE handle validation returned null status",
-                     RDMA_SC_INVALID_STATE);
-      return;
-    end
-    status = lookup_attachment(aeq_h, RDMA_QUEUE_RUNTIME_AEQ, attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("AEQE attachment lookup returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    status = validate_attachment_route_epoch(attachment);
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("AEQE route validation returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (model == null) begin
-      status = bad("AEQE model is null", RDMA_SC_INVALID_ARGUMENT);
-      return;
-    end
-
-    // 设计说明：wire 字段与 owner route 是两类不同 authority。先检查不依赖
-    // target_h 的 qp_state/severity 等物理约束，再让 event.c 对 ecode 的分派
-    // 决定 primary owner；这样 SRQ/CQ/EQ/Function 事件不必伪造 QP handle。
-    status = model.validate_wire_fields();
-    if (status == null || !status.ok()) begin
-      status = status == null ? bad("AEQE wire validation returned null status",
-                                    RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    if (binding == null) begin
-      status = bad("AEQE Function binding is unavailable",
-                   RDMA_SC_INVALID_STATE);
-      return;
-    end
-
-    // 设计说明：route 是唯一的 owner authority。resolve_aeqe_routes 只读取
-    // ecode、QPN/SRFQN/CQN/EQN wire 坐标和当前 Function manager，不读取
-    // srfq_en，也不把 caller 的 target_h 当作分类器。
-    status = resolve_aeqe_routes(
-      model, event_class, primary_route_h, secondary_route_h,
-      primary_found, secondary_found
+    status = validate_aeqe_publish_authority(
+      aeq_h, model, secondary_target_h, attachment, event_class,
+      primary_route_h, secondary_route_h, primary_found, secondary_found,
+      is_cq_flush
     );
     if (status == null || !status.ok()) begin
       if (status == null)
-        status = bad("AEQE route resolver returned null status",
+        status = bad("AEQE publish authority validation returned null status",
                      RDMA_SC_INVALID_STATE);
       return;
-    end
-    is_cq_flush = event_class == RDMA_AEQE_EVENT_CQ &&
-                  model.packet_opcode[4:0] == 5'h1d;
-
-    // 设计说明：CQ flush 的 split CQN 与 QPN 是并列 wire authority，sibling caller
-    // 必须显式提供 CQ/QP 两个 live handle。双路由与双 caller 的 kind、实例、
-    // 当前 Function UID/generation 在 clone/codec/reserve 前校验；任何不一致都
-    // 不能退化为单 owner publish，普通事件保留 primary 错误码与 null-target 兼容。
-    if (is_cq_flush) begin
-      if (model.target_h == null || secondary_target_h == null) begin
-        status = bad("AEQE CQ flush requires primary and secondary caller authority",
-                     RDMA_SC_INVALID_ARGUMENT);
-        return;
-      end
-      if (!primary_found || !secondary_found ||
-          primary_route_h == null || secondary_route_h == null ||
-          model.target_h.kind != RDMA_RESOURCE_CQ ||
-          secondary_target_h.kind != RDMA_RESOURCE_QP ||
-          primary_route_h.function_uid != binding.function_uid ||
-          secondary_route_h.function_uid != binding.function_uid ||
-          model.target_h.function_uid != binding.function_uid ||
-          secondary_target_h.function_uid != binding.function_uid ||
-          primary_route_h.generation != binding.generation ||
-          secondary_route_h.generation != binding.generation ||
-          model.target_h.generation != binding.generation ||
-          secondary_target_h.generation != binding.generation ||
-          !primary_route_h.same_instance(model.target_h) ||
-          !secondary_route_h.same_instance(secondary_target_h)) begin
-        status = bad("AEQE CQ flush caller authority does not match live routes",
-                     RDMA_SC_INVALID_STATE);
-        return;
-      end
-    end
-    else begin
-      if (secondary_target_h != null) begin
-        status = bad("AEQE non-flush event cannot carry secondary caller authority",
-                     RDMA_SC_INVALID_ARGUMENT);
-        return;
-      end
-      if (!primary_found || primary_route_h == null) begin
-        status = bad("AEQE owner route is not present", RDMA_SC_INVALID_STATE);
-        return;
-      end
-      if (primary_route_h.function_uid != binding.function_uid) begin
-        status = bad("AEQE resolved owner Function UID is stale",
-                     RDMA_SC_INVALID_ARGUMENT);
-        return;
-      end
-      if (primary_route_h.generation != binding.generation) begin
-        status = bad("AEQE resolved owner generation is stale",
-                     RDMA_SC_STALE_GENERATION);
-        return;
-      end
-
-      // caller 的 target_h 只作额外一致性证据，不能替代 route lookup。
-      // 这保留旧 API 的 stale/foreign 检查，同时允许真实驱动的非 QP ecode
-      // 以 null target 进入 publish。
-      if (model.target_h != null) begin
-        if (model.target_h.function_uid != binding.function_uid) begin
-          status = bad("AEQE target Function UID does not match AEQ attachment",
-                       RDMA_SC_INVALID_ARGUMENT);
-          return;
-        end
-        if (model.target_h.generation != binding.generation) begin
-          status = bad("AEQE target generation is stale",
-                       RDMA_SC_STALE_GENERATION);
-          return;
-        end
-        if (!primary_route_h.same_instance(model.target_h)) begin
-          status = bad("AEQE target authority does not match ecode route",
-                       RDMA_SC_INVALID_STATE);
-          return;
-        end
-      end
     end
 
     // 设计说明：codec 仍要求 canonical model 带 target_h，因此把 manager 返回
@@ -3460,6 +3882,8 @@ class rdma_queue_data_engine extends uvm_object;
     string attachment_index;
     bit has_pending;
     bit reservation_valid;
+    bit pending_queried;
+    bit reservation_queried;
 
     if (resource_manager == null || function_binding == null || memory == null ||
         scheduler == null || codecs == null || timeout == 0)
@@ -3491,16 +3915,27 @@ class rdma_queue_data_engine extends uvm_object;
         return bad("queue data engine attachment recovery state is corrupt",
                    RDMA_SC_RECOVERY_REQUIRED);
       end
-      status = attachment.runtime.query_state(runtime_state);
-      if (status == null || !status.ok() ||
-          runtime_state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
+      status = snapshot_attachment_recovery_state(
+        attachment, runtime_state, has_pending, reservation_valid, reservation,
+        pending_queried, reservation_queried
+      );
+      if (status == null || !status.ok()) begin
+        resize_lock.put(1);
+        if (reservation_queried)
+          return bad("queue data engine runtime has a device reservation",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        if (pending_queried)
+          return bad("queue data engine runtime has pending recovery",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return bad("queue data engine runtime requires recovery",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      end
+      if (runtime_state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
         resize_lock.put(1);
         return bad("queue data engine runtime requires recovery",
                    RDMA_SC_RECOVERY_REQUIRED);
       end
-      has_pending = 1'b0;
-      status = attachment.runtime.query_has_pending(has_pending);
-      if (status == null || !status.ok() || has_pending) begin
+      if (has_pending) begin
         resize_lock.put(1);
         return bad("queue data engine runtime has pending recovery",
                    RDMA_SC_RECOVERY_REQUIRED);
@@ -3508,12 +3943,7 @@ class rdma_queue_data_engine extends uvm_object;
       if (attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
                                   RDMA_QUEUE_RUNTIME_CEQ,
                                   RDMA_QUEUE_RUNTIME_AEQ}) begin
-        reservation_valid = 1'b0;
-        reservation = null;
-        status = attachment.runtime.query_device_reservation(
-          reservation_valid, reservation);
-        if (status == null || !status.ok() ||
-            reservation_valid || reservation != null) begin
+        if (reservation_valid || reservation != null) begin
           resize_lock.put(1);
           return bad("queue data engine runtime has a device reservation",
                      RDMA_SC_RECOVERY_REQUIRED);
@@ -3647,11 +4077,7 @@ class rdma_queue_data_engine extends uvm_object;
           return status == null ?
             bad("CQ context authority validation returned null",
                 RDMA_SC_INVALID_STATE) : status;
-        if (context_ref.resource_kind != RDMA_RESOURCE_CQ ||
-            context_ref.local_id != local_id ||
-            context_ref.slot_length != 64 ||
-            context_ref.shadow_view_offset != RDMA_CQC_SHADOW_AREA_OFFSET ||
-            context_ref.shadow_view_length != RDMA_CQC_SHADOW_AREA_SIZE)
+        if (!cqc_shadow_context_geometry_valid(context_ref, local_id))
           return bad("CQ context authority geometry is not CQC ABI compatible",
                      RDMA_SC_INVALID_STATE);
       end
@@ -3983,7 +4409,9 @@ class rdma_queue_data_engine extends uvm_object;
   endfunction
 
   // 功能：detach 在 engine resize 锁内先审计指定资源全部 ring 的 recovery
-  //   authority，再隔离无恢复证据的 attachment；QP 场景同时删除对应 route link。
+  //   authority，再隔离无恢复证据的 attachment；QP 场景同时删除对应 route
+  //   link，attachment handle 身份由 attachment_matches_queue_identity 统一门禁，
+  //   helper 内部继续委托 canonical same_handle_instance 比较。
   // 输入/输出及副作用：queue_h 为输入；成功把匹配 runtime 标为 DETACHED 并删除
   //   本地非拥有索引，不释放 manager resource、mapping 或 Host-memory。
   // 失败/边界：handle/stale generation、锁忙、CQ cleanup、claimed pending、device
@@ -3998,6 +4426,8 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_runtime_state_e runtime_state;
     bit has_pending;
     bit reservation_valid;
+    bit pending_queried;
+    bit reservation_queried;
     bit found;
     found = 1'b0;
     status = ensure_handle(queue_h, queue_h == null ? RDMA_RESOURCE_QP :
@@ -4023,8 +4453,7 @@ class rdma_queue_data_engine extends uvm_object;
     // 任一 pending/reservation/RECOVERY_REQUIRED 或查询异常都整体拒绝；只有完整
     // preflight 通过后才写 state/delete，避免前一个 ring 已删除而后一个 ring 拒绝。
     foreach (attachments[key]) begin
-      if (attachments[key] != null && attachments[key].queue_h != null &&
-          attachments[key].queue_h.same_instance(queue_h)) begin
+      if (attachment_matches_queue_identity(attachments[key], queue_h)) begin
         attachment = attachments[key];
         matching_keys.push_back(key);
         if (attachment.runtime == null) begin
@@ -4032,16 +4461,27 @@ class rdma_queue_data_engine extends uvm_object;
           return bad("queue detach runtime is unavailable",
                      RDMA_SC_RECOVERY_REQUIRED);
         end
-        status = attachment.runtime.query_state(runtime_state);
-        if (status == null || !status.ok() ||
-            runtime_state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
+        status = snapshot_attachment_recovery_state(
+          attachment, runtime_state, has_pending, reservation_valid, reservation,
+          pending_queried, reservation_queried
+        );
+        if (status == null || !status.ok()) begin
+          resize_lock.put(1);
+          if (reservation_queried)
+            return bad("queue detach requires device reservation resolution",
+                       RDMA_SC_RECOVERY_REQUIRED);
+          if (pending_queried)
+            return bad("queue detach requires pending recovery resolution",
+                       RDMA_SC_RECOVERY_REQUIRED);
+          return bad("queue detach requires runtime recovery resolution",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        end
+        if (runtime_state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
           resize_lock.put(1);
           return bad("queue detach requires runtime recovery resolution",
                      RDMA_SC_RECOVERY_REQUIRED);
         end
-        has_pending = 1'b0;
-        status = attachment.runtime.query_has_pending(has_pending);
-        if (status == null || !status.ok() || has_pending) begin
+        if (has_pending) begin
           resize_lock.put(1);
           return bad("queue detach requires pending recovery resolution",
                      RDMA_SC_RECOVERY_REQUIRED);
@@ -4049,12 +4489,7 @@ class rdma_queue_data_engine extends uvm_object;
         if (attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
                                     RDMA_QUEUE_RUNTIME_CEQ,
                                     RDMA_QUEUE_RUNTIME_AEQ}) begin
-          reservation_valid = 1'b0;
-          reservation = null;
-          status = attachment.runtime.query_device_reservation(
-            reservation_valid, reservation);
-          if (status == null || !status.ok() ||
-              reservation_valid || reservation != null) begin
+          if (reservation_valid || reservation != null) begin
             resize_lock.put(1);
             return bad("queue detach requires device reservation resolution",
                        RDMA_SC_RECOVERY_REQUIRED);
@@ -4091,8 +4526,11 @@ class rdma_queue_data_engine extends uvm_object;
   // 时调用 expected runtime 的 abort_recovery，非空时调用 cancel_device_producer；
   // 成功后删除同 handle attachments/QP link，但不释放或修改 lifecycle mapping。
   // 失败/边界：锁忙、CQ resize recovery 存在、expected attachment 已消失/换代，或
-  // runtime abort/cancel 拒绝时返回原错误且不删除 attachment；所有 engine 可失败
-  // 条件都在 runtime 状态迁移前检查，故调用方可用同一 evidence 安全重试。
+  // runtime abort/cancel 拒绝时返回原错误且不删除 attachment；两处 attachment
+  // incarnation 检查在各自 null/runtime 门禁后通过
+  // attachment_matches_queue_identity（内部 canonical same_handle_instance）完成，
+  // 所有 engine 可失败条件都在 runtime 状态迁移前检查，故调用方可用同一 evidence
+  // 安全重试。
   protected function rdma_status detach_recovery_transaction(
     rdma_handle queue_h,
     rdma_queue_data_attachment expected_attachment,
@@ -4106,7 +4544,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (queue_h == null || expected_attachment == null ||
         expected_attachment.queue_h == null ||
         expected_attachment.runtime == null ||
-        !expected_attachment.queue_h.same_instance(queue_h))
+        !attachment_matches_queue_identity(expected_attachment, queue_h))
       return bad("recovery detach attachment is invalid",
                  RDMA_SC_INVALID_STATE);
     if (resize_lock == null || !resize_lock.try_get(1))
@@ -4120,8 +4558,7 @@ class rdma_queue_data_engine extends uvm_object;
 
     expected_found = 1'b0;
     foreach (attachments[key]) begin
-      if (attachments[key] != null && attachments[key].queue_h != null &&
-          attachments[key].queue_h.same_instance(queue_h)) begin
+      if (attachment_matches_queue_identity(attachments[key], queue_h)) begin
         matching_keys.push_back(key);
         if (attachments[key] == expected_attachment)
           expected_found = 1'b1;
@@ -4181,7 +4618,10 @@ class rdma_queue_data_engine extends uvm_object;
                  RDMA_SC_INVALID_STATE);
     status = ensure_handle(request.qp_h, RDMA_RESOURCE_QP);
     if (!status.ok()) return status;
-    if (!link.qp_h.same_instance(request.qp_h))
+    // 设计说明：入口先拒绝空句柄、kind、Function UID 和 generation 失配；此处
+    // 只复用 null-safe instance seam，保留 QP route mismatch 的 INVALID_STATE
+    // 优先级，不把 owner、transport 或 attachment 状态混入同一身份比较。
+    if (!same_handle_instance(link.qp_h, request.qp_h))
       return bad("SQE posting QP route identity does not match request",
                  RDMA_SC_INVALID_STATE);
     // QP 的 transport 是 CMQ 创建阶段冻结的 wire/profile authority；请求
@@ -4219,7 +4659,7 @@ class rdma_queue_data_engine extends uvm_object;
           request.authority_h, RDMA_RESOURCE_QP, reference,
           "FLUSH authority");
         if (!status.ok()) return status;
-        if (!request.authority_h.same_instance(link.qp_h))
+        if (!same_handle_instance(request.authority_h, link.qp_h))
           return bad("FLUSH authority is detached from the posting QP",
                      RDMA_SC_INVALID_STATE);
       end
@@ -4237,7 +4677,8 @@ class rdma_queue_data_engine extends uvm_object;
         return bad("URC completion QP is not attached", RDMA_SC_INVALID_STATE);
       completion_link = qp_links[completion_key];
       if (completion_link.qp_h == null ||
-          !completion_link.qp_h.same_instance(request.completion_qp_h))
+          !same_handle_instance(completion_link.qp_h,
+                                request.completion_qp_h))
         return bad("URC completion QP route identity is stale",
                    RDMA_SC_INVALID_STATE);
       if (completion_link.transport != RDMA_TRANSPORT_URC)
@@ -4250,14 +4691,18 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_sqe 将发送请求投影为待编码的硬件 SQE 模型，复制传输、
-  //   authority、原子操作和 SGB 字段，并绑定 reservation 的 index/wrap。
-  // 输入/输出及副作用：request 提供 qp_h、mr_h、mw_h、authority_h、SGE、
-  //   compare_value、swap_add_value、sgb_iova 等语义快照；link/cursor 提供
-  //   QP route 与槽位；model 输出 detached SQE 模型，不取得调用方资源所有权。
-  // 失败/边界：request、link 或 cursor 为空、SGE 含 null、URC 缺少
-  //   completion_qp_h、authority kind 不满足请求语义或模型校验失败时返回错误；
-  //   失败路径不发布可提交模型，也不自动推进 PI。
+  // 功能：make_sqe 将发送请求投影为 detached 硬件 SQE 模型，深复制 SGE，
+  //   补齐 transport extension 与 reservation 坐标，并在 payload/SGE 快照完成后
+  //   调用共享 derivation 发布 canonical sge_num，覆盖 inline ceil、过滤后 SGE
+  //   数量、empty 零值及 atomic fixed-one，避免 facade 与 codec 各自计数。
+  // 输入/输出及副作用：request 提供 qp_h、mr_h、mw_h、authority_h、payload、
+  //   SGE、compare_value、swap_add_value、sgb_iova 等冻结语义；link/cursor 提供
+  //   QP route 与 index/wrap；model 输出新建候选对象，不写 backing、不推进 PI，
+  //   也不取得 request、handle 或外部 route 的所有权。
+  // 失败/边界：request、link 或 cursor 为空，authority/transport 不匹配，SGE
+  //   含 null，URC 缺少合法 completion_qp_h，或 canonical count、payload shape、
+  //   字段宽度未通过 model.validate 时返回非 OK；model 可能保留未提交候选对象，
+  //   调用方必须按 status 丢弃，失败对象不得编码或持久化。
   protected function rdma_status make_sqe(
     rdma_post_send_req request,
     rdma_queue_data_qp_link link,
@@ -4269,7 +4714,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_sqe_urc_ext urc;
     rdma_sge cloned_sge;
     rdma_status status;
-    int unsigned valid_sge_count;
+
     model = null;
     if (request == null || link == null || cursor == null)
       return bad("SQE request, QP link, or reservation is null");
@@ -4313,15 +4758,6 @@ class rdma_queue_data_engine extends uvm_object;
     // recovery 做 authority 校验，不能用截断 ID 代替生命周期证据。
     model.mr_handle_id = request.mr_h == null ? 0 : request.mr_h.object_id;
     model.mw_handle_id = request.mw_h == null ? 0 : request.mw_h.object_id;
-    // SQE header 的 SGE_NUM 表示驱动过滤零长度后的有效 descriptor 数，
-    // 而 model.sges 仍保留请求快照中的原始顺序供 authority/recovery 使用。
-    // 先计算有效数量再发布字段，避免 detached 模型与 codec wire image 分叉。
-    valid_sge_count = 0;
-    foreach (request.sges[i]) begin
-      if (request.sges[i] != null && request.sges[i].length != 0)
-        valid_sge_count++;
-    end
-    model.sge_num = valid_sge_count;
     foreach (request.sges[i]) begin
       if (request.sges[i] == null)
         return bad("SQE request has a null SGE");
@@ -4329,6 +4765,11 @@ class rdma_queue_data_engine extends uvm_object;
       cloned_sge.copy(request.sges[i]);
       model.sges.push_back(cloned_sge);
     end
+    // hardware model 是 SGE_NUM 的唯一 wire-facing authority。必须等 payload 与
+    // SGE detached snapshot 都完成后再派生，使 inline ceil、empty、过滤后的
+    // direct/external descriptor 以及 atomic fixed-one 与三个 writer 使用同一路径。
+    model.sge_num = model.derive_sge_num();
+
     if (request.opcode inside {RDMA_WR_ATOMIC_CMP_SWAP,
                                RDMA_WR_ATOMIC_FETCH_ADD}) begin
       // 原子 fixed body 的 local IOVA/lkey 来自唯一 local SGE，而
@@ -5247,7 +5688,8 @@ class rdma_queue_data_engine extends uvm_object;
   // 输入/输出及副作用：cq_h、qpn、rq_cqe 为输入，link 先置 null；成功返回
   //   engine-owned link 的非拥有引用，不复制或修改 attachment。
   // 失败/边界：无匹配或同一 qpn/CQ 命中多个 QP 时返回 INVALID_STATE；send/recv
-  //   CQ 不可互换，低 18-bit 投影也不能把超宽 local ID 变成合法 wire authority。
+  //   CQ 不可互换，身份由 null 门禁后的 same_handle_instance 比较确认；低 18-bit
+  //   投影也不能把超宽 local ID 变成合法 wire authority。
   protected function rdma_status find_qp_link_for_cq(
     rdma_handle cq_h, int unsigned qpn, bit rq_cqe,
     output rdma_queue_data_qp_link link
@@ -5261,10 +5703,7 @@ class rdma_queue_data_engine extends uvm_object;
       // 设计说明：同一 CQ 可以由 QP 的 send/receive 路径共享，同一 QP 也可为两条
       // 路径配置不同 CQ；因此必须按 CQE 的 receive bit 选择 route。接受相反方向的
       // CQ handle 会释放错误的 WQE ledger，不能仅凭 QPN 命中。
-      if ((!rq_cqe && candidate.send_cq_h != null &&
-           candidate.send_cq_h.same_instance(cq_h)) ||
-          (rq_cqe && candidate.recv_cq_h != null &&
-           candidate.recv_cq_h.same_instance(cq_h))) begin
+      if (qp_link_cq_route_matches(candidate, cq_h, rq_cqe)) begin
         if (link != null)
           return bad("CQE QPN routes to multiple attached QPs",
                      RDMA_SC_INVALID_STATE);
@@ -5280,10 +5719,7 @@ class rdma_queue_data_engine extends uvm_object;
         if (candidate == null || candidate.local_qp_id <= 18'h3ffff ||
             candidate.local_qp_id[17:0] != qpn)
           continue;
-        if ((!rq_cqe && candidate.send_cq_h != null &&
-             candidate.send_cq_h.same_instance(cq_h)) ||
-            (rq_cqe && candidate.recv_cq_h != null &&
-             candidate.recv_cq_h.same_instance(cq_h))) begin
+        if (qp_link_cq_route_matches(candidate, cq_h, rq_cqe)) begin
           if (link != null)
             return bad("CQE projected QPN routes to multiple wide QPs",
                        RDMA_SC_INVALID_STATE);
@@ -5296,6 +5732,33 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：scan_qp_link_by_local_id 在 queue-data engine 的 QP link 索引中按完整
+  //   local QPN 收集命中数量，并保留首个匹配 link 供调用方继续做 authority 判断。
+  // 输入/输出及副作用：qpn 为输入；link 与 match_count 为输出，函数只读取
+  //   engine-owned qp_links 并返回其中的非拥有 link 引用和命中计数，不修改索引、
+  //   attachment、runtime、route/epoch 或任何资源生命周期状态。
+  // 失败/边界：无匹配时 link=null、match_count=0；多个匹配时保留首个 link 并完整
+  //   计数，函数本身不生成 status 或决定 route-miss/ambiguous 语义，零/多命中拒绝
+  //   及错误消息必须由各调用者按原有阶段契约处理。
+  protected function void scan_qp_link_by_local_id(
+    int unsigned qpn,
+    output rdma_queue_data_qp_link link,
+    output int unsigned match_count
+  );
+    rdma_queue_data_qp_link candidate;
+
+    link = null;
+    match_count = 0;
+    foreach (qp_links[key]) begin
+      candidate = qp_links[key];
+      if (candidate == null || candidate.local_qp_id != qpn)
+        continue;
+      if (link == null)
+        link = candidate;
+      match_count++;
+    end
+  endfunction
+
   // 功能：find_qp_link_for_local_id 按完整 local QPN 查找 CEQ/AEQ 或 recovery
   //   使用的唯一 QP route。
   // 输入/输出及副作用：qpn 为输入，link 先置 null；成功返回 engine-owned link 的
@@ -5305,20 +5768,44 @@ class rdma_queue_data_engine extends uvm_object;
   protected function rdma_status find_qp_link_for_local_id(
     int unsigned qpn, output rdma_queue_data_qp_link link
   );
-    rdma_queue_data_qp_link candidate;
-    link = null;
-    foreach (qp_links[key]) begin
-      candidate = qp_links[key];
-      if (candidate != null && candidate.local_qp_id == qpn) begin
-        if (link != null)
-          return bad("event QPN routes to multiple attached QPs",
-                     RDMA_SC_INVALID_STATE);
-        link = candidate;
-      end
-    end
-    if (link == null)
+    int unsigned match_count;
+
+    scan_qp_link_by_local_id(qpn, link, match_count);
+    if (match_count > 1)
+      return bad("event QPN routes to multiple attached QPs",
+                 RDMA_SC_INVALID_STATE);
+    if (match_count == 0)
       return bad("event QPN has no attached QP route", RDMA_SC_INVALID_STATE);
     return rdma_status::success();
+  endfunction
+
+  // 功能：scan_cq_attachment_by_local_id 在 queue-data engine 的 attachment 索引中
+  //   按 CQ local ID 收集命中数量，并保留首个 CQ attachment 供调用者完成 handle
+  //   clone 或 route-miss 处理。
+  // 输入/输出及副作用：cqn 为输入；attachment 与 match_count 为输出；函数只读
+  //   engine-owned attachments，返回其中的非拥有 attachment 引用和完整命中计数，
+  //   不修改 attachment、runtime、CQ cursor、backing 或任何资源生命周期状态。
+  // 失败/边界：仅统计非空且 kind 为 CQ、local_id 等于 cqn 的项；无命中输出 null/0，
+  //   多命中保留首个并继续计数。函数不决定 clone 失败、零 route 或多 route 的
+  //   status，调用者必须保留原错误消息、fallback 和 route_found 语义。
+  protected function void scan_cq_attachment_by_local_id(
+    int unsigned cqn,
+    output rdma_queue_data_attachment attachment,
+    output int unsigned match_count
+  );
+    rdma_queue_data_attachment candidate;
+
+    attachment = null;
+    match_count = 0;
+    foreach (attachments[key]) begin
+      candidate = attachments[key];
+      if (candidate == null || candidate.kind != RDMA_QUEUE_RUNTIME_CQ ||
+          candidate.local_id != cqn)
+        continue;
+      if (attachment == null)
+        attachment = candidate;
+      match_count++;
+    end
   endfunction
 
   // 功能：lookup_event_qp_route_for_poll 在 AEQ poll 阶段按 wire QPN 查找当前
@@ -5334,21 +5821,13 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_queue_data_qp_link link,
     output bit route_found
   );
-    rdma_queue_data_qp_link candidate;
+    int unsigned match_count;
 
-    link = null;
-    route_found = 1'b0;
-
-    foreach (qp_links[key]) begin
-      candidate = qp_links[key];
-      if (candidate == null || candidate.local_qp_id != qpn)
-        continue;
-      if (route_found)
-        return bad("event QPN routes to multiple attached QPs",
-                   RDMA_SC_INVALID_STATE);
-      link = candidate;
-      route_found = 1'b1;
-    end
+    scan_qp_link_by_local_id(qpn, link, match_count);
+    route_found = match_count != 0;
+    if (match_count > 1)
+      return bad("event QPN routes to multiple attached QPs",
+                 RDMA_SC_INVALID_STATE);
 
     return rdma_status::success();
   endfunction
@@ -5362,21 +5841,19 @@ class rdma_queue_data_engine extends uvm_object;
   protected function rdma_status find_cq_handle_for_local_id(
     int unsigned cqn, output rdma_handle cq_h
   );
-    rdma_queue_data_attachment candidate;
+    rdma_queue_data_attachment attachment;
+    int unsigned match_count;
+
     cq_h = null;
-    foreach (attachments[key]) begin
-      candidate = attachments[key];
-      if (candidate != null && candidate.kind == RDMA_QUEUE_RUNTIME_CQ &&
-          candidate.local_id == cqn) begin
-        if (cq_h != null)
-          return bad("CEQE CQN routes to multiple attached CQs",
-                     RDMA_SC_INVALID_STATE);
-        cq_h = rdma_clone_handle_value(candidate.queue_h,
-                                        "CEQE routed CQ");
-        if (cq_h == null)
-          cq_h = candidate.queue_h;
-      end
-    end
+    scan_cq_attachment_by_local_id(cqn, attachment, match_count);
+    if (match_count > 1)
+      return bad("CEQE CQN routes to multiple attached CQs",
+                 RDMA_SC_INVALID_STATE);
+    if (match_count == 0 || attachment == null)
+      return bad("CEQE CQN has no attached CQ route", RDMA_SC_INVALID_STATE);
+    cq_h = rdma_clone_handle_value(attachment.queue_h, "CEQE routed CQ");
+    if (cq_h == null)
+      cq_h = attachment.queue_h;
     if (cq_h == null)
       return bad("CEQE CQN has no attached CQ route", RDMA_SC_INVALID_STATE);
     return rdma_status::success();
@@ -5395,25 +5872,21 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_handle cq_h,
     output bit route_found
   );
-    rdma_queue_data_attachment candidate;
+    rdma_queue_data_attachment attachment;
+    int unsigned match_count;
 
     cq_h = null;
-    route_found = 1'b0;
-
-    foreach (attachments[key]) begin
-      candidate = attachments[key];
-      if (candidate == null || candidate.kind != RDMA_QUEUE_RUNTIME_CQ ||
-          candidate.local_id != cqn)
-        continue;
-      if (route_found)
-        return bad("CEQE CQN routes to multiple attached CQs",
-                   RDMA_SC_INVALID_STATE);
-      cq_h = rdma_clone_handle_value(candidate.queue_h,
-                                     "CEQE poll routed CQ");
-      if (cq_h == null)
-        cq_h = candidate.queue_h;
-      route_found = 1'b1;
-    end
+    scan_cq_attachment_by_local_id(cqn, attachment, match_count);
+    route_found = match_count != 0;
+    if (match_count > 1)
+      return bad("CEQE CQN routes to multiple attached CQs",
+                 RDMA_SC_INVALID_STATE);
+    if (match_count == 0 || attachment == null)
+      return rdma_status::success();
+    cq_h = rdma_clone_handle_value(attachment.queue_h,
+                                   "CEQE poll routed CQ");
+    if (cq_h == null)
+      cq_h = attachment.queue_h;
 
     return rdma_status::success();
   endfunction
@@ -5423,8 +5896,9 @@ class rdma_queue_data_engine extends uvm_object;
   // 输入/输出及副作用：aeqe_event 为已完成 reserved 校验的 AEQE；primary_h、
   //   secondary_h、event_class、primary_found/secondary_found 为输出；函数只读取
   //   当前 Function 的 resource manager authority，不修改 model、runtime 或 CI。
-  // 失败/边界：SRQ/CQ/EQ 使用 ecode 规定的 wire ID，SRQ 不检查 srfq_en，split ID
-  //   使用 (high<<6)|low；只有 INVALID_ARGUMENT/STALE_GENERATION 是独立 route miss，
+  // 失败/边界：SRQ/CQ/EQ 使用 ecode 规定的 wire ID，SRQ 不检查 srfq_en，CQ/EQ
+  //   split ID 统一通过 AEQE 模型的 logical_cqn_eqn() 计算；只有
+  //   INVALID_ARGUMENT/STALE_GENERATION 是独立 route miss，
   //   null status、成功但无 resource 或其他 manager 错误均 fail-closed。
   protected function rdma_status resolve_aeqe_routes(
     rdma_hw_aeqe_model aeqe_event,
@@ -5471,8 +5945,7 @@ class rdma_queue_data_engine extends uvm_object;
       end
 
       RDMA_AEQE_EVENT_CQ: begin
-        logical_id = (int'(aeqe_event.cqn_eqn_high) << 6) |
-                     int'(aeqe_event.cqn_eqn_low);
+        logical_id = aeqe_event.logical_cqn_eqn();
         primary_status = manager.lookup_local_resource(
           owner, RDMA_RESOURCE_CQ, logical_id, primary_resource
         );
@@ -5497,8 +5970,7 @@ class rdma_queue_data_engine extends uvm_object;
       end
 
       RDMA_AEQE_EVENT_EQ: begin
-        logical_id = (int'(aeqe_event.cqn_eqn_high) << 6) |
-                     int'(aeqe_event.cqn_eqn_low);
+        logical_id = aeqe_event.logical_cqn_eqn();
         status = manager.lookup_local_resource(
           owner,
           aeqe_event.ecode == 8'hfb ? RDMA_RESOURCE_AEQ : RDMA_RESOURCE_CEQ,
@@ -5687,20 +6159,13 @@ class rdma_queue_data_engine extends uvm_object;
     if ((!urc_layout &&
          next.index >= (1 << RDMA_CQC_RUNTIME_SHADOW_CI_WIDTH)))
       return bad("CQC shadow CI exceeds driver width", RDMA_SC_INVALID_ARGUMENT);
-    if (attachment.context_ref.resource_kind != RDMA_RESOURCE_CQ ||
-        attachment.context_ref.local_id != attachment.local_id ||
-        attachment.context_ref.slot_length != 64 ||
-        attachment.context_ref.shadow_view_offset !=
-          RDMA_CQC_SHADOW_AREA_OFFSET ||
-        attachment.context_ref.shadow_view_length !=
-          RDMA_CQC_SHADOW_AREA_SIZE)
+    if (!cqc_shadow_context_geometry_valid(attachment.context_ref,
+                                           attachment.local_id))
       return bad("CQC shadow context geometry is not driver compatible",
                  RDMA_SC_INVALID_STATE);
     function_h = binding == null ? null : binding.make_handle();
     if (function_h == null || attachment.context_ref.owner == null ||
-        attachment.context_ref.owner.function_uid != function_h.function_uid ||
-        attachment.context_ref.owner.object_id != function_h.object_id ||
-        attachment.context_ref.owner.generation != function_h.generation)
+        !cqc_shadow_context_owner_matches(attachment.context_ref, function_h))
       return bad("CQC shadow context owner is stale", RDMA_SC_STALE_GENERATION);
 
     offset = RDMA_CQC_RUNTIME_SHADOW_BYTE_OFFSET;
@@ -5770,12 +6235,9 @@ class rdma_queue_data_engine extends uvm_object;
 
       post_index = completion_index;
       post_wrap = completion_wrap;
-      if (post_index + 1 >= completion_attachment.runtime.depth) begin
-        post_index = 0;
-        post_wrap = ~post_wrap;
-      end
-      else
-        post_index++;
+      advance_queue_cursor_value(completion_attachment.runtime.depth,
+                                 completion_index, completion_wrap,
+                                 post_index, post_wrap);
       if (post_index > 15'h7fff)
         return bad("URC CQC shadow consumer index exceeds driver width",
                    RDMA_SC_INVALID_ARGUMENT);
@@ -5844,13 +6306,8 @@ class rdma_queue_data_engine extends uvm_object;
     end
 
     if (context_backing == null || attachment.context_ref == null ||
-        attachment.context_ref.resource_kind != RDMA_RESOURCE_CQ ||
-        attachment.context_ref.local_id != attachment.local_id ||
-        attachment.context_ref.slot_length != 64 ||
-        attachment.context_ref.shadow_view_offset !=
-          RDMA_CQC_SHADOW_AREA_OFFSET ||
-        attachment.context_ref.shadow_view_length !=
-          RDMA_CQC_SHADOW_AREA_SIZE ||
+        !cqc_shadow_context_geometry_valid(attachment.context_ref,
+                                           attachment.local_id) ||
         pending.consumer_shadow_urc !=
           (attachment.transport == RDMA_TRANSPORT_URC)) begin
       status = bad("CQC shadow replay authority is stale",
@@ -5859,9 +6316,7 @@ class rdma_queue_data_engine extends uvm_object;
     end
     function_h = binding == null ? null : binding.make_handle();
     if (function_h == null || attachment.context_ref.owner == null ||
-        attachment.context_ref.owner.function_uid != function_h.function_uid ||
-        attachment.context_ref.owner.object_id != function_h.object_id ||
-        attachment.context_ref.owner.generation != function_h.generation) begin
+        !cqc_shadow_context_owner_matches(attachment.context_ref, function_h)) begin
       status = bad("CQC shadow replay context owner is stale",
                    RDMA_SC_STALE_GENERATION);
       return;
@@ -6387,16 +6842,15 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok()) return;
     // 设计说明：部分 simulator 会在 function 边界丢失由 associative array 遍历
     // 赋给 output 的 class handle。这里在 transaction 现场按相同 identity 与
-    // send/receive-CQ predicate 防御性重查，不能放宽 route 条件。
+    // send/receive-CQ predicate 防御性重查；两侧 CQ handle 通过 null 门禁后的
+    // same_handle_instance 比较确认，不能放宽 route 条件。
     if (link == null) begin
       foreach (qp_links[route_key]) begin
         if (qp_links[route_key] == null ||
             qp_links[route_key].local_qp_id != cqe.qpn)
           continue;
-        if ((!cqe.rq_cqe && qp_links[route_key].send_cq_h != null &&
-             qp_links[route_key].send_cq_h.same_instance(cq_h)) ||
-            (cqe.rq_cqe && qp_links[route_key].recv_cq_h != null &&
-             qp_links[route_key].recv_cq_h.same_instance(cq_h))) begin
+        if (qp_link_cq_route_matches(qp_links[route_key], cq_h,
+                                     cqe.rq_cqe)) begin
           link = qp_links[route_key];
           break;
         end
@@ -6439,10 +6893,8 @@ class rdma_queue_data_engine extends uvm_object;
           "CQ completion status materialization failed");
       return;
     end
-    status = make_poll_cursor_nonfatal(
-      cursor.index + 1 >= cq_attachment.runtime.depth ? 0 : cursor.index + 1,
-      cursor.index + 1 >= cq_attachment.runtime.depth ? ~cursor.wrap : cursor.wrap,
-      "next CQ", next);
+    status = make_next_poll_cursor_nonfatal(
+      cq_attachment.runtime, cursor, "next CQ", next);
     if (status == null || !status.ok()) return;
     status = prepare_cq_completion_candidate(
       cq_h, cqe, result_qp_h, completion_status, release_snapshots,
@@ -6690,7 +7142,10 @@ class rdma_queue_data_engine extends uvm_object;
 
   // 功能：quiesce_cq_dependents 找出引用 CQ 的 QP/SRQ runtime，并在 resize 前逐一切到 QUIESCING，阻止依赖队列产生新事务。
   // 输入/输出及副作用：cq_h 为输入；runtimes 为输出；成功时更新相关 runtime 状态并返回其快照列表。
-  // 失败/边界：关联 runtime 非 ACTIVE、存在 pending/used、句柄拓扑不完整或任一 begin_quiesce 失败时回滚已切换 runtime 并返回错误。
+  // 失败/边界：关联 runtime 非 ACTIVE、存在 pending/used、句柄拓扑不完整或任一
+  // begin_quiesce 失败时回滚已切换 runtime 并返回错误；send/recv CQ route 在
+  // cq_h/link null 门禁后由 qp_link_cq_route_matches 按方向确认完整 identity，
+  // SRQ 拓扑、attachment 缺失与状态迁移仍由本函数保留。
   protected function rdma_status quiesce_cq_dependents(
     rdma_handle cq_h,
     output rdma_queue_runtime runtimes[$]
@@ -6714,8 +7169,8 @@ class rdma_queue_data_engine extends uvm_object;
       link = qp_links[link_key];
       if (link == null)
         continue;
-      if ((link.send_cq_h == null || !link.send_cq_h.same_instance(cq_h)) &&
-          (link.recv_cq_h == null || !link.recv_cq_h.same_instance(cq_h)))
+      if (!qp_link_cq_route_matches(link, cq_h, 1'b0) &&
+          !qp_link_cq_route_matches(link, cq_h, 1'b1))
         continue;
       foreach (kinds[i]) begin
         attachment_key_value = attachment_key(
@@ -6967,9 +7422,14 @@ class rdma_queue_data_engine extends uvm_object;
     status = old_attachment.runtime.query_attachment_config(
       runtime_queue_h, runtime_kind, runtime_host_produced,
       runtime_initial_polarity);
+    // 设计：query_attachment_config 返回的 runtime_queue_h 是旧 runtime 的
+    // authority；status 与两个 handle 的空值门禁必须先于 identity helper。
+    // attachment_matches_queue_identity 只复用 canonical 完整 incarnation 比较，
+    // runtime kind/producer direction 仍由本 caller 审计；若旧 authority 不匹配，
+    // 仍通过 finish_resize 释放 resize_lock 并返回原错误。
     if (status == null || !status.ok() || runtime_queue_h == null ||
         old_attachment.queue_h == null ||
-        !runtime_queue_h.same_instance(old_attachment.queue_h) ||
+        !attachment_matches_queue_identity(old_attachment, runtime_queue_h) ||
         runtime_kind != RDMA_QUEUE_RUNTIME_CQ || runtime_host_produced) begin
       if (status == null || status.ok())
         status = bad("CQ runtime attachment config is inconsistent",
@@ -7344,10 +7804,8 @@ class rdma_queue_data_engine extends uvm_object;
     status = lookup_event_cq_route_for_poll(
       ceqe.cqn, routed_cq_h, route_found);
     if (status == null || !status.ok()) return;
-    status = make_poll_cursor_nonfatal(
-      cursor.index + 1 >= attachment.runtime.depth ? 0 : cursor.index + 1,
-      cursor.index + 1 >= attachment.runtime.depth ? ~cursor.wrap : cursor.wrap,
-      "next CEQ", next);
+    status = make_next_poll_cursor_nonfatal(
+      attachment.runtime, cursor, "next CEQ", next);
     if (status == null || !status.ok()) return;
     if (route_found) begin
       // 驱动 event.c 在 image 合法且 CQN 命中时才向上层交付 payload；ecode
@@ -7605,10 +8063,8 @@ class rdma_queue_data_engine extends uvm_object;
                   aeqe.packet_opcode[4:0] == 5'h1d;
     deliver_found = is_cq_flush ? (primary_found || secondary_found) :
                                   primary_found;
-    status = make_poll_cursor_nonfatal(
-      cursor.index + 1 >= attachment.runtime.depth ? 0 : cursor.index + 1,
-      cursor.index + 1 >= attachment.runtime.depth ? ~cursor.wrap : cursor.wrap,
-      "next AEQ", next);
+    status = make_next_poll_cursor_nonfatal(
+      attachment.runtime, cursor, "next AEQ", next);
     if (status == null || !status.ok()) return;
     if (deliver_found) begin
       // 普通事件按 primary 命中交付；CQ flush 按两路 found 的 OR 交付，允许
@@ -7884,15 +8340,8 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     next = rdma_queue_cursor_snapshot::type_id::create("next_sq_cursor");
-    next.index = cursor.index;
-    next.wrap = cursor.wrap;
-    if (next.index + 1 >= attachment.runtime.depth) begin
-      next.index = 0;
-      next.wrap = ~next.wrap;
-    end
-    else begin
-      next.index++;
-    end
+    advance_queue_cursor_value(attachment.runtime.depth, cursor.index,
+                               cursor.wrap, next.index, next.wrap);
     submit_producer_doorbell(
       snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
       cursor, next, image, link.local_qp_id, doorbell_result, status);
@@ -7988,7 +8437,10 @@ class rdma_queue_data_engine extends uvm_object;
     end
     link = qp_links[identity_key(completion_qp_h)];
     if (snapshot.target_h.kind == RDMA_RESOURCE_SRQ) begin
-      if (link.srq_h == null || !link.srq_h.same_instance(snapshot.target_h)) begin
+      // 设计：snapshot.validate 已冻结 SRQ target，link.srq_h 的空值门禁仍
+      // 先于完整 handle identity 比较；失配继续返回原绑定错误并不触碰 runtime。
+      if (link.srq_h == null ||
+          !same_handle_instance(link.srq_h, snapshot.target_h)) begin
         status = bad("receive completion QP is not attached to the target SRQ");
         return;
       end
@@ -8040,15 +8492,8 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     next = rdma_queue_cursor_snapshot::type_id::create("next_rq_cursor");
-    next.index = cursor.index;
-    next.wrap = cursor.wrap;
-    if (next.index + 1 >= attachment.runtime.depth) begin
-      next.index = 0;
-      next.wrap = ~next.wrap;
-    end
-    else begin
-      next.index++;
-    end
+    advance_queue_cursor_value(attachment.runtime.depth, cursor.index,
+                               cursor.wrap, next.index, next.wrap);
     submit_producer_doorbell(snapshot.target_h,
       snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
       RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
@@ -8113,14 +8558,9 @@ class rdma_queue_data_engine extends uvm_object;
         pending.cursor.index >= attachment.runtime.depth ||
         pending.next_cursor.index >= attachment.runtime.depth)
       return bad("pending recovery cursor is invalid", RDMA_SC_INVALID_STATE);
-    expected_index = pending.cursor.index;
-    expected_wrap = pending.cursor.wrap;
-    if (expected_index + 1 >= attachment.runtime.depth) begin
-      expected_index = 0;
-      expected_wrap = ~expected_wrap;
-    end
-    else
-      expected_index++;
+    advance_queue_cursor_value(attachment.runtime.depth,
+                               pending.cursor.index, pending.cursor.wrap,
+                               expected_index, expected_wrap);
     if (pending.next_cursor.index != expected_index ||
         pending.next_cursor.wrap != expected_wrap)
       return bad("pending recovery next cursor is inconsistent",
@@ -8213,20 +8653,24 @@ class rdma_queue_data_engine extends uvm_object;
               RDMA_SC_RECOVERY_REQUIRED) : status;
         return;
       end
+      // 设计：pending 与 attachment 的 queue handle 是 device reservation 的
+      // 双方 authority；reservation/status/null 门禁先完成，再由
+      // pending_queue_handle_matches_attachment 做纯 incarnation 比较；身份失配
+      // 仍沿用 RECOVERY_REQUIRED，不改变后续 image 重放和 reservation 清理顺序。
       if (!reservation_valid || current_device_reservation == null ||
           device_pending.queue_h == null || attachment.queue_h == null ||
-          !device_pending.queue_h.same_instance(attachment.queue_h) ||
+          !pending_queue_handle_matches_attachment(device_pending, attachment) ||
           device_pending.kind != attachment.kind ||
           !device_pending.device_producer || device_pending.cursor == null ||
           device_pending.next_cursor == null || device_pending.image == null ||
           device_pending.entry_size != attachment.entry_size ||
-          device_pending.entry_size == 0 || !device_pending.route_valid ||
-          !device_pending.epoch_valid ||
-          device_pending.route != runtime_route ||
-          device_pending.reset_epoch != runtime_epoch ||
+          device_pending.entry_size == 0 ||
+          !pending_route_epoch_matches(
+            device_pending, runtime_route, runtime_route_valid,
+            runtime_epoch, runtime_epoch_valid) ||
           !attachment.runtime.reservation_matches(device_pending.cursor) ||
-          current_device_reservation.index != device_pending.cursor.index ||
-          current_device_reservation.wrap != device_pending.cursor.wrap ||
+          !same_cursor_value(current_device_reservation,
+                             device_pending.cursor) ||
           device_pending.entry_offset !=
             longint'(device_pending.cursor.index) * device_pending.entry_size) begin
         status = bad("device pending authority or reservation is stale",
@@ -8389,6 +8833,10 @@ class rdma_queue_data_engine extends uvm_object;
     // 中文设计：consumer pending 在 admission 时已冻结完整 identity、
     // route/epoch 和 completion target。recovery 只核对这些值并选择现有
     // attachment，禁止重新 decode CQE 或从当前 codec 推导 WQ 方向。
+    // 两个 queue handle 的显式空值门禁先于
+    // pending_queue_handle_matches_attachment；pending.kind、producer 阶段和
+    // 几何证据仍由 caller 保留，证据不完整继续返回原 INVALID_STATE，并不执行
+    // route query、release 或 completion 变更。
     link = null;
     wqe_attachment = null;
     if (!(attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
@@ -8397,7 +8845,7 @@ class rdma_queue_data_engine extends uvm_object;
         pending.kind != attachment.kind || pending.producer ||
         pending.device_producer || attachment.queue_h == null ||
         pending.queue_h == null ||
-        !attachment.queue_h.same_instance(pending.queue_h) ||
+        !pending_queue_handle_matches_attachment(pending, attachment) ||
         pending.cursor == null || pending.next_cursor == null ||
         pending.image == null || pending.failure_status == null ||
         pending.entry_size != attachment.entry_size ||
@@ -8416,9 +8864,10 @@ class rdma_queue_data_engine extends uvm_object;
     runtime_epoch_valid = 1'b0;
     status = attachment.runtime.query_route_epoch(
       runtime_route, runtime_route_valid, runtime_epoch, runtime_epoch_valid);
-    if (status == null || !status.ok() || !runtime_route_valid ||
-        !runtime_epoch_valid || !pending.route_valid || !pending.epoch_valid ||
-        pending.route != runtime_route || pending.reset_epoch != runtime_epoch) begin
+    if (status == null || !status.ok() ||
+        !pending_route_epoch_matches(
+          pending, runtime_route, runtime_route_valid,
+          runtime_epoch, runtime_epoch_valid)) begin
       if (status == null || status.ok())
         status = make_engine_status_nonfatal(
           RDMA_SC_STALE_GENERATION,
@@ -8439,18 +8888,26 @@ class rdma_queue_data_engine extends uvm_object;
         return;
       end
       qp_key = identity_key(pending.routed_qp_h);
+      // 设计：CQ recovery 的 routed_qp_h 是 completion target authority；
+      // key、link、qp_h 的空值门禁先于完整 identity 比较，失配继续保留
+      // STALE_GENERATION，不能进入后续 WQ route 或 release 副作用。
       if (qp_key == "" || !qp_links.exists(qp_key) ||
           qp_links[qp_key] == null || qp_links[qp_key].qp_h == null ||
-          !qp_links[qp_key].qp_h.same_instance(pending.routed_qp_h)) begin
+          !same_handle_instance(qp_links[qp_key].qp_h,
+                                pending.routed_qp_h)) begin
         status = make_engine_status_nonfatal(
           RDMA_SC_STALE_GENERATION,
           "CQ recovery routed QP identity is stale");
         return;
       end
       link = qp_links[qp_key];
+      // 设计：pending.queue_h 已在 consumer evidence 门禁确认非空；每个
+      // SQ/RQ/SRQ 分支通过 qp_link_cq_route_matches 按方向选择 send/recv CQ，
+      // 并执行 null-safe 完整 identity 比较；SRQ presence 门禁仍在 helper 后保留，
+      // 身份失配只走原 INVALID_STATE 错误路径，不改变 lookup_attachment、release
+      // 或 completion 顺序。
       if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SQ) begin
-        if (link.send_cq_h == null ||
-            !link.send_cq_h.same_instance(pending.queue_h)) begin
+        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b0)) begin
           status = make_engine_status_nonfatal(
             RDMA_SC_INVALID_STATE,
             "CQ recovery SQ route does not target the pending CQ");
@@ -8460,8 +8917,7 @@ class rdma_queue_data_engine extends uvm_object;
           link.qp_h, RDMA_QUEUE_RUNTIME_SQ, wqe_attachment);
       end
       else if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_RQ) begin
-        if (link.recv_cq_h == null ||
-            !link.recv_cq_h.same_instance(pending.queue_h) ||
+        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b1) ||
             link.srq_h != null) begin
           status = make_engine_status_nonfatal(
             RDMA_SC_INVALID_STATE,
@@ -8472,8 +8928,7 @@ class rdma_queue_data_engine extends uvm_object;
           link.qp_h, RDMA_QUEUE_RUNTIME_RQ, wqe_attachment);
       end
       else begin
-        if (link.recv_cq_h == null ||
-            !link.recv_cq_h.same_instance(pending.queue_h) ||
+        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b1) ||
             link.srq_h == null) begin
           status = make_engine_status_nonfatal(
             RDMA_SC_INVALID_STATE,
@@ -8739,8 +9194,11 @@ class rdma_queue_data_engine extends uvm_object;
       end
       found = unclaimed_recovery_attachments[key];
       unclaimed_pending = unclaimed_device_recoveries[key];
-      if (found.runtime == null || found.queue_h == null ||
-          !found.queue_h.same_instance(queue_h)) begin
+      // 设计：unclaimed attachment 是 engine-owned recovery authority；map
+      // pair 与 found 的 runtime/handle 空值门禁先完成，身份失配必须硬失败
+      // 为 RECOVERY_REQUIRED，保留 evidence，不能继续 admission 或 detach。
+      if (found.runtime == null ||
+          !attachment_matches_queue_identity(found, queue_h)) begin
         status = bad("unclaimed recovery attachment is stale",
                      RDMA_SC_RECOVERY_REQUIRED);
         return;
@@ -8769,8 +9227,7 @@ class rdma_queue_data_engine extends uvm_object;
           if (reservation_valid && reservation != null &&
               runtime_state == RDMA_QUEUE_RUNTIME_ACTIVE &&
               unclaimed_pending.cursor != null &&
-              reservation.index == unclaimed_pending.cursor.index &&
-              reservation.wrap == unclaimed_pending.cursor.wrap) begin
+              same_cursor_value(reservation, unclaimed_pending.cursor)) begin
             status = detach_recovery_transaction(
               queue_h, found, reservation);
             if (status == null) begin
@@ -8791,10 +9248,13 @@ class rdma_queue_data_engine extends uvm_object;
       unclaimed_device_recoveries.delete(key);
       unclaimed_recovery_attachments.delete(key);
     end
+    // 设计：claimed attachment 扫描把 identity mismatch 视为候选不匹配而
+    // 跳过；candidate/runtime 门禁和 RECOVERY_REQUIRED 状态检查仍在身份之后，
+    // 以保留多 runtime ambiguity 的 INVALID_STATE 语义。
     foreach (attachments[key]) begin
       candidate = attachments[key];
-      if (candidate != null && candidate.queue_h != null &&
-          candidate.queue_h.same_instance(queue_h) && candidate.runtime != null &&
+      if (attachment_matches_queue_identity(candidate, queue_h) &&
+          candidate.runtime != null &&
           candidate.runtime.state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
         // 中文设计：unclaimed handoff 已选中同一个 attachment 时只接管一次；
         // 只有发现不同 runtime 也声明同一 queue recovery 时才按歧义拒绝。
@@ -8810,10 +9270,12 @@ class rdma_queue_data_engine extends uvm_object;
       // cancel 前置路径在还没有完整 pending 时也可能返回 RECOVERY_REQUIRED。
       // 它只能显式 abort：再次 cancel 成功后 detach；retry 没有可重放 image，
       // 必须保持 fail-closed，而不是伪造一笔 publish。
+      // 设计：reservation-only 扫描同样只跳过不同 identity；只有命中的
+      // candidate 才查询 reservation，保留 null/status、abort action 与 detach 顺序。
       foreach (attachments[key]) begin
         candidate = attachments[key];
-        if (candidate != null && candidate.queue_h != null &&
-            candidate.queue_h.same_instance(queue_h) && candidate.runtime != null) begin
+        if (attachment_matches_queue_identity(candidate, queue_h) &&
+            candidate.runtime != null) begin
           status = candidate.runtime.query_device_reservation(reservation_valid,
                                                                reservation);
           if (status == null || !status.ok()) begin
