@@ -9065,6 +9065,184 @@ class rdma_queue_data_engine extends uvm_object;
                    RDMA_SC_RECOVERY_REQUIRED);
   endtask
 
+  // 设计说明：consumer recovery 的 route、reset epoch、completion target 和 WQ
+  // attachment 是后续 shadow/doorbell、CQ commit 与 WQE release 的共同 authority。
+  // 这些只读查询必须先于任何 backing、MMIO 或 runtime ledger mutation 完成；因此
+  // 把它们集中在 preflight helper 中，并让 caller 继续持有冻结的 next cursor。
+  // 功能：validate_consumer_recovery_authority 校验 consumer pending 的 queue kind、
+  //   cursor/image geometry、route/epoch 与 CQ completion target；CQ 路径解析完整
+  //   routed QP、SQ/RQ/SRQ route、WQ attachment 和未完成 release range，事件路径
+  //   拒绝携带 CQ-only evidence，成功时返回后续 recovery 所需的 engine-owned 借用引用。
+  // 输入/输出及副作用：attachment、pending 为 caller 已取得的只读借用输入；link、
+  //   wqe_attachment 先置空，成功时分别输出 QP route 与 WQ attachment 的非拥有引用。
+  //   函数只查询 runtime route/epoch、qp_links 与 attachments，并在未完成 CQ→WQ release
+  //   时调用 validate_release_range()；不修改 pending、runtime、cursor、ledger、backing
+  //   或 MMIO，也不取得外部对象生命周期所有权。
+  // 失败/边界：attachment/runtime、entry geometry、pending evidence 不完整返回
+  //   INVALID_STATE；route/epoch 查询失败或 stale 返回原 status 或 STALE_GENERATION；
+  //   CQ completion target、QP incarnation、SQ/RQ/SRQ route、WQ attachment 或
+  //   validate_release_range() 返回 null/非成功时返回既有错误码；CEQ/AEQ 携带 CQ-only
+  //   evidence 同样拒绝。helper 不调用 pending_next_cursor，调用方必须在 branch
+  //   dispatch 前保留 next-cursor 连续性和 null attachment/pending/next 门禁。
+  protected function rdma_status validate_consumer_recovery_authority(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    output rdma_queue_data_qp_link link,
+    output rdma_queue_data_attachment wqe_attachment
+  );
+    rdma_status status;
+    rdma_route_key_t runtime_route;
+    rdma_reset_epoch_t runtime_epoch;
+    bit runtime_route_valid;
+    bit runtime_epoch_valid;
+    string qp_key;
+
+    link = null;
+    wqe_attachment = null;
+
+    if (attachment == null || pending == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "consumer recovery attachment/evidence is null");
+    if (attachment.runtime == null || attachment.entry_size == 0 ||
+        pending.entry_size == 0 || pending.cursor == null ||
+        pending.next_cursor == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "consumer recovery runtime or cursor geometry is incomplete");
+    if (attachment.runtime.depth == 0 ||
+        pending.cursor.index >= attachment.runtime.depth ||
+        pending.next_cursor.index >= attachment.runtime.depth ||
+        pending.cursor.index >
+          64'hffff_ffff_ffff_ffff / pending.entry_size)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "consumer recovery cursor geometry is invalid");
+
+    // 中文设计：consumer pending 在 admission 时已冻结完整 identity、route/epoch
+    // 和 completion target。recovery 只核对这些值并选择现有 attachment，禁止重新
+    // decode CQE 或从当前 codec 推导 WQ 方向；证据不完整时不执行 route/release 副作用。
+    if (!(attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
+                                  RDMA_QUEUE_RUNTIME_CEQ,
+                                  RDMA_QUEUE_RUNTIME_AEQ}) ||
+        pending.kind != attachment.kind || pending.producer ||
+        pending.device_producer || attachment.queue_h == null ||
+        pending.queue_h == null ||
+        !pending_queue_handle_matches_attachment(pending, attachment) ||
+        pending.image == null || pending.failure_status == null ||
+        pending.entry_size != attachment.entry_size ||
+        pending.image.length != pending.entry_size ||
+        pending.image.bytes.size() != pending.image.length ||
+        pending.entry_offset !=
+          longint'(pending.cursor.index) * pending.entry_size) begin
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "consumer recovery pending evidence is incomplete");
+    end
+    runtime_route = '0;
+    runtime_route_valid = 1'b0;
+    runtime_epoch = '0;
+    runtime_epoch_valid = 1'b0;
+    status = attachment.runtime.query_route_epoch(
+      runtime_route, runtime_route_valid, runtime_epoch, runtime_epoch_valid);
+    if (status == null || !status.ok() ||
+        !pending_route_epoch_matches(
+          pending, runtime_route, runtime_route_valid,
+          runtime_epoch, runtime_epoch_valid)) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_STALE_GENERATION,
+          "consumer recovery route or reset epoch is stale");
+      return status;
+    end
+
+    if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) begin
+      if (!pending.completion_target_valid ||
+          !(pending.completion_wq_kind inside {RDMA_QUEUE_RUNTIME_SQ,
+                                               RDMA_QUEUE_RUNTIME_RQ,
+                                               RDMA_QUEUE_RUNTIME_SRQ}) ||
+          pending.routed_qp_h == null ||
+          pending.routed_qp_h.kind != RDMA_RESOURCE_QP) begin
+        return make_engine_status_nonfatal(
+          RDMA_SC_INVALID_STATE,
+          "CQ recovery completion target is incomplete");
+      end
+      qp_key = identity_key(pending.routed_qp_h);
+      // 设计：CQ recovery 的 routed_qp_h 是 completion target authority；key、link、
+      // qp_h 的空值门禁先于完整 identity 比较，失配继续保留 STALE_GENERATION，
+      // 不能进入后续 WQ route 或 release 副作用。
+      if (qp_key == "" || !qp_links.exists(qp_key) ||
+          qp_links[qp_key] == null || qp_links[qp_key].qp_h == null ||
+          !same_handle_instance(qp_links[qp_key].qp_h,
+                                pending.routed_qp_h)) begin
+        return make_engine_status_nonfatal(
+          RDMA_SC_STALE_GENERATION,
+          "CQ recovery routed QP identity is stale");
+      end
+      link = qp_links[qp_key];
+      // 设计：pending.queue_h 已确认非空；SQ/RQ/SRQ 分支按 qp_link 的发送/接收方向
+      // 选择对应 WQ attachment，并保留 SRQ presence 门禁。身份失配只走原错误路径，
+      // 不改变 lookup_attachment、release 或 completion 顺序。
+      if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SQ) begin
+        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b0)) begin
+          return make_engine_status_nonfatal(
+            RDMA_SC_INVALID_STATE,
+            "CQ recovery SQ route does not target the pending CQ");
+        end
+        status = lookup_attachment(
+          link.qp_h, RDMA_QUEUE_RUNTIME_SQ, wqe_attachment);
+      end
+      else if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_RQ) begin
+        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b1) ||
+            link.srq_h != null) begin
+          return make_engine_status_nonfatal(
+            RDMA_SC_INVALID_STATE,
+            "CQ recovery RQ route does not target the pending CQ");
+        end
+        status = lookup_attachment(
+          link.qp_h, RDMA_QUEUE_RUNTIME_RQ, wqe_attachment);
+      end
+      else begin
+        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b1) ||
+            link.srq_h == null) begin
+          return make_engine_status_nonfatal(
+            RDMA_SC_INVALID_STATE,
+            "CQ recovery SRQ route does not target the pending CQ");
+        end
+        status = lookup_attachment(
+          link.srq_h, RDMA_QUEUE_RUNTIME_SRQ, wqe_attachment);
+      end
+      if (status == null || !status.ok() || wqe_attachment == null ||
+          wqe_attachment.runtime == null ||
+          wqe_attachment.kind != pending.completion_wq_kind) begin
+        if (status == null || status.ok())
+          status = make_engine_status_nonfatal(
+            RDMA_SC_INVALID_STATE,
+            "CQ recovery WQ attachment is unavailable");
+        return status;
+      end
+      if (!pending.completion_released) begin
+        status = wqe_attachment.runtime.validate_release_range(
+          pending.completion_index, pending.completion_wrap);
+        if (status == null || !status.ok()) begin
+          if (status == null)
+            status = make_engine_status_nonfatal(
+              RDMA_SC_INVALID_STATE,
+              "CQ recovery release validation returned null status");
+          return status;
+        end
+      end
+    end
+    else if (pending.completion_target_valid || pending.routed_qp_h != null ||
+             pending.cq_consumer_committed || pending.completion_released) begin
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "event recovery carries CQ-only completion evidence");
+    end
+
+    return status;
+  endfunction
+
   // 设计说明：consumer recovery 同时包含 CQ route 解析、CQC shadow/doorbell 续做、
   // CQ consumer commit 和可选 WQE release；这些阶段共享 completion authority 与锁序，
   // 不能与 producer DMA recovery 混用。helper 保留 caller 冻结的 next cursor 和
@@ -9092,12 +9270,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_slot_ledger_entry released[$];
     rdma_doorbell_desc prepared_db_desc;
     rdma_status noalloc_status;
-    rdma_route_key_t runtime_route;
-    rdma_reset_epoch_t runtime_epoch;
-    bit runtime_route_valid;
-    bit runtime_epoch_valid;
     bit release_succeeded;
-    string qp_key;
 
     status = null;
     if (attachment == null || pending == null || next == null) begin
@@ -9106,136 +9279,10 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    // 中文设计：consumer pending 在 admission 时已冻结完整 identity、route/epoch
-    // 和 completion target。recovery 只核对这些值并选择现有 attachment，禁止重新
-    // decode CQE 或从当前 codec 推导 WQ 方向；证据不完整时不执行 route/release 副作用。
-    link = null;
-    wqe_attachment = null;
-    if (!(attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
-                                  RDMA_QUEUE_RUNTIME_CEQ,
-                                  RDMA_QUEUE_RUNTIME_AEQ}) ||
-        pending.kind != attachment.kind || pending.producer ||
-        pending.device_producer || attachment.queue_h == null ||
-        pending.queue_h == null ||
-        !pending_queue_handle_matches_attachment(pending, attachment) ||
-        pending.cursor == null || pending.next_cursor == null ||
-        pending.image == null || pending.failure_status == null ||
-        pending.entry_size != attachment.entry_size ||
-        pending.image.length != pending.entry_size ||
-        pending.image.bytes.size() != pending.image.length ||
-        pending.entry_offset !=
-          longint'(pending.cursor.index) * pending.entry_size) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE,
-        "consumer recovery pending evidence is incomplete");
+    status = validate_consumer_recovery_authority(
+      attachment, pending, link, wqe_attachment);
+    if (status == null || !status.ok())
       return;
-    end
-    runtime_route = '0;
-    runtime_route_valid = 1'b0;
-    runtime_epoch = '0;
-    runtime_epoch_valid = 1'b0;
-    status = attachment.runtime.query_route_epoch(
-      runtime_route, runtime_route_valid, runtime_epoch, runtime_epoch_valid);
-    if (status == null || !status.ok() ||
-        !pending_route_epoch_matches(
-          pending, runtime_route, runtime_route_valid,
-          runtime_epoch, runtime_epoch_valid)) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_STALE_GENERATION,
-          "consumer recovery route or reset epoch is stale");
-      return;
-    end
-
-    if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ) begin
-      if (!pending.completion_target_valid ||
-          !(pending.completion_wq_kind inside {RDMA_QUEUE_RUNTIME_SQ,
-                                               RDMA_QUEUE_RUNTIME_RQ,
-                                               RDMA_QUEUE_RUNTIME_SRQ}) ||
-          pending.routed_qp_h == null ||
-          pending.routed_qp_h.kind != RDMA_RESOURCE_QP) begin
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE,
-          "CQ recovery completion target is incomplete");
-        return;
-      end
-      qp_key = identity_key(pending.routed_qp_h);
-      // 设计：CQ recovery 的 routed_qp_h 是 completion target authority；key、link、
-      // qp_h 的空值门禁先于完整 identity 比较，失配继续保留 STALE_GENERATION，
-      // 不能进入后续 WQ route 或 release 副作用。
-      if (qp_key == "" || !qp_links.exists(qp_key) ||
-          qp_links[qp_key] == null || qp_links[qp_key].qp_h == null ||
-          !same_handle_instance(qp_links[qp_key].qp_h,
-                                pending.routed_qp_h)) begin
-        status = make_engine_status_nonfatal(
-          RDMA_SC_STALE_GENERATION,
-          "CQ recovery routed QP identity is stale");
-        return;
-      end
-      link = qp_links[qp_key];
-      // 设计：pending.queue_h 已确认非空；SQ/RQ/SRQ 分支按 qp_link 的发送/接收方向
-      // 选择对应 WQ attachment，并保留 SRQ presence 门禁。身份失配只走原错误路径，
-      // 不改变 lookup_attachment、release 或 completion 顺序。
-      if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SQ) begin
-        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b0)) begin
-          status = make_engine_status_nonfatal(
-            RDMA_SC_INVALID_STATE,
-            "CQ recovery SQ route does not target the pending CQ");
-          return;
-        end
-        status = lookup_attachment(
-          link.qp_h, RDMA_QUEUE_RUNTIME_SQ, wqe_attachment);
-      end
-      else if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_RQ) begin
-        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b1) ||
-            link.srq_h != null) begin
-          status = make_engine_status_nonfatal(
-            RDMA_SC_INVALID_STATE,
-            "CQ recovery RQ route does not target the pending CQ");
-          return;
-        end
-        status = lookup_attachment(
-          link.qp_h, RDMA_QUEUE_RUNTIME_RQ, wqe_attachment);
-      end
-      else begin
-        if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b1) ||
-            link.srq_h == null) begin
-          status = make_engine_status_nonfatal(
-            RDMA_SC_INVALID_STATE,
-            "CQ recovery SRQ route does not target the pending CQ");
-          return;
-        end
-        status = lookup_attachment(
-          link.srq_h, RDMA_QUEUE_RUNTIME_SRQ, wqe_attachment);
-      end
-      if (status == null || !status.ok() || wqe_attachment == null ||
-          wqe_attachment.runtime == null ||
-          wqe_attachment.kind != pending.completion_wq_kind) begin
-        if (status == null || status.ok())
-          status = make_engine_status_nonfatal(
-            RDMA_SC_INVALID_STATE,
-            "CQ recovery WQ attachment is unavailable");
-        return;
-      end
-      if (!pending.completion_released) begin
-        status = wqe_attachment.runtime.validate_release_range(
-          pending.completion_index, pending.completion_wrap);
-        if (status == null || !status.ok()) begin
-          if (status == null)
-            status = make_engine_status_nonfatal(
-              RDMA_SC_INVALID_STATE,
-              "CQ recovery release validation returned null status");
-          return;
-        end
-      end
-    end
-    else if (pending.completion_target_valid || pending.routed_qp_h != null ||
-             pending.cq_consumer_committed || pending.completion_released) begin
-      status = make_engine_status_nonfatal(
-        RDMA_SC_INVALID_STATE,
-        "event recovery carries CQ-only completion evidence");
-      return;
-    end
 
     // 中文设计：legacy NO_SUBMIT 在 scheduler 入口前预建 descriptor/status；CQC
     // shadow NO_SUBMIT 只写冻结的 context host-memory，不创建 doorbell descriptor；
