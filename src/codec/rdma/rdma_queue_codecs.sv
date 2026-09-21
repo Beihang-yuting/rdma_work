@@ -24,6 +24,8 @@ function automatic rdma_handle rdma_hw_queue_projected_handle(
   return h;
 endfunction
 
+typedef class rdma_hw_rqe_codec;
+
 class rdma_queue_codec;
   // 功能：encode_sqe 将语义发送请求投影为 XTR v1 64B SQE 镜像，统一选择 RC/UD/URC codec。
   // 输入/输出及副作用：request 为只读请求，image 为输出镜像；函数仅复制请求快照，不取得 QP、AV 或 DMA 所有权。
@@ -195,6 +197,59 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     atomic_compare = x.atomic_compare;
   endfunction
 
+  // 功能：validate_inline_payload_authority 确认 SQE 的两个 detached inline
+  //   字节容器没有形成分叉事实源；当 inline_bytes 与 payload 同时存在时，
+  //   它们必须逐字节相同，供 codec 签名和 queue-data SGB writer 共享。
+  // 输入/输出及副作用：只读 inline_bytes、payload；返回 rdma_status，不修改
+  //   任一数组、模型字段或外部 Host-memory 所有权。
+  // 失败/边界：任一数组为空表示未提供该可选镜像来源，不触发冲突；两者长度不等
+  //   或任一 byte 使用 case-inequality 不同时返回 INVALID_ARGUMENT，调用方不得
+  //   选择其中一份继续编码，以免 WQE signature 与实际 SGB backing 不一致。
+  function rdma_status validate_inline_payload_authority();
+    if (inline_bytes.size() == 0 || payload.size() == 0)
+      return rdma_status::success();
+    if (inline_bytes.size() != payload.size())
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "SQE inline payload sources have different lengths");
+    foreach (inline_bytes[i]) begin
+      if (inline_bytes[i] !== payload[i])
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "SQE inline payload sources disagree");
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：resolve_inline_payload_authority 选出本次 inline WQE/SGB 要签名和写入
+  //   的唯一 detached byte 快照；优先使用显式 inline_bytes，否则复制 payload。
+  // 输入/输出及副作用：resolved_bytes 为输出动态数组；读取两个源并复制值，
+  //   不把数组引用或 Host-memory 生命周期转移给调用方，也不修改当前模型。
+  // 失败/边界：若两个非空源未通过 validate_inline_payload_authority，返回同一
+  //   INVALID_ARGUMENT 且 output 置空；两个源均为空时返回长度为零的成功快照。
+  function rdma_status resolve_inline_payload_authority(
+      output byte unsigned resolved_bytes[]
+  );
+    rdma_status status;
+
+    resolved_bytes = new[0];
+    status = validate_inline_payload_authority();
+    if (!status.ok())
+      return status;
+
+    if (inline_bytes.size() != 0) begin
+      resolved_bytes = new[inline_bytes.size()];
+      foreach (inline_bytes[i])
+        resolved_bytes[i] = inline_bytes[i];
+    end
+    else begin
+      resolved_bytes = new[payload.size()];
+      foreach (payload[i])
+        resolved_bytes[i] = payload[i];
+    end
+    return rdma_status::success();
+  endfunction
+
   // 功能：derive_payload_authority 一次归一 payload mode、唯一有效 SGE 数、
   //   inline 实际字节源/长度和最终 hardware SGE_NUM，供 validation 与 writer 共用。
   // 输入/输出及副作用：只读 payload_mode、inline_data、inline_bytes、payload、
@@ -304,6 +359,7 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
   //   不等于 derive_sge_num 时返回 INVALID_ARGUMENT，不发布 image 或转移资源。
   virtual function rdma_status validate();
     rdma_status shape_status;
+    rdma_status inline_authority_status;
     rdma_sq_payload_mode_e canonical_mode;
     int unsigned valid_sge_count;
     int unsigned inline_payload_bytes;
@@ -313,6 +369,13 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     shape_status = validate_payload_shape();
     if (!shape_status.ok())
       return shape_status;
+
+    inline_authority_status = validate_inline_payload_authority();
+    if (inline_authority_status == null || !inline_authority_status.ok())
+      return inline_authority_status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "SQE inline payload authority returned null status") :
+        inline_authority_status;
 
     if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP)
       return rdma_status::make(
@@ -386,6 +449,16 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
   bit external_sgb_descriptor_authority_valid;
   byte unsigned external_sgb_descriptor_bytes[$];
 
+  // decoded external image 没有 typed SGE 列表；provenance 保持为模型私有状态，
+  // 只通过 checked API 暴露，避免调用方直接翻转 public bit 伪造 detached replay。
+  // count、payload、SGB_PA 与 descriptor snapshot 冻结同一份认证输入，后续 mutation
+  // 会在 resolve 阶段 fail-closed。
+  local bit decoded_raw_sgb_provenance_valid;
+  local bit [7:0] external_sgb_authority_sge_num;
+  local bit [31:0] external_sgb_authority_payload_len;
+  local bit [54:0] external_sgb_authority_sgb_pa;
+  local byte unsigned external_sgb_authority_snapshot[$];
+
   // 功能：构造 rdma_hw_rqe_model，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 将 sign_en、sgb_pa 等本地 wire
   // 字段清零并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -396,6 +469,11 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
     sgb_pa = '0;
     external_sgb_descriptor_authority_valid = 1'b0;
     external_sgb_descriptor_bytes.delete();
+    decoded_raw_sgb_provenance_valid = 1'b0;
+    external_sgb_authority_sge_num = '0;
+    external_sgb_authority_payload_len = '0;
+    external_sgb_authority_sgb_pa = '0;
+    external_sgb_authority_snapshot.delete();
   endfunction
 
   // 功能：set_sgb_pa_encoded 把调用方提供的 PA>>9 编码值安装到 RQE 模型。
@@ -439,6 +517,287 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
     return {sgb_pa, 9'b0};
   endfunction
 
+  // 功能：derive_typed_sge_authority 按驱动过滤规则从 detached SGE 列表计算
+  //   有效 descriptor 数和总 payload 长度，作为 RQE canonical authority 的唯一
+  //   typed 来源；length==0 被过滤，0x8000_0000 保留为 2GiB sentinel。
+  // 输入/输出及副作用：有效数量与长度通过 output 返回；只读取 sges，不修改
+  //   SGE、模型字段或外部 backing，也不取得输入对象所有权。
+  // 失败/边界：raw SGE 列表超过 RDMA_MAX_WQ_SGE、包含 null、包含除 sentinel
+  //   外的 bit31 长度，或有效长度和超过 2GiB 时返回 INVALID_ARGUMENT；失败时
+  //   output 仍归零，调用方不得把部分统计发布到 sge_num/payload_len。
+  function rdma_status derive_typed_sge_authority(
+      output int unsigned valid_sge_count,
+      output longint unsigned valid_payload_len
+  );
+    valid_sge_count = 0;
+    valid_payload_len = 0;
+
+    if (sges.size() > RDMA_MAX_WQ_SGE)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE raw SGE list exceeds driver limit of 32");
+
+    foreach (sges[i]) begin
+      if (sges[i] == null)
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "RQE SGE handle is null");
+
+      if (sges[i].length == 0)
+        continue;
+
+      if (sges[i].length != 32'h8000_0000 && sges[i].length[31])
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "RQE SGE length uses reserved bit 31");
+
+      if (valid_payload_len > 64'h8000_0000 - sges[i].length)
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "RQE payload length exceeds 2 GiB");
+
+      valid_sge_count++;
+      valid_payload_len += sges[i].length;
+    end
+
+    if (valid_sge_count > RDMA_MAX_WQ_SGE)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE valid SGE count exceeds driver limit of 32");
+
+    return rdma_status::success();
+  endfunction
+
+  // 功能：build_typed_sgb_descriptor_bytes 将 canonical typed SGE 列表按驱动的
+  //   length/lkey/IOVA 大端布局串行化，供 external-SGB 签名和 authority 比对共用。
+  // 输入/输出及副作用：descriptor_bytes 为 output 动态数组；只读取 sges，并在
+  //   成功时返回有效 SGE_NUM*16 字节，不修改模型或调用方 SGE。
+  // 失败/边界：typed 统计失败、有效数量为零或 descriptor 长度无法按 16 字节表达时
+  //   返回对应 INVALID_ARGUMENT，output 置为空；zero-length SGE 不产生 descriptor。
+  function rdma_status build_typed_sgb_descriptor_bytes(
+      output byte unsigned descriptor_bytes[]
+  );
+    int unsigned valid_sge_count;
+    longint unsigned valid_payload_len;
+    int unsigned descriptor_index;
+    rdma_status status;
+
+    descriptor_bytes = new[0];
+    status = derive_typed_sge_authority(valid_sge_count, valid_payload_len);
+    if (!status.ok())
+      return status;
+    if (valid_sge_count == 0)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE typed SGB descriptor list is empty");
+
+    descriptor_bytes = new[valid_sge_count * 16];
+    descriptor_index = 0;
+    foreach (sges[i]) begin
+      bit [31:0] descriptor_length;
+
+      if (sges[i].length == 0)
+        continue;
+
+      descriptor_length = sges[i].length == 32'h8000_0000 ?
+                          32'b0 : sges[i].length;
+      for (int unsigned byte_index = 0; byte_index < 4; byte_index++) begin
+        descriptor_bytes[descriptor_index++] =
+            descriptor_length[31 - byte_index * 8 -: 8];
+      end
+      for (int unsigned byte_index = 0; byte_index < 4; byte_index++) begin
+        descriptor_bytes[descriptor_index++] =
+            sges[i].lkey[31 - byte_index * 8 -: 8];
+      end
+      for (int unsigned byte_index = 0; byte_index < 8; byte_index++) begin
+        descriptor_bytes[descriptor_index++] =
+            sges[i].iova.value[63 - byte_index * 8 -: 8];
+      end
+    end
+
+    return rdma_status::success();
+  endfunction
+
+  // 功能：mark_decoded_raw_sgb_provenance 仅在 RQE codec 的 decode-active window
+  //   内标记 detached raw external image；codec handle 与 candidate identity 双重
+  //   检查把 provenance 建立限制在真实 decode 路径，而不是 caller 直接翻转状态。
+  // 输入/输出及副作用：codec_handle 为输入 capability；成功时只更新模型内部
+  //   provenance，不修改 wire 字段、descriptor bytes 或外部内存所有权。
+  // 失败/边界：null/非 active codec、已有 marker、typed SGE 或 descriptor authority
+  //   均返回 INVALID_STATE；调用方必须保留原状态，不能绕过 clear/re-authorize 边界。
+  function rdma_status mark_decoded_raw_sgb_provenance(
+      rdma_hw_rqe_codec codec_handle);
+    if (codec_handle == null ||
+        !codec_handle.is_raw_decode_authorization_active(this) ||
+        decoded_raw_sgb_provenance_valid ||
+        sges.size() != 0 || external_sgb_descriptor_authority_valid)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "RQE raw SGB provenance requires an active codec decode");
+
+    decoded_raw_sgb_provenance_valid = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：clear_decoded_raw_sgb_provenance 放弃 detached raw 来源证明，使模型
+  //   必须重新通过 typed SGE 或显式 provenance API 建立 external authority。
+  // 输入/输出及副作用：无输入；清除内部 marker，不修改 sge_num、payload_len、
+  //   SGB_PA 或已安装 descriptor bytes。
+  // 失败/边界：清除后若 sges 为空且仍要编码 external RQE，必须重新调用
+  //   mark_decoded_raw_sgb_provenance 并安装 descriptor authority，否则 fail-closed。
+  function void clear_decoded_raw_sgb_provenance();
+    decoded_raw_sgb_provenance_valid = 1'b0;
+  endfunction
+
+  // 功能：has_decoded_raw_sgb_provenance 返回模型是否持有 codec 建立的 detached
+  //   raw external-SGB 来源证明，供测试和上层诊断读取而不暴露可写 marker。
+  // 输入/输出及副作用：无输入；返回只读 bit，不修改模型、authority 或外部资源。
+  // 失败/边界：构造或 typed 模型返回 0；该结果不能替代 descriptor length、签名和
+  //   当前字段快照校验，调用方仍必须走 resolve_payload_authority()。
+  function bit has_decoded_raw_sgb_provenance();
+    return decoded_raw_sgb_provenance_valid;
+  endfunction
+
+  // 功能：clear_external_sgb_descriptor_authority 丢弃已安装的 external descriptor
+  //   bytes 及其冻结 count/payload snapshot，供 caller 在确认 source 变化后重新授权。
+  // 输入/输出及副作用：无输入；清除 authority bytes/valid 位和 snapshot，不修改
+  //   typed SGE、wire 字段或外部 host-memory 生命周期。
+  // 失败/边界：清除不可恢复旧 descriptor 证明；若模型仍是 detached raw，后续 encode
+  //   必须重新安装恰好 sge_num*16 字节并再次通过快照检查。
+  function void clear_external_sgb_descriptor_authority();
+    external_sgb_descriptor_authority_valid = 1'b0;
+    external_sgb_descriptor_bytes.delete();
+    external_sgb_authority_sge_num = '0;
+    external_sgb_authority_payload_len = '0;
+    external_sgb_authority_sgb_pa = '0;
+    external_sgb_authority_snapshot.delete();
+  endfunction
+
+  // 功能：validate_external_sgb_descriptor_authority 校验 external descriptor
+  //   bytes 与当前 RQE 字段、typed SGE（若存在）或 detached raw provenance 的一致性。
+  // 输入/输出及副作用：无显式输入；返回状态并只读 authority/SGE，不修改模型或 bytes。
+  // 失败/边界：拒绝 N<=2、N>32、长度非 N*16、snapshot 被 mutation 改写、typed
+  //   count/payload 或 descriptor 内容冲突，以及没有 raw provenance 的空 sges 模型。
+  function rdma_status validate_external_sgb_descriptor_authority();
+    int unsigned valid_sge_count;
+    longint unsigned valid_payload_len;
+    byte unsigned typed_descriptor_bytes[];
+    rdma_status status;
+
+    if (!external_sgb_descriptor_authority_valid)
+      return rdma_status::success();
+
+    if (sge_num <= 2 || sge_num > RDMA_MAX_WQ_SGE)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE external SGB authority count is invalid");
+    if (sgb_pa == 0)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE external SGB authority requires an SGB pointer");
+    if (payload_len > 32'h8000_0000)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE external SGB payload length exceeds 2 GiB");
+    if (external_sgb_descriptor_bytes.size() != int'(sge_num) * 16)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE external SGB descriptor authority length is invalid");
+    if (external_sgb_authority_sge_num != sge_num ||
+        external_sgb_authority_payload_len != payload_len ||
+        external_sgb_authority_sgb_pa != sgb_pa)
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "RQE external SGB authority snapshot is stale");
+    if (external_sgb_authority_snapshot.size() !=
+        external_sgb_descriptor_bytes.size())
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "RQE external SGB authority bytes are stale");
+    foreach (external_sgb_descriptor_bytes[i]) begin
+      if (external_sgb_descriptor_bytes[i] !==
+          external_sgb_authority_snapshot[i])
+        return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "RQE external SGB authority bytes are stale");
+    end
+
+    if (sges.size() == 0) begin
+      if (!decoded_raw_sgb_provenance_valid)
+        return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "RQE external SGB authority lacks raw provenance");
+      return rdma_status::success();
+    end
+
+    status = derive_typed_sge_authority(valid_sge_count, valid_payload_len);
+    if (!status.ok())
+      return status;
+    if (valid_sge_count != sge_num ||
+        valid_payload_len != payload_len)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE external SGB authority disagrees with typed SGE list");
+
+    status = build_typed_sgb_descriptor_bytes(typed_descriptor_bytes);
+    if (!status.ok())
+      return status;
+    if (typed_descriptor_bytes.size() != external_sgb_descriptor_bytes.size())
+      return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "RQE external SGB authority descriptor count is stale");
+    foreach (typed_descriptor_bytes[i]) begin
+      if (typed_descriptor_bytes[i] !== external_sgb_descriptor_bytes[i])
+        return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "RQE external SGB authority bytes are stale");
+    end
+
+    return rdma_status::success();
+  endfunction
+
+  // 功能：resolve_payload_authority 统一解析 RQE 当前可发布的 SGE_NUM、payload
+  //   length 和 external descriptor authority，供 model.validate、codec encode 与
+  //   queue-data make_rqe 共用，消除 typed/raw 双事实源。
+  // 输入/输出及副作用：有效数量与长度通过 output 返回；只读模型状态，不修改
+  //   caller 字段、SGE 或外部 backing。
+  // 失败/边界：external authority 存在时必须通过 snapshot/typed/raw provenance
+  //   检查；否则要求 typed 列表统计与 sge_num/payload_len 完全一致，并拒绝范围、
+  //   null、reserved bit31 或 2GiB 溢出。失败时 output 归零。
+  function rdma_status resolve_payload_authority(
+      output int unsigned effective_sge_count,
+      output longint unsigned effective_payload_len
+  );
+    rdma_status status;
+
+    effective_sge_count = 0;
+    effective_payload_len = 0;
+
+    if (external_sgb_descriptor_authority_valid) begin
+      status = validate_external_sgb_descriptor_authority();
+      if (!status.ok())
+        return status;
+      effective_sge_count = sge_num;
+      effective_payload_len = payload_len;
+      return rdma_status::success();
+    end
+
+    status = derive_typed_sge_authority(
+        effective_sge_count, effective_payload_len);
+    if (!status.ok())
+      return status;
+    if (effective_sge_count != sge_num)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE SGE_NUM does not match canonical SGE count");
+    if (effective_payload_len != payload_len)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE payload length does not match canonical SGE sum");
+
+    return rdma_status::success();
+  endfunction
+
   // 功能：set_external_sgb_descriptor_bytes 安装与当前 external-SGB RQE
   //   对应的、按驱动大端布局排列的 descriptor 字节，作为签名 authority。
   // 输入/输出及副作用：descriptor_bytes 为输入快照；成功时复制到对象并置
@@ -448,17 +807,82 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
   function rdma_status set_external_sgb_descriptor_bytes(
       input byte unsigned descriptor_bytes[]);
     int unsigned expected_bytes;
+    int unsigned valid_sge_count;
+    longint unsigned valid_payload_len;
+    byte unsigned typed_descriptor_bytes[];
+    rdma_status status;
 
     expected_bytes = int'(sge_num) * 16;
-    if (sge_num <= 2 || descriptor_bytes.size() != expected_bytes)
+    if (sge_num <= 2 || sge_num > RDMA_MAX_WQ_SGE ||
+        descriptor_bytes.size() != expected_bytes)
       return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
           "RQE external SGB descriptor authority length is invalid");
+
+    if (sgb_pa == 0)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE external SGB descriptor authority requires an SGB pointer");
+    if (payload_len > 32'h8000_0000)
+      return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "RQE external SGB payload length exceeds 2 GiB");
+
+    if (external_sgb_descriptor_authority_valid) begin
+      status = validate_external_sgb_descriptor_authority();
+      if (!status.ok())
+        return status;
+      if (external_sgb_authority_sge_num != sge_num ||
+          external_sgb_authority_payload_len != payload_len ||
+          external_sgb_authority_sgb_pa != sgb_pa ||
+          external_sgb_descriptor_bytes.size() != descriptor_bytes.size())
+        return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "RQE external SGB authority is already frozen");
+      foreach (descriptor_bytes[i]) begin
+        if (descriptor_bytes[i] !== external_sgb_descriptor_bytes[i])
+          return rdma_status::make(
+              RDMA_SC_INVALID_STATE,
+              "RQE external SGB authority is already frozen");
+      end
+      return rdma_status::success();
+    end
+
+    if (sges.size() == 0) begin
+      if (!decoded_raw_sgb_provenance_valid)
+        return rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "RQE external SGB authority lacks raw provenance");
+    end
+    else begin
+      status = derive_typed_sge_authority(valid_sge_count, valid_payload_len);
+      if (!status.ok())
+        return status;
+      if (valid_sge_count != sge_num || valid_payload_len != payload_len)
+        return rdma_status::make(
+            RDMA_SC_INVALID_ARGUMENT,
+            "RQE external SGB authority disagrees with typed SGE list");
+      status = build_typed_sgb_descriptor_bytes(typed_descriptor_bytes);
+      if (!status.ok())
+        return status;
+      foreach (typed_descriptor_bytes[i]) begin
+        if (typed_descriptor_bytes[i] !== descriptor_bytes[i])
+          return rdma_status::make(
+              RDMA_SC_INVALID_ARGUMENT,
+              "RQE external SGB descriptor bytes disagree with typed SGE");
+      end
+    end
 
     external_sgb_descriptor_bytes.delete();
     foreach (descriptor_bytes[i])
       external_sgb_descriptor_bytes.push_back(descriptor_bytes[i]);
     external_sgb_descriptor_authority_valid = 1'b1;
+    external_sgb_authority_sge_num = sge_num;
+    external_sgb_authority_payload_len = payload_len;
+    external_sgb_authority_sgb_pa = sgb_pa;
+    external_sgb_authority_snapshot.delete();
+    foreach (descriptor_bytes[i])
+      external_sgb_authority_snapshot.push_back(descriptor_bytes[i]);
     return rdma_status::success();
   endfunction
 
@@ -485,15 +909,31 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
     sgb_pa = x.sgb_pa;
     external_sgb_descriptor_authority_valid =
         x.external_sgb_descriptor_authority_valid;
+    decoded_raw_sgb_provenance_valid = x.decoded_raw_sgb_provenance_valid;
+    external_sgb_authority_sge_num = x.external_sgb_authority_sge_num;
+    external_sgb_authority_payload_len = x.external_sgb_authority_payload_len;
+    external_sgb_authority_sgb_pa = x.external_sgb_authority_sgb_pa;
     external_sgb_descriptor_bytes.delete();
     foreach (x.external_sgb_descriptor_bytes[i])
       external_sgb_descriptor_bytes.push_back(x.external_sgb_descriptor_bytes[i]);
+    external_sgb_authority_snapshot.delete();
+    foreach (x.external_sgb_authority_snapshot[i])
+      external_sgb_authority_snapshot.push_back(
+          x.external_sgb_authority_snapshot[i]);
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“RQE requires QP or SRQ handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、target_h、target_h.kind、index 并使用字段 rdma_status、target_h、target_h.kind、index；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“RQE requires QP or SRQ handle”“RQE index exceeds width”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：validate 校验 RQE route handle、index 以及 typed/raw payload authority，
+  //   确认 caller-visible sge_num/payload_len 与唯一有效 SGE 来源一致后才允许编码。
+  // 输入/输出及副作用：无显式参数；只读取 target_h、index、SGE 列表、wire count/
+  //   length 和 external authority，返回 rdma_status，不取得句柄、descriptor 或 backing 所有权。
+  // 失败/边界：拒绝缺失/错误 kind handle、index 越界、raw SGE 数量/长度范围错误、
+  //   typed count/payload mismatch、stale external snapshot 或无 provenance 的 detached
+  //   authority；失败时不发布 image、不修改模型状态。
   virtual function rdma_status validate();
+    int unsigned effective_sge_count;
+    longint unsigned effective_payload_len;
+    rdma_status status;
+
     if (target_h == null ||
         !(target_h.kind inside {RDMA_RESOURCE_QP, RDMA_RESOURCE_SRQ}))
       return rdma_status::make(
@@ -504,6 +944,11 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
       return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
           "RQE index exceeds width");
+
+    status = resolve_payload_authority(
+        effective_sge_count, effective_payload_len);
+    if (!status.ok())
+      return status;
 
     return rdma_status::success();
   endfunction
@@ -1817,6 +2262,7 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     longint unsigned sge_length;
     bit [31:0] encoded_length;
     byte unsigned raw[];
+    byte unsigned resolved_inline_bytes[];
     int unsigned valid_sge_count;
     int unsigned inline_payload_bytes;
     int unsigned canonical_sge_num;
@@ -1887,15 +2333,15 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     encoded_length = length == 64'h8000_0000 ? 32'h0 : length[31:0];
     if (mode inside {RDMA_SQ_PAYLOAD_INLINE_WQE,
                      RDMA_SQ_PAYLOAD_INLINE_SGB}) begin
-      if (inline_bytes_are_authority) begin
-        raw = new[inline_payload_bytes];
-        foreach (raw[i])
-          raw[i] = x.inline_bytes[i];
-      end else begin
-        raw = new[inline_payload_bytes];
-        foreach (raw[i])
-          raw[i] = x.payload[i];
-      end
+      s = x.resolve_inline_payload_authority(resolved_inline_bytes);
+      if (s == null || !s.ok())
+        return s == null ?
+          rdma_status::make(RDMA_SC_INVALID_STATE,
+                            "RC inline payload authority returned null status") :
+          s;
+      raw = new[resolved_inline_bytes.size()];
+      foreach (resolved_inline_bytes[i])
+        raw[i] = resolved_inline_bytes[i];
       if (raw.size() != length)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RC inline payload length is inconsistent");
@@ -2691,6 +3137,7 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
     byte unsigned sgb[$];
     byte unsigned raw[];
     byte unsigned payload_bytes[];
+    byte unsigned resolved_inline_bytes[];
     bit [3:0] op;
     bit [7:0] sig;
     bit [31:0] encoded_sge_length;
@@ -2743,15 +3190,18 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
         mode = length == 0 ? RDMA_SQ_PAYLOAD_INLINE_WQE :
                              RDMA_SQ_PAYLOAD_INLINE_SGB;
         if (length != 0) begin
-          payload_bytes = new[inline_payload_bytes];
-          if (inline_bytes_are_authority) begin
-            foreach (payload_bytes[i])
-              payload_bytes[i] = x.inline_bytes[i];
+          s = x.resolve_inline_payload_authority(resolved_inline_bytes);
+          if (s == null || !s.ok()) begin
+            if (s == null) begin
+              return rdma_status::make(
+                  RDMA_SC_INVALID_STATE,
+                  "UD inline payload authority returned null status");
+            end
+            return s;
           end
-          else begin
-            foreach (payload_bytes[i])
-              payload_bytes[i] = x.payload[i];
-          end
+          payload_bytes = new[resolved_inline_bytes.size()];
+          foreach (resolved_inline_bytes[i])
+            payload_bytes[i] = resolved_inline_bytes[i];
           foreach (payload_bytes[i])
             sgb.push_back(payload_bytes[i]);
           while (sgb.size() < 512)
@@ -3064,6 +3514,11 @@ endclass
 class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
   `uvm_object_utils(rdma_hw_rqe_codec)
 
+  // decode_fields 只在构造 detached external model 的瞬间建立这个 capability
+  //   window；active model 采用对象 identity 比较，避免 fresh caller 伪造 raw marker。
+  local bit raw_decode_authorization_active;
+  local rdma_hw_rqe_model active_raw_decode_model;
+
   // 驱动 wr.h/wr.c 将 qword4 复用为两种物理布局：最多两个有效 SGE
   // 直接内联，更多 SGE 时写入外部 SGB_PA。codec 必须依据 wire 上的
   // SGE_NUM、SGE qword 和 SGB 对齐位判定布局，不能用放宽保留位掩码掩盖歧义。
@@ -3072,6 +3527,20 @@ class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
   // 失败/边界：rdma_hw_rqe_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name="rdma_hw_rqe_codec");
     super.new(name);
+    raw_decode_authorization_active = 1'b0;
+    active_raw_decode_model = null;
+  endfunction
+
+  // 功能：is_raw_decode_authorization_active 把 model candidate 与当前 codec 的
+  //   decode-active seam 做 identity 比对，供 RQE model 建立 opaque provenance。
+  // 输入/输出及副作用：candidate 为输入；返回只读 bit，不修改 codec、model、image
+  //   或外部 host-memory/backing 所有权。
+  // 失败/边界：codec 未处于 decode_fields 的 active window、candidate 为空或不是
+  //   当前 active 对象时返回 0；该 accessor 不提供设置 capability 的入口。
+  function bit is_raw_decode_authorization_active(
+      rdma_hw_rqe_model candidate);
+    return raw_decode_authorization_active &&
+           candidate != null && candidate == active_raw_decode_model;
   endfunction
   // 功能：在 rdma_hw_rqe_codec 中，image_check 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
   // 输入/输出及副作用：b（输入）；image_check 读取 b 的 8 个 qword，校验 RQE 保留位和未使用 qword；函数返回 rdma_status，不取得调用方资源所有权。
@@ -3332,38 +3801,10 @@ class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
     if (!status.ok())
       return status;
 
-    valid_sge_count = 0;
-    valid_payload_len = 0;
-    if (x.external_sgb_descriptor_authority_valid && x.sge_num > 2) begin
-      valid_sge_count = x.sge_num;
-      valid_payload_len = x.payload_len;
-    end
-    else begin
-      foreach (x.sges[i]) begin
-        if (x.sges[i] == null)
-          return err("RQE SGE is null");
-        if (x.sges[i].length != 0) begin
-          if (x.sges[i].length != 32'h8000_0000 &&
-              x.sges[i].length[31])
-            return err("RQE SGE length uses reserved bit 31");
-
-          valid_sge_count++;
-          valid_payload_len += x.sges[i].length;
-        end
-      end
-    end
-
-    // 驱动 queue data 路径为 external SGB 仅保留 32 个 descriptor 槽位；
-    // 在比较 SGE_NUM 或写入 qword 前拒绝更多有效 SGE，避免截断或发布
-    // 驱动无法消费的 RQE image。
-    if (valid_sge_count > RDMA_MAX_WQ_SGE)
-      return err("RQE valid SGE count exceeds driver limit of 32");
-
-    if (valid_payload_len > 64'h8000_0000)
-      return err("RQE payload length exceeds 2 GiB");
-
-    if (x.payload_len != valid_payload_len[31:0])
-      return err("RQE payload length does not match SGE length sum");
+    status = x.resolve_payload_authority(
+        valid_sge_count, valid_payload_len);
+    if (!status.ok())
+      return status;
 
     // wr.c selects inline RQE storage for at most two valid SGEs.  A nonzero
     // SGB_PA is the explicit model-side request for the external SGB layout,
@@ -3390,25 +3831,14 @@ class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
           descriptor_bytes.push_back(x.external_sgb_descriptor_bytes[i]);
       end
       else begin
-        if (x.sge_num != valid_sge_count)
-          return err("RQE external SGE count does not match SGE_NUM");
-        foreach (x.sges[i]) begin
-          bit [31:0] descriptor_length;
+        byte unsigned typed_descriptor_bytes[];
 
-          if (x.sges[i].length == 0)
-            continue;
-          descriptor_length = x.sges[i].length == 32'h8000_0000 ?
-                              32'b0 : x.sges[i].length;
-          for (int unsigned byte_index = 0; byte_index < 4; byte_index++)
-            descriptor_bytes.push_back(
-                descriptor_length[31 - byte_index * 8 -: 8]);
-          for (int unsigned byte_index = 0; byte_index < 4; byte_index++)
-            descriptor_bytes.push_back(
-                x.sges[i].lkey[31 - byte_index * 8 -: 8]);
-          for (int unsigned byte_index = 0; byte_index < 8; byte_index++)
-            descriptor_bytes.push_back(
-                x.sges[i].iova.value[63 - byte_index * 8 -: 8]);
-        end
+        status = x.build_typed_sgb_descriptor_bytes(
+            typed_descriptor_bytes);
+        if (!status.ok())
+          return status;
+        foreach (typed_descriptor_bytes[i])
+          descriptor_bytes.push_back(typed_descriptor_bytes[i]);
         if (descriptor_bytes.size() != int'(x.sge_num) * 16)
           return err("RQE external SGB descriptor bytes are unavailable");
       end
@@ -3559,8 +3989,16 @@ class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
     `RQGET(RDMA_RQE_PAYLOAD_LEN, x.payload_len)
     `RQGET(RDMA_RQE_SIGNATURE, x.signature)
     `RQGET(RDMA_RQE_SGE_NUM, x.sge_num)
-    if (!inline_mode)
+    if (!inline_mode) begin
       `RQGET(RDMA_RQE_SGB_PA, x.sgb_pa)
+      raw_decode_authorization_active = 1'b1;
+      active_raw_decode_model = x;
+      status = x.mark_decoded_raw_sgb_provenance(this);
+      raw_decode_authorization_active = 1'b0;
+      active_raw_decode_model = null;
+      if (!status.ok())
+        return status;
+    end
 
     `undef RQGET
     model = x;

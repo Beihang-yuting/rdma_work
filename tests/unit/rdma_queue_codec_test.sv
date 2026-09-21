@@ -376,6 +376,8 @@ class rdma_queue_codec_test extends uvm_test;
     rdma_hw_rqe_model rq;
     rdma_hw_rqe_model rq2;
     rdma_hw_rqe_model rq_external_mismatch;
+    rdma_hw_rqe_model rq_forged_external;
+    rdma_hw_rqe_model rq_fresh_raw;
     rdma_hw_rqe_model rq_count_overflow;
     rdma_hw_rqe_model rq_payload_mismatch;
     rdma_hw_rqe_model rq_zero_sentinel;
@@ -423,6 +425,8 @@ class rdma_queue_codec_test extends uvm_test;
     bit [54:0] previous_sgb_pa;
     bit [7:0] expected_rqe_signature;
     byte unsigned rqe_descriptor_bytes[$];
+    byte unsigned forged_rqe_descriptor_bytes[$];
+    byte unsigned short_rqe_descriptor_bytes[$];
     rdma_hw_image rqe_bad_signature_image;
     rdma_hw_rqe_codec rqe_codec;
     phase.raise_objection(this);
@@ -1519,6 +1523,89 @@ class rdma_queue_codec_test extends uvm_test;
         else
           eq_bytes("rq external descriptor round-trip", im, im2);
       end
+
+      // fresh model 没有 codec decode-active capability；即使拿到同一个 idle
+      // codec handle，也不能直接建立 raw provenance 或注入 detached descriptors。
+      rq_fresh_raw = rdma_hw_rqe_model::type_id::create(
+          "rq_fresh_raw_provenance");
+      s = rq_fresh_raw.mark_decoded_raw_sgb_provenance(rqe_codec);
+      if (s == null || s.ok())
+        `uvm_error("RQE_FRESH_RAW_PROVENANCE",
+                   "fresh model forged raw provenance outside decode")
+
+      // typed model 即使携带 external descriptor bytes，也必须与 detached
+      // SGE 的 count、payload 和每个 descriptor 完全一致；不能靠公开 authority
+      // 字段绕过 canonical typed source。
+      rq_forged_external = rdma_hw_rqe_model::type_id::create(
+          "rq_forged_typed_external");
+      rq_forged_external.copy(rq);
+      forged_rqe_descriptor_bytes.delete();
+      foreach (rqe_descriptor_bytes[i])
+        forged_rqe_descriptor_bytes.push_back(rqe_descriptor_bytes[i]);
+      forged_rqe_descriptor_bytes[0] ^= 8'h01;
+      s = rq_forged_external.set_external_sgb_descriptor_bytes(
+          forged_rqe_descriptor_bytes);
+      if (s == null || s.ok())
+        `uvm_error("RQE_TYPED_EXTERNAL_AUTHORITY",
+                   "typed RQE accepted descriptor bytes that disagree with SGE");
+      s = rq_forged_external.set_external_sgb_descriptor_bytes(
+          rqe_descriptor_bytes);
+      ok("rq typed external authority install", s);
+      if (s != null && s.ok()) begin
+        rq_forged_external.sges[0].lkey ^= 32'h1;
+        s = c.encode(rq_forged_external, im2);
+        if (s == null || s.ok())
+          `uvm_error("RQE_TYPED_EXTERNAL_MUTATION",
+                     "typed SGE mutation bypassed frozen external authority")
+      end
+
+      // raw decode 的 provenance、count/payload snapshot 和 descriptor snapshot
+      // 必须共同生效；任一 public wire/descriptor mutation 都要求先 clear 后重授权。
+      if (!rq2.has_decoded_raw_sgb_provenance())
+        `uvm_error("RQE_RAW_PROVENANCE",
+                   "external raw decode did not retain detached provenance")
+      rq2.sge_num = 8'd4;
+      s = c.encode(rq2, im2);
+      if (s == null || s.ok())
+        `uvm_error("RQE_RAW_COUNT_MUTATION",
+                   "raw authority accepted mutated SGE_NUM")
+      rq2.sge_num = 8'd3;
+      rq2.payload_len = 32'd25;
+      s = c.encode(rq2, im2);
+      if (s == null || s.ok())
+        `uvm_error("RQE_RAW_PAYLOAD_MUTATION",
+                   "raw authority accepted mutated payload length")
+      rq2.payload_len = 32'd24;
+      rq2.external_sgb_descriptor_bytes[0] ^= 8'h01;
+      s = c.encode(rq2, im2);
+      if (s == null || s.ok())
+        `uvm_error("RQE_RAW_DESCRIPTOR_MUTATION",
+                   "raw authority accepted mutated descriptor bytes")
+      rq2.external_sgb_descriptor_bytes[0] = rqe_descriptor_bytes[0];
+      rq2.clear_external_sgb_descriptor_authority();
+      s = c.encode(rq2, im2);
+      if (s == null || s.ok())
+        `uvm_error("RQE_RAW_CLEAR_REAUTHORIZE",
+                   "cleared raw descriptor authority unexpectedly encoded")
+      s = rq2.set_external_sgb_descriptor_bytes(rqe_descriptor_bytes);
+      ok("rq raw descriptor re-authorize", s);
+      if (s != null && s.ok()) begin
+        s = c.encode(rq2, im2);
+        ok("rq raw descriptor re-authorized encode", s);
+      end
+      rq2.sge_num = 8'd33;
+      s = rq2.set_external_sgb_descriptor_bytes(rqe_descriptor_bytes);
+      if (s == null || s.ok())
+        `uvm_error("RQE_RAW_COUNT_LIMIT",
+                   "raw authority setter accepted more than 32 descriptors")
+      rq2.sge_num = 8'd3;
+      short_rqe_descriptor_bytes.delete();
+      for (int unsigned short_i = 0; short_i < 16; short_i++)
+        short_rqe_descriptor_bytes.push_back(8'h00);
+      s = rq2.set_external_sgb_descriptor_bytes(short_rqe_descriptor_bytes);
+      if (s == null || s.ok())
+        `uvm_error("RQE_RAW_DESCRIPTOR_LENGTH",
+                   "raw authority setter accepted a truncated descriptor array")
     end
 
     // RED：驱动 wr.c 的 SGE wire 长度只有低 31 位，bit31 是 reserved；

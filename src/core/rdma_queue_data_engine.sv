@@ -4826,12 +4826,13 @@ class rdma_queue_data_engine extends uvm_object;
   endfunction
 
   // 功能：make_rqe 把 receive request 与 QP route/cursor 投影为可编码 RQE，
-  //   深复制每个 SGE 并计算 32-bit payload length。
+  //   深复制每个 SGE，并通过 rdma_hw_rqe_model 的 canonical authority helper
+  //   统一派生有效 SGE 数与 32-bit payload length。
   // 输入/输出及副作用：request、link、cursor 为输入，model 先置 null；成功返回
   //   detached RQE model，不写 backing、不提交 PI 或取得 request/SGE 所有权。
-  // 失败/边界：输入为空、SGE 为 null、payload 总长溢出 32 bit 或最终
-  //   model.validate 失败时返回错误；零长度 SGE 会被保留在 detached 列表中但
-  //   从 payload_len/SGE_NUM 统计中滤除；任一失败都不发布半成品 model。
+  // 失败/边界：输入为空、SGE 为 null、raw 列表超过 32 项、reserved bit31 长度
+  //   或有效 payload 超过 2GiB 时返回错误；零长度 SGE 会保留在 detached 列表中
+  //   但从 payload_len/SGE_NUM 统计中滤除；任一失败都不发布半成品 model。
   protected function rdma_status make_rqe(
     rdma_post_recv_req request,
     rdma_queue_data_qp_link link,
@@ -4841,7 +4842,8 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_sge cloned_sge;
     rdma_hw_rqe_model candidate;
     rdma_status status;
-    longint unsigned payload_len;
+    int unsigned valid_sge_count;
+    longint unsigned valid_payload_len;
 
     model = null;
 
@@ -4864,7 +4866,6 @@ class rdma_queue_data_engine extends uvm_object;
     candidate.valid = 1'b1;
     candidate.sge_num = 0;
 
-    payload_len = 0;
     foreach (request.sges[i]) begin
       if (request.sges[i] == null)
         return bad("RQE request contains a null SGE");
@@ -4874,16 +4875,17 @@ class rdma_queue_data_engine extends uvm_object;
         return bad("RQE SGE allocation failed", RDMA_SC_INVALID_STATE);
       cloned_sge.copy(request.sges[i]);
       candidate.sges.push_back(cloned_sge);
-
-      if (request.sges[i].length == 0)
-        continue;
-      if (payload_len > 64'hffff_ffff - request.sges[i].length)
-        return bad("RQE payload length exceeds 32 bits");
-      payload_len += request.sges[i].length;
-      candidate.sge_num++;
     end
 
-    candidate.payload_len = payload_len;
+    status = candidate.derive_typed_sge_authority(
+        valid_sge_count, valid_payload_len);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("RQE canonical SGE authority returned null status",
+            RDMA_SC_INVALID_STATE) :
+        status;
+    candidate.sge_num = valid_sge_count;
+    candidate.payload_len = valid_payload_len[31:0];
     status = candidate.validate();
     if (status == null || !status.ok())
       return status == null ?
@@ -4973,19 +4975,23 @@ class rdma_queue_data_engine extends uvm_object;
   endfunction
 
   // 功能：write_sgb_and_verify 为 SQE 的外置 SGB 构造 512-byte 大端槽位，并
-  //   完成 host-memory 写入/回读校验。
-  // 输入/输出及副作用：link/model 为输入；link.sq_sgb_access 指向借用的
-  // QP SGB backing，函数只写入该 backing，并把原始 SGE 列表中的有效描述符
-  // 压紧到连续槽位。
-  // 失败/边界：缺少 SGB authority、原始 SGE 数超过 32、IOVA 未按 512 对齐
-  // 或超出 mapping 范围、后端写入/回读失败时返回 DMA/INVALID_STATE，调用方
-  // 不得推进 PI。
+  //   完成 host-memory 写入/回读校验；inline payload 的字节源与 codec 签名
+  //   共用 rdma_hw_sqe_model 的 authority resolver，避免 image 与 backing 分叉。
+  // 输入/输出及副作用：link/model/cursor 为输入；link.sq_sgb_access 指向借用的
+  // QP SGB backing，函数只写入该 backing，并把 inline 快照或原始 SGE 列表中的
+  // 有效描述符压紧到连续槽位，不取得 model、SGE 或 mapping 的所有权。
+  // 失败/边界：inline_bytes 与 payload 冲突、model 不是 external-SGB mode、缺少
+  // SGB authority、原始 SGE 数超过 32、IOVA 未按 512 对齐或超出 mapping 范围、
+  // 后端写入/回读失败时返回对应 INVALID_ARGUMENT/DMA/INVALID_STATE，失败前不
+  // 写 Host-memory，调用方不得推进 PI。
   protected function rdma_status write_sgb_and_verify(
       rdma_queue_data_qp_link link, rdma_hw_sqe_model model,
       rdma_queue_cursor_snapshot cursor);
     byte data[];
     byte readback[];
+    byte unsigned inline_payload[];
     rdma_status status;
+    rdma_sq_payload_mode_e payload_mode;
     bit [31:0] len;
     bit [31:0] key;
     bit [63:0] va;
@@ -4994,6 +5000,18 @@ class rdma_queue_data_engine extends uvm_object;
     if (link == null || model == null || cursor == null ||
         link.sq_sgb_access == null)
       return bad("SQE SGB backing authority is unavailable", RDMA_SC_INVALID_STATE);
+
+    status = model.validate_inline_payload_authority();
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("SQE inline payload authority returned null status",
+            RDMA_SC_INVALID_STATE) :
+        status;
+    payload_mode = model.derive_payload_mode();
+    if (!(payload_mode inside {RDMA_SQ_PAYLOAD_INLINE_SGB,
+                               RDMA_SQ_PAYLOAD_SGE_SGB}))
+      return bad("SQE SGB writer received a non-external payload mode",
+                 RDMA_SC_INVALID_ARGUMENT);
     if (model.sgb_iova.value == 0 ||
         (model.sgb_iova.value & 64'h1ff) != 0)
       return bad("SQE SGB IOVA is not 512-byte aligned",
@@ -5042,11 +5060,17 @@ class rdma_queue_data_engine extends uvm_object;
         return bad("SQE SGB IOVA does not resolve to backing slot",
                    RDMA_SC_DMA_TRANSLATION);
     end
-    if (model.inline_data) begin
-      if (model.payload.size() > 512)
+    if (payload_mode == RDMA_SQ_PAYLOAD_INLINE_SGB) begin
+      status = model.resolve_inline_payload_authority(inline_payload);
+      if (status == null || !status.ok())
+        return status == null ?
+          bad("SQE inline payload resolver returned null status",
+              RDMA_SC_INVALID_STATE) :
+          status;
+      if (inline_payload.size() > 512)
         return bad("SQE inline SGB exceeds 512 bytes");
-      foreach (model.payload[i])
-        data[i] = model.payload[i];
+      foreach (inline_payload[i])
+        data[i] = inline_payload[i];
     end else begin
       // 驱动先依据原始 wr->num_sge 做上限检查，再跳过 length==0 的
       // 条目；descriptor_index 只在有效条目上递增，保证后续 SGE

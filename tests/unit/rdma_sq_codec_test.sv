@@ -181,6 +181,46 @@ class rdma_sq_codec_test extends uvm_test;
       sgb.push_back(i < 33 ? i : 0);
     if (image != null && !signature_is_ff(image, sgb))
       `uvm_error("RC_SGB_SIG", "RC SGB signature XOR is not 8'hff")
+
+    // F2 RED/GREEN：inline_bytes 与通用 payload 都是 detached 输入时，codec 和
+    // queue-data writer 必须共享同一份字节 authority；冲突不得由其中一路静默
+    // 覆盖，恢复一致后则应继续生成同一份 512B SGB signature。
+    // 功能：先注入首字节分叉验证拒绝，再恢复逐字节一致并验证 33-byte inline-SGB
+    //       的 signature 覆盖 literal bytes 与零填充，而不是只读取 payload。
+    // 输入/输出及副作用：authority_sqe、authority_image 和 authority_sgb 都是
+    //       本地 fixture；encode 只发布 detached image，不写 Host-memory 或外部资源。
+    // 失败/边界：双源非空且任一长度/byte 不一致时必须返回 INVALID_ARGUMENT 并把
+    //       image 保持 null；恢复一致后编码失败或 signature 非 8'hff 均报告回归。
+    begin
+      rdma_hw_sqe_model authority_sqe;
+      rdma_hw_image authority_image;
+      rdma_status authority_status;
+      byte unsigned authority_sgb[$];
+
+      authority_sqe = make_rc_inline_request(33);
+      authority_sqe.sgb_iova.value = 64'h4000;
+      foreach (authority_sqe.inline_bytes[i])
+        authority_sqe.payload.push_back(authority_sqe.inline_bytes[i]);
+      authority_sqe.payload[0] = authority_sqe.payload[0] ^ 8'hff;
+      authority_image = null;
+      authority_status = encode_rc_sqe(authority_sqe, authority_image);
+      if (authority_status == null || authority_status.ok() ||
+          authority_image != null)
+        `uvm_error("RC_INLINE_AUTHORITY_CONFLICT",
+                   "conflicting inline_bytes/payload sources were accepted")
+
+      authority_sqe.payload[0] = authority_sqe.inline_bytes[0];
+      authority_status = encode_rc_sqe(authority_sqe, authority_image);
+      authority_sgb.delete();
+      for (int unsigned i = 0; i < 512; i++)
+        authority_sgb.push_back(i < 33 ? i : 0);
+      if (authority_status == null || !authority_status.ok() ||
+          authority_image == null ||
+          !signature_is_ff(authority_image, authority_sgb))
+        `uvm_error("RC_INLINE_AUTHORITY_MATCH",
+                   "matching inline sources did not produce shared SGB signature")
+    end
+
     begin
       byte unsigned malformed_sgb[$];
       bit malformed_valid;
