@@ -4833,6 +4833,73 @@ class rdma_resource_manager extends uvm_object;
                              "resource handle has been released");
   endfunction
 
+  // 设计说明：local-resource lookup 的 registry 遍历只负责观察 owner、generation、
+  // local-id 和生命周期状态；project_resource_value 会触发 factory/快照复制，不能
+  // 在“多个 live 命中”的歧义分支中提前执行。把只读匹配与 detached 投影分开，既
+  // 保留 generation 优先级，也让 caller 在确认唯一 live candidate 后才发布 resource。
+  // 功能：scan_local_resource_matches 按 trusted_owner、kind 和完整 local_id 扫描
+  //   registry，收集唯一 live candidate 以及 stale/released/multiple 状态证据。
+  // 输入/输出及副作用：trusted_owner、kind、local_id 为已完成前置校验的输入；
+  //   live_candidate、found_live、found_released、found_stale、multiple_live 为输出。
+  //   helper 只读取 registry 和 resource 字段，不创建 rdma_status、不投影快照、不改写
+  //   registry，也不取得任何 resource 或外部 backing 的所有权。
+  // 失败/边界：null/错误 kind、owner 或越界 local_id 由 caller 处理；匹配到旧 generation
+  //   只置 found_stale，RELEASED 只对同一 local_id 置 found_released，NEW/ERROR 跳过；
+  //   第二个 live 命中置 multiple_live 并停止扫描，caller 必须在投影前返回歧义错误。
+  protected function void scan_local_resource_matches(
+    rdma_function_handle trusted_owner,
+    rdma_resource_kind_e kind,
+    int unsigned local_id,
+    output rdma_resource live_candidate,
+    output bit found_live,
+    output bit found_released,
+    output bit found_stale,
+    output bit multiple_live
+  );
+    rdma_resource candidate;
+    int unsigned candidate_local_id;
+
+    live_candidate = null;
+    found_live = 1'b0;
+    found_released = 1'b0;
+    found_stale = 1'b0;
+    multiple_live = 1'b0;
+
+    foreach (registry[key]) begin
+      candidate = registry[key];
+      if (candidate == null || candidate.handle == null ||
+          candidate.handle.kind != kind || candidate.owner == null)
+        continue;
+
+      if (candidate.owner.function_uid != trusted_owner.function_uid ||
+          candidate.owner.object_id != trusted_owner.object_id)
+        continue;
+
+      if (candidate.owner.generation != trusted_owner.generation) begin
+        found_stale = 1'b1;
+        continue;
+      end
+
+      candidate_local_id = resource_local_id(candidate);
+      if (candidate_local_id != local_id)
+        continue;
+
+      if (candidate.state == RDMA_RESOURCE_RELEASED) begin
+        found_released = 1'b1;
+        continue;
+      end
+      if (candidate.state inside {RDMA_RESOURCE_NEW, RDMA_RESOURCE_ERROR})
+        continue;
+      if (found_live) begin
+        multiple_live = 1'b1;
+        return;
+      end
+
+      live_candidate = candidate;
+      found_live = 1'b1;
+    end
+  endfunction
+
   // 功能：lookup_local_resource 按当前 Function owner、资源 kind 和完整 local_id
   //   反查唯一权威资源，供 AEQE/CEQE 等 wire owner route 使用。
   // 输入/输出及副作用：owner、kind、local_id 为输入，resource 为 detached 输出；
@@ -4849,13 +4916,13 @@ class rdma_resource_manager extends uvm_object;
     output rdma_resource resource
   );
     rdma_function_handle trusted_owner;
-    rdma_resource candidate;
+    rdma_resource live_candidate;
     rdma_resource projected;
     rdma_status status;
-    int unsigned candidate_local_id;
     bit found_live;
     bit found_released;
     bit found_stale;
+    bit multiple_live;
 
     resource = null;
 
@@ -4886,39 +4953,20 @@ class rdma_resource_manager extends uvm_object;
         "lookup local resource owner status is unavailable"
       ) : status;
 
-    foreach (registry[key]) begin
-      candidate = registry[key];
-      if (candidate == null || candidate.handle == null ||
-          candidate.handle.kind != kind || candidate.owner == null)
-        continue;
+    scan_local_resource_matches(
+      trusted_owner, kind, local_id, live_candidate, found_live,
+      found_released, found_stale, multiple_live
+    );
 
-      if (candidate.owner.function_uid != trusted_owner.function_uid ||
-          candidate.owner.object_id != trusted_owner.object_id)
-        continue;
+    if (multiple_live)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "lookup local resource found multiple live matches"
+      );
 
-      if (candidate.owner.generation != trusted_owner.generation) begin
-        found_stale = 1'b1;
-        continue;
-      end
-
-      candidate_local_id = resource_local_id(candidate);
-      if (candidate_local_id != local_id)
-        continue;
-
-      if (candidate.state == RDMA_RESOURCE_RELEASED) begin
-        found_released = 1'b1;
-        continue;
-      end
-      if (candidate.state inside {RDMA_RESOURCE_NEW, RDMA_RESOURCE_ERROR})
-        continue;
-      if (found_live)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "lookup local resource found multiple live matches"
-        );
-
+    if (found_live) begin
       status = project_resource_value(
-        candidate, "lookup local resource", projected
+        live_candidate, "lookup local resource", projected
       );
       if (status == null || !status.ok() || projected == null)
         return status == null ? rdma_status::make(
@@ -4926,7 +4974,6 @@ class rdma_resource_manager extends uvm_object;
           "lookup local resource projection failed"
         ) : status;
       resource = projected;
-      found_live = 1'b1;
     end
 
     if (found_live)
