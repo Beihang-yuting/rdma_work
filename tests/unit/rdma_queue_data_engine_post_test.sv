@@ -52,6 +52,91 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
     return prepare_consumer_doorbell(
       attachment, next, null, prepared_desc, prepared_status);
   endfunction
+
+  // 功能：probe_write_sgb_after_model_mutation 通过真实 SQ attachment 生成并
+  //   编码一个 external-SGB SQE，然后在 image 已签名后按指定类别篡改 detached
+  //   model，调用生产 write_sgb_and_verify 验证 canonical gate 与 signature gate。
+  // 输入/输出及副作用：request、mutate_count、mutate_mode、mutate_descriptor 为
+  //   输入；函数只可能写入当前 SQ SGB slot，返回 writer status；它不 reserve/commit
+  //   runtime cursor，也不推进 PI、doorbell 或 recovery ledger，调用方负责比较
+  //   Host-memory trace 并释放 fixture attachment。
+  // 失败/边界：request/route/attachment、三项 SGE、SGB mapping、model/image 编码
+  //   任一缺失或失败时原样返回；mutation 会在首次 writer Host-memory write 前
+  //   被 canonical count/mode 或 SQ signature 拒绝，未授权的非 external-SGB model
+  //   不能被该 probe 当作成功写入。
+  function rdma_status probe_write_sgb_after_model_mutation(
+    rdma_post_send_req request,
+    bit mutate_count,
+    bit mutate_mode,
+    bit mutate_descriptor
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_queue_data_qp_link link;
+    rdma_queue_cursor_snapshot cursor;
+    rdma_hw_sqe_model model;
+    rdma_hw_image image;
+    rdma_status status;
+    string variant;
+
+    if (request == null || request.qp_h == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "SGB mutation probe request is null");
+
+    status = lookup_attachment(request.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                               attachment);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "SGB mutation probe SQ lookup returned null status") :
+        status;
+    if (!qp_links.exists(identity_key(request.qp_h)) ||
+        qp_links[identity_key(request.qp_h)] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "SGB mutation probe QP route is unavailable");
+    link = qp_links[identity_key(request.qp_h)];
+
+    cursor = rdma_queue_cursor_snapshot::type_id::create(
+      "sgb_mutation_probe_cursor");
+    if (cursor == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "SGB mutation probe cursor allocation failed");
+    cursor.index = 0;
+    cursor.wrap = 1'b0;
+
+    status = make_sqe(request, link, cursor, model);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "SGB mutation probe SQE construction returned null") :
+        status;
+    case (request.transport)
+      RDMA_TRANSPORT_RC: variant = "rc";
+      RDMA_TRANSPORT_UD: variant = "ud";
+      RDMA_TRANSPORT_URC: variant = "urc";
+      default: return rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        "SGB mutation probe transport is unsupported");
+    endcase
+    status = encode_queue_model(model, RDMA_IMAGE_SQE, "sqe", variant, image);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(RDMA_SC_CODEC_ERROR,
+                          "SGB mutation probe SQE encode returned null") :
+        status;
+
+    if (mutate_count)
+      model.sge_num = model.sge_num + 8'd1;
+    if (mutate_mode)
+      model.payload_mode = RDMA_SQ_PAYLOAD_SGE_WQE;
+    if (mutate_descriptor) begin
+      if (model.sges.size() == 0 || model.sges[0] == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "SGB mutation probe has no descriptor");
+      model.sges[0].length = model.sges[0].length + 32'd8;
+    end
+
+    return write_sgb_and_verify(link, model, cursor, image);
+  endfunction
 endclass
 
 class rdma_queue_data_engine_fixture extends uvm_object;
@@ -1332,6 +1417,137 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_sgb_writer_rejects_post_encode_mutation 验证 SQ external-SGB
+  //   writer 在 image 已签名后仍以 canonical authority 保护首次 backing write：
+  //   分别篡改 sge_num、payload_mode，以及保持 count 不变但改写 descriptor length。
+  // 输入/输出及副作用：任务创建使用真实 attachment/codec registry 的 probe fixture，
+  //   读取 Host-memory call trace；每个 mutation 只生成 detached model，不 reserve
+  //   runtime、不推进 PI/doorbell，也不取得 SGE、mapping 或 fixture 资源所有权。
+  // 失败/边界：fixture/probe/SGB route 缺失、任一 mutation 返回 OK、status 为空，
+  //   或首次 writer 调用新增任何 Host-memory call（尤其 512-byte SGB/64-byte SQ
+  //   write）均报告错误；mode mutation 可返回 INVALID_ARGUMENT，count/descriptor
+  //   mutation 预期返回 INVALID_STATE，但三者都必须在写入前 fail-closed。
+  task automatic check_sgb_writer_rejects_post_encode_mutation();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_probe probe;
+    rdma_post_send_req request;
+    rdma_sge sge;
+    rdma_status status;
+    rdma_status cleanup_status;
+    longint unsigned sgb_base;
+    int unsigned trace_start;
+    int unsigned write_calls;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "sgb_mutation_fixture");
+    begin : sgb_mutation_flow
+      if (fixture == null) begin
+        `uvm_error("SGB_MUTATION_FIXTURE", "fixture allocation failed")
+        disable sgb_mutation_flow;
+      end
+      // use_prepare_probe 只暴露受保护 writer；所有 route、mapping、codec 和
+      // lifecycle authority 仍由生产 fixture 建立，测试不复制 queue admission。
+      fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b0, 1'b0, 1'b1);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SGB_MUTATION_FIXTURE", status == null ? "null setup status" :
+                   status.convert2string())
+        disable sgb_mutation_flow;
+      end
+      if (!$cast(probe, fixture.engine) || probe == null) begin
+        `uvm_error("SGB_MUTATION_PROBE", "fixture did not create writer probe")
+        disable sgb_mutation_flow;
+      end
+
+      request = fixture.make_send(64'h0bad_f00d_0000_0010);
+      request.sges.delete();
+      for (int unsigned i = 0; i < 3; i++) begin
+        sge = rdma_sge::type_id::create($sformatf("sgb_mutation_sge%0d", i));
+        sge.iova.value = 64'h0000_1000_0000_2000 + i * 64;
+        sge.length = 8;
+        sge.lkey = 32'hb0b0_b000 + i;
+        request.sges.push_back(sge);
+      end
+      sgb_base = fixture.qp.qp_plan.sq_sgb_ref.mapping.iova.value +
+                 fixture.qp.qp_plan.sq_sgb_ref.mapping_offset;
+      request.sgb_iova.value = sgb_base;
+
+      trace_start = fixture.mem.calls.size();
+      status = probe.probe_write_sgb_after_model_mutation(
+        request, 1'b0, 1'b0, 1'b0);
+      write_calls = 0;
+      for (int unsigned i = trace_start; i < fixture.mem.calls.size(); i++)
+        if (fixture.mem.calls[i] != null &&
+            fixture.mem.calls[i].method_name == "write")
+          write_calls++;
+      if (status == null || !status.ok() || fixture.mem.calls.size() <= trace_start ||
+          write_calls == 0)
+        `uvm_error("SGB_MUTATION_BASELINE",
+                   status == null ? "baseline writer returned null status" :
+                   $sformatf("baseline status=%s calls=%0d writes=%0d",
+                             status.convert2string(),
+                             fixture.mem.calls.size() - trace_start,
+                             write_calls))
+
+      trace_start = fixture.mem.calls.size();
+      status = probe.probe_write_sgb_after_model_mutation(
+        request, 1'b1, 1'b0, 1'b0);
+      write_calls = 0;
+      for (int unsigned i = trace_start; i < fixture.mem.calls.size(); i++)
+        if (fixture.mem.calls[i] != null &&
+            fixture.mem.calls[i].method_name == "write")
+          write_calls++;
+      if (status == null || status.ok() || fixture.mem.calls.size() != trace_start ||
+          write_calls != 0)
+        `uvm_error("SGB_MUTATION_COUNT",
+                   status == null ? "count mutation returned null status" :
+                   $sformatf("count mutation status=%s calls=%0d writes=%0d",
+                             status.convert2string(),
+                             fixture.mem.calls.size() - trace_start,
+                             write_calls))
+
+      trace_start = fixture.mem.calls.size();
+      status = probe.probe_write_sgb_after_model_mutation(
+        request, 1'b0, 1'b1, 1'b0);
+      write_calls = 0;
+      for (int unsigned i = trace_start; i < fixture.mem.calls.size(); i++)
+        if (fixture.mem.calls[i] != null &&
+            fixture.mem.calls[i].method_name == "write")
+          write_calls++;
+      if (status == null || status.ok() || fixture.mem.calls.size() != trace_start ||
+          write_calls != 0)
+        `uvm_error("SGB_MUTATION_MODE",
+                   status == null ? "mode mutation returned null status" :
+                   $sformatf("mode mutation status=%s calls=%0d writes=%0d",
+                             status.convert2string(),
+                             fixture.mem.calls.size() - trace_start,
+                             write_calls))
+
+      trace_start = fixture.mem.calls.size();
+      status = probe.probe_write_sgb_after_model_mutation(
+        request, 1'b0, 1'b0, 1'b1);
+      write_calls = 0;
+      for (int unsigned i = trace_start; i < fixture.mem.calls.size(); i++)
+        if (fixture.mem.calls[i] != null &&
+            fixture.mem.calls[i].method_name == "write")
+          write_calls++;
+      if (status == null || status.ok() || fixture.mem.calls.size() != trace_start ||
+          write_calls != 0)
+        `uvm_error("SGB_MUTATION_DESCRIPTOR",
+                   status == null ? "descriptor mutation returned null status" :
+                   $sformatf("descriptor mutation status=%s calls=%0d writes=%0d",
+                             status.convert2string(),
+                             fixture.mem.calls.size() - trace_start,
+                             write_calls))
+    end
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("SGB_MUTATION_CLEANUP", cleanup_status == null ?
+                   "fixture cleanup returned null" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：check_sgb_filters_zero_length_descriptors 验证 SQ external-SGB
   //   mixed-zero post 把同一 result.index 的 64-byte header 与 512-byte backing
   //   联合持久化：header 发布三个有效描述符、48-byte TPL 和精确 SGB_PA，backing
@@ -2370,6 +2586,7 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       check_transport_link_mismatch();
       check_ud_inline_capacity_admission();
       check_sgb_recovery_replays_slot();
+      check_sgb_writer_rejects_post_encode_mutation();
       check_sgb_filters_zero_length_descriptors();
       check_qpc_shadow_sq_gate();
       check_recv_owner_authority();

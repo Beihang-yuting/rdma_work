@@ -4975,29 +4975,43 @@ class rdma_queue_data_engine extends uvm_object;
   endfunction
 
   // 功能：write_sgb_and_verify 为 SQE 的外置 SGB 构造 512-byte 大端槽位，并
-  //   完成 host-memory 写入/回读校验；inline payload 的字节源与 codec 签名
-  //   共用 rdma_hw_sqe_model 的 authority resolver，避免 image 与 backing 分叉。
-  // 输入/输出及副作用：link/model/cursor 为输入；link.sq_sgb_access 指向借用的
-  // QP SGB backing，函数只写入该 backing，并把 inline 快照或原始 SGE 列表中的
-  // 有效描述符压紧到连续槽位，不取得 model、SGE 或 mapping 的所有权。
-  // 失败/边界：inline_bytes 与 payload 冲突、model 不是 external-SGB mode、缺少
-  // SGB authority、原始 SGE 数超过 32、IOVA 未按 512 对齐或超出 mapping 范围、
-  // 后端写入/回读失败时返回对应 INVALID_ARGUMENT/DMA/INVALID_STATE，失败前不
-  // 写 Host-memory，调用方不得推进 PI。
+  //   完成 host-memory 写入/回读校验；写入前重新解析共享 payload authority，
+  //   以 canonical mode/count 拦截 encode 后的 model mutation；inline payload
+  //   的字节源与 codec 签名共用 rdma_hw_sqe_model 的 authority resolver，避免
+  //   image 与 backing 分叉。
+  // 输入/输出及副作用：link/model/cursor/image 为输入；image 是同一 model
+  //   已编码并签名的 64-byte SQE 快照；link.sq_sgb_access 指向借用的 QP SGB
+  //   backing，函数只写入该 backing，并把 inline 快照或原始 SGE 列表中的有效
+  //   描述符压紧到连续槽位，不取得 model、SGE、image 或 mapping 的所有权。
+  // 失败/边界：inline_bytes 与 payload 冲突、model 不是 external-SGB mode、
+  //   canonical mode/count 与 model.sge_num 不一致、压紧后的 descriptor_index
+  //   未覆盖全部 canonical SGE、缺少 SGB authority、原始 SGE 数超过 32、IOVA
+  //   未按 512 对齐或超出 mapping 范围、后端写入/回读失败时返回对应
+  //   INVALID_ARGUMENT/DMA/INVALID_STATE；image 缺失或其既有 signature 与构造出的
+  //   512-byte data 不一致时也在首个 Host-memory write 前拒绝，调用方不得推进 PI。
+  //   本 gate 不重新解析所有 opcode/remote/control header 字段，也不接受“重写
+  //   header 后自行重算 signature”作为新的 authority；写入中途失败仍按既有
+  //   recovery 证据处理。
   protected function rdma_status write_sgb_and_verify(
       rdma_queue_data_qp_link link, rdma_hw_sqe_model model,
-      rdma_queue_cursor_snapshot cursor);
+      rdma_queue_cursor_snapshot cursor, rdma_hw_image image);
     byte data[];
     byte readback[];
     byte unsigned inline_payload[];
+    byte unsigned signature_sgb[$];
     rdma_status status;
     rdma_sq_payload_mode_e payload_mode;
+    rdma_sq_payload_mode_e canonical_mode;
+    int unsigned valid_sge_count;
+    int unsigned inline_payload_bytes;
+    int unsigned canonical_sge_num;
+    bit inline_bytes_are_authority;
     bit [31:0] len;
     bit [31:0] key;
     bit [63:0] va;
     longint unsigned sgb_offset;
     int unsigned descriptor_index;
-    if (link == null || model == null || cursor == null ||
+    if (link == null || model == null || cursor == null || image == null ||
         link.sq_sgb_access == null)
       return bad("SQE SGB backing authority is unavailable", RDMA_SC_INVALID_STATE);
 
@@ -5007,7 +5021,17 @@ class rdma_queue_data_engine extends uvm_object;
         bad("SQE inline payload authority returned null status",
             RDMA_SC_INVALID_STATE) :
         status;
-    payload_mode = model.derive_payload_mode();
+    // Encode 与 SGB writer 必须复用同一 authority derivation。这里不信任
+    // caller 在 encode 后可能改写的 sge_num，也不让 writer 按自身遍历结果
+    // 静默重算 wire count；任何漂移都在首次 Host-memory write 前 fail-closed。
+    model.derive_payload_authority(canonical_mode, valid_sge_count,
+                                   inline_payload_bytes,
+                                   inline_bytes_are_authority,
+                                   canonical_sge_num);
+    payload_mode = canonical_mode;
+    if (canonical_sge_num > 8'hff || model.sge_num != canonical_sge_num)
+      return bad("SQE SGB canonical payload count changed before write",
+                 RDMA_SC_INVALID_STATE);
     if (!(payload_mode inside {RDMA_SQ_PAYLOAD_INLINE_SGB,
                                RDMA_SQ_PAYLOAD_SGE_SGB}))
       return bad("SQE SGB writer received a non-external payload mode",
@@ -5099,6 +5123,28 @@ class rdma_queue_data_engine extends uvm_object;
 
         descriptor_index++;
       end
+      if (descriptor_index != canonical_sge_num)
+        return bad("SQE SGB descriptor packing count is not canonical",
+                   RDMA_SC_INVALID_STATE);
+    end
+
+    // 设计：SQE signature 覆盖 detached SGB 字节。首次 backing write 前必须把
+    // 待写 data 与已编码 image 重新比对；即使 descriptor 数量不变，length/lkey/
+    // IOVA 或 inline 字节被篡改，也不能生成另一份自洽但签名不同的 SGB slot。
+    begin
+      bit signature_valid;
+      signature_sgb.delete();
+      foreach (data[i])
+        signature_sgb.push_back(data[i]);
+      status = validate_sq_signature(image, signature_sgb, signature_valid);
+      if (status == null || !status.ok())
+        return status == null ?
+          bad("SQE SGB signature validation returned null status",
+              RDMA_SC_INVALID_STATE) :
+          status;
+      if (!signature_valid)
+        return bad("SQE SGB data does not match encoded SQE signature",
+                   RDMA_SC_INVALID_STATE);
     end
     sgb_offset = cursor.index * 512;
     status = link.sq_sgb_access.write(sgb_offset, data);
@@ -8336,7 +8382,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok())
       return;
     if (snapshot.sgb_iova.value != 0) begin
-      status = write_sgb_and_verify(link, model, cursor);
+      status = write_sgb_and_verify(link, model, cursor, image);
       if (!status.ok()) begin
         pending = make_pending(
           cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
@@ -8816,7 +8862,8 @@ class rdma_queue_data_engine extends uvm_object;
         end
         status = make_sqe(pending_send, link, pending.cursor, sgb_model);
         if (!status.ok()) return;
-        status = write_sgb_and_verify(link, sgb_model, pending.cursor);
+        status = write_sgb_and_verify(link, sgb_model, pending.cursor,
+                                      pending.image);
         if (!status.ok()) begin
           void'(attachment.runtime.record_recovery_failure(
             RDMA_QUEUE_MMIO_NO_SUBMIT));

@@ -75,6 +75,14 @@
   changed-SV style/diff 均 GREEN，严格 UVM warning/error/fatal 为 0/0/0；详见
   `task-cmq-batch112-tokenless-dataplane-admission-report.md`。本批仍不把同步 admission
   误称为跨线程原子锁。
+- Batch113 在 queue-data 的 SQ external-SGB writer 前增加 detached image authority
+  gate：写入前重新派生 canonical payload mode/count，检查压紧 descriptor 数量，并
+  用同一已编码 SQE image 的 signature 验证待写 512-byte SGB；本批 fixture 覆盖
+  count、mode 和 descriptor length 的 post-encode mutation，均在首次 Host-memory
+  write 前拒绝。
+  focused `rdma_queue_data_engine_post_test`、SQE codec 三套测试和静态门禁保持 GREEN；
+  该批只关闭 SGB payload writer seam，不代表广义 Phase 1C F2 收口。详见
+  `task-cmq-batch113-sgb-writer-authority-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -86,9 +94,10 @@
 
 计划状态：`active`。Batch109/110 已关闭当前严格一对一 ownership/close/candidate seam
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
-Batch112 关闭同步 tokenless dataplane reset-admission seam，但广义 F2、coordinator 的
-全局并发/更深生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁
-仍未关闭，不得标记为 `complete`。
+Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
+writer 的局部 image/payload authority seam，但 UD transport-aware effective mode、
+广义 F2、coordinator 的全局并发/更深生命周期语义、manager 外部调用窗口补偿、全目录
+后续生命周期审计和外部锁仍未关闭，不得标记为 `complete`。
 
 ## 0. 主线接管与冻结
 
