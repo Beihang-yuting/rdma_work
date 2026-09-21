@@ -8692,6 +8692,128 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 设计说明：host producer recovery 只重放 admission 时冻结的 SGB/WQE image，
+  //   不重新 reserve cursor，也不从当前 request/queue state 推导新的 payload；
+  //   device producer 与 consumer recovery 保持在 replay_pending() 的独立分支，
+  //   防止 DMA 方向、doorbell evidence 和 ledger commit 互相串用。
+  // 功能：replay_host_producer_pending 按 pending 的 SQ/RQ host-producer 证据重放
+  //   可选 SGB、固定 WQE image、producer doorbell 与 runtime producer commit，并在
+  //   每个失败点记录原 recovery evidence。
+  // 输入/输出及副作用：attachment、pending、next 为已通过 authority/cursor 校验的
+  //   非拥有输入；status 为输出；成功时访问 Host-memory、发送一次 doorbell、提交同一
+  //   producer cursor 并完成 recovery，失败时保留 runtime pending，不取得 queue/backing
+  //   所有权。
+  // 失败/边界：pending image 缺失、SQ SGB route/link 无法解析、SGB/WQE 写回、
+  //   doorbell、recovery commit 或完成阶段返回错误时立即停止；模型构造失败不触碰
+  //   backing，SGB/WQE 写失败记录 NO_SUBMIT，doorbell 失败记录 AMBIGUOUS，commit
+  //   失败记录 SUCCESS，不能自动重发 ambiguous MMIO 或推进新的 cursor。该 task 只
+  //   接受 host producer pending，不处理 device-producer/consumer evidence。
+  protected task replay_host_producer_pending(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    rdma_queue_cursor_snapshot next,
+    output rdma_status status
+  );
+    rdma_queue_data_qp_link link;
+    rdma_hw_sqe_model sgb_model;
+    rdma_post_send_req pending_send;
+    rdma_doorbell_result db_result;
+
+    status = null;
+    if (attachment == null || attachment.runtime == null ||
+        pending == null || next == null) begin
+      status = bad("host producer recovery input is incomplete",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    if (!pending.producer) begin
+      status = bad("host producer recovery evidence is not producer-owned",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+    if (pending.image == null || pending.image.bytes.size() == 0) begin
+      status = bad("producer recovery image is missing", RDMA_SC_INVALID_STATE);
+      return;
+    end
+
+    // 设计：SGB bytes 不属于 pending.image；只有 SQ request snapshot 仍可证明
+    //   原始 SGB route 时才重建并写回 512-byte SGB，否则直接拒绝而不触碰 WQE。
+    if (pending.kind == RDMA_QUEUE_RUNTIME_SQ &&
+        pending.request_snapshot != null &&
+        $cast(pending_send, pending.request_snapshot) &&
+        pending_send.sgb_iova.value != 0) begin
+      link = null;
+      if (pending.queue_h != null &&
+          qp_links.exists(identity_key(pending.queue_h)))
+        link = qp_links[identity_key(pending.queue_h)];
+      if (link == null) begin
+        status = bad("SQ SGB recovery QP route is unavailable",
+                     RDMA_SC_INVALID_STATE);
+        return;
+      end
+      status = make_sqe(pending_send, link, pending.cursor, sgb_model);
+      if (status == null) begin
+        status = bad("SQ SGB recovery model construction returned null status",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+      if (!status.ok()) return;
+      status = write_sgb_and_verify(link, sgb_model, pending.cursor,
+                                    pending.image);
+      if (status == null)
+        status = bad("SQ SGB recovery write returned null status",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      if (!status.ok()) begin
+        void'(attachment.runtime.record_recovery_failure(
+          RDMA_QUEUE_MMIO_NO_SUBMIT));
+        return;
+      end
+    end
+    status = write_and_verify(attachment, pending.entry_offset,
+                              pending.image);
+    if (status == null)
+      status = bad("host producer recovery write returned null status",
+                   RDMA_SC_RECOVERY_REQUIRED);
+    if (!status.ok()) begin
+      void'(attachment.runtime.record_recovery_failure(
+        RDMA_QUEUE_MMIO_NO_SUBMIT));
+      return;
+    end
+    submit_producer_doorbell(pending.queue_h, pending.kind, pending.cursor,
+                             next,
+                             pending.kind == RDMA_QUEUE_RUNTIME_SQ ?
+                             pending.image : null,
+                             attachment.local_id, db_result, status);
+    if (status == null)
+      status = bad("host producer recovery doorbell returned null status",
+                   RDMA_SC_RECOVERY_REQUIRED);
+    if (!status.ok()) begin
+      void'(attachment.runtime.record_recovery_failure(
+        RDMA_QUEUE_MMIO_AMBIGUOUS));
+      return;
+    end
+    status = attachment.runtime.enable_recovery_commit();
+    if (status == null)
+      status = bad("host producer recovery commit gate returned null status",
+                   RDMA_SC_RECOVERY_REQUIRED);
+    if (!status.ok()) return;
+    status = attachment.runtime.commit_producer(
+      pending.cursor, pending.request_snapshot, pending.wr_id,
+      pending.signaled, pending.image);
+    if (status == null)
+      status = bad("host producer recovery commit returned null status",
+                   RDMA_SC_RECOVERY_REQUIRED);
+    if (!status.ok()) begin
+      void'(attachment.runtime.record_recovery_failure(
+        RDMA_QUEUE_MMIO_SUCCESS));
+      return;
+    end
+    status = attachment.runtime.complete_recovery_retry();
+    if (status == null)
+      status = bad("host producer recovery completion returned null status",
+                   RDMA_SC_RECOVERY_REQUIRED);
+  endtask
+
   // 设计说明：仅当原事务确定没有到达 MMIO，或调用方已经明确确认可重放时才执行
   // detached transaction。所有副作用和 ledger transition 完成前，runtime 保持
   // RECOVERY_REQUIRED，防止同一 reservation 被并发消费。
@@ -8713,8 +8835,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment wqe_attachment;
     rdma_queue_slot_ledger_entry released[$];
     rdma_doorbell_desc prepared_db_desc;
-    rdma_hw_sqe_model sgb_model;
-    rdma_post_send_req pending_send;
     rdma_status local_status;
     rdma_status noalloc_status;
     byte data[];
@@ -8892,65 +9012,7 @@ class rdma_queue_data_engine extends uvm_object;
     end
 
     if (pending.producer) begin
-      if (pending.image == null || pending.image.bytes.size() == 0) begin
-        status = bad("producer recovery image is missing", RDMA_SC_INVALID_STATE);
-        return;
-      end
-      // 设计说明：已知未发 MMIO 的 producer 故障通常发生在 queue write；若存在
-      // detached SGB slot，必须先重放它，再重放精确的 detached 64-byte WQE image，
-      // 最后才发 doorbell。SGB bytes 不属于 pending.image，省略该写入会让恢复后的
-      // SGE-SGB WQE 引用 stale/zero payload data。
-      if (pending.kind == RDMA_QUEUE_RUNTIME_SQ &&
-          pending.request_snapshot != null &&
-          $cast(pending_send, pending.request_snapshot) &&
-          pending_send.sgb_iova.value != 0) begin
-        link = null;
-        if (pending.queue_h != null &&
-            qp_links.exists(identity_key(pending.queue_h)))
-          link = qp_links[identity_key(pending.queue_h)];
-        if (link == null) begin
-          status = bad("SQ SGB recovery QP route is unavailable",
-                       RDMA_SC_INVALID_STATE);
-          return;
-        end
-        status = make_sqe(pending_send, link, pending.cursor, sgb_model);
-        if (!status.ok()) return;
-        status = write_sgb_and_verify(link, sgb_model, pending.cursor,
-                                      pending.image);
-        if (!status.ok()) begin
-          void'(attachment.runtime.record_recovery_failure(
-            RDMA_QUEUE_MMIO_NO_SUBMIT));
-          return;
-        end
-      end
-      status = write_and_verify(attachment, pending.entry_offset,
-                                pending.image);
-      if (!status.ok()) begin
-        void'(attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_NO_SUBMIT));
-        return;
-      end
-      submit_producer_doorbell(pending.queue_h, pending.kind, pending.cursor,
-                               next,
-                               pending.kind == RDMA_QUEUE_RUNTIME_SQ ?
-                               pending.image : null,
-                               attachment.local_id, db_result, status);
-      if (!status.ok()) begin
-        void'(attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_AMBIGUOUS));
-        return;
-      end
-      status = attachment.runtime.enable_recovery_commit();
-      if (!status.ok()) return;
-      status = attachment.runtime.commit_producer(
-        pending.cursor, pending.request_snapshot, pending.wr_id,
-        pending.signaled, pending.image);
-      if (!status.ok()) begin
-        void'(attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_SUCCESS));
-        return;
-      end
-      status = attachment.runtime.complete_recovery_retry();
+      replay_host_producer_pending(attachment, pending, next, status);
       return;
     end
 

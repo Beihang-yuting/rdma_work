@@ -96,6 +96,15 @@
   和 commit 顺序保持不变。当前 post/recovery focused 与公开 UD 正向/恢复探针均
   GREEN；该批不声称已完成 SRQ 全量 lifecycle 矩阵、广义 F2 或整份结构重构。详见
   `task-cmq-batch115-receive-target-resolution-report.md`。
+- Batch116 将 `replay_pending()` 的 host-producer recovery 分支提取为受保护的
+  `replay_host_producer_pending()` task：SQ external-SGB route/model、SGB/WQE
+  write/readback、producer doorbell、recovery commit 与 completion 现在位于单一
+  producer 阶段；device-producer 与 consumer recovery 仍由主 task 管理，避免 DMA
+  方向、completion release 和 evidence 混用。提取同时把 helper 内的 null status
+  转为 `RECOVERY_REQUIRED` 的 fail-closed 结果，保留 `NO_SUBMIT`/`AMBIGUOUS`/
+  `SUCCESS` evidence 顺序、冻结 cursor 和 pending 生命周期。当前 recovery/post
+  focused 均 GREEN；本批不声称已完成完整 SRQ/跨队列生命周期、广义 F2 或整份结构
+  重构。详见 `task-cmq-batch116-host-producer-recovery-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
