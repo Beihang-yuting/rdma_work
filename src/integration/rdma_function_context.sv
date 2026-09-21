@@ -57,12 +57,132 @@ class rdma_function_context extends uvm_object;
   rdma_pcie_router pcie;
   rdma_reset_coordinator reset_coordinator;
   rdma_function_context_state_e state;
+  // 最近一次通过 validate_reset_candidate() 的候选句柄；commit seam 必须按对象身份
+  // 复用这份记录，不能只伪造公开 validation_complete bit 跨 context 注入 candidate。
+  protected rdma_function_reset_candidate m_validated_candidate;
   // 功能：构造尚未绑定依赖的 Function context；所有校验和引用绑定集中在 build()。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name="rdma_function_context");
     super.new(name);
     state = RDMA_CONTEXT_DISCOVERED;
+    m_validated_candidate = null;
+  endfunction
+
+  // 功能：统一校验 context 状态变更是否位于当前 coordinator 的合法 ownership/transaction
+  //       边界内，供 activate、quiesce、rollback 和单 context commit 共用。
+  // 输入/输出及副作用：owner/token（输入）描述可选 env lease；require_active（输入）要求
+  //   有 token 的调用必须处于 begin_reset()/end_reset() 之间；require_lease（输入）要求
+  //   coordinator 已被其它 env claim 时，不能再用无 token 的兼容入口改变 incarnation。
+  //   函数只读 coordinator lease/transaction 状态，不修改 context、binding 或 ledger。
+  // 失败/边界：无 coordinator 时只接受 null/0 并保留 standalone 兼容语义；部分 owner/token、
+  //   错 owner/旧 token、active transaction 下的 tokenless callback，以及 strict lease 入口的
+  //   tokenless 调用均返回 INVALID_ARGUMENT/RESOURCE_BUSY；coordinator 返回 null status 时
+  //   转换为 INVALID_STATE，调用方不得继续状态或 authority assignment。
+  protected function rdma_status authorize_context_mutation(
+    uvm_object owner = null,
+    longint unsigned token = 0,
+    bit require_active = 1'b0,
+    bit require_lease = 1'b0
+  );
+    rdma_status status;
+
+    if ((owner == null) != (token == 0))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "Function context owner/token pair is incomplete"
+      );
+    if (reset_coordinator == null) begin
+      if (owner != null || token != 0)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "Function context has no coordinator for supplied lease"
+        );
+      return rdma_status::success();
+    end
+    if (!reset_coordinator.lease_held()) begin
+      if (owner != null || token != 0)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "Function context coordinator has no active lease"
+        );
+      return rdma_status::success();
+    end
+
+    // activate/quiesce 的无 token 兼容调用仍可在 transaction 外运行（例如设备
+    // build 后的初始 lifecycle）；一旦 outer reset 已 begin，任何同步 callback
+    // 都必须携带同一 owner/token，避免越过 env 的 scope 选择与 fingerprint。
+    if (owner == null && token == 0) begin
+      if (require_lease || reset_coordinator.reset_transaction_active())
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_BUSY,
+          require_lease ?
+            "Function context mutation requires the coordinator lease" :
+            "Function context mutation is blocked during reset transaction"
+        );
+      return rdma_status::success();
+    end
+    // quiesce/rollback/owned commit 是 env 已经 begin_reset() 后的受控 seam，
+    // 因而显式 allow_active；activate 或其它 transaction 外入口保持默认拒绝，
+    // 防止任意 callback 借第四参数伪造 publication 权限。
+    status = reset_coordinator.authorize_owned_operation(
+      owner, token, require_active, require_active
+    );
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function context lease validation returned null status"
+      );
+    return status;
+  endfunction
+
+  // 功能：在不分配 status/factory 对象的提交边界，复核 candidate 与当前 context 的来源句柄、
+  //       incarnation、binding identity 和 owner handle 值图是否仍一致。
+  // 输入/输出及副作用：candidate（输入）只读；返回 bit，不修改 candidate、context 或外部账本，
+  //   供 virtual validate 之后的 env seal 和 epoch 后 commit 共用同一纯检查。
+  // 失败/边界：candidate/context 的 identity 或 binding 缺失、source identity/binding/state
+  //   被替换、context 已隔离、candidate generation 未严格前进、reset_epoch 回退，或 identity
+  //   snapshot/PCIe 镜像/owner handle 不匹配时返回 0；该 helper 不检查公开
+  //   validation_complete 标志，调用方必须另行确认对象身份 marker，避免伪造 bit 绕过验证。
+  protected function bit candidate_matches_context_noalloc(
+    rdma_function_reset_candidate candidate
+  );
+    if (identity == null || binding == null ||
+        candidate == null || candidate.identity == null ||
+        candidate.binding == null || candidate.binding_identity_snapshot == null ||
+        candidate.source_identity != identity ||
+        candidate.source_binding != binding ||
+        candidate.source_state != state ||
+        state == RDMA_CONTEXT_QUARANTINED ||
+        candidate.identity.generation <= identity.generation ||
+        candidate.identity.reset_epoch < identity.reset_epoch ||
+        !candidate.binding_identity_snapshot.same_incarnation(candidate.identity) ||
+        !candidate.binding.matches_identity_snapshot(
+          candidate.binding_identity_snapshot
+        ) ||
+        candidate.binding.owner_h == null ||
+        !candidate.binding.accepts_noalloc(candidate.binding.owner_h))
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
+  // 功能：把 virtual validate 之后仍未登记 marker 的 candidate 以非 virtual、无分配路径封存，
+  //       使 device env 在 hostile callback 也能在 epoch publication 前建立唯一提交凭证。
+  // 输入/输出及副作用：candidate（输入）；成功时设置 validation_complete 和当前 context 的
+  //   m_validated_candidate，失败时保持旧 context/identity/binding 不变并返回 status。
+  // 失败/边界：值图或来源句柄任一漂移返回 INVALID_STATE；该函数不调用 factory/clone，调用方
+  //   必须在成功后立即完成 fingerprint verify，不能把 marker 当作跨 reset 生命周期的永久授权。
+  function rdma_status seal_prevalidated_candidate(
+    rdma_function_reset_candidate candidate
+  );
+    if (!candidate_matches_context_noalloc(candidate))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function reset candidate cannot be sealed"
+      );
+    candidate.validation_complete = 1'b1;
+    m_validated_candidate = candidate;
+    return rdma_status::success();
   endfunction
 
   // 功能：校验 identity/资源快照并构造单 Function context，同时创建或复用 reset
@@ -223,15 +343,29 @@ class rdma_function_context extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：允许已构造的 Function context 接收新的控制面/数据面事务。
-  // 输入/输出及副作用：无参数；成功时先为当前 binding 创建新的 owner handle，
-  //   再把 DISCOVERED/QUIESCING context 与 binding 一起标记为 ACTIVE，不分配队列或 DMA 资源。
-  // 失败/边界：QUARANTINED、identity validator 返回 null、binding 缺失或 owner-handle
-  //   factory 返回 null 时拒绝激活且保留原 state/owner；ACTIVE 仅在已有 handle 仍接受
-  //   当前 incarnation 时幂等成功，避免空 handle 伪装成已激活 context。
-  function rdma_status activate();
+  // 功能：允许已构造的 Function context 接收新的控制面/数据面事务，并在 outer reset
+  //       transaction 已开始时要求调用者携带同一 coordinator lease。
+  // 输入/输出及副作用：owner/token（输入）为可选 env lease；成功时先为当前 binding 创建
+  //   新 owner handle，再把 DISCOVERED/QUIESCING context 与 binding 一起标记为 ACTIVE，不
+  //   分配队列或 DMA 资源。无 token 的 standalone 或 transaction 外兼容调用只读 coordinator。
+  // 失败/边界：QUARANTINED、identity validator 返回 null、binding 缺失、owner-handle factory
+  //   返回 null，或 active transaction 中缺少/错误 lease 时拒绝激活且保留原 state/owner；
+  //   ACTIVE 仅在已有 handle 仍接受当前 incarnation 时幂等成功。
+  function rdma_status activate(
+    uvm_object owner = null,
+    longint unsigned lease_token = 0
+  );
     rdma_status identity_status;
+    rdma_status lease_status;
     rdma_function_handle next_owner_h;
+
+    lease_status = authorize_context_mutation(owner, lease_token, 1'b0, 1'b0);
+    if (lease_status == null || !lease_status.ok())
+      return lease_status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function context activation lease validation returned null"
+        ) : lease_status;
 
     if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -266,10 +400,33 @@ class rdma_function_context extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：停止该 Function 接收新事务，为 reset 或资源回收建立 quiesce 边界。
-  // 输入/输出及副作用：无参数；ACTIVE context 转为 QUIESCING，重复调用幂等；不释放或修改外部资源。
-  // 失败/边界：DISCOVERED/QUARANTINED context 不能 quiesce；重复 quiesce 幂等成功。
-  function rdma_status quiesce();
+  // 功能：停止该 Function 接收新事务，为 reset 或资源回收建立 quiesce 边界，并在 outer
+  //       reset transaction 中把状态迁移绑定到同一 coordinator owner。
+  // 输入/输出及副作用：owner/token（输入）为可选 env lease；ACTIVE context 转为 QUIESCING，
+  //   重复调用幂等；不释放或修改外部资源。transaction 外无 token 的兼容调用只保留状态写入。
+  // 失败/边界：active transaction 中的 tokenless/错误 lease、DISCOVERED/QUARANTINED context
+  //   返回错误并保持状态；重复 quiesce 在授权通过后幂等成功。
+  function rdma_status quiesce(
+    uvm_object owner = null,
+    longint unsigned lease_token = 0
+  );
+    rdma_status lease_status;
+    bit require_lease;
+
+    // quiesce 改写入口状态；一旦 coordinator 已被 env claim，不能再把它当作
+    // transaction 外的 legacy callback。未 claim 的 standalone/context-build fixture
+    // 仍保留旧的 null/0 兼容语义。
+    require_lease = reset_coordinator != null &&
+                    reset_coordinator.lease_held();
+    lease_status = authorize_context_mutation(
+      owner, lease_token, 1'b1, require_lease
+    );
+    if (lease_status == null || !lease_status.ok())
+      return lease_status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function context quiesce lease validation returned null"
+        ) : lease_status;
     if (state == RDMA_CONTEXT_QUIESCING)
       return rdma_status::success();
     if (state != RDMA_CONTEXT_ACTIVE)
@@ -403,6 +560,7 @@ class rdma_function_context extends uvm_object;
   );
     rdma_status status;
 
+    m_validated_candidate = null;
     if (candidate != null)
       candidate.validation_complete = 1'b0;
 
@@ -433,6 +591,12 @@ class rdma_function_context extends uvm_object;
       );
     if (!status.ok())
       return status;
+    if (candidate.identity.generation <= identity.generation ||
+        candidate.identity.reset_epoch < identity.reset_epoch)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "Function reset candidate does not advance the current incarnation"
+      );
     if (!candidate.binding_identity_snapshot.same_incarnation(candidate.identity) ||
         !candidate.binding.matches_identity_snapshot(
           candidate.binding_identity_snapshot
@@ -450,26 +614,41 @@ class rdma_function_context extends uvm_object;
       );
 
     candidate.validation_complete = 1'b1;
+    m_validated_candidate = candidate;
 
     return rdma_status::success();
   endfunction
 
   // 功能：把 prepare_reset() 产生的 detached candidate 一次性发布到当前 context，完成
-  //       identity/binding/state 的无分配 commit。
-  // 输入/输出及副作用：candidate（输入）必须已经通过 validate_reset_candidate()；成功时交换
+  //       identity/binding/state 的无分配 commit，并把该 mutation 绑定到 reset coordinator lease。
+  // 输入/输出及副作用：candidate（输入）必须已经通过 validate_reset_candidate()；owner/token
+  //   （输入）在已 claim coordinator 时必须是当前 active transaction 的 lease。成功时交换
   //   identity/binding，并把原来非 DISCOVERED 状态恢复为 ACTIVE；不调用 factory、不修改外部
   //   router/queue 资源，旧对象仅由 context 放弃引用。
-  // 失败/边界：candidate 校验失败时拒绝且保持旧组合；device env 应在 coordinator epoch commit
-  //   前验证全部 candidate，随后本函数只执行 assignment，因此不会留下可预见的跨 context 半提交。
+  // 失败/边界：coordinator lease 存在时 tokenless direct commit、错误 owner/旧 token 或未 begin
+  //   transaction 均返回 RESOURCE_BUSY/INVALID_STATE 并保持旧组合；candidate 校验失败同样拒绝。
+  //   device env 应在 coordinator epoch commit 前验证全部 candidate，随后本函数只执行 assignment，
+  //   因而不会留下可预见的跨 context 半提交。
   virtual function rdma_status commit_reset(
-    rdma_function_reset_candidate candidate
+    rdma_function_reset_candidate candidate,
+    uvm_object owner = null,
+    longint unsigned lease_token = 0
   );
     rdma_status status;
+
+    status = authorize_context_mutation(owner, lease_token, 1'b1, 1'b1);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function reset commit lease validation returned null status"
+        ) : status;
 
     // device env 在 epoch 发布前已经完成 validate_reset_candidate()；保留一次兼容
     // fallback，让旧的单 context 调用者仍能直接 commit，但成功的批量路径不再重复
     // 任何 identity/binding snapshot 或 factory 操作。
-    if (candidate == null || !candidate.validation_complete) begin
+    if (candidate == null || !candidate.validation_complete ||
+        candidate !== m_validated_candidate) begin
       status = validate_reset_candidate(candidate);
       if (status == null || !status.ok())
         return status == null ?
@@ -484,52 +663,125 @@ class rdma_function_context extends uvm_object;
         candidate.source_identity != identity ||
         candidate.source_binding != binding ||
         candidate.source_state != state ||
-        state == RDMA_CONTEXT_QUARANTINED ||
-        !candidate.binding_identity_snapshot.same_incarnation(candidate.identity) ||
-        !candidate.binding.matches_identity_snapshot(
-          candidate.binding_identity_snapshot
-        ) ||
-        candidate.binding.owner_h == null ||
-        !candidate.binding.accepts_noalloc(candidate.binding.owner_h))
+        !candidate_matches_context_noalloc(candidate))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "Function reset candidate changed before commit"
       );
 
-    commit_reset_prevalidated(candidate);
-    return rdma_status::success();
+    status = commit_reset_prevalidated_owned(candidate, owner, lease_token);
+    return status == null ?
+      rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "prevalidated Function reset commit returned null status"
+      ) : status;
   endfunction
 
   // 功能：在 device env 已完成整组 candidate 验证且 coordinator epoch 已发布后，执行
-  //       identity/binding/state 的不可失败字段交换。
+  //       identity/binding/state 的不可失败字段交换，并确认调用者仍持有同一 reset lease。
   // 输入/输出及副作用：candidate（输入）必须是当前 context 通过
-  //   validate_reset_candidate() 的 detached candidate，且 source_identity/source_binding/
-  //   source_state 在调用期间保持不变；函数只写入三个 context 字段，不调用 status、factory、
-  //   clone、identity_snapshot 或任何外部 router/ledger API。
-  // 失败/边界：本 seam 没有可恢复失败返回值；调用方若未满足 prevalidated/source 哨兵契约，
-  //   属于 device env 内部编程错误，必须在 epoch 发布前由 validate_reset_candidate() 阻断；
-  //   该实现保持 non-virtual，不能在 epoch 发布后被故障 subclass 替换。
-  //   因此 rebuild_scope 在调用后不能再分支为“部分 commit”或隔离单个 context。
-  function void commit_reset_prevalidated(
-    rdma_function_reset_candidate candidate
+  //   validate_reset_candidate() 的 detached candidate；有 lease 时 owner/token 必须匹配当前
+  //   active transaction，无 lease 的 standalone context 仅接受 null/0 兼容调用。授权通过后
+  //   函数只写入三个 context 字段，不调用 factory、clone、identity_snapshot 或外部 ledger API。
+  // 失败/边界：candidate 来源句柄、source_state、identity snapshot、owner handle 或 no-alloc
+  //   镜像任一漂移、owner/token 失效或 active transaction 未开始时返回错误且不写入 context；
+  //   调用方必须在 epoch 发布前完成同一授权预检，因为之后拒绝只能暴露不可回滚的生命周期破坏。
+  function rdma_status commit_reset_prevalidated_owned(
+    rdma_function_reset_candidate candidate,
+    uvm_object owner,
+    longint unsigned lease_token
   );
+    rdma_status lease_status;
+
+    lease_status = authorize_context_mutation(
+      owner, lease_token, 1'b1, 1'b1
+    );
+    if (lease_status == null || !lease_status.ok())
+      return lease_status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "prevalidated Function commit lease validation returned null status"
+        ) : lease_status;
+    if (candidate == null || candidate.identity == null ||
+        candidate.binding == null || candidate.binding_identity_snapshot == null ||
+        !candidate.validation_complete ||
+        candidate !== m_validated_candidate ||
+        candidate.source_identity != identity ||
+        candidate.source_binding != binding ||
+        candidate.source_state != state ||
+        !candidate_matches_context_noalloc(candidate))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "prevalidated Function commit candidate changed before commit"
+      );
     identity = candidate.identity;
     binding = candidate.binding;
     if (state != RDMA_CONTEXT_DISCOVERED)
       state = RDMA_CONTEXT_ACTIVE;
+    m_validated_candidate = null;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：保留旧的无返回值 prevalidated commit 兼容入口，同时在 coordinator 已被 claim
+  //       时拒绝无 token 的 direct context 绕过，并复核 candidate 的来源/值图后再交换字段。
+  // 输入/输出及副作用：candidate（输入）在 standalone/no-lease context 中成功交换
+  //   identity/binding/state；leased context 的 tokenless 调用只读授权并在拒绝时保持原值。
+  // 失败/边界：candidate 缺失、validation flag/source/value graph/owner handle 任一不一致、
+  //   active transaction 或 lease ownership 不匹配都 fail-closed；void API 无法携带 status，
+  //   调用方需要详细诊断时必须改用 owned 入口。
+  function void commit_reset_prevalidated(
+    rdma_function_reset_candidate candidate
+  );
+    rdma_status lease_status;
+
+    lease_status = authorize_context_mutation(null, 0, 1'b1, 1'b1);
+    if (lease_status == null || !lease_status.ok())
+      return;
+    if (candidate == null || candidate.identity == null ||
+        candidate.binding == null || candidate.binding_identity_snapshot == null ||
+        !candidate.validation_complete ||
+        candidate !== m_validated_candidate ||
+        candidate.source_identity != identity ||
+        candidate.source_binding != binding ||
+        candidate.source_state != state ||
+        !candidate_matches_context_noalloc(candidate))
+      return;
+    identity = candidate.identity;
+    binding = candidate.binding;
+    if (state != RDMA_CONTEXT_DISCOVERED)
+      state = RDMA_CONTEXT_ACTIVE;
+    m_validated_candidate = null;
   endfunction
 
   // 功能：兼容旧的单 context reset API，将 prepare_reset() 和 commit_reset() 串成一次局部事务。
   // 输入/输出及副作用：new_generation/new_epoch（输入）描述新 incarnation；成功时发布新的
   //   identity/binding 并恢复可用状态，失败时不改变旧 context；不推进任何 coordinator ledger。
-  // 失败/边界：任一 prepare/commit 校验失败原样返回，调用方必须自行决定是否隔离 context；该
-  //   wrapper 不提供跨 context 原子性，批量 reset 必须由 device env 调用 prepare/commit seam。
+  // 失败/边界：当 context 绑定的 coordinator 已被 device env claim ownership lease 时，
+  //   无 token 的 direct reset 返回 RESOURCE_BUSY，避免 callback 在跨 context transaction 中
+  //   绕过 coordinator epoch；没有 coordinator 的 standalone context 继续保留旧语义。其余
+  //   prepare/commit 校验失败原样返回，且该 wrapper 不提供跨 context 原子性，批量 reset 必须
+  //   由 device env 调用 prepare/commit seam。
   function rdma_status reset(
     int unsigned new_generation,
     rdma_reset_epoch_t new_epoch
   );
     rdma_function_reset_candidate candidate;
     rdma_status status;
+
+    // device env 取得 coordinator ownership lease 后，context.reset() 不能以兼容
+    // wrapper 身份直接交换 identity/binding；否则 coordinator 的 scope epoch 与
+    // context incarnation 会脱节。传入 null/0 明确表示本调用没有 lease token，
+    // coordinator 在无 lease 时仍允许 legacy/standalone context reset。
+    if (reset_coordinator != null) begin
+      status = reset_coordinator.authorize_owned_operation(null, 0, 1'b0);
+      if (status == null)
+        return rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "Function context direct reset lease validation returned null"
+        );
+      if (!status.ok())
+        return status;
+    end
 
     status = prepare_reset(new_generation, new_epoch, candidate);
     if (status == null || !status.ok())
@@ -553,12 +805,32 @@ class rdma_function_context extends uvm_object;
       ) : status;
   endfunction
 
-  // 功能：撤销本次 reset prepare 之前由 quiesce() 建立的入口屏障，恢复 context 原有 ACTIVE 状态。
-  // 输入/输出及副作用：无参数；仅把 QUIESCING context 的 state 写回 ACTIVE，binding owner 和
-  //   identity 保持原句柄，不分配资源也不触碰 coordinator/router。
-  // 失败/边界：QUARANTINED、DISCOVERED 或缺失 binding/owner 的 context 拒绝恢复；ACTIVE 状态
-  //   幂等成功。调用方只能对本次实际从 ACTIVE 转换的 context 调用，不能覆盖既有 QUIESCING 状态。
-  function rdma_status restore_after_quiesce();
+  // 功能：撤销本次 reset prepare 之前由 quiesce() 建立的入口屏障，恢复 context 原有 ACTIVE
+  //       状态，并在 outer transaction 中验证相同 coordinator lease。
+  // 输入/输出及副作用：owner/token（输入）为可选 env lease；仅把 QUIESCING context 的 state
+  //   写回 ACTIVE，binding owner 和 identity 保持原句柄，不分配资源也不触碰 router。
+  // 失败/边界：active transaction 中 tokenless/错误 lease、QUARANTINED、DISCOVERED 或缺失
+  //   binding/owner 的 context 拒绝恢复；ACTIVE 状态在授权通过后幂等成功。
+  function rdma_status restore_after_quiesce(
+    uvm_object owner = null,
+    longint unsigned lease_token = 0
+  );
+    rdma_status lease_status;
+    bit require_lease;
+
+    // rollback 同样会把 QUIESCING 状态写回 ACTIVE；leased coordinator 下必须由
+    // 同一 owner/token 执行，避免 foreign callback 在 scope 失败后私自恢复入口。
+    require_lease = reset_coordinator != null &&
+                    reset_coordinator.lease_held();
+    lease_status = authorize_context_mutation(
+      owner, lease_token, 1'b1, require_lease
+    );
+    if (lease_status == null || !lease_status.ok())
+      return lease_status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function context quiesce restore lease validation returned null"
+        ) : lease_status;
     if (state == RDMA_CONTEXT_ACTIVE)
       return rdma_status::success();
     if (state == RDMA_CONTEXT_QUARANTINED)
@@ -573,6 +845,68 @@ class rdma_function_context extends uvm_object;
         "Function context quiesce rollback authority is invalid"
       );
     state = RDMA_CONTEXT_ACTIVE;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在不改写 context 值图的前提下，预检 close 流程是否拥有把该 Function
+  //       隔离到 QUARANTINED 的授权，供 device env 在解除 Host-router 绑定前建立
+  //       整体失败屏障。
+  // 输入/输出及副作用：owner/lease_token（输入）描述可选 coordinator ownership；函数
+  //       只读取当前 reset_coordinator 的 lease/transaction 状态并返回授权 status，不清空
+  //       identity、binding、资源引用或 m_validated_candidate，也不取得外部对象所有权。
+  // 失败/边界：coordinator 由其它 owner 持有、owner/token 不成对、token 过期，或当前
+  //       context 的 coordinator 已缺失而调用者仍携带 lease 时返回错误；未绑定/未 claim
+  //       coordinator 的 standalone context 接受 null/0。调用方必须在该检查全部成功后再
+  //       调用 quarantine_for_close()，因为本函数本身不提供隔离提交。
+  function rdma_status validate_quarantine_for_close(
+    uvm_object owner = null,
+    longint unsigned lease_token = 0
+  );
+    bit require_lease;
+
+    // QUARANTINED 是不可复用终态；即使 context 在上一次 close 尝试中已经清空
+    // coordinator 引用，重复清理也不能因为旧 token 不再可回验而阻塞剩余字段清除。
+    if (state == RDMA_CONTEXT_QUARANTINED)
+      return rdma_status::success();
+    require_lease = reset_coordinator != null &&
+                    reset_coordinator.lease_held();
+    return authorize_context_mutation(
+      owner, lease_token, 1'b0, require_lease
+    );
+  endfunction
+
+  // 功能：quarantine_for_close 在 device env 已完成外部 router teardown 后，把 retained
+  //       context 变成不可复用的终态，切断旧 identity、binding、资源快照和 reset authority。
+  // 输入/输出及副作用：owner/lease_token（输入）描述可选 coordinator ownership；成功时将
+  //       state 设为 RDMA_CONTEXT_QUARANTINED，清空 identity、binding、resources、manager、
+  //       Host/PCIe/coordinator 非拥有引用及 m_validated_candidate，不释放这些外部对象。
+  // 失败/边界：coordinator 仍由其它 owner 持有、owner/token 不匹配或参数成对不完整时返回
+  //       RESOURCE_BUSY/INVALID_ARGUMENT 且保留当前值图；已隔离 context 进入终态后不再要求
+  //       旧 coordinator lease，可幂等清理残留引用，但调用方仍必须在 release lease 前完成
+  //       本函数，避免 retained handle 继续携带旧 authority。
+  function rdma_status quarantine_for_close(
+    uvm_object owner = null,
+    longint unsigned lease_token = 0
+  );
+    rdma_status lease_status;
+
+    lease_status = validate_quarantine_for_close(owner, lease_token);
+    if (lease_status == null || !lease_status.ok())
+      return lease_status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function context close quarantine lease validation returned null"
+        ) : lease_status;
+
+    state = RDMA_CONTEXT_QUARANTINED;
+    identity = null;
+    binding = null;
+    resources = null;
+    resource_manager = null;
+    host_mem = null;
+    pcie = null;
+    reset_coordinator = null;
+    m_validated_candidate = null;
     return rdma_status::success();
   endfunction
 

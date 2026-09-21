@@ -814,14 +814,6 @@ class rdma_reset_candidate_integrity_test extends rdma_reset_cascade_test;
     rdma_reset_candidate_mutation_context::arm();
     status = env.request_pf_reset(pf_identity);
     rdma_reset_candidate_mutation_context::disarm();
-    `uvm_info("RESET_CANDIDATE", $sformatf(
-      "debug status=%s code=%0d prepare=%0d validate=%0d seen=%0b failed=%0b",
-      status == null ? "null" : status.message,
-      status == null ? -1 : status.code,
-      rdma_reset_candidate_mutation_context::prepare_call_count,
-      rdma_reset_candidate_mutation_context::validate_call_count,
-      rdma_reset_candidate_mutation_context::mutation_seen,
-      rdma_reset_candidate_mutation_context::mutation_failed), UVM_NONE)
     if (!rdma_reset_candidate_mutation_context::mutation_seen ||
         rdma_reset_candidate_mutation_context::mutation_failed)
       `uvm_error("RESET_CANDIDATE", "hostile candidate mutation was not injected")

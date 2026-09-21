@@ -3,7 +3,8 @@
 //       handle 查询；不验证队列编码，也不连接真实 PCIe/Host-memory 数据面。
 // 依赖：rdma_dpu_env_pkg、现有 dpu snapshot fixture、dpu_resource_manager 和 UVM。
 // 所有权与生命周期：测试拥有快照、router、manager、coordinator 和 device env；
-//       env/context 只保存外部依赖引用，测试结束时随 UVM 对象生命周期结束。
+//       env/context 只保存外部依赖引用，测试显式调用 close() 验证双侧 detach、lease
+//       释放和重复 close 的幂等语义，外部快照/manager 仍由测试持有。
 
 class rdma_device_env_test extends uvm_test;
   `uvm_component_utils(rdma_device_env_test)
@@ -87,6 +88,7 @@ class rdma_device_env_test extends uvm_test;
     rdma_host_mem_router host_mem;
     rdma_pcie_router pcie;
     rdma_reset_coordinator coordinator;
+    rdma_reset_coordinator foreign_coordinator;
     rdma_device_env env;
     rdma_function_identity identity;
     rdma_function_context found_context;
@@ -124,6 +126,75 @@ class rdma_device_env_test extends uvm_test;
       status = env.find_handle(function_h, found_context);
       if (!status.ok() || found_context == null)
         `uvm_error("DEV_ENV", "Function handle lookup did not find context")
+
+      // close 原子性边界：故意把 retained context 的 coordinator 引用改成未 claim 的
+      // foreign coordinator。预检必须在 detach 前拒绝，旧 coordinator 的 lease、router
+      // 双侧绑定、registration ledger 和 context 值图都应保持不变；恢复引用后再验证
+      // 正常 close，覆盖失败后可重试的生命周期契约。
+      foreign_coordinator = rdma_reset_coordinator::type_id::create(
+        "device_env_foreign_close_coordinator"
+      );
+      found_context.reset_coordinator = foreign_coordinator;
+      status = env.close();
+      if (status == null || status.ok())
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "close accepted a context with foreign coordinator authority")
+      if (!coordinator.lease_held() || !coordinator.host_router_bound() ||
+          coordinator.function_count() == 0 ||
+          found_context.identity == null || found_context.binding == null)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "failed close detached router/lease or mutated context state")
+      found_context.reset_coordinator = coordinator;
+
+      // Batch109 生命周期边界：build 成功后 env 独占 coordinator lease，close() 必须
+      // 先清掉 coordinator/router 双侧绑定，再清理 context/identity 引用。close() 返回
+      // 前不应留下可被旧 identity 或 handle 查询到的 context，也不能让已关闭 env 再次
+      // 发起 reset；重复 close 则必须保持幂等成功。
+      status = env.close();
+      if (status == null || !status.ok())
+        `uvm_error("DEV_ENV_LIFECYCLE", "device env close returned an error")
+      if (coordinator == null)
+        `uvm_error("DEV_ENV_LIFECYCLE", "close fixture lost coordinator handle")
+      else if (coordinator.lease_held() || coordinator.host_router_bound() ||
+               coordinator.function_count() != 0)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "close left coordinator lease, router binding, or registration ledger active")
+      if (env.context_count() != 0 || env.get_identity(key) != null ||
+          found_context == null || found_context.reset_coordinator != null ||
+          env.device_snapshot != null || env.resources != null ||
+          env.resource_manager != null || env.host_mem != null || env.pcie != null)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "device env close did not atomically release lease and references")
+      if (found_context.state != RDMA_CONTEXT_QUARANTINED ||
+          found_context.identity != null || found_context.binding != null ||
+          found_context.resources != null || found_context.resource_manager != null ||
+          found_context.host_mem != null || found_context.pcie != null)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "retained Function context was not quarantined on close")
+      status = found_context.activate();
+      if (status == null || status.code != RDMA_SC_INVALID_STATE)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "retained quarantined context accepted activate")
+      status = found_context.reset(2, 1);
+      if (status == null || status.code != RDMA_SC_INVALID_STATE)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "retained quarantined context accepted reset")
+      status = found_context.lookup_queue(function_h);
+      if (status == null || status.code != RDMA_SC_INVALID_STATE)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "retained quarantined context accepted queue lookup")
+      status = env.request_device_reset();
+      if (status == null || status.code != RDMA_SC_INVALID_STATE)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "closed device env accepted a reset request")
+      status = env.find_function(identity, found_context);
+      if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+          found_context != null)
+        `uvm_error("DEV_ENV_LIFECYCLE",
+                   "closed device env retained a Function lookup path")
+      status = env.close();
+      if (status == null || !status.ok())
+        `uvm_error("DEV_ENV_LIFECYCLE", "repeated device env close was not idempotent")
     end
     phase.drop_objection(this);
   endtask

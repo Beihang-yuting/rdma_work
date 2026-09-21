@@ -102,6 +102,9 @@ readonly INTEGRATION_TESTS=(
   rdma_pcie_router_test
   rdma_host_mem_router_test
   rdma_reset_coordinator_test
+  rdma_reset_coordinator_pf_root_scope_test
+  rdma_reset_coordinator_lifecycle_test
+  rdma_reset_candidate_integrity_test
 )
 
 # 这些文件位于 tests/unit/，但只有 RDMA_DPU_INTEGRATION 定义下才会被
@@ -111,6 +114,8 @@ readonly UNIT_INTEGRATION_TESTS=(
   rdma_host_mem_router_test
   rdma_pcie_router_test
   rdma_reset_coordinator_test
+  rdma_reset_coordinator_pf_root_scope_test
+  rdma_reset_coordinator_lifecycle_test
 )
 
 # engine 的物理 process 由 sim/rdma_cmq_engine_process.list 交给统一

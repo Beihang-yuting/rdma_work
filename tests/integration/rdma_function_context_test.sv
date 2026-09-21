@@ -140,9 +140,14 @@ class rdma_function_context_test extends uvm_test;
     return identity;
   endfunction
 
-  // 功能：验证 context 的 build→activate→quiesce→reset 迁移和 queue 查询边界。
-  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
-  // 失败/边界：仿真超时、事务返回错误或断言不满足时报告 UVM_ERROR/UVM_FATAL；空 fixture 不得被当作成功。
+  // 功能：验证 context 的 build→activate→quiesce→reset 迁移、queue 查询边界，以及
+  //       三条 candidate commit seam 在 validation 后遭遇 coherent generation/epoch
+  //       篡改时仍 fail-closed。
+  // 输入/输出及副作用：phase（输入）；task 通过 objection、日志和断言暴露结果，创建的
+  //   fixture 只保存本测试拥有的对象；hostile candidate 只在 detached 值图中被改写，不
+  //   取得 context、coordinator、Host-memory 或 PCIe 资源所有权。
+  // 失败/边界：仿真超时、事务返回错误、候选拒绝状态不明确，或拒绝路径改写 identity/
+  //   binding/state 时报告 UVM_ERROR/UVM_FATAL；factory/null fixture 失败不得被当作成功。
   task run_phase(uvm_phase phase);
     rdma_function_identity identity;
     rdma_context_test_resource_snapshot resources;
@@ -162,6 +167,8 @@ class rdma_function_context_test extends uvm_test;
     rdma_function_context mismatch_context;
     rdma_function_context candidate_context;
     rdma_function_reset_candidate reset_candidate;
+    rdma_function_reset_candidate owned_candidate;
+    rdma_function_reset_candidate void_candidate;
     rdma_function_identity old_identity;
     rdma_function_identity candidate_old_identity;
     rdma_function_identity mismatched_identity;
@@ -169,6 +176,8 @@ class rdma_function_context_test extends uvm_test;
     rdma_function_binding candidate_old_binding;
     rdma_function_binding mismatched_binding;
     rdma_function_context_state_e candidate_old_state;
+    rdma_function_context_state_e candidate_state_before_commit;
+    rdma_status mutation_status;
     rdma_context_factory_fault_wrapper binding_fault;
     rdma_context_factory_fault_wrapper context_fault;
     rdma_context_factory_fault_wrapper coordinator_fault;
@@ -357,7 +366,10 @@ class rdma_function_context_test extends uvm_test;
 
     // Batch101 focused commit seam：candidate 在 epoch/状态发布前完成 prepare+validate；
     // 随后 arm identity/binding/owner factory，commit 仍必须只交换已准备句柄，不能再次
-    // 触发 clone、identity_snapshot() 或 owner-handle factory。
+    // 触发 clone、identity_snapshot() 或 owner-handle factory。下面先在 marker 已建立后
+    // 对 detached candidate 做 coherent generation 篡改，确认普通 commit 不会把“自洽但
+    // 不再前进”的值图发布；再推进一次合法 incarnation，分别验证 owned 与 void
+    // prevalidated seam 拒绝 reset_epoch 回退，且三条拒绝路径都保持旧组合。
     candidate_context = null;
     failure_status = rdma_function_context::build(
       identity, resources, host_mem, pcie, registry, 1ns, candidate_context,
@@ -379,6 +391,7 @@ class rdma_function_context_test extends uvm_test;
       if (failure_status == null || !failure_status.ok())
         `uvm_error("CTX_RESET_ATOMICITY",
                    "candidate commit fixture quiesce failed")
+      candidate_state_before_commit = candidate_context.state;
       failure_status = candidate_context.prepare_reset(
         candidate_old_identity.generation + 1,
         candidate_old_identity.reset_epoch + 1,
@@ -394,6 +407,57 @@ class rdma_function_context_test extends uvm_test;
             !reset_candidate.validation_complete)
           `uvm_error("CTX_RESET_ATOMICITY",
                      "reset candidate validation failed")
+
+        // hostile candidate 只改写 detached identity，再同步 binding identity/owner
+        // snapshot，模拟 virtual callback 在 validation 之后构造出的 coherent 伪值图。
+        // generation 被退回到当前 context 的 generation，因此即使 snapshot 与 binding
+        // 彼此一致，也不能成为下一次 incarnation；commit 必须在任何 assignment 前拒绝。
+        reset_candidate.identity.generation = candidate_old_identity.generation;
+        mutation_status = reset_candidate.binding.configure_identity(
+          reset_candidate.identity);
+        if (mutation_status == null || !mutation_status.ok()) begin
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "hostile generation candidate binding update failed")
+        end
+        else begin
+          reset_candidate.binding.owner_h =
+            reset_candidate.binding.make_handle();
+          reset_candidate.binding_identity_snapshot =
+            reset_candidate.binding.identity_snapshot();
+          if (reset_candidate.binding.owner_h == null ||
+              reset_candidate.binding_identity_snapshot == null)
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "hostile generation candidate snapshot rebuild failed")
+        end
+        failure_status = candidate_context.commit_reset(reset_candidate);
+        if (failure_status == null || failure_status.ok() ||
+            (failure_status.code != RDMA_SC_INVALID_STATE &&
+             failure_status.code != RDMA_SC_STALE_GENERATION) ||
+            candidate_context.identity != candidate_old_identity ||
+            candidate_context.binding != candidate_old_binding ||
+            candidate_context.state != candidate_state_before_commit)
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "commit_reset accepted hostile generation or changed context")
+
+        // 放弃已改写 candidate，重新 prepare/validate 一份合法值图，保留原有
+        // no-allocation commit 断言；失败候选不能污染下一次 marker。
+        reset_candidate = null;
+        failure_status = candidate_context.prepare_reset(
+          candidate_old_identity.generation + 1,
+          candidate_old_identity.reset_epoch + 1,
+          reset_candidate);
+        if (failure_status == null || !failure_status.ok() ||
+            reset_candidate == null)
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "replacement reset candidate prepare failed")
+        else begin
+          failure_status = candidate_context.validate_reset_candidate(
+            reset_candidate);
+          if (failure_status == null || !failure_status.ok() ||
+              !reset_candidate.validation_complete)
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "replacement reset candidate validation failed")
+        end
         identity_fault.arm();
         binding_fault.arm();
         handle_fault.arm();
@@ -411,8 +475,110 @@ class rdma_function_context_test extends uvm_test;
               candidate_old_identity.generation + 1 ||
             candidate_context.identity.reset_epoch !=
               candidate_old_identity.reset_epoch + 1)
-          `uvm_error("CTX_RESET_ATOMICITY",
-                     "validated reset commit did not publish detached candidate")
+            `uvm_error("CTX_RESET_ATOMICITY",
+                       "validated reset commit did not publish detached candidate")
+
+        // 合法 commit 将 context 推进到非零 reset epoch；后续两个 seam 才能安全地
+        // 构造“低于当前 epoch”的 hostile candidate，而不会触发无符号下溢。
+        candidate_old_identity = candidate_context.identity;
+        candidate_old_binding = candidate_context.binding;
+        if (candidate_context.state != RDMA_CONTEXT_ACTIVE ||
+            candidate_old_identity.reset_epoch == 0)
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "candidate fixture did not reach nonzero active epoch")
+
+        // owned prevalidated seam：candidate generation 仍前进，但 reset_epoch 回退到
+        // 当前值以下；binding/snapshot 同步更新后，commit 仍必须保持 QUIESCING 组合。
+        failure_status = candidate_context.quiesce();
+        if (failure_status == null || !failure_status.ok())
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "owned seam fixture quiesce failed")
+        candidate_state_before_commit = candidate_context.state;
+        owned_candidate = null;
+        failure_status = candidate_context.prepare_reset(
+          candidate_old_identity.generation + 1,
+          candidate_old_identity.reset_epoch + 1,
+          owned_candidate);
+        if (failure_status == null || !failure_status.ok() ||
+            owned_candidate == null)
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "owned seam candidate prepare failed")
+        else begin
+          failure_status = candidate_context.validate_reset_candidate(
+            owned_candidate);
+          if (failure_status == null || !failure_status.ok() ||
+              !owned_candidate.validation_complete)
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "owned seam candidate validation failed")
+          owned_candidate.identity.reset_epoch =
+            candidate_old_identity.reset_epoch - 1;
+          mutation_status = owned_candidate.binding.configure_identity(
+            owned_candidate.identity);
+          if (mutation_status == null || !mutation_status.ok())
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "owned seam hostile epoch binding update failed")
+          else begin
+            owned_candidate.binding.owner_h =
+              owned_candidate.binding.make_handle();
+            owned_candidate.binding_identity_snapshot =
+              owned_candidate.binding.identity_snapshot();
+          end
+          failure_status = candidate_context.commit_reset_prevalidated_owned(
+            owned_candidate, null, 0);
+          if (failure_status == null || failure_status.ok() ||
+              (failure_status.code != RDMA_SC_INVALID_STATE &&
+               failure_status.code != RDMA_SC_STALE_GENERATION) ||
+              candidate_context.identity != candidate_old_identity ||
+              candidate_context.binding != candidate_old_binding ||
+              candidate_context.state != candidate_state_before_commit)
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "owned prevalidated seam accepted hostile epoch")
+        end
+
+        // void prevalidated seam 复用同一 lower-epoch 攻击，但只能通过 context 的
+        // 可观察 identity/binding/state 结果判断拒绝；它不得因缺少 status 返回而发布。
+        void_candidate = null;
+        failure_status = candidate_context.prepare_reset(
+          candidate_old_identity.generation + 1,
+          candidate_old_identity.reset_epoch + 1,
+          void_candidate);
+        if (failure_status == null || !failure_status.ok() ||
+            void_candidate == null)
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "void seam candidate prepare failed")
+        else begin
+          failure_status = candidate_context.validate_reset_candidate(
+            void_candidate);
+          if (failure_status == null || !failure_status.ok() ||
+              !void_candidate.validation_complete)
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "void seam candidate validation failed")
+          void_candidate.identity.reset_epoch =
+            candidate_old_identity.reset_epoch - 1;
+          mutation_status = void_candidate.binding.configure_identity(
+            void_candidate.identity);
+          if (mutation_status == null || !mutation_status.ok())
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "void seam hostile epoch binding update failed")
+          else begin
+            void_candidate.binding.owner_h =
+              void_candidate.binding.make_handle();
+            void_candidate.binding_identity_snapshot =
+              void_candidate.binding.identity_snapshot();
+          end
+          candidate_state_before_commit = candidate_context.state;
+          candidate_context.commit_reset_prevalidated(void_candidate);
+          if (candidate_context.identity != candidate_old_identity ||
+              candidate_context.binding != candidate_old_binding ||
+              candidate_context.state != candidate_state_before_commit)
+            `uvm_error("CTX_RESET_INTEGRITY",
+                       "void prevalidated seam accepted hostile epoch")
+        end
+        status = candidate_context.restore_after_quiesce();
+        if (status == null || !status.ok() ||
+            candidate_context.state != RDMA_CONTEXT_ACTIVE)
+          `uvm_error("CTX_RESET_INTEGRITY",
+                     "hostile candidate rollback did not restore active state")
       end
     end
     reset_context_factory_state();

@@ -193,6 +193,150 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 功能：复制 binding 的完整公开值图，建立 reset seal 专用 detached snapshot；该路径
+  //       校验 identity/PCIe/BAR/owner 图的结构和镜像一致性，但不把 ACTIVE readiness
+  //       （MSE/BME、notify/DMI/VFT ready）误当成 reset capture 的前置条件。
+  // 输入/输出及副作用：source（输入）为 context 或 candidate binding；name（输入）为
+  //   snapshot 名称；snapshot（输出）获得独立 identity、PCIe/BAR、queue/vector、owner
+  //   和 readiness 值，不修改 source、context、router 或 coordinator。
+  // 失败/边界：source/identity/PCIe/BAR 缺失、identity snapshot 或 owner 类型不支持、
+  //   UID/generation/route 镜像不一致时返回 INVALID_STATE/INVALID_ARGUMENT；该 helper
+  //   不调用 source.validate()，因此调用方仍须由 binding_value_matches() 做最终值比对。
+  protected static function rdma_status snapshot_binding_value_graph(
+    rdma_function_binding source,
+    string name,
+    output rdma_function_binding snapshot
+  );
+    rdma_function_identity identity_snapshot;
+    rdma_function_handle function_owner_snapshot;
+    rdma_handle owner_snapshot;
+    rdma_status status;
+
+    snapshot = null;
+    if (source == null || source.pcie == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "reset binding value graph source or PCIe identity is missing"
+      );
+    if (source.pcie.get_object_type() != rdma_pcie_identity::get_type())
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "reset binding value graph PCIe subtype is unsupported"
+      );
+    foreach (source.pcie.bar[i]) begin
+      if (source.pcie.bar[i] == null ||
+          source.pcie.bar[i].get_object_type() != rdma_bar_info::get_type())
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          $sformatf("reset binding value graph BAR %0d is incomplete", i)
+        );
+    end
+    status = source.snapshot_identity_nonfatal(identity_snapshot);
+    if (status == null || !status.ok() || identity_snapshot == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        status == null ?
+          "reset binding value graph identity snapshot returned null" :
+          status.message
+      );
+
+    snapshot = new(name);
+    if (snapshot == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "reset binding value graph allocation failed"
+      );
+    status = snapshot.configure_identity(identity_snapshot);
+    if (status == null || !status.ok())
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        status == null ?
+          "reset binding value graph identity configuration returned null" :
+          status.message
+      );
+
+    snapshot.function_uid = source.function_uid;
+    snapshot.pcie.bdf = source.pcie.bdf;
+    snapshot.pcie.parent_pf_bdf = source.pcie.parent_pf_bdf;
+    snapshot.pcie.vf_index = source.pcie.vf_index;
+    snapshot.pcie.mse = source.pcie.mse;
+    snapshot.pcie.bme = source.pcie.bme;
+    foreach (source.pcie.bar[i]) begin
+      snapshot.pcie.bar[i].bar_id = source.pcie.bar[i].bar_id;
+      snapshot.pcie.bar[i].base = source.pcie.bar[i].base;
+      snapshot.pcie.bar[i].size = source.pcie.bar[i].size;
+      snapshot.pcie.bar[i].enabled = source.pcie.bar[i].enabled;
+    end
+    snapshot.notify_bar_id = source.notify_bar_id;
+    snapshot.notify_base = source.notify_base;
+    snapshot.notify_size = source.notify_size;
+    snapshot.notify_table_sel = source.notify_table_sel;
+    snapshot.notify_table_index = source.notify_table_index;
+    snapshot.host_id = source.host_id;
+    snapshot.pfvf_id = source.pfvf_id;
+    snapshot.rdma_vf_id = source.rdma_vf_id;
+    snapshot.global_function_id = source.global_function_id;
+    snapshot.vsi_id = source.vsi_id;
+    snapshot.queue_dma = source.queue_dma;
+    snapshot.queue_caps = source.queue_caps;
+    snapshot.interrupt_vectors = source.interrupt_vectors;
+    snapshot.state = source.state;
+    snapshot.generation = source.generation;
+    snapshot.notify_valid = source.notify_valid;
+    snapshot.notify_ready = source.notify_ready;
+    snapshot.dmi_valid = source.dmi_valid;
+    snapshot.dmi_ready = source.dmi_ready;
+    snapshot.vft_valid = source.vft_valid;
+    snapshot.vft_ready = source.vft_ready;
+
+    if (source.owner_h == null) begin
+      snapshot.owner_h = null;
+    end
+    else if (source.owner_h.get_object_type() ==
+             rdma_function_handle::get_type()) begin
+      function_owner_snapshot = new("reset_binding_function_owner_value");
+      if (function_owner_snapshot == null)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "reset binding function owner value allocation failed"
+        );
+      function_owner_snapshot.kind = source.owner_h.kind;
+      function_owner_snapshot.function_uid = source.owner_h.function_uid;
+      function_owner_snapshot.object_id = source.owner_h.object_id;
+      function_owner_snapshot.generation = source.owner_h.generation;
+      snapshot.owner_h = function_owner_snapshot;
+    end
+    else if (source.owner_h.get_object_type() == rdma_handle::get_type()) begin
+      owner_snapshot = new("reset_binding_owner_value");
+      if (owner_snapshot == null)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "reset binding owner value allocation failed"
+        );
+      owner_snapshot.kind = source.owner_h.kind;
+      owner_snapshot.function_uid = source.owner_h.function_uid;
+      owner_snapshot.object_id = source.owner_h.object_id;
+      owner_snapshot.generation = source.owner_h.generation;
+      snapshot.owner_h = owner_snapshot;
+    end
+    else
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "reset binding owner subtype is unsupported"
+      );
+
+    if (snapshot.function_uid != source.function_uid ||
+        snapshot.global_function_id != source.global_function_id ||
+        snapshot.generation != source.generation ||
+        !snapshot.matches_identity_snapshot(identity_snapshot) ||
+        ((snapshot.owner_h == null) != (source.owner_h == null)))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "reset binding value graph mirror verification failed"
+      );
+    return rdma_status::success();
+  endfunction
+
   // 功能：在 virtual validate_reset_candidate() 之前，根据旧 identity 和 coordinator
   //       preview 的 next generation/epoch 记录候选预期值及 source/binding/owner 哨兵，
   //       建立防止后续 hostile callback 改写早期 candidate 的 env-owned seal。
@@ -305,17 +449,16 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
     // 变成 detached expected graph；verify 只读该 graph，避免 validate 后只比 UID/route
     // 而放过公开值图漂移。source 也保存一份 detached 值，捕获 callback 对旧 authority
     // 的原地改写。该 accessor 在 capture 阶段运行，失败时不触碰 context 或 epoch。
-    expected_binding_value = new("reset_candidate_expected_binding_value");
-    expected_source_binding_value = new("reset_candidate_expected_source_binding_value");
-    if (expected_binding_value == null || expected_source_binding_value == null)
-      return rdma_status::make(
-        RDMA_SC_RESOURCE_EXHAUSTED,
-        "reset candidate binding fingerprint allocation failed"
-      );
-    binding_snapshot_status = candidate.binding.snapshot_complete_nonfatal(
+    expected_binding_value = null;
+    expected_source_binding_value = null;
+    binding_snapshot_status = snapshot_binding_value_graph(
+      candidate.binding,
+      "reset_candidate_expected_binding_value",
       expected_binding_value
     );
-    source_binding_snapshot_status = expected_source_binding_arg.snapshot_complete_nonfatal(
+    source_binding_snapshot_status = snapshot_binding_value_graph(
+      expected_source_binding_arg,
+      "reset_candidate_expected_source_binding_value",
       expected_source_binding_value
     );
     if (binding_snapshot_status == null || !binding_snapshot_status.ok() ||
@@ -323,7 +466,12 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
         !source_binding_snapshot_status.ok())
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
-        "reset candidate binding fingerprint snapshot is invalid"
+        {"reset candidate binding fingerprint snapshot is invalid; candidate=",
+         binding_snapshot_status == null ? "null" :
+           binding_snapshot_status.message,
+         "; source=",
+         source_binding_snapshot_status == null ? "null" :
+           source_binding_snapshot_status.message}
       );
 
     expected_candidate_identity_ref = candidate.identity;
@@ -396,6 +544,7 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
         candidate.binding != expected_candidate_binding_ref ||
         candidate.binding_identity_snapshot !=
           expected_candidate_binding_snapshot_ref ||
+        candidate.binding.get_object_type() != expected_binding_type ||
         candidate.binding.pcie != expected_candidate_pcie_ref ||
         candidate.binding.owner_h != expected_candidate_owner_ref ||
         expected_source_identity_value == null ||
@@ -462,6 +611,12 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
         "reset candidate owner presence changed after validation"
       );
     if (expected_owner_present &&
+        candidate.binding.owner_h.get_object_type() != expected_owner_type)
+      return rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "reset candidate owner dynamic type changed after validation"
+      );
+    if (expected_owner_present &&
         (candidate.binding.owner_h.kind != expected_owner_kind ||
          candidate.binding.owner_h.function_uid != expected_owner_uid ||
          candidate.binding.owner_h.object_id != expected_owner_object_id ||
@@ -489,6 +644,15 @@ class rdma_device_env extends uvm_object;
   // Context 索引与 identity ledger 使用同一完整 Function key；value 由 env
   // 创建并持有，外部只通过 find_*() 获取非拥有引用，避免调用方绕过 scope 校验。
   protected rdma_function_context m_contexts[string];
+  // reset 请求在 virtual prepare/validate callback 内仍可能被同步重入；该标志只
+  // 保护当前 env 的 reset 事务边界，不代表外部 router 或 coordinator 的锁所有权。
+  protected bit m_reset_in_progress;
+  // device env 成功 build 后持有 coordinator 的唯一 ownership lease；token 是
+  // coordinator 生成的 opaque 值，env 不把它写入 Function identity 或 router ledger。
+  protected longint unsigned m_reset_lease_token;
+  // close() 成功后禁止再次通过 env 发起 reset；context/router 的非拥有引用同时被清理，
+  // 使 coordinator lease 与 env 生命周期有明确的终点。
+  protected bit m_closed;
 
   // 功能：env_status_or_error 将 identity/context/reset 边界返回的状态统一为
   //       非空值，避免集成层在错误诊断中再次解引用 null。
@@ -513,6 +677,9 @@ class rdma_device_env extends uvm_object;
   // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
   function new(string name="rdma_device_env");
     super.new(name);
+    m_reset_in_progress = 1'b0;
+    m_reset_lease_token = 0;
+    m_closed = 1'b0;
   endfunction
 
   // 功能：以冻结 dpu_common 快照为权威，原子地组装 device env、identity ledger
@@ -532,7 +699,7 @@ class rdma_device_env extends uvm_object;
     uvm_object registry,
     time build_timeout,
     output rdma_device_env result_env,
-    rdma_reset_coordinator coordinator = null
+    input rdma_reset_coordinator coordinator = null
   );
     dpu_function_key_t keys[$];
     rdma_function_identity identity;
@@ -543,6 +710,8 @@ class rdma_device_env extends uvm_object;
     rdma_device_env candidate_env;
     string key_name;
     rdma_status status;
+    rdma_status lease_status;
+    longint unsigned lease_token;
 
     result_env = null;
     if (source_device_snapshot == null || source_resources == null ||
@@ -566,6 +735,11 @@ class rdma_device_env extends uvm_object;
         RDMA_SC_RESOURCE_EXHAUSTED,
         "Device environment reset coordinator allocation failed"
       );
+    if (selected_coordinator.host_router_bound())
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "Device environment coordinator is still bound to a Host router"
+      );
     candidate_env = rdma_device_env::type_id::create("device_env");
     if (candidate_env == null)
       return rdma_status::make(
@@ -578,6 +752,8 @@ class rdma_device_env extends uvm_object;
     candidate_env.host_mem = source_host_mem;
     candidate_env.pcie = source_pcie;
     candidate_env.reset_coordinator = selected_coordinator;
+    candidate_env.m_reset_lease_token = 0;
+    candidate_env.m_closed = 1'b0;
     candidate_env.m_identities.delete();
     candidate_env.m_contexts.delete();
     staged_identities.delete();
@@ -617,11 +793,34 @@ class rdma_device_env extends uvm_object;
       staged_identities.push_back(identity);
       candidate_env.m_contexts[key_name] = ctx_snapshot;
     end
+    // 所有 Function candidate 已经构造完成后才 claim coordinator；这样中途
+    // projection/factory 失败不会把一个尚未发布的 env 留在 owner ledger 中。
+    lease_token = 0;
+    lease_status = selected_coordinator.acquire_lease(
+      candidate_env, lease_token
+    );
+    lease_status = env_status_or_error(
+      lease_status, "Device environment coordinator lease acquire"
+    );
+    if (!lease_status.ok())
+      return lease_status;
+    candidate_env.m_reset_lease_token = lease_token;
     status = selected_coordinator.commit_registration_atomic(
-      source_host_mem, staged_identities);
+      source_host_mem, staged_identities, candidate_env, lease_token);
     status = env_status_or_error(status, "Device environment coordinator commit");
-    if (!status.ok())
-      return status;
+    if (!status.ok()) begin
+      // commit 失败时 candidate_env 尚未对外发布；显式释放 lease，避免外部 caller
+      // 在下一次 build 中永久看到 RESOURCE_BUSY。
+      lease_status = selected_coordinator.release_lease(
+        candidate_env, lease_token
+      );
+      lease_status = env_status_or_error(
+        lease_status, "Device environment coordinator lease rollback"
+      );
+      return reset_status_after_rollback(
+        status, lease_status, "Device environment coordinator lease rollback"
+      );
+    end
     // registry/timeout 保留在 API 中用于上层兼容；Device env 只保存已经
     // 校验过的 dpu_common snapshot 和唯一 reset coordinator。
     result_env = candidate_env;
@@ -876,6 +1075,297 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：执行一个已经完成参数/authority 初筛的 env reset scope，并把 preflight、quiesce
+  //       和两阶段 rebuild 串成单一可清理的事务边界。
+  // 输入/输出及副作用：scope/identity/host_key（输入）选择 reset 范围；函数只调用现有
+  //       validate_reset_scope()/quiesce_scope()/rebuild_scope()，成功时发布对应新 incarnation。
+  // 失败/边界：任一阶段返回 null 或错误都立即返回；调用方负责在进入本函数前设置 guard，
+  //       并在返回后清除 guard，使 virtual callback 重入请求只能观察到 RESOURCE_BUSY。
+  protected function rdma_status execute_reset_scope(
+    rdma_device_reset_scope_e scope,
+    rdma_function_identity identity,
+    int unsigned host_key
+  );
+    rdma_status status;
+    rdma_function_context transitioned_contexts[$];
+    string phase;
+
+    case (scope)
+      RDMA_ENV_RESET_VF: phase = "VF FLR";
+      RDMA_ENV_RESET_PF: phase = "PF reset";
+      RDMA_ENV_RESET_HOST: phase = "Host reset";
+      RDMA_ENV_RESET_DEVICE: phase = "Device reset";
+      default: phase = "unknown reset";
+    endcase
+    status = validate_reset_scope(scope, identity, host_key);
+    status = env_status_or_error(status, {phase, " preflight"});
+    if (!status.ok())
+      return status;
+    status = quiesce_scope(scope, identity, host_key, transitioned_contexts);
+    status = env_status_or_error(status, {phase, " quiesce"});
+    if (!status.ok())
+      return status;
+    status = rebuild_scope(scope, identity, host_key, transitioned_contexts);
+    return env_status_or_error(status, {phase, " rebuild"});
+  endfunction
+
+  // 功能：在 env-local guard 之外，为已 claim coordinator lease 的 device env 开启 reset
+  //       transaction；standalone legacy probe 没有 lease 时保留旧的单对象语义。
+  // 输入/输出及副作用：无显式输入；读取 reset_coordinator/m_reset_lease_token，成功时由
+  //       coordinator 设置 active 标志；无 lease 时返回 OK 且只依赖 m_reset_in_progress。
+  // 失败/边界：coordinator 缺失返回 INVALID_STATE；另一个 owner、旧 token 或已有 active
+  //       transaction 返回 RESOURCE_BUSY/INVALID_STATE，调用方不得进入 execute_reset_scope。
+  protected function rdma_status begin_reset_transaction();
+    if (reset_coordinator == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "device env reset coordinator is missing"
+      );
+    if (!reset_coordinator.lease_held())
+      return rdma_status::success();
+    return reset_coordinator.begin_reset(this, m_reset_lease_token);
+  endfunction
+
+  // 功能：关闭 begin_reset_transaction() 建立的 coordinator active 标志，作为 env reset
+  //       成功、预检失败或 rollback 返回后的统一清理出口。
+  // 输入/输出及副作用：无显式输入；读取当前 coordinator lease，成功时清除 active 标志；无
+  //       lease 的 standalone env 返回 OK，不修改 context/epoch/ledger。
+  // 失败/边界：coordinator 缺失或 owner/token 已失效返回对应错误；end 失败表示生命周期契约
+  //       破坏，调用方应保留原 reset status 并将环境视为需要隔离。
+  protected function rdma_status end_reset_transaction();
+    if (reset_coordinator == null || !reset_coordinator.lease_held())
+      return rdma_status::success();
+    return reset_coordinator.end_reset(this, m_reset_lease_token);
+  endfunction
+
+  // 功能：为 reset scope 的所有 context/coordinator seam 统一提供可选 lease owner，避免
+  //       standalone/no-lease env 把非零 owner 与零 token 组合传入而被误判为半授权调用。
+  // 输入/输出及副作用：无显式输入；当 coordinator 当前由本 env 持有 lease 时返回 this，
+  //       否则返回 null；只读 coordinator lease，不修改 context、router 或 reset ledger。
+  // 失败/边界：coordinator 缺失或未 claim lease 时返回 null，调用方必须同时使用
+  //       reset_operation_token() 的零 token 兼容值，不能只替换 owner 参数。
+  protected function uvm_object reset_operation_owner();
+    if (reset_coordinator != null && reset_coordinator.lease_held())
+      return this;
+    return null;
+  endfunction
+
+  // 功能：返回与 reset_operation_owner() 成对的 coordinator lease token，供 context 状态
+  //       迁移、epoch publication 和 prevalidated commit 共用同一授权边界。
+  // 输入/输出及副作用：无显式输入；持有当前 env lease 时返回 m_reset_lease_token，否则
+  //       返回零；函数只读 env/coordinator 生命周期字段，不修改任何账本。
+  // 失败/边界：coordinator 未 claim lease、token 尚未初始化或 coordinator 缺失时返回零；
+  //       调用方不得把零 token 与非 null owner 拼接使用。
+  protected function longint unsigned reset_operation_token();
+    if (reset_coordinator != null && reset_coordinator.lease_held())
+      return m_reset_lease_token;
+    return 0;
+  endfunction
+
+  // 功能：在 execute_reset_scope() 返回后清除 env guard、结束 coordinator transaction，并
+  //       合并 reset 原始结果与 end_reset 清理结果，保持最先可定位的失败诊断不被吞掉。
+  // 输入/输出及副作用：reset_status/phase（输入）；清除 m_reset_in_progress，调用 end_reset_transaction()
+  //       并返回原始成功/失败或带清理 metadata 的 detached status，不修改已发布 epoch。
+  // 失败/边界：end_reset 返回 null/错误时 fail-closed；原始 reset 失败与清理失败同时存在时
+  //       返回包含两者消息的 status，调用方不得把 transaction 生命周期破坏当作成功。
+  protected function rdma_status finish_reset_transaction(
+    rdma_status reset_status,
+    string phase
+  );
+    rdma_status end_status;
+
+    m_reset_in_progress = 1'b0;
+    end_status = end_reset_transaction();
+    end_status = env_status_or_error(
+      end_status, {phase, " transaction end"}
+    );
+    return reset_status_after_rollback(
+      reset_status, end_status, {phase, " transaction end"}
+    );
+  endfunction
+
+  // 功能：在 device env 改写 Host-router 或 retained context 之前，逐项预检所有 context
+  //       是否能够在同一 owner/token 下完成 close quarantine，建立不会产生部分 teardown
+  //       的失败屏障。
+  // 输入/输出及副作用：owner/lease_token（输入）描述当前 env 的 coordinator ownership；
+  //       函数只读取 m_contexts 及每个 context 的 reset authority，返回第一个失败 status，
+  //       不清空 identity/binding、router 引用、coordinator ledger 或任何外部资源所有权。
+  // 失败/边界：索引中出现 null context、context 的 coordinator/lease 不匹配、owner/token
+  //       不成对或 coordinator transaction 已失效时返回错误；全部 context 已处于
+  //       QUARANTINED 仍按幂等路径通过，调用方只有在本函数成功后才可进入 teardown 提交。
+  protected function rdma_status preflight_close_contexts(
+    uvm_object owner = null,
+    longint unsigned lease_token = 0
+  );
+    rdma_status status;
+    string key_name;
+
+    foreach (m_contexts[key_name]) begin
+      if (m_contexts[key_name] == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          {"Device environment retained context ", key_name, " is null"}
+        );
+      status = m_contexts[key_name].validate_quarantine_for_close(
+        owner, lease_token
+      );
+      status = env_status_or_error(
+        status,
+        {"Device environment context ", key_name, " close preflight"}
+      );
+      if (!status.ok())
+        return status;
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：关闭 device env 的 reset ownership 生命周期，先预检所有 retained context，再
+  //       双侧解除 Host-router 绑定并 quarantine context，最后释放 coordinator lease 并
+  //       清理 env 对所有外部快照、manager、router、context 和 identity 的非拥有引用；
+  //       预检保证任一 context authority 拒绝时不会先发生 router 单侧 detach。
+  // 输入/输出及副作用：无显式输入；成功时 m_closed 置位、context 进入
+  //       RDMA_CONTEXT_QUARANTINED、router 与 coordinator 的反向引用均清除；外部
+  //       snapshot/manager/PCIe/Host 资源仍由调用方拥有，close 不调用或释放它们。
+  // 失败/边界：reset 正在执行、coordinator lease 属于他人、router 未知/仍有 active mapping 或
+  //       detach/release 返回错误时保持 env、lease 和双侧绑定不变；重复 close 幂等成功，调用方
+  //       必须先 drain mapping 后再重试 close。
+  function rdma_status close();
+    rdma_status status;
+    string key_name;
+
+    if (m_closed)
+      return rdma_status::success();
+    if (m_reset_in_progress)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "cannot close device env during reset"
+      );
+    if (reset_coordinator == null) begin
+      // coordinator 已经缺失时，context 仍可能保留旧的非拥有 coordinator 引用；逐项
+      // quarantine 后再删除 env 索引，避免外部仍持有 context handle 时观察到已关闭 env
+      // 的 stale reset authority。若旧 coordinator 仍被其它 owner 持有，quarantine 会
+      // fail-closed，不能用 env 的 null 引用伪造 teardown。
+      status = preflight_close_contexts();
+      status = env_status_or_error(
+        status, "Device environment retained context close preflight"
+      );
+      if (!status.ok())
+        return status;
+      foreach (m_contexts[key_name]) begin
+        if (m_contexts[key_name] != null) begin
+          status = m_contexts[key_name].quarantine_for_close();
+          status = env_status_or_error(
+            status, "Device environment retained context quarantine"
+          );
+          if (!status.ok())
+            return status;
+        end
+      end
+      m_contexts.delete();
+      m_identities.delete();
+      device_snapshot = null;
+      resources = null;
+      resource_manager = null;
+      host_mem = null;
+      pcie = null;
+      m_reset_lease_token = 0;
+      m_closed = 1'b1;
+      return rdma_status::success();
+    end
+    if (!reset_coordinator.lease_held()) begin
+      // standalone env 没有 coordinator lease；只清理自身的非拥有引用，不伪造
+      // 一个不存在的 detach/release 事务；retained context 仍必须进入 quarantine，
+      // 不能因为 coordinator 没有 owner 就继续沿用旧 identity/binding。
+      if (reset_coordinator.host_router_bound())
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_BUSY,
+          "standalone device env cannot clear a bound Host router without ownership"
+        );
+      status = preflight_close_contexts();
+      status = env_status_or_error(
+        status, "Device environment standalone context close preflight"
+      );
+      if (!status.ok())
+        return status;
+      foreach (m_contexts[key_name]) begin
+        if (m_contexts[key_name] != null) begin
+          status = m_contexts[key_name].quarantine_for_close();
+          status = env_status_or_error(
+            status, "Device environment standalone context quarantine"
+          );
+          if (!status.ok())
+            return status;
+        end
+      end
+      m_contexts.delete();
+      m_identities.delete();
+      reset_coordinator = null;
+      device_snapshot = null;
+      resources = null;
+      resource_manager = null;
+      host_mem = null;
+      pcie = null;
+      m_reset_lease_token = 0;
+      m_closed = 1'b1;
+      return rdma_status::success();
+    end
+
+    // release_lease() 只接受 transaction 已结束的 owner；先在任何 detach/quarantine
+    // side effect 前拒绝 active transaction，避免后续 release 失败后留下不可重试的半关闭 env。
+    if (reset_coordinator.reset_transaction_active())
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        "cannot close device env during coordinator reset transaction"
+      );
+    status = preflight_close_contexts(this, m_reset_lease_token);
+    status = env_status_or_error(
+      status, "Device environment leased context close preflight"
+    );
+    if (!status.ok())
+      return status;
+
+    status = reset_coordinator.detach_host_router_owned(
+      host_mem, this, m_reset_lease_token
+    );
+    status = env_status_or_error(status, "Device environment Host router detach");
+    if (!status.ok())
+      return status;
+    // router 已完成双侧 detach 后，先隔离所有 retained context，再释放 coordinator
+    // lease；这样 quarantine 仍可用当前 owner/token 完成一次授权检查，同时 release
+    // 下面清空 coordinator ledger 时不会留下可继续提交旧 candidate 的外部句柄。
+    foreach (m_contexts[key_name]) begin
+      if (m_contexts[key_name] != null) begin
+        status = m_contexts[key_name].quarantine_for_close(
+          this, m_reset_lease_token
+        );
+        status = env_status_or_error(
+          status, "Device environment context quarantine"
+        );
+        if (!status.ok())
+          return status;
+      end
+    end
+    status = reset_coordinator.release_lease(this, m_reset_lease_token);
+    status = env_status_or_error(status, "Device environment coordinator lease release");
+    if (!status.ok())
+      return status;
+    foreach (m_contexts[key_name]) begin
+      if (m_contexts[key_name] != null)
+        m_contexts[key_name].reset_coordinator = null;
+    end
+    m_contexts.delete();
+    m_identities.delete();
+    reset_coordinator = null;
+    device_snapshot = null;
+    resources = null;
+    resource_manager = null;
+    host_mem = null;
+    pcie = null;
+    m_reset_lease_token = 0;
+    m_closed = 1'b1;
+    return rdma_status::success();
+  endfunction
+
   // 功能：请求指定 VF 的 Function-level reset，并以单 context prepare/commit 事务发布新 incarnation。
   // 输入/输出及副作用：identity（输入）；先只读校验 authority，再 quiesce 目标 VF，由 rebuild_scope
   //   预构造 identity/binding/ledger 候选，随后才推进 coordinator epoch 并无分配地提交；其他
@@ -884,28 +1374,31 @@ class rdma_device_env extends uvm_object;
   //   coordinator 缺失时返回错误；epoch commit 前失败保持 context/router/epoch/ledger 不变。
   function rdma_status request_vf_flr(rdma_function_identity identity);
     rdma_status status;
-    rdma_function_context transitioned_contexts[$];
 
+    if (m_closed)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "closed device env cannot reset"
+      );
     if (identity == null || identity.key.function_kind != RDMA_FUNCTION_VF)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "VF FLR requires a VF identity");
     if (reset_coordinator == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "device env reset coordinator is missing");
-    status = validate_reset_scope(RDMA_ENV_RESET_VF, identity, 0);
-    status = env_status_or_error(status, "VF FLR preflight");
-    if (!status.ok())
-      return status;
-    status = quiesce_scope(
-      RDMA_ENV_RESET_VF, identity, 0, transitioned_contexts
-    );
-    status = env_status_or_error(status, "VF FLR quiesce");
-    if (!status.ok())
-      return status;
-    status = rebuild_scope(
-      RDMA_ENV_RESET_VF, identity, 0, transitioned_contexts
-    );
-    return env_status_or_error(status, "VF FLR rebuild");
+    if (m_reset_in_progress)
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "device env reset is already in progress");
+    status = begin_reset_transaction();
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "VF FLR reset transaction begin returned null"
+        ) : status;
+    m_reset_in_progress = 1'b1;
+    status = execute_reset_scope(RDMA_ENV_RESET_VF, identity, 0);
+    return finish_reset_transaction(status, "VF FLR");
   endfunction
 
   // 功能：请求指定 PF reset，并按同 Host、同 root、同 parent BDF 级联执行跨 context prepare/commit。
@@ -915,28 +1408,31 @@ class rdma_device_env extends uvm_object;
   //   factory 失败或 coordinator 缺失时返回错误；epoch commit 前失败不留下部分 context 变化。
   function rdma_status request_pf_reset(rdma_function_identity identity);
     rdma_status status;
-    rdma_function_context transitioned_contexts[$];
 
+    if (m_closed)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "closed device env cannot reset"
+      );
     if (identity == null || identity.key.function_kind != RDMA_FUNCTION_PF)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "PF reset requires a PF identity");
     if (reset_coordinator == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "device env reset coordinator is missing");
-    status = validate_reset_scope(RDMA_ENV_RESET_PF, identity, 0);
-    status = env_status_or_error(status, "PF reset preflight");
-    if (!status.ok())
-      return status;
-    status = quiesce_scope(
-      RDMA_ENV_RESET_PF, identity, 0, transitioned_contexts
-    );
-    status = env_status_or_error(status, "PF reset quiesce");
-    if (!status.ok())
-      return status;
-    status = rebuild_scope(
-      RDMA_ENV_RESET_PF, identity, 0, transitioned_contexts
-    );
-    return env_status_or_error(status, "PF reset rebuild");
+    if (m_reset_in_progress)
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "device env reset is already in progress");
+    status = begin_reset_transaction();
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "PF reset transaction begin returned null"
+        ) : status;
+    m_reset_in_progress = 1'b1;
+    status = execute_reset_scope(RDMA_ENV_RESET_PF, identity, 0);
+    return finish_reset_transaction(status, "PF reset");
   endfunction
 
   // 功能：请求 Host reset，级联停止并以跨 context prepare/commit 重建该 Host topology 的全部 Function。
@@ -946,25 +1442,28 @@ class rdma_device_env extends uvm_object;
   //   quarantined context 时在 epoch commit 前返回，并恢复本次 quiesce 的 context 状态。
   function rdma_status request_host_reset(int unsigned host_topology_key);
     rdma_status status;
-    rdma_function_context transitioned_contexts[$];
 
+    if (m_closed)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "closed device env cannot reset"
+      );
     if (reset_coordinator == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "device env reset coordinator is missing");
-    status = validate_reset_scope(RDMA_ENV_RESET_HOST, null, host_topology_key);
-    status = env_status_or_error(status, "Host reset preflight");
-    if (!status.ok())
-      return status;
-    status = quiesce_scope(
-      RDMA_ENV_RESET_HOST, null, host_topology_key, transitioned_contexts
-    );
-    status = env_status_or_error(status, "Host reset quiesce");
-    if (!status.ok())
-      return status;
-    status = rebuild_scope(
-      RDMA_ENV_RESET_HOST, null, host_topology_key, transitioned_contexts
-    );
-    return env_status_or_error(status, "Host reset rebuild");
+    if (m_reset_in_progress)
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "device env reset is already in progress");
+    status = begin_reset_transaction();
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Host reset transaction begin returned null"
+        ) : status;
+    m_reset_in_progress = 1'b1;
+    status = execute_reset_scope(RDMA_ENV_RESET_HOST, null, host_topology_key);
+    return finish_reset_transaction(status, "Host reset");
   endfunction
 
   // 功能：请求 Device reset，级联停止并以全 env 的跨 context prepare/commit 重建所有 Function。
@@ -974,25 +1473,28 @@ class rdma_device_env extends uvm_object;
   //   context 时在 epoch commit 前拒绝并恢复本次 quiesce；commit 后仅保留无分配 assignment 路径。
   function rdma_status request_device_reset();
     rdma_status status;
-    rdma_function_context transitioned_contexts[$];
 
+    if (m_closed)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "closed device env cannot reset"
+      );
     if (reset_coordinator == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "device env reset coordinator is missing");
-    status = validate_reset_scope(RDMA_ENV_RESET_DEVICE, null, 0);
-    status = env_status_or_error(status, "Device reset preflight");
-    if (!status.ok())
-      return status;
-    status = quiesce_scope(
-      RDMA_ENV_RESET_DEVICE, null, 0, transitioned_contexts
-    );
-    status = env_status_or_error(status, "Device reset quiesce");
-    if (!status.ok())
-      return status;
-    status = rebuild_scope(
-      RDMA_ENV_RESET_DEVICE, null, 0, transitioned_contexts
-    );
-    return env_status_or_error(status, "Device reset rebuild");
+    if (m_reset_in_progress)
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "device env reset is already in progress");
+    status = begin_reset_transaction();
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Device reset transaction begin returned null"
+        ) : status;
+    m_reset_in_progress = 1'b1;
+    status = execute_reset_scope(RDMA_ENV_RESET_DEVICE, null, 0);
+    return finish_reset_transaction(status, "Device reset");
   endfunction
 
   // 功能：判断 context 是否属于给定复位范围，集中维护 VF/PF/Host/Device 选择规则。
@@ -1076,7 +1578,9 @@ class rdma_device_env extends uvm_object;
           RDMA_SC_INVALID_STATE,
           "quiesce rollback contains a null Function context"
         );
-      status = transitioned_contexts[index].restore_after_quiesce();
+      status = transitioned_contexts[index].restore_after_quiesce(
+        reset_operation_owner(), reset_operation_token()
+      );
       status = env_status_or_error(status, "Function context quiesce rollback");
       if (!status.ok())
         return status;
@@ -1179,7 +1683,9 @@ class rdma_device_env extends uvm_object;
             status, rollback_status, "quiesce scope non-quiesceable context"
           );
         end
-      status = m_contexts[key_name].quiesce();
+      status = m_contexts[key_name].quiesce(
+        reset_operation_owner(), reset_operation_token()
+      );
       status = env_status_or_error(status, "Function context quiesce");
       if (!status.ok()) begin
         rollback_status = restore_quiesced_scope(transitioned_contexts);
@@ -1213,13 +1719,21 @@ class rdma_device_env extends uvm_object;
       );
     case (scope)
       RDMA_ENV_RESET_VF:
-        status = reset_coordinator.request_vf_flr(identity);
+        status = reset_coordinator.request_vf_flr(
+          identity, reset_operation_owner(), reset_operation_token()
+        );
       RDMA_ENV_RESET_PF:
-        status = reset_coordinator.request_pf_reset(identity);
+        status = reset_coordinator.request_pf_reset(
+          identity, reset_operation_owner(), reset_operation_token()
+        );
       RDMA_ENV_RESET_HOST:
-        status = reset_coordinator.request_host_reset(host_key);
+        status = reset_coordinator.request_host_reset(
+          host_key, reset_operation_owner(), reset_operation_token()
+        );
       RDMA_ENV_RESET_DEVICE:
-        status = reset_coordinator.request_device_reset();
+        status = reset_coordinator.request_device_reset(
+          reset_operation_owner(), reset_operation_token()
+        );
       default:
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
@@ -1454,10 +1968,23 @@ class rdma_device_env extends uvm_object;
           "Function reset candidate fingerprint verification"
         );
       end
+      status = selected_contexts[index].seal_prevalidated_candidate(
+        candidates[index]
+      );
+      status = env_status_or_error(
+        status, "Function reset candidate prevalidated seal"
+      );
+      if (!status.ok()) begin
+        rollback_status = restore_quiesced_scope(transitioned_contexts);
+        return reset_status_after_rollback(
+          status, rollback_status,
+          "reset scope candidate prevalidated seal"
+        );
+      end
     end
 
     // 此处是唯一 epoch side effect；其后所有提交均为已预验证 candidate 的
-    // commit_reset_prevalidated()/ledger assignment，不再调用可失败的 reset API。
+    // owned prevalidated seam/ledger assignment，不再调用可分配或可重入的 reset API。
     status = publish_reset_epoch(scope, identity, host_key);
     if (!status.ok()) begin
       rollback_status = restore_quiesced_scope(transitioned_contexts);
@@ -1467,9 +1994,16 @@ class rdma_device_env extends uvm_object;
     end
 
     foreach (selected_contexts[index]) begin
-      // 全量 candidate 已在 epoch publish 前完成 validate；该 seam 只交换字段，
-      // 不再 factory/clone/status-return 分支，故 epoch 后不存在可观察的半提交错误路。
-      selected_contexts[index].commit_reset_prevalidated(candidates[index]);
+      // 全量 candidate 已在 epoch publish 前完成 validate；owned seam 只交换字段并
+      // 再确认同一 env lease。若此处拒绝，说明 begin/publish 后 owner 生命周期已被
+      // 外部破坏，无法安全回滚已发布 epoch，必须以 fatal 隔离而不能继续写部分 ledger。
+      status = selected_contexts[index].commit_reset_prevalidated_owned(
+        candidates[index], reset_operation_owner(), reset_operation_token()
+      );
+      if (status == null || !status.ok())
+        `uvm_fatal("RDMA_RESET_COMMIT", status == null ?
+                   "prevalidated context commit returned null status" :
+                   status.message)
       m_identities[ledger_keys[index]] = staged_ledgers[index];
     end
     return rdma_status::success();
