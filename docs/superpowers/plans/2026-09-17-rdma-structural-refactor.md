@@ -10,10 +10,10 @@
 交接时只读检查发现主线仍在运行 `rdma_queue_codec_test` 的 VCS53 wrapper。
 
 工作树：`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-cmq-contract-foundation`。
-检查时 HEAD：`917beeb769bab84cff95e9e4b2e5ebe9dfeadecd`，真实 index 为空；
+当前继续执行工作树 HEAD：`367a75bb909ac19abecc15c043ce4b95d6595f8b`；
 有大量已存在的未提交改动。所有改动和已有验证证据必须保留。
 
-## 当前批次状态（2026-09-20）
+## 当前批次状态（2026-09-21）
 
 - Batch100 已关闭本项目 RC raw `INLINE_SGB` 的固定 512B/32-chunk 容量拒绝 guard；这不等于
   广义 Phase 1C F2 收口，`sge_num` canonical-authority/whole-plan 工作仍暂停。
@@ -23,14 +23,72 @@
 - Batch104 在当前源码边界完成 parent/core gate：CMQ 28/28 process、11/11 logical，core
   95/95 process、78/78 logical，严格 UVM warning/error/fatal 均为 0/0/0；Batch103 focused
   reset/codec follow-up 同样保持 GREEN。完整日志与 SHA 由 structural-refactor evidence 索引。
+- Batch105/106 已完成当前 reset 事务边界的 focused 收口：candidate detached value-graph
+  seal 拒绝跨 context hostile mutation；coordinator registration baseline/incarnation、
+  duplicate UID/global-ID、PF/Host/Device 及 router-local Host epoch capacity 均在提交前
+  预检，Function epoch map 采用 detached staging；env-local reset guard 拒绝同步重入。
+  最新 focused 日志必须与当前源码指纹一并冻结，不能复用早期源码边界的旧 hash。
+- Batch107 修复并覆盖 reset 后旧 registration snapshot 的幂等快路径缺口：coordinator
+  先解析 current incarnation，只有 `applied_resets == 0` 才接受完全相同的旧 snapshot；
+  reset 后旧值返回 `RDMA_SC_STALE_GENERATION`，current incarnation 才能刷新 baseline。
+  当前源码已刷新 integration regression（8/8）、CMQ gate（28/28 process、11/11 logical）
+  与 core regression（95/95 process、78/78 logical），严格 UVM warning/error/fatal 均为
+  0/0/0；完整指纹见 `evidence/batch107.*`。
+- Batch108 对 coordinator↔env↔router 的跨环境 ownership、同步 callback 重入、direct
+  context reset、detach/rebind 和 active-mapping 生命周期做了只读审计；结论与下一批所需
+  的一对一/aggregate、lease/token、detach/close 契约记录在
+  `task-cmq-batch108-coordinator-ownership-audit.md`，未在缺少架构选择时擅自改 API。
+- Batch109 采用严格一对一 ownership：coordinator lease/token、reset transaction、
+  bilateral router attach/detach、一次性 attach capability、device-env `close()` 和
+  detached candidate provenance seal 已落地；leased coordinator 下 tokenless direct
+  registration/reset/context mutation/router rebind fail-closed，standalone/no-lease
+  context 保留兼容 reset 语义。focused 与 integration regression（10/10）已在当前
+  源码边界通过，并刷新 CMQ gate（28/28 process、11/11 logical）与 core regression
+  （95/95 process、78/78 logical）；详见 `task-cmq-batch109-coordinator-ownership-and-close-report.md`。
+- Batch110 在 coordinator 的四个公开 `request_*` reset wrapper 外安装同步
+  `m_reset_operation_active` publication guard，并把 implementation 与 guard 清理拆开；
+  同一 SystemVerilog 调用栈的 callback 嵌套现在 fail-closed 返回
+  `RDMA_SC_RESOURCE_BUSY`，implementation 的 null status 统一转为 `INVALID_STATE`。
+  guard 明确不是跨线程/跨进程抢占式锁。生命周期 fixture 同步修正 router attach 后再注入
+  local epoch 的顺序，并按 legacy 空 Function scope 的既有 Device reset 语义校正断言。
+  修复后 focused 6 项、integration 10/10、CMQ 28/28 process+11/11 logical、core
+  95/95 process+78/78 logical 均为 GREEN，严格 UVM warning/error/fatal 全部 0/0/0；
+  证据见 `evidence/batch110.*` 与 `task-cmq-batch110-reset-publication-guard-report.md`。
+- Batch111 继续封闭 publication window 内未经过统一 lease validator 的同步 mutation：
+  `acquire_lease()`、`begin_reset()`、`end_reset()`、legacy router attach 和已绑定 router
+  的 direct configure/epoch callback 均回到同一 `reject_mutation_during_reset_operation()`
+  guard；Host epoch capacity/advance 改用 coordinator-issued 一次性 opaque capability，
+  legacy callback 不能再伪造 `allow_active=1`。当前 worktree 的 focused coordinator/lifecycle、
+  integration 10/10、CMQ 28/28 process+11/11 logical、core 95/95 process+78/78 logical
+  与 Python 292 均通过，严格 UVM warning/error/fatal 为 0/0/0；全目录 scanner 覆盖
+  185 个 `.sv`、2 个 `.svh`，共 5,387 个 function/task、0 diagnostics，style/diff、manifest、
+  queue/profile/Phase-1A auxiliary gates 也通过。不能引用错误 worktree 的旧 core 失败日志。
+  Host-router tokenless dataplane `allocate/write/read/release/release_opaque` 未纳入本批同步
+  guard，仍保留为更深 reset-admission/lifecycle OPEN。详见
+  `task-cmq-batch111-reset-mutation-guard-report.md` 与 `evidence/batch111.*`。
+- Batch112 将 Host-router tokenless dataplane 纳入 reset admission：绑定 coordinator 时
+  `allocate/write/read` 在 publication-only 或 active transaction 窗口内 fail-closed，
+  manager call count、router ledger 和 read output 保持无副作用；外部 manager 返回后
+  若同步开启 reset，`allocate()` 以 opaque release 回滚 backing；`release/release_opaque`
+  保留 cleanup/drain 语义；Host reset 后 fresh Function incarnation 的 dataplane 恢复
+  路径已覆盖。当前 focused host-router/coordinator、integration 10/10、Python 292 与
+  changed-SV style/diff 均 GREEN，严格 UVM warning/error/fatal 为 0/0/0；详见
+  `task-cmq-batch112-tokenless-dataplane-admission-report.md`。本批仍不把同步 admission
+  误称为跨线程原子锁。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
-- 最终当前源码静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
-  `git diff --check`、changed-SV style，以及覆盖 5,286 个 function/task 的全目录中文契约/文件头
-  scanner 均 GREEN；完整摘要和 SHA 位于 `evidence/final-static.meta`。
+- Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
+  `git diff --check`、changed-SV style，以及覆盖 5,286 个 function/task 的历史全目录中文契约/文件头
+  scanner 均 GREEN；Batch110 按当前工作树重新扫描 185 个 `.sv`、2 个 `.svh`，共 5,382
+  个 function/task、0 diagnostics，且 Python/manifest/keyword/queue/profile/Phase-1A
+  辅助门禁均通过；Batch111 在 capability 改动后重扫为 5,387 个 function/task、0 diagnostics，
+  摘要见 `evidence/batch111.*`，历史完整摘要仍位于 `evidence/final-static.meta`。
 
-计划状态：`active`。广义 F2、reset coordinator 更深生命周期/所有权语义复审和外部锁仍未关闭，
-不得标记为 `complete`。
+计划状态：`active`。Batch109/110 已关闭当前严格一对一 ownership/close/candidate seam
+和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
+Batch112 关闭同步 tokenless dataplane reset-admission seam，但广义 F2、coordinator 的
+全局并发/更深生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁
+仍未关闭，不得标记为 `complete`。
 
 ## 0. 主线接管与冻结
 

@@ -13,13 +13,13 @@
 | queue-data attachment/recovery | Batch40、46–47、52–54、55–66、78–86：context geometry、route/epoch、CQ identity、pending attachment、CEQE route | `rdma_queue_data_engine_post_test`、`rdma_queue_data_engine_recovery_test`、`rdma_queue_data_engine_device_publish_test`、`rdma_queue_event_route_consume_test` | Batch86 focused 与 integration GREEN | 仍需最终全目录 ownership/注释审查 |
 | queue runtime | Batch37、41–42、45、48、50、53–54 的 cursor/credit/identity/value seam；Batch88 收敛 route/epoch 纯比较并完成注释合规刷新 | `rdma_queue_runtime_test`、`rdma_queue_lifecycle_test`、recovery focused suites、CMQ gate | Batch88 focused GREEN；Batch89–93 后 parent gate GREEN（28/28、11/11、UVM 0/0/0） | 不复制 runtime mutable ledger；Phase 1C F2 的全局 sge_num 收口仍暂停，RC inline-SGB 容量拒绝已由 Batch100 独立关闭 |
 | resource manager | Batch38–44、51、67、74、76、79 的 segment/backing/type/owner/recovery projection；Batch89 收敛 SRQ restore flush progress；Batch97 role cardinality；Batch99 context progress authority/parity；Batch102 QP/queue transient alias audit | `rdma_resource_manager_test`、`rdma_queue_recovery_test`、`rdma_queue_lifecycle_test`、`rdma_qp_lifecycle_test` | Batch99/102 focused GREEN；Batch104 current parent/core gate GREEN（CMQ 28/28 process、11/11 logical；core 95/95 process、78/78 logical；UVM 0/0/0） | 更深 recovery/MMIO 与跨资源生命周期仍开放 |
-| environment/backing composition | Batch91 复审 env/config、queue backing access、responder registry 的 detached snapshot、borrowed adapter、claim/seal 和 Function-incarnation 契约 | `rdma_env_composition_test`、`rdma_queue_backing_access_test`、`rdma_responder_registry_test`、reset integration suites | Batch91 focused、Batch101/103 reset integration 与 Batch104 current parent/core gate GREEN；UVM 0/0/0 | reset coordinator 跨 Function 的全目录生命周期复审及最终中文契约/所有权审查仍开放 |
+| environment/backing composition | Batch91 复审 env/config、queue backing access、responder registry 的 detached snapshot、borrowed adapter、claim/seal 和 Function-incarnation 契约；Batch105 candidate detached value-graph seal 与 hostile cross-context mutation 拒绝；Batch106 env-local reset reentrancy guard；Batch107 reset 后 registration incarnation 刷新；Batch108 coordinator↔env↔router ownership seam 只读审计；Batch109 严格一对一 lease/token、bilateral attach/detach、close 和 capability handshake；Batch110 coordinator publication guard 与同步 callback 拒绝；Batch111 legacy Host epoch callback capability seal 与 direct mutation guard；Batch112 tokenless dataplane reset admission、opaque allocate rollback、cleanup drain 与 fresh-incarnation recovery | `rdma_env_composition_test`、`rdma_queue_backing_access_test`、`rdma_responder_registry_test`、`rdma_reset_candidate_integrity_test`、`rdma_device_env_test`、`rdma_host_mem_router_test`、`rdma_reset_coordinator_lifecycle_test`、reset integration suites | Batch91 focused、Batch101/103 reset integration、Batch105/106 focused、Batch107 integration/CMQ/core regression、Batch109 focused 与 integration 10/10、Batch110 focused 6 项与 integration 10/10/CMQ/core GREEN；Batch111 focused/lifecycle、integration 10/10、CMQ 28/28+11/11、core 95/95+78/78 与 Python 292 均在当前 worktree GREEN；Batch112 focused host-router/coordinator、integration 10/10、Python 292、style/diff GREEN，UVM 0/0/0；全目录 scanner 185 `.sv`+2 `.svh`、5,387 methods、0 diagnostics，静态辅助门禁通过 | coordinator 的跨线程/跨进程全局并发锁、跨环境 callback 语义、manager 外部调用窗口补偿与更深生命周期/所有权审计仍开放 |
 | SQ payload transaction | Batch92 把 receipt/Function/SGE/mapping candidate staging 前移到 refs++/Host I/O 之前，并归一化外部 null status | `rdma_sq_payload_writer_test`、queue-data post paths | Batch92 focused GREEN；Batch89–93 后 parent gate GREEN | Host-memory partial write 后的补偿语义仍由 writer/adapter 契约维护 |
 | CMQ poison/recovery contract | Batch93 校正 poison 的 FIFO 清理、diagnostic staging fallback 和 fail-closed 失败边界说明 | `rdma_cmq_engine_test`、`rdma_cmq_completion_test`、CMQ gate | Batch93 focused GREEN；parent gate GREEN（28/28、11/11、UVM 0/0/0） | 尚未加入同一 poll late-final+malformed CQE 的组合 fault fixture |
 | codec/profile/wire | Batch9–26、68、72–75 的 tuple/profile/mask/CQE metadata 与 hostile factory fixture；Batch100 RC inline-SGB fixed-capacity guard（512B/32 chunks） | codec/profile/driver-field mutation tests、`rdma_defs`、`rdma_sq_codec_test`、`rdma_queue_codec_test`、`rdma_ud_urc_sqe_codec_test` | Batch100 focused GREEN（3/3 wrapper、PROCESS/LOGICAL PASS、UVM 0/0/0）；保留冻结 wire 坐标和 reserved bits | 不将结构重构扩大为 ABI/wire 修复；Phase 1C F2 更广泛的 sge_num/whole-plan 收口仍暂停 |
-| Function context/binding | Batch87 候选式 build/reset/activate、identity consistency、owner handle 与 PCIe projection；Batch95 延迟 registration；Batch98 reset preflight；Batch101 跨 context prepare/commit 原子性 | `rdma_function_context_test`、`rdma_env_composition_test`、`rdma_device_env_test`、`rdma_reset_cascade_test` | Batch98 与 Batch101 focused integration GREEN，UVM 0/0/0；Batch101 关闭跨 context 半提交窗口 | reset coordinator 的全目录生命周期复审、当前源码的 parent/core 回归和最终注释审查仍开放 |
+| Function context/binding | Batch87 候选式 build/reset/activate、identity consistency、owner handle 与 PCIe projection；Batch95 延迟 registration；Batch98 reset preflight；Batch101 跨 context prepare/commit 原子性；Batch105 candidate fingerprint/value-graph seal；Batch106 coordinator epoch staging、registration incarnation 与 router-local capacity 预检；Batch107 reset 后 stale registration 拒绝与 current baseline refresh；Batch109 三条 commit seam 的 generation/epoch provenance seal 与 leased mutation authorization；Batch110 coordinator publication guard；Batch111 coordinator/router direct mutation guard 与 opaque Host epoch publication capability；Batch112 tokenless dataplane admission 与 reset 后 fresh context recovery | `rdma_function_context_test`、`rdma_env_composition_test`、`rdma_device_env_test`、`rdma_reset_cascade_test`、`rdma_reset_candidate_integrity_test`、`rdma_reset_coordinator_test`、`rdma_reset_coordinator_lifecycle_test`、`rdma_host_mem_router_test` | Batch98/101/105/106 focused、Batch107 integration/CMQ/core regression、Batch109 focused 与 integration 10/10、Batch110 focused 6 项与 integration/CMQ/core GREEN，UVM 0/0/0；Batch101 关闭跨 context 半提交窗口，Batch106 关闭普通 scope 的部分 epoch bump 窗口，Batch107 关闭 reset 后旧 registration 快路径，Batch109 关闭 tokenless leased mutation 绕过，Batch110 关闭同步 publication callback 重入，Batch111 关闭 legacy Host epoch capability bypass；Batch112 focused host-router/coordinator 与 integration 10/10、Python/style/diff 均 GREEN | coordinator 的跨线程/跨进程全局并发锁、全目录生命周期/所有权复审、manager 外部调用窗口补偿及最终注释审查仍开放 |
 | SR-IOV/PCIe allocator | Batch87 null status、pre-existing ownership guard、BAR rollback、lease factory atomicity；Batch90 清理多 VF 失败时 `discovered` 部分输出并加入 VF1 注入 | `rdma_sriov_enumerator_authority_test`、`rdma_sriov_enumeration_test`、allocator focused | core authority GREEN；`pcie_work` integration 仍被外部锁阻断 | 不修改外部 pcie_work；需获批 snapshot 后再运行真实 integration |
-| 外部环境与门禁 | dpu_common identity authority；VCS53 wrapper；manifest/style/diff gates；全目录中文契约 scanner | `scripts/run_vcs53.sh`、Python 292、manifest 22、`rdma_defs` 203、style、diff-check、5,286-method scanner | 当前源码静态门禁 GREEN；外部锁错误单独记录 | 任何 VCS 仿真必须继续在 53 主机登录 shell 执行；`pcie_work` 仍 OPEN |
+| 外部环境与门禁 | dpu_common identity authority；VCS53 wrapper；manifest/style/diff gates；全目录中文契约 scanner；Batch106 focused reset evidence；Batch107 current-source static and parent/core/integration evidence；Batch109 ownership/close/candidate evidence；Batch110 publication-guard evidence；Batch111 mutation-guard/capability evidence | `scripts/run_vcs53.sh`、Python 292、manifest 22、`rdma_defs` 203、style、diff-check、current-source contract scanner、Batch111 reset/integration/CMQ/core suites | 当前源码 focused/integration 10/10、CMQ 28/28 process+11/11 logical、core 95/95 process+78/78 logical、Python 292 与 `rdma_defs` 203 均 GREEN；scanner 185 `.sv`+2 `.svh`、5,387 methods、0 diagnostics；UVM 已完成入口为 0/0/0；外部锁错误单独记录 | 任何 VCS 仿真必须继续在 53 主机登录 shell 执行；`pcie_work` 仍 OPEN；coordinator 跨线程/跨进程并发与更深生命周期审计仍开放 |
 
 ## 证据索引
 
@@ -43,12 +43,42 @@
 - 当前源码最终静态证据位于 `evidence/final-static.meta`、`final-static-artifact-sha256.txt`、
   `final-static-python.log`、`final-static-cmq-manifest.log`、`final-static-style.log`、
   `final-static-diff-check.log`、`final-static-contract-scan.log` 和
-  `final-static-rdma_defs.log`；全目录 scanner 覆盖 185 个 `.sv`、2 个 `.svh`、5,286 个
-  function/task，0 diagnostics。冻结 ABI manifest 的摘要更新只反映当前源码字节，未改变 wire
-  坐标或外部依赖。
+  `final-static-rdma_defs.log`；历史 final-static scanner 覆盖 185 个 `.sv`、2 个 `.svh`、
+  5,286 个 function/task，0 diagnostics；Batch109 报告中的 5,346 是其当时的旧扫描口径，
+  Batch110 当前工作树以同一 API 重新计数为 5,382 个、0 diagnostics。冻结 ABI manifest 的
+  摘要更新只反映当前源码字节，未改变 wire 坐标或外部依赖；Batch111 capability 改动后的
+  scanner 已重计为 5,387 个 function/task、0 diagnostics，详见 `evidence/batch111.*`。
 - `pcie_work` 的正确 suite 阻断证据是
   `evidence/post-batch87-rdma_sriov_pcie_work-correct-blocked.log`；`rc=2` 只表示
   `external dependency is not approved: pcie_work`，不是 UVM 业务失败。
+- Batch105 candidate-integrity 的源码刷新与 Batch106 reset-coordinator lifecycle focused
+  证据分别见 `task-cmq-batch105-reset-candidate-integrity-report.md`、
+  `evidence/batch105.meta`/`batch105-artifact-sha256.txt` 和
+  `task-cmq-batch106-reset-coordinator-lifecycle-report.md`、`evidence/batch106.meta`/
+  `batch106-artifact-sha256.txt`；报告中的日志和 source SHA 必须属于同一当前工作树边界。
+- Batch107 reset-incarnation refresh、当前 integration/CMQ/core regression 与静态门禁见
+  `task-cmq-batch107-reset-incarnation-refresh-report.md`、`evidence/batch107.meta`、
+  `evidence/batch107-artifact-sha256.txt`、`evidence/batch107-rdma_reset_coordinator_lifecycle_test.log`、
+  `evidence/batch107-integration-regression.log`、`evidence/batch107-cmq-gate-regression.log`
+  和 `evidence/batch107-core-regression.log`；这些日志与当前源码边界对应。
+- Batch108 的 coordinator ownership / transaction 只读审计与下一批契约决策见
+  `task-cmq-batch108-coordinator-ownership-audit.md`；它不代表新增源码或 GREEN 验证。
+- Batch109 的一对一 coordinator lease、bilateral detach/close、capability handshake 和
+  candidate provenance seal 见 `task-cmq-batch109-coordinator-ownership-and-close-report.md`；
+  当前 integration 10/10、focused seams 和最终静态门禁必须与 Batch109 源码指纹对应，不能
+  复用 Batch107 的旧日志。
+- Batch110 的同步 publication guard、生命周期 fixture 修正与当前源码全量验证见
+  `task-cmq-batch110-reset-publication-guard-report.md`；对应日志为
+  `evidence/batch110-rdma_reset_coordinator_lifecycle_test.log`、
+  `evidence/batch110-integration-regression.log`、`evidence/batch110-cmq-gate-regression.log`、
+  `evidence/batch110-core-regression.log` 及 `evidence/batch110-contract-scan.log`。本批
+  scanner 重新计数为 5,382 个 function/task、0 diagnostics，不能继续沿用 5,346/5,371
+  的旧口径。
+- Batch111 的 coordinator mutation guard、legacy Host epoch capability seal 与 lifecycle
+  fixture 见 `task-cmq-batch111-reset-mutation-guard-report.md`；当前源码的 focused、
+  integration、CMQ、core、Python、`rdma_defs` 与全量静态/hash 日志均冻结在
+  `evidence/batch111.*`，其中 core 为 95/95 process、78/78 logical，scanner 为 5,387
+  methods/0 diagnostics。不能使用错误 worktree 的旧 core 编译日志。
 
 ## 尚未关闭的验收项
 
@@ -63,9 +93,21 @@
    （SHA-256 `c59989807df0feb7cc92e9b34cf0640190c7f0b521e864e7cff130e0e8a7a30b`），
    95/95 process、78/78 logical、95/95 UVM pristine；Batch104 已在 Batch101/102 后的当前
    源码边界重新验证 parent/core gate（CMQ 28/28 process、11/11 logical；core 95/95 process、
-   78/78 logical；UVM pristine），因此旧 SHA 只作历史边界证据。
-3. 全目录中文 function/task、文件头和静态门禁复审已在当前源码边界通过；仍需完成 reset
-   coordinator 的更深生命周期/所有权语义复审，并在后续源码变化后重复这些门禁。
+   78/78 logical；UVM pristine），因此旧 SHA 只作历史边界证据。Batch107 已在当前源码
+   边界再次刷新 CMQ gate（28/28 process、11/11 logical）、core regression（95/95 process、
+   78/78 logical）以及 integration regression（8/8 tests），严格 UVM 仍为 0/0/0；Batch109
+   在 candidate/ownership/close 改动后的当前源码边界再次验证 CMQ 28/28、core 95/95 和
+   integration 10/10，严格 UVM 仍为 0/0/0；Batch110 在 publication-guard 与 queue-codec
+   当前工作树上重新验证同样的 CMQ/core/integration 结论，严格 UVM 仍为 0/0/0；Batch111
+   已刷新 focused/lifecycle、integration 10/10 和 CMQ gate 28/28+11/11，core 与静态门禁
+   已在 Batch111 当前源码边界证据闭合。
+3. 全目录中文 function/task、文件头和静态门禁复审已在 Batch111 当前源码边界通过（185
+   `.sv`、2 `.svh`、5,387 methods、0 diagnostics）；Batch106 覆盖 registration/epoch/
+   router-local overflow 与 scope 原子性 focused seam，Batch107 关闭 reset 后 stale
+   registration 快路径，Batch109 关闭严格一对一 lease/close 与 candidate provenance 绕过，
+   Batch110 关闭同步 publication callback 重入，Batch111 关闭 legacy Host epoch capability
+   bypass；coordinator 的跨线程/跨进程全局并发锁、更深生命周期/所有权语义复审仍需后续
+   完成，并在后续源码变化后重复门禁。
 4. `pcie_work` external lock 仍为 OPEN；覆盖矩阵不替代真实外部依赖批准，在 lock 获批前
    SR-IOV integration 只能报告已知阻断，不能伪造 GREEN。
 
