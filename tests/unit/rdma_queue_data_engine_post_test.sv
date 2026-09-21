@@ -142,6 +142,159 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
       status;
   endfunction
 
+  // 功能：probe_canonicalize_cq_poll_wq_attachment_fixture 在冻结 send-CQE/link
+  //   与 pending kind 的前提下调用生产 canonicalize helper；fault_kind=0 使用
+  //   registry 中的真实 SQ attachment，fault_kind=1..5 分别注入 null、错误
+  //   entry geometry、错误 backing role、空 runtime 与 stale queue-handle 的
+  //   detached staged alias，验证 hostile output 能否安全回查 canonical 引用。
+  // 输入/输出及副作用：qp_h、fault_kind 为输入，used_canonical_relookup 为输出；
+  //   函数只读取 attachment/link 索引，创建临时 CQE、pending 和 alias，调用只读
+  //   helper 后清空临时引用，不推进 cursor、ledger、runtime pending、Host-memory、
+  //   MMIO 或外部资源所有权。输出为 1 表示返回的 attachment 是 registry 中的
+  //   canonical 引用且不同于本次 detached staged alias。
+  // 失败/边界：QP/link/SQ attachment、临时对象或 pending status 缺失时返回明确
+  //   非成功 status；fault_kind=6 故意使 pending.completion_wq_kind 与冻结 SQ
+  //   target 不一致，必须 fail-closed；未知 fault_kind 返回 INVALID_ARGUMENT。
+  //   alias 只保存非拥有字段，任何变形均不写回 engine-owned attachment，避免
+  //   hostile fixture 污染后续 cleanup 或其他测试。
+  function rdma_status probe_canonicalize_cq_poll_wq_attachment_fixture(
+    rdma_handle qp_h,
+    int unsigned fault_kind,
+    output bit used_canonical_relookup
+  );
+    rdma_queue_data_attachment canonical_attachment;
+    rdma_queue_data_attachment staged_attachment;
+    rdma_queue_data_attachment canonical_result;
+    rdma_queue_data_qp_link link;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_pending_operation pending;
+    rdma_status status;
+    string qp_key;
+
+    used_canonical_relookup = 1'b0;
+    canonical_attachment = null;
+    staged_attachment = null;
+    canonical_result = null;
+    link = null;
+    cqe = null;
+    pending = null;
+
+    if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQ poll canonicalization probe QP is invalid");
+    if (!(fault_kind inside {0, 1, 2, 3, 4, 5, 6}))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQ poll canonicalization probe fault is unknown");
+
+    status = lookup_attachment(qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                               canonical_attachment);
+    if (status == null || !status.ok() || canonical_attachment == null)
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CQ poll canonicalization probe SQ lookup returned null") :
+        status;
+    qp_key = identity_key(qp_h);
+    if (qp_key == "" || !qp_links.exists(qp_key) || qp_links[qp_key] == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ poll canonicalization probe QP link is missing");
+    link = qp_links[qp_key];
+    if (link.qp_h == null || canonical_attachment.queue_h == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ poll canonicalization probe authority is incomplete");
+
+    cqe = rdma_hw_cqe_model::type_id::create(
+      "cq_poll_canonicalization_probe_cqe");
+    pending = rdma_queue_pending_operation::type_id::create(
+      "cq_poll_canonicalization_probe_pending");
+    if (cqe == null || pending == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "CQ poll canonicalization probe evidence allocation failed");
+    cqe.rq_cqe = 1'b0;
+    pending.completion_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
+    pending.failure_status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "canonicalization probe sentinel");
+    if (pending.failure_status == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "CQ poll canonicalization probe status allocation failed");
+
+    if (fault_kind != 0) begin
+      staged_attachment = rdma_queue_data_attachment::type_id::create(
+        "cq_poll_canonicalization_probe_alias");
+      if (staged_attachment == null)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "CQ poll canonicalization probe alias allocation failed");
+      staged_attachment.queue_h = rdma_handle::type_id::create(
+        "cq_poll_canonicalization_probe_alias_handle");
+      if (staged_attachment.queue_h == null)
+        return rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "CQ poll canonicalization probe alias handle allocation failed");
+      staged_attachment.queue_h.kind = canonical_attachment.queue_h.kind;
+      staged_attachment.queue_h.function_uid =
+        canonical_attachment.queue_h.function_uid;
+      staged_attachment.queue_h.object_id =
+        canonical_attachment.queue_h.object_id;
+      staged_attachment.queue_h.generation =
+        canonical_attachment.queue_h.generation;
+      staged_attachment.ceq_h = canonical_attachment.ceq_h;
+      staged_attachment.kind = canonical_attachment.kind;
+      staged_attachment.runtime = canonical_attachment.runtime;
+      staged_attachment.access = canonical_attachment.access;
+      staged_attachment.role = canonical_attachment.role;
+      staged_attachment.context_ref = canonical_attachment.context_ref;
+      staged_attachment.entry_size = canonical_attachment.entry_size;
+      staged_attachment.local_id = canonical_attachment.local_id;
+      staged_attachment.transport = canonical_attachment.transport;
+    end
+
+    case (fault_kind)
+      0: staged_attachment = canonical_attachment;
+      1: staged_attachment = null;
+      2: staged_attachment.entry_size = canonical_attachment.entry_size + 1;
+      3: staged_attachment.role = RDMA_QUEUE_ROLE_CQ_RING;
+      4: begin
+        staged_attachment.runtime = rdma_queue_runtime::type_id::create(
+          "cq_poll_canonicalization_probe_empty_runtime");
+        if (staged_attachment.runtime == null)
+          return rdma_status::make(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "CQ poll canonicalization probe runtime allocation failed");
+      end
+      5: staged_attachment.queue_h.generation =
+        canonical_attachment.queue_h.generation ^ 32'h1;
+      6: pending.completion_wq_kind = RDMA_QUEUE_RUNTIME_RQ;
+      default: begin end
+    endcase
+
+    status = canonicalize_cq_poll_wq_attachment(
+      cqe, link, pending, staged_attachment, canonical_result);
+    used_canonical_relookup = status != null && status.ok() &&
+      canonical_result != null && canonical_result == canonical_attachment &&
+      (staged_attachment == null || canonical_result != staged_attachment);
+
+    // 中文设计：staged alias 只借用 runtime/access/context_ref，不能把其生命周期
+    // 传给调用方；显式清空所有临时引用后再返回，确保本 probe 不留下跨 fixture
+    // 的可变别名。engine-owned canonical attachment 从未被修改，无需恢复生产字段。
+    staged_attachment = null;
+    canonical_result = null;
+    pending = null;
+    cqe = null;
+    link = null;
+    return status == null ?
+      rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQ poll canonicalization probe returned null status") :
+      status;
+  endfunction
+
   // 功能：probe_prepare_cq_consumer_doorbell 通过真实 CQ attachment 调用生产
   //   prepare_consumer_doorbell，观察 CQ consumer CI 是否错误地物化为 MMIO 描述符。
   // 输入/输出及副作用：cq_h/next 为输入；prepared_desc/prepared_status 为输出；
