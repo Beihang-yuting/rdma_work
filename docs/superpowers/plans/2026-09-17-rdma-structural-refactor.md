@@ -280,6 +280,19 @@
   profile/manifest/keyword/Phase-1A 门禁通过。该批仍不声称 SRQ 全生命周期、UD receive/
   replay、legacy descriptor、poll/recovery 全阶段组合、跨队列并发或最终 ownership 审计
   已完成；详见 `task-cmq-batch131-poll-wq-canonicalization-report.md`。
+- Batch132 在不改生产路径的前提下补齐 shared-SRQ receive CQE 的公开正向证据：poll
+  测试内新增独立的 SRQ/QP 创建与销毁 helper，避免借用其他测试 class 的隐含上下文；
+  `post_recv(target_h=SRQ, completion_qp_h=QP)`→`publish_cqe(rq_cqe=1,srfq=1)`→
+  `poll_cqe` 真实执行，并断言 `RDMA_CQE_VARIANT_RQ_SRFQ`、authoritative
+  `local_srq_id` 的 `srfqn`、`srfqe_index/wrap`、`rqe_cpl`、SRQ ledger release、
+  CQ cursor/occupancy 与基础私有 RQ 不变。SRQ wire ID 使用 `local_srq_id`，不把
+  manager registry 的 `handle.object_id` 当作 SRFQN；QP→SRQ→fixture cleanup 在
+  所有 early-disable 路径保持幂等。poll/post/recovery/device-publish 四项 focused
+  wrapper 均 PROCESS/LOGICAL PASS、UVM 0/0/0；当前 scanner 为 185 个 `.sv`、2 个
+  `.svh`、5,426 methods、0 diagnostics。该批只关闭 shared-SRQ receive poll 的窄
+  证据 seam，UD receive/replay、publish variant consistency、legacy descriptor、
+  poll/recovery 组合、跨队列并发与最终 ownership 审计仍开放；详见
+  `task-cmq-batch132-shared-srq-cqe-poll-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -303,7 +316,8 @@ recovery CQ→WQ release 的局部职责 seam、Batch125 关闭 CQ poll candidat
 Batch127 关闭 live CQ poll mutation/commit 的局部职责 seam、Batch128 关闭 CEQ/AEQ
 consumer commit 的局部职责 seam、Batch129 关闭 CQ poll WQ target selector/validator
 的局部职责 seam、Batch130 关闭私有 RQ receive CQE 正向 poll 的测试覆盖 seam、Batch131
-关闭 staged WQ canonicalization 的 admission seam并补充 UD SEND 正向 poll 证据；完整公开
+关闭 staged WQ canonicalization 的 admission seam并补充 UD SEND 正向 poll 证据、Batch132
+关闭 shared-SRQ receive CQE 正向 poll 的测试覆盖 seam；完整公开
 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。

@@ -161,6 +161,78 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     return model;
   endfunction
 
+  // 功能：make_cqe_for_outstanding_shared_srq_receive 根据已 post 的共享 SRQ
+  //   slot、负责完成的 RC QP、SRQ wire local ID 与 CQ producer polarity，构造带
+  //   SRFQ overlay 的 receive CQE；模型同时保留 WQE release 坐标，供公开
+  //   publish_cqe→poll_cqe 链验证 shared-SRQ ledger release；调用方负责把真实
+  //   SRQ 的 authoritative local_srq_id 作为 srqn 传入，helper 只负责 wire 范围门禁。
+  // 输入/输出及副作用：qp_h、qpn、srqn、posted、polarity 为输入；status 为输出；
+  //   成功返回 detached QP-owned CQE，不读取/写入 CQ/SRQ backing，不修改 posted
+  //   或任何 runtime；srfqn 从 SRQ resource 的 authoritative local_srq_id 投影，
+  //   不把 handle.object_id（manager registry identity）误当成 wire 坐标。
+  // 失败/边界：QP kind、local_qp_id 超出 18-bit wire 范围、local_srq_id 超出 12-bit
+  //   wire 范围、posted/status
+  //   evidence 或对象分配/clone 失败时返回 null 与非成功 status；调用方不得把
+  //   缺失 srfqn、srfqe index/wrap 或 RQ/SRFQ variant 的半成品送入 publish_cqe。
+  function automatic rdma_hw_cqe_model make_cqe_for_outstanding_shared_srq_receive(
+    rdma_handle qp_h,
+    int unsigned qpn,
+    int unsigned srqn,
+    rdma_queue_post_result posted,
+    bit polarity,
+    output rdma_status status
+  );
+    rdma_hw_cqe_model model;
+
+    status = rdma_status::success();
+    model = null;
+    if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP ||
+        qpn > 18'h3ffff || srqn > 12'hfff || posted == null ||
+        posted.status == null || !posted.status.ok()) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "poll test shared-SRQ receive CQE evidence is incomplete");
+      return null;
+    end
+    model = rdma_hw_cqe_model::type_id::create(
+      "poll_test_shared_srq_receive_cqe");
+    if (model == null) begin
+      status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "poll test shared-SRQ receive CQE allocation failed");
+      return null;
+    end
+    status = clone_test_handle(qp_h, model.qp_h);
+    if (status == null || !status.ok() || model.qp_h == null) begin
+      if (status == null)
+        status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "poll test shared-SRQ CQE QP clone returned null status");
+      model = null;
+      return null;
+    end
+    model.wr_id = posted.wr_id;
+    model.opcode = RDMA_WR_RECV;
+    model.qpn = qpn;
+    model.wqe_index = posted.index;
+    model.wqe_wrap = posted.wrap;
+    model.rq_cqe = 1'b1;
+    model.srfq = 1'b1;
+    model.variant = RDMA_CQE_VARIANT_RQ_SRFQ;
+    model.polarity = polarity;
+    model.packet_opcode = 8'h01;
+    model.ecode = RDMA_CMQ_SUCCESS_ECODE;
+    model.payload_len = 32;
+    model.immediate_data = 32'h0;
+    model.signature = 8'h0;
+    model.rqe_cpl = 1'b1;
+    model.srfqn = srqn[11:0];
+    model.srfqe_wrap = posted.wrap;
+    model.srfqe_index = posted.index[14:0];
+    model.status = rdma_status::success();
+    return model;
+  endfunction
+
   // 功能：make_cqe_for_outstanding_ud_send 根据已 post 的 UD SQ slot、UD QP
   //   route 和 CQ producer polarity 构造显式 UD variant 的 send CQE，供公开
   //   publish_cqe→poll_cqe 链验证 UD qword2/qword3 overlay 与 SQ ledger release。
@@ -512,6 +584,544 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     end
   endtask
 
+  // 功能：create_shared_srq_poll_route 为 poll focused fixture 创建 owned-backing
+  //   SRQ 与引用该 SRQ 的真实 RC QP，并把 QP attach 到指定 CQ，交付可供
+  //   post_recv/publish_cqe/poll_cqe 使用的 shared receive route。
+  // 输入/输出及副作用：label、fixture、target_cq 为输入；srq/srq_qp 与四个
+  //   lifecycle flag、status 为输出；成功时 queue/QP executor 会新增资源和
+  //   engine attachment，所有权仍由调用方按 flag 逆序回收；srq_attached 明确
+  //   记录 attach_qp 成功后由 QP 借用建立的 SRQ attachment。
+  // 失败/边界：fixture dependency、request allocation/clone、CMQ create/cast 或
+  //   attach 失败时保留已置位 flag、清晰错误 status 和部分输出；调用方必须继续
+  //   cleanup，不能因为 SRQ QP 创建失败而跳过已成功创建的 SRQ。
+  task automatic create_shared_srq_poll_route(
+    string label,
+    rdma_queue_data_engine_fixture fixture,
+    rdma_cq target_cq,
+    output rdma_srq srq,
+    output rdma_qp srq_qp,
+    output bit srq_created,
+    output bit srq_qp_created,
+    output bit srq_qp_attached,
+    output bit srq_attached,
+    output rdma_status status
+  );
+    rdma_create_srq_req srq_request;
+    rdma_create_qp_req qp_request;
+    rdma_resource created_resource;
+    rdma_control_result control_result;
+
+    srq = null;
+    srq_qp = null;
+    srq_created = 1'b0;
+    srq_qp_created = 1'b0;
+    srq_qp_attached = 1'b0;
+    srq_attached = 1'b0;
+    status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "shared-SRQ poll route is incomplete");
+    if (fixture == null || fixture.binding == null || fixture.pd == null ||
+        fixture.pd.handle == null || target_cq == null ||
+        target_cq.handle == null || fixture.queue_executor == null ||
+        fixture.qp_executor == null || fixture.engine == null)
+      return;
+
+    srq_request = rdma_create_srq_req::type_id::create(
+      {label, "_srq_request"});
+    if (srq_request == null) begin
+      status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "shared-SRQ poll request allocation failed");
+      return;
+    end
+    srq_request.owner = fixture.binding.make_handle();
+    srq_request.depth = 16;
+    srq_request.max_sge = 4;
+    srq_request.limit_threshold = 16;
+    srq_request.pd_h = rdma_clone_handle_value(
+      fixture.pd.handle, {label, "_srq_pd"});
+    srq_request.payload_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+    if (srq_request.owner == null || srq_request.pd_h == null) begin
+      status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "shared-SRQ poll handle clone failed");
+      return;
+    end
+    created_resource = null;
+    control_result = null;
+    fixture.queue_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), srq_request, 64'h2133,
+      created_resource, control_result);
+    status = control_result == null ?
+      rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "shared-SRQ poll create returned no control result") :
+      control_result.status;
+    if (status == null || !status.ok() || created_resource == null ||
+        !$cast(srq, created_resource)) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "shared-SRQ poll create returned wrong resource");
+      return;
+    end
+    srq_created = 1'b1;
+
+    qp_request = rdma_create_qp_req::type_id::create(
+      {label, "_qp_request"});
+    if (qp_request == null) begin
+      status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "shared-SRQ poll QP request allocation failed");
+      return;
+    end
+    qp_request.owner = fixture.binding.make_handle();
+    qp_request.transport = RDMA_TRANSPORT_RC;
+    qp_request.sq_depth = 16;
+    qp_request.rq_depth = 16;
+    qp_request.max_send_sge = 4;
+    qp_request.max_recv_sge = 4;
+    qp_request.max_inline_data = 32;
+    qp_request.pd_h = rdma_clone_handle_value(
+      fixture.pd.handle, {label, "_qp_pd"});
+    qp_request.send_cq_h = rdma_clone_handle_value(
+      target_cq.handle, {label, "_send_cq"});
+    qp_request.recv_cq_h = rdma_clone_handle_value(
+      target_cq.handle, {label, "_recv_cq"});
+    qp_request.srq_h = rdma_clone_handle_value(
+      srq.handle, {label, "_srq"});
+    qp_request.context_attrs = fixture.make_transport_attrs(
+      {label, "_attrs"}, RDMA_TRANSPORT_RC);
+    if (qp_request.owner == null || qp_request.pd_h == null ||
+        qp_request.send_cq_h == null || qp_request.recv_cq_h == null ||
+        qp_request.srq_h == null || qp_request.context_attrs == null) begin
+      status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "shared-SRQ poll QP request is incomplete");
+      return;
+    end
+    control_result = null;
+    fixture.qp_executor.create_locked(
+      fixture.binding, fixture.binding.make_handle(), qp_request, 64'h2134,
+      srq_qp, control_result);
+    status = control_result == null ?
+      rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "shared-SRQ poll QP create returned no control result") :
+      control_result.status;
+    if (status == null || !status.ok() || srq_qp == null)
+      return;
+    srq_qp_created = 1'b1;
+    status = fixture.engine.attach_qp(srq_qp.handle);
+    if (status == null || !status.ok())
+      return;
+    srq_qp_attached = 1'b1;
+    srq_attached = 1'b1;
+    status = rdma_status::success();
+  endtask
+
+  // 功能：destroy_shared_srq_poll_route 先撤销 QP 借用的 SRQ engine attachment，
+  //   再通过公开 executor 回收 poll task 创建的 SRQ；调用方应在此 task 前先销毁
+  //   引用 SRQ 的 QP，确保 QP link、SRQ attachment 与 SRFQ backing 依赖顺序闭合。
+  // 输入/输出及副作用：fixture、srq_h、created、srq_attached、transaction_id 为
+  //   输入，status 为输出；created=1 时按 detach→destroy 顺序提交 cleanup，不直接
+  //   改写 manager 私有表；即使 srq_attached=0 也会探测一次 detach，以清理
+  //   attach_qp 部分失败后可能残留的 SRQ attachment；明确的“未附着”状态可安全忽略。
+  // 失败/边界：created=0 是幂等成功；依赖、handle、transaction 或 control result
+  //   缺失时返回明确失败；SRQ detach 失败时仍尝试 destroy 并返回首个错误，不能吞掉
+  //   engine attachment 残留或跳过基础 fixture cleanup。
+  task automatic destroy_shared_srq_poll_route(
+    rdma_queue_data_engine_fixture fixture,
+    rdma_handle srq_h,
+    bit created,
+    bit srq_attached,
+    longint unsigned transaction_id,
+    output rdma_status status
+  );
+    rdma_destroy_resource_req request;
+    rdma_control_result control_result;
+    rdma_status detach_status;
+    rdma_status destroy_status;
+
+    status = rdma_status::make(
+      RDMA_SC_INVALID_STATE, "shared-SRQ poll teardown is incomplete");
+    if (!created) begin
+      status = rdma_status::success();
+      return;
+    end
+    if (fixture == null || fixture.binding == null ||
+        fixture.queue_executor == null || srq_h == null ||
+        transaction_id == 0)
+      return;
+    status = rdma_status::success();
+    if (fixture.engine == null) begin
+      if (srq_attached)
+        status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "shared-SRQ poll detach requires queue-data engine");
+    end
+    else begin
+      detach_status = fixture.engine.detach(srq_h);
+      if (detach_status == null)
+        detach_status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "shared-SRQ poll detach returned null status");
+      if (!detach_status.ok() &&
+          !(detach_status.code == RDMA_SC_INVALID_STATE &&
+            detach_status.message == "queue is not attached"))
+        status = detach_status;
+    end
+    request = rdma_destroy_resource_req::type_id::create(
+      "shared_srq_poll_destroy");
+    if (request == null) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "shared-SRQ poll destroy request allocation failed");
+      return;
+    end
+    request.owner = fixture.binding.make_handle();
+    request.target_h = srq_h;
+    if (request.owner == null) begin
+      if (status == null || status.ok())
+        status = rdma_status::make(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "shared-SRQ poll destroy owner clone failed");
+      return;
+    end
+    control_result = null;
+    fixture.queue_executor.destroy_locked(
+      fixture.binding, fixture.binding.make_handle(), request,
+      transaction_id, control_result);
+    destroy_status = control_result == null ?
+      rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "shared-SRQ poll destroy returned no control result") :
+      control_result.status;
+    if (destroy_status == null)
+      destroy_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "shared-SRQ poll destroy returned null status");
+    if (status == null || status.ok())
+      status = destroy_status;
+  endtask
+
+  // 功能：check_shared_srq_receive_cqe_e2e 在真实 shared-SRQ/QP/CQ lifecycle
+  //   route 上执行 post_recv→公开 publish_cqe(rq_cqe=1,srfq=1)→poll_cqe，
+  //   确认 receive completion 释放共享 SRQ ledger，而不是负责完成的 QP 私有 RQ。
+  // 输入/输出及副作用：无显式参数；任务创建带 CQC context shadow 的基础 fixture，
+  //   通过本测试的独立 route helper 增加 fixture-scope SRQ 与 RC QP，发布/消费一条
+  //   SRFQ receive CQE，读取 SRQ、私有 RQ、CQ 的 occupancy/cursor 与 detached result，
+  //   最后按 QP→SRQ→基础 fixture 顺序释放全部资源。
+  // 失败/边界：setup、SRQ route、request/post、polarity、CQE 构造、publish、poll、
+  //   overlay/ledger/cursor 查询或第二次空轮询任一步失败均报告 UVM_ERROR；任何
+  //   early disable 都继续销毁已创建的 SRQ QP/SRQ，避免共享 CQ/PD 被提前释放。
+  task automatic check_shared_srq_receive_cqe_e2e();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_srq srq;
+    rdma_qp srq_qp;
+    rdma_post_recv_req request;
+    rdma_post_recv_req released_request;
+    rdma_sge sge;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_status setup_status;
+    rdma_status status;
+    rdma_status clone_status;
+    rdma_status cqe_status;
+    rdma_status cleanup_status;
+    bit srq_created;
+    bit srq_qp_created;
+    bit srq_qp_attached;
+    bit srq_attached;
+    int unsigned used;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit pending;
+    bit producer_wrap;
+    bit consumer_wrap;
+    bit polarity;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "shared_srq_receive_cqe_fixture");
+    srq = null;
+    srq_qp = null;
+    srq_created = 1'b0;
+    srq_qp_created = 1'b0;
+    srq_qp_attached = 1'b0;
+    srq_attached = 1'b0;
+    begin : shared_srq_receive_cqe_flow
+      if (fixture == null) begin
+        `uvm_error("SHARED_SRQ_CQE_FIXTURE",
+                   "shared-SRQ receive CQE fixture allocation failed")
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      // CQ poll 的 CI/wrap 仍必须来自 CQC context shadow；SRQ route 额外借用
+      // 同一 CQ，但其 WQE ledger 由独立 SRQ runtime 拥有。
+      fixture.setup(setup_status, 16, RDMA_CQE_BYTES, 16, 16,
+                    1'b1, 1'b0, 1'b0);
+      if (setup_status == null || !setup_status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_SETUP",
+                   setup_status == null ? "null setup status" :
+                   setup_status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      // 独立 helper 通过本 fixture 的 queue/QP executor 创建真实 SRQ/QP route；
+      // 资源所有权仍由本 task 的 explicit flags 与 fixture executor 管理，不依赖
+      // 其他测试 class 的字段或 run_phase 上下文。
+      create_shared_srq_poll_route(
+        "shared_srq_receive", fixture, fixture.cq, srq, srq_qp,
+        srq_created, srq_qp_created, srq_qp_attached, srq_attached, status);
+      if (status == null || !status.ok() || srq == null || srq.handle == null ||
+          srq_qp == null || srq_qp.handle == null || !srq_created ||
+          !srq_qp_created || !srq_qp_attached || !srq_attached) begin
+        `uvm_error("SHARED_SRQ_CQE_ROUTE",
+                   status == null ? "null SRQ route status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      request = rdma_post_recv_req::type_id::create(
+        "shared_srq_receive_request");
+      sge = rdma_sge::type_id::create("shared_srq_receive_sge");
+      clone_status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "shared-SRQ request handle clone was not attempted");
+      if (request != null)
+        request.owner = fixture.binding.make_handle();
+      if (request != null)
+        clone_status = clone_test_handle(
+          srq.handle, request.target_h);
+      if (request != null && clone_status != null && clone_status.ok())
+        clone_status = clone_test_handle(
+          srq_qp.handle, request.completion_qp_h);
+      if (sge != null) begin
+        sge.iova.value = 64'h0000_3000_0000_0000;
+        sge.length = 128;
+        sge.lkey = 32'h090a_0b0c;
+      end
+      if (request != null && sge != null)
+        request.sges.push_back(sge);
+      if (request == null || sge == null || clone_status == null ||
+          !clone_status.ok() || request.owner == null ||
+          request.target_h == null || request.completion_qp_h == null) begin
+        `uvm_error("SHARED_SRQ_CQE_REQUEST",
+                   clone_status == null ? "null SRQ request status" :
+                   clone_status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      request.wr_id = 64'hbabe_cafe_0000_1320;
+
+      posted = null;
+      fixture.engine.post_recv(request, posted, status);
+      if (status == null || !status.ok() || posted == null ||
+          posted.status == null || !posted.status.ok() || posted.index != 0 ||
+          posted.wrap != 1'b0 || posted.image == null ||
+          posted.image.bytes.size() != RDMA_WQE_BYTES) begin
+        `uvm_error("SHARED_SRQ_CQE_POST",
+                   status == null ? "null shared-SRQ post status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      used = 0;
+      pending = 1'b1;
+      status = fixture.engine.query_runtime_occupancy(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, used, pending);
+      if (status == null || !status.ok() || used != 1 || pending) begin
+        `uvm_error("SHARED_SRQ_CQE_POST_CREDIT",
+                   status == null ? "null SRQ occupancy status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      // 基础 fixture QP 仍携带独立私有 RQ；共享 SRQ post 不得伪造或消耗该账本。
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending) begin
+        `uvm_error("SHARED_SRQ_CQE_PRIVATE_RQ_BASELINE",
+                   status == null ? "null private RQ baseline status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      polarity = 1'b0;
+      cqe_status = fixture.engine.query_runtime_producer_polarity(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+      if (cqe_status == null || !cqe_status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLARITY",
+                   cqe_status == null ? "null CQ polarity status" :
+                   cqe_status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      cqe = make_cqe_for_outstanding_shared_srq_receive(
+        srq_qp.handle, srq_qp.local_qp_id, srq.local_srq_id, posted, polarity,
+        cqe_status);
+      if (cqe_status == null || !cqe_status.ok() || cqe == null ||
+          cqe.rq_cqe != 1'b1 || cqe.srfq != 1'b1 ||
+          cqe.variant != RDMA_CQE_VARIANT_RQ_SRFQ ||
+          cqe.srfqn != srq.local_srq_id[11:0] ||
+          cqe.srfqe_wrap != posted.wrap ||
+          cqe.srfqe_index != posted.index[14:0]) begin
+        `uvm_error("SHARED_SRQ_CQE_MODEL",
+                   cqe_status == null ? "null shared-SRQ CQE status" :
+                   cqe_status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      published = null;
+      fixture.engine.publish_cqe(fixture.cq.handle, cqe, published, status);
+      if (status == null || !status.ok() || published == null ||
+          published.status == null || !published.status.ok() ||
+          published.index != 0 || published.wrap != 1'b0 ||
+          !published.occupancy_valid || published.occupancy != 1 ||
+          published.image == null ||
+          published.image.bytes.size() != RDMA_CQE_BYTES) begin
+        `uvm_error("SHARED_SRQ_CQE_PUBLISH",
+                   status == null ? "null shared-SRQ CQE publish status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      completion = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      if (status == null || !status.ok() || completion == null ||
+          completion.cqe == null || completion.cqe.rq_cqe != 1'b1 ||
+          completion.cqe.srfq != 1'b1 ||
+          completion.cqe.variant != RDMA_CQE_VARIANT_RQ_SRFQ ||
+          completion.cqe.qpn != srq_qp.local_qp_id ||
+          completion.cqe.wqe_index != posted.index ||
+          completion.cqe.wqe_wrap != posted.wrap ||
+          completion.cqe.wr_id != posted.wr_id ||
+          completion.cqe.opcode != RDMA_WR_RECV ||
+          completion.cqe.rqe_cpl != 1'b1 ||
+          completion.cqe.srfqn != srq.local_srq_id[11:0] ||
+          completion.cqe.srfqe_wrap != posted.wrap ||
+          completion.cqe.srfqe_index != posted.index[14:0] ||
+          completion.completion_status == null ||
+          !completion.completion_status.ok() ||
+          completion.released_slots.size() != 1 ||
+          completion.released_slots[0] == null ||
+          completion.released_slots[0].wr_id != posted.wr_id ||
+          completion.released_slots[0].index != posted.index ||
+          completion.released_slots[0].wrap != posted.wrap ||
+          completion.released_slots[0].completion_status == null ||
+          !completion.released_slots[0].completion_status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLL",
+                   status == null ? "null shared-SRQ CQE poll status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      if (completion.released_slots[0].request_snapshot == null ||
+          !$cast(released_request,
+                 completion.released_slots[0].request_snapshot) ||
+          released_request == null || released_request.target_h == null ||
+          released_request.target_h.kind != RDMA_RESOURCE_SRQ ||
+          !released_request.target_h.same_instance(srq.handle) ||
+          released_request.completion_qp_h == null ||
+          !released_request.completion_qp_h.same_instance(srq_qp.handle)) begin
+        `uvm_error("SHARED_SRQ_CQE_LEDGER_TARGET",
+                   "released ledger does not retain shared-SRQ target")
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      status = fixture.engine.query_runtime_occupancy(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending)
+        `uvm_error("SHARED_SRQ_CQE_SRQ_RELEASE",
+                   status == null ? "null SRQ release status" :
+                   status.convert2string())
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending)
+        `uvm_error("SHARED_SRQ_CQE_PRIVATE_RQ_UNTOUCHED",
+                   status == null ? "null private RQ post-poll status" :
+                   status.convert2string())
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending)
+        `uvm_error("SHARED_SRQ_CQE_CQ_RELEASE",
+                   status == null ? "null CQ release status" :
+                   status.convert2string())
+
+      status = fixture.engine.query_runtime_cursors(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (status == null || !status.ok() || producer_index != 1 ||
+          producer_wrap != 1'b0 || consumer_index != 1 ||
+          consumer_wrap != 1'b0)
+        `uvm_error("SHARED_SRQ_CQE_SRQ_CURSOR",
+                   status == null ? "null SRQ cursor status" :
+                   status.convert2string())
+      status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (status == null || !status.ok() || producer_index != 0 ||
+          producer_wrap != 1'b0 || consumer_index != 0 ||
+          consumer_wrap != 1'b0)
+        `uvm_error("SHARED_SRQ_CQE_PRIVATE_RQ_CURSOR",
+                   status == null ? "null private RQ cursor status" :
+                   status.convert2string())
+      status = fixture.engine.query_runtime_cursors(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (status == null || !status.ok() || producer_index != 1 ||
+          producer_wrap != 1'b0 || consumer_index != 1 ||
+          consumer_wrap != 1'b0)
+        `uvm_error("SHARED_SRQ_CQE_CQ_CURSOR",
+                   status == null ? "null CQ cursor status" :
+                   status.convert2string())
+
+      completion = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      if (status == null || status.code != RDMA_SC_QUEUE_EMPTY ||
+          completion != null)
+        `uvm_error("SHARED_SRQ_CQE_EMPTY",
+                   status == null ? "null second shared-SRQ poll status" :
+                   status.convert2string())
+    end
+
+    // 设计说明：SRQ QP 的 link 必须先从 engine 撤销，随后再撤销 attach_qp
+    // 隐式建立的 SRQ attachment，最后才销毁 SRQ；基础 fixture 的 cleanup 只认识
+    // 自身 QP/CQ，因此这里显式回收 helper 新增的非拥有 route。
+    if (srq_qp_created) begin
+      fixture.destroy_lifecycle_owned_qp(
+        srq_qp == null ? null : srq_qp.handle, 1'b1, srq_qp_attached,
+        64'h2131, cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("SHARED_SRQ_CQE_QP_CLEANUP",
+                   cleanup_status == null ? "null SRQ QP cleanup status" :
+                   cleanup_status.convert2string())
+      else begin
+        srq_qp_created = 1'b0;
+        srq_qp_attached = 1'b0;
+      end
+    end
+    if (srq_created) begin
+      destroy_shared_srq_poll_route(
+        fixture, srq == null ? null : srq.handle, 1'b1, srq_attached, 64'h2132,
+        cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("SHARED_SRQ_CQE_SRQ_CLEANUP",
+                   cleanup_status == null ? "null SRQ cleanup status" :
+                   cleanup_status.convert2string())
+      else
+        begin
+          srq_created = 1'b0;
+          srq_attached = 1'b0;
+        end
+    end
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("SHARED_SRQ_CQE_CLEANUP",
+                   cleanup_status == null ? "null fixture cleanup status" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：check_ud_send_cqe_e2e 在真实 UD QP/CQ route 上执行
   //   post_send→公开 publish_cqe→poll_cqe，确认 poll 按冻结 UD variant 保留
   //   qword2/qword3 overlay，并只释放 UD SQ ledger，不误碰私有 RQ。
@@ -810,6 +1420,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     phase.raise_objection(this);
     check_cq_poll_wq_attachment_validator();
     check_private_rq_receive_cqe_e2e();
+    check_shared_srq_receive_cqe_e2e();
     check_ud_send_cqe_e2e();
     engine = rdma_queue_data_engine::type_id::create("unconfigured_engine");
     completion = rdma_queue_completion_result::type_id::create("sentinel_cqe");
