@@ -10,7 +10,7 @@
 | --- | --- | --- | --- | --- |
 | CMQ 值比较与提交证据 | Batch1 value contract、Batch2 typed snapshot、Batch5 body value、Batch6 journal value、Batch7 reset proof、Batch8 binding value | `rdma_cmq_engine_models_test`、`rdma_cmq_codec_test`、`rdma_cmq_completion_test`、CMQ gate | GREEN；Batch86 gate 28/28 process、11/11 logical、UVM 0/0/0 | legacy `execute()` 的三个 Phase 1B consumer 尚未完全移除 |
 | CMQ completion/route authority | Batch27–30 CQE/CEQE/AEQE publish authority；Batch31–37 handle/route/cursor predicates | `rdma_cq_engine_test`、`rdma_cq_shadow_flush_test`、`rdma_eq_engine_test`、`rdma_aeqe_route_test` | focused 与 parent gate GREEN | 更深的 recovery/MMIO 语义仍由 owner task 维护 |
-| queue-data attachment/recovery | Batch40、46–47、52–54、55–66、78–86：context geometry、route/epoch、CQ identity、pending attachment、CEQE route；Batch113 SQ external-SGB writer 的 canonical mode/count、descriptor packing 与 image-signature gate；Batch114 UD effective mode 对齐 | `rdma_queue_data_engine_post_test`、`rdma_queue_data_engine_recovery_test`、`rdma_queue_data_engine_device_publish_test`、`rdma_queue_event_route_consume_test` | Batch86 focused 与 integration GREEN；Batch113 post-test baseline/mutation focused GREEN；Batch114 UD 1B inline/1-SGE/2-SGE writer focused GREEN，UVM 0/0/0 | 完整公开 UD `post_send()`/`replay_pending()` 成功矩阵尚待补齐；仍需最终全目录 ownership/注释审查 |
+| queue-data attachment/recovery | Batch40、46–47、52–54、55–66、78–86：context geometry、route/epoch、CQ identity、pending attachment、CEQE route；Batch113 SQ external-SGB writer 的 canonical mode/count、descriptor packing 与 image-signature gate；Batch114 UD effective mode 对齐；Batch115 `post_recv()` RQ/SRQ target-resolution helper | `rdma_queue_data_engine_post_test`、`rdma_queue_data_engine_recovery_test`、`rdma_queue_data_engine_device_publish_test`、`rdma_queue_event_route_consume_test` | Batch86 focused 与 integration GREEN；Batch113 post-test baseline/mutation focused GREEN；Batch114 UD 1B inline/1-SGE/2-SGE writer focused GREEN；Batch115 post/recovery focused 与公开 UD post/replay probe GREEN，UVM 0/0/0 | SRQ 全量公开 post/recovery lifecycle 矩阵、跨队列并发与最终全目录 ownership/注释审查仍开放 |
 | queue runtime | Batch37、41–42、45、48、50、53–54 的 cursor/credit/identity/value seam；Batch88 收敛 route/epoch 纯比较并完成注释合规刷新 | `rdma_queue_runtime_test`、`rdma_queue_lifecycle_test`、recovery focused suites、CMQ gate | Batch88 focused GREEN；Batch89–93 后 parent gate GREEN（28/28、11/11、UVM 0/0/0） | 不复制 runtime mutable ledger；Phase 1C F2 的全局 sge_num 收口仍暂停，RC inline-SGB 容量拒绝已由 Batch100 独立关闭 |
 | resource manager | Batch38–44、51、67、74、76、79 的 segment/backing/type/owner/recovery projection；Batch89 收敛 SRQ restore flush progress；Batch97 role cardinality；Batch99 context progress authority/parity；Batch102 QP/queue transient alias audit | `rdma_resource_manager_test`、`rdma_queue_recovery_test`、`rdma_queue_lifecycle_test`、`rdma_qp_lifecycle_test` | Batch99/102 focused GREEN；Batch104 current parent/core gate GREEN（CMQ 28/28 process、11/11 logical；core 95/95 process、78/78 logical；UVM 0/0/0） | 更深 recovery/MMIO 与跨资源生命周期仍开放 |
 | environment/backing composition | Batch91 复审 env/config、queue backing access、responder registry 的 detached snapshot、borrowed adapter、claim/seal 和 Function-incarnation 契约；Batch105 candidate detached value-graph seal 与 hostile cross-context mutation 拒绝；Batch106 env-local reset reentrancy guard；Batch107 reset 后 registration incarnation 刷新；Batch108 coordinator↔env↔router ownership seam 只读审计；Batch109 严格一对一 lease/token、bilateral attach/detach、close 和 capability handshake；Batch110 coordinator publication guard 与同步 callback 拒绝；Batch111 legacy Host epoch callback capability seal 与 direct mutation guard；Batch112 tokenless dataplane reset admission、opaque allocate rollback、cleanup drain 与 fresh-incarnation recovery | `rdma_env_composition_test`、`rdma_queue_backing_access_test`、`rdma_responder_registry_test`、`rdma_reset_candidate_integrity_test`、`rdma_device_env_test`、`rdma_host_mem_router_test`、`rdma_reset_coordinator_lifecycle_test`、reset integration suites | Batch91 focused、Batch101/103 reset integration、Batch105/106 focused、Batch107 integration/CMQ/core regression、Batch109 focused 与 integration 10/10、Batch110 focused 6 项与 integration 10/10/CMQ/core GREEN；Batch111 focused/lifecycle、integration 10/10、CMQ 28/28+11/11、core 95/95+78/78 与 Python 292 均在当前 worktree GREEN；Batch112 focused host-router/coordinator、integration 10/10、Python 292、style/diff GREEN，UVM 0/0/0；全目录 scanner 185 `.sv`+2 `.svh`、5,387 methods、0 diagnostics，静态辅助门禁通过 | coordinator 的跨线程/跨进程全局并发锁、跨环境 callback 语义、manager 外部调用窗口补偿与更深生命周期/所有权审计仍开放 |
@@ -86,6 +86,10 @@
 - Batch114 的 UD effective-mode 修复与 focused 证据见
   `task-cmq-batch114-ud-sgb-effective-mode-report.md`；该批确认共享 resolver 与
   writer/codec 对齐，但不替代完整公开 `post_send()`/`replay_pending()` 矩阵。
+- Batch115 的 receive target-resolution 提取、公开 UD 正向/恢复探针和当前
+  `rdma_queue_data_engine_post_test`/`rdma_queue_data_engine_recovery_test` 证据见
+  `task-cmq-batch115-receive-target-resolution-report.md`；临时公开 UD probe 已在
+  验证后删除，仅保留报告中的可复核结果，不把它当作长期测试入口。
 
 ## 尚未关闭的验收项
 
@@ -116,8 +120,10 @@
    bypass；coordinator 的跨线程/跨进程全局并发锁、更深生命周期/所有权语义复审仍需后续
    完成，并在后续源码变化后重复门禁。
 4. Batch114 已关闭 UD codec 与通用 model/writer 对非零 inline/1–2 SGE 的 effective
-   mode 对齐缺口；完整公开 `post_send()`/`replay_pending()` 成功与恢复矩阵仍需独立
-   证据，且不能通过放宽 writer gate 掩盖新的 transport authority 缺口。
+   mode 对齐缺口；Batch115 已用临时 focused probe 补充公开 `post_send()`/
+   `replay_pending()` 的 UD 1B inline/1–2 SGE 与 SGB failure recovery 证据，但完整
+   SRQ/跨队列 lifecycle 矩阵仍需独立证据，且不能通过放宽 writer gate 掩盖新的
+   transport authority 缺口。
 5. `pcie_work` external lock 仍为 OPEN；覆盖矩阵不替代真实外部依赖批准，在 lock 获批前
    SR-IOV integration 只能报告已知阻断，不能伪造 GREEN。
 

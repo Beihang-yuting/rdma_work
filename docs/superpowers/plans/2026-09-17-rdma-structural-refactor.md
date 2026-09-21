@@ -89,6 +89,13 @@
   probe 的 1B inline、1-SGE、2-SGE writer 以及三套 SQE/queue codec focused 均 GREEN。
   该批关闭 mode 对齐 seam，但完整公开 post/replay 矩阵和广义 F2 仍开放。详见
   `task-cmq-batch114-ud-sgb-effective-mode-report.md`。
+- Batch115 将 `rdma_queue_data_engine::post_recv()` 的 RQ/SRQ target-resolution
+  从 posting pipeline 提取为只读 `resolve_receive_target()` helper：completion-QP
+  选择、QP link 查找、SRQ 完整 handle-incarnation 比较和 RQ/SRQ attachment lookup
+  现在集中在一个 canonical target 阶段；owner、route/epoch、reserve、write、doorbell
+  和 commit 顺序保持不变。当前 post/recovery focused 与公开 UD 正向/恢复探针均
+  GREEN；该批不声称已完成 SRQ 全量 lifecycle 矩阵、广义 F2 或整份结构重构。详见
+  `task-cmq-batch115-receive-target-resolution-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、

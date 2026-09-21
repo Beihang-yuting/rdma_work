@@ -8449,10 +8449,87 @@ class rdma_queue_data_engine extends uvm_object;
     status = result.status;
   endtask
 
+  // 设计说明：RQ 与 SRQ 的 receive target resolution 只冻结 completion-QP
+  // 路由、SRQ link identity 和目标 ring attachment；它不能把 owner/route epoch
+  // 校验或 producer reservation 混入 lookup 层，否则 post_recv 的失败优先级和
+  // 生命周期边界会随 posting pipeline 变化。该 helper 只读取 engine 索引，向
+  // 后续阶段交付同一组非拥有引用。
+  // 功能：resolve_receive_target 根据已验证的 receive request 选择 completion QP，
+  //   检查 QP link 及 SRQ 完整 handle identity，并解析 RQ/SRQ 对应 attachment 与
+  //   runtime kind，形成 post_recv 后续阶段使用的 canonical target。
+  // 输入/输出及副作用：snapshot 为 snapshot.validate() 已成功的只读请求；link、
+  //   attachment 先置空，成功时输出 engine 索引中的非拥有引用，runtime_kind 输出
+  //   RDMA_QUEUE_RUNTIME_RQ 或 RDMA_QUEUE_RUNTIME_SRQ；函数只读 qp_links/attachments，
+  //   不 reserve、修改 cursor、访问 backing/doorbell 或取得 QP/SRQ 生命周期所有权。
+  // 失败/边界：snapshot/target 缺失、completion QP 未 attach、SRQ link 为空或与
+  //   target handle incarnation 不一致、attachment lookup 返回 null/非成功状态时，
+  //   返回对应的 INVALID_ARGUMENT/INVALID_STATE 或 lookup 错误；输出引用保持空，
+  //   调用方不得进入 owner、route/epoch、write 或 commit 阶段。
+  protected function rdma_status resolve_receive_target(
+    rdma_post_recv_req snapshot,
+    output rdma_queue_data_qp_link link,
+    output rdma_queue_data_attachment attachment,
+    output rdma_queue_runtime_kind_e runtime_kind
+  );
+    rdma_handle completion_qp_h;
+    rdma_status status;
+
+    link = null;
+    attachment = null;
+    runtime_kind = RDMA_QUEUE_RUNTIME_RQ;
+    if (snapshot == null || snapshot.target_h == null)
+      return bad("receive target snapshot is incomplete",
+                 RDMA_SC_INVALID_ARGUMENT);
+
+    runtime_kind = snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
+                   RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ;
+    completion_qp_h = snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
+                      snapshot.completion_qp_h : snapshot.target_h;
+    if (completion_qp_h == null ||
+        !qp_links.exists(identity_key(completion_qp_h)) ||
+        qp_links[identity_key(completion_qp_h)] == null)
+      return bad("receive completion QP is not attached", RDMA_SC_INVALID_STATE);
+
+    link = qp_links[identity_key(completion_qp_h)];
+    if (link == null)
+      return bad("receive completion QP link is incomplete", RDMA_SC_INVALID_STATE);
+    if (runtime_kind == RDMA_QUEUE_RUNTIME_SRQ) begin
+      // 设计：SRQ completion QP 的 link 必须仍指向 request 冻结的同一 SRQ
+      // incarnation；只比较 object_id 会让 reset 后旧 SRQ 借新 generation 重用。
+      if (link.srq_h == null ||
+          !same_handle_instance(link.srq_h, snapshot.target_h)) begin
+        link = null;
+        return bad("receive completion QP is not attached to the target SRQ");
+      end
+    end
+
+    status = lookup_attachment(snapshot.target_h, runtime_kind, attachment);
+    if (status == null) begin
+      link = null;
+      attachment = null;
+      return bad("receive target attachment lookup returned null status",
+                 RDMA_SC_INVALID_STATE);
+    end
+    if (!status.ok()) begin
+      link = null;
+      attachment = null;
+      return status;
+    end
+    if (attachment == null || attachment.runtime == null ||
+        attachment.access == null || attachment.entry_size == 0) begin
+      link = null;
+      attachment = null;
+      return bad("receive target attachment is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    end
+    return rdma_status::success();
+  endfunction
+
   // 功能：post_recv 冻结并校验 request，按 target_h 选择 QP RQ 或共享 SRQ，
   //   编码/写回 RQE 后提交 producer doorbell 与对应 WQE ledger。
-  // 输入/输出及副作用：request 为输入，result/status 为输出；completion_qp_h 提供
-  //   SRQ completion route。成功推进目标 RQ/SRQ PI/used 并发布 detached result；
+  // 输入/输出及副作用：request 为输入，result/status 为输出；target resolution 使用
+  //   completion_qp_h 提供 SRQ completion route。成功推进目标 RQ/SRQ PI/used 并发布
+  //   detached result；
   //   write、doorbell 或 commit 失败保存同一 cursor/request/image pending 供 recovery。
   // 失败/边界：null/非法 request、foreign owner、completion QP 未 attach、SRQ
   //   绑定不一致、attachment route/reset epoch 过期、队列无 credit、codec/backing
@@ -8474,8 +8551,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_doorbell_result doorbell_result;
     rdma_queue_pending_operation pending;
     rdma_status recovery_status;
-    rdma_handle completion_qp_h;
-    string runtime_key;
+    rdma_queue_runtime_kind_e runtime_kind;
     longint unsigned offset;
 
     result = null;
@@ -8498,32 +8574,13 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok())
       return;
 
-    completion_qp_h = (snapshot.target_h.kind == RDMA_RESOURCE_SRQ) ?
-                      snapshot.completion_qp_h : snapshot.target_h;
-    if (!qp_links.exists(identity_key(completion_qp_h)) ||
-        qp_links[identity_key(completion_qp_h)] == null) begin
-      status = bad("receive completion QP is not attached", RDMA_SC_INVALID_STATE);
+    status = resolve_receive_target(snapshot, link, attachment, runtime_kind);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("receive target resolution returned null status",
+                     RDMA_SC_INVALID_STATE);
       return;
     end
-    link = qp_links[identity_key(completion_qp_h)];
-    if (snapshot.target_h.kind == RDMA_RESOURCE_SRQ) begin
-      // 设计：snapshot.validate 已冻结 SRQ target，link.srq_h 的空值门禁仍
-      // 先于完整 handle identity 比较；失配继续返回原绑定错误并不触碰 runtime。
-      if (link.srq_h == null ||
-          !same_handle_instance(link.srq_h, snapshot.target_h)) begin
-        status = bad("receive completion QP is not attached to the target SRQ");
-        return;
-      end
-      status = lookup_attachment(snapshot.target_h, RDMA_QUEUE_RUNTIME_SRQ,
-                                 attachment);
-    end
-    else begin
-      status = lookup_attachment(snapshot.target_h, RDMA_QUEUE_RUNTIME_RQ,
-                                 attachment);
-    end
-
-    if (!status.ok())
-      return;
 
     // receive request 的 owner 是 Function authority 证据，不能只依赖 target_h
     // 已出现在 attachment 索引中；同时在 reserve 前复核 binding 的 route/epoch，
@@ -8551,8 +8608,7 @@ class rdma_queue_data_engine extends uvm_object;
     status = write_and_verify(attachment, offset, image);
     if (!status.ok()) begin
       pending = make_pending(cursor, snapshot.target_h,
-                            snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
-                            RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
+                            runtime_kind,
                             1'b1, offset, image, snapshot, 1'b1);
       if (pending == null) begin
         status = pending_build_failure("RQ entry write");
@@ -8565,15 +8621,13 @@ class rdma_queue_data_engine extends uvm_object;
     advance_queue_cursor_value(attachment.runtime.depth, cursor.index,
                                cursor.wrap, next.index, next.wrap);
     submit_producer_doorbell(snapshot.target_h,
-      snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
-      RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
+      runtime_kind,
       cursor, next, null,
-      snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
+      runtime_kind == RDMA_QUEUE_RUNTIME_SRQ ?
       attachment.local_id : link.local_qp_id, doorbell_result, status);
     if (!status.ok()) begin
       pending = make_pending(cursor, snapshot.target_h,
-                            snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
-                            RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
+                            runtime_kind,
                             1'b1, offset, image, snapshot, 1'b1);
       if (pending == null) begin
         status = pending_build_failure("RQ producer doorbell");
@@ -8586,8 +8640,7 @@ class rdma_queue_data_engine extends uvm_object;
       snapshot.wr_id, 1'b1, image);
     if (!status.ok()) begin
       pending = make_pending(cursor, snapshot.target_h,
-                            snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
-                            RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ,
+                            runtime_kind,
                             1'b1, offset, image, snapshot, 1'b1);
       if (pending == null) begin
         status = pending_build_failure("RQ ledger commit");
