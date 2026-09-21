@@ -178,6 +178,18 @@
   复审为 140/122 个 method。计划继续保持 `active`；engine-level 全局锁、CEQ/AEQ
   malformed retry、SRQ/跨队列 lifecycle、device+consumer 组合和最终 ownership 审计仍开放。
   详见 `task-cmq-batch123-consumer-authority-report.md`。
+- Batch124 将 `replay_consumer_pending()` recovery-only 的 CQ→WQ release 阶段提取为
+  受保护的 `release_consumer_pending_wqe()` task：`begin_consumer_release_noalloc()`、
+  frozen completion index/wrap 的 `release_cq_wqe()`、null-status 归一化、
+  `finish_consumer_release_noalloc()` 与失败 recovery evidence 现在由同一 seam 收束；
+  caller 继续负责 consumer authority、shadow/doorbell、CQ commit 与最终 completion，
+  poll 路径不被强行统一，保持其 live-CQE/cq-shadow 契约。三套 queue-data VCS53
+  focused、style/diff、queue/profile、manifest/keyword、Phase-1A、Python 与全目录
+  中文契约 scanner 均 GREEN；当前全目录为 185 个 `.sv`、2 个 `.svh`、5,408 个
+  method、0 diagnostics，queue-data engine/device-publish test 逐文件 method 复审为
+  141/122。计划继续保持 `active`；全局锁、poll/recovery 全阶段组合、CEQ/AEQ malformed
+  retry、SRQ/跨队列 lifecycle、device+consumer 组合和最终 ownership 审计仍开放。详见
+  `task-cmq-batch124-consumer-release-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -191,11 +203,12 @@
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
 Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
 writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
-mode 对齐 seam；Batch115–123 继续关闭 queue-data 的局部 target/replay/recovery 扫描
+mode 对齐 seam；Batch115–124 继续关闭 queue-data 的局部 target/replay/recovery 扫描
 结构 seam，但 Batch119 关闭 recovery action/cardinality/query 顺序的局部契约、Batch120
 关闭 device-producer replay 的局部职责 seam、Batch121 关闭 consumer replay 的局部职责
 seam、Batch122 关闭 local-resource match/projection 的局部职责 seam、Batch123 关闭
-consumer recovery authority preflight 的局部职责 seam；完整公开
+consumer recovery authority preflight 的局部职责 seam、Batch124 关闭 consumer
+recovery CQ→WQ release 的局部职责 seam；完整公开
 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。

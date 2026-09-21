@@ -9243,6 +9243,84 @@ class rdma_queue_data_engine extends uvm_object;
     return status;
   endfunction
 
+  // 设计说明：consumer recovery 的 CQ→WQ release 必须在 CQ runtime 持有
+  // begin marker 后按单向 CQ→WQ 锁序执行；release 完成前不能让 recovery task
+  // 继续推进 completion，也不能让失败路径遗留活动 gate。将 begin/release/finish
+  // 和失败 evidence 放在同一 task，避免 retry caller 漏掉 bilateral finish。
+  // 功能：release_consumer_pending_wqe 使用 pending 冻结的 completion index/wrap，
+  //   在已完成 CQ consumer commit 后释放 routed WQ 的连续 ledger range，并把失败
+  //   的 MMIO evidence/status 留在 recovery runtime；成功时只返回可继续 completion
+  //   的 status，不重新解析 CQE 或推导 WQ 方向。
+  // 输入/输出及副作用：attachment、pending、wqe_attachment 是 caller 已完成
+  //   authority 校验的非拥有借用；status 为输出，pending.failure_status 作为预建
+  //   noalloc continuation slot。成功可能标记 runtime.completion_released 并推进
+  //   WQ CI/used；失败保持 pending evidence，不取得 CQ/WQ/runtime 生命周期所有权。
+  // 失败/边界：null runtime/attachment/pending 或缺失 failure_status 返回
+  //   INVALID_STATE；begin gate 拒绝时原样返回其 status；release 或 finish 任一步失败
+  //   都停止，finish 失败时仍以 noalloc status 收束；WQ release 失败记录 NO_SUBMIT
+  //   （shadow）或 SUCCESS（doorbell）对应的 recovery evidence，绝不重复释放同一 range。
+  protected task release_consumer_pending_wqe(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    rdma_queue_data_attachment wqe_attachment,
+    output rdma_status status
+  );
+    rdma_queue_slot_ledger_entry released[$];
+    rdma_status noalloc_status;
+    bit release_succeeded;
+
+    status = null;
+    if (attachment == null || pending == null || wqe_attachment == null ||
+        attachment.runtime == null || wqe_attachment.runtime == null ||
+        pending.failure_status == null)
+      begin
+        status = make_engine_status_nonfatal(
+          RDMA_SC_INVALID_STATE,
+          "consumer recovery WQE release input is incomplete");
+        return;
+      end
+
+    noalloc_status = pending.failure_status;
+    if (!attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
+      status = noalloc_status;
+      return;
+    end
+    released.delete();
+    status = release_cq_wqe(
+      wqe_attachment, null, released, noalloc_status, 1'b1,
+      pending.completion_index, pending.completion_wrap);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CQ recovery WQE release returned null status"));
+      status = noalloc_status;
+    end
+    release_succeeded = status.ok();
+    if (!attachment.runtime.finish_consumer_release_noalloc(
+          release_succeeded, status)) begin
+      if (status == null || status.ok()) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "CQ recovery release gate finalization failed"));
+        status = noalloc_status;
+      end
+      return;
+    end
+    if (!release_succeeded) begin
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            pending.consumer_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
+                                                 RDMA_QUEUE_MMIO_SUCCESS,
+            status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CQ recovery release failure could not be retained"));
+        status = noalloc_status;
+      end
+      return;
+    end
+    status = noalloc_status;
+  endtask
+
   // 设计说明：consumer recovery 同时包含 CQ route 解析、CQC shadow/doorbell 续做、
   // CQ consumer commit 和可选 WQE release；这些阶段共享 completion authority 与锁序，
   // 不能与 producer DMA recovery 混用。helper 保留 caller 冻结的 next cursor 和
@@ -9267,10 +9345,8 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_queue_data_qp_link link;
     rdma_queue_data_attachment wqe_attachment;
-    rdma_queue_slot_ledger_entry released[$];
     rdma_doorbell_desc prepared_db_desc;
     rdma_status noalloc_status;
-    bit release_succeeded;
 
     status = null;
     if (attachment == null || pending == null || next == null) begin
@@ -9410,46 +9486,10 @@ class rdma_queue_data_engine extends uvm_object;
 
     if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ &&
         !pending.completion_released) begin
-      // 设计：recovery 与首轮 poll 共用同一 CQ→WQ 锁序。begin 成功后 release seam 的
-      // 成功/失败都由 finish 在 CQ lock 内发布 marker 或仅解锁，因而后续 complete
-      // 即使竞争失败也不会再次释放同一 WQE range。
-      if (!attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
-        status = noalloc_status;
+      release_consumer_pending_wqe(
+        attachment, pending, wqe_attachment, status);
+      if (status == null || !status.ok())
         return;
-      end
-      released.delete();
-      status = release_cq_wqe(
-        wqe_attachment, null, released, noalloc_status, 1'b1,
-        pending.completion_index, pending.completion_wrap);
-      if (status == null) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ recovery WQE release returned null status"));
-        status = noalloc_status;
-      end
-      release_succeeded = status.ok();
-      if (!attachment.runtime.finish_consumer_release_noalloc(
-            release_succeeded, status)) begin
-        if (status == null || status.ok()) begin
-          void'(set_engine_status_noalloc(
-            noalloc_status, RDMA_SC_INVALID_STATE,
-            "CQ recovery release gate finalization failed"));
-          status = noalloc_status;
-        end
-        return;
-      end
-      if (!release_succeeded) begin
-        if (!attachment.runtime.record_recovery_failure_noalloc(
-              pending.consumer_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
-                                                   RDMA_QUEUE_MMIO_SUCCESS,
-              status, noalloc_status)) begin
-          void'(set_engine_status_noalloc(
-            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-            "CQ recovery release failure could not be retained"));
-          status = noalloc_status;
-        end
-        return;
-      end
     end
     if (!attachment.runtime.complete_consumer_recovery_noalloc(
           1'b0, noalloc_status)) begin
