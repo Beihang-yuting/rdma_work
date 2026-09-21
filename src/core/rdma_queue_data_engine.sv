@@ -8882,6 +8882,189 @@ class rdma_queue_data_engine extends uvm_object;
                    RDMA_SC_RECOVERY_REQUIRED);
   endtask
 
+  // 设计说明：device-producer recovery 的 DMA 方向、reservation authority、readback
+  // 和 producer commit 与 host-producer/consumer recovery 不共享副作用阶段；单独的
+  // task 让 device image 只能通过 DEVICE_WRITE 重放，并把 reservation/route/epoch
+  // 快照校验保持在同一 recovery owner 内。
+  // 功能：replay_device_producer_pending 校验 detached device-producer evidence，向
+  //   device backing 重放冻结 image，回读验证后提交原 cursor 并完成 recovery retry。
+  // 输入/输出及副作用：attachment、pending 为只读借用输入，status 为输出；成功时
+  //   访问 device backing、更新 pending write-attempt marker、提交 runtime device
+  //   reservation 并结束 recovery，task 不取得 attachment、mapping 或 backing 所有权。
+  // 失败/边界：pending/runtime/route/epoch/reservation/identity/geometry 不完整、
+  //   image copy、device write/readback、commit gate、producer commit 或 completion
+  //   返回 null/非成功时立即停止；写入、回读或 commit 失败均保留对应
+  //   `NO_SUBMIT`/`NOT_APPLICABLE` recovery evidence，不能推进新 cursor 或静默改用
+  //   host-write 方向。
+  protected task replay_device_producer_pending(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    output rdma_status status
+  );
+    rdma_queue_pending_operation device_pending;
+    rdma_queue_cursor_snapshot current_device_reservation;
+    rdma_route_key_t runtime_route;
+    rdma_reset_epoch_t runtime_epoch;
+    bit runtime_route_valid;
+    bit runtime_epoch_valid;
+    bit reservation_valid;
+    bit backend_write_started;
+    byte data[];
+    byte readback[];
+    rdma_status local_status;
+
+    status = null;
+    if (attachment == null || pending == null) begin
+      status = bad("device producer recovery attachment/evidence is null",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+
+    device_pending = null;
+    current_device_reservation = null;
+    reservation_valid = 1'b0;
+    runtime_route = '0;
+    runtime_route_valid = 1'b0;
+    runtime_epoch = '0;
+    runtime_epoch_valid = 1'b0;
+    status = attachment.runtime.query_pending(device_pending);
+    if (status == null || !status.ok() || device_pending == null) begin
+      status = status == null ?
+        bad("device pending query returned null status",
+            RDMA_SC_RECOVERY_REQUIRED) : status;
+      return;
+    end
+    status = attachment.runtime.query_route_epoch(
+      runtime_route, runtime_route_valid, runtime_epoch,
+      runtime_epoch_valid);
+    if (status == null || !status.ok() || !runtime_route_valid ||
+        !runtime_epoch_valid) begin
+      status = status == null ?
+        bad("device recovery route/epoch query failed",
+            RDMA_SC_RECOVERY_REQUIRED) : status;
+      return;
+    end
+    status = attachment.runtime.query_device_reservation(
+      reservation_valid, current_device_reservation);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("device recovery reservation query failed",
+            RDMA_SC_RECOVERY_REQUIRED) : status;
+      return;
+    end
+    // 设计：pending 与 attachment 的 queue handle 是 device reservation 的双方
+    // authority；reservation/status/null 门禁先完成，再由完整 incarnation 比较和
+    // route/epoch 校验决定能否触碰 device backing，身份失配继续保留 recovery evidence。
+    if (!reservation_valid || current_device_reservation == null ||
+        device_pending.queue_h == null || attachment.queue_h == null ||
+        !pending_queue_handle_matches_attachment(device_pending, attachment) ||
+        device_pending.kind != attachment.kind ||
+        !device_pending.device_producer || device_pending.cursor == null ||
+        device_pending.next_cursor == null || device_pending.image == null ||
+        device_pending.entry_size != attachment.entry_size ||
+        device_pending.entry_size == 0 ||
+        !pending_route_epoch_matches(
+          device_pending, runtime_route, runtime_route_valid,
+          runtime_epoch, runtime_epoch_valid) ||
+        !attachment.runtime.reservation_matches(device_pending.cursor) ||
+        !same_cursor_value(current_device_reservation,
+                           device_pending.cursor) ||
+        device_pending.entry_offset !=
+          longint'(device_pending.cursor.index) * device_pending.entry_size) begin
+      status = bad("device pending authority or reservation is stale",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    status = copy_image_bytes(device_pending.image, data);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("device recovery image copy returned null status",
+            RDMA_SC_RECOVERY_REQUIRED) : status;
+      return;
+    end
+    readback = new[0];
+    backend_write_started = 1'b0;
+    status = attachment.access.write_device(
+      device_pending.entry_offset, data, backend_write_started);
+    if (status == null || !status.ok() || !backend_write_started) begin
+      if (status == null)
+        status = bad("device recovery write returned null status",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      local_status = attachment.runtime.record_recovery_failure(
+        backend_write_started ? RDMA_QUEUE_MMIO_NOT_APPLICABLE :
+                                RDMA_QUEUE_MMIO_NO_SUBMIT);
+      if (local_status == null || !local_status.ok())
+        status = bad("device recovery write evidence could not be retained",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    // 设计：preflight/cancel fallback 生成的 pending 可能尚未带有 attempted-write
+    // 位；只有 write_device 明确报告已进入 backend 后才标记，避免 retry 把未尝试
+    // 的 device write 误判成可提交。
+    if (!device_pending.device_write_attempted) begin
+      local_status = attachment.runtime.mark_pending_device_write_attempted();
+      if (local_status == null || !local_status.ok()) begin
+        status = local_status == null ?
+          bad("device recovery write-attempt evidence failed",
+              RDMA_SC_RECOVERY_REQUIRED) : local_status;
+        return;
+      end
+    end
+    status = attachment.access.read(device_pending.entry_offset,
+                                    device_pending.image.length, readback);
+    if (status == null || !status.ok() ||
+        readback.size() != data.size()) begin
+      if (status == null)
+        status = bad("device recovery read returned null status",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      else if (status.ok())
+        status = bad("device recovery readback length differs",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      local_status = attachment.runtime.record_recovery_failure(
+        RDMA_QUEUE_MMIO_NOT_APPLICABLE);
+      if (local_status == null || !local_status.ok())
+        status = bad("device recovery read failure evidence could not be retained",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    foreach (data[i]) begin
+      if (readback[i] !== data[i]) begin
+        status = bad("device recovery readback mismatch",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        local_status = attachment.runtime.record_recovery_failure(
+          RDMA_QUEUE_MMIO_NOT_APPLICABLE);
+        if (local_status == null || !local_status.ok())
+          status = bad("device recovery mismatch evidence could not be retained",
+                       RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+    end
+    status = attachment.runtime.enable_recovery_commit();
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("device recovery commit gate returned null status",
+            RDMA_SC_RECOVERY_REQUIRED) : status;
+      return;
+    end
+    status = attachment.runtime.commit_device_producer(
+      device_pending.cursor);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("device recovery producer commit returned null status",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      local_status = attachment.runtime.record_recovery_failure(
+        RDMA_QUEUE_MMIO_NOT_APPLICABLE);
+      if (local_status == null || !local_status.ok())
+        status = bad("device recovery commit evidence could not be retained",
+                     RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    status = attachment.runtime.complete_recovery_retry();
+    if (status == null)
+      status = bad("device recovery completion returned null status",
+                   RDMA_SC_RECOVERY_REQUIRED);
+  endtask
+
   // 设计说明：仅当原事务确定没有到达 MMIO，或调用方已经明确确认可重放时才执行
   // detached transaction。所有副作用和 ledger transition 完成前，runtime 保持
   // RECOVERY_REQUIRED，防止同一 reservation 被并发消费。
@@ -8905,17 +9088,11 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_doorbell_desc prepared_db_desc;
     rdma_status local_status;
     rdma_status noalloc_status;
-    byte data[];
-    rdma_queue_pending_operation device_pending;
-    rdma_queue_cursor_snapshot current_device_reservation;
     rdma_route_key_t runtime_route;
     rdma_reset_epoch_t runtime_epoch;
     bit runtime_route_valid;
     bit runtime_epoch_valid;
-    bit reservation_valid;
-    bit backend_write_started;
     bit release_succeeded;
-    byte readback[];
     string qp_key;
 
     status = null;
@@ -8927,155 +9104,11 @@ class rdma_queue_data_engine extends uvm_object;
     status = pending_next_cursor(attachment, pending, next);
     if (!status.ok()) return;
 
-    // 设计说明：device-produced CQ/CEQ/AEQ recovery 必须先于旧的 host producer/
-    // consumer 分支处理。reservation 仍归 runtime 所有，image 只能经
-    // DEVICE_WRITE 重放；write()/write_and_verify() 使用相反 DMA 方向，会把
-    // 非法 CQ recovery 静默当作合法 host posting。
+    // 设计说明：device-produced CQ/CEQ/AEQ recovery 必须先于 host producer/
+    // consumer 分支处理；专用 helper 保留 reservation、route/epoch、DEVICE_WRITE
+    // 和 readback 的完整阶段，caller 只负责按 evidence 类型选择 recovery owner。
     if (pending.device_producer) begin
-      device_pending = null;
-      current_device_reservation = null;
-      reservation_valid = 1'b0;
-      runtime_route = '0;
-      runtime_route_valid = 1'b0;
-      runtime_epoch = '0;
-      runtime_epoch_valid = 1'b0;
-      status = attachment.runtime.query_pending(device_pending);
-      if (status == null || !status.ok() || device_pending == null) begin
-        status = status == null ?
-          bad("device pending query returned null status",
-              RDMA_SC_RECOVERY_REQUIRED) : status;
-        return;
-      end
-      status = attachment.runtime.query_route_epoch(
-        runtime_route, runtime_route_valid, runtime_epoch,
-        runtime_epoch_valid);
-      if (status == null || !status.ok() || !runtime_route_valid ||
-          !runtime_epoch_valid) begin
-        status = status == null ?
-          bad("device recovery route/epoch query failed",
-              RDMA_SC_RECOVERY_REQUIRED) : status;
-        return;
-      end
-      status = attachment.runtime.query_device_reservation(
-        reservation_valid, current_device_reservation);
-      if (status == null || !status.ok()) begin
-        status = status == null ?
-          bad("device recovery reservation query failed",
-              RDMA_SC_RECOVERY_REQUIRED) : status;
-        return;
-      end
-      // 设计：pending 与 attachment 的 queue handle 是 device reservation 的
-      // 双方 authority；reservation/status/null 门禁先完成，再由
-      // pending_queue_handle_matches_attachment 做纯 incarnation 比较；身份失配
-      // 仍沿用 RECOVERY_REQUIRED，不改变后续 image 重放和 reservation 清理顺序。
-      if (!reservation_valid || current_device_reservation == null ||
-          device_pending.queue_h == null || attachment.queue_h == null ||
-          !pending_queue_handle_matches_attachment(device_pending, attachment) ||
-          device_pending.kind != attachment.kind ||
-          !device_pending.device_producer || device_pending.cursor == null ||
-          device_pending.next_cursor == null || device_pending.image == null ||
-          device_pending.entry_size != attachment.entry_size ||
-          device_pending.entry_size == 0 ||
-          !pending_route_epoch_matches(
-            device_pending, runtime_route, runtime_route_valid,
-            runtime_epoch, runtime_epoch_valid) ||
-          !attachment.runtime.reservation_matches(device_pending.cursor) ||
-          !same_cursor_value(current_device_reservation,
-                             device_pending.cursor) ||
-          device_pending.entry_offset !=
-            longint'(device_pending.cursor.index) * device_pending.entry_size) begin
-        status = bad("device pending authority or reservation is stale",
-                     RDMA_SC_RECOVERY_REQUIRED);
-        return;
-      end
-      status = copy_image_bytes(device_pending.image, data);
-      if (status == null || !status.ok()) begin
-        status = status == null ?
-          bad("device recovery image copy returned null status",
-              RDMA_SC_RECOVERY_REQUIRED) : status;
-        return;
-      end
-      readback = new[0];
-      backend_write_started = 1'b0;
-      status = attachment.access.write_device(
-        device_pending.entry_offset, data, backend_write_started);
-      if (status == null || !status.ok() || !backend_write_started) begin
-        if (status == null)
-          status = bad("device recovery write returned null status",
-                       RDMA_SC_RECOVERY_REQUIRED);
-        local_status = attachment.runtime.record_recovery_failure(
-          backend_write_started ? RDMA_QUEUE_MMIO_NOT_APPLICABLE :
-                                  RDMA_QUEUE_MMIO_NO_SUBMIT);
-        if (local_status == null || !local_status.ok())
-          status = bad("device recovery write evidence could not be retained",
-                       RDMA_SC_RECOVERY_REQUIRED);
-        return;
-      end
-      // 设计说明：preflight/cancel fallback 生成的 pending 可能尚未带有
-      // attempted-write 位；只有 write_device 明确报告已进入 backend 后才标记，
-      // 保证 retry 始终 fail-closed，不能将未尝试写入误判成可提交。
-      if (!device_pending.device_write_attempted) begin
-        local_status = attachment.runtime.mark_pending_device_write_attempted();
-        if (local_status == null || !local_status.ok()) begin
-          status = local_status == null ?
-            bad("device recovery write-attempt evidence failed",
-                RDMA_SC_RECOVERY_REQUIRED) : local_status;
-          return;
-        end
-      end
-      status = attachment.access.read(device_pending.entry_offset,
-                                      device_pending.image.length, readback);
-      if (status == null || !status.ok() ||
-          readback.size() != data.size()) begin
-        if (status == null)
-          status = bad("device recovery read returned null status",
-                       RDMA_SC_RECOVERY_REQUIRED);
-        else if (status.ok())
-          status = bad("device recovery readback length differs",
-                       RDMA_SC_RECOVERY_REQUIRED);
-        local_status = attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_NOT_APPLICABLE);
-        if (local_status == null || !local_status.ok())
-          status = bad("device recovery read failure evidence could not be retained",
-                       RDMA_SC_RECOVERY_REQUIRED);
-        return;
-      end
-      foreach (data[i]) begin
-        if (readback[i] !== data[i]) begin
-          status = bad("device recovery readback mismatch",
-                       RDMA_SC_RECOVERY_REQUIRED);
-          local_status = attachment.runtime.record_recovery_failure(
-            RDMA_QUEUE_MMIO_NOT_APPLICABLE);
-          if (local_status == null || !local_status.ok())
-            status = bad("device recovery mismatch evidence could not be retained",
-                         RDMA_SC_RECOVERY_REQUIRED);
-          return;
-        end
-      end
-      status = attachment.runtime.enable_recovery_commit();
-      if (status == null || !status.ok()) begin
-        status = status == null ?
-          bad("device recovery commit gate returned null status",
-              RDMA_SC_RECOVERY_REQUIRED) : status;
-        return;
-      end
-      status = attachment.runtime.commit_device_producer(
-        device_pending.cursor);
-      if (status == null || !status.ok()) begin
-        if (status == null)
-          status = bad("device recovery producer commit returned null status",
-                       RDMA_SC_RECOVERY_REQUIRED);
-        local_status = attachment.runtime.record_recovery_failure(
-          RDMA_QUEUE_MMIO_NOT_APPLICABLE);
-        if (local_status == null || !local_status.ok())
-          status = bad("device recovery commit evidence could not be retained",
-                       RDMA_SC_RECOVERY_REQUIRED);
-        return;
-      end
-      status = attachment.runtime.complete_recovery_retry();
-      if (status == null)
-        status = bad("device recovery completion returned null status",
-                     RDMA_SC_RECOVERY_REQUIRED);
+      replay_device_producer_pending(attachment, pending, status);
       return;
     end
 
