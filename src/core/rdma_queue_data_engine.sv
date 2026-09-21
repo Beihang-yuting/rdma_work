@@ -6871,6 +6871,141 @@ class rdma_queue_data_engine extends uvm_object;
     return cq_attachment.runtime.commit_consumer(cursor);
   endfunction
 
+  // 设计说明：CEQ 与 AEQ 的 poll 入口各自负责 image 解码、route 解析和
+  // detached event candidate 构造，但从 pending admission 开始共享同一条
+  // consumer-only 副作用链。将这段链路集中到一个 task，能够让两种事件队列
+  // 使用相同的 MMIO evidence、失败续接和 CI 提交顺序，同时明确它不拥有 CQ
+  // completion target，也不会触碰 CQ→WQ release gate。
+  // 功能：commit_event_poll_candidate 接管已完成准备的 CEQ/AEQ candidate，进入
+  // prepared recovery，提交 consumer doorbell，记录 MMIO evidence，推进事件队列
+  // consumer cursor，并在 recovery 完成后按 route 命中与否发布 detached result。
+  // 输入/输出及副作用：event_name、attachment、cursor、next、pending、prepared
+  //   descriptor/status、result_candidate、final_success 与 deliver_found 为 caller
+  //   冻结输入；result/status 为输出。task 可能写 doorbell、runtime pending、CI/used
+  //   和 recovery evidence，但不取得 queue、backing、route handle 或 event model 的
+  //   生命周期所有权；deliver_found=0 时只确认事件而丢弃 payload。
+  // 失败/边界：输入缺失、admission、doorbell、MMIO evidence、consumer commit 或
+  //   recovery completion 任一阶段失败时 result 保持 null；scheduler 返回 null 或
+  //   不完整 success 会写入预建 noalloc slot。失败 evidence 保留后立即停止，不重发
+  //   已提交 doorbell、不重复 CI，也不把 route miss 误报为 malformed；CEQ/AEQ caller
+  //   必须在本 task 外完成各自的 decode/route/result preparation。
+  protected task commit_event_poll_candidate(
+    string event_name,
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot cursor,
+    rdma_queue_cursor_snapshot next,
+    rdma_queue_pending_operation pending,
+    rdma_doorbell_desc prepared_db_desc,
+    rdma_status prepared_noalloc_status,
+    rdma_queue_event_result result_candidate,
+    rdma_status final_success,
+    bit deliver_found,
+    output rdma_queue_event_result result,
+    output rdma_status status
+  );
+    rdma_doorbell_result db_result;
+    rdma_queue_mmio_evidence_e db_mmio_evidence;
+    rdma_queue_data_qp_link no_route;
+    rdma_status noalloc_status;
+
+    result = null;
+    status = null;
+    no_route = null;
+    noalloc_status = prepared_noalloc_status;
+
+    if (attachment == null || attachment.runtime == null || cursor == null ||
+        next == null || pending == null || pending.failure_status == null ||
+        prepared_db_desc == null || noalloc_status == null ||
+        final_success == null ||
+        (deliver_found &&
+         (result_candidate == null || result_candidate.event_model == null ||
+          result_candidate.event_status == null))) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        {event_name, " poll commit candidate input is incomplete"});
+      return;
+    end
+
+    // 中文设计：admission 是 CEQ/AEQ live poll 的第一个 runtime mutation；
+    // 后续阶段只能沿同一 pending/failure_status continuation 前进，不能由
+    // caller 在失败后重建 descriptor 或重复进入 recovery。
+    status = attachment.runtime.enter_recovery_prepared(pending);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = make_engine_status_nonfatal(
+          RDMA_SC_INVALID_STATE,
+          {event_name, " prepared pending admission returned null"});
+      return;
+    end
+
+    db_result = null;
+    db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+    submit_consumer_doorbell(
+      attachment, next, db_result, status, db_mmio_evidence,
+      no_route, prepared_db_desc, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        {event_name, " consumer doorbell returned null status"}));
+      status = noalloc_status;
+    end
+    else if (status.ok() &&
+             (db_result == null ||
+              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        {event_name, " consumer doorbell returned incomplete success evidence"}));
+      status = noalloc_status;
+    end
+    if (!status.ok()) begin
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            db_mmio_evidence, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          {event_name, " doorbell failure evidence could not be retained"}));
+        status = noalloc_status;
+      end
+      return;
+    end
+    if (!attachment.runtime.record_recovery_failure_noalloc(
+          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+        {event_name, " doorbell success evidence could not be retained"}));
+      status = noalloc_status;
+      return;
+    end
+
+    if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
+      status = noalloc_status;
+      return;
+    end
+    status = commit_cq_consumer(attachment, cursor, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        {event_name, " consumer commit returned null status"}));
+      status = noalloc_status;
+    end
+    if (!status.ok()) begin
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          {event_name, " consumer commit failure could not be retained"}));
+        status = noalloc_status;
+      end
+      return;
+    end
+    if (!attachment.runtime.complete_consumer_recovery_noalloc(
+          1'b0, noalloc_status)) begin
+      status = noalloc_status;
+      return;
+    end
+    result = deliver_found ? result_candidate : null;
+    status = final_success;
+  endtask
+
   // 功能：release_cq_wqe 为 CQ poll/recovery 提供唯一可覆写 WQE release seam，
   //   默认按可选 caller slot 选择 noalloc release，或保持 legacy match_and_release。
   // 输入/输出及副作用：wqe_attachment/cqe、prepared_status 与仅供 cqe=null recovery
@@ -8172,9 +8307,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_handle routed_cq_h;
     rdma_queue_pending_operation pending;
     rdma_queue_event_result result_candidate;
-    rdma_doorbell_result db_result;
     rdma_doorbell_desc prepared_db_desc;
-    rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_queue_data_qp_link no_route;
     rdma_status event_status;
     rdma_status final_success;
@@ -8279,80 +8412,10 @@ class rdma_queue_data_engine extends uvm_object;
           "CEQ consumer doorbell preparation is incomplete");
       return;
     end
-    status = attachment.runtime.enter_recovery_prepared(pending);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE, "CEQ prepared pending admission returned null");
-      return;
-    end
-
-    db_result = null;
-    db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-    submit_consumer_doorbell(attachment, next, db_result, status,
-                             db_mmio_evidence, no_route, prepared_db_desc,
-                             noalloc_status);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CEQ consumer doorbell returned null status"));
-      status = noalloc_status;
-    end
-    else if (status.ok() &&
-             (db_result == null ||
-              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CEQ consumer doorbell returned incomplete success evidence"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            db_mmio_evidence, status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "CEQ doorbell failure evidence could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    if (!attachment.runtime.record_recovery_failure_noalloc(
-          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status,
-        RDMA_SC_RECOVERY_REQUIRED,
-        "CEQ doorbell success evidence could not be retained"));
-      status = noalloc_status;
-      return;
-    end
-    if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    status = commit_cq_consumer(attachment, cursor, noalloc_status);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CEQ consumer commit returned null status"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "CEQ consumer commit failure could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    if (!attachment.runtime.complete_consumer_recovery_noalloc(
-          1'b0, noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    result = route_found ? result_candidate : null;
-    status = final_success;
+    commit_event_poll_candidate(
+      "CEQ", attachment, cursor, next, pending, prepared_db_desc,
+      noalloc_status, result_candidate, final_success, route_found,
+      result, status);
   endtask
 
   // 功能：poll_ceqe 以 ceq_h 轮询一条 CEQE；poll_ceqe_once 在 prepared
@@ -8414,9 +8477,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_aeqe_model aeqe;
     rdma_queue_pending_operation pending;
     rdma_queue_event_result result_candidate;
-    rdma_doorbell_result db_result;
     rdma_doorbell_desc prepared_db_desc;
-    rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_queue_data_qp_link no_route;
     rdma_status event_status;
     rdma_status final_success;
@@ -8537,80 +8598,10 @@ class rdma_queue_data_engine extends uvm_object;
           "AEQ consumer doorbell preparation is incomplete");
       return;
     end
-    status = attachment.runtime.enter_recovery_prepared(pending);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE, "AEQ prepared pending admission returned null");
-      return;
-    end
-
-    db_result = null;
-    db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-    submit_consumer_doorbell(attachment, next, db_result, status,
-                             db_mmio_evidence, no_route, prepared_db_desc,
-                             noalloc_status);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "AEQ consumer doorbell returned null status"));
-      status = noalloc_status;
-    end
-    else if (status.ok() &&
-             (db_result == null ||
-              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "AEQ consumer doorbell returned incomplete success evidence"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            db_mmio_evidence, status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "AEQ doorbell failure evidence could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    if (!attachment.runtime.record_recovery_failure_noalloc(
-          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status,
-        RDMA_SC_RECOVERY_REQUIRED,
-        "AEQ doorbell success evidence could not be retained"));
-      status = noalloc_status;
-      return;
-    end
-    if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    status = commit_cq_consumer(attachment, cursor, noalloc_status);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "AEQ consumer commit returned null status"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "AEQ consumer commit failure could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    if (!attachment.runtime.complete_consumer_recovery_noalloc(
-          1'b0, noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    result = deliver_found ? result_candidate : null;
-    status = final_success;
+    commit_event_poll_candidate(
+      "AEQ", attachment, cursor, next, pending, prepared_db_desc,
+      noalloc_status, result_candidate, final_success, deliver_found,
+      result, status);
   endtask
 
   // 功能：poll_aeqe 以 aeq_h 轮询一条 AEQE；poll_aeqe_once 在 prepared
