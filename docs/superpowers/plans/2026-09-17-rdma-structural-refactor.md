@@ -113,6 +113,16 @@
   I/O、MMIO 或 runtime mutation。当前 device-publish/recovery/post focused 均 GREEN；
   本批不声称已完成 SRQ/跨队列 lifecycle、广义 F2 或整份结构重构。详见
   `task-cmq-batch117-claimed-recovery-scan-report.md`。
+- Batch118 将 `recover_queue()` 的 reservation-only 候选扫描抽为只读
+  `collect_reservation_only_candidates()`：它按 `attachments` 的既有 foreach 顺序，
+  以完整 queue incarnation 收集 non-null candidate/runtime 的借用引用；不查询
+  reservation/pending，不修改 runtime、ledger、索引、cursor 或生命周期。caller 仍
+  保留 reservation query 的 null/status 映射、action 判断、detach 顺序和首错优先级，
+  因而本批只关闭结构 seam，不改变 reservation-only 多匹配或 hostile action 契约。
+  当前 device-publish/recovery/post focused、style/diff、queue/profile、manifest/keyword
+  与 Python 门禁均 GREEN；全目录中文 method/comment scanner 仍沿用 Batch111 历史证据，
+  待后续源码边界复审时刷新；计划继续保持 `active`。详见
+  `task-cmq-batch118-reservation-candidate-scan-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -126,7 +136,8 @@
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
 Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
 writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
-mode 对齐 seam，但完整公开 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
+mode 对齐 seam；Batch115–118 继续关闭 queue-data 的局部 target/replay/recovery 扫描
+结构 seam，但完整公开 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。
 

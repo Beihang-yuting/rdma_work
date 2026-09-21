@@ -1302,6 +1302,37 @@ class rdma_queue_data_engine extends uvm_object;
     return same_handle_instance(attachment.queue_h, queue_h);
   endfunction
 
+  // 功能：collect_reservation_only_candidates 按当前 queue 的完整 incarnation 从
+  //   engine attachment 索引收集 reservation-only recovery 的候选 runtime，供
+  //   recover_queue 逐个执行原有 reservation evidence 查询。
+  // 输入/输出及副作用：queue_h 为只读目标句柄，candidates 为输出队列；函数按
+  //   attachments 的 foreach 顺序保存通过 attachment_matches_queue_identity 且
+  //   runtime 非空的非拥有 attachment 引用，不查询 runtime 状态或 reservation，
+  //   不修改 attachment、runtime、索引、cursor、ledger 或外部资源生命周期。
+  // 失败/边界：queue_h 为空或没有匹配项时输出空队列并静默返回；identity 不匹配、
+  //   candidate 为空或 candidate.runtime 为空均跳过。函数不判定候选是否真的持有
+  //   reservation、不报告多候选、不改变候选顺序，调用方必须保留后续 query/action/
+  //   detach 的首错优先级和 reservation evidence 生命周期。
+  protected function void collect_reservation_only_candidates(
+    rdma_handle queue_h,
+    output rdma_queue_data_attachment candidates[$]
+  );
+    rdma_queue_data_attachment candidate;
+    string scan_key;
+
+    candidates.delete();
+    if (queue_h == null)
+      return;
+
+    foreach (attachments[scan_key]) begin
+      candidate = attachments[scan_key];
+      if (!attachment_matches_queue_identity(candidate, queue_h) ||
+          candidate == null || candidate.runtime == null)
+        continue;
+      candidates.push_back(candidate);
+    end
+  endfunction
+
   // 功能：find_claimed_recovery_attachment 在 engine-owned attachment 索引中查找
   //   与 recover_queue 目标 queue 完整 identity 相同、且 runtime 已声明
   //   RECOVERY_REQUIRED 的 claimed recovery；它只负责收集候选，不执行恢复动作。
@@ -9384,6 +9415,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment candidate;
     rdma_queue_data_attachment claimed_found;
     rdma_queue_data_attachment found;
+    rdma_queue_data_attachment reservation_candidates[$];
     rdma_queue_pending_operation unclaimed_pending;
     rdma_queue_cursor_snapshot reservation;
     rdma_queue_runtime_state_e runtime_state;
@@ -9497,34 +9529,32 @@ class rdma_queue_data_engine extends uvm_object;
       // 必须保持 fail-closed，而不是伪造一笔 publish。
       // 设计：reservation-only 扫描同样只跳过不同 identity；只有命中的
       // candidate 才查询 reservation，保留 null/status、abort action 与 detach 顺序。
-      foreach (attachments[key]) begin
-        candidate = attachments[key];
-        if (attachment_matches_queue_identity(candidate, queue_h) &&
-            candidate.runtime != null) begin
-          status = candidate.runtime.query_device_reservation(reservation_valid,
-                                                               reservation);
-          if (status == null || !status.ok()) begin
-            status = status == null ?
-              bad("reservation-only recovery query returned null status",
-                  RDMA_SC_RECOVERY_REQUIRED) : status;
+      collect_reservation_only_candidates(queue_h, reservation_candidates);
+      foreach (reservation_candidates[i]) begin
+        candidate = reservation_candidates[i];
+        status = candidate.runtime.query_device_reservation(reservation_valid,
+                                                             reservation);
+        if (status == null || !status.ok()) begin
+          status = status == null ?
+            bad("reservation-only recovery query returned null status",
+                RDMA_SC_RECOVERY_REQUIRED) : status;
+          return;
+        end
+        if (reservation_valid && reservation != null) begin
+          if (action != RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
+            status = bad("reservation-only recovery cannot retry without image",
+                         RDMA_SC_RECOVERY_REQUIRED);
             return;
           end
-          if (reservation_valid && reservation != null) begin
-            if (action != RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
-              status = bad("reservation-only recovery cannot retry without image",
-                           RDMA_SC_RECOVERY_REQUIRED);
-              return;
-            end
-            status = detach_recovery_transaction(
-              queue_h, candidate, reservation);
-            if (status == null) begin
-              status = bad("reservation-only recovery abort could not cancel",
-                           RDMA_SC_RECOVERY_REQUIRED);
-              return;
-            end
-            if (!status.ok()) return;
+          status = detach_recovery_transaction(
+            queue_h, candidate, reservation);
+          if (status == null) begin
+            status = bad("reservation-only recovery abort could not cancel",
+                         RDMA_SC_RECOVERY_REQUIRED);
             return;
           end
+          if (!status.ok()) return;
+          return;
         end
       end
       status = bad("queue has no pending recovery", RDMA_SC_INVALID_STATE);
