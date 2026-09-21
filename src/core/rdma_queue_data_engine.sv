@@ -1302,6 +1302,43 @@ class rdma_queue_data_engine extends uvm_object;
     return same_handle_instance(attachment.queue_h, queue_h);
   endfunction
 
+  // 功能：find_claimed_recovery_attachment 在 engine-owned attachment 索引中查找
+  //   与 recover_queue 目标 queue 完整 identity 相同、且 runtime 已声明
+  //   RECOVERY_REQUIRED 的 claimed recovery；它只负责收集候选，不执行恢复动作。
+  // 输入/输出及副作用：queue_h 为只读目标句柄，found 输出唯一命中的 attachment；
+  //   返回 status 表示扫描或多 runtime 判定结果。函数只读取 attachments、candidate
+  //   的 queue_h/runtime/state，不查询 pending/reservation，不修改 runtime、索引、账本，
+  //   也不访问 Host-memory、MMIO 或外部 mapping。
+  // 失败/边界：queue_h 为空时返回 INVALID_ARGUMENT；identity 不匹配、candidate 或
+  //   runtime 为空、runtime 非 RECOVERY_REQUIRED 均跳过；没有命中返回成功且 found=null，
+  //   由 caller 继续 reservation-only 扫描；同一完整 identity 命中不同 runtime 时返回
+  //   INVALID_STATE，调用方必须保留 unclaimed handoff 的原有 authority 和错误优先级。
+  protected function rdma_status find_claimed_recovery_attachment(
+    rdma_handle queue_h,
+    output rdma_queue_data_attachment found
+  );
+    rdma_queue_data_attachment candidate;
+    string scan_key;
+
+    found = null;
+    if (queue_h == null)
+      return bad("claimed recovery queue handle is missing",
+                 RDMA_SC_INVALID_ARGUMENT);
+
+    foreach (attachments[scan_key]) begin
+      candidate = attachments[scan_key];
+      if (!attachment_matches_queue_identity(candidate, queue_h) ||
+          candidate == null || candidate.runtime == null ||
+          candidate.runtime.state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)
+        continue;
+      if (found != null && found != candidate)
+        return bad("queue has multiple pending recovery runtimes",
+                   RDMA_SC_INVALID_STATE);
+      found = candidate;
+    end
+    return rdma_status::success();
+  endfunction
+
   // 功能：pending_queue_handle_matches_attachment 判断 recovery pending 携带的
   //   queue handle 与 attachment.queue_h 是否属于同一完整 incarnation，供 device
   //   producer 与 consumer replay 共用纯 queue-h identity 门禁。
@@ -9345,6 +9382,7 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_status status
   );
     rdma_queue_data_attachment candidate;
+    rdma_queue_data_attachment claimed_found;
     rdma_queue_data_attachment found;
     rdma_queue_pending_operation unclaimed_pending;
     rdma_queue_cursor_snapshot reservation;
@@ -9360,6 +9398,7 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     found = null;
+    claimed_found = null;
     unclaimed_pending = null;
     reservation = null;
     reservation_valid = 1'b0;
@@ -9434,23 +9473,23 @@ class rdma_queue_data_engine extends uvm_object;
       unclaimed_device_recoveries.delete(key);
       unclaimed_recovery_attachments.delete(key);
     end
-    // 设计：claimed attachment 扫描把 identity mismatch 视为候选不匹配而
-    // 跳过；candidate/runtime 门禁和 RECOVERY_REQUIRED 状态检查仍在身份之后，
-    // 以保留多 runtime ambiguity 的 INVALID_STATE 语义。
-    foreach (attachments[key]) begin
-      candidate = attachments[key];
-      if (attachment_matches_queue_identity(candidate, queue_h) &&
-          candidate.runtime != null &&
-          candidate.runtime.state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED) begin
-        // 中文设计：unclaimed handoff 已选中同一个 attachment 时只接管一次；
-        // 只有发现不同 runtime 也声明同一 queue recovery 时才按歧义拒绝。
-        if (found != null && found != candidate) begin
-          status = bad("queue has multiple pending recovery runtimes",
-                       RDMA_SC_INVALID_STATE);
-          return;
-        end
-        found = candidate;
+    // 设计：unclaimed admission 成功后仍以 engine-owned found 作为第一 authority；
+    // helper 只收集 claimed attachment，再由 caller 比较对象身份。这样同一 attachment
+    // 的 handoff 只接管一次，而另一个 matching runtime 仍明确返回 INVALID_STATE。
+    status = find_claimed_recovery_attachment(queue_h, claimed_found);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("claimed recovery attachment scan returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return;
+    end
+    if (claimed_found != null) begin
+      if (found != null && found != claimed_found) begin
+        status = bad("queue has multiple pending recovery runtimes",
+                     RDMA_SC_INVALID_STATE);
+        return;
       end
+      found = claimed_found;
     end
     if (found == null) begin
       // cancel 前置路径在还没有完整 pending 时也可能返回 RECOVERY_REQUIRED。

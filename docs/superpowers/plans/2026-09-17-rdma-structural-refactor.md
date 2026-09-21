@@ -105,6 +105,14 @@
   `SUCCESS` evidence 顺序、冻结 cursor 和 pending 生命周期。当前 recovery/post
   focused 均 GREEN；本批不声称已完成完整 SRQ/跨队列生命周期、广义 F2 或整份结构
   重构。详见 `task-cmq-batch116-host-producer-recovery-report.md`。
+- Batch117 将 `recover_queue()` 的 claimed attachment 定位抽为只读
+  `find_claimed_recovery_attachment()`：完整 queue incarnation 比较、null/runtime
+  门禁和 `RECOVERY_REQUIRED` 状态筛选集中在独立查询阶段；unclaimed handoff 仍先于
+  查询，matching 多 runtime 继续 fail-closed 为 `INVALID_STATE`，无命中仍交给
+  reservation-only 分支。helper 不查询 pending/reservation，不执行 detach、Host-memory
+  I/O、MMIO 或 runtime mutation。当前 device-publish/recovery/post focused 均 GREEN；
+  本批不声称已完成 SRQ/跨队列 lifecycle、广义 F2 或整份结构重构。详见
+  `task-cmq-batch117-claimed-recovery-scan-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
