@@ -6773,15 +6773,16 @@ class rdma_queue_data_engine extends uvm_object;
   //   校验为后续 release 阶段可消费的只读路由结果。
   // 输入/输出及副作用：cqe、link 为已冻结的 CQE/route 输入；wqe_attachment 与
   //   expected_wq_kind 为输出的非拥有 attachment 引用和目标 runtime kind。函数只
-  //   查询 engine attachment 索引，不读取/推进 cursor，不创建 pending，不修改
-  //   ledger、Host-memory、MMIO 或任何生命周期所有权。
+  //   读取 engine 的 attachment/binding authority 索引，不读取/推进 cursor，不创建
+  //   pending，不修改 ledger、Host-memory、MMIO 或任何生命周期所有权。
   // 失败/边界：输入缺失、receive CQE 的 QP/SRQ handle kind/identity 不完整、
   //   attachment lookup 返回 null/失败、kind/runtime/access/queue handle/entry
   //   geometry/backing role 与冻结 route 不一致时 fail-closed；SRQ 目标必须匹配
   //   link.srq_h，SQ/RQ 目标必须匹配 link.qp_h。该 helper 不替 caller 校验 CQ
   //   route/epoch，也不执行
   //   simulator 兼容的二次 relookup；caller 仍须在 admission 前保留完整 identity
-  //   防御和原有错误优先级。
+  //   防御。目标 authority/geometry 门禁故意先于 release-range snapshot，发生冲突
+  //   时以 fail-closed 的 target 错误为首错，不承诺保留旧 snapshot 错误优先级。
   protected function rdma_status resolve_cq_poll_wq_target(
     rdma_hw_cqe_model cqe,
     rdma_queue_data_qp_link link,
@@ -7079,6 +7080,204 @@ class rdma_queue_data_engine extends uvm_object;
     return status;
   endfunction
 
+  // 设计说明：CQ poll 的 prepared candidate 一旦 admission，shadow/doorbell、CQ
+  //   consumer commit 与 CQ→WQ release 必须成为一个单向、可恢复的副作用序列；把
+  //   该阶段集中在独立 task 可让 caller 保持 read/decode/route/staging 的纯准备边界，
+  //   也避免 recovery retry 重新解析可变 CQE 或 route。该 task 不与 frozen recovery
+  //   的 release_consumer_pending_wqe 合并，因为这里仍拥有本次 live poll 的 CQE。
+  // 功能：commit_cq_poll_candidate 接管已通过 staging 和 WQ identity relookup 的
+  //   CQ candidate，先进入 prepared recovery，再按 shadow 或 doorbell 发布、开启并
+  //   提交 CQ consumer，最后按 CQ→WQ 顺序释放 completion target 并完成 runtime recovery；
+  //   全链成功时发布 detached completion result。
+  // 输入/输出及副作用：cq_attachment/cursor/next/link/wqe_attachment/cqe/pending、
+  //   result_candidate/final_success 与 publication 参数均为 caller 冻结输入；result
+  //   与 status 为输出。task 可能写 context shadow、提交 consumer doorbell、推进 CQ
+  //   cursor/credit、释放 routed WQ ledger，并更新 runtime pending/evidence，但不取得
+  //   attachment、queue、backing 或 handle 的生命周期所有权。
+  // 失败/边界：输入缺失、admission、doorbell、commit、CQ→WQ begin/release/finish
+  //   或 complete 任一阶段失败时 result 保持 null；doorbell/commit/release 的具体
+  //   错误写入预建 noalloc slot，shadow publication 若返回 null status 则原样交给
+  //   外层 poll wrapper 归一化。已发生的 MMIO/commit 只通过 runtime recovery evidence
+  //   保留，绝不重复提交、提前释放或在不确定 evidence 下伪造成功；target release
+  //   失败会完成 bilateral finish 后停止，caller 不得在本 task 外补做阶段。
+  protected task commit_cq_poll_candidate(
+    rdma_queue_data_attachment cq_attachment,
+    rdma_queue_cursor_snapshot cursor,
+    rdma_queue_cursor_snapshot next,
+    rdma_queue_data_qp_link link,
+    rdma_queue_data_attachment wqe_attachment,
+    rdma_hw_cqe_model cqe,
+    rdma_queue_pending_operation pending,
+    bit cq_shadow_required,
+    rdma_doorbell_desc prepared_db_desc,
+    rdma_status prepared_noalloc_status,
+    rdma_queue_completion_result result_candidate,
+    rdma_status final_success,
+    output rdma_queue_completion_result result,
+    output rdma_status status
+  );
+    rdma_doorbell_result db_result;
+    rdma_queue_mmio_evidence_e db_mmio_evidence;
+    rdma_status noalloc_status;
+    rdma_queue_slot_ledger_entry released[$];
+    bit release_succeeded;
+
+    result = null;
+    status = null;
+    noalloc_status = prepared_noalloc_status;
+    released.delete();
+
+    if (cq_attachment == null || cq_attachment.runtime == null ||
+        cursor == null || next == null || link == null || cqe == null ||
+        wqe_attachment == null || wqe_attachment.runtime == null ||
+        pending == null || pending.failure_status == null ||
+        result_candidate == null || result_candidate.cqe == null ||
+        result_candidate.completion_status == null || final_success == null ||
+        (cq_shadow_required ? 1'b0 :
+         (prepared_db_desc == null || noalloc_status == null))) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "CQ poll commit candidate input is incomplete");
+      return;
+    end
+
+    // 中文设计：admission 是 live poll 第一个 runtime mutation；之后的每个阶段
+    // 都只能沿同一 pending/failure_status continuation 前进，不能回到 caller 重建。
+    status = cq_attachment.runtime.enter_recovery_prepared(pending);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = make_engine_status_nonfatal(
+          RDMA_SC_INVALID_STATE, "CQ prepared pending admission returned null");
+      return;
+    end
+
+    if (cq_shadow_required) begin
+      publish_cqc_shadow(cq_attachment, pending, status);
+      if (status == null || !status.ok())
+        return;
+      noalloc_status = pending.failure_status;
+      if (noalloc_status == null) begin
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RECOVERY_REQUIRED,
+          "CQ shadow continuation status is unavailable");
+        return;
+      end
+    end
+    else begin
+      db_result = null;
+      db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+      submit_consumer_doorbell(cq_attachment, next, db_result, status,
+                               db_mmio_evidence, link, prepared_db_desc,
+                               noalloc_status);
+      if (status == null) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "CQ consumer doorbell returned null status"));
+        status = noalloc_status;
+      end
+      else if (status.ok() &&
+               (db_result == null ||
+                db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "CQ consumer doorbell returned incomplete success evidence"));
+        status = noalloc_status;
+      end
+      if (!status.ok()) begin
+        if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+              db_mmio_evidence, status, noalloc_status)) begin
+          void'(set_engine_status_noalloc(
+            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+            "CQ doorbell failure evidence could not be retained"));
+          status = noalloc_status;
+        end
+        return;
+      end
+      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+            RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status,
+          RDMA_SC_RECOVERY_REQUIRED,
+          "CQ doorbell success evidence could not be retained"));
+        status = noalloc_status;
+        return;
+      end
+    end
+
+    if (!cq_attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
+      status = noalloc_status;
+      return;
+    end
+    status = commit_cq_consumer(cq_attachment, cursor, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CQ consumer commit returned null status"));
+      status = noalloc_status;
+    end
+    if (!status.ok()) begin
+      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+            cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
+                                 RDMA_QUEUE_MMIO_SUCCESS,
+            status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CQ consumer commit failure could not be retained"));
+        status = noalloc_status;
+      end
+      return;
+    end
+
+    // 中文设计：CQ runtime 持有 marker 后才允许进入 routed WQ；finish 必须覆盖
+    // release 的成功和失败路径，避免跨 runtime 锁序反转或残留活动 gate。
+    if (!cq_attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
+      status = noalloc_status;
+      return;
+    end
+    released.delete();
+    status = release_cq_wqe(
+      wqe_attachment, cqe, released, noalloc_status);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        "CQ WQE release returned null status"));
+      status = noalloc_status;
+    end
+    release_succeeded = status.ok();
+    if (!cq_attachment.runtime.finish_consumer_release_noalloc(
+          release_succeeded, status)) begin
+      if (status == null || status.ok()) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          "CQ release gate finalization failed"));
+        status = noalloc_status;
+      end
+      return;
+    end
+    if (!release_succeeded) begin
+      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
+            cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
+                                 RDMA_QUEUE_MMIO_SUCCESS,
+            status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          "CQ WQE release failure could not be retained"));
+        status = noalloc_status;
+      end
+      return;
+    end
+    if (!cq_attachment.runtime.complete_consumer_recovery_noalloc(
+          1'b0, noalloc_status)) begin
+      status = noalloc_status;
+      return;
+    end
+    result = result_candidate;
+    status = final_success;
+  endtask
+
+  // 设计说明：poll_cqe_once 负责 occupancy/read/decode/route、detached staging 和
+  // admission 前的 WQ identity relookup；首次 runtime mutation 之后统一委托
+  // commit_cq_poll_candidate，避免 caller 与 live-CQE recovery 顺序分叉。
   // 功能：poll_cqe_once 先冻结 CQ entry、route、WQE release range、最终 result 与
   //   prepared pending，再严格按 doorbell→CQ CI commit→WQE release 完成一次消费。
   // 输入/输出及副作用：cq_h 为输入，result/status 为输出；成功推进 CQ CI/used、
@@ -7101,16 +7300,12 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_model decoded_model;
     rdma_hw_cqe_model cqe;
     rdma_cqe_variant_e cqe_variant;
-    rdma_queue_slot_ledger_entry released[$];
     rdma_queue_pending_operation pending;
-    rdma_doorbell_result db_result;
     rdma_doorbell_desc prepared_db_desc;
-    rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_status noalloc_status;
     rdma_status final_success;
     rdma_queue_completion_result result_candidate;
     int unsigned cq_occupancy;
-    bit release_succeeded;
     bit cq_shadow_required;
     bit wqe_attachment_valid;
     int unsigned owner_byte_offset;
@@ -7299,132 +7494,11 @@ class rdma_queue_data_engine extends uvm_object;
       end
     end
 
-    // 中文设计：候选 staging 只建立 detached 对象与 caller-local payload；此处
-    // 是 poll 路径首次允许 runtime 发布 pending/admission 的边界，后续所有
-    // shadow/doorbell、CQ commit 与 WQ release 都必须依赖这次成功的 admission。
-    status = cq_attachment.runtime.enter_recovery_prepared(pending);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE, "CQ prepared pending admission returned null");
-      return;
-    end
-
-    if (cq_shadow_required) begin
-      publish_cqc_shadow(cq_attachment, pending, status);
-      if (status == null || !status.ok())
-        return;
-      noalloc_status = pending.failure_status;
-    end
-    else begin
-      db_result = null;
-      db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-      submit_consumer_doorbell(cq_attachment, next, db_result, status,
-                               db_mmio_evidence, link, prepared_db_desc,
-                               noalloc_status);
-      if (status == null) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ consumer doorbell returned null status"));
-        status = noalloc_status;
-      end
-      else if (status.ok() &&
-               (db_result == null ||
-                db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ consumer doorbell returned incomplete success evidence"));
-        status = noalloc_status;
-      end
-      if (!status.ok()) begin
-        if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-              db_mmio_evidence, status, noalloc_status)) begin
-          void'(set_engine_status_noalloc(
-            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-            "CQ doorbell failure evidence could not be retained"));
-          status = noalloc_status;
-        end
-        return;
-      end
-      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-            RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status,
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CQ doorbell success evidence could not be retained"));
-        status = noalloc_status;
-        return;
-      end
-    end
-    if (!cq_attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    status = commit_cq_consumer(cq_attachment, cursor, noalloc_status);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CQ consumer commit returned null status"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-            cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
-                                 RDMA_QUEUE_MMIO_SUCCESS,
-            status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "CQ consumer commit failure could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    // 中文设计：这是唯一允许的跨 runtime 嵌套区间。先由 CQ runtime begin
-    // 持有 marker authority，再按 CQ->WQ 顺序进入 routed WQ runtime；所有
-    // begin-success 分支必须调用 finish，严禁新增 WQ->CQ 的反向嵌套路径。
-    if (!cq_attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    released.delete();
-    status = release_cq_wqe(
-      wqe_attachment, cqe, released, noalloc_status);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CQ WQE release returned null status"));
-      status = noalloc_status;
-    end
-    release_succeeded = status.ok();
-    if (!cq_attachment.runtime.finish_consumer_release_noalloc(
-          release_succeeded, status)) begin
-      if (status == null || status.ok()) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ release gate finalization failed"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    if (!release_succeeded) begin
-      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-            cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
-                                 RDMA_QUEUE_MMIO_SUCCESS,
-            status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "CQ WQE release failure could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    if (!cq_attachment.runtime.complete_consumer_recovery_noalloc(
-          1'b0, noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    result = result_candidate;
-    status = final_success;
+    commit_cq_poll_candidate(
+      cq_attachment, cursor, next, link, wqe_attachment, cqe, pending,
+      cq_shadow_required, prepared_db_desc, noalloc_status, result_candidate,
+      final_success, result, status);
+    return;
   endtask
 
   // 功能：poll_cqe 以 cq_h 轮询一条 CQE；每次调用 poll_cqe_once 完成 prepared
