@@ -13,7 +13,7 @@
 当前继续执行工作树 HEAD：`367a75bb909ac19abecc15c043ce4b95d6595f8b`；
 有大量已存在的未提交改动。所有改动和已有验证证据必须保留。
 
-## 当前批次状态（2026-09-21）
+## 当前批次状态（2026-09-22）
 
 - Batch100 已关闭本项目 RC raw `INLINE_SGB` 的固定 512B/32-chunk 容量拒绝 guard；这不等于
   广义 Phase 1C F2 收口，`sge_num` canonical-authority/whole-plan 工作仍暂停。
@@ -250,6 +250,19 @@
   class-handle output 在 simulator 跨 function 边界的保真性、完整 canonical-relookup
   hostile poll fixture、snapshot 后二次 alias 审计仍是明确 OPEN 边界；计划继续保持
   `active`。详见 `task-cmq-batch129-poll-wq-contract-report.md`。
+- Batch130 在既有重构后的 queue-data poll 入口上补充私有 RQ 正向 receive CQE 的端到端
+  测试，不修改生产代码：`make_cqe_for_outstanding_receive()` 显式构造
+  `rq_cqe=1`、`RDMA_CQE_VARIANT_RQ_SRFQ`、`rqe_cpl=1` 的 CQE，
+  `check_private_rq_receive_cqe_e2e()` 依次执行 `post_recv`→公开 `publish_cqe`→
+  `poll_cqe`，并断言 `RDMA_WR_RECV`、QPN/WQE index+wrap、`wr_id`、单个 released
+  slot、RQ/SQ/CQ occupancy、RQ/CQ producer-consumer cursor 以及第二次
+  `RDMA_SC_QUEUE_EMPTY`。当前四项 queue-data focused wrapper（poll/post/recovery/
+  device-publish）均 PROCESS/LOGICAL PASS、UVM warning/error/fatal `0/0/0`；全目录
+  中文契约 scanner 刷新为 185 个 `.sv`、2 个 `.svh`、5,418 methods（`.sv` 5,416、
+  `.svh` 2），0 diagnostics，`git diff --check` 与 changed-SV style 通过。私有 RQ
+  正向路径已取得证据，但 SRQ/UD 正向 poll、legacy descriptor、hostile staged/
+  recovery 组合、跨队列并发与最终 ownership 审计仍开放。详见
+  `task-cmq-batch130-private-rq-cqe-poll-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -263,7 +276,7 @@
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
 Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
 writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
-mode 对齐 seam；Batch115–129 继续关闭 queue-data 的局部 target/replay/recovery 扫描
+mode 对齐 seam；Batch115–130 继续关闭 queue-data 的局部 target/replay/recovery 扫描
 结构 seam，但 Batch119 关闭 recovery action/cardinality/query 顺序的局部契约、Batch120
 关闭 device-producer replay 的局部职责 seam、Batch121 关闭 consumer replay 的局部职责
 seam、Batch122 关闭 local-resource match/projection 的局部职责 seam、Batch123 关闭
@@ -272,7 +285,7 @@ recovery CQ→WQ release 的局部职责 seam、Batch125 关闭 CQ poll candidat
 局部职责 seam、Batch126 关闭 CQ poll SQ/RQ/SRQ completion target 解析的局部职责 seam、
 Batch127 关闭 live CQ poll mutation/commit 的局部职责 seam、Batch128 关闭 CEQ/AEQ
 consumer commit 的局部职责 seam、Batch129 关闭 CQ poll WQ target selector/validator
-的局部职责 seam；完整公开
+的局部职责 seam、Batch130 关闭私有 RQ receive CQE 正向 poll 的测试覆盖 seam；完整公开
 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。

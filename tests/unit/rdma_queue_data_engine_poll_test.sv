@@ -96,6 +96,71 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     return model;
   endfunction
 
+  // 功能：make_cqe_for_outstanding_receive 根据已 post 的私有 RQ slot、QP route
+  //   和 CQ producer polarity 构造显式 RQ/SRFQ variant 的 receive CQE，供公开
+  //   publish_cqe→poll_cqe 正向链验证 RQ ledger release。
+  // 输入/输出及副作用：qp_h、qpn、posted、polarity 为输入；status 为输出；成功
+  //   返回携带 detached QP handle、RQ_CQE、WQE index/wrap、RQ overlay 和成功 ecode
+  //   的 CQE model，不读取/写入 CQ backing，也不修改 posted 或 runtime。
+  // 失败/边界：QP/posted/status evidence 缺失、clone/factory 分配失败时返回 null
+  //   与非成功 status；模型必须保留 non-null status、RQ/SRFQ variant 和合法 qpn，
+  //   调用方不得把半成品送入 publish_cqe。
+  function automatic rdma_hw_cqe_model make_cqe_for_outstanding_receive(
+    rdma_handle qp_h,
+    int unsigned qpn,
+    rdma_queue_post_result posted,
+    bit polarity,
+    output rdma_status status
+  );
+    rdma_hw_cqe_model model;
+
+    status = rdma_status::success();
+    model = null;
+    if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP || posted == null ||
+        posted.status == null || !posted.status.ok()) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "poll test posted-receive evidence is incomplete");
+      return null;
+    end
+    model = rdma_hw_cqe_model::type_id::create("poll_test_receive_cqe");
+    if (model == null) begin
+      status = rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "poll test receive CQE allocation failed");
+      return null;
+    end
+    status = clone_test_handle(qp_h, model.qp_h);
+    if (status == null || !status.ok() || model.qp_h == null) begin
+      if (status == null)
+        status = rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "poll test receive CQE QP clone returned null status");
+      model = null;
+      return null;
+    end
+    model.wr_id = posted.wr_id;
+    model.opcode = RDMA_WR_RECV;
+    model.qpn = qpn;
+    model.wqe_index = posted.index;
+    model.wqe_wrap = posted.wrap;
+    model.rq_cqe = 1'b1;
+    model.srfq = 1'b0;
+    model.variant = RDMA_CQE_VARIANT_RQ_SRFQ;
+    model.polarity = polarity;
+    model.packet_opcode = 8'h01;
+    model.ecode = RDMA_CMQ_SUCCESS_ECODE;
+    model.payload_len = 32;
+    model.immediate_data = 32'h0;
+    model.signature = 8'h0;
+    model.rqe_cpl = 1'b1;
+    model.srfqn = 12'h0;
+    model.srfqe_wrap = 1'b0;
+    model.srfqe_index = 15'h0;
+    model.status = rdma_status::success();
+    return model;
+  endfunction
+
   // 功能：check_cq_poll_wq_attachment_validator 驱动 test-only probe 逐项验证 CQ→WQ
   //   validator 的正常 contract、depth/entry-size/role hostile 变形和 stale
   //   incarnation 拒绝，确认 geometry/role/authority 门禁在 admission 前可独立审查。
@@ -161,6 +226,200 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_private_rq_receive_cqe_e2e 通过独立 lifecycle fixture 执行
+  //   post_recv→公开 publish_cqe(rq_cqe=1)→poll_cqe 的完整私有 RQ 正向事务，
+  //   确认 CQ consumer commit 只释放目标 RQ ledger，而不误碰 SQ。
+  // 输入/输出及副作用：无显式参数；任务创建拥有 CQ context shadow 的 fixture，
+  //   发布真实 RQE/CQE、读取 runtime occupancy/cursor 和 detached completion，
+  //   最后由 fixture cleanup 释放全部 queue、QP、CQ、PD 与 Function 资源。
+  // 失败/边界：setup、post、polarity、CQE 构造、publish、poll、cursor/occupancy
+  //   查询或第二次空轮询任一步失败均报告 UVM_ERROR；result 保持 null 的失败链
+  //   不得被当作完成，cleanup 无论中途哪一阶段失败都必须继续执行。
+  task automatic check_private_rq_receive_cqe_e2e();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_post_recv_req request;
+    rdma_queue_post_result posted;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_status setup_status;
+    rdma_status status;
+    rdma_status cqe_status;
+    rdma_status cleanup_status;
+    int unsigned used;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit pending;
+    bit producer_wrap;
+    bit consumer_wrap;
+    bit polarity;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "private_rq_receive_cqe_fixture");
+    begin : private_rq_receive_cqe_flow
+      if (fixture == null) begin
+        `uvm_error("PRIVATE_RQ_CQE_FIXTURE",
+                   "private RQ receive CQE fixture allocation failed")
+        disable private_rq_receive_cqe_flow;
+      end
+
+      // CQ poll 的 CI/wrap 必须走 fixture context shadow；未注入 shadow 的
+      // fixture 会在 occupancy/read 前按生产 contract 返回 UNSUPPORTED_OPCODE。
+      fixture.setup(setup_status, 16, RDMA_CQE_BYTES, 16, 16,
+                    1'b1, 1'b0, 1'b0);
+      if (setup_status == null || !setup_status.ok()) begin
+        `uvm_error("PRIVATE_RQ_CQE_SETUP",
+                   setup_status == null ? "null setup status" :
+                   setup_status.convert2string())
+        disable private_rq_receive_cqe_flow;
+      end
+
+      request = fixture.make_recv(64'hbabe_cafe_0000_1300);
+      posted = null;
+      fixture.engine.post_recv(request, posted, status);
+      if (status == null || !status.ok() || posted == null ||
+          posted.status == null || !posted.status.ok() || posted.index != 0 ||
+          posted.wrap != 1'b0 || posted.image == null ||
+          posted.image.bytes.size() != RDMA_WQE_BYTES) begin
+        `uvm_error("PRIVATE_RQ_CQE_POST",
+                   status == null ? "null post-receive status" :
+                   status.convert2string())
+        disable private_rq_receive_cqe_flow;
+      end
+
+      used = 0;
+      pending = 1'b1;
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, used, pending);
+      if (status == null || !status.ok() || used != 1 || pending) begin
+        `uvm_error("PRIVATE_RQ_CQE_POST_CREDIT",
+                   status == null ? "null RQ occupancy status" :
+                   status.convert2string())
+        disable private_rq_receive_cqe_flow;
+      end
+
+      polarity = 1'b0;
+      cqe_status = fixture.engine.query_runtime_producer_polarity(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+      if (cqe_status == null || !cqe_status.ok()) begin
+        `uvm_error("PRIVATE_RQ_CQE_POLARITY",
+                   cqe_status == null ? "null CQ polarity status" :
+                   cqe_status.convert2string())
+        disable private_rq_receive_cqe_flow;
+      end
+      cqe = make_cqe_for_outstanding_receive(
+        fixture.qp.handle, fixture.qp.local_qp_id, posted, polarity,
+        cqe_status);
+      if (cqe_status == null || !cqe_status.ok() || cqe == null) begin
+        `uvm_error("PRIVATE_RQ_CQE_MODEL",
+                   cqe_status == null ? "null receive CQE status" :
+                   cqe_status.convert2string())
+        disable private_rq_receive_cqe_flow;
+      end
+
+      published = null;
+      fixture.engine.publish_cqe(fixture.cq.handle, cqe, published, status);
+      if (status == null || !status.ok() || published == null ||
+          published.status == null || !published.status.ok() ||
+          published.index != 0 || published.wrap != 1'b0 ||
+          !published.occupancy_valid || published.occupancy != 1 ||
+          published.image == null ||
+          published.image.bytes.size() != RDMA_CQE_BYTES) begin
+        `uvm_error("PRIVATE_RQ_CQE_PUBLISH",
+                   status == null ? "null receive CQE publish status" :
+                   status.convert2string())
+        disable private_rq_receive_cqe_flow;
+      end
+
+      completion = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      if (status == null || !status.ok() || completion == null ||
+          completion.cqe == null || completion.cqe.rq_cqe != 1'b1 ||
+          completion.cqe.variant != RDMA_CQE_VARIANT_RQ_SRFQ ||
+          completion.cqe.qpn != fixture.qp.local_qp_id ||
+          completion.cqe.wqe_index != posted.index ||
+          completion.cqe.wqe_wrap != posted.wrap ||
+          completion.cqe.wr_id != posted.wr_id ||
+          completion.cqe.opcode != RDMA_WR_RECV ||
+          completion.cqe.rqe_cpl != 1'b1 ||
+          completion.completion_status == null ||
+          !completion.completion_status.ok() ||
+          completion.released_slots.size() != 1 ||
+          completion.released_slots[0] == null ||
+          completion.released_slots[0].wr_id != posted.wr_id ||
+          completion.released_slots[0].index != posted.index ||
+          completion.released_slots[0].wrap != posted.wrap ||
+          completion.released_slots[0].completion_status == null ||
+          !completion.released_slots[0].completion_status.ok()) begin
+        `uvm_error("PRIVATE_RQ_CQE_POLL",
+                   status == null ? "null receive CQE poll status" :
+                   status.convert2string())
+        disable private_rq_receive_cqe_flow;
+      end
+
+      used = 1;
+      pending = 1'b1;
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending) begin
+        `uvm_error("PRIVATE_RQ_CQE_RQ_RELEASE",
+                   status == null ? "null RQ release status" :
+                   status.convert2string())
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending) begin
+        `uvm_error("PRIVATE_RQ_CQE_SQ_UNTOUCHED",
+                   status == null ? "null SQ occupancy status" :
+                   status.convert2string())
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, pending);
+      if (status == null || !status.ok() || used != 0 || pending) begin
+        `uvm_error("PRIVATE_RQ_CQE_CQ_RELEASE",
+                   status == null ? "null CQ release status" :
+                   status.convert2string())
+      end
+
+      status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_RQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (status == null || !status.ok() || producer_index != 1 ||
+          producer_wrap != 1'b0 || consumer_index != 1 ||
+          consumer_wrap != 1'b0) begin
+        `uvm_error("PRIVATE_RQ_CQE_RQ_CURSOR",
+                   status == null ? "null RQ cursor status" :
+                   status.convert2string())
+      end
+      status = fixture.engine.query_runtime_cursors(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (status == null || !status.ok() || producer_index != 1 ||
+          producer_wrap != 1'b0 || consumer_index != 1 ||
+          consumer_wrap != 1'b0) begin
+        `uvm_error("PRIVATE_RQ_CQE_CQ_CURSOR",
+                   status == null ? "null CQ cursor status" :
+                   status.convert2string())
+      end
+
+      completion = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      if (status == null || status.code != RDMA_SC_QUEUE_EMPTY ||
+          completion != null)
+        `uvm_error("PRIVATE_RQ_CQE_EMPTY",
+                   status == null ? "null second-poll status" :
+                   status.convert2string())
+    end
+
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("PRIVATE_RQ_CQE_CLEANUP",
+                   cleanup_status == null ? "null cleanup status" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：run_phase 验证未配置拒绝、post→public publish_cqe→poll 的 WQE release，
   //   以及 consumer commit 后 CQ 为空的可观察结果。
   // 输入/输出及副作用：phase 为输入；任务创建 fixture、调用公开 API 并报告断言，
@@ -185,6 +444,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
 
     phase.raise_objection(this);
     check_cq_poll_wq_attachment_validator();
+    check_private_rq_receive_cqe_e2e();
     engine = rdma_queue_data_engine::type_id::create("unconfigured_engine");
     completion = rdma_queue_completion_result::type_id::create("sentinel_cqe");
     status = null;
