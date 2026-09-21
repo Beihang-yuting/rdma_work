@@ -6841,6 +6841,187 @@ class rdma_queue_data_engine extends uvm_object;
       cqe.wqe_index, cqe.wqe_wrap, released);
   endfunction
 
+  // 功能：stage_cq_poll_candidate 在 CQ poll 首次 runtime mutation 之前冻结
+  //   routed WQ、release range、下一 CQ cursor、detached completion/pending，以及
+  //   CQC shadow 或 legacy doorbell 的 caller-local payload；它把 poll 的复杂准备
+  //   阶段集中在一个可审查的只读 seam，使 enter_recovery_prepared 成为后续首个
+  //   改变 runtime pending 状态的边界。
+  // 输入/输出及副作用：cq_h/cq_attachment/cursor/entry_offset/entry_image/cqe/link
+  //   是本次消费的冻结输入；next、wqe_attachment、result_candidate、final_success、
+  //   pending、cq_shadow_required、prepared_db_desc 和 noalloc_status 是输出。函数只
+  //   通过 runtime 的 snapshot/query 接口读取 live authority，并创建由 caller 接管
+  //   生命周期的 detached 对象；wqe_attachment 是非拥有借用输出，caller 必须按
+  //   link/kind/完整 incarnation 再验证，不推进 CQ/WQ cursor、不写 ledger、不 admission
+  //   pending，也不执行 MMIO。
+  // 失败/边界：CQ/WQ/route/CQE 输入不完整、release snapshot、completion status、
+  //   cursor/result/pending、shadow payload 或 doorbell descriptor 任一阶段返回 null/
+  //   非成功时原样返回（null status 会被转换为对应的确定性 non-fatal 错误），所有
+  //   输出保持安全空值；lookup 返回空 attachment 或空 snapshot 也 fail-closed；成功
+  //   但 context_backing 缺失时只准备 legacy descriptor，CQ caller 的入口门禁仍会在
+  //   更早阶段拒绝该情况。
+  protected function rdma_status stage_cq_poll_candidate(
+    rdma_handle cq_h,
+    rdma_queue_data_attachment cq_attachment,
+    rdma_queue_cursor_snapshot cursor,
+    longint unsigned entry_offset,
+    rdma_hw_image entry_image,
+    rdma_hw_cqe_model cqe,
+    rdma_queue_data_qp_link link,
+    output rdma_queue_cursor_snapshot next,
+    output rdma_queue_data_attachment wqe_attachment,
+    output rdma_queue_completion_result result_candidate,
+    output rdma_status final_success,
+    output rdma_queue_pending_operation pending,
+    output bit cq_shadow_required,
+    output rdma_doorbell_desc prepared_db_desc,
+    output rdma_status noalloc_status
+  );
+    rdma_queue_slot_ledger_entry release_snapshots[$];
+    rdma_handle result_qp_h;
+    rdma_status status;
+    rdma_status completion_status;
+    rdma_queue_runtime_kind_e expected_wq_kind;
+    longint unsigned shadow_offset;
+    int unsigned shadow_length;
+    int unsigned shadow_value;
+    byte unsigned shadow_payload[];
+
+    next = null;
+    result_candidate = null;
+    final_success = null;
+    pending = null;
+    cq_shadow_required = 1'b0;
+    prepared_db_desc = null;
+    noalloc_status = null;
+    release_snapshots.delete();
+    result_qp_h = null;
+    wqe_attachment = null;
+    completion_status = null;
+    shadow_offset = 0;
+    shadow_length = 0;
+    shadow_value = 0;
+    shadow_payload = new[0];
+    expected_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
+
+    if (cq_h == null || cq_attachment == null || cq_attachment.runtime == null ||
+        cursor == null || entry_image == null || cqe == null || link == null ||
+        link.qp_h == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_ARGUMENT, "CQ poll candidate input is incomplete");
+
+    // 设计说明：route handle 在所有 detached preparation 前冻结；WQ attachment
+    // 只借用 engine registry 中的 live 引用，release_snapshots/result/pending 则
+    // 由各自 helper 深复制，避免后续 admission 或 recovery 依赖可变 CQE 对象。
+    result_qp_h = link.qp_h;
+    if (cqe.rq_cqe) begin
+      if (link.srq_h != null) begin
+        expected_wq_kind = RDMA_QUEUE_RUNTIME_SRQ;
+        status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
+                                   wqe_attachment);
+      end
+      else begin
+        expected_wq_kind = RDMA_QUEUE_RUNTIME_RQ;
+        status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_RQ,
+                                   wqe_attachment);
+      end
+    end
+    else begin
+      expected_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
+      status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
+                                  wqe_attachment);
+    end
+    if (status == null || !status.ok() || wqe_attachment == null ||
+        wqe_attachment.runtime == null ||
+        wqe_attachment.kind != expected_wq_kind) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_INVALID_STATE,
+          "CQ WQ attachment lookup returned incomplete attachment");
+      return status;
+    end
+
+    status = wqe_attachment.runtime.snapshot_release_range(
+      cqe.wqe_index, cqe.wqe_wrap, release_snapshots);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = make_engine_status_nonfatal(
+          RDMA_SC_INVALID_STATE, "CQ release snapshot returned null status");
+      return status;
+    end
+    if (release_snapshots.size() == 0 ||
+        release_snapshots[release_snapshots.size()-1] == null)
+      return make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE, "CQ release snapshot is empty");
+    status = completion_status_from_ecode(cqe.ecode,
+      cqe.rq_cqe ? RDMA_ENGINE_RQ : RDMA_ENGINE_SQ, completion_status);
+    if (status == null || !status.ok() || completion_status == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "CQ completion status materialization failed");
+      return status;
+    end
+    status = make_next_poll_cursor_nonfatal(
+      cq_attachment.runtime, cursor, "next CQ", next);
+    if (status == null || !status.ok()) return status;
+    status = prepare_cq_completion_candidate(
+      cq_h, cqe, result_qp_h, completion_status, release_snapshots,
+      result_candidate, final_success);
+    if (status == null || !status.ok() || result_candidate == null ||
+        final_success == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED, "CQ completion candidate is incomplete");
+      return status;
+    end
+    status = prepare_consumer_pending(
+      cq_attachment, cursor, next, entry_offset, entry_image,
+      cqe.wqe_index, cqe.wqe_wrap, 1'b1, wqe_attachment.kind,
+      result_qp_h, pending);
+    if (status == null || !status.ok() || pending == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED, "CQ prepared pending is incomplete");
+      return status;
+    end
+    pending.wr_id = result_candidate.cqe.wr_id;
+    pending.signaled = release_snapshots[release_snapshots.size()-1].signaled;
+    cq_shadow_required = (context_backing != null);
+    if (cq_shadow_required) begin
+      status = prepare_cqc_shadow_publication(
+        cq_attachment, next, shadow_offset, shadow_length,
+        shadow_value, shadow_payload, link, wqe_attachment,
+        cqe.wqe_index, cqe.wqe_wrap, 1'b1, cqe.rq_cqe);
+      if (status == null || !status.ok() ||
+          shadow_payload.size() != shadow_length) begin
+        if (status == null || status.ok())
+          status = make_engine_status_nonfatal(
+            RDMA_SC_RECOVERY_REQUIRED,
+            "CQ CQC shadow preparation is incomplete");
+        return status;
+      end
+      pending.consumer_shadow_required = 1'b1;
+      pending.consumer_shadow_urc =
+        (cq_attachment.transport == RDMA_TRANSPORT_URC);
+      pending.consumer_shadow_offset = shadow_offset;
+      pending.consumer_shadow_length = shadow_length;
+      pending.consumer_shadow_value = shadow_value;
+    end
+    else begin
+      status = prepare_consumer_doorbell(
+        cq_attachment, next, link, prepared_db_desc, noalloc_status);
+      if (status == null || !status.ok() || prepared_db_desc == null ||
+          noalloc_status == null) begin
+        if (status == null || status.ok())
+          status = make_engine_status_nonfatal(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "CQ consumer doorbell preparation is incomplete");
+        return status;
+      end
+    end
+    return status;
+  endfunction
+
   // 功能：poll_cqe_once 先冻结 CQ entry、route、WQE release range、最终 result 与
   //   prepared pending，再严格按 doorbell→CQ CI commit→WQE release 完成一次消费。
   // 输入/输出及副作用：cq_h 为输入，result/status 为输出；成功推进 CQ CI/used、
@@ -6864,20 +7045,17 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_cqe_model cqe;
     rdma_cqe_variant_e cqe_variant;
     rdma_queue_slot_ledger_entry released[$];
-    rdma_queue_slot_ledger_entry release_snapshots[$];
     rdma_queue_pending_operation pending;
-    rdma_handle result_qp_h;
     rdma_doorbell_result db_result;
     rdma_doorbell_desc prepared_db_desc;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
-    rdma_status local_status;
     rdma_status noalloc_status;
-    rdma_status completion_status;
     rdma_status final_success;
     rdma_queue_completion_result result_candidate;
     int unsigned cq_occupancy;
     bit release_succeeded;
     bit cq_shadow_required;
+    bit wqe_attachment_valid;
     int unsigned owner_byte_offset;
     byte data[];
     longint unsigned offset;
@@ -6998,103 +7176,75 @@ class rdma_queue_data_engine extends uvm_object;
       status = bad("CQE route has no QP link", RDMA_SC_INVALID_STATE);
       return;
     end
-    // 设计说明：在 doorbell task 前冻结 route handle，使 result 构造不依赖
-    // simulator 对跨 task class-handle lifetime/argument aliasing 的差异行为。
-    result_qp_h = link.qp_h;
-    if (cqe.rq_cqe) begin
-      if (link.srq_h != null)
+    // 设计说明：route handle 已在 decode/relookup 后冻结并作为 staging 输入；
+    // candidate function 返回的 live WQ 引用若被 simulator 丢失，caller 只在此处
+    // 按同一 link/kind 重新查询，避免跨边界的 class-handle aliasing 变成错误提交。
+    status = stage_cq_poll_candidate(
+      cq_h, cq_attachment, cursor, offset, entry_image, cqe, link,
+      next, wqe_attachment, result_candidate, final_success, pending,
+      cq_shadow_required, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok()) return;
+    if (next == null || result_candidate == null ||
+        result_candidate.cqe == null ||
+        result_candidate.completion_status == null || final_success == null ||
+        pending == null) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "CQ staged candidate output is incomplete");
+      return;
+    end
+    if (cq_shadow_required != (context_backing != null) ||
+        (cq_shadow_required && !pending.consumer_shadow_required) ||
+        (!cq_shadow_required &&
+         (prepared_db_desc == null || noalloc_status == null))) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_RECOVERY_REQUIRED,
+        "CQ staged consumer publication output is incomplete");
+      return;
+    end
+    // 中文设计：output class handle 不能只凭 non-null/kind 视为 authority；
+    // simulator 若复制了错误 incarnation，必须在 admission 前按 link 的 QP/SRQ
+    // 完整 identity 重新验证，避免把另一个 ring 的 ledger 交给 release seam。
+    wqe_attachment_valid = 1'b0;
+    if (wqe_attachment != null && wqe_attachment.runtime != null &&
+        wqe_attachment.kind == pending.completion_wq_kind) begin
+      if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SRQ)
+        wqe_attachment_valid = same_handle_instance(
+          wqe_attachment.queue_h, link.srq_h);
+      else
+        wqe_attachment_valid = same_handle_instance(
+          wqe_attachment.queue_h, link.qp_h);
+    end
+    if (!wqe_attachment_valid) begin
+      if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SRQ)
         status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
                                    wqe_attachment);
       else
-        status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_RQ,
+        status = lookup_attachment(link.qp_h, pending.completion_wq_kind,
                                    wqe_attachment);
+      wqe_attachment_valid = 1'b0;
+      if (status != null && status.ok() && wqe_attachment != null &&
+          wqe_attachment.runtime != null &&
+          wqe_attachment.kind == pending.completion_wq_kind) begin
+        if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SRQ)
+          wqe_attachment_valid = same_handle_instance(
+            wqe_attachment.queue_h, link.srq_h);
+        else
+          wqe_attachment_valid = same_handle_instance(
+            wqe_attachment.queue_h, link.qp_h);
+      end
+      if (status == null || !status.ok() || !wqe_attachment_valid) begin
+        if (status == null || status.ok())
+          status = make_engine_status_nonfatal(
+            RDMA_SC_INVALID_STATE,
+            "CQ staged WQ attachment recovery lookup is incomplete");
+        return;
+      end
     end
-    else begin
-      status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-                                  wqe_attachment);
-    end
-    if (!status.ok()) return;
-    status = wqe_attachment.runtime.snapshot_release_range(
-      cqe.wqe_index, cqe.wqe_wrap, release_snapshots);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE, "CQ release snapshot returned null status");
-      return;
-    end
-    status = completion_status_from_ecode(cqe.ecode,
-      cqe.rq_cqe ? RDMA_ENGINE_RQ : RDMA_ENGINE_SQ, completion_status);
-    if (status == null || !status.ok() || completion_status == null) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RESOURCE_EXHAUSTED,
-          "CQ completion status materialization failed");
-      return;
-    end
-    status = make_next_poll_cursor_nonfatal(
-      cq_attachment.runtime, cursor, "next CQ", next);
-    if (status == null || !status.ok()) return;
-    status = prepare_cq_completion_candidate(
-      cq_h, cqe, result_qp_h, completion_status, release_snapshots,
-      result_candidate, final_success);
-    if (status == null || !status.ok() || result_candidate == null ||
-        final_success == null) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RESOURCE_EXHAUSTED, "CQ completion candidate is incomplete");
-      return;
-    end
-    status = prepare_consumer_pending(
-      cq_attachment, cursor, next, offset, entry_image,
-      cqe.wqe_index, cqe.wqe_wrap, 1'b1, wqe_attachment.kind,
-      result_qp_h, pending);
-    if (status == null || !status.ok() || pending == null) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RESOURCE_EXHAUSTED, "CQ prepared pending is incomplete");
-      return;
-    end
-    pending.wr_id = result_candidate.cqe.wr_id;
-    pending.signaled = release_snapshots[release_snapshots.size()-1].signaled;
-    cq_shadow_required = (context_backing != null);
-    prepared_db_desc = null;
-    noalloc_status = null;
-    if (cq_shadow_required) begin
-      longint unsigned shadow_offset;
-      int unsigned shadow_length;
-      int unsigned shadow_value;
-      byte unsigned shadow_payload[];
 
-      status = prepare_cqc_shadow_publication(
-        cq_attachment, next, shadow_offset, shadow_length,
-        shadow_value, shadow_payload, link, wqe_attachment,
-        cqe.wqe_index, cqe.wqe_wrap, 1'b1, cqe.rq_cqe);
-      if (status == null || !status.ok() || shadow_payload.size() != shadow_length) begin
-        if (status == null || status.ok())
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "CQ CQC shadow preparation is incomplete");
-        return;
-      end
-      pending.consumer_shadow_required = 1'b1;
-      pending.consumer_shadow_urc =
-        (cq_attachment.transport == RDMA_TRANSPORT_URC);
-      pending.consumer_shadow_offset = shadow_offset;
-      pending.consumer_shadow_length = shadow_length;
-      pending.consumer_shadow_value = shadow_value;
-    end
-    else begin
-      status = prepare_consumer_doorbell(
-        cq_attachment, next, link, prepared_db_desc, noalloc_status);
-      if (status == null || !status.ok() || prepared_db_desc == null ||
-          noalloc_status == null) begin
-        if (status == null || status.ok())
-          status = make_engine_status_nonfatal(
-            RDMA_SC_RESOURCE_EXHAUSTED,
-            "CQ consumer doorbell preparation is incomplete");
-        return;
-      end
-    end
+    // 中文设计：候选 staging 只建立 detached 对象与 caller-local payload；此处
+    // 是 poll 路径首次允许 runtime 发布 pending/admission 的边界，后续所有
+    // shadow/doorbell、CQ commit 与 WQ release 都必须依赖这次成功的 admission。
     status = cq_attachment.runtime.enter_recovery_prepared(pending);
     if (status == null || !status.ok()) begin
       if (status == null)
