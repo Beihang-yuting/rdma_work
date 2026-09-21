@@ -202,6 +202,17 @@
   142/122。计划继续保持 `active`；RQ/SRQ 与 UD 正向 poll、legacy descriptor 分支、
   engine-level 全局锁、poll/recovery 全阶段组合、CQ→WQ 跨队列并发和最终 ownership
   审计仍开放。详见 `task-cmq-batch125-poll-candidate-staging-report.md`。
+- Batch126 将 `stage_cq_poll_candidate()` 内的 CQ completion target 解析提取为只读
+  `resolve_cq_poll_wq_target()`：按冻结 CQE receive 标志和 QP link 统一选择 SQ、私有
+  RQ 或共享 SRQ，集中校验完整 handle incarnation、runtime/access、entry geometry、
+  kind 与 backing role；helper 不 reserve/snapshot ledger、不进入 pending、不写 Host-memory
+  或 MMIO。poll caller 继续保留完整 QP/SRQ relookup 防御、`enter_recovery_prepared()`
+  首个 mutation 及 shadow/doorbell→CQ commit→CQ→WQ release 顺序。当前 poll/post/
+  recovery/device-publish 四项 wrapper 均已在最终源码边界通过 PROCESS/LOGICAL PASS、
+  UVM 0/0/0，静态门禁与全目录 scanner 同样 GREEN；计划继续保持 `active`，
+  RQ/SRQ 与 UD 正向 poll 的实际端到端矩阵、legacy descriptor 分支、engine-level 全局
+  锁、poll/recovery 组合、CQ→WQ 跨队列并发和最终 ownership 审计仍开放。详见
+  `task-cmq-batch126-poll-target-resolution-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -215,13 +226,13 @@
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
 Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
 writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
-mode 对齐 seam；Batch115–125 继续关闭 queue-data 的局部 target/replay/recovery 扫描
+mode 对齐 seam；Batch115–126 继续关闭 queue-data 的局部 target/replay/recovery 扫描
 结构 seam，但 Batch119 关闭 recovery action/cardinality/query 顺序的局部契约、Batch120
 关闭 device-producer replay 的局部职责 seam、Batch121 关闭 consumer replay 的局部职责
 seam、Batch122 关闭 local-resource match/projection 的局部职责 seam、Batch123 关闭
 consumer recovery authority preflight 的局部职责 seam、Batch124 关闭 consumer
 recovery CQ→WQ release 的局部职责 seam、Batch125 关闭 CQ poll candidate staging 的
-局部职责 seam；完整公开
+局部职责 seam、Batch126 关闭 CQ poll SQ/RQ/SRQ completion target 解析的局部职责 seam；完整公开
 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。

@@ -6767,6 +6767,83 @@ class rdma_queue_data_engine extends uvm_object;
     end
   endtask
 
+  // 功能：resolve_cq_poll_wq_target 根据已解码 CQE 的 receive 标志和冻结的 QP
+  //   link，选择本次 completion 对应的 SQ、私有 RQ 或共享 SRQ attachment，并
+  //   把目标队列的完整 handle、kind、runtime、backing access 与 ring role 一次性
+  //   校验为后续 release 阶段可消费的只读路由结果。
+  // 输入/输出及副作用：cqe、link 为已冻结的 CQE/route 输入；wqe_attachment 与
+  //   expected_wq_kind 为输出的非拥有 attachment 引用和目标 runtime kind。函数只
+  //   查询 engine attachment 索引，不读取/推进 cursor，不创建 pending，不修改
+  //   ledger、Host-memory、MMIO 或任何生命周期所有权。
+  // 失败/边界：输入缺失、receive CQE 的 QP/SRQ handle kind/identity 不完整、
+  //   attachment lookup 返回 null/失败、kind/runtime/access/queue handle/entry
+  //   geometry/backing role 与冻结 route 不一致时 fail-closed；SRQ 目标必须匹配
+  //   link.srq_h，SQ/RQ 目标必须匹配 link.qp_h。该 helper 不替 caller 校验 CQ
+  //   route/epoch，也不执行
+  //   simulator 兼容的二次 relookup；caller 仍须在 admission 前保留完整 identity
+  //   防御和原有错误优先级。
+  protected function rdma_status resolve_cq_poll_wq_target(
+    rdma_hw_cqe_model cqe,
+    rdma_queue_data_qp_link link,
+    output rdma_queue_data_attachment wqe_attachment,
+    output rdma_queue_runtime_kind_e expected_wq_kind
+  );
+    rdma_handle target_h;
+    rdma_queue_backing_role_e expected_role;
+    rdma_status status;
+
+    wqe_attachment = null;
+    expected_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
+    target_h = null;
+    expected_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+
+    if (cqe == null || link == null || link.qp_h == null ||
+        link.qp_h.kind != RDMA_RESOURCE_QP)
+      return bad("CQ poll completion target input is incomplete",
+                 RDMA_SC_INVALID_ARGUMENT);
+
+    if (cqe.rq_cqe) begin
+      if (link.srq_h != null) begin
+        if (link.srq_h.kind != RDMA_RESOURCE_SRQ)
+          return bad("CQ poll completion SRQ handle kind is invalid",
+                     RDMA_SC_INVALID_ARGUMENT);
+        expected_wq_kind = RDMA_QUEUE_RUNTIME_SRQ;
+        expected_role = RDMA_QUEUE_ROLE_SRQ_RING;
+        target_h = link.srq_h;
+      end
+      else begin
+        expected_wq_kind = RDMA_QUEUE_RUNTIME_RQ;
+        expected_role = RDMA_QUEUE_ROLE_QP_RQ_RING;
+        target_h = link.qp_h;
+      end
+    end
+    else begin
+      expected_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
+      expected_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+      target_h = link.qp_h;
+    end
+
+    if (target_h == null)
+      return bad("CQ poll completion target handle is unavailable",
+                 RDMA_SC_INVALID_STATE);
+    status = lookup_attachment(target_h, expected_wq_kind, wqe_attachment);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("CQ poll completion target lookup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    if (wqe_attachment == null || wqe_attachment.runtime == null ||
+        wqe_attachment.access == null || wqe_attachment.runtime.depth == 0 ||
+        wqe_attachment.entry_size != RDMA_WQE_BYTES ||
+        wqe_attachment.kind != expected_wq_kind ||
+        wqe_attachment.role != expected_role)
+      return bad("CQ poll completion target attachment is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    if (!same_handle_instance(wqe_attachment.queue_h, target_h))
+      return bad("CQ poll completion target handle incarnation is stale",
+                 RDMA_SC_STALE_GENERATION);
+    return rdma_status::success();
+  endfunction
+
   // 功能：commit_cq_consumer 为 CQ/CEQ/AEQ poll/recovery 提供唯一可覆写 CI
   //   commit seam；名称保留 CQ 兼容契约，可选 slot 选择零分配 recovery 原子提交。
   // 输入/输出及副作用：cq_attachment/cursor 与可选 prepared_status 为输入；有 slot
@@ -6913,32 +6990,12 @@ class rdma_queue_data_engine extends uvm_object;
     // 只借用 engine registry 中的 live 引用，release_snapshots/result/pending 则
     // 由各自 helper 深复制，避免后续 admission 或 recovery 依赖可变 CQE 对象。
     result_qp_h = link.qp_h;
-    if (cqe.rq_cqe) begin
-      if (link.srq_h != null) begin
-        expected_wq_kind = RDMA_QUEUE_RUNTIME_SRQ;
-        status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
-                                   wqe_attachment);
-      end
-      else begin
-        expected_wq_kind = RDMA_QUEUE_RUNTIME_RQ;
-        status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_RQ,
-                                   wqe_attachment);
-      end
-    end
-    else begin
-      expected_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
-      status = lookup_attachment(link.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-                                  wqe_attachment);
-    end
-    if (status == null || !status.ok() || wqe_attachment == null ||
-        wqe_attachment.runtime == null ||
-        wqe_attachment.kind != expected_wq_kind) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE,
-          "CQ WQ attachment lookup returned incomplete attachment");
-      return status;
-    end
+    status = resolve_cq_poll_wq_target(cqe, link, wqe_attachment,
+                                       expected_wq_kind);
+    if (status == null || !status.ok())
+      return status == null ? make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        "CQ completion target resolver returned null status") : status;
 
     status = wqe_attachment.runtime.snapshot_release_range(
       cqe.wqe_index, cqe.wqe_wrap, release_snapshots);
