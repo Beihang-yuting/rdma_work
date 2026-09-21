@@ -25,6 +25,123 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
     super.new(name);
   endfunction
 
+  // 功能：probe_validate_cq_poll_wq_attachment_fixture 在已 attach 的 QP/SQ 上
+  //   构造最小冻结 send-CQE/link contract，并按 fault_kind 注入单一 hostile
+  //   attachment 变形，再调用生产 selector 与 validator；该 probe 只为 focused
+  //   contract test 暴露受保护只读 seam，不模拟完整 poll admission。
+  // 输入/输出及副作用：qp_h、fault_kind 为输入；函数返回 validator status。测试
+  //   fault_kind=0 验证正常 SQ，1 暂时置 runtime.depth=0，2 暂时置 entry_size=32，
+  //   3 暂时置错误 backing role，4 暂时修改 attachment.queue_h generation；所有
+  //   变形在 validator 返回后恢复，engine attachment、ledger、cursor 与外部资源
+  //   ownership 不被永久修改。
+  // 失败/边界：QP/SQ attachment、QP link、CQE 或 selector/validator 输入缺失时返回
+  //   对应非成功 status；未知 fault_kind 返回 INVALID_ARGUMENT；该 helper 不调用
+  //   snapshot/release/admission，不把临时 hostile 字段修改传播到 fixture cleanup。
+  function rdma_status probe_validate_cq_poll_wq_attachment_fixture(
+    rdma_handle qp_h,
+    int unsigned fault_kind
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_queue_data_qp_link link;
+    rdma_hw_cqe_model cqe;
+    rdma_handle target_h;
+    rdma_queue_runtime_kind_e expected_kind;
+    rdma_queue_backing_role_e expected_role;
+    rdma_status status;
+    int unsigned saved_depth;
+    int unsigned saved_entry_size;
+    rdma_queue_backing_role_e saved_role;
+    int unsigned saved_generation;
+    bit mutated;
+
+    if (qp_h == null || qp_h.kind != RDMA_RESOURCE_QP)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "CQ poll validator probe QP is invalid");
+    status = lookup_attachment(qp_h, RDMA_QUEUE_RUNTIME_SQ, attachment);
+    if (status == null || !status.ok() || attachment == null ||
+        attachment.runtime == null)
+      return status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "CQ poll validator probe SQ lookup returned null") :
+        status;
+    if (!qp_links.exists(identity_key(qp_h)) ||
+        qp_links[identity_key(qp_h)] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ poll validator probe QP link is missing");
+    link = qp_links[identity_key(qp_h)];
+    cqe = rdma_hw_cqe_model::type_id::create(
+      "cq_poll_validator_probe_cqe");
+    if (cqe == null)
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "CQ poll validator probe CQE allocation failed");
+    cqe.rq_cqe = 1'b0;
+    status = select_cq_poll_wq_target_contract(
+      cqe, link, target_h, expected_kind, expected_role);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "CQ poll validator probe selector returned null") :
+        status;
+    // 中文设计：probe 与生产 resolver 一样，以冻结 link 重新确认 selector 的
+    // class-handle output；focused test 不应把 simulator 的 output 复制差异误报为
+    // attachment validator 失败，真正的 hostile 变形仍由后续 validator 判定。
+    if (expected_kind == RDMA_QUEUE_RUNTIME_SRQ) begin
+      if (target_h == null || !same_handle_instance(target_h, link.srq_h))
+        target_h = link.srq_h;
+    end
+    else begin
+      if (target_h == null || !same_handle_instance(target_h, link.qp_h))
+        target_h = link.qp_h;
+    end
+    if (target_h == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "CQ poll validator probe target is missing");
+    saved_depth = attachment.runtime.depth;
+    saved_entry_size = attachment.entry_size;
+    saved_role = attachment.role;
+    saved_generation = attachment.queue_h == null ? 0 :
+                       attachment.queue_h.generation;
+    mutated = 1'b0;
+    case (fault_kind)
+      0: begin end
+      1: begin
+        attachment.runtime.depth = 0;
+        mutated = 1'b1;
+      end
+      2: begin
+        attachment.entry_size = 32;
+        mutated = 1'b1;
+      end
+      3: begin
+        attachment.role = RDMA_QUEUE_ROLE_CQ_RING;
+        mutated = 1'b1;
+      end
+      4: begin
+        if (attachment.queue_h == null)
+          return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                   "CQ poll validator probe handle is missing");
+        attachment.queue_h.generation = saved_generation ^ 32'h1;
+        mutated = 1'b1;
+      end
+      default:
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "CQ poll validator probe fault is unknown");
+    endcase
+    status = validate_cq_poll_wq_attachment(
+      attachment, target_h, expected_kind, expected_role);
+    if (mutated) begin
+      attachment.runtime.depth = saved_depth;
+      attachment.entry_size = saved_entry_size;
+      attachment.role = saved_role;
+      if (attachment.queue_h != null)
+        attachment.queue_h.generation = saved_generation;
+    end
+    return status == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                        "CQ poll validator probe returned null status") :
+      status;
+  endfunction
+
   // 功能：probe_prepare_cq_consumer_doorbell 通过真实 CQ attachment 调用生产
   //   prepare_consumer_doorbell，观察 CQ consumer CI 是否错误地物化为 MMIO 描述符。
   // 输入/输出及副作用：cq_h/next 为输入；prepared_desc/prepared_status 为输出；

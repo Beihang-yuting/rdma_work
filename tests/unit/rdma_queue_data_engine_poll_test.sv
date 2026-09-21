@@ -96,6 +96,71 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     return model;
   endfunction
 
+  // 功能：check_cq_poll_wq_attachment_validator 驱动 test-only probe 逐项验证 CQ→WQ
+  //   validator 的正常 contract、depth/entry-size/role hostile 变形和 stale
+  //   incarnation 拒绝，确认 geometry/role/authority 门禁在 admission 前可独立审查。
+  // 输入/输出及副作用：无显式输入输出；任务创建并清理一个 probe fixture，读取
+  //   validator status 并报告断言，不提交 CQE、不推进 runtime cursor、不写 Host-memory
+  //   或 MMIO。probe 在每次断言后恢复临时 attachment 字段，fixture 仍由自身 cleanup
+  //   持有 queue、runtime、mapping 与 backing 所有权。
+  // 失败/边界：fixture/probe setup、cast 或 cleanup 失败均报告 UVM_ERROR；正常 case
+  //   必须返回 OK，fault_kind 1/2/3 必须返回 INVALID_STATE，fault_kind 4 必须返回
+  //   STALE_GENERATION；任一状态不符不会跳过后续 case 或生命周期清理。
+  task automatic check_cq_poll_wq_attachment_validator();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_probe probe;
+    rdma_status setup_status;
+    rdma_status validator_status;
+    rdma_status cleanup_status;
+    int unsigned fault_kind;
+    rdma_status_code_e expected_code;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "poll_validator_fixture");
+    begin : validator_flow
+      if (fixture == null) begin
+        `uvm_error("POLL_VALIDATOR_FIXTURE",
+                   "CQ poll validator fixture allocation failed")
+        disable validator_flow;
+      end
+      fixture.setup(setup_status, 16, RDMA_CQE_BYTES, 16, 16,
+                    1'b0, 1'b0, 1'b1);
+      if (setup_status == null || !setup_status.ok()) begin
+        `uvm_error("POLL_VALIDATOR_SETUP",
+                   setup_status == null ? "null setup status" :
+                   setup_status.convert2string())
+        disable validator_flow;
+      end
+      if (!$cast(probe, fixture.engine) || probe == null) begin
+        `uvm_error("POLL_VALIDATOR_CAST",
+                   "fixture did not create queue-data probe")
+        disable validator_flow;
+      end
+      for (fault_kind = 0; fault_kind < 5; fault_kind++) begin
+        expected_code = fault_kind == 0 ? RDMA_SC_OK :
+                        (fault_kind == 4 ? RDMA_SC_STALE_GENERATION :
+                                           RDMA_SC_INVALID_STATE);
+        validator_status = probe.probe_validate_cq_poll_wq_attachment_fixture(
+          fixture.qp.handle, fault_kind);
+        if (validator_status == null ||
+            validator_status.code != expected_code) begin
+          `uvm_error("POLL_VALIDATOR_CASE",
+                     $sformatf("fault_kind=%0d expected=%0d got=%s",
+                               fault_kind, expected_code,
+                               validator_status == null ? "null" :
+                               validator_status.convert2string()))
+        end
+      end
+    end
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("POLL_VALIDATOR_CLEANUP",
+                   cleanup_status == null ? "null cleanup status" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：run_phase 验证未配置拒绝、post→public publish_cqe→poll 的 WQE release，
   //   以及 consumer commit 后 CQ 为空的可观察结果。
   // 输入/输出及副作用：phase 为输入；任务创建 fixture、调用公开 API 并报告断言，
@@ -119,6 +184,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     bit polarity;
 
     phase.raise_objection(this);
+    check_cq_poll_wq_attachment_validator();
     engine = rdma_queue_data_engine::type_id::create("unconfigured_engine");
     completion = rdma_queue_completion_result::type_id::create("sentinel_cqe");
     status = null;
