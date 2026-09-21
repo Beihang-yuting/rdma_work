@@ -127,6 +127,85 @@ class rdma_ud_urc_sqe_codec_test extends uvm_test;
     return h;
   endfunction
 
+  // 功能：check_ud_effective_payload_mode 验证共享 SQE authority 会把 UD 的非零
+  //   inline bytes 和一项 direct-SGE 统一解析为驱动实际发布的 external-SGB mode，
+  //   同时确认 RC 的一项 SGE 仍保留 direct-SGE mode。
+  // 输入/输出及副作用：任务只创建 detached hardware model/SGE，并读取
+  //   derive_payload_authority 的五个输出；不编码 image、不写 Host-memory，也不
+  //   修改 codec registry、QP 或资源账本。
+  // 失败/边界：model/SGE 分配失败、UD mode 未分别得到 INLINE_SGB/SGE_SGB，或 RC
+  //   被错误提升为 external mode 时报告 UVM_ERROR；zero-byte UD inline 不在本 task
+  //   覆盖范围内，由既有 zero-payload codec fixture 验证。
+  task automatic check_ud_effective_payload_mode();
+    rdma_hw_sqe_model inline_model;
+    rdma_hw_sqe_model sge_model;
+    rdma_hw_sqe_model rc_model;
+    rdma_sge sge;
+    rdma_sq_payload_mode_e mode;
+    int unsigned valid_sge_count;
+    int unsigned inline_payload_bytes;
+    int unsigned canonical_sge_num;
+    bit inline_bytes_are_authority;
+
+    inline_model = rdma_hw_sqe_model::type_id::create(
+      "ud_effective_inline_model");
+    sge_model = rdma_hw_sqe_model::type_id::create(
+      "ud_effective_sge_model");
+    rc_model = rdma_hw_sqe_model::type_id::create(
+      "rc_effective_sge_model");
+    if (inline_model == null || sge_model == null || rc_model == null) begin
+      `uvm_error("UD_EFFECTIVE_MODE_FIXTURE", "model allocation failed")
+      return;
+    end
+
+    inline_model.transport = RDMA_TRANSPORT_UD;
+    inline_model.inline_data = 1'b1;
+    inline_model.inline_bytes = new[1];
+    inline_model.inline_bytes[0] = 8'h5a;
+    inline_model.derive_payload_authority(
+      mode, valid_sge_count, inline_payload_bytes,
+      inline_bytes_are_authority, canonical_sge_num);
+    if (mode != RDMA_SQ_PAYLOAD_INLINE_SGB || canonical_sge_num != 1)
+      `uvm_error("UD_EFFECTIVE_INLINE_MODE",
+                 $sformatf("mode=%0d count=%0d", mode, canonical_sge_num))
+
+    inline_model.payload_mode = RDMA_SQ_PAYLOAD_INLINE_SGB;
+    inline_model.inline_bytes = new[0];
+    inline_model.inline_data = 1'b1;
+    inline_model.derive_payload_authority(
+      mode, valid_sge_count, inline_payload_bytes,
+      inline_bytes_are_authority, canonical_sge_num);
+    if (mode != RDMA_SQ_PAYLOAD_INLINE_WQE || canonical_sge_num != 0)
+      `uvm_error("UD_EFFECTIVE_ZERO_INLINE_MODE",
+                 $sformatf("mode=%0d count=%0d", mode, canonical_sge_num))
+
+    sge = rdma_sge::type_id::create("ud_effective_sge");
+    if (sge == null) begin
+      `uvm_error("UD_EFFECTIVE_MODE_FIXTURE", "SGE allocation failed")
+      return;
+    end
+    sge.length = 8;
+    sge.lkey = 32'h1234_5678;
+    sge.iova.value = 64'h4000;
+    sge_model.transport = RDMA_TRANSPORT_UD;
+    sge_model.sges.push_back(sge);
+    sge_model.derive_payload_authority(
+      mode, valid_sge_count, inline_payload_bytes,
+      inline_bytes_are_authority, canonical_sge_num);
+    if (mode != RDMA_SQ_PAYLOAD_SGE_SGB || canonical_sge_num != 1)
+      `uvm_error("UD_EFFECTIVE_SGE_MODE",
+                 $sformatf("mode=%0d count=%0d", mode, canonical_sge_num))
+
+    rc_model.transport = RDMA_TRANSPORT_RC;
+    rc_model.sges.push_back(sge);
+    rc_model.derive_payload_authority(
+      mode, valid_sge_count, inline_payload_bytes,
+      inline_bytes_are_authority, canonical_sge_num);
+    if (mode != RDMA_SQ_PAYLOAD_SGE_WQE || canonical_sge_num != 1)
+      `uvm_error("RC_EFFECTIVE_SGE_MODE",
+                 $sformatf("mode=%0d count=%0d", mode, canonical_sge_num))
+  endtask
+
   // 功能：run_phase 覆盖 UD SEND/SEND_WITH_INV 的 raw authority、显式 inline
   //   bytes、512B SGB 容量、SGE 过滤与 mismatch gate，并验证 URC external READ
   //   packet count、fresh raw reserved mask 及 RQE external-SGB 坐标。
@@ -149,6 +228,8 @@ class rdma_ud_urc_sqe_codec_test extends uvm_test;
     byte unsigned rqe_descriptor_bytes[$];
     rdma_hw_model decoded_model;
     phase.raise_objection(this);
+
+    check_ud_effective_payload_mode();
 
     probe = rdma_ud_codec_probe::type_id::create("ud_reserved_probe");
     s = probe.probe_payload(

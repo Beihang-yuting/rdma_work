@@ -1548,6 +1548,131 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_ud_effective_sgb_writer_paths 通过真实 UD SQ attachment、共享
+  //   make_sqe/codec 和生产 SGB writer，验证非零 inline、一个 SGE 与两个 SGE
+  //   都使用 transport-aware external-SGB mode，并能在 signature gate 后完成
+  //   detached 512-byte backing 写入。
+  // 输入/输出及副作用：任务只创建 focused probe fixture，request/model/image 为
+  //   detached 输入快照；probe 允许 writer 写入当前 UD SQ SGB slot，任务读取
+  //   Host-memory trace，不推进 runtime cursor、PI、doorbell 或 completion ledger。
+  // 失败/边界：fixture/UD route/SGB mapping、codec 或 writer 返回 null/non-OK，
+  //   或合法 variant 没有新增 Host-memory write 时报告 UVM_ERROR；只覆盖非零
+  //   payload 的 effective mode 对齐，zero-byte inline 仍由既有 codec 场景负责。
+  task automatic check_ud_effective_sgb_writer_paths();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_probe probe;
+    rdma_post_send_req request;
+    rdma_address_vector av;
+    rdma_sge sge;
+    rdma_status status;
+    rdma_status cleanup_status;
+    longint unsigned sgb_base;
+    int unsigned trace_start;
+    int unsigned write_calls;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "ud_effective_sgb_fixture");
+    begin : ud_effective_sgb_flow
+      if (fixture == null) begin
+        `uvm_error("UD_EFFECTIVE_SGB_FIXTURE", "fixture allocation failed")
+        disable ud_effective_sgb_flow;
+      end
+      fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b0, 1'b0, 1'b1);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_EFFECTIVE_SGB_FIXTURE",
+                   status == null ? "null setup status" :
+                                    status.convert2string())
+        disable ud_effective_sgb_flow;
+      end
+      fixture.create_transport_qp(
+        "ud_effective_sgb", RDMA_TRANSPORT_UD, fixture.ud_qp, status);
+      if (status == null || !status.ok() || fixture.ud_qp == null) begin
+        `uvm_error("UD_EFFECTIVE_SGB_FIXTURE",
+                   status == null ? "null UD QP status" :
+                                    status.convert2string())
+        disable ud_effective_sgb_flow;
+      end
+      fixture.ud_qp_created = 1'b1;
+      status = fixture.engine.attach_qp(fixture.ud_qp.handle);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_EFFECTIVE_SGB_FIXTURE",
+                   status == null ? "null UD attach status" :
+                                    status.convert2string())
+        disable ud_effective_sgb_flow;
+      end
+      fixture.ud_qp_attached = 1'b1;
+      if (fixture.ud_qp.qp_plan == null ||
+          fixture.ud_qp.qp_plan.sq_sgb_ref == null ||
+          fixture.ud_qp.qp_plan.sq_sgb_ref.mapping == null) begin
+        `uvm_error("UD_EFFECTIVE_SGB_FIXTURE",
+                   "UD SQ-SGB mapping authority is unavailable")
+        disable ud_effective_sgb_flow;
+      end
+      if (!$cast(probe, fixture.engine) || probe == null) begin
+        `uvm_error("UD_EFFECTIVE_SGB_PROBE",
+                   "fixture did not create queue-data probe")
+        disable ud_effective_sgb_flow;
+      end
+
+      sgb_base = fixture.ud_qp.qp_plan.sq_sgb_ref.mapping.iova.value +
+                 fixture.ud_qp.qp_plan.sq_sgb_ref.mapping_offset;
+      for (int unsigned sge_count = 0; sge_count <= 2; sge_count++) begin
+        request = fixture.make_send(
+          64'h0d00_0000_0000_0000 + sge_count);
+        request.qp_h = rdma_clone_handle_value(
+          fixture.ud_qp.handle, "UD effective mode QP");
+        request.transport = RDMA_TRANSPORT_UD;
+        request.opcode = RDMA_WR_SEND;
+        request.destination_qpn = 24'h123;
+        request.qkey = 32'h8001_0000;
+        request.address_vector_valid = 1'b1;
+        av = rdma_address_vector::type_id::create(
+          $sformatf("ud_effective_mode_av%0d", sge_count));
+        av.destination_mac = 48'h0011_2233_4455;
+        request.address_vector = av;
+        request.sgb_iova.value = sgb_base;
+        request.sges.delete();
+        request.payload.delete();
+        request.inline_data = sge_count == 0;
+        if (sge_count == 0) begin
+          request.payload.push_back(8'h5a);
+        end
+        else begin
+          for (int unsigned i = 0; i < sge_count; i++) begin
+            sge = rdma_sge::type_id::create(
+              $sformatf("ud_effective_mode_sge%0d_%0d", sge_count, i));
+            sge.iova.value = 64'h0000_1000_0000_4000 + i * 64;
+            sge.length = 8;
+            sge.lkey = 32'hc0de_1000 + i;
+            request.sges.push_back(sge);
+          end
+        end
+
+        trace_start = fixture.mem.calls.size();
+        status = probe.probe_write_sgb_after_model_mutation(
+          request, 1'b0, 1'b0, 1'b0);
+        write_calls = 0;
+        for (int unsigned i = trace_start; i < fixture.mem.calls.size(); i++)
+          if (fixture.mem.calls[i] != null &&
+              fixture.mem.calls[i].method_name == "write")
+            write_calls++;
+        if (status == null || !status.ok() || write_calls == 0)
+          `uvm_error("UD_EFFECTIVE_SGB_PATH",
+                     status == null ?
+                       $sformatf("variant=%0d returned null status", sge_count) :
+                       $sformatf("variant=%0d status=%s writes=%0d",
+                                 sge_count, status.convert2string(), write_calls))
+      end
+    end
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("UD_EFFECTIVE_SGB_CLEANUP", cleanup_status == null ?
+                   "fixture cleanup returned null" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：check_sgb_filters_zero_length_descriptors 验证 SQ external-SGB
   //   mixed-zero post 把同一 result.index 的 64-byte header 与 512-byte backing
   //   联合持久化：header 发布三个有效描述符、48-byte TPL 和精确 SGB_PA，backing
@@ -2586,6 +2711,7 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       check_transport_link_mismatch();
       check_ud_inline_capacity_admission();
       check_sgb_recovery_replays_slot();
+      check_ud_effective_sgb_writer_paths();
       check_sgb_writer_rejects_post_encode_mutation();
       check_sgb_filters_zero_length_descriptors();
       check_qpc_shadow_sq_gate();

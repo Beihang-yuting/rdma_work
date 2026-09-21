@@ -251,12 +251,16 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
   endfunction
 
   // 功能：derive_payload_authority 一次归一 payload mode、唯一有效 SGE 数、
-  //   inline 实际字节源/长度和最终 hardware SGE_NUM，供 validation 与 writer 共用。
-  // 输入/输出及副作用：只读 payload_mode、inline_data、inline_bytes、payload、
-  //   opcode、sges；五个 output 返回本次 authority，不修改模型、数组或 SGE。
+  //   inline 实际字节源/长度和最终 hardware SGE_NUM，供 validation、codec 与
+  //   queue-data writer 共用；UD 的非零 inline/descriptor 会在这里映射到驱动
+  //   实际使用的 external-SGB effective mode。
+  // 输入/输出及副作用：只读 transport、payload_mode、inline_data、inline_bytes、
+  //   payload、opcode、sges；五个 output 返回本次 authority，不修改模型、数组或
+  //   SGE，也不取得 SGB/Host-memory 所有权。
   // 失败/边界：null/zero-length SGE 不进入数值计数，null 仍由 shape gate 拒绝；
   //   显式 SGE mode 无有效项归一为 NONE，未知显式 mode 原样交给 validate 拒绝，
-  //   total_payload_len 不参与 byte-source 选择，避免用声明长度伪造 payload。
+  //   total_payload_len 不参与 byte-source 选择，避免用声明长度伪造 payload；UD
+  //   零字节 inline 仍保留 INLINE_WQE，只有非零 inline/descriptor 才强制外部 SGB。
   function automatic void derive_payload_authority(
       output rdma_sq_payload_mode_e mode,
       output int unsigned valid_sge_count,
@@ -297,6 +301,22 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     end
     else begin
       mode = RDMA_SQ_PAYLOAD_NONE;
+    end
+
+    // 设计：UD 的 wr.c 路径把非零 inline bytes 放入 SQ-SGB，并把非零 SGE
+    // descriptor 一律放入 SQ-SGB；INLINE_LOCAL_QPC_RD 仍记录 inline 语义。
+    // 这里统一发布“effective wire mode”，使 make_sqe、UD codec 和 SGB writer
+    // 不会分别把同一请求解释成 INLINE/SGE_WQE 与 external-SGB 两种布局。
+    if (transport == RDMA_TRANSPORT_UD) begin
+      if (mode == RDMA_SQ_PAYLOAD_INLINE_SGB &&
+          inline_payload_bytes == 0)
+        mode = RDMA_SQ_PAYLOAD_INLINE_WQE;
+      else if (mode == RDMA_SQ_PAYLOAD_INLINE_WQE &&
+          inline_payload_bytes != 0)
+        mode = RDMA_SQ_PAYLOAD_INLINE_SGB;
+      else if (mode == RDMA_SQ_PAYLOAD_SGE_WQE &&
+               valid_sge_count != 0)
+        mode = RDMA_SQ_PAYLOAD_SGE_SGB;
     end
 
     case (mode)
