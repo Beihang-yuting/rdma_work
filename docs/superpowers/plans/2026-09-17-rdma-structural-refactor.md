@@ -144,6 +144,17 @@
   逐文件 method/comment 复审为 138/122 个 method、0 diagnostics。计划继续保持
   `active`；consumer recovery、跨队列并发、SRQ 全生命周期和全目录后续审计仍开放。
   详见 `task-cmq-batch120-device-producer-recovery-report.md`。
+- Batch121 将 `replay_pending()` 的 consumer 分支抽为受保护的
+  `replay_consumer_pending()` task：CQ route/QP/SRQ identity、CQC shadow 或 consumer
+  doorbell、CQ consumer commit、CQ→WQ release gate 与 completion 现在位于单一
+  consumer recovery 阶段；caller 只保留 attachment/pending 校验、`pending_next_cursor()`
+  和阶段分派，原语句顺序与 failure evidence 不变。三套 queue-data VCS53 focused、
+  changed-SV style/diff、queue/profile、manifest/keyword、Phase-1A 与 Python 292 门禁
+  均 GREEN；queue-data engine/device-publish test 逐文件 method/comment 复审为
+  139/122 个 method、0 diagnostics，全目录 scanner 为 185 个 `.sv`、2 个 `.svh`、
+  5,405 个 method、0 diagnostics。计划继续保持 `active`；跨队列并发、SRQ 全生命周期、
+  device/consumer 组合 recovery 与全目录后续 ownership 审计仍开放。详见
+  `task-cmq-batch121-consumer-recovery-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -159,7 +170,8 @@ Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭
 writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
 mode 对齐 seam；Batch115–120 继续关闭 queue-data 的局部 target/replay/recovery 扫描
 结构 seam，但 Batch119 关闭 recovery action/cardinality/query 顺序的局部契约、Batch120
-关闭 device-producer replay 的局部职责 seam；完整公开
+关闭 device-producer replay 的局部职责 seam、Batch121 关闭 consumer replay 的局部职责
+seam；完整公开
 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。

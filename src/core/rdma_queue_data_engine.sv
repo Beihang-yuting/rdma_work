@@ -9065,28 +9065,32 @@ class rdma_queue_data_engine extends uvm_object;
                    RDMA_SC_RECOVERY_REQUIRED);
   endtask
 
-  // 设计说明：仅当原事务确定没有到达 MMIO，或调用方已经明确确认可重放时才执行
-  // detached transaction。所有副作用和 ledger transition 完成前，runtime 保持
-  // RECOVERY_REQUIRED，防止同一 reservation 被并发消费。
-  // 功能：replay_pending 按 pending 的 producer/device-producer/consumer 阶段重放
-  //   必要写入、doorbell 或 cursor commit，并保持已完成阶段的幂等性。
-  // 输入/输出及副作用：attachment、pending 为输入，status 为输出；可能访问 backing
-  //   与 runtime recovery 状态，但不接管 attachment、mapping 或 pending 的所有权。
-  // 失败/边界：authority、cursor、route/epoch、readback 或下游提交不一致时返回明确
-  //   非成功 status 并保留 pending；没有 caller confirmation 时不得重放 ambiguous MMIO。
-  protected task replay_pending(
+  // 设计说明：consumer recovery 同时包含 CQ route 解析、CQC shadow/doorbell 续做、
+  // CQ consumer commit 和可选 WQE release；这些阶段共享 completion authority 与锁序，
+  // 不能与 producer DMA recovery 混用。helper 保留 caller 冻结的 next cursor 和
+  // pending evidence，集中维护 CQ→WQ 的副作用顺序。
+  // 功能：replay_consumer_pending 校验 consumer pending 的 queue/route/epoch/completion
+  //   authority，按 MMIO evidence 续做 shadow 或 consumer doorbell，提交 CQ cursor，
+  //   释放 CQ 对应 WQE，并完成 consumer recovery。
+  // 输入/输出及副作用：attachment、pending、next 为已通过 caller cursor 校验的借用
+  //   输入，status 为输出；成功时可能访问 context/backing、scheduler、runtime ledger
+  //   和 WQ release，但不取得 attachment、QP、SRQ 或 Host-memory 生命周期所有权。
+  // 失败/边界：consumer evidence、route/epoch、completion target、WQ attachment、
+  //   shadow/doorbell、commit、release 或 completion 任一查询返回 null/非成功时立即
+  //   停止并保留 pending；AMBIGUOUS 或不安全 MMIO evidence 不重放，release gate 失败
+  //   不重复释放同一 WQE range。
+  protected task replay_consumer_pending(
     rdma_queue_data_attachment attachment,
     rdma_queue_pending_operation pending,
+    rdma_queue_cursor_snapshot next,
     output rdma_status status
   );
-    rdma_queue_cursor_snapshot next;
     rdma_doorbell_result db_result;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_queue_data_qp_link link;
     rdma_queue_data_attachment wqe_attachment;
     rdma_queue_slot_ledger_entry released[$];
     rdma_doorbell_desc prepared_db_desc;
-    rdma_status local_status;
     rdma_status noalloc_status;
     rdma_route_key_t runtime_route;
     rdma_reset_epoch_t runtime_epoch;
@@ -9096,34 +9100,15 @@ class rdma_queue_data_engine extends uvm_object;
     string qp_key;
 
     status = null;
-    if (attachment == null || pending == null) begin
-      status = bad("pending recovery attachment/evidence is null",
+    if (attachment == null || pending == null || next == null) begin
+      status = bad("consumer recovery attachment/evidence/cursor is null",
                    RDMA_SC_INVALID_STATE);
       return;
     end
-    status = pending_next_cursor(attachment, pending, next);
-    if (!status.ok()) return;
 
-    // 设计说明：device-produced CQ/CEQ/AEQ recovery 必须先于 host producer/
-    // consumer 分支处理；专用 helper 保留 reservation、route/epoch、DEVICE_WRITE
-    // 和 readback 的完整阶段，caller 只负责按 evidence 类型选择 recovery owner。
-    if (pending.device_producer) begin
-      replay_device_producer_pending(attachment, pending, status);
-      return;
-    end
-
-    if (pending.producer) begin
-      replay_host_producer_pending(attachment, pending, next, status);
-      return;
-    end
-
-    // 中文设计：consumer pending 在 admission 时已冻结完整 identity、
-    // route/epoch 和 completion target。recovery 只核对这些值并选择现有
-    // attachment，禁止重新 decode CQE 或从当前 codec 推导 WQ 方向。
-    // 两个 queue handle 的显式空值门禁先于
-    // pending_queue_handle_matches_attachment；pending.kind、producer 阶段和
-    // 几何证据仍由 caller 保留，证据不完整继续返回原 INVALID_STATE，并不执行
-    // route query、release 或 completion 变更。
+    // 中文设计：consumer pending 在 admission 时已冻结完整 identity、route/epoch
+    // 和 completion target。recovery 只核对这些值并选择现有 attachment，禁止重新
+    // decode CQE 或从当前 codec 推导 WQ 方向；证据不完整时不执行 route/release 副作用。
     link = null;
     wqe_attachment = null;
     if (!(attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
@@ -9175,9 +9160,9 @@ class rdma_queue_data_engine extends uvm_object;
         return;
       end
       qp_key = identity_key(pending.routed_qp_h);
-      // 设计：CQ recovery 的 routed_qp_h 是 completion target authority；
-      // key、link、qp_h 的空值门禁先于完整 identity 比较，失配继续保留
-      // STALE_GENERATION，不能进入后续 WQ route 或 release 副作用。
+      // 设计：CQ recovery 的 routed_qp_h 是 completion target authority；key、link、
+      // qp_h 的空值门禁先于完整 identity 比较，失配继续保留 STALE_GENERATION，
+      // 不能进入后续 WQ route 或 release 副作用。
       if (qp_key == "" || !qp_links.exists(qp_key) ||
           qp_links[qp_key] == null || qp_links[qp_key].qp_h == null ||
           !same_handle_instance(qp_links[qp_key].qp_h,
@@ -9188,11 +9173,9 @@ class rdma_queue_data_engine extends uvm_object;
         return;
       end
       link = qp_links[qp_key];
-      // 设计：pending.queue_h 已在 consumer evidence 门禁确认非空；每个
-      // SQ/RQ/SRQ 分支通过 qp_link_cq_route_matches 按方向选择 send/recv CQ，
-      // 并执行 null-safe 完整 identity 比较；SRQ presence 门禁仍在 helper 后保留，
-      // 身份失配只走原 INVALID_STATE 错误路径，不改变 lookup_attachment、release
-      // 或 completion 顺序。
+      // 设计：pending.queue_h 已确认非空；SQ/RQ/SRQ 分支按 qp_link 的发送/接收方向
+      // 选择对应 WQ attachment，并保留 SRQ presence 门禁。身份失配只走原错误路径，
+      // 不改变 lookup_attachment、release 或 completion 顺序。
       if (pending.completion_wq_kind == RDMA_QUEUE_RUNTIME_SQ) begin
         if (!qp_link_cq_route_matches(link, pending.queue_h, 1'b0)) begin
           status = make_engine_status_nonfatal(
@@ -9254,10 +9237,9 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    // 中文设计：legacy NO_SUBMIT 在 scheduler 入口前预建 descriptor/status；
-    // CQC shadow NO_SUBMIT 则只写冻结的 context host-memory，不创建 doorbell
-    // descriptor，也不进入 scheduler。SUCCESS 继续复用 detached pending 的
-    // caller-owned failure_status 作 continuation slot。
+    // 中文设计：legacy NO_SUBMIT 在 scheduler 入口前预建 descriptor/status；CQC
+    // shadow NO_SUBMIT 只写冻结的 context host-memory，不创建 doorbell descriptor；
+    // SUCCESS 复用 detached pending 的 caller-owned failure_status continuation slot。
     prepared_db_desc = null;
     noalloc_status = null;
     if (pending.consumer_shadow_required) begin
@@ -9270,10 +9252,9 @@ class rdma_queue_data_engine extends uvm_object;
       end
       noalloc_status = pending.failure_status;
       if (!pending.consumer_shadow_published) begin
-        // 只有尚未完成的 shadow 阶段允许再次进入 publication seam。已发布的
-        // shadow 是 detached pending 的不可变事实；重放时直接恢复 continuation
-        // status，避免重复触碰 context backing 或让测试/适配 seam 误以为又发生
-        // 一次硬件写入。
+        // 只有尚未完成的 shadow 阶段允许再次进入 publication seam。已发布的 shadow
+        // 是 detached pending 的不可变事实；重放时直接恢复 continuation status，避免
+        // 重复触碰 context backing 或让测试/适配 seam 误以为又发生一次硬件写入。
         publish_cqc_shadow(attachment, pending, status);
         if (status == null || !status.ok())
           return;
@@ -9382,9 +9363,9 @@ class rdma_queue_data_engine extends uvm_object;
 
     if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ &&
         !pending.completion_released) begin
-      // 中文设计：recovery 与首轮 poll 共用同一 CQ->WQ 锁序。begin 成功后
-      // release seam 的成功/失败都由 finish 在 CQ lock 内发布 marker 或仅解锁，
-      // 因而后续 complete 即使竞争失败也不会再次释放同一 WQE range。
+      // 设计：recovery 与首轮 poll 共用同一 CQ→WQ 锁序。begin 成功后 release seam 的
+      // 成功/失败都由 finish 在 CQ lock 内发布 marker 或仅解锁，因而后续 complete
+      // 即使竞争失败也不会再次释放同一 WQE range。
       if (!attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
         status = noalloc_status;
         return;
@@ -9429,6 +9410,48 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
     status = noalloc_status;
+  endtask
+
+  // 设计说明：仅当原事务确定没有到达 MMIO，或调用方已经明确确认可重放时才执行
+  // detached transaction。所有副作用和 ledger transition 完成前，runtime 保持
+  // RECOVERY_REQUIRED，防止同一 reservation 被并发消费。
+  // 功能：replay_pending 按 pending 的 producer/device-producer/consumer 阶段重放
+  //   必要写入、doorbell 或 cursor commit，并保持已完成阶段的幂等性。
+  // 输入/输出及副作用：attachment、pending 为输入，status 为输出；可能访问 backing
+  //   与 runtime recovery 状态，但不接管 attachment、mapping 或 pending 的所有权。
+  // 失败/边界：authority、cursor、route/epoch、readback 或下游提交不一致时返回明确
+  //   非成功 status 并保留 pending；没有 caller confirmation 时不得重放 ambiguous MMIO。
+  protected task replay_pending(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    output rdma_status status
+  );
+    rdma_queue_cursor_snapshot next;
+
+    status = null;
+    if (attachment == null || pending == null) begin
+      status = bad("pending recovery attachment/evidence is null",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = pending_next_cursor(attachment, pending, next);
+    if (!status.ok()) return;
+
+    // 设计说明：device-produced CQ/CEQ/AEQ recovery 必须先于 host producer/
+    // consumer 分支处理；专用 helper 保留 reservation、route/epoch、DEVICE_WRITE
+    // 和 readback 的完整阶段，caller 只负责按 evidence 类型选择 recovery owner。
+    if (pending.device_producer) begin
+      replay_device_producer_pending(attachment, pending, status);
+      return;
+    end
+
+    if (pending.producer) begin
+      replay_host_producer_pending(attachment, pending, next, status);
+      return;
+    end
+
+    replay_consumer_pending(attachment, pending, next, status);
+    return;
   endtask
 
   // 功能：recover_queue 定位 queue 的 claimed/unclaimed recovery，执行 abort，
