@@ -83,6 +83,12 @@
   focused `rdma_queue_data_engine_post_test`、SQE codec 三套测试和静态门禁保持 GREEN；
   该批只关闭 SGB payload writer seam，不代表广义 Phase 1C F2 收口。详见
   `task-cmq-batch113-sgb-writer-authority-report.md`。
+- Batch114 修复 Batch113 暴露的 UD transport-aware effective mode 缺口：共享
+  `derive_payload_authority()` 现在把 UD 非零 inline/1–2 SGE 统一映射到驱动使用的
+  `INLINE_SGB`/`SGE_SGB`，而 zero-byte inline 与 RC direct-SGE 保持原语义；真实 UD
+  probe 的 1B inline、1-SGE、2-SGE writer 以及三套 SQE/queue codec focused 均 GREEN。
+  该批关闭 mode 对齐 seam，但完整公开 post/replay 矩阵和广义 F2 仍开放。详见
+  `task-cmq-batch114-ud-sgb-effective-mode-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -95,9 +101,10 @@
 计划状态：`active`。Batch109/110 已关闭当前严格一对一 ownership/close/candidate seam
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
 Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
-writer 的局部 image/payload authority seam，但 UD transport-aware effective mode、
-广义 F2、coordinator 的全局并发/更深生命周期语义、manager 外部调用窗口补偿、全目录
-后续生命周期审计和外部锁仍未关闭，不得标记为 `complete`。
+writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
+mode 对齐 seam，但完整公开 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
+生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
+不得标记为 `complete`。
 
 ## 0. 主线接管与冻结
 
