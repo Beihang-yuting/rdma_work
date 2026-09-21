@@ -123,6 +123,18 @@
   与 Python 门禁均 GREEN；全目录中文 method/comment scanner 仍沿用 Batch111 历史证据，
   待后续源码边界复审时刷新；计划继续保持 `active`。详见
   `task-cmq-batch118-reservation-candidate-scan-report.md`。
+- Batch119 在 `recover_queue()` 的控制面与 reservation/retry 交界处补齐 recovery
+  action contract：非法 action 和未确认 retry 在 unclaimed admission、reservation
+  query 与 runtime handoff 之前 fail-closed；reservation-only 路径先完成全部 matching
+  candidate 的 reservation query，再按 cardinality 判定，多个有效 snapshot 返回
+  `RDMA_SC_INVALID_STATE` 且不提前 detach；retry 先取得 `query_pending()` 快照，再
+  记录 runtime confirmation，避免 query 失败遗留一次性授权。device-publish fixture
+  覆盖未确认 retry 的 evidence/admission 保序和多 reservation ambiguity；三套 VCS53
+  focused、changed-SV style/diff、queue/profile、manifest/keyword、Phase-1A 与 Python
+  门禁均 GREEN，queue-data engine 与 device-publish test 的逐文件复审分别为 137/122
+  个 method、0 diagnostics。计划继续保持 `active`；完整 SRQ/跨队列并发、device/consumer
+  recovery 全阶段、query/recover 原子并发与全目录后续生命周期审计仍开放。详见
+  `task-cmq-batch119-recovery-action-contract-report.md`。
 - `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
   不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
@@ -137,7 +149,8 @@
 Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
 writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
 mode 对齐 seam；Batch115–118 继续关闭 queue-data 的局部 target/replay/recovery 扫描
-结构 seam，但完整公开 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
+结构 seam，但 Batch119 仅关闭 recovery action/cardinality/query 顺序的局部契约；完整公开
+post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。
 

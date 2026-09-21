@@ -9403,9 +9403,11 @@ class rdma_queue_data_engine extends uvm_object;
   // 输入/输出及副作用：queue_h、action、caller_confirmed_no_submit（输入）选择
   //   recovery 对象与动作，status（输出）返回最终阶段结果；retry 可能访问 backing、
   //   doorbell 和 runtime ledger，abort 可能删除 attachment，但不接管外部 mapping。
-  // 失败/边界：句柄/证据不完整、非法 action、未确认 retry、AMBIGUOUS MMIO、
-  //   runtime 授权/pending 查询返回 null 或非成功，以及 replay 任一阶段失败时保留可恢复
-  //   evidence；只有 runtime enum gate 可以记录一次性 confirmation。
+  // 失败/边界：句柄/证据不完整、非法 action、未确认 retry、reservation-only 多匹配、
+  //   无 image 的 reservation-only retry、AMBIGUOUS MMIO、runtime 的 reservation/state/
+  //   pending 查询或一次性授权返回 null/非成功，以及 replay 任一阶段失败时保留可恢复
+  //   evidence；所有 reservation candidate query 完成前不得 detach，只有 runtime enum
+  //   gate 可以记录一次性 confirmation。
   task recover_queue(
     rdma_handle queue_h,
     rdma_queue_recovery_action_e action,
@@ -9418,8 +9420,11 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment reservation_candidates[$];
     rdma_queue_pending_operation unclaimed_pending;
     rdma_queue_cursor_snapshot reservation;
+    rdma_queue_cursor_snapshot reservation_match;
+    rdma_queue_data_attachment reservation_found;
     rdma_queue_runtime_state_e runtime_state;
     bit reservation_valid;
+    int unsigned reservation_matches;
     string key;
     status = ensure_handle(queue_h, queue_h == null ? RDMA_RESOURCE_QP :
                            queue_h.kind);
@@ -9429,11 +9434,29 @@ class rdma_queue_data_engine extends uvm_object;
             RDMA_SC_INVALID_STATE) : status;
       return;
     end
+    // 设计说明：action 与 caller confirmation 是 recover_queue 的纯控制面前置条件。
+    // 必须在 unclaimed evidence admission、reservation 查询和 runtime handoff 之前
+    // 结束判定，避免一个非法动作或未确认 retry 先把 engine-owned evidence 迁移到
+    // runtime，随后才返回错误。abort 不需要 caller confirmation；retry 的确认位
+    // 只表达本次调用允许继续 recovery，不改变 queue/runtime 的生命周期所有权。
+    if (!(action inside {RDMA_QUEUE_RECOVERY_RETRY_PENDING,
+                         RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH})) begin
+      status = bad("recovery action is invalid");
+      return;
+    end
+    if (action == RDMA_QUEUE_RECOVERY_RETRY_PENDING &&
+        !caller_confirmed_no_submit) begin
+      status = bad("retry requires caller confirmation");
+      return;
+    end
     found = null;
     claimed_found = null;
     unclaimed_pending = null;
     reservation = null;
+    reservation_match = null;
+    reservation_found = null;
     reservation_valid = 1'b0;
+    reservation_matches = 0;
     runtime_state = RDMA_QUEUE_RUNTIME_DETACHED;
     key = identity_key(queue_h);
     // 设计说明：runtime admission 失败时 evidence 由 engine 的 unclaimed 表保留。
@@ -9527,8 +9550,11 @@ class rdma_queue_data_engine extends uvm_object;
       // cancel 前置路径在还没有完整 pending 时也可能返回 RECOVERY_REQUIRED。
       // 它只能显式 abort：再次 cancel 成功后 detach；retry 没有可重放 image，
       // 必须保持 fail-closed，而不是伪造一笔 publish。
-      // 设计：reservation-only 扫描同样只跳过不同 identity；只有命中的
-      // candidate 才查询 reservation，保留 null/status、abort action 与 detach 顺序。
+      // 设计：reservation-only 扫描同样只跳过不同 identity；所有匹配 candidate
+      // 都先完成 reservation query，再决定是否 detach。每个返回 valid+snapshot
+      // 的候选都计入 cardinality，即使索引意外重复同一 attachment 也 fail-closed；
+      // 这样多个 runtime 同时持有同一 queue incarnation 的 reservation 时不会先
+      // 取消其中一个、留下另一个不可见 reservation，query 失败仍保留原首错与全部 evidence。
       collect_reservation_only_candidates(queue_h, reservation_candidates);
       foreach (reservation_candidates[i]) begin
         candidate = reservation_candidates[i];
@@ -9541,21 +9567,33 @@ class rdma_queue_data_engine extends uvm_object;
           return;
         end
         if (reservation_valid && reservation != null) begin
-          if (action != RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
-            status = bad("reservation-only recovery cannot retry without image",
-                         RDMA_SC_RECOVERY_REQUIRED);
-            return;
+          reservation_matches++;
+          if (reservation_found == null) begin
+            reservation_found = candidate;
+            reservation_match = reservation;
           end
-          status = detach_recovery_transaction(
-            queue_h, candidate, reservation);
-          if (status == null) begin
-            status = bad("reservation-only recovery abort could not cancel",
-                         RDMA_SC_RECOVERY_REQUIRED);
-            return;
-          end
-          if (!status.ok()) return;
+        end
+      end
+      if (reservation_matches > 1) begin
+        status = bad("queue has multiple pending reservations",
+                     RDMA_SC_INVALID_STATE);
+        return;
+      end
+      if (reservation_found != null) begin
+        if (action != RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
+          status = bad("reservation-only recovery cannot retry without image",
+                       RDMA_SC_RECOVERY_REQUIRED);
           return;
         end
+        status = detach_recovery_transaction(
+          queue_h, reservation_found, reservation_match);
+        if (status == null) begin
+          status = bad("reservation-only recovery abort could not cancel",
+                       RDMA_SC_RECOVERY_REQUIRED);
+          return;
+        end
+        if (!status.ok()) return;
+        return;
       end
       status = bad("queue has no pending recovery", RDMA_SC_INVALID_STATE);
       return;
@@ -9574,24 +9612,14 @@ class rdma_queue_data_engine extends uvm_object;
       status = bad("recovery action is invalid");
       return;
     end
-    if (!caller_confirmed_no_submit) begin
-      status = bad("retry requires caller confirmation");
-      return;
-    end
     begin
       rdma_queue_pending_operation pending;
 
-      // 中文设计：caller bit 不能由 engine snapshot 或兼容投影直接解释成 authority。
-      // runtime.recover() 先依据唯一 mmio_evidence enum 拒绝 AMBIGUOUS/错误方向，
-      // 再记录一次性 confirmation；后续 commit gate 成功时消费该授权。
-      status = found.runtime.recover(
-        RDMA_QUEUE_RECOVERY_RETRY_PENDING, caller_confirmed_no_submit);
-      if (status == null || !status.ok()) begin
-        status = status == null ?
-          bad("runtime recovery confirmation returned null status",
-              RDMA_SC_RECOVERY_REQUIRED) : status;
-        return;
-      end
+      // 中文设计：先取得 detached pending snapshot，再向 runtime 记录一次性
+      // confirmation。snapshot/query 可能因 factory、锁或 evidence 缺失失败；把
+      // 它放在 recover() 之前可保证这些失败不会留下可被后续路径消费的 retry
+      // authorization。runtime.recover() 仍以其锁内的唯一 MMIO enum 做最终
+      // 状态校验，随后 replay 只消费已经成功取得的值快照。
       status = found.runtime.query_pending(pending);
       if (status == null || !status.ok()) begin
         status = status == null ?
@@ -9607,6 +9635,14 @@ class rdma_queue_data_engine extends uvm_object;
       if (pending.mmio_evidence == RDMA_QUEUE_MMIO_AMBIGUOUS) begin
         status = bad("pending MMIO outcome is ambiguous",
                      RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+      status = found.runtime.recover(
+        RDMA_QUEUE_RECOVERY_RETRY_PENDING, caller_confirmed_no_submit);
+      if (status == null || !status.ok()) begin
+        status = status == null ?
+          bad("runtime recovery confirmation returned null status",
+              RDMA_SC_RECOVERY_REQUIRED) : status;
         return;
       end
       replay_pending(found, pending, status);

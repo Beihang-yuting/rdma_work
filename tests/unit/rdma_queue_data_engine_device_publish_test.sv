@@ -841,15 +841,84 @@ class rdma_device_publish_recovery_fault_engine extends rdma_queue_data_engine;
 
   static int unsigned admission_failures_remaining;
   static int unsigned cancel_failures_remaining;
+  protected string reservation_alias_key;
 
   // 功能：构造 device publish recovery 故障 engine，默认不消耗 admission 或
-  //   cancel 注入次数，使未 armed 的 fixture 完全采用生产 data-engine 行为。
+  //   cancel 注入次数，并清空 alias 索引键，使未 armed 的 fixture 完全采用生产
+  //   data-engine 行为。
   // 输入/输出及副作用：name 为输入；构造只建立 engine 自身默认状态，不配置
-  //   manager/Host-memory，也不改变静态故障计数或外部资源所有权。
+  //   manager/Host-memory，不改变静态故障计数或外部资源所有权；alias key 仅记录
+  //   本测试 subclass 后续注入的借用索引。
   // 失败/边界：构造不验证依赖；未执行 configure 的对象仍由基类公开 API 返回
   //   INVALID_STATE，不能作为直接操作 queue runtime 的测试后门。
   function new(string name = "rdma_device_publish_recovery_fault_engine");
     super.new(name);
+    reservation_alias_key = "";
+  endfunction
+
+  // 功能：alias_reservation_attachment_for_test 在已建立的 CQ reservation 上挂接
+  //   第二个 candidate 视图，模拟同一 queue incarnation 被两个 attachment/runtime
+  //   同时索引的 hostile 状态，以驱动 recover_queue 的多 reservation 判定。
+  // 输入/输出及副作用：queue_h 为输入；成功时向本测试 engine 的 protected
+  //   attachment 索引加入一个借用相同 runtime/access 的非拥有 alias，不复制或释放
+  //   lifecycle 资源，也不改变 reservation 本身。
+  // 失败/边界：目标 CQ attachment 缺失、runtime/access 不完整或 alias key 已存在时
+  //   返回明确错误；该 helper 只用于紧邻的 ambiguity 断言，调用方必须在清理前调用
+  //   remove_reservation_attachment_alias()。
+  function rdma_status alias_reservation_attachment_for_test(
+    rdma_handle queue_h
+  );
+    rdma_queue_data_attachment source;
+    rdma_queue_data_attachment alias_attachment;
+    string source_key;
+
+    reservation_alias_key = "";
+    source_key = attachment_key(queue_h, RDMA_QUEUE_RUNTIME_CQ);
+    if (!attachments.exists(source_key) || attachments[source_key] == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "reservation alias source is unavailable");
+    source = attachments[source_key];
+    if (source.runtime == null || source.access == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "reservation alias source is incomplete");
+    reservation_alias_key = {source_key, "::reservation_alias"};
+    if (attachments.exists(reservation_alias_key)) begin
+      reservation_alias_key = "";
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "reservation alias already exists");
+    end
+    alias_attachment = rdma_queue_data_attachment::type_id::create(
+      "reservation_only_alias_attachment");
+    if (alias_attachment == null) begin
+      reservation_alias_key = "";
+      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
+                               "reservation alias allocation failed");
+    end
+    alias_attachment.queue_h = source.queue_h;
+    alias_attachment.ceq_h = source.ceq_h;
+    alias_attachment.kind = source.kind;
+    alias_attachment.runtime = source.runtime;
+    alias_attachment.access = source.access;
+    alias_attachment.role = source.role;
+    alias_attachment.context_ref = source.context_ref;
+    alias_attachment.entry_size = source.entry_size;
+    alias_attachment.local_id = source.local_id;
+    alias_attachment.transport = source.transport;
+    attachments[reservation_alias_key] = alias_attachment;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：remove_reservation_attachment_alias 删除前一 helper 注入的 alias 索引，
+  //   恢复 fixture 只有原始 CQ attachment 的 topology，供后续 abort/cleanup 使用。
+  // 输入/输出及副作用：无显式输入；只删除 test-owned 索引键，不修改共享 runtime、
+  //   reservation、backing 或 lifecycle mapping，重复调用保持幂等。
+  // 失败/边界：没有已注入 alias 时为空操作；该函数不尝试 detach alias runtime，
+  //   因为 runtime/access 的所有权仍归原始 fixture attachment。
+  function void remove_reservation_attachment_alias();
+    if (reservation_alias_key != "") begin
+      attachments.delete(reservation_alias_key);
+      reservation_alias_key = "";
+    end
   endfunction
 
   // 功能：admit_device_publish_recovery 在 armed 次数内拒绝 runtime 接管，促使
@@ -5040,11 +5109,13 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   endtask
 
   // 功能：check_unclaimed_pending_kind_authority 让 runtime admission 一次失败，
-  //   验证同一 CQ identity 的错误 runtime kind 不能读取 engine-owned evidence。
+  //   验证同一 CQ identity 的错误 runtime kind 不能读取 engine-owned evidence，
+  //   且未确认 retry 在 unclaimed handoff 前被拒绝。
   // 输入/输出及副作用：无显式输入；任务只经公开 publish/query API 建立并读取
   //   unclaimed recovery，不直接取得 attachment、runtime 或 backing 可变引用。
   // 失败/边界：setup/post/故障注入失败时报告 UVM_ERROR；错误 kind 若返回成功或
-  //   非空 pending 即为 authority 泄漏，正确 CQ kind 必须仍能查询同一 evidence。
+  //   非空 pending 即为 authority 泄漏，未确认 retry 若消耗 admission fault 或
+  //   改变 evidence 归属也失败，正确 CQ kind 必须仍能查询同一 evidence。
   task automatic check_unclaimed_pending_kind_authority();
     rdma_queue_data_engine_fixture fixture;
     rdma_queue_post_result posted;
@@ -5052,6 +5123,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     rdma_hw_cqe_model cqe;
     rdma_queue_completion_result completion;
     rdma_queue_pending_operation correct_pending;
+    rdma_queue_pending_operation pending_before_unconfirmed;
     rdma_queue_pending_operation wrong_pending;
     rdma_status status;
     rdma_status model_status;
@@ -5121,6 +5193,33 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         !correct_pending.device_producer || correct_pending.cursor == null)
       `uvm_error("CQE_UNCLAIMED_KIND_CORRECT",
                  "correct runtime kind lost retained unclaimed evidence")
+
+    // 设计：重新 arm admission fault 后调用未确认 retry；严格的 control-plane
+    // preflight 必须在 admission 前返回 INVALID_ARGUMENT，并保留 engine-owned
+    // evidence。旧的先 handoff 再检查 confirmation 实现会消耗该 fault，因而
+    // 这个静态计数同时作为 ownership migration 的可观察证据。
+    pending_before_unconfirmed = correct_pending;
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 1;
+    fixture.engine.recover_queue(
+      fixture.cq.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b0, status);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+        rdma_device_publish_recovery_fault_engine::admission_failures_remaining != 1)
+      `uvm_error("CQE_UNCLAIMED_CONFIRM_PREFLIGHT",
+                 "unconfirmed retry reached runtime admission")
+    correct_pending = null;
+    status = fixture.engine.query_runtime_pending(
+      fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, correct_pending);
+    if (status == null || !status.ok() || correct_pending == null ||
+        !same_device_pending_value(pending_before_unconfirmed, correct_pending))
+      `uvm_error("CQE_UNCLAIMED_CONFIRM_EVIDENCE",
+                 "unconfirmed retry changed unclaimed evidence")
+    rdma_device_publish_recovery_fault_engine::admission_failures_remaining = 0;
+
+    // 设计：rdma_queue_recovery_action_e 是 2-state 1-bit enum，只有 RETRY
+    // 和 ABORT 两个可表示值；因此不能在 VCS 中构造一个可观察的 X/Z 非法枚举
+    // 来覆盖 inside 的 default 分支。上面的未确认 RETRY 断言覆盖了同一控制面
+    // 前置点，并验证了任何 admission 前拒绝都不会消耗 engine-owned evidence。
+
     occupancy = 1;
     occupancy_pending = 1'b1;
     status = fixture.engine.query_runtime_occupancy(
@@ -6115,11 +6214,13 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
 
   // 功能：check_reservation_only_detach_reconfigure 让 device publish 的 next cursor
   //   分配失败且安全 cancel 同时失败，建立只有 reservation、没有 pending 的恢复窗口，
-  //   验证普通 detach/reconfigure 均不能越过该 authority。
+  //   验证普通 detach/reconfigure 均不能越过该 authority，并验证多个 matching
+  //   reservation 在任何 detach 前 fail-closed。
   // 输入/输出及副作用：无显式输入；通过精确 factory 与 cancel 故障驱动真实 CQ
   //   reservation，读取公开 reservation/pending/occupancy，并以显式 abort 完成 detach。
-  // 失败/边界：分配故障必须非致命返回 RECOVERY_REQUIRED；detach/reconfigure 拒绝和
-  //   abort 锁忙均须保留 reservation，只有最终 abort 成功后才允许重新 configure。
+  // 失败/边界：分配故障必须非致命返回 RECOVERY_REQUIRED；多 reservation 必须返回
+  //   INVALID_STATE 且保留原 reservation；detach/reconfigure 拒绝和 abort 锁忙均须
+  //   保留 reservation，只有最终 abort 成功后才允许重新 configure。
   task automatic check_reservation_only_detach_reconfigure();
     rdma_queue_data_engine_fixture fixture;
     rdma_device_publish_recovery_fault_engine fault_engine;
@@ -6192,6 +6293,38 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
         reservation_before == null)
       `uvm_error("RESERVATION_ONLY_EVIDENCE",
                  "reservation-only evidence is not observable")
+
+    // 设计：复制一个只借用原 runtime 的第二索引候选，制造多 matching reservation。
+    // recover_queue 必须先完成全部 reservation query，再返回 ambiguity；若先 detach
+    // 第一个 candidate，第二个 alias 会把同一 reservation 的 authority 留在隐蔽索引。
+    status = fault_engine.alias_reservation_attachment_for_test(
+      fixture.cq.handle);
+    if (status == null || !status.ok()) begin
+      `uvm_error("RESERVATION_ONLY_ALIAS", status == null ?
+                 "reservation alias returned null status" :
+                 status.convert2string())
+    end
+    else begin
+      fixture.engine.recover_queue(
+        fixture.cq.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH,
+        1'b0, status);
+      if (status == null || status.code != RDMA_SC_INVALID_STATE)
+        `uvm_error("RESERVATION_ONLY_AMBIGUOUS",
+                   "multiple reservations were not rejected before detach")
+      reservation_valid = 1'b0;
+      reservation_after = null;
+      status = fixture.engine.query_runtime_device_reservation(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, reservation_valid,
+        reservation_after);
+      if (status == null || !status.ok() || !reservation_valid ||
+          reservation_after == null ||
+          reservation_after.index != reservation_before.index ||
+          reservation_after.wrap != reservation_before.wrap)
+        `uvm_error("RESERVATION_ONLY_AMBIGUOUS_EVIDENCE",
+                   "ambiguity check changed the reservation")
+      fault_engine.remove_reservation_attachment_alias();
+    end
+
     status = fixture.engine.query_runtime_occupancy(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, occupancy, has_pending);
     if (status == null || !status.ok() || occupancy != 0 || has_pending)
