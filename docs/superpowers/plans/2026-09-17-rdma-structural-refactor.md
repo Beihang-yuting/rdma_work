@@ -17,8 +17,8 @@
 ## 当前执行状态（2026-09-23）
 
 当前工作树为
-`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-structural-refactor-batch155`，分支为
-`feature/rdma-structural-refactor-batch155`，HEAD/基线为 `8b8ad4e`。Batch157 的源码、
+`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-structural-refactor-batch158`，分支为
+`feature/rdma-structural-refactor-batch158`，HEAD/基线为 `33be6c7`。Batch158 的源码、
 测试和文档尚未提交；计划保持 `active`，不得把 focused GREEN 解释为整份重构完成。
 
 ## 批次进展记录（更新至 2026-09-23）
@@ -578,6 +578,19 @@
   实测为 189 文件（187 `.sv`、2 `.svh`）、5,483 methods（`.sv` 5,481、`.svh` 2）、
   0 diagnostics。`configure_shared()`-only 没有 live reset binding 的限制仍 OPEN，计划
   继续保持 `active`。详见 `task-cmq-batch157-cq-shadow-replay-atomicity-report.md`。
+- Batch158 在 `src/core/rdma_queue_data_engine.sv` 新增受保护的
+  `reserve_device_publish_checked()` 与 `check_device_publish_polarity()`，收束
+  `publish_cqe()`、`publish_ceqe()` 和 `publish_aeqe_common()` 的重复 device-producer
+  reservation、null-status 和 expected-polarity admission。CQE/CEQE 保持
+  authority→reservation→polarity→codec；AEQE 保持 image staging→reservation→
+  route/epoch recheck→polarity→commit，`write_commit_device_entry()` 的 recovery、
+  backing/MMIO/ledger 所有权不变。四项 device-publish/AEQE focused 在 53 机均
+  PROCESS/LOGICAL PASS，UVM INFO `220/3/3/115`，WARNING/ERROR/FATAL 全为 0；静态
+  gates 与 Python 292/292 通过，全目录 scanner 为 5,485 methods（`.sv` 5,483、
+  `.svh` 2）、0 diagnostics。计划继续保持 `active`；跨队列并发、SRQ lifecycle、
+  legacy descriptor、外部 ordering/error、engine-level 全局锁、完整 parent/core gate
+  与最终 ownership 审计仍开放。详见
+  `task-cmq-batch158-device-publish-admission-report.md`。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
   `git diff --check`、changed-SV style，以及覆盖 5,286 个 function/task 的历史全目录中文契约/文件头
   scanner 均 GREEN；Batch110 按当时工作树边界重新扫描 185 个 `.sv`、2 个 `.svh`，共 5,382
@@ -594,8 +607,9 @@
   （`.sv` 5,462、`.svh` 2）；Batch154 event poll timeout helper 后为 5,465 methods，
   Batch155 EQ facade operation envelope helper 后为 5,467 methods，Batch156 CQ facade
   operation envelope helper 后为 5,469 methods（`.sv` 5,467、`.svh` 2）；Batch157
-  CQ shadow replay/factory atomicity helper 与测试后当前边界为 5,483 methods（`.sv`
-  5,481、`.svh` 2）、0 diagnostics；扫描继续复用
+  CQ shadow replay/factory atomicity helper 与测试后为 5,483 methods（`.sv`
+  5,481、`.svh` 2）；Batch158 device-publish admission helper 后当前边界为 5,485
+  methods（`.sv` 5,483、`.svh` 2）、0 diagnostics；扫描继续复用
   `sanitize_source`、`method_ranges`、`check_method_comments` 和 `check_file_header`，覆盖
   `src/`、`tests/`、`sim/`，不把历史计数冒充当前证据。
 
@@ -626,8 +640,9 @@ rollback legacy execution 去重 seam、Batch137 的 create/destroy legacy execu
   和 Batch149 的 reservation-only recovery seam、Batch150 的 CMQ context helper 重复收缩、
   Batch151/152/153 的 facade authority/configuration admission 收缩、Batch154 的 CEQ/AEQ
   timeout wrapper 收缩、Batch155 的 EQ facade operation envelope 收缩、Batch156 的 CQ
-  facade operation envelope 收缩和 Batch157 的 CQ shadow canonical replay/factory
-  atomicity 收口；完整公开
+  facade operation envelope 收缩、Batch157 的 CQ shadow canonical replay/factory
+  atomicity 收口和 Batch158 的 device-publish reservation/polarity admission 收缩；
+  完整公开
   post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。

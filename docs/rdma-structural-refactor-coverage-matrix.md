@@ -32,11 +32,13 @@
 | SR-IOV/PCIe allocator | Batch87 null status、pre-existing ownership guard、BAR rollback、lease factory atomicity；Batch90 清理多 VF 失败时 `discovered` 部分输出并加入 VF1 注入；当前接入 `pcie_work` main 的真实 config-proxy/SR-IOV 路径 | `rdma_sriov_enumerator_authority_test`、`rdma_sriov_enumeration_test`、`rdma_pcie_work_adapter_test`、allocator focused | core authority GREEN；依赖锁 verify GREEN；`rdma_pcie_work_adapter_test` compile/elab/link 与仿真 GREEN（UVM 4/0/0/0）；`rdma_sriov_enumeration_test` compile/elab/link 与仿真 GREEN（UVM 260/0/0/0） | pcie_work 上游缺少 root README/LICENSE/tag，需保留供应链风险；host_mem/pcie_work 完整 regression、更多 PCIe error/ordering matrix 仍开放 |
 | 外部环境与门禁 | dpu_common identity authority；VCS53 wrapper；manifest/style/diff gates；全目录中文契约 scanner；Batch106 focused reset evidence；Batch107 current-source static and parent/core/integration evidence；Batch109 ownership/close/candidate evidence；Batch110 publication-guard evidence；Batch111 mutation-guard/capability evidence；Batch113 SGB writer mutation evidence；Batch114 UD effective-mode evidence；Batch118 reservation-candidate seam evidence；Batch119 recovery-action contract evidence；Batch120 device-producer replay seam evidence；Batch121 consumer recovery seam evidence；Batch122 local-resource match/projection seam evidence；Batch123 consumer-authority preflight evidence；Batch124 consumer release seam evidence；Batch125 poll candidate-staging evidence；Batch126 poll target-resolution evidence；Batch127 poll commit-candidate evidence；Batch128 event commit-candidate evidence；Batch130 private-RQ poll evidence；Batch131 staged WQ canonicalization/UD SEND poll evidence；Batch132 shared-SRQ receive poll evidence；Batch133 variant/SRFQ admission、shared-SRQ hostile poll 与 transport capability evidence；pcie_work adoption/lock/adapter/SR-IOV evidence | `scripts/run_vcs53.sh`、Python 292、manifest 22、`rdma_defs` 203、style、diff-check、current-source contract scanner、Batch111 reset/integration/CMQ/core suites、resource-manager/AEQE/recovery/post focused tests、`rdma_queue_data_engine_poll_test`、`rdma_queue_data_engine_post_test`、queue-data recovery/device-publish focused tests、`rdma_queue_event_route_consume_test`、`rdma_aeqe_route_test`、codec focused tests、`tools/check_external_dependency_lock.py` | Batch113/114 post/codec suites PROCESS/LOGICAL PASS、UVM 0/0/0；Batch118 device-publish/recovery/post PROCESS/LOGICAL PASS、UVM 0/0/0；Batch119 device-publish/recovery/post focused PROCESS/LOGICAL PASS、UVM 0/0/0；Batch120 device-publish/recovery/post focused PROCESS/LOGICAL PASS、UVM 0/0/0；Batch121 device-publish/recovery/post focused GREEN，PROCESS/LOGICAL PASS、UVM 0/0/0；Batch122 resource-manager/AEQE/recovery/post focused GREEN，PROCESS/LOGICAL PASS、UVM 0/0/0；style/keyword/diff/queue/profile/manifest/Phase-1A/Python gates GREEN；Batch123 device-publish/recovery/post focused PROCESS/LOGICAL PASS、UVM 0/0/0，全目录 scanner 185 `.sv`+2 `.svh`、5,407 methods/0 diagnostics；Batch124 device-publish/recovery/post focused PROCESS/LOGICAL PASS、UVM 0/0/0，全目录 scanner 185 `.sv`+2 `.svh`、5,408 methods/0 diagnostics；Batch125 poll/device-publish/recovery/post focused PROCESS/LOGICAL PASS、UVM 0/0/0，全目录 scanner 185 `.sv`+2 `.svh`、5,409 methods/0 diagnostics；Batch126 poll/post/recovery/device-publish focused PROCESS/LOGICAL PASS、UVM 0/0/0，全目录 scanner 185 `.sv`+2 `.svh`、5,410 methods/0 diagnostics；Batch127 poll/post/recovery/device-publish focused PROCESS/LOGICAL PASS、UVM 0/0/0，全目录 scanner 185 `.sv`+2 `.svh`、5,411 methods/0 diagnostics；Batch128 poll/event route focused PROCESS/LOGICAL PASS、UVM 0/0/0（`rdma_queue_data_engine_poll_test`、`rdma_queue_event_route_consume_test`、`rdma_aeqe_route_test`）；Batch130 poll/post/recovery/device-publish focused PROCESS/LOGICAL PASS、UVM 0/0/0，其中 poll 新增私有 RQ receive CQE 正向链；Batch131 poll/post/recovery/device-publish focused PROCESS/LOGICAL PASS、UVM 0/0/0，其中 poll 新增 UD SEND 正向链和 staged hostile canonicalization probe；Batch132 poll/post/recovery/device-publish focused PROCESS/LOGICAL PASS、UVM 0/0/0，其中 poll 新增 shared-SRQ receive CQE 正向链；Batch133 poll/post/recovery/device-publish focused PROCESS/LOGICAL PASS、UVM 0/0/0，transport E2E UVM INFO 32/WARNING 0/ERROR 0/FATAL 0；pcie_work/host_mem lock verify GREEN；adapter 与 SR-IOV focused 分别 UVM INFO 4/260、WARNING/ERROR/FATAL 全为 0；全目录 scanner 刷新为 5,431 methods/0 diagnostics，style/diff/queue/profile/manifest/keyword/Phase-1A/Python 292 GREEN | 任何 VCS 仿真必须继续在 53 主机登录 shell 执行；host_mem/pcie_work 完整 regression、coordinator 跨线程/跨进程并发、更深生命周期审计、公开 UD replay 与外部 ordering/error matrix 仍开放 |
 
+| queue-data device-producer publish admission | Batch158 将 `publish_cqe()`、`publish_ceqe()` 与 `publish_aeqe_common()` 重复的 `reserve_device_producer()`/expected-polarity 检查提取为 `reserve_device_publish_checked()` 与 `check_device_publish_polarity()`；CQE/CEQE 继续 reservation→polarity→codec，AEQE 继续 image staging→reservation→route/epoch recheck→polarity→commit | `rdma_queue_data_engine_device_publish_test`、`rdma_queue_data_engine_poll_test`、`rdma_aeqe_route_test`、`rdma_aeqe_f5_e2e_test` | Batch158 四项 VCS53 最终源码边界均 wrapper rc=0、PROCESS/LOGICAL PASS，UVM `INFO=220/3/3/115`、WARNING/ERROR/FATAL 全为 0；`git diff --check`、changed-SV style、queue/profile/Phase-1A/Python 292 与全目录 scanner 5,485 methods/0 diagnostics GREEN | authority/codec 顺序、AEQE reservation 后 route/epoch 窗口、write/commit recovery、跨队列并发、SRQ lifecycle、legacy descriptor、外部 PCIe ordering/error、engine-level 全局锁和最终 ownership 审计仍 OPEN |
+
 > 当前口径更新（2026-09-23）：上表“外部环境与门禁”行末的 5,431 methods 是
-> Batch133 历史边界，不是当前总数。Batch157 当前 scanner 为 189 文件（187 `.sv`、
-> 2 `.svh`）、5,483 methods（`.sv` 5,481、`.svh` 2）、0 diagnostics；当前只刷新
-> 三项 CQ focused 与相关静态门禁，未重跑全量 CMQ/core gate。表中早期行使用的“当前
-> worktree”均指对应批次当时的源码边界，不指 Batch157 当前源码边界。
+> Batch133 历史边界，不是当前总数。Batch158 当前 scanner 为 189 文件（187 `.sv`、
+> 2 `.svh`）、5,485 methods（`.sv` 5,483、`.svh` 2）、0 diagnostics；当前刷新了
+> 四项 device-publish/AEQE focused 与相关静态门禁，完整 CMQ/core gate 仍未重跑。表中
+> 早期行使用的“当前 worktree”均指对应批次当时的源码边界，不指 Batch158 当前源码边界。
 
 ### pcie_work 当前接入证据（2026-09-22）
 
@@ -464,7 +466,9 @@
   0-diagnostic 结果及复现口径见
   `task-cmq-batch156-cq-facade-operation-envelope-report.md`；Batch157 当前 5,483-method/
   0-diagnostic 结果、VCS wrapper hash 和 factory atomicity 证据见
-  `task-cmq-batch157-cq-shadow-replay-atomicity-report.md`。
+  `task-cmq-batch157-cq-shadow-replay-atomicity-report.md`；Batch158 当前 5,485-method/
+  0-diagnostic 结果与 device-publish focused 证据见
+  `task-cmq-batch158-device-publish-admission-report.md`。
 - `pcie_work` 的正确 suite 阻断证据是
   `evidence/post-batch87-rdma_sriov_pcie_work-correct-blocked.log`；`rc=2` 只表示
   `external dependency is not approved: pcie_work`，不是 UVM 业务失败。
@@ -765,6 +769,30 @@
   legacy descriptor、外部 PCIe ordering/error、engine-level 全局锁、完整 parent/core
   gate 与最终 ownership 审计仍 OPEN；计划继续保持 `active`。
 
+### Batch158 当前更新（2026-09-23）
+
+- `src/core/rdma_queue_data_engine.sv` 新增受保护的
+  `reserve_device_publish_checked()` 与 `check_device_publish_polarity()`，将
+  `publish_cqe()`、`publish_ceqe()` 和 `publish_aeqe_common()` 重复的设备 producer
+  reservation、null-status 归一化、expected-polarity 比较与 polarity cancel 收束为
+  两个窄 seam。CQE/CEQE 仍按 authority→reservation→polarity→codec，AEQE 仍按
+  image staging→reservation→route/epoch recheck→polarity→commit；`write_commit_device_entry()`
+  的 backing、MMIO、ledger 与 recovery 所有权未移动。
+- `check_device_publish_polarity()` 的 reservation 是 `inout`：匹配时保留 runtime 内部
+  保留的 reservation 对外返回 detached 快照，失败时调用既有 cancel/recovery 并清零
+  reservation。AEQE reservation 后 `validate_attachment_route_epoch()` 仍在 polarity
+  检查前执行，因而没有把 post-reservation reset/route 窗口隐藏到泛化 helper 中。
+- `rdma_queue_data_engine_device_publish_test`、`rdma_queue_data_engine_poll_test`、
+  `rdma_aeqe_route_test` 与 `rdma_aeqe_f5_e2e_test` 在 53 机最终源码边界均 wrapper
+  rc=0、PROCESS/LOGICAL PASS，UVM INFO 分别为 `220/3/3/115`，WARNING/ERROR/FATAL
+  全为 0；`git diff --check`、changed-SV style、queue/profile/Phase-1A 与 Python
+  292/292 均通过。全目录 scanner 为 189 文件（187 `.sv`、2 `.svh`）、5,485 methods
+  （`.sv` 5,483、`.svh` 2）、0 diagnostics。
+- 本批只关闭设备发布 admission 的局部重复 seam；跨队列/跨线程并发、SRQ lifecycle、
+  legacy descriptor、外部 PCIe ordering/error、engine-level 全局锁、完整 parent/core
+  gate 和最终 ownership 审计仍 OPEN，计划继续保持 `active`。详见
+  `task-cmq-batch158-device-publish-admission-report.md`。
+
 ## 尚未关闭的验收项
 
 1. Phase 1C F2 仍暂停于更广泛的 `sge_num` canonical-authority/whole-plan 收口；Batch100
@@ -803,7 +831,8 @@
    Phase-1A、changed-SV style、`git diff --check` 与 Python 292 均通过；Batch152 边界为
    5,464 methods（`.sv` 5,462、`.svh` 2），Batch154 边界为 5,465 methods；Batch155
    边界为 5,467 methods，Batch156 最新边界为 5,469 methods（`.sv` 5,467、`.svh`
-   2），Batch157 当前边界为 5,483 methods（`.sv` 5,481、`.svh` 2），0 diagnostics。
+   2），Batch157 当前边界为 5,483 methods（`.sv` 5,481、`.svh` 2），Batch158 当前边界为
+   5,485 methods（`.sv` 5,483、`.svh` 2），0 diagnostics。
 4. Batch114 已关闭 UD codec 与通用 model/writer 对非零 inline/1–2 SGE 的 effective
    mode 对齐缺口；Batch115 已用临时 focused probe 补充公开 `post_send()`/
    `replay_pending()` 的 UD 1B inline/1–2 SGE 与 SGB failure recovery 证据；Batch116
@@ -817,7 +846,8 @@
    5,437 methods，Batch144 当前边界为 5,438 methods，Batch145 当前边界为 5,440，
    Batch148 当前边界为 5,460 methods/0 diagnostics；Batch152 边界为 5,464 methods/0
    diagnostics；Batch154 边界为 5,465 methods，Batch155 边界为 5,467 methods，
-   Batch156 边界为 5,469 methods，Batch157 当前边界为 5,483 methods/0 diagnostics；
+   Batch156 边界为 5,469 methods，Batch157 当前边界为 5,483 methods，Batch158 当前边界为
+   5,485 methods/0 diagnostics；
    不把 Batch111/Batch122 的旧计数冒充当前源码结果。
 5. 旧批次条目中的 `pcie_work` OPEN/UNAPPROVED 文案是批准前的历史记录；当前锁已按用户
    指定上游快照更新为 75 个 `APPROVED` 闭包行，`tools/check_external_dependency_lock.py`

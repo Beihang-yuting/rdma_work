@@ -3241,6 +3241,97 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：reserve_device_publish_checked 统一 CQE、CEQE 与 AEQE 的设备 producer
+  //   reservation admission，在进入各自 authority/编码阶段前取得唯一 runtime
+  //   cursor，并把 reserve 的 null/失败结果收敛为可观察 status。
+  // 输入/输出及副作用：attachment、reservation_label 为输入；reservation/status
+  //   为输出并先清空。成功时 reservation 是 runtime 内部保留 reservation 的
+  //   detached cursor 快照；task 不编码、不写 backing、不推进 committed cursor，
+  //   也不取得外部资源所有权。
+  // 失败/边界：attachment/runtime 缺失、reserve 返回 null/非成功或成功却没有
+  //   cursor 时返回非空 INVALID_STATE（保留 runtime 的非成功码），并清零
+  //   reservation；调用方不得在该 task 失败后进入 codec、Host-memory 或 commit。
+  protected task reserve_device_publish_checked(
+    input rdma_queue_data_attachment attachment,
+    input string reservation_label,
+    output rdma_queue_cursor_snapshot reservation,
+    output rdma_status status
+  );
+    reservation = null;
+    status = null;
+    if (attachment == null || attachment.runtime == null) begin
+      status = rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        {reservation_label, " attachment/runtime is incomplete"});
+      return;
+    end
+
+    status = attachment.runtime.reserve_device_producer(reservation);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          {reservation_label, " returned null status"});
+      reservation = null;
+      return;
+    end
+    if (reservation == null) begin
+      status = rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        {reservation_label, " returned no reservation"});
+      return;
+    end
+  endtask
+
+  // 功能：check_device_publish_polarity 比较 caller image 的 owner/polarity 与已
+  //   取得 reservation 的 expected producer polarity；不把 CQE/CEQE/AEQE 的
+  //   authority、wire encode 或 AEQE route/epoch 复核混入共享 admission。
+  // 输入/输出及副作用：attachment、reservation、actual_polarity、错误文本为输入；
+  //   status 为输出并先清空，reservation 是 inout：匹配时保持原值供 caller
+  //   继续编码；不匹配或输入不完整时清零。匹配不改变 runtime；不匹配时调用
+  //   既有 finish_device_producer_cancel，成功取消不推进 committed cursor，失败
+  //   则保留 runtime/engine recovery evidence。
+  // 失败/边界：attachment/runtime/reservation 缺失返回 INVALID_STATE；actual
+  //   polarity 与 expected 值不一致时返回原 polarity 错误或 RECOVERY_REQUIRED，
+  //   并清零 reservation；finish/cancel 返回 null 也归一化为非空恢复状态，caller
+  //   不得把清零后的句柄继续用于 write_commit_device_entry。
+  protected task check_device_publish_polarity(
+    input rdma_queue_data_attachment attachment,
+    inout rdma_queue_cursor_snapshot reservation,
+    input bit actual_polarity,
+    input string polarity_error_label,
+    input string cancel_context,
+    output rdma_status status
+  );
+    rdma_status original_status;
+    bit expected_polarity;
+
+    status = null;
+    if (attachment == null || attachment.runtime == null ||
+        reservation == null) begin
+      status = rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        {cancel_context, " polarity validation input is incomplete"});
+      reservation = null;
+      return;
+    end
+    expected_polarity = attachment.runtime.expected_producer_polarity(
+      reservation);
+    if (actual_polarity !== expected_polarity) begin
+      original_status = rdma_status::make_direct(
+        RDMA_SC_INVALID_ARGUMENT, polarity_error_label);
+      finish_device_producer_cancel(
+        attachment, reservation, null, original_status, cancel_context, status);
+      if (status == null)
+        status = rdma_status::make_direct(
+          RDMA_SC_RECOVERY_REQUIRED,
+          {cancel_context, " returned null status"});
+      reservation = null;
+      return;
+    end
+    status = rdma_status::make_direct(RDMA_SC_OK);
+  endtask
+
   // 功能：publish_cqe 校验 CQE 的 Function/QP/WQE authority，随后经公共设备生产
   //   pipeline 写入 CQ backing 并提交 producer cursor。
   // 输入/输出及副作用：cq_h、model 为只读输入，result/status 为输出；成功时仅
@@ -3261,7 +3352,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_cqe_codec cqe_codec;
     rdma_hw_image image;
     rdma_status original_status;
-    bit expected_polarity;
 
     result = null;
     status = null;
@@ -3280,19 +3370,24 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    status = attachment.runtime.reserve_device_producer(reservation);
+    reserve_device_publish_checked(
+      attachment, "CQ device reservation", reservation, status);
     if (status == null || !status.ok()) begin
       if (status == null)
-        status = bad("CQ device reservation returned null status",
-                     RDMA_SC_INVALID_STATE);
+        status = rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "CQE device reservation helper returned null status");
       return;
     end
-    expected_polarity = attachment.runtime.expected_producer_polarity(
-      reservation);
-    if (model.polarity !== expected_polarity) begin
-      original_status = bad("CQE producer polarity does not match reservation");
-      finish_device_producer_cancel(attachment, reservation, null,
-                                    original_status, "CQE polarity", status);
+    check_device_publish_polarity(
+      attachment, reservation, model.polarity,
+      "CQE producer polarity does not match reservation",
+      "CQE polarity", status);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "CQE polarity helper returned null status");
       return;
     end
     key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CQE,
@@ -3549,7 +3644,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_ceqe_model encode_model;
     rdma_hw_image image;
     rdma_status original_status;
-    bit expected_polarity;
 
     result = null;
     status = null;
@@ -3566,19 +3660,24 @@ class rdma_queue_data_engine extends uvm_object;
                      RDMA_SC_INVALID_STATE);
       return;
     end
-    status = attachment.runtime.reserve_device_producer(reservation);
+    reserve_device_publish_checked(
+      attachment, "CEQE device reservation", reservation, status);
     if (status == null || !status.ok()) begin
       if (status == null)
-        status = bad("CEQE device reservation returned null status",
-                     RDMA_SC_INVALID_STATE);
+        status = rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "CEQE reservation helper returned null status");
       return;
     end
-    expected_polarity = attachment.runtime.expected_producer_polarity(
-      reservation);
-    if (model.valid !== expected_polarity) begin
-      original_status = bad("CEQE producer polarity does not match reservation");
-      finish_device_producer_cancel(attachment, reservation, null,
-                                    original_status, "CEQE polarity", status);
+    check_device_publish_polarity(
+      attachment, reservation, model.valid,
+      "CEQE producer polarity does not match reservation",
+      "CEQE polarity", status);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "CEQE polarity helper returned null status");
       return;
     end
     key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CEQE,
@@ -3918,7 +4017,6 @@ class rdma_queue_data_engine extends uvm_object;
     bit primary_found;
     bit secondary_found;
     bit is_cq_flush;
-    bit expected_polarity;
 
     result = null;
     status = null;
@@ -3947,11 +4045,13 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    status = attachment.runtime.reserve_device_producer(reservation);
+    reserve_device_publish_checked(
+      attachment, "AEQE device reservation", reservation, status);
     if (status == null || !status.ok()) begin
       if (status == null)
-        status = bad("AEQE device reservation returned null status",
-                     RDMA_SC_INVALID_STATE);
+        status = rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "AEQE reservation helper returned null status");
       return;
     end
     // 设计说明：preflight 与 reserve 之间 route/reset epoch 仍可能变化；取得
@@ -3966,12 +4066,15 @@ class rdma_queue_data_engine extends uvm_object;
                                     original_status, "AEQE route epoch", status);
       return;
     end
-    expected_polarity = attachment.runtime.expected_producer_polarity(
-      reservation);
-    if (encode_model.valid !== expected_polarity) begin
-      original_status = bad("AEQE producer polarity does not match reservation");
-      finish_device_producer_cancel(attachment, reservation, null,
-                                    original_status, "AEQE polarity", status);
+    check_device_publish_polarity(
+      attachment, reservation, encode_model.valid,
+      "AEQE producer polarity does not match reservation",
+      "AEQE polarity", status);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "AEQE polarity helper returned null status");
       return;
     end
     write_commit_device_entry(attachment, reservation, image, result, status);

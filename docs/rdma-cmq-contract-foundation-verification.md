@@ -94,9 +94,11 @@ logical gate 失败。mutation gate 还必须保持 `CQC_CREATE` request unsuppo
 | host_mem candidate regression | `make host_mem TEST=regression` on `ubuntu@10.11.10.53` login bash | PASS; adapter/queue-data/UMEM `UVM_INFO=17/17/4`, warning/error/fatal all zero, leak checks zero |
 | queue/control-plane/QP execution seams | `SSHPASS=<runtime-only> ./scripts/run_vcs53.sh core rdma_queue_lifecycle_test`, `rdma_queue_recovery_test`, `rdma_control_plane_cmq_engine_test`, `rdma_control_plane_test`, `rdma_qp_lifecycle_test`, and `rdma_qp_recovery_test` | PASS at the recorded source boundary; each compile/elab/link and PROCESS/LOGICAL PASS with `UVM_INFO=3`, `UVM_WARNING/ERROR/FATAL=0/0/0`; Batch136–140 deduplicate rollback/create/destroy/control-plane/QP/KEY_ALLOC raw dispatch while retaining legacy compatibility |
 | Batch157 focused CQ shadow/replay | `scripts/run_vcs53.sh core rdma_cq_engine_test`; `rdma_cq_engine_resize_test`; `rdma_cq_shadow_flush_test` | Current source boundary: all wrapper rc=0, PROCESS/LOGICAL PASS, UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`, pristine; complete wrapper hashes are recorded in the Batch157 section below |
+| Batch158 focused device publish/admission | `scripts/run_vcs53.sh core rdma_queue_data_engine_device_publish_test`; `rdma_queue_data_engine_poll_test`; `rdma_aeqe_route_test`; `rdma_aeqe_f5_e2e_test` | Current source boundary: all four wrapper rc=0, PROCESS/LOGICAL PASS, UVM `INFO=220/3/3/115`, `UVM_WARNING/ERROR/FATAL=0/0/0`, pristine; reservation/polarity helper preserves AEQE post-reservation route/epoch recheck |
 | local static gates | `git diff --check`; `python3 tools/check_changed_sv_style.py --base 8b8ad4e`; queue/profile/Phase-1A checks; manifest/keyword/ownership tests; Python discover | Batch157 current boundary PASS; combined log `/tmp/batch157-static-fix.log`, SHA-256 `73e0e60ee02883bcdda68f52e72e54f07760844a1e5db3c501376e782997d13a`; full-tree scanner is recorded below |
-| final CMQ gate | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test`; `scripts/run_vcs53.sh cmq_gate regression` | Historical source-boundary evidence: CMQ 28/28 process, 11/11 logical, UVM 0/0/0; Batch157 后尚未刷新全量 gate |
-| compatibility/full core | host_mem, integration, focused consumers and `scripts/run_vcs53.sh core regression` | Historical source-boundary evidence: core 95/95 process, 78/78 logical, UVM 0/0/0; Batch157 仅刷新三项 CQ focused，完整 core 与更广 PCIe ordering/error 组合仍开放 |
+| Batch158 local static gates | `git diff --check`; `python3 tools/check_changed_sv_style.py --base 33be6c7`; queue/profile/Phase-1A checks; Python discover; full-tree contract scanner | Current source boundary PASS; Python 292/292, scanner 189 files/5,485 methods/0 diagnostics; final log/hash is intentionally frozen with the Batch158 commit rather than this uncommitted worktree |
+| final CMQ gate | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test`; `scripts/run_vcs53.sh cmq_gate regression` | Historical source-boundary evidence: CMQ 28/28 process, 11/11 logical, UVM 0/0/0; Batch158 后尚未刷新全量 gate |
+| compatibility/full core | host_mem, integration, focused consumers and `scripts/run_vcs53.sh core regression` | Historical source-boundary evidence: core 95/95 process, 78/78 logical, UVM 0/0/0；Batch158 仅刷新四项 device-publish/AEQE focused，完整 core 与更广 PCIe ordering/error 组合仍开放 |
 
 ### Batch138 current source boundary
 
@@ -590,6 +592,44 @@ Batch157 仍不关闭 shared-only live reset 认证、跨队列并发、SRQ 生�
 descriptor、外部 PCIe ordering/error、engine-level 全局锁、完整 CMQ/core regression、
 全目录最终 ownership 审计或广义 Phase 1C F2；计划继续保持 `active`。详见
 `task-cmq-batch157-cq-shadow-replay-atomicity-report.md`。
+
+### Batch158：device-publish reservation/polarity admission
+
+Batch158 只收束 `src/core/rdma_queue_data_engine.sv` 中三个设备 producer 发布入口的
+重复 admission 外壳。新增的 `reserve_device_publish_checked()` 统一清空
+`reservation/status`、检查 attachment/runtime、调用 `reserve_device_producer()` 并
+归一化 null/失败结果；`check_device_publish_polarity()` 接受 `inout reservation`，
+依据该 reservation 比较 CQE `model.polarity`、CEQE `model.valid` 或 AEQE encode model
+的 `valid`。polarity 不匹配时仍调用 `finish_device_producer_cancel()`，失败会清零
+reservation 并保留 recovery 语义；成功时 runtime 内部保留 reservation、对外返回
+detached 快照供 caller 继续编码。
+
+三个 caller 的职责边界保持明确：CQE/CEQE 继续 authority→reservation→polarity→codec；
+AEQE 继续 image staging→reservation→`validate_attachment_route_epoch()`→polarity→
+`write_commit_device_entry()`。因此 authority/codec 错误优先级、AEQE reservation 后
+route/reset 窗口，以及 backing/MMIO/ledger/recovery 的后端事务没有被泛化 helper
+覆盖；本批也没有修改外部依赖或 driver wire contract。
+
+最终源码边界的 focused VCS53 结果为：
+
+| Entry | Result |
+| --- | --- |
+| `rdma_queue_data_engine_device_publish_test` | wrapper rc=0；PROCESS/LOGICAL PASS；UVM `INFO=220/WARNING=0/ERROR=0/FATAL=0`；pristine |
+| `rdma_queue_data_engine_poll_test` | wrapper rc=0；PROCESS/LOGICAL PASS；UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；pristine |
+| `rdma_aeqe_route_test` | wrapper rc=0；PROCESS/LOGICAL PASS；UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；pristine |
+| `rdma_aeqe_f5_e2e_test` | wrapper rc=0；PROCESS/LOGICAL PASS；UVM `INFO=115/WARNING=0/ERROR=0/FATAL=0`；pristine |
+
+`git diff --check`、changed-SV style（base=`33be6c7`）、queue/profile/Phase-1A checks
+和 Python 292/292 均通过。全目录中文契约 scanner 复用
+`sanitize_source`/`method_ranges`/`check_method_comments`/`check_file_header`，覆盖
+189 个文件（187 `.sv`、2 `.svh`），5,485 methods（`.sv` 5,483、`.svh` 2），0
+diagnostics。完整 log/source hash 将在 commit 后冻结，避免把未提交 worktree 指纹
+误作为主线证据。
+
+Batch158 不关闭 `configure_shared()`-only live reset 认证、跨队列/跨线程并发、SRQ
+全生命周期、legacy descriptor、外部 PCIe ordering/error、engine-level 全局锁、完整
+CMQ/core gate、全目录最终 ownership 审计或广义 Phase 1C F2；计划继续保持 `active`。
+详见 `task-cmq-batch158-device-publish-admission-report.md`。
 
 ## Explicit follow-up boundaries
 
