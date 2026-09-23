@@ -38,36 +38,24 @@ class rdma_sq_engine extends uvm_object;
   //   和 reset epoch 仍与借用 binding 一致，阻止 reset 后继续写 SQE。
   // 输入/输出及副作用：label 仅用于诊断消息；函数只读 binding 和快照字段，不修改
   //   delegate、runtime、cursor 或 backing，返回 rdma_status。
-  // 失败/边界：未配置/缺少 binding、binding 失活或校验失败返回对应错误；UID、generation
+  // 失败/边界：未配置、delegate 或 binding 缺失、binding 失活或校验失败返回对应错误；UID、generation
   //   或 reset epoch 漂移返回 STALE_GENERATION，调用方不得继续提交 WQE。
   protected function rdma_status validate_live_authority(string label);
-    rdma_status status;
-
-    if (!configured || delegate == null || authority_binding == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               {label, " facade is not configured"});
-    if (authority_binding.function_uid != authority_function_uid ||
-        authority_binding.generation != authority_generation ||
-        authority_binding.function_reset_epoch() != authority_reset_epoch)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               {label, " Function authority is stale"});
-    if (authority_binding.state != RDMA_BIND_ACTIVE)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               {label, " Function binding is not ACTIVE"});
-    status = authority_binding.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               {label, " binding validation returned null"});
-    if (!status.ok())
-      return status;
-    return rdma_status::success();
+    return rdma_validate_live_authority(
+      configured,
+      delegate != null,
+      authority_binding,
+      authority_function_uid,
+      authority_generation,
+      authority_reset_epoch,
+      label);
   endfunction
 
   // 功能：把 SQ facade 绑定到已配置的共享 queue-data engine，并校验所有依赖
   //   是同一组引用。
   // 输入/输出及副作用：resource_manager、function_binding、memory、scheduler、
-  //   codecs、timeout 和 shared_engine 为输入；调用方必须先完成输入对象的空值、
-  //   authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，
+  //   codecs、timeout 和 shared_engine 为输入；函数先通过共用 admission helper
+  //   完成依赖、authority 和 ACTIVE 校验，成功时更新本对象配置/状态并保存非拥有引用，
   //   返回 rdma_status。
   // 失败/边界：空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；
   //   失败时保留旧配置。
@@ -81,28 +69,17 @@ class rdma_sq_engine extends uvm_object;
     rdma_queue_data_engine shared_engine = null
   );
     rdma_status status;
-    if (resource_manager == null || function_binding == null || memory == null ||
-        scheduler == null || codecs == null || timeout == 0 || shared_engine == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SQ facade configuration dependency is null/zero");
-    if (shared_engine.manager != resource_manager ||
-        shared_engine.binding != function_binding ||
-        shared_engine.host_mem != memory ||
-        shared_engine.doorbells != scheduler ||
-        shared_engine.registry != codecs)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "SQ facade dependencies do not match shared engine");
-    status = function_binding.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "SQ Function binding validation returned null");
-    if (!status.ok())
+    status = rdma_validate_queue_facade_configuration(
+      resource_manager,
+      function_binding,
+      memory,
+      scheduler,
+      codecs,
+      timeout,
+      shared_engine,
+      "SQ");
+    if (status == null || !status.ok())
       return status;
-    if (function_binding.state != RDMA_BIND_ACTIVE)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "SQ Function binding is not ACTIVE");
     // 中文设计：配置是 one-shot。完整依赖与 authority 校验必须先于该门禁，
     // 这样非法重配保留具体错误，合法重配不会覆盖正在使用的 delegate/timeout。
     if (configured)

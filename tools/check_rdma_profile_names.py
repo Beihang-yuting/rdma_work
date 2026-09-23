@@ -1115,20 +1115,23 @@ def parse_sv_value(
     输入输出及副作用：expression 为 SV localparam 右值；symbol_resolver 可按
     名称返回同一份 localparam 表中的值；返回精确整数，不执行 Python eval，也不
     修改调用方的常量表。
-    失败边界：只接受明确的 token、括号和 + - * / % << >> | & ^ 运算；二进制/
-    八进制 literal、未知符号、除零、负结果、残余 token 或空值抛 ValidationError，
-    解析不会截断超宽值。
+    失败边界：只接受明确的 token、括号和 + - * / % << >> | & ^ 运算；based
+    literal 的尺寸、基数和数字之间允许 SV 语法规定的空白；二进制/八进制
+    literal、未知符号、除零、负结果、残余 token 或空值抛 ValidationError，解析不会
+    截断超宽值。
     """
     expr = expression.strip()
     compact = expr.replace("_", "")
-    match = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", compact)
+    match = re.fullmatch(
+        r"(?:\d+)\s*'\s*([hHdD])\s*([0-9a-fA-F]+)", compact
+    )
     if match:
         return int(match.group(2), 16 if match.group(1).lower() == "h" else 10)
     if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", compact):
         return int(compact, 0)
 
     token_pattern = re.compile(
-        r"(?:\d+'[hHdD][0-9a-fA-F_]+|0[xX][0-9a-fA-F_]+|"
+        r"(?:\d+\s*'\s*[hHdD]\s*[0-9a-fA-F_]+|0[xX][0-9a-fA-F_]+|"
         r"[0-9][0-9_]*|[A-Za-z_][A-Za-z0-9_]*|<<|>>|"
         r"[()+\-*/%|&^])"
     )
@@ -1162,7 +1165,7 @@ def parse_sv_value(
         return token
 
     def literal(token: str) -> int | None:
-        normalized = token.replace("_", "")
+        normalized = re.sub(r"[\s_]", "", token)
         based = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", normalized)
         if based:
             return int(

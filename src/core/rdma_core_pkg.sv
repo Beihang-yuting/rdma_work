@@ -30,6 +30,7 @@ package rdma_core_pkg;
   `include "rdma_coverage.sv"
   `include "rdma_doorbell_scheduler.sv"
   `include "rdma_queue_data_engine.sv"
+  `include "rdma_queue_facade_configuration.sv"
   `include "rdma_sq_engine.sv"
   `include "rdma_rq_engine.sv"
   `include "rdma_cq_engine.sv"

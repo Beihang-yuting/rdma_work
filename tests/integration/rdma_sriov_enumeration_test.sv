@@ -62,17 +62,23 @@ class rdma_sriov_fault_pcie_adapter extends rdma_pcie_work_adapter;
     output bit [31:0] data,
     output rdma_status status
   );
+    pcie_tl_func_context target_ctx;
+
     if (null_cfg_read) begin
       data = 32'hffff_ffff;
       status = null;
       return;
     end
     cfg_read_count++;
-    if (offset.value == 12'h000)
+    target_ctx = (func_mgr == null) ? null :
+                 func_mgr.lookup_by_bdf(raw_bdf(target));
+    if (offset.value == 12'h000 && target_ctx != null && target_ctx.is_vf)
       vf_vendor_read_count++;
     if ((fail_cfg_read_at > 0 && cfg_read_count == fail_cfg_read_at) ||
-        (fail_vf_vendor_read && offset.value == 12'h000) ||
+        (fail_vf_vendor_read && offset.value == 12'h000 &&
+         target_ctx != null && target_ctx.is_vf) ||
         (fail_vf_vendor_read_at > 0 && offset.value == 12'h000 &&
+         target_ctx != null && target_ctx.is_vf &&
          vf_vendor_read_count == fail_vf_vendor_read_at)) begin
       data = 32'hffff_ffff;
       status = rdma_status::make(RDMA_SC_PCIE_COMPLETION,
@@ -168,6 +174,10 @@ class rdma_sriov_enumeration_test extends uvm_test;
   pcie_tl_func_manager func_mgr;
   pcie_tl_bar_decoder bar_decoder;
   pcie_tl_config_proxy config_proxy;
+  // 故障夹具在 run_phase task 中建立，因此 config proxy 必须预先属于 UVM 层级。
+  // 该 proxy 只在串行 fixture 之间复用；任一时刻不会有两个故障 adapter 同时使用它，
+  // 每次交接都会在下方重新绑定 canonical manager。
+  pcie_tl_config_proxy fault_config_proxy;
   rdma_pcie_work_adapter pcie_adapter;
   rdma_pcie_bar_allocator allocator;
   rdma_sriov_enumerator enumerator;
@@ -189,6 +199,8 @@ class rdma_sriov_enumeration_test extends uvm_test;
     func_mgr.cfg_profile = PCIE_CFG_PROFILE_DPU_20F9_501X;
     bar_decoder = pcie_tl_bar_decoder::type_id::create("bar_decoder");
     config_proxy = pcie_tl_config_proxy::type_id::create("config_proxy", this);
+    fault_config_proxy = pcie_tl_config_proxy::type_id::create(
+      "fault_config_proxy", this);
     pcie_adapter = rdma_pcie_work_adapter::type_id::create("pcie_adapter");
     allocator = rdma_pcie_bar_allocator::type_id::create("allocator");
     enumerator = rdma_sriov_enumerator::type_id::create("enumerator");
@@ -282,35 +294,46 @@ class rdma_sriov_enumeration_test extends uvm_test;
   endtask
 
   // 功能：使用过小的 allocator 触发枚举失败，确认 VFE/NumVFs 被清理且其他 PF 未被修改。
-  // 输入/输出及副作用：创建独立 sequence/allocator 并执行一次失败枚举；原有 PF0 配置应保持。
-  // 失败/边界：失败若留下 active lease、VFE 或 NumVFs 则报告 UVM error。
+  // 输入/输出及副作用：创建独立 manager/adapter/allocator/sequence fixture 并执行一次
+  //   失败枚举；主 fixture 已成功启用的 PF0/PF1 不参与本场景，避免把既有 ownership
+  //   误当成待回滚状态。
+  // 失败/边界：失败若留下 active lease、VFE 或 NumVFs 则报告 UVM error；入口 PF
+  //   若已有 SR-IOV ownership，本场景应先 fail-closed，而不是伪造回滚成功。
   task automatic test_failure_rollback();
+    pcie_tl_func_manager rollback_mgr;
+    rdma_sriov_fault_pcie_adapter rollback_adapter;
+    rdma_pcie_bar_allocator rollback_fixture_allocator;
+    rdma_sriov_enumerator rollback_enumerator;
     rdma_pcie_bar_allocator tiny_allocator;
     rdma_sriov_enumerator failing_enumerator;
     rdma_status status;
     rdma_pcie_function_info discovered[$];
 
+    build_fault_fixture("tiny_rollback", rollback_mgr, rollback_adapter,
+                        rollback_fixture_allocator, rollback_enumerator);
     tiny_allocator = rdma_pcie_bar_allocator::type_id::create("tiny_allocator");
     status = tiny_allocator.configure('{value:64'h0000_0002_0000_0000}, 64'h0000_0000_0000_8000);
     if (!status.ok()) `uvm_fatal("TINY_ALLOC", status.convert2string())
     failing_enumerator = rdma_sriov_enumerator::type_id::create("failing_enumerator");
-    status = failing_enumerator.configure(pcie_adapter, tiny_allocator);
+    status = failing_enumerator.configure(rollback_adapter, tiny_allocator);
     if (!status.ok()) `uvm_fatal("FAIL_ENUM_CONFIG", status.convert2string())
     failing_enumerator.enumerate_and_configure_pf(
       '{segment:16'h0, bus:8'h1, device:5'h0, function_num:3'h0},
       2, discovered, status);
     if (status.ok() || tiny_allocator.active_lease_count() != 0 ||
-        func_mgr.sriov_caps[0].vf_enable ||
-        func_mgr.sriov_caps[0].num_vfs != 0)
+        rollback_mgr.sriov_caps[0].vf_enable ||
+        rollback_mgr.sriov_caps[0].num_vfs != 0)
       `uvm_error("ROLLBACK", "failed SR-IOV enumeration was not rolled back")
   endtask
 
   // 功能：创建一个独立的单 PF fault-injection fixture，确保每个失败场景从
   //   未启用 VF、无 active lease 的干净状态开始。
   // 输入/输出及副作用：tag（输入）、manager/adapter/allocator/enumerator（输出）；
-  //   新建并配置 PCIe canonical 对象，不修改本测试的主 fixture。
+  //   新建并配置 PCIe canonical 对象；config proxy 复用 build_phase 所有的
+  //   fault_config_proxy，不修改本测试的主 fixture。
   // 失败/边界：任一 configure 失败立即 fatal；返回的对象均由调用方持有，
-  //   adapter/enumerator 不接管 manager/allocator 生命周期。
+  //   adapter/enumerator 不接管 manager/allocator 生命周期；复用 proxy 的
+  //   manager 引用只在本 task 完成前有效，调用方必须串行使用返回的 adapter。
   task automatic build_fault_fixture(
     string tag,
     output pcie_tl_func_manager local_mgr,
@@ -319,6 +342,7 @@ class rdma_sriov_enumeration_test extends uvm_test;
     output rdma_sriov_enumerator local_enumerator
   );
     pcie_tl_bar_decoder local_decoder;
+    pcie_tl_config_proxy local_proxy;
     rdma_status local_status;
 
     local_mgr = pcie_tl_func_manager::type_id::create({tag, "_mgr"});
@@ -336,10 +360,25 @@ class rdma_sriov_enumeration_test extends uvm_test;
     local_mgr.sync_sriov_cfg_image(0);
 
     local_decoder = pcie_tl_bar_decoder::type_id::create({tag, "_decoder"});
+    // 该 helper 在 build_phase 之后运行，复用 build_phase 创建的 test child，
+    // 不再向已结束的 UVM 构建阶段插入 component。
+    if (fault_config_proxy == null)
+      `uvm_fatal("FAULT_PROXY", "fault config proxy was not built")
+    local_proxy = fault_config_proxy;
+    local_proxy.func_mgr = local_mgr;
+    local_proxy.multi_function_mode = 1'b1;
+    local_proxy.bar0_sizing_lo = 1'b0;
+    local_proxy.bar0_sizing_hi = 1'b0;
+    local_proxy.bar0_addr = '0;
+    local_proxy.init_config_space();
     local_adapter = rdma_sriov_fault_pcie_adapter::type_id::create(
       {tag, "_adapter"});
+    // 故障夹具必须保留真实 config-proxy 路径；model-bypass 只返回原始
+    // descriptor flags，无法模拟 BAR sizing write/read 往返，导致 vendor
+    // fault 之前就被错误的 aperture 拒绝。proxy 的 manager 引用由该对象
+    // 持有，adapter 只借用它，生命周期覆盖整个本次 task。
     local_status = local_adapter.configure(local_mgr, local_decoder,
-                                            null, 1'b1);
+                                            local_proxy, 1'b0);
     if (local_status == null || !local_status.ok())
       `uvm_fatal("FAULT_ADAPTER", local_status == null ? "null" :
                  local_status.convert2string())
@@ -384,10 +423,14 @@ class rdma_sriov_enumeration_test extends uvm_test;
 
     build_fault_fixture(tag, local_mgr, local_adapter, local_allocator,
                         local_enumerator);
-    // 非零且 4-KiB 对齐的基线能同时暴露 low/high DWORD 遗留；高 DWORD
+    // mode 0..3 使用非零且 4-KiB 对齐的基线暴露 low/high DWORD 遗留；高 DWORD
     // 由 canonical 64-bit base 隐含保存，sizing 位则覆盖“只写 sizing mask”失败。
-    local_mgr.pf_ctx[0].bar_base[0] = 64'h0000_0001_1000_0000;
-    local_mgr.sriov_caps[0].vf_bar[0] = 64'h0000_0002_2000_0000;
+    // mode 4 必须走完整 VF0/VF1 路径，保留 profile 原生 descriptor，避免测试注入
+    // 的非默认 base 先制造与 VF vendor fault 无关的 sizing 失败。
+    if (mode != 4) begin
+      local_mgr.pf_ctx[0].bar_base[0] = 64'h0000_0001_1000_0000;
+      local_mgr.sriov_caps[0].vf_bar[0] = 64'h0000_0002_2000_0000;
+    end
     foreach (original_pf_base[i]) begin
       original_pf_base[i] = local_mgr.pf_ctx[0].bar_base[i];
       original_vf_base[i] = local_mgr.sriov_caps[0].vf_bar[i];
@@ -415,8 +458,9 @@ class rdma_sriov_enumeration_test extends uvm_test;
         "%s unexpectedly completed SR-IOV enumeration", tag))
     if (mode == 4 && local_adapter.vf_vendor_read_count != 2)
       `uvm_error("FAULT_VF_INDEX", $sformatf(
-        "%s did not reach the second VF vendor read (count=%0d)",
-        tag, local_adapter.vf_vendor_read_count))
+        "%s did not reach the second VF vendor read (count=%0d status=%s)",
+        tag, local_adapter.vf_vendor_read_count,
+        status == null ? "null" : status.convert2string()))
     if (discovered.size() != 0)
       `uvm_error("FAULT_DISCOVERED_ATOMIC", $sformatf(
         "%s published partial Function snapshots after failure", tag))

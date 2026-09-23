@@ -1772,21 +1772,22 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_attachment_route_epoch 对比 attachment runtime 冻结的 route/epoch
-  //   与当前 binding detached identity，阻止复位或换路后的旧 attachment 继续读写队列。
-  // 输入/输出及副作用：attachment 为输入；函数只读取 runtime 与 binding snapshot，
-  //   不预留 cursor、不访问 backing、不修改任何 ownership。
-  // 失败/边界：attachment/binding/identity 缺失、query 返回 null、route/epoch 无效
-  //   或 same_route/epoch 比较失败时返回明确非成功 status，调用方必须在首次队列
-  //   副作用前停止；same_route 只比较 route 字段，不替代 valid 位与身份校验。
-  protected function rdma_status validate_attachment_route_epoch(
-    rdma_queue_data_attachment attachment
+  // 功能：snapshot_attachment_route_epoch 读取 attachment runtime 锁存的 route/epoch，
+  //   并与当前 binding 的 detached identity 比较后，把通过校验的旧 authority 输出
+  //   给 producer admission 用作 recovery evidence。
+  // 输入/输出及副作用：attachment 为非拥有输入；route、epoch、valid 位为输出；
+  //   函数只读取 binding/runtime 快照，不预留 cursor、不访问 backing 或修改 ownership。
+  // 失败/边界：attachment/binding/identity 缺失、query 返回 null、route/epoch 无效或
+  //   与当前 identity 不同返回明确非成功 status；失败时输出清零，调用方不得把
+  //   部分快照交给 pending 或队列副作用阶段。
+  protected function rdma_status snapshot_attachment_route_epoch(
+    rdma_queue_data_attachment attachment,
+    output rdma_route_key_t route,
+    output rdma_reset_epoch_t epoch,
+    output bit route_valid,
+    output bit epoch_valid
   );
     rdma_function_identity identity;
-    rdma_route_key_t route;
-    rdma_reset_epoch_t epoch;
-    bit route_valid;
-    bit epoch_valid;
     rdma_status status;
 
     route = '0;
@@ -1816,6 +1817,139 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("attachment route or reset epoch is stale",
                  RDMA_SC_STALE_GENERATION);
     return rdma_status::success();
+  endfunction
+
+  // 功能：validate_attachment_route_epoch 对比 attachment runtime 冻结的 route/epoch
+  //   与当前 binding detached identity，阻止复位或换路后的旧 attachment 继续读写队列。
+  // 输入/输出及副作用：attachment 为输入；函数只读取 runtime、binding snapshot 和
+  //   临时 authority 输出，不预留 cursor、不访问 backing、不修改任何 ownership。
+  // 失败/边界：attachment/binding/identity 缺失、query 返回 null、route/epoch 无效
+  //   或 same_route/epoch 比较失败时返回明确非成功 status，调用方必须在首次队列
+  //   副作用前停止；same_route 只比较 route 字段，不替代 valid 位与身份校验。
+  protected function rdma_status validate_attachment_route_epoch(
+    rdma_queue_data_attachment attachment
+  );
+    rdma_route_key_t route;
+    rdma_reset_epoch_t epoch;
+    bit route_valid;
+    bit epoch_valid;
+
+    return snapshot_attachment_route_epoch(
+      attachment, route, epoch, route_valid, epoch_valid);
+  endfunction
+
+  // 设计说明：SQ、私有 RQ 与共享 SRQ 都必须在第一次 producer 副作用前重新确认
+  //   attachment 冻结的 Function route/reset epoch；这项 admission 与后续
+  //   reserve_producer 的 runtime 锁边界相邻，但不应散落在各 posting caller 中。
+  //   将两步收束在这里，保证发送和接收都不会在 stale binding 上先拿到可写 cursor。
+  // 功能：reserve_host_producer_cursor 先校验 attachment 的 route/epoch，再从其
+  //   host-producer runtime 取得 detached producer cursor，供 WQE 编码与完成尾段使用。
+  // 输入/输出及副作用：attachment 为 engine-owned 的非拥有引用；cursor 为输出，成功
+  //   时保存当前 producer index/wrap 的独立快照。函数只读取 binding/runtime authority
+  //   并调用一次 reserve_producer，不访问 Host-memory、doorbell、ledger 或 pending。
+  // 失败/边界：attachment/runtime 缺失、route/epoch 查询或比较失败、runtime 非 ACTIVE、
+  //   device ring、ring 满、锁忙或 reservation factory 失败时返回对应非成功 status，
+  //   cursor 保持 null；validate_attachment_route_epoch 的 stale 结果优先于任何
+  //   reservation 失败，确保 caller 在首个副作用前 fail-closed。
+  protected function rdma_status reserve_host_producer_cursor(
+    rdma_queue_data_attachment attachment,
+    output rdma_queue_cursor_snapshot cursor,
+    output rdma_route_key_t reservation_route,
+    output rdma_reset_epoch_t reservation_epoch,
+    output bit reservation_route_valid,
+    output bit reservation_epoch_valid
+  );
+    rdma_status status;
+
+    cursor = null;
+    reservation_route = '0;
+    reservation_epoch = '0;
+    reservation_route_valid = 1'b0;
+    reservation_epoch_valid = 1'b0;
+    if (attachment == null || attachment.runtime == null)
+      return bad("host producer reservation attachment is incomplete",
+                 RDMA_SC_INVALID_STATE);
+
+    status = snapshot_attachment_route_epoch(
+      attachment, reservation_route, reservation_epoch,
+      reservation_route_valid, reservation_epoch_valid);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("host producer route/epoch validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+
+    status = attachment.runtime.reserve_producer(cursor);
+    if (status == null) begin
+      cursor = null;
+      return bad("host producer reservation returned null status",
+                 RDMA_SC_INVALID_STATE);
+    end
+    if (!status.ok())
+      cursor = null;
+    return status;
+  endfunction
+
+  // 设计说明：reserve_producer 只返回 detached cursor，并不把 binding 的
+  // route/reset epoch 与 runtime reservation 绑定成一个跨对象事务；因此在
+  // reservation 返回后、任何 model 编码或 Host-memory 副作用之前仍需重新读取
+  // 当前 Function authority。该 virtual seam 让派生测试/集成层可以在这一窄窗口
+  // 注入一次 reset/换路，再复用同一 fail-closed 校验，而不伪造跨组件全局锁。
+  // 功能：validate_host_producer_reservation_window 复核已取得 cursor 的 attachment
+  //   route/reset epoch，确认 reservation 仍可进入纯编码和后续写回阶段。
+  // 输入/输出及副作用：attachment、cursor 为 caller 保持的非拥有输入；函数只读取
+  //   binding/runtime authority 并返回独立 status，不访问 backing、doorbell、ledger
+  //   或 pending，也不取得 queue/mapping 生命周期所有权。
+  // 失败/边界：attachment/runtime/cursor 缺失、binding identity 无效、route/epoch
+  //   已变化或校验返回 null 时返回对应非成功 status；调用方必须清空本地 cursor 并
+  //   在首次外部副作用前停止，不能把该失败转成 QUEUE_FULL 或创建 recovery pending。
+  protected virtual function rdma_status validate_host_producer_reservation_window(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot cursor
+  );
+    rdma_status status;
+
+    if (attachment == null || attachment.runtime == null || cursor == null)
+      return bad("host producer reservation window is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    status = validate_attachment_route_epoch(attachment);
+    if (status == null)
+      return bad("host producer reservation window validation returned null status",
+                 RDMA_SC_INVALID_STATE);
+    return status;
+  endfunction
+
+  // 设计说明：host producer 的 WQE/doorbell 阶段由 queue-data engine 负责，
+  //   ledger commit 则由 attachment.runtime 负责；若两个调用点各自直接调用
+  //   runtime.commit_producer，null status 归一化和测试故障注入会出现两套边界。
+  //   此 seam 只收束调用与 status ownership，不把 runtime ledger 的锁或状态迁移
+  //   复制到 engine，也不宣称跨组件原子性。
+  // 功能：commit_host_producer_ledger 将冻结的 producer reservation、request 和
+  //   image 交给 runtime 提交一次 host-producer ledger，并统一规范 backend 返回。
+  // 输入/输出及副作用：attachment、cursor、request、wr_id、signaled、image 为
+  //   caller 冻结输入；函数只调用 attachment.runtime.commit_producer，成功时由
+  //   runtime 推进 PI/used 并保存 slot snapshot，函数本身不修改 engine attachment。
+  // 失败/边界：attachment/runtime/cursor 缺失返回 INVALID_STATE；runtime 返回
+  //   null 时转换为 INVALID_STATE；非成功 status 原样返回且不安装 recovery，
+  //   caller 必须按当前阶段决定是否保存 AMBIGUOUS/NO_SUBMIT evidence。
+  protected virtual function rdma_status commit_host_producer_ledger(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot cursor,
+    rdma_semantic_request request,
+    longint unsigned wr_id,
+    bit signaled,
+    rdma_hw_image image
+  );
+    rdma_status status;
+
+    if (attachment == null || attachment.runtime == null || cursor == null)
+      return bad("host producer ledger commit input is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    status = attachment.runtime.commit_producer(
+      cursor, request, wr_id, signaled, image);
+    if (status == null)
+      return bad("host producer ledger commit returned null status",
+                 RDMA_SC_INVALID_STATE);
+    return status;
   endfunction
 
   // 功能：query_runtime_state 返回指定队列 attachment 的只读运行状态，供
@@ -2847,22 +2981,155 @@ class rdma_queue_data_engine extends uvm_object;
       bad("pending query returned null status", RDMA_SC_INVALID_STATE) : status;
   endfunction
 
-  // 设计说明：publish_cqe 的前半段只负责确认 CQ attachment、QP route、CQE
-  //   model 与 WQE release authority；reservation、codec、backing write 及 recovery
-  //   commit 必须继续由 task 独占，避免 helper 在校验阶段产生不可回滚的 runtime
-  //   mutation。输出句柄是 engine-owned registry 的非拥有引用，仅供同一次 task
-  //   调用后续阶段使用。
+  // 功能：resolve_cqe_variant_for_route 根据冻结 QP link transport、CQE 的 receive
+  //   与 SRFQ 标志计算唯一 overlay variant，集中执行 publish/decode 共用的
+  //   transport authority gate。
+  // 输入/输出及副作用：rq_cqe、srfq、transport 为输入；variant 为输出；函数只读
+  //   route 标志，不修改 model、link、CQ runtime、codec registry、cursor 或 backing
+  //   ownership，也不建立 recovery evidence。
+  // 失败/边界：rq_cqe/srfq 含 X/Z、send CQE 设置 srfq、transport 不是 RC/UD/URC
+  //   时返回 INVALID_ARGUMENT 或 INVALID_STATE；receive CQE 一律要求 RQ/SRFQ
+  //   variant，send CQE 的 UD/RC/URC 分别要求 UD/RC overlay；QP 是否实际挂接
+  //   SRQ 由紧邻的 route-consistency helper 继续校验。
+  protected function rdma_status resolve_cqe_variant_for_route(
+    input logic rq_cqe,
+    input logic srfq,
+    input rdma_transport_e transport,
+    output rdma_cqe_variant_e variant
+  );
+    variant = RDMA_CQE_VARIANT_RC;
+
+    if (rq_cqe !== 1'b0 && rq_cqe !== 1'b1)
+      return bad("CQE receive flag is unknown", RDMA_SC_INVALID_ARGUMENT);
+    if (srfq !== 1'b0 && srfq !== 1'b1)
+      return bad("CQE SRFQ flag is unknown", RDMA_SC_INVALID_ARGUMENT);
+
+    // 设计说明：receive CQE 的 overlay 虽然不依赖 RC/UD/URC 的 send
+    // union，但其 QP route 仍必须来自受支持的 transport。先做 route
+    // authority 校验，再允许 RQ/SRFQ overlay，避免 CUSTOM/RESERVED link
+    // 借 receive 标志绕过 transport gate。
+    case (transport)
+      RDMA_TRANSPORT_RC,
+      RDMA_TRANSPORT_UD,
+      RDMA_TRANSPORT_URC: begin end
+      default:
+        return bad("CQE route transport is invalid", RDMA_SC_INVALID_STATE);
+    endcase
+
+    if (rq_cqe) begin
+      variant = RDMA_CQE_VARIANT_RQ_SRFQ;
+      return rdma_status::success();
+    end
+    if (srfq)
+      return bad("CQE send cannot set SRFQ", RDMA_SC_INVALID_ARGUMENT);
+
+    case (transport)
+      RDMA_TRANSPORT_UD:
+        variant = RDMA_CQE_VARIANT_UD;
+      RDMA_TRANSPORT_RC,
+      RDMA_TRANSPORT_URC:
+        variant = RDMA_CQE_VARIANT_RC;
+      default:
+        return bad("CQE route transport is invalid", RDMA_SC_INVALID_STATE);
+    endcase
+    return rdma_status::success();
+  endfunction
+
+  // 功能：validate_cqe_srfq_route_consistency 将 CQE 的 receive/SRFQ wire 标志与
+  //   冻结 QP link 的 SRQ 拓扑对齐，阻止同一 QPN 被错误地导向私有 RQ 或 shared
+  //   SRQ ledger。
+  // 输入/输出及副作用：rq_cqe、srfq、link 为只读输入；函数返回独立
+  //   rdma_status，不修改 model、link、attachment、runtime、cursor、backing 或
+  //   recovery evidence，也不查询或创建任何资源。
+  // 失败/边界：link/QP handle 为空、标志含 X/Z、send CQE 携带 srfq，或 receive
+  //   CQE 的 srfq 与 `link.srq_h != null` 不相等时返回 INVALID_STATE 或
+  //   INVALID_ARGUMENT；成功只证明 wire route 与 SRQ presence 一致，仍需由调用方
+  //   继续完成 QP identity、attachment、WQE ledger 和 polarity 校验。
+  protected function rdma_status validate_cqe_srfq_route_consistency(
+    input logic rq_cqe,
+    input logic srfq,
+    input rdma_queue_data_qp_link link
+  );
+    bit route_uses_srq;
+
+    if (link == null || link.qp_h == null ||
+        link.qp_h.kind !== RDMA_RESOURCE_QP)
+      return bad("CQE SRFQ route authority is incomplete",
+                 RDMA_SC_INVALID_STATE);
+    if (link.srq_h != null && link.srq_h.kind !== RDMA_RESOURCE_SRQ)
+      return bad("CQE SRFQ route SRQ handle kind is invalid",
+                 RDMA_SC_INVALID_STATE);
+    if (rq_cqe !== 1'b0 && rq_cqe !== 1'b1)
+      return bad("CQE receive flag is unknown", RDMA_SC_INVALID_ARGUMENT);
+    if (srfq !== 1'b0 && srfq !== 1'b1)
+      return bad("CQE SRFQ flag is unknown", RDMA_SC_INVALID_ARGUMENT);
+    if (!rq_cqe) begin
+      if (srfq)
+        return bad("CQE send cannot set SRFQ", RDMA_SC_INVALID_ARGUMENT);
+      return rdma_status::success();
+    end
+
+    route_uses_srq = (link.srq_h != null);
+    if (srfq !== route_uses_srq)
+      return bad("CQE SRFQ flag disagrees with QP receive route",
+                 RDMA_SC_INVALID_ARGUMENT);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：validate_cqe_variant_consistency 比较 CQE model 的显式 variant 与已冻结
+  //   QP link authority，阻止错误 overlay 在 producer reservation 前进入编码阶段。
+  // 输入/输出及副作用：model、link 为只读输入；返回独立 rdma_status，不修改
+  //   model、link、attachment、runtime、cursor、backing 或 recovery ownership。
+  // 失败/边界：model/link 为空、receive/SRFQ 标志或 route transport 未知、send CQE
+  //   带 srfq、SRFQ 与 QP 的 SRQ presence 不一致，或显式 variant 与期望的
+  //   RQ_SRFQ/UD/RC 不一致时返回错误；成功只表示 authority 一致，不代表 WQE
+  //   ledger 或 CQ polarity 已经通过后续校验。
+  protected function rdma_status validate_cqe_variant_consistency(
+    input rdma_hw_cqe_model model,
+    input rdma_queue_data_qp_link link
+  );
+    rdma_cqe_variant_e expected_variant;
+    rdma_status status;
+
+    if (model == null || link == null)
+      return bad("CQE variant authority is incomplete", RDMA_SC_INVALID_STATE);
+    status = resolve_cqe_variant_for_route(
+      model.rq_cqe, model.srfq, link.transport, expected_variant);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("CQE variant route resolver returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    status = validate_cqe_srfq_route_consistency(
+      model.rq_cqe, model.srfq, link);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("CQE SRFQ route validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    if (model.variant !== expected_variant)
+      return bad($sformatf(
+        "CQE variant does not match QP transport (expected=%0d actual=%0d)",
+        expected_variant, model.variant), RDMA_SC_INVALID_ARGUMENT);
+    return rdma_status::success();
+  endfunction
+
+  // 设计说明：CQE 的 qword2/qword3 是物理 union，不能由 CQ attachment 上保存的
+  //   transport 猜测 overlay；必须先锁定携带完整 QP authority 的 qp_link，再以该
+  //   link 的 transport 和 CQE receive/SRFQ 标志共同决定 variant。publish 与 poll
+  //   decode 共用同一只读解析 helper，避免共享 CQ 上 RC/UD/URC QP 交错时出现不同
+  //   解释。该阶段只做 admission，reservation、codec、backing write 及 recovery
+  //   commit 继续由 task 独占，避免校验阶段产生不可回滚的 runtime mutation。
   // 功能：按既有失败顺序校验 CQ handle/attachment/route、CQE model Function 与
-  //   generation、QP link、QPN wire 范围以及 routed SQ/RQ/SRQ 的 WQE release range，
-  //   成功返回后续 publish 所需的三个 canonical authority 引用。
+  //   generation、QP link、QPN wire 范围、transport-aware CQE variant 以及 routed
+  //   SQ/RQ/SRQ 的 WQE release range，成功返回后续 publish 所需的三个 canonical
+  //   authority 引用。
   // 输入/输出及副作用：cq_h、model 为只读输入；attachment、wqe_attachment、link
   //   先清空，成功时分别返回 CQ、WQE 和 QP route 的非拥有引用；函数只查询 registry、
   //   binding 与 runtime 校验，不 reserve producer、编码/写入 CQE、不推进 cursor，
   //   不取得或转移 backing、QP、CQ 或 WQE 生命周期所有权。
   // 失败/边界：null status 会被归一化为原有 INVALID_STATE/各阶段错误；handle、
   //   attachment/route/epoch、model/status、Function UID/generation、link identity
-  //   （由 same_handle_instance 比较）、QPN 表示范围、WQE attachment 或 release
-  //   range 任一拒绝时返回首个具体错误，
+  //   （由 same_handle_instance 比较）、QPN 表示范围、variant/transport 一致性、
+  //   WQE attachment 或 release range 任一拒绝时返回首个具体错误，
   //   输出引用保持 null，调用方不得进入 reservation 或 encode/write 阶段。
   protected function rdma_status validate_cqe_publish_authority(
     input rdma_handle cq_h,
@@ -2927,6 +3194,13 @@ class rdma_queue_data_engine extends uvm_object;
     if (link.local_qp_id > 18'h3ffff)
       return bad("CQE QPN cannot represent attached QP",
                  RDMA_SC_INVALID_ARGUMENT);
+    status = validate_cqe_variant_consistency(model, link);
+    if (status == null || !status.ok()) begin
+      status = status == null ?
+        bad("CQE variant consistency validation returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+      return status;
+    end
     if (model.rq_cqe) begin
       if (link.srq_h != null)
         status = lookup_attachment(link.srq_h, RDMA_QUEUE_RUNTIME_SRQ,
@@ -3533,6 +3807,83 @@ class rdma_queue_data_engine extends uvm_object;
       aeq_h, model, secondary_target_h, result, status);
   endtask
 
+  // 功能：在 rdma_queue_data_engine 中，prepare_aeqe_publish_image 将已解析的
+  //   AEQE route authority 物化为独立 encode model，并在任何 producer reservation
+  //   之前完成 registry lookup、typed codec dispatch 与固定 16B image staging。
+  // 输入/输出及副作用：model、primary_route_h、event_class 为只读输入；encode_model
+  //   与 image 为输出，成功时分别持有 primary route 的 detached clone 和完整 AEQE
+  //   hardware image；函数只访问 codec registry/factory，不写 attachment、runtime、
+  //   cursor、backing、pending 或外部资源生命周期。
+  // 失败/边界：输入缺失、clone/cast、target snapshot、profile authority、registry
+  //   lookup/type、codec null status/失败或非 16B image 均返回具体错误，并保持两个
+  //   输出为 null；函数不 reserve、不写 Host-memory/MMIO，也不把失败 image 交给 caller。
+  protected function rdma_status prepare_aeqe_publish_image(
+    input rdma_hw_aeqe_model model,
+    input rdma_handle primary_route_h,
+    input rdma_aeqe_event_class_e event_class,
+    output rdma_hw_aeqe_model encode_model,
+    output rdma_hw_image image
+  );
+    rdma_codec_key key;
+    rdma_codec_base base_codec;
+    rdma_hw_aeqe_codec aeqe_codec;
+    uvm_object raw_encode_model;
+    rdma_handle encoded_target_h;
+    rdma_status status;
+
+    encode_model = null;
+    image = null;
+    if (model == null || primary_route_h == null)
+      return bad("AEQE encode authority is incomplete",
+                 RDMA_SC_INVALID_ARGUMENT);
+
+    raw_encode_model = model.clone();
+    if (raw_encode_model == null || !$cast(encode_model, raw_encode_model)) begin
+      encode_model = null;
+      return bad("AEQE encode model clone failed",
+                 RDMA_SC_RESOURCE_EXHAUSTED);
+    end
+    encoded_target_h = rdma_clone_handle_value(
+      primary_route_h, "AEQE encode target");
+    if (encoded_target_h == null) begin
+      encode_model = null;
+      return bad("AEQE encode target snapshot allocation failed",
+                 RDMA_SC_RESOURCE_EXHAUSTED);
+    end
+    encode_model.target_h = encoded_target_h;
+    status = encode_model.set_profile_owner_authority(
+      event_class, primary_route_h.kind);
+    if (status == null || !status.ok()) begin
+      encode_model = null;
+      return status == null ?
+        bad("AEQE profile authority setup returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    end
+    key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
+      object_type:"aeqe", variant:"default", opcode:8'h00};
+    status = registry.lookup(key, base_codec);
+    if (status == null || !status.ok()) begin
+      encode_model = null;
+      return status == null ?
+        bad("AEQE codec lookup returned null status", RDMA_SC_CODEC_ERROR) : status;
+    end
+    if (!$cast(aeqe_codec, base_codec) || aeqe_codec == null) begin
+      encode_model = null;
+      return bad("AEQE registry codec type mismatch", RDMA_SC_CODEC_ERROR);
+    end
+    status = aeqe_codec.encode(encode_model, image);
+    if (status == null || !status.ok() || image == null ||
+        image.length != 16 || image.bytes.size() != 16) begin
+      encode_model = null;
+      image = null;
+      return status == null ?
+        bad("AEQE encode returned null status", RDMA_SC_CODEC_ERROR) :
+        (!status.ok() ? status : bad("AEQE codec did not return fixed 16B image",
+                                     RDMA_SC_CODEC_ERROR));
+    end
+    return status;
+  endfunction
+
   // 功能：publish_aeqe_common 统一执行 AEQE wire/双路由 authority preflight、完整
   //   16B encode、device reservation 与 backing commit，供 legacy/sibling API 共用。
   // 输入/输出及副作用：aeq_h/model/secondary_target_h 为只读输入；成功返回
@@ -3549,17 +3900,12 @@ class rdma_queue_data_engine extends uvm_object;
   );
     rdma_queue_data_attachment attachment;
     rdma_queue_cursor_snapshot reservation;
-    rdma_codec_key key;
-    rdma_codec_base base_codec;
-    rdma_hw_aeqe_codec aeqe_codec;
     rdma_hw_image image;
     rdma_status original_status;
-    uvm_object raw_encode_model;
     rdma_hw_aeqe_model encode_model;
     rdma_aeqe_event_class_e event_class;
     rdma_handle primary_route_h;
     rdma_handle secondary_route_h;
-    rdma_handle encoded_target_h;
     bit primary_found;
     bit secondary_found;
     bit is_cq_flush;
@@ -3582,51 +3928,13 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    // 设计说明：codec 仍要求 canonical model 带 target_h，因此把 manager 返回
-    // 的 primary route 克隆到局部 encode_model，并冻结 class/owner authority。
-    // caller model 不被写回；registry lookup、cast 和完整 16B encode 都必须在
-    // reserve 前完成，使 class-cross/codec 拒绝没有临时 cursor 或 fault precedence。
-    raw_encode_model = model.clone();
-    if (raw_encode_model == null || !$cast(encode_model, raw_encode_model)) begin
-      status = bad("AEQE encode model clone failed",
-                   RDMA_SC_RESOURCE_EXHAUSTED);
-      return;
-    end
-    encoded_target_h = rdma_clone_handle_value(
-      primary_route_h, "AEQE encode target");
-    if (encoded_target_h == null) begin
-      status = bad("AEQE encode target snapshot allocation failed",
-                   RDMA_SC_RESOURCE_EXHAUSTED);
-      return;
-    end
-    encode_model.target_h = encoded_target_h;
-    status = encode_model.set_profile_owner_authority(
-      event_class, primary_route_h.kind);
+    status = prepare_aeqe_publish_image(
+      model, primary_route_h, event_class, encode_model, image
+    );
     if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("AEQE profile authority setup returned null status",
-            RDMA_SC_INVALID_STATE) : status;
-      return;
-    end
-    key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
-      object_type:"aeqe", variant:"default", opcode:8'h00};
-    status = registry.lookup(key, base_codec);
-    if (status == null || !status.ok()) begin
-      status = status == null ?
-        bad("AEQE codec lookup returned null status", RDMA_SC_CODEC_ERROR) : status;
-      return;
-    end
-    if (!$cast(aeqe_codec, base_codec) || aeqe_codec == null) begin
-      status = bad("AEQE registry codec type mismatch", RDMA_SC_CODEC_ERROR);
-      return;
-    end
-    status = aeqe_codec.encode(encode_model, image);
-    if (status == null || !status.ok() || image == null ||
-        image.length != 16 || image.bytes.size() != 16) begin
-      status = status == null ?
-        bad("AEQE encode returned null status", RDMA_SC_CODEC_ERROR) :
-        (!status.ok() ? status : bad("AEQE codec did not return fixed 16B image",
-                                     RDMA_SC_CODEC_ERROR));
+      if (status == null)
+        status = bad("AEQE publish image preparation returned null status",
+                     RDMA_SC_INVALID_STATE);
       return;
     end
 
@@ -5237,11 +5545,15 @@ class rdma_queue_data_engine extends uvm_object;
   endfunction
 
   // 功能：make_pending 为 legacy host producer/post 失败构造 recovery evidence，
-  //   保存 queue/cursor、image、request、WR 与可选 completion route 字段。
+  //   保存 queue/cursor、image、request、WR 与可选 completion route 字段，并尽量
+  //   锁存 attachment 当前的 route/reset epoch，供 recovery 重放前再次核对。
   // 输入/输出及副作用：cursor 和其余事务字段为输入；成功返回 detached pending，
-  //   handle/cursor/request/image/routed QP 均按值复制，不修改源对象或 runtime。
+  //   handle/cursor/request/image/routed QP 均按值复制；source_attachment 只读查询
+  //   runtime route/epoch，不修改源对象或 runtime，也不取得外部生命周期所有权。
   // 失败/边界：该兼容 factory 入口无 status；任一 nested clone 返回 null 或错误
-  //   类型时返回 null，禁止把 request/image 缺失的半成品交给 enter_recovery。
+  //   类型时返回 null，禁止把 request/image 缺失的半成品交给 enter_recovery；若
+  //   route/epoch 查询失败则保留 route_valid/epoch_valid=0，使 replay 明确拒绝
+  //   旧 evidence，而不是猜测当前 authority。
   protected function rdma_queue_pending_operation make_pending(
     rdma_queue_cursor_snapshot cursor,
     rdma_handle queue_h = null,
@@ -5255,9 +5567,11 @@ class rdma_queue_data_engine extends uvm_object;
     bit completion_wrap = 1'b0,
     bit completion_target_valid = 1'b0,
     bit completion_released = 1'b0,
-    rdma_handle routed_qp_h = null
+    rdma_handle routed_qp_h = null,
+    rdma_queue_data_attachment source_attachment = null
   );
     rdma_queue_pending_operation pending;
+    rdma_status route_status;
     uvm_object cloned;
     rdma_post_send_req source_send;
     rdma_post_recv_req source_recv;
@@ -5329,7 +5643,53 @@ class rdma_queue_data_engine extends uvm_object;
         return null;
       end
     end
+    if (source_attachment != null && source_attachment.runtime != null) begin
+      route_status = source_attachment.runtime.query_route_epoch(
+        pending.route, pending.route_valid, pending.reset_epoch,
+        pending.epoch_valid);
+      if (route_status == null || !route_status.ok() ||
+          !pending.route_valid || !pending.epoch_valid ||
+          !rdma_route_key_valid(pending.route)) begin
+        pending.route = '0;
+        pending.route_valid = 1'b0;
+        pending.reset_epoch = '0;
+        pending.epoch_valid = 1'b0;
+      end
+    end
     return pending;
+  endfunction
+
+  // 功能：apply_host_producer_pending_route_epoch 把 reservation admission 时冻结的
+  //   route/reset epoch 写入刚构造的 host-producer pending，覆盖 make_pending 对
+  //   当前 runtime 的兼容查询结果。
+  // 输入/输出及副作用：pending 为待发布的本地 evidence；route、epoch 和 valid 位为
+  //   caller 在 reserve 前取得的值。函数只修改 pending 的四个 authority 字段，不
+  //   访问 runtime/backing/ledger，也不取得任何生命周期所有权。
+  // 失败/边界：pending 为空、valid 位不全、route 非法时返回 0 并清空 pending
+  //   authority；成功后 replay 可区分 reservation incarnation，不能把当前 runtime
+  //   查询结果当作旧事务的原始证据。
+  protected function bit apply_host_producer_pending_route_epoch(
+    rdma_queue_pending_operation pending,
+    rdma_route_key_t route,
+    rdma_reset_epoch_t epoch,
+    bit route_valid,
+    bit epoch_valid
+  );
+    if (pending == null || !route_valid || !epoch_valid ||
+        !rdma_route_key_valid(route)) begin
+      if (pending != null) begin
+        pending.route = '0;
+        pending.route_valid = 1'b0;
+        pending.reset_epoch = '0;
+        pending.epoch_valid = 1'b0;
+      end
+      return 1'b0;
+    end
+    pending.route = route;
+    pending.route_valid = 1'b1;
+    pending.reset_epoch = epoch;
+    pending.epoch_valid = 1'b1;
+    return 1'b1;
   endfunction
 
   // 功能：clone_pending_handle_value 为 legacy pending 复制可选 queue/route handle，
@@ -5769,9 +6129,10 @@ class rdma_queue_data_engine extends uvm_object;
   // 输入/输出及副作用：cq_h、entry_image 和 header_offset 为输入；variant、link
   //       为输出的非拥有 route/variant 快照；函数只读 CQE bytes 与 qp_links，不修改
   //       runtime、codec registry 或 backing ownership。
-  // 失败/边界：image 为空、header 窗口越界、qpn/CQ route 不唯一、route 缺失或
-  //       transport 非法时返回错误；没有 route 时禁止猜测 RC/UD variant，以免真实
-  //       UD qword3 被错误地按 reserved 位拒收或把 RQ overlay 解释成 send CQE。
+  // 失败/边界：image 为空、header 窗口越界、qpn/CQ route 不唯一、route 缺失、
+  //       send CQE 携带 srfq、receive CQE 的 SRFQ 位与 QP 的 SRQ presence 不一致，
+  //       或 transport 非法时返回错误；没有 route 时禁止猜测 RC/UD variant，以免
+  //       真实 UD qword3 被错误地按 reserved 位拒收或把 RQ overlay 解释成 send CQE。
   protected function rdma_status resolve_cqe_variant_for_image(
     rdma_handle cq_h,
     rdma_hw_image entry_image,
@@ -5808,17 +6169,16 @@ class rdma_queue_data_engine extends uvm_object;
     if (link == null)
       return bad("CQE variant route lookup returned no link", RDMA_SC_INVALID_STATE);
 
-    if (rq_cqe || srfq)
-      variant = RDMA_CQE_VARIANT_RQ_SRFQ;
-    else if (link.transport == RDMA_TRANSPORT_UD)
-      variant = RDMA_CQE_VARIANT_UD;
-    else if (link.transport == RDMA_TRANSPORT_RC ||
-             link.transport == RDMA_TRANSPORT_URC)
-      variant = RDMA_CQE_VARIANT_RC;
-    else
-      return bad("CQE variant route transport is invalid", RDMA_SC_INVALID_STATE);
-
-    return rdma_status::success();
+    status = resolve_cqe_variant_for_route(
+      rq_cqe, srfq, link.transport, variant);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("CQE image variant route resolver returned null status",
+            RDMA_SC_INVALID_STATE) : status;
+    status = validate_cqe_srfq_route_consistency(rq_cqe, srfq, link);
+    return status == null ?
+      bad("CQE image SRFQ route validation returned null status",
+          RDMA_SC_INVALID_STATE) : status;
   endfunction
 
   // 功能：find_qp_link_for_cq 按 CQE qpn 与 send/receive 标志，在 qp_links 中选择
@@ -7069,6 +7429,71 @@ class rdma_queue_data_engine extends uvm_object;
       return prepared_status;
     end
     return cq_attachment.runtime.commit_consumer(cursor);
+  endfunction
+
+  // 设计说明：CEQ 与 AEQ 在 decode、route 和 result 物化之后都必须先准备完整的
+  //   consumer pending/doorbell evidence，才能进入 commit_event_poll_candidate 的
+  //   首个 runtime mutation。两条入口的 prepared continuation 过去各自维护同一段
+  //   顺序，容易让一侧新增的 null-status 或 noalloc 保护漏到另一侧；这里仅收束
+  //   这段无副作用 staging，不把 event route、result delivery 或 recovery commit
+  //   伪装成通用逻辑。
+  // 功能：prepare_event_poll_continuation 为 CEQ/AEQ poll 构造 detached consumer
+  //   pending、doorbell descriptor 和 post-scheduler noalloc status，供唯一的 event
+  //   commit task 接管；它保持调用方已经冻结的 cursor、image 与 attachment。
+  // 输入/输出及副作用：event_name、attachment、cursor、next、entry_offset 和
+  //   entry_image 为只读输入；pending、prepared_db_desc、noalloc_status 先清空并由
+  //   成功路径输出。函数只分配/复制 staging 对象并读取 runtime/registry，不调用
+  //   scheduler、写 Host-memory/MMIO、推进 CI/used、建立 recovery 或取得资源所有权。
+  // 失败/边界：attachment/cursor/next/image 输入不完整、prepare_consumer_pending
+  //   返回 null/失败、doorbell descriptor 或 noalloc status 缺失时返回确定的
+  //   non-fatal 错误；保留底层非成功 status 与原有阶段优先级，失败输出会清空，
+  //   caller 不得进入
+  //   enter_recovery_prepared。event_name 仅用于诊断，不改变 CEQ/AEQ route-miss 语义。
+  protected function rdma_status prepare_event_poll_continuation(
+    string event_name,
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot cursor,
+    rdma_queue_cursor_snapshot next,
+    longint unsigned entry_offset,
+    rdma_hw_image entry_image,
+    output rdma_queue_pending_operation pending,
+    output rdma_doorbell_desc prepared_db_desc,
+    output rdma_status noalloc_status
+  );
+    rdma_queue_data_qp_link no_route;
+    rdma_status status;
+
+    pending = null;
+    prepared_db_desc = null;
+    noalloc_status = null;
+    no_route = null;
+
+    status = prepare_consumer_pending(
+      attachment, cursor, next, entry_offset, entry_image,
+      0, 1'b0, 1'b0, RDMA_QUEUE_RUNTIME_SQ, null, pending);
+    if (status == null || !status.ok() || pending == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          {event_name, " prepared pending is incomplete"});
+      pending = null;
+      return status;
+    end
+
+    status = prepare_consumer_doorbell(
+      attachment, next, no_route, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok() || prepared_db_desc == null ||
+        noalloc_status == null) begin
+      if (status == null || status.ok())
+        status = make_engine_status_nonfatal(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          {event_name, " consumer doorbell preparation is incomplete"});
+      pending = null;
+      prepared_db_desc = null;
+      noalloc_status = null;
+      return status;
+    end
+    return status;
   endfunction
 
   // 设计说明：CEQ 与 AEQ 的 poll 入口各自负责 image 解码、route 解析和
@@ -8486,10 +8911,8 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_pending_operation pending;
     rdma_queue_event_result result_candidate;
     rdma_doorbell_desc prepared_db_desc;
-    rdma_queue_data_qp_link no_route;
     rdma_status event_status;
     rdma_status final_success;
-    rdma_status local_status;
     rdma_status noalloc_status;
     bit route_found;
     byte data[];
@@ -8569,31 +8992,69 @@ class rdma_queue_data_engine extends uvm_object;
       if (final_success == null)
         return;
     end
-    status = prepare_consumer_pending(
-      attachment, cursor, next, offset, entry_image,
-      0, 1'b0, 1'b0, RDMA_QUEUE_RUNTIME_SQ, null, pending);
-    if (status == null || !status.ok() || pending == null) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RESOURCE_EXHAUSTED, "CEQ prepared pending is incomplete");
-      return;
-    end
-    prepared_db_desc = null;
-    noalloc_status = null;
-    status = prepare_consumer_doorbell(
-      attachment, next, no_route, prepared_db_desc, noalloc_status);
-    if (status == null || !status.ok() || prepared_db_desc == null ||
-        noalloc_status == null) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RESOURCE_EXHAUSTED,
-          "CEQ consumer doorbell preparation is incomplete");
-      return;
-    end
+    status = prepare_event_poll_continuation(
+      "CEQ", attachment, cursor, next, offset, entry_image,
+      pending, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok()) return;
     commit_event_poll_candidate(
       "CEQ", attachment, cursor, next, pending, prepared_db_desc,
       noalloc_status, result_candidate, final_success, route_found,
       result, status);
+  endtask
+
+  // 功能：poll_event_with_timeout 统一 CEQ/AEQ wrapper 的 deadline、QUEUE_EMPTY
+  //   重试和结果发布外壳，再把单次尝试委托给对应的 `*_once` task。
+  // 输入/输出及副作用：event_h、timeout、is_aeq 和 label 为输入，result/status 为
+  //   输出；timeout=0 只尝试一次，非零时每 1ns 重试 QUEUE_EMPTY，成功时发布 detached
+  //   event 快照。helper 不修改 runtime、ledger、backing 或外部 resource ownership。
+  // 失败/边界：deadline 溢出、单次 task 返回 null status、非 QUEUE_EMPTY 失败以及
+  //   timeout 到期均直接返回并保持 result=null；is_aeq 只选择 CEQ/AEQ 单次入口，
+  //   不改变各自 decode/route/pending/doorbell/commit/recovery 语义。
+  protected task poll_event_with_timeout(
+    rdma_handle event_h,
+    time timeout,
+    bit is_aeq,
+    string label,
+    output rdma_queue_event_result result,
+    output rdma_status status
+  );
+    time deadline;
+    rdma_queue_event_result candidate;
+    rdma_status attempt;
+
+    result = null;
+    status = null;
+    if (timeout != 0) begin
+      deadline = $time + timeout;
+      if (deadline < $time) begin
+        status = bad({label, " poll deadline overflows simulation time"});
+        return;
+      end
+    end
+    do begin
+      candidate = null;
+      attempt = null;
+      if (is_aeq)
+        poll_aeqe_once(event_h, candidate, attempt);
+      else
+        poll_ceqe_once(event_h, candidate, attempt);
+      if (attempt == null) begin
+        status = bad({label, " poll returned null status"}, RDMA_SC_INVALID_STATE);
+        return;
+      end
+      if (attempt.code != RDMA_SC_QUEUE_EMPTY || timeout == 0) begin
+        status = attempt;
+        if (attempt.ok())
+          result = candidate;
+        return;
+      end
+      if ($time >= deadline) begin
+        status = rdma_status::make(
+          RDMA_SC_TIMEOUT, {label, " poll deadline expired"});
+        return;
+      end
+      #1ns;
+    end while (1);
   endtask
 
   // 功能：poll_ceqe 以 ceq_h 轮询一条 CEQE；poll_ceqe_once 在 prepared
@@ -8609,24 +9070,7 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_queue_event_result result,
     output rdma_status status
   );
-    time deadline;
-    rdma_queue_event_result candidate;
-    rdma_status attempt;
-    result = null; status = null;
-    if (timeout != 0) begin
-      deadline = $time + timeout;
-      if (deadline < $time) begin status = bad("CEQ poll deadline overflows simulation time"); return; end
-    end
-    do begin
-      candidate = null; attempt = null;
-      poll_ceqe_once(ceq_h, candidate, attempt);
-      if (attempt == null) begin status = bad("CEQ poll returned null status", RDMA_SC_INVALID_STATE); return; end
-      if (attempt.code != RDMA_SC_QUEUE_EMPTY || timeout == 0) begin
-        status = attempt; if (attempt.ok()) result = candidate; return;
-      end
-      if ($time >= deadline) begin status = rdma_status::make(RDMA_SC_TIMEOUT, "CEQ poll deadline expired"); return; end
-      #1ns;
-    end while (1);
+    poll_event_with_timeout(ceq_h, timeout, 1'b0, "CEQ", result, status);
   endtask
 
   // 功能：poll_aeqe_once 在 scheduler 前冻结 AEQE、按 ecode class 解析 owner route
@@ -8656,7 +9100,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_pending_operation pending;
     rdma_queue_event_result result_candidate;
     rdma_doorbell_desc prepared_db_desc;
-    rdma_queue_data_qp_link no_route;
     rdma_status event_status;
     rdma_status final_success;
     rdma_status noalloc_status;
@@ -8755,27 +9198,10 @@ class rdma_queue_data_engine extends uvm_object;
       if (final_success == null)
         return;
     end
-    status = prepare_consumer_pending(
-      attachment, cursor, next, offset, entry_image,
-      0, 1'b0, 1'b0, RDMA_QUEUE_RUNTIME_SQ, null, pending);
-    if (status == null || !status.ok() || pending == null) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RESOURCE_EXHAUSTED, "AEQ prepared pending is incomplete");
-      return;
-    end
-    prepared_db_desc = null;
-    noalloc_status = null;
-    status = prepare_consumer_doorbell(
-      attachment, next, no_route, prepared_db_desc, noalloc_status);
-    if (status == null || !status.ok() || prepared_db_desc == null ||
-        noalloc_status == null) begin
-      if (status == null || status.ok())
-        status = make_engine_status_nonfatal(
-          RDMA_SC_RESOURCE_EXHAUSTED,
-          "AEQ consumer doorbell preparation is incomplete");
-      return;
-    end
+    status = prepare_event_poll_continuation(
+      "AEQ", attachment, cursor, next, offset, entry_image,
+      pending, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok()) return;
     commit_event_poll_candidate(
       "AEQ", attachment, cursor, next, pending, prepared_db_desc,
       noalloc_status, result_candidate, final_success, deliver_found,
@@ -8795,31 +9221,276 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_queue_event_result result,
     output rdma_status status
   );
-    time deadline;
-    rdma_queue_event_result candidate;
-    rdma_status attempt;
-    result = null; status = null;
-    if (timeout != 0) begin
-      deadline = $time + timeout;
-      if (deadline < $time) begin status = bad("AEQ poll deadline overflows simulation time"); return; end
+    poll_event_with_timeout(aeq_h, timeout, 1'b1, "AEQ", result, status);
+  endtask
+
+  // 功能：admit_host_producer_recovery 将 host-producer 失败证据交给对应 runtime，
+  //   并把 runtime 的 null 返回归一化为 RECOVERY_REQUIRED，供发送/接收尾段共享。
+  // 输入/输出及副作用：attachment、pending 和 mmio_maybe_submitted 为输入；成功时
+  //   runtime 接管 pending 并切换 recovery 状态，函数不修改 caller 的 request/image
+  //   或外部 backing 所有权。
+  // 失败/边界：attachment/runtime/pending 缺失、runtime 拒绝或返回 null 时返回非空
+  //   非成功状态；调用方必须保留原始阶段失败并禁止伪造 post result。
+  protected virtual function rdma_status admit_host_producer_recovery(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    bit mmio_maybe_submitted
+  );
+    rdma_status admission;
+
+    if (attachment == null || attachment.runtime == null || pending == null)
+      return bad("host producer recovery admission input is incomplete",
+                 RDMA_SC_RECOVERY_REQUIRED);
+    admission = attachment.runtime.enter_recovery(
+      pending, mmio_maybe_submitted);
+    if (admission == null)
+      return bad("host producer recovery admission returned null status",
+                 RDMA_SC_RECOVERY_REQUIRED);
+    return admission;
+  endfunction
+
+  // 功能：install_host_producer_recovery 为已经发生 Host-memory 写入的 SQ/RQ/SRQ
+  //   事务构造同一 detached pending，覆盖 make_pending 的兼容 route 查询并完成
+  //   NO_SUBMIT/AMBIGUOUS recovery admission。
+  // 输入/输出及副作用：attachment、queue_h、kind、cursor、offset、image、snapshot、
+  //   signaled、reservation route/epoch、MMIO 阶段和 failure_label 为输入；status 为
+  //   inout，成功 admission 时保持原始阶段错误，pending 构造或 admission 失败时改
+  //   为可观察的资源/恢复错误；可能切换 runtime recovery，但不取得外部资源所有权。
+  // 失败/边界：pending clone、route/epoch 覆盖、runtime admission 任一失败都返回
+  //   非空 status 且不发布 result；route/epoch valid 位不全时拒绝旧 evidence，不能
+  //   退化为读取当前 runtime authority。
+  protected task install_host_producer_recovery(
+    rdma_queue_data_attachment attachment,
+    rdma_handle queue_h,
+    rdma_queue_runtime_kind_e kind,
+    rdma_queue_cursor_snapshot cursor,
+    longint unsigned offset,
+    rdma_hw_image image,
+    rdma_semantic_request snapshot,
+    bit signaled,
+    rdma_route_key_t reservation_route,
+    rdma_reset_epoch_t reservation_epoch,
+    bit reservation_route_valid,
+    bit reservation_epoch_valid,
+    bit mmio_maybe_submitted,
+    string failure_label,
+    inout rdma_status status
+  );
+    rdma_queue_pending_operation pending;
+    rdma_status admission;
+
+    pending = make_pending(
+      cursor, queue_h, kind, 1'b1, offset, image, snapshot, signaled,
+      0, 1'b0, 1'b0, 1'b0, null, attachment);
+    if (pending == null ||
+        !apply_host_producer_pending_route_epoch(
+          pending, reservation_route, reservation_epoch,
+          reservation_route_valid, reservation_epoch_valid)) begin
+      status = pending_build_failure(failure_label);
+      return;
     end
-    do begin
-      candidate = null; attempt = null;
-      poll_aeqe_once(aeq_h, candidate, attempt);
-      if (attempt == null) begin status = bad("AEQ poll returned null status", RDMA_SC_INVALID_STATE); return; end
-      if (attempt.code != RDMA_SC_QUEUE_EMPTY || timeout == 0) begin
-        status = attempt; if (attempt.ok()) result = candidate; return;
+    admission = admit_host_producer_recovery(
+      attachment, pending, mmio_maybe_submitted);
+    if (admission == null || !admission.ok()) begin
+      status = admission == null ?
+        bad("host producer recovery admission returned null status",
+            RDMA_SC_RECOVERY_REQUIRED) : admission;
+    end
+  endtask
+
+  // 设计说明：SQ、私有 RQ 与 shared SRQ 在 request/authority/model 阶段不同，
+  //   但 reservation 成功后的 host-producer 尾段必须保持同一顺序：先把固定 WQE
+  //   image 写回并验证，再用冻结 cursor 计算 next、提交 doorbell，最后才进入
+  //   producer ledger commit。将这段顺序集中到一个 task，避免某个 posting ring
+  //   在 write、MMIO evidence 或 recovery pending 上出现漂移；SQ 专属 SGB 写入
+  //   仍由 post_send 在本 task 之前独占处理。本 task 在第一笔 WQE write 前再做
+  //   一次 route/epoch gate，覆盖 model encode 期间发生的 reset；该 gate 不宣称
+  //   binding、runtime 与 backing 的跨组件原子锁，实际 backend write 的并发复位
+  //   仍由既有 pending/recovery 证据处理。
+  // 功能：complete_host_producer_tail 完成已预留 SQ/RQ/SRQ producer cursor 的 WQE
+  //   write/readback、doorbell continuation、producer commit 和 detached post result
+  //   构造；失败时按阶段保存同一 cursor/request/image 的 recovery evidence。
+  // 输入/输出及副作用：attachment、queue_h、kind、cursor、offset、image、snapshot、
+  //   wr_id、signaled、doorbell_sqe_image 和 local_id 为 caller 冻结输入；caller 必须
+  //   先完成对应 posting ring 的 authority 检查，并证明 queue_h、attachment/
+  //   runtime kind 与同一 reserve_producer cursor 相配；task 自身会在首次 WQE
+  //   write 前复核 attachment route/epoch，且 SQ 以外的
+  //   doorbell_sqe_image 必须为空；result/status 为输出。
+  //   task 可能访问 Host-memory、发送一次 producer doorbell、推进 runtime PI/used/ledger
+  //   或安装 pending，但不取得 queue、backing、request 或 handle 的外部生命周期所有权。
+  // 失败/边界：WQE 写回/读回失败尝试安装 NO_SUBMIT pending；doorbell 失败或
+  //   producer commit 失败尝试安装既有 AMBIGUOUS evidence；WQE 已写后 result
+  //   factory/cast 或 queue clone 失败也安装 NO_SUBMIT pending；next cursor factory
+  //   失败按同一规则保存 WQE evidence。pending clone 失败返回 RESOURCE_EXHAUSTED，
+  //   且不伪造 result。SQ shadow gate 合法地返回 status=OK、
+  //   doorbell_result=null 时仍继续 commit；正常 recovery admission 保留原始阶段
+  //   status，admission 拒绝或返回 null 时升级为 RECOVERY_REQUIRED，避免调用方把
+  //   未接管的 evidence 当作可安全重试。若调用方已完成 SQ SGB 的 Host-memory 写入，
+  //   尾段 gate 失败也必须安装同一 cursor/image 的 NO_SUBMIT pending，不能把已发生
+  //   的 SGB 副作用伪装成无事务返回。
+  protected task complete_host_producer_tail(
+    rdma_queue_data_attachment attachment,
+    rdma_handle queue_h,
+    rdma_queue_runtime_kind_e kind,
+    rdma_queue_cursor_snapshot cursor,
+    longint unsigned offset,
+    rdma_hw_image image,
+    rdma_semantic_request snapshot,
+    longint unsigned wr_id,
+    bit signaled,
+    rdma_hw_image doorbell_sqe_image,
+    int unsigned local_id,
+    string next_name,
+    string write_failure_label,
+    string doorbell_failure_label,
+    string commit_failure_label,
+    string result_name,
+    string result_handle_label,
+    output rdma_queue_post_result result,
+    output rdma_status status,
+    input rdma_route_key_t reservation_route = '0,
+    input rdma_reset_epoch_t reservation_epoch = '0,
+    input bit reservation_route_valid = 1'b0,
+    input bit reservation_epoch_valid = 1'b0,
+    input bit prior_host_write = 1'b0
+  );
+    rdma_queue_cursor_snapshot next;
+    rdma_queue_post_result result_candidate;
+    rdma_doorbell_result doorbell_result;
+    rdma_status next_status;
+    uvm_object raw_result;
+
+    result = null;
+    status = null;
+    next = null;
+    result_candidate = null;
+
+    // reservation 返回的是 detached cursor；在 WQE 首次写回前再次确认当前
+    // Function route/epoch，避免编码期间发生 reset 后仍把旧 attachment 当作可写。
+    status = validate_host_producer_reservation_window(attachment, cursor);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("host producer reservation window returned null status",
+                     RDMA_SC_INVALID_STATE);
+      if (prior_host_write) begin
+        install_host_producer_recovery(
+          attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+          reservation_route, reservation_epoch, reservation_route_valid,
+          reservation_epoch_valid, 1'b0, write_failure_label, status);
       end
-      if ($time >= deadline) begin status = rdma_status::make(RDMA_SC_TIMEOUT, "AEQ poll deadline expired"); return; end
-      #1ns;
-    end while (1);
+      return;
+    end
+
+    status = write_and_verify(attachment, offset, image);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("host producer entry write returned null status",
+                     RDMA_SC_DMA_TRANSLATION);
+      install_host_producer_recovery(
+        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+        reservation_route, reservation_epoch, reservation_route_valid,
+        reservation_epoch_valid, 1'b0, write_failure_label, status);
+      return;
+    end
+
+    // WQE 已成功写回；先以 nonfatal raw factory 物化 result，避免 hostile
+    // override 在已提交后触发 FCTTYP fatal 或把空 queue handle 伪装成成功。
+    raw_result = factory_create_object_nonfatal(
+      rdma_queue_post_result::get_type(), result_name);
+    if (raw_result == null || !$cast(result_candidate, raw_result) ||
+        result_candidate == null) begin
+      result_candidate = null;
+      status = bad("host producer result allocation or cast failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      install_host_producer_recovery(
+        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+        reservation_route, reservation_epoch, reservation_route_valid,
+        reservation_epoch_valid, 1'b0, result_name, status);
+      return;
+    end
+    if (!clone_pending_handle_value(
+          queue_h, result_handle_label, result_candidate.queue_h) ||
+        result_candidate.queue_h == null) begin
+      result_candidate = null;
+      status = bad("host producer result queue snapshot allocation failed",
+                   RDMA_SC_RESOURCE_EXHAUSTED);
+      install_host_producer_recovery(
+        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+        reservation_route, reservation_epoch, reservation_route_valid,
+        reservation_epoch_valid, 1'b0, result_name, status);
+      return;
+    end
+
+    next_status = make_next_poll_cursor_nonfatal(
+      attachment.runtime, cursor, next_name, next);
+    if (next_status == null || !next_status.ok() || next == null) begin
+      status = next_status == null ?
+        bad("host producer next cursor factory returned null status",
+            RDMA_SC_RESOURCE_EXHAUSTED) :
+        (!next_status.ok() ? next_status :
+         bad("host producer next cursor factory returned null cursor",
+             RDMA_SC_RESOURCE_EXHAUSTED));
+      install_host_producer_recovery(
+        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+        reservation_route, reservation_epoch, reservation_route_valid,
+        reservation_epoch_valid, 1'b0, next_name, status);
+      return;
+    end
+    submit_producer_doorbell(
+      queue_h, kind, cursor, next, doorbell_sqe_image, local_id,
+      doorbell_result, status);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("host producer doorbell returned null status",
+                     RDMA_SC_INVALID_STATE);
+      install_host_producer_recovery(
+        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+        reservation_route, reservation_epoch, reservation_route_valid,
+        reservation_epoch_valid, 1'b1, doorbell_failure_label, status);
+      return;
+    end
+
+    status = commit_host_producer_ledger(
+      attachment, cursor, snapshot, wr_id, signaled, image);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("host producer ledger commit returned null status",
+                     RDMA_SC_INVALID_STATE);
+      install_host_producer_recovery(
+        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+        reservation_route, reservation_epoch, reservation_route_valid,
+        reservation_epoch_valid, 1'b1, commit_failure_label, status);
+      return;
+    end
+
+    // ledger commit 已完成；candidate 已在 doorbell 前完成 factory/cast/handle
+    // 检查，因此这里只填充已提交值并使用 direct status，避免结果 status factory
+    // 失败把已提交事务降格成空 result。
+    result_candidate.wr_id = wr_id;
+    result_candidate.index = cursor.index;
+    result_candidate.wrap = cursor.wrap;
+    result_candidate.image = image;
+    result_candidate.status = rdma_status::make_direct(RDMA_SC_OK);
+    if (result_candidate.status == null) begin
+      result_candidate = null;
+      status = bad("host producer committed result status allocation failed",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    result = result_candidate;
+    status = result_candidate.status;
   endtask
 
   // 功能：post_send 冻结并校验 request/QP authority，预留 SQ cursor，编码可选
   //   SGB 与 SQE，完成 Host-memory write/readback、producer doorbell 和 ledger commit。
   // 输入/输出及副作用：request 为输入，result/status 为输出；成功推进 SQ PI/used，
   //   保存 wr_id/signaled/image ledger 并返回 detached queue/result。写入或 doorbell/commit
-  //   失败会把同一 cursor、request 和 image 安装为 runtime recovery pending。
+  //   失败会把同一 cursor、request 和 image 安装为 runtime recovery pending；在
+  //   caller-specific QP/SQE authority 通过后，发送路径还会在 reservation 前复核
+  //   attachment route/reset epoch，并在 detached cursor 返回后再次复核，避免
+  //   reservation 窗口中的 stale binding 进入 model/write 阶段；尾段在首个 WQE
+  //   write 前仍保留最后一道 gate，external-SGB 分支还会在 512-byte SGB writer
+  //   前单独复核；这些局部 gate 不等同于跨 binding/runtime/backing 的全局原子锁。
   // 失败/边界：null request、不支持的 transport/opcode、请求/route/authority/SGE
   //   非法、队列无 credit 或 codec/backing 失败均不发布 result；validate() 返回
   //   null 时归一化为 INVALID_STATE；MMIO 进入后失败按 ambiguous evidence 保留，
@@ -8833,13 +9504,14 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment attachment;
     rdma_queue_data_qp_link link;
     rdma_queue_cursor_snapshot cursor;
-    rdma_queue_cursor_snapshot next;
     rdma_hw_sqe_model model;
     rdma_hw_image image;
-    rdma_doorbell_result doorbell_result;
     rdma_queue_pending_operation pending;
     rdma_status recovery_status;
-    rdma_status local_status;
+    rdma_route_key_t reservation_route;
+    rdma_reset_epoch_t reservation_epoch;
+    bit reservation_route_valid;
+    bit reservation_epoch_valid;
     longint unsigned offset;
 
     result = null;
@@ -8886,9 +9558,19 @@ class rdma_queue_data_engine extends uvm_object;
     status = sqe_authority_status(snapshot, link);
     if (!status.ok())
       return;
-    status = attachment.runtime.reserve_producer(cursor);
+    status = reserve_host_producer_cursor(
+      attachment, cursor, reservation_route, reservation_epoch,
+      reservation_route_valid, reservation_epoch_valid);
     if (!status.ok())
       return;
+    status = validate_host_producer_reservation_window(attachment, cursor);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("send reservation window validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      cursor = null;
+      return;
+    end
     status = make_sqe(snapshot, link, cursor, model);
     if (!status.ok())
       return;
@@ -8900,71 +9582,38 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok())
       return;
     if (snapshot.sgb_iova.value != 0) begin
+      // SQ external-SGB 在公共 WQE 尾段之前有独立的 Host-memory 写入，因此必须
+      // 在专用 writer 前立即关闭 reservation→encode→SGB 窗口；公共尾段还会在
+      // 64-byte WQE 首次写入前再次复核，覆盖 SGB 写入之后发生的 reset。
+      status = validate_host_producer_reservation_window(attachment, cursor);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = bad("SQ SGB reservation window validation returned null status",
+                       RDMA_SC_INVALID_STATE);
+        cursor = null;
+        return;
+      end
       status = write_sgb_and_verify(link, model, cursor, image);
       if (!status.ok()) begin
-        pending = make_pending(
-          cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-          1'b1, longint'(cursor.index) * 64, image,
-          snapshot, snapshot.signaled);
-        if (pending == null) begin
-          status = pending_build_failure("SQ SGB write");
-          return;
-        end
-        recovery_status = attachment.runtime.enter_recovery(pending, 1'b0);
+        // SGB 已进入独立 Host-memory writer；即使 writer 失败时 runtime 的
+        // 当前 route 已变化，pending 仍必须携带 reservation admission 冻结的
+        // route/epoch，不能让 make_pending 的兼容查询把新 authority 当成旧证据。
+        install_host_producer_recovery(
+          attachment, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ, cursor,
+          longint'(cursor.index) * 64, image, snapshot, snapshot.signaled,
+          reservation_route, reservation_epoch, reservation_route_valid,
+          reservation_epoch_valid, 1'b0, "SQ SGB write", status);
         return;
       end
     end
     offset = longint'(cursor.index) * 64;
-    status = write_and_verify(attachment, offset, image);
-    if (!status.ok()) begin
-      pending = make_pending(
-        cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-        1'b1, offset, image, snapshot, snapshot.signaled);
-      if (pending == null) begin
-        status = pending_build_failure("SQ entry write");
-        return;
-      end
-      recovery_status = attachment.runtime.enter_recovery(pending, 1'b0);
-      return;
-    end
-    next = rdma_queue_cursor_snapshot::type_id::create("next_sq_cursor");
-    advance_queue_cursor_value(attachment.runtime.depth, cursor.index,
-                               cursor.wrap, next.index, next.wrap);
-    submit_producer_doorbell(
-      snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-      cursor, next, image, link.local_qp_id, doorbell_result, status);
-    if (!status.ok()) begin
-      pending = make_pending(
-        cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-        1'b1, offset, image, snapshot, snapshot.signaled);
-      if (pending == null) begin
-        status = pending_build_failure("SQ producer doorbell");
-        return;
-      end
-      recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
-      return;
-    end
-    status = attachment.runtime.commit_producer(
-      cursor, snapshot, snapshot.wr_id, snapshot.signaled, image);
-    if (!status.ok()) begin
-      pending = make_pending(
-        cursor, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ,
-        1'b1, offset, image, snapshot, snapshot.signaled);
-      if (pending == null) begin
-        status = pending_build_failure("SQ ledger commit");
-        return;
-      end
-      recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
-      return;
-    end
-    result = rdma_queue_post_result::type_id::create("send_result");
-    result.queue_h = rdma_clone_handle_value(snapshot.qp_h, "send result QP");
-    result.wr_id = snapshot.wr_id;
-    result.index = cursor.index;
-    result.wrap = cursor.wrap;
-    result.image = image;
-    result.status = rdma_status::success();
-    status = result.status;
+    complete_host_producer_tail(
+      attachment, snapshot.qp_h, RDMA_QUEUE_RUNTIME_SQ, cursor, offset, image,
+      snapshot, snapshot.wr_id, snapshot.signaled, image, link.local_qp_id,
+      "next_sq_cursor", "SQ entry write", "SQ producer doorbell",
+      "SQ ledger commit", "send_result", "send result QP", result, status,
+      reservation_route, reservation_epoch, reservation_route_valid,
+      reservation_epoch_valid, snapshot.sgb_iova.value != 0);
   endtask
 
   // 设计说明：RQ 与 SRQ 的 receive target resolution 只冻结 completion-QP
@@ -9050,7 +9699,8 @@ class rdma_queue_data_engine extends uvm_object;
   //   detached result；
   //   write、doorbell 或 commit 失败保存同一 cursor/request/image pending 供 recovery。
   // 失败/边界：null/非法 request、foreign owner、completion QP 未 attach、SRQ
-  //   绑定不一致、attachment route/reset epoch 过期、队列无 credit、codec/backing
+  //   绑定不一致、attachment route/reset epoch 在 reservation 前或 reservation 后
+  //   复核时过期、队列无 credit、codec/backing
   //   或 MMIO/commit 失败时 result 保持 null；request.validate() 返回 null 时统一
   //   为 INVALID_STATE；ambiguous doorbell 不自动重发，task 不取得 QP/SRQ、mapping
   //   或 Host-memory 生命周期所有权。
@@ -9063,13 +9713,13 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment attachment;
     rdma_queue_data_qp_link link;
     rdma_queue_cursor_snapshot cursor;
-    rdma_queue_cursor_snapshot next;
     rdma_hw_rqe_model model;
     rdma_hw_image image;
-    rdma_doorbell_result doorbell_result;
-    rdma_queue_pending_operation pending;
-    rdma_status recovery_status;
     rdma_queue_runtime_kind_e runtime_kind;
+    rdma_route_key_t reservation_route;
+    rdma_reset_epoch_t reservation_epoch;
+    bit reservation_route_valid;
+    bit reservation_epoch_valid;
     longint unsigned offset;
 
     result = null;
@@ -9109,13 +9759,19 @@ class rdma_queue_data_engine extends uvm_object;
         return;
     end
 
-    status = validate_attachment_route_epoch(attachment);
+    status = reserve_host_producer_cursor(
+      attachment, cursor, reservation_route, reservation_epoch,
+      reservation_route_valid, reservation_epoch_valid);
     if (!status.ok())
       return;
-
-    status = attachment.runtime.reserve_producer(cursor);
-    if (!status.ok())
+    status = validate_host_producer_reservation_window(attachment, cursor);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("receive reservation window validation returned null status",
+                     RDMA_SC_INVALID_STATE);
+      cursor = null;
       return;
+    end
     status = make_rqe(snapshot, link, cursor, model);
     if (!status.ok())
       return;
@@ -9123,59 +9779,15 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok())
       return;
     offset = longint'(cursor.index) * 64;
-    status = write_and_verify(attachment, offset, image);
-    if (!status.ok()) begin
-      pending = make_pending(cursor, snapshot.target_h,
-                            runtime_kind,
-                            1'b1, offset, image, snapshot, 1'b1);
-      if (pending == null) begin
-        status = pending_build_failure("RQ entry write");
-        return;
-      end
-      recovery_status = attachment.runtime.enter_recovery(pending, 1'b0);
-      return;
-    end
-    next = rdma_queue_cursor_snapshot::type_id::create("next_rq_cursor");
-    advance_queue_cursor_value(attachment.runtime.depth, cursor.index,
-                               cursor.wrap, next.index, next.wrap);
-    submit_producer_doorbell(snapshot.target_h,
-      runtime_kind,
-      cursor, next, null,
+    complete_host_producer_tail(
+      attachment, snapshot.target_h, runtime_kind, cursor, offset, image,
+      snapshot, snapshot.wr_id, 1'b1, null,
       runtime_kind == RDMA_QUEUE_RUNTIME_SRQ ?
-      attachment.local_id : link.local_qp_id, doorbell_result, status);
-    if (!status.ok()) begin
-      pending = make_pending(cursor, snapshot.target_h,
-                            runtime_kind,
-                            1'b1, offset, image, snapshot, 1'b1);
-      if (pending == null) begin
-        status = pending_build_failure("RQ producer doorbell");
-        return;
-      end
-      recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
-      return;
-    end
-    status = attachment.runtime.commit_producer(cursor, snapshot,
-      snapshot.wr_id, 1'b1, image);
-    if (!status.ok()) begin
-      pending = make_pending(cursor, snapshot.target_h,
-                            runtime_kind,
-                            1'b1, offset, image, snapshot, 1'b1);
-      if (pending == null) begin
-        status = pending_build_failure("RQ ledger commit");
-        return;
-      end
-      recovery_status = attachment.runtime.enter_recovery(pending, 1'b1);
-      return;
-    end
-    result = rdma_queue_post_result::type_id::create("recv_result");
-    result.queue_h = rdma_clone_handle_value(snapshot.target_h,
-                                              "receive result queue");
-    result.wr_id = snapshot.wr_id;
-    result.index = cursor.index;
-    result.wrap = cursor.wrap;
-    result.image = image;
-    result.status = rdma_status::success();
-    status = result.status;
+        attachment.local_id : link.local_qp_id,
+      "next_rq_cursor", "RQ entry write", "RQ producer doorbell",
+      "RQ ledger commit", "recv_result", "receive result queue", result,
+      status, reservation_route, reservation_epoch, reservation_route_valid,
+      reservation_epoch_valid, 1'b0);
   endtask
 
   // 功能：pending_next_cursor 校验 pending 中 admission 前冻结的 old/next cursor，
@@ -9214,6 +9826,56 @@ class rdma_queue_data_engine extends uvm_object;
   //   不重新 reserve cursor，也不从当前 request/queue state 推导新的 payload；
   //   device producer 与 consumer recovery 保持在 replay_pending() 的独立分支，
   //   防止 DMA 方向、doorbell evidence 和 ledger commit 互相串用。
+  // 功能：validate_host_producer_pending_route_epoch 在 host-producer recovery
+  //   首次重放前比较 pending 锁存的 attachment route/reset epoch 与 runtime 当前
+  //   authority，阻止 reset 或换路后把旧 WQE/SGB image 写回新 incarnation。
+  // 输入/输出及副作用：attachment、pending 为只读借用输入；函数只查询 runtime
+  //   route/epoch 并返回 status，不访问 Host-memory、PCIe、ledger、cursor 或 pending。
+  // 失败/边界：pending 缺 route/epoch、runtime 查询失败、route 不同或 epoch 变化时
+  //   返回 RECOVERY_REQUIRED/STALE_GENERATION，调用方必须保留 evidence 并等待显式
+  //   abort；成功只表示 authority 仍匹配，不代表后续 SGB/WQE 或 MMIO 可提交。
+  protected function rdma_status validate_host_producer_pending_route_epoch(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending
+  );
+    rdma_route_key_t current_route;
+    rdma_reset_epoch_t current_epoch;
+    bit current_route_valid;
+    bit current_epoch_valid;
+    rdma_status status;
+
+    current_route = '0;
+    current_epoch = '0;
+    current_route_valid = 1'b0;
+    current_epoch_valid = 1'b0;
+    if (attachment == null || attachment.runtime == null || pending == null)
+      return bad("host producer pending route input is incomplete",
+                 RDMA_SC_RECOVERY_REQUIRED);
+    if (!pending.route_valid || !pending.epoch_valid ||
+        !rdma_route_key_valid(pending.route))
+      return bad("host producer pending route evidence is unavailable",
+                 RDMA_SC_RECOVERY_REQUIRED);
+    status = validate_attachment_route_epoch(attachment);
+    if (status == null || !status.ok())
+      return status == null ?
+        bad("host producer pending attachment route validation returned null status",
+            RDMA_SC_RECOVERY_REQUIRED) : status;
+    status = attachment.runtime.query_route_epoch(
+      current_route, current_route_valid, current_epoch, current_epoch_valid);
+    if (status == null || !status.ok() || !current_route_valid ||
+        !current_epoch_valid)
+      return status == null ?
+        bad("host producer pending route query returned null status",
+            RDMA_SC_RECOVERY_REQUIRED) :
+        (status.ok() ? bad("host producer pending route query is incomplete",
+                           RDMA_SC_RECOVERY_REQUIRED) : status);
+    if (!same_route(current_route, pending.route) ||
+        current_epoch != pending.reset_epoch)
+      return bad("host producer pending route or reset epoch is stale",
+                 RDMA_SC_STALE_GENERATION);
+    return rdma_status::success();
+  endfunction
+
   // 功能：replay_host_producer_pending 按 pending 的 SQ/RQ host-producer 证据重放
   //   可选 SGB、固定 WQE image、producer doorbell 与 runtime producer commit，并在
   //   每个失败点记录原 recovery evidence。
@@ -9251,6 +9913,13 @@ class rdma_queue_data_engine extends uvm_object;
     end
     if (pending.image == null || pending.image.bytes.size() == 0) begin
       status = bad("producer recovery image is missing", RDMA_SC_INVALID_STATE);
+      return;
+    end
+    status = validate_host_producer_pending_route_epoch(attachment, pending);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad("host producer pending route validation returned null status",
+                     RDMA_SC_RECOVERY_REQUIRED);
       return;
     end
 
@@ -9315,8 +9984,8 @@ class rdma_queue_data_engine extends uvm_object;
       status = bad("host producer recovery commit gate returned null status",
                    RDMA_SC_RECOVERY_REQUIRED);
     if (!status.ok()) return;
-    status = attachment.runtime.commit_producer(
-      pending.cursor, pending.request_snapshot, pending.wr_id,
+    status = commit_host_producer_ledger(
+      attachment, pending.cursor, pending.request_snapshot, pending.wr_id,
       pending.signaled, pending.image);
     if (status == null)
       status = bad("host producer recovery commit returned null status",
@@ -9991,6 +10660,109 @@ class rdma_queue_data_engine extends uvm_object;
     return;
   endtask
 
+  // 设计说明：reservation-only recovery 没有可重放的 image，因而不能沿用
+  // claimed pending 的 retry 流程。该阶段必须先对所有 matching attachment
+  // 查询 reservation，再按 cardinality 决定是否允许唯一的 abort；把查询、
+  // 多匹配判定和 detach 边界集中在这里，避免 recover_queue 在“无 pending”分支
+  // 中混入 runtime 状态迁移或提前删除 attachment 索引。
+  // 功能：resolve_reservation_only_recovery 扫描目标 queue 的 reservation-only
+  //   candidate，确认唯一 reservation 后按 action 执行 abort/detach，并报告调用方
+  //   是否已经处理了一个 reservation-only recovery。
+  // 输入/输出及副作用：queue_h、action 为输入；handled 先置零，发现唯一
+  //   reservation 时置一；status 为输出。函数只借用 engine attachment/runtime，
+  //   成功 abort 可能调用 detach_recovery_transaction 删除 matching attachment，
+  //   不释放外部 mapping、backing 或 lifecycle 所有权。
+  // 失败/边界：candidate query 返回 null/非成功、多个 valid reservation、retry
+  //   action 缺少 image、detach 返回 null/失败或 queue/action 不完整时返回明确的
+  //   RECOVERY_REQUIRED/INVALID_STATE；任何失败都不删除 candidate。没有任何
+  //   reservation 时返回成功且 handled=0，由 recover_queue 保留“无 pending”首错。
+  protected task resolve_reservation_only_recovery(
+    rdma_handle queue_h,
+    rdma_queue_recovery_action_e action,
+    output bit handled,
+    output rdma_status status
+  );
+    rdma_queue_data_attachment candidates[$];
+    rdma_queue_data_attachment candidate;
+    rdma_queue_data_attachment reservation_found;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_queue_cursor_snapshot reservation_match;
+    bit reservation_valid;
+    int unsigned reservation_matches;
+
+    handled = 1'b0;
+    status = null;
+    reservation = null;
+    reservation_match = null;
+    reservation_found = null;
+    reservation_matches = 0;
+
+    if (queue_h == null)
+      begin
+        status = bad("reservation-only recovery queue handle is null",
+                     RDMA_SC_INVALID_STATE);
+        return;
+      end
+    if (!(action inside {RDMA_QUEUE_RECOVERY_RETRY_PENDING,
+                         RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH})) begin
+      status = bad("reservation-only recovery action is invalid",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+
+    collect_reservation_only_candidates(queue_h, candidates);
+    foreach (candidates[i]) begin
+      candidate = candidates[i];
+      if (candidate == null || candidate.runtime == null)
+        continue;
+      reservation_valid = 1'b0;
+      reservation = null;
+      status = candidate.runtime.query_device_reservation(
+        reservation_valid, reservation);
+      if (status == null || !status.ok()) begin
+        status = status == null ?
+          bad("reservation-only recovery query returned null status",
+              RDMA_SC_RECOVERY_REQUIRED) : status;
+        return;
+      end
+      if (reservation_valid && reservation != null) begin
+        reservation_matches++;
+        if (reservation_found == null) begin
+          reservation_found = candidate;
+          reservation_match = reservation;
+        end
+      end
+    end
+
+    if (reservation_matches > 1) begin
+      status = bad("queue has multiple pending reservations",
+                   RDMA_SC_INVALID_STATE);
+      return;
+    end
+    if (reservation_found == null) begin
+      // no-reservation 是 caller 继续执行“无 pending”首错的正常分支；使用
+      // non-fatal status 避免一次 hostile factory 注入改变该分支的诊断顺序。
+      status = rdma_status::make_direct(RDMA_SC_OK);
+      return;
+    end
+
+    handled = 1'b1;
+    if (action != RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
+      status = bad("reservation-only recovery cannot retry without image",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    status = detach_recovery_transaction(
+      queue_h, reservation_found, reservation_match);
+    if (status == null) begin
+      status = bad("reservation-only recovery abort could not cancel",
+                   RDMA_SC_RECOVERY_REQUIRED);
+      return;
+    end
+    if (!status.ok())
+      return;
+  endtask
+
   // 功能：recover_queue 定位 queue 的 claimed/unclaimed recovery，执行 abort，
   //   或把 caller-confirmed retry 先交给 runtime 授权，再重放尚未完成的事务阶段。
   // 输入/输出及副作用：queue_h、action、caller_confirmed_no_submit（输入）选择
@@ -10010,14 +10782,11 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment candidate;
     rdma_queue_data_attachment claimed_found;
     rdma_queue_data_attachment found;
-    rdma_queue_data_attachment reservation_candidates[$];
     rdma_queue_pending_operation unclaimed_pending;
     rdma_queue_cursor_snapshot reservation;
-    rdma_queue_cursor_snapshot reservation_match;
-    rdma_queue_data_attachment reservation_found;
     rdma_queue_runtime_state_e runtime_state;
     bit reservation_valid;
-    int unsigned reservation_matches;
+    bit reservation_only_handled;
     string key;
     status = ensure_handle(queue_h, queue_h == null ? RDMA_RESOURCE_QP :
                            queue_h.kind);
@@ -10046,10 +10815,8 @@ class rdma_queue_data_engine extends uvm_object;
     claimed_found = null;
     unclaimed_pending = null;
     reservation = null;
-    reservation_match = null;
-    reservation_found = null;
     reservation_valid = 1'b0;
-    reservation_matches = 0;
+    reservation_only_handled = 1'b0;
     runtime_state = RDMA_QUEUE_RUNTIME_DETACHED;
     key = identity_key(queue_h);
     // 设计说明：runtime admission 失败时 evidence 由 engine 的 unclaimed 表保留。
@@ -10143,51 +10910,16 @@ class rdma_queue_data_engine extends uvm_object;
       // cancel 前置路径在还没有完整 pending 时也可能返回 RECOVERY_REQUIRED。
       // 它只能显式 abort：再次 cancel 成功后 detach；retry 没有可重放 image，
       // 必须保持 fail-closed，而不是伪造一笔 publish。
-      // 设计：reservation-only 扫描同样只跳过不同 identity；所有匹配 candidate
-      // 都先完成 reservation query，再决定是否 detach。每个返回 valid+snapshot
-      // 的候选都计入 cardinality，即使索引意外重复同一 attachment 也 fail-closed；
-      // 这样多个 runtime 同时持有同一 queue incarnation 的 reservation 时不会先
-      // 取消其中一个、留下另一个不可见 reservation，query 失败仍保留原首错与全部 evidence。
-      collect_reservation_only_candidates(queue_h, reservation_candidates);
-      foreach (reservation_candidates[i]) begin
-        candidate = reservation_candidates[i];
-        status = candidate.runtime.query_device_reservation(reservation_valid,
-                                                             reservation);
-        if (status == null || !status.ok()) begin
-          status = status == null ?
-            bad("reservation-only recovery query returned null status",
-                RDMA_SC_RECOVERY_REQUIRED) : status;
-          return;
-        end
-        if (reservation_valid && reservation != null) begin
-          reservation_matches++;
-          if (reservation_found == null) begin
-            reservation_found = candidate;
-            reservation_match = reservation;
-          end
-        end
-      end
-      if (reservation_matches > 1) begin
-        status = bad("queue has multiple pending reservations",
-                     RDMA_SC_INVALID_STATE);
+      resolve_reservation_only_recovery(
+        queue_h, action, reservation_only_handled, status);
+      if (status == null || !status.ok()) begin
+        status = status == null ?
+          bad("reservation-only recovery resolution returned null status",
+              RDMA_SC_RECOVERY_REQUIRED) : status;
         return;
       end
-      if (reservation_found != null) begin
-        if (action != RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
-          status = bad("reservation-only recovery cannot retry without image",
-                       RDMA_SC_RECOVERY_REQUIRED);
-          return;
-        end
-        status = detach_recovery_transaction(
-          queue_h, reservation_found, reservation_match);
-        if (status == null) begin
-          status = bad("reservation-only recovery abort could not cancel",
-                       RDMA_SC_RECOVERY_REQUIRED);
-          return;
-        end
-        if (!status.ok()) return;
+      if (reservation_only_handled)
         return;
-      end
       status = bad("queue has no pending recovery", RDMA_SC_INVALID_STATE);
       return;
     end

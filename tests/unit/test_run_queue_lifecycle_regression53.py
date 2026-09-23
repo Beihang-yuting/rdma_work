@@ -59,8 +59,14 @@ class RunnerManifestTest(unittest.TestCase):
     # 失败/边界：不得列出 regression 聚合别名；任一跨行注册类遗漏或孤儿条目都会
     # 使断言失败，提示维护者同步清单与源码。
     def test_runner_lists_every_normal_unit_test(self) -> None:
-        listed = set(
-            subprocess.check_output([str(RUNNER), "--list"], text=True).splitlines()
+        raw_list = subprocess.check_output(
+            [str(RUNNER), "--list"], text=True
+        ).splitlines()
+        listed = set(raw_list)
+        self.assertEqual(
+            len(raw_list),
+            len(listed),
+            "runner --list must not expose duplicate test names",
         )
         self.assertNotIn("regression", listed)
         self.assertEqual(listed, discover_uvm_tests(REPO_ROOT / "tests" / "unit"))

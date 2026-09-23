@@ -16,6 +16,15 @@
 class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
   `uvm_object_utils(rdma_queue_data_engine_probe)
 
+  // 设计说明：reservation-window hostile 注入默认关闭；armed 后只在指定的
+  // post-reservation gate 推进一次借用 Function reset epoch，probe 不改变生产
+  // engine 的默认 authority 或资源所有权。
+  bit reservation_epoch_flip_armed;
+  bit reservation_epoch_flip_done;
+  rdma_reset_epoch_t reservation_epoch_flip_value;
+  int unsigned reservation_epoch_flip_gate;
+  int unsigned reservation_window_gate_count;
+
   // 功能：构造 queue-data engine probe，沿用生产 engine 的默认未配置状态。
   // 输入/输出及副作用：name 为 UVM 对象名；仅调用基类构造，不接管 manager、
   //   binding、Host-memory、doorbell scheduler 或 codec registry。
@@ -23,6 +32,71 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
   //   前完成有效 binding、依赖和 CQ attachment，否则原样返回生产拒绝状态。
   function new(string name = "rdma_queue_data_engine_probe");
     super.new(name);
+    reservation_epoch_flip_armed = 1'b0;
+    reservation_epoch_flip_done = 1'b0;
+    reservation_epoch_flip_value = 0;
+    reservation_epoch_flip_gate = 1;
+    reservation_window_gate_count = 0;
+  endfunction
+
+  // 功能：arm_reservation_epoch_flip 配置 probe 在 producer reservation 返回后的
+  //   指定 route/epoch gate 注入一次 binding reset epoch 变化，用于验证生产路径
+  //   不会把 stale cursor 带入 model、Host-memory 或 doorbell 阶段。
+  // 输入/输出及副作用：next_epoch 为输入；函数只更新 probe 自有 fault flags，不直接
+  //   修改 binding，调用方必须在有效 configure/attach fixture 上再触发 post_send 或
+  //   post_recv；返回 void 且不访问 runtime、backing、ledger 或外部资源所有权。
+  // 失败/边界：next_epoch=0 会关闭注入并由后续 gate 保持正常行为；gate_number=0
+  //   归一化为第一道 gate；重复 arm 会重置计数和 done 标志，只有达到指定 gate
+  //   才执行一次 epoch 更新。
+  function void arm_reservation_epoch_flip(
+    rdma_reset_epoch_t next_epoch,
+    int unsigned gate_number = 1
+  );
+    reservation_epoch_flip_value = next_epoch;
+    reservation_epoch_flip_armed = next_epoch != 0;
+    reservation_epoch_flip_done = 1'b0;
+    reservation_epoch_flip_gate = gate_number == 0 ? 1 : gate_number;
+    reservation_window_gate_count = 0;
+  endfunction
+
+  // 功能：在生产 engine 的 reservation-window revalidation seam 前注入一次 epoch
+  //   变化，再调用基类校验，令 stale attachment 在首次 producer 副作用前被拒绝。
+  // 输入/输出及副作用：attachment/cursor 为输入；成功或失败返回 route/epoch
+  //   status。注入时只替换 binding 所拥有的 identity value snapshot，不修改 queue
+  //   runtime、cursor、Host-memory、doorbell 或 ledger；binding 仍由 fixture 管理。
+  // 失败/边界：binding/identity 缺失、configure_identity 返回 null/非成功或基类
+  //   gate 拒绝时原样返回非成功；fault 已执行后不会重复推进 epoch，避免一次 post
+  //   的尾段 gate 与 caller gate 产生两次 reset。
+  protected virtual function rdma_status validate_host_producer_reservation_window(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot cursor
+  );
+    rdma_function_identity identity;
+    rdma_status status;
+
+    reservation_window_gate_count++;
+    if (reservation_epoch_flip_armed && !reservation_epoch_flip_done &&
+        reservation_window_gate_count >= reservation_epoch_flip_gate) begin
+      if (binding == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "reservation-window probe binding is unavailable");
+      identity = binding.function_identity_snapshot();
+      if (identity == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "reservation-window probe identity is unavailable");
+      identity.reset_epoch = reservation_epoch_flip_value;
+      status = binding.configure_identity(identity);
+      if (status == null || !status.ok())
+        return status == null ?
+          rdma_status::make(
+            RDMA_SC_INVALID_STATE,
+            "reservation-window probe epoch update returned null status") :
+          status;
+      reservation_epoch_flip_done = 1'b1;
+    end
+    return super.validate_host_producer_reservation_window(attachment, cursor);
   endfunction
 
   // 功能：probe_validate_cq_poll_wq_attachment_fixture 在已 attach 的 QP/SQ 上
@@ -321,6 +395,102 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
         lookup_status;
     return prepare_consumer_doorbell(
       attachment, next, null, prepared_desc, prepared_status);
+  endfunction
+
+  // 功能：probe_rewrite_committed_cqe_srfq_bit 在已提交的 CQ consumer slot 中只
+  //   改写 CQE qword0 的 SRFQ wire bit，用于把 malformed image 直接送入公开
+  //   poll_cqe admission，而不经过会先拒绝该模型的 publish_cqe gate。
+  // 输入/输出及副作用：cq_h、desired_srfq 为输入；函数读取当前 CQ consumer
+  //   cursor 对应的 8-byte qword，并以 DEVICE_WRITE 方向回写一个只变更 bit[58]
+  //   的 detached byte buffer；不 reserve/commit runtime、不改 occupancy/cursor、
+  //   不建立 pending，也不取得 CQ/backing 生命周期所有权。
+  // 失败/边界：CQ handle/attachment/access/runtime 缺失、CQ 为空、entry size 不是
+  //   32/64/128、consumer cursor 无法取得、header window 越界、read/write 或
+  //   backend_write_started 证据失败时返回原错误且不继续写入；调用方必须用同一
+  //   desired_srfq=原值恢复 slot，避免 hostile image 留给后续 cleanup 或测试。
+  function rdma_status probe_rewrite_committed_cqe_srfq_bit(
+    rdma_handle cq_h,
+    bit desired_srfq
+  );
+    rdma_queue_data_attachment attachment;
+    rdma_queue_cursor_snapshot cursor;
+    rdma_status status;
+    byte qword[];
+    bit backend_write_started;
+    bit current_srfq;
+    int unsigned header_offset;
+    longint unsigned slot_offset;
+
+    attachment = null;
+    cursor = null;
+    qword = new[0];
+    backend_write_started = 1'b0;
+    header_offset = 0;
+    slot_offset = 0;
+
+    if (cq_h == null || cq_h.kind != RDMA_RESOURCE_CQ)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQE SRFQ rewrite probe CQ handle is invalid");
+    status = lookup_attachment(cq_h, RDMA_QUEUE_RUNTIME_CQ, attachment);
+    if (status == null || !status.ok() || attachment == null ||
+        attachment.runtime == null || attachment.access == null)
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CQE SRFQ rewrite probe attachment lookup returned null") :
+        status;
+    if (!(attachment.entry_size inside {32, 64, 128}))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQE SRFQ rewrite probe entry size is unsupported");
+    status = attachment.runtime.peek_consumer(cursor);
+    if (status == null || !status.ok() || cursor == null)
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CQE SRFQ rewrite probe consumer cursor is unavailable") :
+        status;
+    if (attachment.entry_size == 128)
+      header_offset = 64;
+    if (header_offset + 8 > attachment.entry_size ||
+        cursor.index >= attachment.runtime.depth ||
+        cursor.index > 64'hffff_ffff_ffff_ffff /
+                       longint'(attachment.entry_size))
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQE SRFQ rewrite probe header window is invalid");
+    slot_offset = longint'(cursor.index) * attachment.entry_size;
+    status = attachment.access.read(slot_offset + header_offset, 8, qword);
+    if (status == null || !status.ok() || qword.size() != 8)
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CQE SRFQ rewrite probe read returned null") :
+        status;
+    // qword bytes are stored big-endian; qword bit[58] is byte 0 bit 2.
+    current_srfq = qword[0][2];
+    if (current_srfq == desired_srfq)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQE SRFQ rewrite probe found the requested bit already set");
+    if (desired_srfq)
+      qword[0] = qword[0] | 8'h04;
+    else
+      qword[0] = qword[0] & 8'hfb;
+    status = attachment.access.write_device(
+      slot_offset + header_offset, qword, backend_write_started);
+    if (status == null || !status.ok())
+      return status == null ?
+        rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "CQE SRFQ rewrite probe device write returned null") :
+        status;
+    if (!backend_write_started)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "CQE SRFQ rewrite probe did not enter backend");
+    return rdma_status::success();
   endfunction
 
   // 功能：probe_write_sgb_after_model_mutation 通过真实 SQ attachment 生成并
@@ -2393,6 +2563,232 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_send_route_epoch_authority 验证发送路径在 SQE authority 通过后、
+  //   producer reservation 之前重新检查 attachment 的 Function route/reset epoch，
+  //   从而拒绝 binding 已复位但仍留在 engine 索引中的旧 SQ。
+  // 输入/输出及副作用：无显式参数；task 建立独立 RC fixture，记录 SQ producer/
+  //   consumer cursor、occupancy、Host-memory/PCIe 调用计数，先推进 binding epoch
+  //   再调用 post_send，并在结束时释放 fixture-owned lifecycle 资源。
+  // 失败/边界：setup、cursor/occupancy 查询、epoch 更新或 cleanup 返回 null/失败时
+  //   单独报告；若 stale epoch 未返回 STALE_GENERATION、发布 result、创建 pending、
+  //   推进任一 cursor/used，或触碰 Host-memory/MMIO，则报告 UVM_ERROR。
+  task automatic check_send_route_epoch_authority();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_post_send_req request;
+    rdma_queue_post_result result;
+    rdma_status status;
+    rdma_status cursor_status;
+    rdma_status occupancy_status;
+    rdma_status epoch_status;
+    rdma_status cleanup_status;
+    int unsigned before_index;
+    int unsigned after_index;
+    int unsigned before_consumer;
+    int unsigned after_consumer;
+    int unsigned before_used;
+    int unsigned after_used;
+    int unsigned mem_calls_before;
+    int unsigned mem_calls_after;
+    int unsigned pcie_calls_before;
+    int unsigned pcie_calls_after;
+    bit before_wrap;
+    bit after_wrap;
+    bit before_consumer_wrap;
+    bit after_consumer_wrap;
+    bit before_pending;
+    bit after_pending;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "send_route_epoch_authority_fixture");
+
+    begin : send_route_epoch_authority_flow
+      if (fixture == null) begin
+        `uvm_error("SEND_EPOCH_FIXTURE", "fixture allocation failed")
+        disable send_route_epoch_authority_flow;
+      end
+
+      fixture.setup(status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SEND_EPOCH_FIXTURE",
+                   status == null ? "null setup status" :
+                   status.convert2string())
+        disable send_route_epoch_authority_flow;
+      end
+
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_index, before_wrap,
+        before_consumer, before_consumer_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_used, before_pending);
+      if (cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok()) begin
+        `uvm_error("SEND_EPOCH_BASELINE", "SQ baseline query failed")
+        disable send_route_epoch_authority_flow;
+      end
+
+      mem_calls_before = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      pcie_calls_before = fixture.pcie == null ? 0 : fixture.pcie.calls.size();
+      epoch_status = fixture.advance_binding_reset_epoch(2);
+      if (epoch_status == null || !epoch_status.ok()) begin
+        `uvm_error("SEND_EPOCH_FIXTURE",
+                   epoch_status == null ? "null epoch status" :
+                   epoch_status.convert2string())
+        disable send_route_epoch_authority_flow;
+      end
+
+      request = fixture.make_send(64'hface_cafe_0000_0003);
+      result = null;
+      fixture.engine.post_send(request, result, status);
+
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_index, after_wrap,
+        after_consumer, after_consumer_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_used, after_pending);
+      mem_calls_after = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      pcie_calls_after = fixture.pcie == null ? 0 : fixture.pcie.calls.size();
+      if (status == null || status.code != RDMA_SC_STALE_GENERATION ||
+          result != null || cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok() ||
+          after_index != before_index || after_wrap != before_wrap ||
+          after_consumer != before_consumer ||
+          after_consumer_wrap != before_consumer_wrap ||
+          after_used != before_used || after_pending != before_pending ||
+          mem_calls_after != mem_calls_before ||
+          pcie_calls_after != pcie_calls_before)
+        `uvm_error("SEND_EPOCH_AUTHORITY",
+                   status == null ? "null status" : status.convert2string())
+    end
+
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("SEND_EPOCH_CLEANUP", cleanup_status == null ?
+                   "fixture cleanup returned null" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
+  // 功能：check_send_reservation_route_epoch_window 验证 SQ producer cursor 已由
+  //   runtime 返回后、进入 SQE model/Host-memory 之前若 Function reset epoch 变化，
+  //   post_send 会通过第二道 route/epoch gate fail-closed。
+  // 输入/输出及副作用：无显式参数；task 使用 probe fixture，在 reservation-window
+  //   seam 注入一次 binding epoch=2，记录 SQ cursor、occupancy、pending、Host-memory
+  //   与 PCIe 调用数，并由 UVM 报告状态契约；cleanup 仍由 fixture 释放 lifecycle
+  //   owned resources，probe 不取得外部资源所有权。
+  // 失败/边界：setup、probe cast、baseline/after 查询或 cleanup 返回 null/失败时单独
+  //   报告；若 reservation 后 stale epoch 未返回 RDMA_SC_STALE_GENERATION、发布
+  //   result、推进 cursor/used、创建 pending 或触碰 Host-memory/MMIO，则报告错误。
+  task automatic check_send_reservation_route_epoch_window();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_probe probe;
+    rdma_post_send_req request;
+    rdma_queue_post_result result;
+    rdma_status status;
+    rdma_status cursor_status;
+    rdma_status occupancy_status;
+    rdma_status cleanup_status;
+    int unsigned before_index;
+    int unsigned after_index;
+    int unsigned before_consumer;
+    int unsigned after_consumer;
+    int unsigned before_used;
+    int unsigned after_used;
+    int unsigned mem_calls_before;
+    int unsigned mem_calls_after;
+    int unsigned pcie_calls_before;
+    int unsigned pcie_calls_after;
+    longint unsigned sgb_base;
+    bit before_wrap;
+    bit after_wrap;
+    bit before_consumer_wrap;
+    bit after_consumer_wrap;
+    bit before_pending;
+    bit after_pending;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "send_reservation_window_fixture");
+
+    begin : send_reservation_window_flow
+      if (fixture == null) begin
+        `uvm_error("SEND_RESERVATION_WINDOW_FIXTURE", "fixture allocation failed")
+        disable send_reservation_window_flow;
+      end
+
+      // 使用既有 probe fixture，只替换 reservation-window virtual seam；其余
+      // configure/attach、codec、backing 与 scheduler 路径仍来自生产 engine。
+      fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b0, 1'b0, 1'b1);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SEND_RESERVATION_WINDOW_FIXTURE",
+                   status == null ? "null setup status" :
+                   status.convert2string())
+        disable send_reservation_window_flow;
+      end
+      if (!$cast(probe, fixture.engine) || probe == null) begin
+        `uvm_error("SEND_RESERVATION_WINDOW_PROBE", "engine probe cast failed")
+        disable send_reservation_window_flow;
+      end
+      // 令 fault 在第二道 gate 触发：第一道验证已经通过 reservation，第二道
+      // 正好位于 SQ external-SGB writer 之前，证明 SGB backing 也保持零副作用。
+      probe.arm_reservation_epoch_flip(2, 2);
+
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_index, before_wrap,
+        before_consumer, before_consumer_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_used, before_pending);
+      if (cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok()) begin
+        `uvm_error("SEND_RESERVATION_WINDOW_BASELINE",
+                   "SQ baseline query failed")
+        disable send_reservation_window_flow;
+      end
+
+      mem_calls_before = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      pcie_calls_before = fixture.pcie == null ? 0 : fixture.pcie.calls.size();
+      request = fixture.make_send(64'hface_cafe_0000_0004);
+      if (fixture.qp == null || fixture.qp.qp_plan == null ||
+          fixture.qp.qp_plan.sq_sgb_ref == null ||
+          fixture.qp.qp_plan.sq_sgb_ref.mapping == null) begin
+        `uvm_error("SEND_RESERVATION_WINDOW_SGB",
+                   "SQ SGB mapping authority is unavailable")
+        disable send_reservation_window_flow;
+      end
+      sgb_base = fixture.qp.qp_plan.sq_sgb_ref.mapping.iova.value +
+                 fixture.qp.qp_plan.sq_sgb_ref.mapping_offset;
+      request.sgb_iova.value = sgb_base;
+      result = null;
+      fixture.engine.post_send(request, result, status);
+
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_index, after_wrap,
+        after_consumer, after_consumer_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_used, after_pending);
+      mem_calls_after = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      pcie_calls_after = fixture.pcie == null ? 0 : fixture.pcie.calls.size();
+      if (status == null || status.code != RDMA_SC_STALE_GENERATION ||
+          result != null || cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok() ||
+          after_index != before_index || after_wrap != before_wrap ||
+          after_consumer != before_consumer ||
+          after_consumer_wrap != before_consumer_wrap ||
+          after_used != before_used || after_pending != before_pending ||
+          mem_calls_after != mem_calls_before ||
+          pcie_calls_after != pcie_calls_before)
+        `uvm_error("SEND_RESERVATION_WINDOW",
+                   status == null ? "null status" : status.convert2string())
+    end
+
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("SEND_RESERVATION_WINDOW_CLEANUP", cleanup_status == null ?
+                   "fixture cleanup returned null" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：check_transport_link_mismatch 拦截“请求声明 transport 与已绑定
   // QP transport 不一致”的合法语义请求，验证 route authority 在写 SQE
   // 之前就 fail-closed。
@@ -2986,6 +3382,8 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       check_sgb_filters_zero_length_descriptors();
       check_qpc_shadow_sq_gate();
       check_recv_owner_authority();
+      check_send_route_epoch_authority();
+      check_send_reservation_route_epoch_window();
       check_empty_receive_rqe();
     end
 

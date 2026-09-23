@@ -107,33 +107,17 @@ class rdma_cq_engine extends uvm_object;
   // 功能：校验 CQ facade 保存的 Function binding 仍处于原 generation/reset epoch。
   // 输入/输出及副作用：label 仅用于诊断；读取 binding 快照并返回状态，不修改
   //   delegate 或队列游标。
-  // 失败/边界：未配置 binding、binding 校验失败或 UID/generation/reset epoch
+  // 失败/边界：未配置、delegate 缺失、binding 校验失败或 UID/generation/reset epoch
   //   漂移时返回错误，调用方不得继续访问 CQ。
   protected function rdma_status validate_live_authority(string label);
-    rdma_status status;
-
-    if (!configured || delegate == null || authority_binding == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               {label, " facade is not configured"});
-
-    // 先比较已冻结的 authority 坐标，再调用 binding.validate()；这样兼容
-    // 镜像已经漂移时返回 STALE_GENERATION，而不会把同一漂移误报成普通参数错。
-    if (authority_binding.function_uid != authority_function_uid ||
-        authority_binding.generation != authority_generation ||
-        authority_binding.function_reset_epoch() != authority_reset_epoch)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               {label, " Function authority is stale"});
-    if (authority_binding.state != RDMA_BIND_ACTIVE)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               {label, " Function binding is not ACTIVE"});
-
-    status = authority_binding.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               {label, " binding validation returned null"});
-    if (!status.ok())
-      return status;
-    return rdma_status::success();
+    return rdma_validate_live_authority(
+      configured,
+      delegate != null,
+      authority_binding,
+      authority_function_uid,
+      authority_generation,
+      authority_reset_epoch,
+      label);
   endfunction
 
   // 功能：配置共享 CQ 的 Function authority、URC completion QP 和可恢复
@@ -342,8 +326,8 @@ class rdma_cq_engine extends uvm_object;
   // 功能：绑定共享 queue-data engine，校验 CQ 使用的资源、binding、Host-memory、
   //   doorbell 和 codec 引用一致。
   // 输入/输出及副作用：resource_manager、function_binding、memory、scheduler、
-  //   codecs、timeout 和 shared_engine 为输入；调用方必须先完成输入对象的空值、
-  //   authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，
+  //   codecs、timeout 和 shared_engine 为输入；函数先通过共用 admission helper
+  //   完成依赖、authority 和 ACTIVE 校验，成功时更新本对象配置/状态并保存非拥有引用，
   //   返回 rdma_status。
   // 失败/边界：空依赖、重复登记、状态或 generation/authority 校验失败时返回
   //   错误；configure_shared 已绑定另一 delegate 时返回 INVALID_ARGUMENT；本入口
@@ -358,28 +342,17 @@ class rdma_cq_engine extends uvm_object;
     rdma_queue_data_engine shared_engine = null
   );
     rdma_status status;
-    if (resource_manager == null || function_binding == null || memory == null ||
-        scheduler == null || codecs == null || timeout == 0 || shared_engine == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CQ facade configuration dependency is null/zero");
-    if (shared_engine.manager != resource_manager ||
-        shared_engine.binding != function_binding ||
-        shared_engine.host_mem != memory ||
-        shared_engine.doorbells != scheduler ||
-        shared_engine.registry != codecs)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CQ facade dependencies do not match shared engine");
-    status = function_binding.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ Function binding validation returned null");
-    if (!status.ok())
+    status = rdma_validate_queue_facade_configuration(
+      resource_manager,
+      function_binding,
+      memory,
+      scheduler,
+      codecs,
+      timeout,
+      shared_engine,
+      "CQ");
+    if (status == null || !status.ok())
       return status;
-    if (function_binding.state != RDMA_BIND_ACTIVE)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ Function binding is not ACTIVE");
     // 配置成功后 facade 的 delegate 与 authority 是不可替换的；否则第二次
     // configure 会覆盖冻结坐标，使正在执行的 poll/resize 失去生命周期边界。
     if (configured)

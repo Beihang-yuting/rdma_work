@@ -1511,6 +1511,10 @@ localparam int unsigned RDMA_LATER = 6;
         )
         self.assertEqual(constants["RDMA_ABSOLUTE"], 52)
         self.assertEqual(constants["RDMA_FORWARD"], 8)
+        spaced = CHECKER.parse_sv_constants(
+            "localparam bit [63:0] RDMA_WINDOW = 64 'h 2000;\n"
+        )
+        self.assertEqual(spaced["RDMA_WINDOW"], 0x2000)
 
     def test_global_mapping_uniqueness_is_enforced(self) -> None:
         """

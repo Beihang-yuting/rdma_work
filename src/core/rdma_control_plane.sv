@@ -88,6 +88,58 @@ class rdma_control_plane extends uvm_object;
     return rdma_cmq_clone_status_value(source);
   endfunction
 
+  // 功能：在 rdma_control_plane 中，execute_control_command_raw_status 收束一次
+  //   legacy CMQ 原始 dispatch，明确保留 backend status identity，供仍依赖原始
+  //   status 引用的特殊控制面阶段调用。
+  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）。任务
+  //   清空本次事务的 ticket/completion，检查 CMQ/command 后恰好调用 cmq.execute 一次，
+  //   将 backend 原始 status 写入 status；不取得 command 或外部 CMQ 资源所有权。
+  // 失败/边界：cmq 为空时返回 RDMA_SC_INVALID_STATE，command 为空时返回
+  //   RDMA_SC_INVALID_ARGUMENT；backend 返回 null status 时保留 null，由调用方按其
+  //   原有诊断和 recovery 优先级归一化。任务不重试、不推断 timeout 或 ambiguity，
+  //   也不推进 generation/资源状态。
+  protected task execute_control_command_raw_status(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    ticket = null;
+    completion = null;
+    status = null;
+    if (cmq == null) begin
+      status = invalid_state("control-plane CMQ is unavailable");
+      return;
+    end
+    if (command == null) begin
+      status = invalid_argument("control-plane CMQ command is null");
+      return;
+    end
+    cmq.execute(command, ticket, completion, status);
+  endtask
+
+  // 功能：在 rdma_control_plane 中，execute_control_command 在原始 CMQ dispatch
+  // 之后生成 detached status，供 MR 回滚、注销和恢复阶段安全读取稳定诊断值。
+  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）；
+  //   null_status_message（输入）。任务复用 raw-status seam 且只调用一次
+  //   cmq.execute；成功或 backend status 均复制为独立 status，不取得 command 或
+  //   外部 CMQ 资源所有权。
+  // 失败/边界：cmq/command guard 的错误沿用 raw seam；backend null status 按
+  //   null_status_message 归一化为 RDMA_SC_INVALID_STATE。任务不重试、不推断
+  //   timeout/ambiguity，也不推进 generation、资源状态或 recovery journal。
+  protected task execute_control_command(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status,
+    input string null_status_message
+  );
+    execute_control_command_raw_status(
+      command, ticket, completion, status
+    );
+    status = checked_status(status, null_status_message);
+  endtask
+
   // 功能：make_result 创建独立的 rdma_control_result；根据 调用方输入 设置字段 result、pending_status、result.status、result.primary_status、result.final_resource_state、result.recovery_required，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：无显式参数；make_result 读取局部计算结果，并使用字段 result、pending_status、result.status、result.primary_status、result.final_resource_state、result.recovery_required；函数返回 rdma_control_result，不取得调用方资源所有权。
   // 失败/边界：make_result 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
@@ -309,9 +361,9 @@ class rdma_control_plane extends uvm_object;
       command.opcode_key = opcode_key;
       command.body = deregister_body;
       command.timeout = default_timeout;
-      cmq.execute(command, ticket, completion, rollback_status);
-      rollback_status = checked_status(
-        rollback_status, "MR_DEREGISTER rollback returned null"
+      execute_control_command(
+        command, ticket, completion, rollback_status,
+        "MR_DEREGISTER rollback returned null"
       );
       if (!rollback_status.ok()) begin
         result.rollback_statuses.push_back(
@@ -2034,10 +2086,10 @@ class rdma_control_plane extends uvm_object;
         command.opcode_key = opcode_key;
         command.body = occ_body;
         command.timeout = default_timeout;
-        ticket = null;
-        completion = null;
-        cmq.execute(command, ticket, completion, status);
-        status = checked_status(status, "OCC_FLUSH execution returned null");
+        execute_control_command(
+          command, ticket, completion, status,
+          "OCC_FLUSH execution returned null"
+        );
         if (!status.ok()) begin
           primary_status = rdma_cmq_clone_status_value(status);
           if (status.code == RDMA_SC_TIMEOUT) begin
@@ -2108,11 +2160,9 @@ class rdma_control_plane extends uvm_object;
       command.opcode_key = opcode_key;
       command.body = deregister_body;
       command.timeout = default_timeout;
-      ticket = null;
-      completion = null;
-      cmq.execute(command, ticket, completion, status);
-      status = checked_status(
-        status, "MR_DEREGISTER execution returned null"
+      execute_control_command(
+        command, ticket, completion, status,
+        "MR_DEREGISTER execution returned null"
       );
       if (!status.ok()) begin
         primary_status = rdma_cmq_clone_status_value(status);
@@ -2181,10 +2231,10 @@ class rdma_control_plane extends uvm_object;
       command.opcode_key = opcode_key;
       command.body = drain_body;
       command.timeout = default_timeout;
-      ticket = null;
-      completion = null;
-      cmq.execute(command, ticket, completion, status);
-      status = checked_status(status, "TQ_FLUSH execution returned null");
+      execute_control_command(
+        command, ticket, completion, status,
+        "TQ_FLUSH execution returned null"
+      );
       if (!status.ok()) begin
         primary_status = rdma_cmq_clone_status_value(status);
         retain_mr_destroy_error(
@@ -2633,7 +2683,9 @@ class rdma_control_plane extends uvm_object;
       command.body = mrt;
       command.timeout = default_timeout;
 
-      cmq.execute(command, ticket, completion, status);
+      execute_control_command_raw_status(
+        command, ticket, completion, status
+      );
       if (status == null || !status.ok()) begin
         status = checked_status(status,
                                 "KEY_ALLOC execution returned null status");
@@ -3667,9 +3719,10 @@ class rdma_control_plane extends uvm_object;
       default: command.body = null;
     endcase
     command.timeout = default_timeout;
-    cmq.execute(command, ticket, completion, status);
-    status = checked_status(status,
-                            "recovery hardware execution returned null");
+    execute_control_command(
+      command, ticket, completion, status,
+      "recovery hardware execution returned null"
+    );
   endtask
 
   // 功能：在 rdma_control_plane 中，recover_resource 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。

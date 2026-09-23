@@ -11,6 +11,7 @@ package rdma_model_pkg;
   `include "rdma_handle.sv"
   `include "rdma_function_identity.sv"
   `include "rdma_function_binding.sv"
+  `include "rdma_authority_validation.sv"
   `include "rdma_dma_request_context.sv"
   `include "rdma_dma_mapping.sv"
   `include "rdma_resource_refs.sv"

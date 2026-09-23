@@ -1116,6 +1116,36 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：在 rdma_qp_lifecycle_executor 中，execute_qp_legacy_command 收束 QP
+  //   创建、修改、查询和回滚阶段共用的 legacy CMQ 原始 dispatch，避免各阶段
+  //   重复维护输出初始化与一次 execute 调用。
+  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）。任务
+  //   清空本次调用的 ticket/completion/status，调用 cmq.execute 一次并保留后端原始
+  //   status；不执行 generation fence、ambiguity 分类、completion 校验或资源状态
+  //   提交，也不取得 command/CMQ 资源所有权。
+  // 失败/边界：cmq 为空时返回 RDMA_SC_INVALID_STATE，command 为空时返回
+  //   RDMA_SC_INVALID_ARGUMENT；后端返回 null status 时保留 null，由调用方按各阶段
+  //   原有诊断和 recovery 优先级归一化。任务不重试、不代替调用方的 pre/post fence。
+  protected task execute_qp_legacy_command(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    ticket = null;
+    completion = null;
+    status = null;
+    if (cmq == null) begin
+      status = invalid_state("QP CMQ is unavailable");
+      return;
+    end
+    if (command == null) begin
+      status = invalid_argument("QP CMQ command is null");
+      return;
+    end
+    cmq.execute(command, ticket, completion, status);
+  endtask
+
   // 功能：在 rdma_qp_lifecycle_executor 中由 same_qpc_snapshot 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
   // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
   // 失败/边界：same_qpc_snapshot 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
@@ -1340,7 +1370,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       completion = null;
       status = live_binding_fence(binding, expected_owner);
       if (status.ok())
-        cmq.execute(query_command, ticket, completion, status);
+        execute_qp_legacy_command(
+          query_command, ticket, completion, status
+        );
       else begin
         ticket = null;
         completion = null;
@@ -1873,7 +1905,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (!status.ok())
       return;
     status = null;
-    cmq.execute(command, ticket, completion, status);
+    execute_qp_legacy_command(command, ticket, completion, status);
     ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
     recovery_ticket = ticket;
     if (recovery_ticket == null && completion != null)
@@ -2470,7 +2502,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     ticket = null;
     completion = null;
     status = null;
-    cmq.execute(command, ticket, completion, status);
+    execute_qp_legacy_command(command, ticket, completion, status);
     ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
     recovery_ticket = ticket;
     if (recovery_ticket == null && completion != null)
@@ -2753,7 +2785,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                  RDMA_OP_QPC_MODIFY, command);
     if (status.ok()) begin
       ticket = null; completion = null; ambiguous = 1'b0; status = null;
-      cmq.execute(command, ticket, completion, status);
+      execute_qp_legacy_command(command, ticket, completion, status);
       // Some CMQ adapters expose the authoritative ticket only through the
       // completion.  Recover it before classifying the outcome so a
       // definitive completion remains definitive and an ambiguous one keeps
@@ -4066,7 +4098,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
           ticket = null; completion = null;
           status = live_binding_fence(binding, expected_owner);
           if (status.ok())
-            cmq.execute(query_command, ticket, completion, status);
+            execute_qp_legacy_command(
+              query_command, ticket, completion, status
+            );
           else begin
             ticket = null;
             completion = null;

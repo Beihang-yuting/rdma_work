@@ -1066,9 +1066,16 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：在 rdma_queue_lifecycle_executor 中，execute_queue_command 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）、ambiguous（输出）、null（输入）、null（输入）；execute_queue_command 驱动下游事务，并写入 ticket、completion、status、ambiguous；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：execute_queue_command 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：在 rdma_queue_lifecycle_executor 中，execute_queue_command 统一消费一次
+  // legacy CMQ execute，归一化 ticket、completion 和状态，并计算提交证据是否不可判定。
+  // 输入/输出及副作用：command（输入）、ticket/completion/status/ambiguous（输出）、
+  // binding/expected_owner（可选输入）、null_status_message/completion_lost_message（输入）；
+  // 任务只调用一次 cmq.execute，不取得 command、ticket 或外部资源所有权。binding 与
+  // expected_owner 同时非空时执行一次 post-execute generation fence；两者为空时由调用方
+  // 保留 fence checkpoint。
+  // 失败/边界：cmq 或 command 为空时返回 INVALID_ARGUMENT；legacy execute 返回 null
+  // status、缺失 completion、timeout/reset 或 fence 失败时保持 fail-closed 结果，不推进
+  // 队列游标；调用方提供的诊断消息只用于对应 null 结果分支。
   protected task execute_queue_command(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -1076,7 +1083,9 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     output rdma_status status,
     output bit ambiguous,
     input rdma_function_binding binding = null,
-    input rdma_function_handle expected_owner = null
+    input rdma_function_handle expected_owner = null,
+    input string null_status_message = "queue CMQ execution returned null",
+    input string completion_lost_message = "queue CMQ completion was lost"
   );
     rdma_status execute_status;
 
@@ -1099,10 +1108,9 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
     end
     ambiguous = cmq_outcome_ambiguous(execute_status, ticket, completion);
-    status = normalize_status(execute_status,
-                              "queue CMQ execution returned null");
+    status = normalize_status(execute_status, null_status_message);
     if (status.ok() && (completion == null || completion.status == null))
-      status = invalid_state("queue CMQ completion was lost");
+      status = invalid_state(completion_lost_message);
   endtask
 
   // 功能：在 rdma_queue_lifecycle_executor 中，rollback_created 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
@@ -1141,17 +1149,16 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         resource.owner, plan.flush_targets[i], command_timeout, command
       ), "queue rollback pre-delete flush descriptor returned null");
       if (status.ok()) begin
-        ticket = null;
-        completion = null;
-        cmq.execute(command, ticket, completion, status);
+        // 设计说明：rollback_created 保留 fence checkpoint 的原位置和“失败即返回”
+        // 语义，因此故意让 helper 不接管 binding/owner；helper 只负责 legacy CMQ
+        // 输出、ambiguity 与 null-result 归一化。
+        execute_queue_command(
+          command, ticket, completion, status, ambiguous, null, null,
+          "queue rollback pre-delete flush result was lost",
+          "queue rollback pre-delete flush completion was lost"
+        );
         fence_status = live_binding_fence(binding, expected_owner);
         if (!fence_status.ok()) return;
-        ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
-        status = normalize_status(status,
-          "queue rollback pre-delete flush result was lost");
-        if (status.ok() &&
-            (completion == null || completion.status == null))
-          status = invalid_state("queue rollback pre-delete flush completion was lost");
       end
       else ambiguous = 1'b0;
       if (!status.ok()) begin
@@ -1181,16 +1188,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                       1'b1, 1'b1, queue);
       return;
     end
-    ticket = null;
-    completion = null;
-    cmq.execute(command, ticket, completion, status);
+    execute_queue_command(
+      command, ticket, completion, status, ambiguous, null, null,
+      "queue rollback delete result was lost",
+      "queue rollback delete completion was lost"
+    );
     fence_status = live_binding_fence(binding, expected_owner);
     if (!fence_status.ok()) return;
-    ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
-    status = normalize_status(status, "queue rollback delete result was lost");
-    if (status.ok() &&
-        (completion == null || completion.status == null))
-      status = invalid_state("queue rollback delete completion was lost");
     if (!status.ok()) begin
       fence_status = live_binding_fence(binding, expected_owner);
       if (!fence_status.ok()) return;
@@ -1212,19 +1216,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         resource.owner, plan.flush_targets[i], command_timeout, command
       ), "queue rollback post-delete flush descriptor returned null");
       if (status.ok()) begin
-        ticket = null;
-        completion = null;
-        cmq.execute(command, ticket, completion, status);
+        execute_queue_command(
+          command, ticket, completion, status, ambiguous, null, null,
+          "queue rollback post-delete flush result was lost",
+          "queue rollback post-delete flush completion was lost"
+        );
         fence_status = live_binding_fence(binding, expected_owner);
         if (!fence_status.ok()) return;
-        ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
-        status = normalize_status(status,
-                                  "queue rollback post-delete flush result was lost");
-        if (status.ok() &&
-            (completion == null || completion.status == null))
-          status = invalid_state(
-            "queue rollback post-delete flush completion was lost"
-          );
       end
       else ambiguous = 1'b0;
       if (!status.ok()) begin
@@ -2411,18 +2409,20 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
       ticket = null;
       completion = null;
-      cmq.execute(create_command, ticket, completion, status);
+      // 设计说明：create_locked 保留 fence checkpoint 在 helper 之后，和原始
+      // 提交顺序一致；helper 只收束 legacy 输出归一化，不改变 create 失败时
+      // 进入 retain_recovery/rollback_local 的判定。
+      execute_queue_command(
+        create_command, ticket, completion, status, cmq_ambiguous,
+        null, null, "queue create result was lost",
+        "queue create completion was lost"
+      );
       fence_status = live_binding_fence(binding, expected_owner);
       if (!fence_status.ok()) begin
         publish_failure(fence_status, result, RDMA_RESOURCE_ALLOCATED,
                        1'b1, 1'b0);
         return;
       end
-      cmq_ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
-      status = normalize_status(status, "queue create result was lost");
-      if (status.ok() &&
-          (completion == null || completion.status == null))
-        status = invalid_state("queue create completion was lost");
       if (!status.ok()) begin
         primary = rdma_cmq_clone_status_value(status);
         if (cmq_ambiguous) begin
@@ -2631,19 +2631,17 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                 ticket = null;
                 completion = null;
                 step_status = null;
-                cmq.execute(command, ticket, completion, step_status);
+                execute_queue_command(
+                  command, ticket, completion, step_status, ambiguous,
+                  null, null, "flush result was lost",
+                  "flush completion was lost"
+                );
                 fence_status = live_binding_fence(binding, expected_owner);
                 if (!fence_status.ok()) begin
                   status = fence_status;
                   break;
                 end
-                ambiguous = cmq_outcome_ambiguous(step_status, ticket,
-                                                  completion);
-                status = normalize_status(step_status,
-                                          "flush result was lost");
-                if (status.ok() &&
-                    (completion == null || completion.status == null))
-                  status = invalid_state("flush completion was lost");
+                status = step_status;
               end
               if (ambiguous)
                 ambiguous_op = RDMA_QUEUE_AMBIG_OCC_FLUSH;
@@ -2679,17 +2677,16 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           ticket = null;
           completion = null;
           step_status = null;
-          cmq.execute(command, ticket, completion, step_status);
+          execute_queue_command(
+            command, ticket, completion, step_status, ambiguous,
+            null, null, "delete result was lost",
+            "delete completion was lost"
+          );
           fence_status = live_binding_fence(binding, expected_owner);
           if (!fence_status.ok()) status = fence_status;
           if (status.ok()) begin
-            ambiguous = cmq_outcome_ambiguous(step_status, ticket,
-                                              completion);
-            status = normalize_status(step_status, "delete result was lost");
+            status = step_status;
           end
-          if (status.ok() &&
-              (completion == null || completion.status == null))
-            status = invalid_state("delete completion was lost");
           if (ambiguous)
             ambiguous_op = RDMA_QUEUE_AMBIG_DELETE;
         end
@@ -2714,19 +2711,17 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                 ticket = null;
                 completion = null;
                 step_status = null;
-                cmq.execute(command, ticket, completion, step_status);
+                execute_queue_command(
+                  command, ticket, completion, step_status, ambiguous,
+                  null, null, "flush result was lost",
+                  "flush completion was lost"
+                );
                 fence_status = live_binding_fence(binding, expected_owner);
                 if (!fence_status.ok()) begin
                   status = fence_status;
                   break;
                 end
-                ambiguous = cmq_outcome_ambiguous(step_status, ticket,
-                                                  completion);
-                status = normalize_status(step_status,
-                                          "flush result was lost");
-                if (status.ok() &&
-                    (completion == null || completion.status == null))
-                  status = invalid_state("flush completion was lost");
+                status = step_status;
               end
               if (ambiguous)
                 ambiguous_op = RDMA_QUEUE_AMBIG_OCC_FLUSH;

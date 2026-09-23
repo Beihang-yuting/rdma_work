@@ -10,7 +10,7 @@
 交接时只读检查发现主线仍在运行 `rdma_queue_codec_test` 的 VCS53 wrapper。
 
 工作树：`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-cmq-contract-foundation`。
-当前继续执行工作树 HEAD：`367a75bb909ac19abecc15c043ce4b95d6595f8b`；
+当前继续执行工作树 HEAD：`00b8ff6`（feature/rdma-cmq-contract-foundation）；
 有大量已存在的未提交改动。所有改动和已有验证证据必须保留。
 
 ## 当前批次状态（2026-09-22）
@@ -290,23 +290,274 @@
   所有 early-disable 路径保持幂等。poll/post/recovery/device-publish 四项 focused
   wrapper 均 PROCESS/LOGICAL PASS、UVM 0/0/0；当前 scanner 为 185 个 `.sv`、2 个
   `.svh`、5,426 methods、0 diagnostics。该批只关闭 shared-SRQ receive poll 的窄
-  证据 seam，UD receive/replay、publish variant consistency、legacy descriptor、
+  证据 seam；在 Batch133 之前，UD receive/replay、publish variant consistency、legacy descriptor、
   poll/recovery 组合、跨队列并发与最终 ownership 审计仍开放；详见
   `task-cmq-batch132-shared-srq-cqe-poll-report.md`。
-- `pcie_work` integration 仍受外部锁阻断，唯一阻断文本为 `external dependency is not approved: pcie_work`；
-  不修改外部依赖，也不把该阻断伪造为业务失败或 GREEN。
+- Batch133 在重构后的 queue-data publish/poll 共用同一组 CQE variant authority gate：
+  `resolve_cqe_variant_for_route()` 按冻结 `link.transport` 选择 RC/UD/RQ_SRFQ overlay，
+  `validate_cqe_variant_consistency()` 在 `publish_cqe()` 的 WQE lookup 与 producer
+  reservation 之前拒绝显式 variant 漂移；新增
+  `validate_cqe_srfq_route_consistency()` 要求 send CQE 的 `srfq=0`，并要求 receive
+  CQE 的 `srfq` 与冻结 `link.srq_h != null` 一致。`resolve_cqe_variant_for_image()`
+  在 poll decode 前复用同一 topology gate，因而同一 RC-attached CQ 上交错的 RC/UD/URC
+  QP 仍按 QP link transport 解码，不读取 CQ attachment transport 猜测 union。测试补齐
+  RC/UD/RQ_SRFQ mismatch、private-RQ/shared-SRQ SRFQ 拓扑 hostile case 的 publish
+  admission 原子性；shared-SRQ poll 测试再以受控 probe 在已提交 CQE 槽位只翻转
+  SRFQ wire bit，验证 poll-side rejection 在 image decode 前不改变 occupancy/cursor，
+  恢复原像后继续正向链。双环境 fixture 同时显式启用 CQC context shadow，保持公开
+  poll 契约可执行。当前
+  poll/post/recovery/device-publish focused 均 PROCESS/LOGICAL PASS、UVM 0/0/0；
+  锁定依赖后的 transport E2E 通过核心/网络正向矩阵，并在 net_packet 层按预期拒绝
+  URC READ；最终源码边界的全目录中文契约 scanner 为 185 个 `.sv`、2 个 `.svh`、
+  5,431 methods、0 diagnostics，Python 292、manifest/keyword、queue/profile、
+  Phase-1A、changed-SV style 与 `git diff --check` 均通过。该批只关闭
+  publish/poll variant admission 的局部 seam，UD receive/replay、legacy descriptor、
+  private-RQ poll hostile、poll/recovery 组合、跨队列并发、全量 malformed matrix、
+  最终 ownership 审计仍开放；
+  详见 `task-cmq-batch133-cqe-variant-consistency-report.md`。
+- `pcie_work` 已按用户授权纳入本项目依赖锁：commit
+  `1a80801e7d336ceeb492e7cdf57ba26ef27c2456`、闭包 tree SHA-256
+  `8a9853c2cb618b5f73f4d2fed2167fad3a7b08bce37298cfef9ea159b1c5feb1`，75 个锁定文件均为
+  `APPROVED`；`host_mem` 同时固定为 commit `365b7553fc7dac6b4ad55886a8e4869153607c28`，
+  tree SHA-256 `b9cd7d686c954823bdeafcea2f02013908fed51db5a8f4d39e96e5e877f6c770`。两项
+  clean-clone lock verify 均通过。53 机登录 bash 中 pcie adapter（UVM INFO 4/0/0/0）与
+  SR-IOV（INFO 260/0/0/0）均 compile/elab/link/exit 通过；host_mem 三项 regression
+  为 INFO 17/17/4、UVM 0/0/0 且 leak=0。详见 `docs/rdma-pcie-work-adoption-evidence.md`。
+  这不代表 pcie_work 更广 error/ordering/组合矩阵已完成，也不修改外部源码；上游缺少
+  root README/LICENSE/tag 的 provenance 风险继续保留。
+- Batch134 在同一锁定 `pcie_work` 快照上补充供应商 TL-only error/ordering smoke：
+  `pcie_tl_smoke_err_test` 为 UVM `5/0/0/0`，ordering smoke 为 `6/0/0/0`，scoreboard
+  `2 requests / 1 completion / 1 matched`。该批只证明供应商本体的基础错误/顺序契约，
+  未证明 RDMA adapter 的 poisoned、timeout、malformed TLP、tag-conflict、DMA/backpressure
+  或 SR-IOV stress 组合。
+- Batch135 在 `rdma_queue_data_engine_poll_test` 中补充公开 UD 私有 RQ 的
+  Host-memory write fault → confirmed replay → receive CQE poll/release 窄闭环：未确认
+  retry 返回 `RDMA_SC_INVALID_ARGUMENT`，confirmed replay 逐字节复核 pending image，
+  随后断言 RQ/CQ occupancy、cursor、QPN、`wr_id` 和单槽 release；53 机最终源码边界
+  compile/elab/link/PROCESS/LOGICAL 均 PASS，UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`。
+  详见 `task-cmq-batch134-pcie-work-error-ordering-report.md` 与
+  `task-cmq-batch135-ud-receive-replay-report.md`。两批仍不关闭完整外部 regression、UD
+  多包/多队列 replay、malformed recovery、legacy descriptor、跨队列并发和全局锁。
+- Batch136 在 `rdma_queue_lifecycle_executor.sv` 中把 `rollback_created()` 的三处
+  legacy `cmq.execute()` 结果归一化提取到 `execute_queue_command()`，并允许调用方传入
+  阶段化 null-status/completion 诊断消息；原有 post-execute `live_binding_fence()`
+  checkpoint、ambiguity 判定和失败即返回顺序保持不变。`rdma_queue_lifecycle_test` 与
+  `rdma_queue_recovery_test` 均在 53 机最终源码边界 PROCESS/LOGICAL PASS、UVM
+  `INFO=3/WARNING=0/ERROR=0/FATAL=0`。这是兼容 legacy consumer 的局部去重，不是
+  `execute_observed()` 全量迁移；详见
+  `task-cmq-batch136-legacy-rollback-execution-seam-report.md`。
+- Batch137 延伸同一 seam：`create_locked()` 和 `destroy_locked()` 的三处 direct
+  `cmq.execute()` 也改由 `execute_queue_command()` 统一归一化，原
+  `live_binding_fence()`、ambiguity、completion 缺失和 manager progress 顺序保持不变。
+  当前 executor 只在 helper 内保留一处 direct legacy call；lifecycle/recovery 两项
+  53 机 focused 均 rc=0、PROCESS/LOGICAL PASS、UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`。
+  详见 `task-cmq-batch137-create-destroy-legacy-execution-seam-report.md`。这仍不等于
+  control-plane、QP lifecycle 和 queue lifecycle consumer 已迁移到 `execute_observed()`；
+  在该批边界 control-plane/QP 两类剩余 consumer direct call 为 11 个，需按 timeout、
+  rollback 和 recovery 语义继续分批收口。
+- Batch138 在 `rdma_control_plane.sv` 中新增 `execute_control_command()`，把 MR rollback、
+  `deregister_mr()` 的 OCC_FLUSH/MR_DEREGISTER/TQ_FLUSH 以及 recovery hardware step
+  的五处同构 legacy `cmq.execute()` 结果归一化收束到一个入口，并加入 CMQ/command
+  fail-closed guard；调用方原有 timeout、ticket、generation fence、恢复记录和资源释放
+  顺序保持不变。KEY_ALLOC 因成功 status 与 timeout→recovery/rollback 分支特殊暂留
+  direct 路径；control-plane/QP 剩余 consumer direct call 从 11 降为 6（KEY_ALLOC 1、
+  QP lifecycle 5），helper 内兼容调用不计入 consumer 数。`rdma_control_plane_cmq_engine_test`
+  与 `rdma_control_plane_test` 在 53 机均 PROCESS/LOGICAL PASS、UVM `INFO=3/WARNING=0/
+  ERROR=0/FATAL=0`；详见 `task-cmq-batch138-control-plane-legacy-execution-seam-report.md`。
+  该批仍是 legacy normalization 去重，不是 `execute_observed()` 或 detached
+  ticket/completion ownership 的迁移。
+- Batch139 在 `rdma_qp_lifecycle_executor.sv` 中新增 `execute_qp_legacy_command()`，仅
+  统一 QP presence/query、QPC_CREATE、QPC_MODIFY、recovery query 与 terminal rollback
+  的 ticket/completion/status 初始化和一次 raw `cmq.execute()`；每个调用方原有
+  pre/post generation fence、ambiguity、completion、timeout 和 recovery 分支保持原位。
+  QP 文件 direct legacy dispatch 现仅剩 helper 内一处；与 queue/control-plane helper
+  一样，这仍是 compatibility normalization，不是 `execute_observed()` 或 detached
+  ticket/completion ownership 迁移。`rdma_qp_lifecycle_test` 与 `rdma_qp_recovery_test`
+  在 53 机均 PROCESS/LOGICAL PASS、UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；详见
+  `task-cmq-batch139-qp-legacy-execution-seam-report.md`。当前跨三个 consumer 的
+  未收束 consumer direct call 仅剩 control-plane KEY_ALLOC 一处。
+- Batch140 将 control-plane 的 KEY_ALLOC 也通过 `execute_control_command()` 执行，保留
+  该特殊路径的原始 status identity；timeout ticket、recovery/rollback 和后续 generation
+  语义不变。至此 queue lifecycle、control-plane、QP lifecycle 三个 consumer 文件均只
+  在各自兼容 helper 内保留一处 legacy `cmq.execute()`，不再存在 direct consumer dispatch
+  call site。`rdma_control_plane_cmq_engine_test` 与 `rdma_control_plane_test` 在 53 机均
+  PROCESS/LOGICAL PASS、UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；详见
+  `task-cmq-batch140-key-alloc-legacy-execution-seam-report.md`。这仍不是
+  `execute_observed()`、detached ticket/completion ownership 或 legacy accessor 删除，
+  计划继续保持 `active`。
+- Batch141 在 `rdma_control_plane.sv` 中把 raw 与 detached status ownership 拆成两个
+  显式 seam：`execute_control_command_raw_status()` 负责 CMQ/command fail-closed guard、
+  ticket/completion 初始化、一次 legacy dispatch 和 backend raw status identity；
+  `execute_control_command()` 复用 raw seam，再通过 `checked_status()` 生成 detached
+  status，供 MR rollback、deregister 与 recovery hardware-step 使用。KEY_ALLOC 显式调用
+  raw seam，并在原调用点保留 null-status 归一化、timeout ticket、recovery/rollback 和
+  generation 检查，未改变 dispatch 次数、失败优先级或资源提交顺序。两项 control-plane
+  focused 在 53 机 compile/elab/link、PROCESS/LOGICAL PASS，UVM `INFO=3/WARNING=0/
+  ERROR=0/FATAL=0`；`git diff --check`、changed-SV style、profile naming、queue lifecycle
+  与 Python 292 门禁通过。该批只澄清 ownership，不是 `execute_observed()` 或 detached
+  ticket/completion 迁移；详见 `task-cmq-batch141-control-status-ownership-seam-report.md`。
+- Batch142 在 `rdma_queue_data_engine.sv` 中提取
+  `prepare_aeqe_publish_image()`，把 AEQE reservation 前的 model clone、live primary
+  route authority、profile owner、registry/type check、codec encode 和完整 16-byte image
+  校验集中到无 runtime 副作用的 staging seam；失败时清空 `encode_model`/`image`，不
+  触碰 attachment、runtime、cursor、backing、pending、Host-memory 或 MMIO。
+  `publish_aeqe_common()` 继续负责 reservation 后 epoch/polarity、cancel/recovery 和
+  commit，CQE/CEQE reserve-before-encode 语义不变。四项 53 机 focused
+  (`rdma_queue_data_engine_device_publish_test`、`rdma_aeqe_route_test`、
+  `rdma_aeqe_f5_e2e_test`、`rdma_queue_event_route_consume_test`) 均 compile/elab/link、
+  PROCESS/LOGICAL PASS，UVM INFO 分别为 220/3/115/3，WARNING/ERROR/FATAL 全为 0；
+  changed-SV style、diff、profile、queue lifecycle 与 Python 292 门禁通过。该批只收束
+  AEQE image staging 局部职责，malformed retry、poll/recovery 组合、SRQ lifecycle、
+  legacy descriptor、跨队列并发和 registry null/type-fault 原子性仍开放；详见
+  `task-cmq-batch142-aeqe-image-staging-report.md`。
+- Batch143 在 `rdma_queue_data_engine.sv` 中提取
+  `prepare_event_poll_continuation()`，把 CEQ/AEQ decode/route/result 之后、首次
+  `enter_recovery_prepared()` 之前同构的 consumer pending、doorbell descriptor 和
+  noalloc status staging 收束到一个无副作用 seam。CEQ 的 `route_found` 与 AEQ 的
+  `deliver_found` 仍由各自 caller 保持，route miss 仍确认事件但丢弃 payload；helper
+  不做 lookup/read/decode/route/result clone、不写 Host-memory/MMIO、不推进 CI/used，
+  `commit_event_poll_candidate()` 仍是唯一 mutation/commit 边界。最终 53 机
+  `rdma_queue_event_route_consume_test` 与 `rdma_aeqe_route_test` 均 PROCESS/LOGICAL
+  PASS、UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；全目录 scanner 为 185 `.sv`、2
+  `.svh`、5,437 methods、0 diagnostics，计划继续保持 `active`。详见
+  `task-cmq-batch143-event-preparation-seam-report.md`。
+- Batch144 在 `rdma_queue_data_engine.sv` 中提取
+  `complete_host_producer_tail()`，把 `post_send()`/`post_recv()` 在 producer
+  reservation、model encode 以及 SQ 专属 `write_sgb_and_verify()`（仅发送路径）之后
+  重复的 WQE write/readback、next cursor、producer doorbell、`commit_producer()`、
+  detached result 和 recovery pending 尾段收束到统一 task。写回/读回失败保持
+  `NO_SUBMIT` pending，doorbell/commit 失败保持 `AMBIGUOUS` evidence，pending clone
+  失败返回 `RESOURCE_EXHAUSTED`，recovery 返回值不覆盖首个阶段 status；helper 不取得
+  queue、backing、request 或 handle 的外部生命周期所有权。该 task 接收 caller 冻结的
+  attachment/queue/kind/cursor/image/request 输入，不新增 reservation、authority 或
+  route/epoch admission；`post_recv()` 的显式 route/epoch 检查仍在 helper 前，
+  `post_send()` 的独立 route/epoch 复核不在本批新增。最终源码 SHA 为
+  `1dfe2bf1038d2fe847e801e4f5eaad837b649c00f0efd9733427b5c448af7388`；
+  `rdma_queue_data_engine_post_test`、`rdma_queue_data_engine_recovery_test` 与
+  `rdma_queue_data_engine_poll_test` 均 PROCESS/LOGICAL PASS、UVM `INFO=3/WARNING=0/
+  ERROR=0/FATAL=0`，`rdma_queue_data_engine_device_publish_test` 同样 PASS、UVM
+  `INFO=220/WARNING=0/ERROR=0/FATAL=0`；全目录 scanner 为 185 `.sv`、2 `.svh`、5,438 methods
+  （`.sv` 5,436、`.svh` 2）、0 diagnostics，计划继续保持 `active`。详见
+  `task-cmq-batch144-host-producer-tail-report.md`。
+- Batch145 在 `rdma_queue_data_engine.sv` 中新增受保护的
+  `reserve_host_producer_cursor()`，把 SQ/私有 RQ/shared SRQ 在首次 producer 副作用前
+  的 `validate_attachment_route_epoch()`→`reserve_producer()` 顺序收束为一个 admission
+  seam。`post_send()` 在 SQE authority 后调用，`post_recv()` 在 target/owner 检查后调用；
+  stale route/epoch 或 null-status fault 时 cursor 保持 null，不创建 pending、不写 Host-memory、不发 MMIO、
+  不改 ledger。post-test 新增 direct send stale-epoch fixture，确认返回
+  `RDMA_SC_STALE_GENERATION` 且 SQ cursor/used/pending、Host-memory/PCIe 计数不变。
+  post/recovery/poll/device-publish 四项 53 机 focused 均 PROCESS/LOGICAL PASS，UVM
+  分别为 `INFO=3/3/3/220`，WARNING/ERROR/FATAL 全为 0；最终源码 SHA 为
+  `dde548fb979c0dd1e694651031edc2acb469766e57d2d9f221673001016bb431`，全目录 scanner
+  为 185 `.sv`、2 `.svh`、5,440 methods（`.sv` 5,438、`.svh` 2）、0 diagnostics。
+  计划继续保持 `active`；reservation 后 route 变化窗口、host-producer hostile fault
+  matrix、SRQ 全生命周期、legacy descriptor、跨队列并发、engine-level 全局锁和最终
+  ownership 审计仍开放。详见 `task-cmq-batch145-host-producer-admission-report.md`。
+- Batch148 在 `rdma_queue_data_engine.sv` 中继续收束 host-producer 的 route/epoch
+  evidence 与副作用尾段：`snapshot_attachment_route_epoch()`、reservation 后窗口复核、
+  `commit_host_producer_ledger()`、recovery admission/install 和
+  `complete_host_producer_tail()` 现在分别承担快照、admission、ledger 调用、pending
+  安装和 write/readback→next cursor→doorbell→commit→result 顺序。pending 始终覆盖为
+  reservation 冻结的 route/epoch；nonfatal raw factory 与 fail-closed handle clone 不会
+  让已提交事务因结果构造失败而重复 mutation。commit-failure test 与 stale-replay
+  fixture 分别证明 `AMBIGUOUS` evidence/PI/CI/used 不前进，以及 reset epoch 变化后
+  retry 不增加 I/O。post/recovery/poll/device-publish/hostile-failure/commit-failure
+  六项 53 机 focused 均 PROCESS/LOGICAL PASS，UVM INFO `3/3/3/220/27/8`，WARNING/
+  ERROR/FATAL 全 0；最终源码 SHA 为
+  `ca11b30a716b7672b8a648457475dc45cd122f33107b879e0c40738bddb1b509`，全目录 scanner
+  为 185 `.sv`、2 `.svh`、5,460 methods（`.sv` 5,458、`.svh` 2）、0 diagnostics。
+  计划继续保持 `active`；reservation 后并发、admission/enter-recovery failure matrix、
+  SRQ 全生命周期、跨队列并发、legacy descriptor、外部 PCIe error/ordering、全局锁和
+  最终 ownership 审计仍开放。详见
+  `task-cmq-batch148-host-producer-commit-route-report.md`。
+- Batch149 在 `recover_queue()` 的 reservation-only 分支新增受保护的
+  `resolve_reservation_only_recovery()`：该 helper 统一收集完整 queue incarnation 的
+  candidate、逐个查询 reservation、完成多匹配 cardinality 判定，并只允许唯一
+  reservation 走公开 abort/detach；没有 image 的 retry 仍返回 `RECOVERY_REQUIRED`，
+  query/detach/null-status 失败不删除任何 evidence。unclaimed admission 失败分支
+  保留独立的 ACTIVE state 与 pending cursor 对齐门禁，避免把两种 recovery evidence
+  混成一个过宽的 cancel seam。`rdma_queue_data_engine_device_publish_test`（含
+  multiple-reservation、锁忙和最终 reconfigure）与 `rdma_queue_data_engine_recovery_test`
+  均在 53 机最终源码边界 PROCESS/LOGICAL PASS，UVM `INFO=220/3`、WARNING/ERROR/FATAL
+  全为 0；源码 SHA 为
+  `adf49cd8f64b94fc7f0426637df9869688e76333401f08727ce353f9b679c322`，全目录 scanner
+  为 185 `.sv`、2 `.svh`、5,461 methods（`.sv` 5,459、`.svh` 2）、0 diagnostics。
+  计划继续保持 `active`；跨队列并发、SRQ 全生命周期、legacy descriptor、外部
+  PCIe error/ordering、engine-level 全局锁、全目录 ownership 与 integration aggregate
+  仍开放。详见 `task-cmq-batch149-reservation-only-recovery-seam-report.md`。
+- Batch150 在 `src/codec/rdma/rdma_cmq_codecs.sv` 收束两个 CMQ consumer 之间重复的
+  `context_key()`/`is_context_opcode()`：新增 package-scope
+  `rdma_cmq_context_codec_key()` 与 `rdma_cmq_is_context_opcode()`，原 protected
+  方法保留为兼容转发；六个 context opcode 映射与 unknown fail-closed 行为逐值不变。
+  同批删除 `rdma_cmq_codec_test.sv` 中无调用的旧 context-key fixture，并同步 frozen ABI
+  manifest 摘要。codec、context-body、context-CMQ focused 和 CMQ gate 均在 53 机登录
+  bash 通过；CMQ gate 为 PROCESS 28/28、LOGICAL 11/11、UVM pristine 28/28，严格
+  warning/error/fatal 均为 0。最终 codec/test/manifest SHA 分别为
+  `07fd199219f2ec8ce57e90a8e863cb259d3e02da8543970c7e3bc41c17ac3ac7`、
+  `5f6c14ce8fa0b34c8d89a38ed5f9d88bd1c782120021f4e8e5b74dd958b9103d`、
+  `cac560ed8225ae163fa1641fa2a9b470fc0828d6184411eef21abeeddf634caa`；全目录 scanner
+  为 185 `.sv`、2 `.svh`、5,462 methods（`.sv` 5,460、`.svh` 2）、0 diagnostics。
+  本批只消除两个 consumer helper 的重复，不把 registration 表宣称为同一全局数据源；
+  计划继续保持 `active`。详见 `task-cmq-batch150-context-helper-shrink-report.md`。
+- Batch151 在 `src/model/rdma_authority_validation.sv` 收束 CQ/EQ/RQ/SQ facade
+  重复的 live-authority admission：统一 configured/delegate/binding 缺失、Function
+  UID/generation/reset epoch 漂移、ACTIVE 状态和 `validate()` null/failure 的拒绝顺序；
+  四个 facade 的 protected `validate_live_authority()` 保留为薄转发，未改变
+  authority 快照或 runtime/ledger 所有权。SQ/RQ/CQ/EQ focused 均在 53 机登录 bash
+  通过，UVM warning/error/fatal 为 0/0/0；helper 加入后全目录 scanner 为 188 文件
+  （186 `.sv`、2 `.svh`）、5,463 methods、0 diagnostics。详见
+  `task-cmq-batch151-authority-validation-helper-report.md`。
+- Batch152 在 `src/core/rdma_queue_facade_configuration.sv` 收束 SQ/RQ/EQ 三个
+  `configure()` 的重复依赖一致性、binding 校验和 ACTIVE admission；one-shot
+  `configured` 门禁、delegate/authority/timeout 快照写入仍留在各 facade，CQ 的 URC
+  专属配置路径不被泛化。`rdma_sq_engine_test`、`rdma_rq_engine_test` 和
+  `rdma_eq_engine_test` 在 53 机最终源码边界均 PROCESS/LOGICAL PASS，UVM
+  `INFO=3/WARNING=0/ERROR=0/FATAL=0`；全目录 scanner 刷新为 189 文件（187 `.sv`、
+  2 `.svh`）、5,464 methods（`.sv` 5,462、`.svh` 2）、0 diagnostics。计划继续保持
+  `active`。详见 `task-cmq-batch152-facade-configuration-shrink-report.md`。
+- Batch153 将 CQ 普通 `configure()` 接入同一
+  `rdma_validate_queue_facade_configuration()`，收束第四个 facade 的依赖非空、
+  shared-engine 五引用一致性、binding validation 和 ACTIVE admission；CQ 的
+  `configure_shared()`、URC completion-QP/shadow 约束、`configured` 与
+  `shared_configured` 门禁以及 authority/delegate/timeout 快照仍由 CQ 自己负责。
+  `rdma_cq_engine_test`、`rdma_cq_engine_resize_test` 和
+  `rdma_cq_shadow_flush_test` 在 53 机登录 bash 均 PROCESS/LOGICAL PASS，UVM
+  `INFO=3/WARNING=0/ERROR=0/FATAL=0`；全目录 scanner 仍为 189 文件（187 `.sv`、
+  2 `.svh`）、5,464 methods（`.sv` 5,462、`.svh` 2）、0 diagnostics。计划继续保持
+  `active`。详见 `task-cmq-batch153-cq-configuration-admission-report.md`。
+- Batch154 在 `src/core/rdma_queue_data_engine.sv` 新增受保护的
+  `poll_event_with_timeout()`，收束 CEQ/AEQ public poll wrapper 重复的 deadline、
+  `QUEUE_EMPTY` 重试、null-status 归一化和 timeout 返回；`poll_ceqe_once()`/
+  `poll_aeqe_once()` 的 decode、route、pending、doorbell、commit、recovery 和
+  detached-result 逻辑仍各自保留，virtual `poll_ceqe()`/`poll_aeqe()` 入口不变。
+  `rdma_queue_data_engine_poll_test`、`rdma_queue_event_route_consume_test` 和
+  `rdma_aeqe_route_test` 以及覆盖非零 timeout 的 `rdma_eq_engine_test` 在 53 机登录 bash 均 PROCESS/LOGICAL PASS，UVM
+  `INFO=3/WARNING=0/ERROR=0/FATAL=0`；全目录 scanner 更新为 189 文件（187 `.sv`、
+  2 `.svh`）、5,465 methods（`.sv` 5,463、`.svh` 2）、0 diagnostics。计划继续保持
+  `active`。详见 `task-cmq-batch154-event-poll-timeout-shrink-report.md`。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
   `git diff --check`、changed-SV style，以及覆盖 5,286 个 function/task 的历史全目录中文契约/文件头
   scanner 均 GREEN；Batch110 按当前工作树重新扫描 185 个 `.sv`、2 个 `.svh`，共 5,382
   个 function/task、0 diagnostics，且 Python/manifest/keyword/queue/profile/Phase-1A
   辅助门禁均通过；Batch111 在 capability 改动后重扫为 5,387 个 function/task、0 diagnostics，
   摘要见 `evidence/batch111.*`，历史完整摘要仍位于 `evidence/final-static.meta`。
+  Batch142 自身边界为 5,436 methods，Batch143 helper 后为 5,437 methods；Batch144
+  当前边界为 5,438 methods（`.sv` 5,436、`.svh` 2）；Batch145 新增 admission helper
+  与 stale-epoch fixture 后为 5,440 methods；Batch148 当前最终源码边界重扫为 185 个
+  `.sv`、2 个 `.svh`，5,460 methods（`.sv` 5,458、`.svh` 2）；Batch149 新增
+  reservation-only recovery helper 后重扫为 5,461 methods（`.sv` 5,459、`.svh` 2）；Batch150
+  context helper 收缩与 dead fixture 删除后重扫为 5,462 methods（`.sv` 5,460、`.svh` 2）、
+  Batch151 authority helper 与 Batch152 facade configuration helper 后重扫为 5,464 methods
+  （`.sv` 5,462、`.svh` 2）；Batch154 event poll timeout helper 后当前边界为 5,465
+  methods（`.sv` 5,463、`.svh` 2）、0 diagnostics；扫描继续复用
+  `sanitize_source`、`method_ranges`、`check_method_comments` 和 `check_file_header`，覆盖
+  `src/`、`tests/`、`sim/`，不把历史计数冒充当前证据。
 
 计划状态：`active`。Batch109/110 已关闭当前严格一对一 ownership/close/candidate seam
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
 Batch112 关闭同步 tokenless dataplane reset-admission seam；Batch113 关闭 SQ SGB
 writer 的局部 image/payload authority seam；Batch114 关闭 UD transport-aware effective
-mode 对齐 seam；Batch115–131 继续关闭 queue-data 的局部 target/replay/recovery 扫描
+mode 对齐 seam；Batch115–133 继续关闭 queue-data 的局部 target/replay/recovery 扫描
 结构 seam，但 Batch119 关闭 recovery action/cardinality/query 顺序的局部契约、Batch120
 关闭 device-producer replay 的局部职责 seam、Batch121 关闭 consumer replay 的局部职责
 seam、Batch122 关闭 local-resource match/projection 的局部职责 seam、Batch123 关闭
@@ -317,8 +568,18 @@ Batch127 关闭 live CQ poll mutation/commit 的局部职责 seam、Batch128 关
 consumer commit 的局部职责 seam、Batch129 关闭 CQ poll WQ target selector/validator
 的局部职责 seam、Batch130 关闭私有 RQ receive CQE 正向 poll 的测试覆盖 seam、Batch131
 关闭 staged WQ canonicalization 的 admission seam并补充 UD SEND 正向 poll 证据、Batch132
-关闭 shared-SRQ receive CQE 正向 poll 的测试覆盖 seam；完整公开
-post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
+关闭 shared-SRQ receive CQE 正向 poll 的测试覆盖 seam、Batch133 关闭 CQE
+variant/SRFQ topology consistency 的 publish/poll admission seam、Batch134 的供应商
+TL-only error/ordering smoke、Batch135 的 UD receive/replay 窄闭环、Batch136 的
+rollback legacy execution 去重 seam、Batch137 的 create/destroy legacy execution
+归一化、Batch138 的 control-plane legacy execution seam、Batch139 的 QP legacy
+  execution seam、Batch140 的 KEY_ALLOC 收口、Batch141 的 raw/detached status ownership
+  拆分、Batch142 的 AEQE reservation 前 image staging、Batch143 的 CEQ/AEQ prepared
+  consumer staging、Batch144 的 SQ/RQ/SRQ host-producer completion tail、Batch145 的
+  host-producer route/epoch admission、Batch148 的 host-producer commit/recovery route
+  和 Batch149 的 reservation-only recovery seam、Batch150 的 CMQ context helper 重复收缩、
+  Batch151/152/153 的 facade authority/configuration admission 收缩、Batch154 的 CEQ/AEQ
+  timeout wrapper 收缩；完整公开 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。
 

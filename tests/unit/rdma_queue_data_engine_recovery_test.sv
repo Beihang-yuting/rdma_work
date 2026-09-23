@@ -558,6 +558,289 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
                  status.convert2string())
   endtask
 
+  // 功能：check_host_producer_replay_rejects_stale_epoch 在 SQ producer reservation
+  //   已取得、外置 SGB 已写回而公共 WQE 尚未写回的窗口注入 Function reset，验证
+  //   engine 会保留带旧 route/epoch 的 NO_SUBMIT pending，并在 caller-confirmed
+  //   replay 前置校验处拒绝该旧代际 evidence。
+  // 输入/输出及副作用：无显式参数；建立 probe lifecycle fixture，记录 SQ cursor、
+  //   occupancy、pending、Host-memory/PCIe 调用轨迹，执行 post_send、查询 pending、
+  //   retry 与 abort；fixture 继续拥有所有 resource/mapping，任务只读取 detached
+  //   snapshots，不转移外部生命周期所有权。
+  // 失败/边界：setup/probe cast、SGB mapping、reservation-window 注入或任一公开查询
+  //   失败时停止当前场景；post 必须返回 STALE_GENERATION 且只留下已发生的 SGB
+  //   write/readback，replay 必须返回 STALE_GENERATION 或 RECOVERY_REQUIRED、保持
+  //   pending/cursor/used 和 I/O 计数不变，最后只有成功 abort 才把 qp_attached 清零。
+  task automatic check_host_producer_replay_rejects_stale_epoch();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_probe probe;
+    rdma_post_send_req request;
+    rdma_sge sge;
+    rdma_queue_post_result result;
+    rdma_queue_pending_operation pending;
+    rdma_queue_pending_operation pending_after;
+    rdma_status status;
+    rdma_status post_status;
+    rdma_status pending_status;
+    rdma_status replay_status;
+    rdma_status cursor_status;
+    rdma_status occupancy_status;
+    rdma_status cleanup_status;
+    rdma_reset_epoch_t reservation_epoch;
+    longint unsigned sgb_base;
+    int unsigned sge_index;
+    int unsigned before_index;
+    int unsigned after_index;
+    int unsigned before_consumer;
+    int unsigned after_consumer;
+    int unsigned before_used;
+    int unsigned after_used;
+    int unsigned before_mem_calls;
+    int unsigned after_post_mem_calls;
+    int unsigned before_replay_mem_calls;
+    int unsigned after_replay_mem_calls;
+    int unsigned before_pcie_calls;
+    int unsigned after_post_pcie_calls;
+    int unsigned before_replay_pcie_calls;
+    int unsigned after_replay_pcie_calls;
+    int unsigned before_mem_write_64;
+    int unsigned before_mem_write_512;
+    int unsigned after_post_mem_write_64;
+    int unsigned after_post_mem_write_512;
+    int unsigned after_replay_mem_write_64;
+    int unsigned after_replay_mem_write_512;
+    int unsigned before_mmio_writes;
+    int unsigned after_post_mmio_writes;
+    int unsigned after_replay_mmio_writes;
+    int unsigned i;
+    string post_diagnostic;
+    bit before_wrap;
+    bit after_wrap;
+    bit before_consumer_wrap;
+    bit after_consumer_wrap;
+    bit before_pending;
+    bit after_pending;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "stale_producer_replay_fixture");
+    begin : stale_producer_replay_flow
+      if (fixture == null) begin
+        `uvm_error("STALE_REPLAY_FIXTURE", "fixture allocation failed")
+        disable stale_producer_replay_flow;
+      end
+
+      // 只替换 reservation-window seam；Function/queue/backing/codec authority
+      // 仍由完整 fixture 建立，避免测试自行复制 attachment 生命周期。
+      fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b0, 1'b0, 1'b1);
+      if (status == null || !status.ok()) begin
+        `uvm_error("STALE_REPLAY_SETUP", status == null ? "null setup status" :
+                   status.convert2string())
+        disable stale_producer_replay_flow;
+      end
+      if (!$cast(probe, fixture.engine) || probe == null) begin
+        `uvm_error("STALE_REPLAY_PROBE", "engine probe cast failed")
+        disable stale_producer_replay_flow;
+      end
+
+      reservation_epoch = fixture.binding.function_reset_epoch();
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_index, before_wrap,
+        before_consumer, before_consumer_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_used, before_pending);
+      if (cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok() || before_pending) begin
+        `uvm_error("STALE_REPLAY_BASELINE", "SQ baseline query failed")
+        disable stale_producer_replay_flow;
+      end
+
+      request = fixture.make_send(64'hf149_0000_0000_0001);
+      if (request == null || fixture.qp == null || fixture.qp.qp_plan == null ||
+          fixture.qp.qp_plan.sq_sgb_ref == null ||
+          fixture.qp.qp_plan.sq_sgb_ref.mapping == null) begin
+        `uvm_error("STALE_REPLAY_SGB", "SQ SGB mapping authority is unavailable")
+        disable stale_producer_replay_flow;
+      end
+      // RC 的 payload authority 以三个以上有效 SGE 选择 SGE_SGB；仅填写
+      // sgb_iova 不会改变 derive_payload_authority 的 mode，故这里显式构造
+      // 最小三项 descriptor，确保测试真正进入 external-SGB writer。
+      request.sges.delete();
+      for (sge_index = 0; sge_index < 3; sge_index++) begin
+        sge = rdma_sge::type_id::create(
+          $sformatf("stale_replay_sge%0d", sge_index));
+        sge.iova.value = 64'h0000_1000_0000_3000 + sge_index * 64;
+        sge.length = 8;
+        sge.lkey = 32'hc0c0_c000 + sge_index;
+        request.sges.push_back(sge);
+      end
+      sgb_base = fixture.qp.qp_plan.sq_sgb_ref.mapping.iova.value +
+                 fixture.qp.qp_plan.sq_sgb_ref.mapping_offset;
+      request.sgb_iova.value = sgb_base;
+
+      before_mem_calls = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      before_pcie_calls = fixture.pcie == null ? 0 : fixture.pcie.calls.size();
+      before_mem_write_64 = 0;
+      before_mem_write_512 = 0;
+      before_mmio_writes = 0;
+      if (fixture.mem != null) begin
+        foreach (fixture.mem.calls[i]) begin
+          if (fixture.mem.calls[i] != null &&
+              fixture.mem.calls[i].method_name == "write" &&
+              fixture.mem.calls[i].data.size() == 64)
+            before_mem_write_64++;
+          if (fixture.mem.calls[i] != null &&
+              fixture.mem.calls[i].method_name == "write" &&
+              fixture.mem.calls[i].data.size() == 512)
+            before_mem_write_512++;
+        end
+      end
+      if (fixture.pcie != null) begin
+        foreach (fixture.pcie.calls[i]) begin
+          if (fixture.pcie.calls[i] != null &&
+              fixture.pcie.calls[i].method_name == "mmio_write")
+            before_mmio_writes++;
+        end
+      end
+
+      // gate 1/2 允许 reservation 与 SGB writer，gate 3 在公共 WQE 首写前翻转
+      // epoch，专门覆盖 prior_host_write=1 的 pending 构造分支。
+      probe.arm_reservation_epoch_flip(2, 3);
+      result = null;
+      fixture.engine.post_send(request, result, post_status);
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_index, after_wrap,
+        after_consumer, after_consumer_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_used, after_pending);
+      pending = null;
+      pending_status = fixture.engine.query_runtime_pending(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, pending);
+      after_post_mem_calls = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      after_post_pcie_calls = fixture.pcie == null ? 0 : fixture.pcie.calls.size();
+      after_post_mem_write_64 = 0;
+      after_post_mem_write_512 = 0;
+      after_post_mmio_writes = 0;
+      if (fixture.mem != null) begin
+        foreach (fixture.mem.calls[i]) begin
+          if (fixture.mem.calls[i] != null &&
+              fixture.mem.calls[i].method_name == "write") begin
+            if (fixture.mem.calls[i].data.size() == 64)
+              after_post_mem_write_64++;
+            if (fixture.mem.calls[i].data.size() == 512)
+              after_post_mem_write_512++;
+          end
+        end
+      end
+      if (fixture.pcie != null) begin
+        foreach (fixture.pcie.calls[i]) begin
+          if (fixture.pcie.calls[i] != null &&
+              fixture.pcie.calls[i].method_name == "mmio_write")
+            after_post_mmio_writes++;
+        end
+      end
+      after_pending = 1'b0;
+      if (pending != null)
+        after_pending = 1'b1;
+      post_diagnostic = post_status == null ? "null post status" :
+                        post_status.convert2string();
+      if (post_status == null || post_status.code != RDMA_SC_STALE_GENERATION ||
+          result != null || cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok() ||
+          pending_status == null || !pending_status.ok() || pending == null ||
+          !pending.producer || pending.device_producer || !pending.route_valid ||
+          !pending.epoch_valid || pending.reset_epoch != reservation_epoch ||
+          pending.mmio_evidence != RDMA_QUEUE_MMIO_NO_SUBMIT ||
+          pending.mmio_maybe_submitted || !pending.known_no_mmio ||
+          pending.cursor == null || pending.image == null ||
+          pending.request_snapshot == null ||
+          after_index != before_index || after_wrap != before_wrap ||
+          after_consumer != before_consumer ||
+          after_consumer_wrap != before_consumer_wrap ||
+          after_used != before_used || !after_pending ||
+          after_post_mem_calls <= before_mem_calls ||
+          after_post_pcie_calls < before_pcie_calls ||
+          after_post_mem_write_64 != before_mem_write_64 ||
+          after_post_mem_write_512 <= before_mem_write_512 ||
+          after_post_mmio_writes != before_mmio_writes ||
+          fixture.binding.function_reset_epoch() != 2)
+        `uvm_error("STALE_REPLAY_POST", post_diagnostic)
+
+      before_replay_mem_calls = after_post_mem_calls;
+      before_replay_pcie_calls = after_post_pcie_calls;
+      fixture.engine.recover_queue(
+        fixture.qp.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING, 1'b1,
+        replay_status);
+      pending_after = null;
+      pending_status = fixture.engine.query_runtime_pending(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, pending_after);
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_index, after_wrap,
+        after_consumer, after_consumer_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_used, after_pending);
+      after_replay_mem_calls = fixture.mem == null ? 0 : fixture.mem.calls.size();
+      after_replay_pcie_calls = fixture.pcie == null ? 0 : fixture.pcie.calls.size();
+      after_replay_mem_write_64 = 0;
+      after_replay_mem_write_512 = 0;
+      after_replay_mmio_writes = 0;
+      if (fixture.mem != null) begin
+        foreach (fixture.mem.calls[i]) begin
+          if (fixture.mem.calls[i] != null &&
+              fixture.mem.calls[i].method_name == "write") begin
+            if (fixture.mem.calls[i].data.size() == 64)
+              after_replay_mem_write_64++;
+            if (fixture.mem.calls[i].data.size() == 512)
+              after_replay_mem_write_512++;
+          end
+        end
+      end
+      if (fixture.pcie != null) begin
+        foreach (fixture.pcie.calls[i]) begin
+          if (fixture.pcie.calls[i] != null &&
+              fixture.pcie.calls[i].method_name == "mmio_write")
+            after_replay_mmio_writes++;
+        end
+      end
+      if (replay_status == null ||
+          !(replay_status.code inside {RDMA_SC_STALE_GENERATION,
+                                       RDMA_SC_RECOVERY_REQUIRED}) ||
+          pending_status == null || !pending_status.ok() || pending_after == null ||
+          !pending_after.producer || !pending_after.route_valid ||
+          !pending_after.epoch_valid ||
+          pending_after.reset_epoch != reservation_epoch ||
+          pending_after.mmio_evidence != RDMA_QUEUE_MMIO_NO_SUBMIT ||
+          cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok() ||
+          after_index != before_index || after_wrap != before_wrap ||
+          after_consumer != before_consumer ||
+          after_consumer_wrap != before_consumer_wrap ||
+          after_used != before_used || !after_pending ||
+          after_replay_mem_calls != before_replay_mem_calls ||
+          after_replay_pcie_calls != before_replay_pcie_calls ||
+          after_replay_mem_write_64 != after_post_mem_write_64 ||
+          after_replay_mem_write_512 != after_post_mem_write_512 ||
+          after_replay_mmio_writes != after_post_mmio_writes)
+        `uvm_error("STALE_REPLAY_REJECT", replay_status == null ?
+                   "null replay status" : replay_status.convert2string())
+
+      fixture.engine.recover_queue(
+        fixture.qp.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH, 1'b0,
+        status);
+      if (status == null || !status.ok())
+        `uvm_error("STALE_REPLAY_ABORT", status == null ? "null abort status" :
+                   status.convert2string())
+      else
+        fixture.qp_attached = 1'b0;
+    end
+
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("STALE_REPLAY_CLEANUP", cleanup_status == null ?
+                   "fixture cleanup returned null" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：验证真实 CQ poll 在 CQC shadow 已发布、WQE release 一次性失败后留下
   //   consumer shadow pending；未确认 recovery 不推进，确认后只补 WQE release，
   //   不重发 shadow write、CQ CI 或 consumer doorbell。
@@ -658,6 +941,10 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     cqe.wqe_index = posted.index;
     cqe.wqe_wrap = posted.wrap;
     cqe.rq_cqe = 1'b0;
+    // fixture.make_send() 只提交基础 RC QP；显式写入 RC/SQ authority，
+    // 让 publish variant gate 与该 recovery fixture 的冻结 route 对齐。
+    cqe.srfq = 1'b0;
+    cqe.variant = RDMA_CQE_VARIANT_RC;
     cqe.polarity = polarity;
     cqe.packet_opcode = 8'h01;
     cqe.ecode = RDMA_CMQ_SUCCESS_ECODE;
@@ -1041,6 +1328,7 @@ class rdma_queue_data_engine_recovery_test extends uvm_test;
     check_pending_snapshot();
     check_consumer_local_stage_gates();
     check_engine_recovery_policy();
+    check_host_producer_replay_rejects_stale_epoch();
     check_success_consumer_recovery_skips_mmio();
     check_pending_clone_fail_closed();
     check_pending_shape_fail_closed();

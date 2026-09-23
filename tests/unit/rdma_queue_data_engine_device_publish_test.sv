@@ -1369,7 +1369,7 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   endfunction
 
   // 功能：make_cqe_for_outstanding_send 仅利用 post_send 已发布的 slot/wr_id
-  //   evidence 构造 CQE，验证 CQ poll 能精确释放对应 SQ WQE。
+  //   evidence 构造显式 RC variant CQE，验证 CQ poll 能精确释放对应 SQ WQE。
   // 输入/输出及副作用：qp_h、qpn、post_result、polarity 为输入，status 为输出；
   //   成功时返回新的 CQE model，不读取 CQ backing 或修改 post_result。
   // 失败/边界：QP authority、post status 或对象分配不完整时返回 null，并保持
@@ -1413,6 +1413,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
     model.wqe_index = post_result.index;
     model.wqe_wrap = post_result.wrap;
     model.rq_cqe = 1'b0;
+    model.srfq = 1'b0;
+    model.variant = RDMA_CQE_VARIANT_RC;
     model.polarity = polarity;
     model.packet_opcode = 8'h01;
     model.ecode = 8'h00;
@@ -2955,7 +2957,8 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
   endtask
 
   // 功能：check_cqe_authority_rejections 逐项覆盖 foreign QPN、错误 QP identity/
-  //   Function、stale generation、错误 rq_cqe、非 outstanding WQE 与 polarity。
+  //   Function、stale generation、transport/receive variant 不一致、SRFQ 与私有
+  //   RQ 拓扑不一致、send SRFQ、错误 rq_cqe、非 outstanding WQE 与 polarity。
   // 输入/输出及副作用：无显式输入；每个 case 使用同一真实 posted SQ WQE 和独立
   //   调用前快照，调用公开 publish_cqe 后验证完整拒绝原子性。
   // 失败/边界：fixture/post/model/snapshot 失败会报告并停止；任一拒绝错误码、result、
@@ -3008,6 +3011,64 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       return;
     end
 
+    cqe.variant = RDMA_CQE_VARIANT_UD;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_VARIANT_UD_ON_RC", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    cqe.variant = RDMA_CQE_VARIANT_RQ_SRFQ;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_VARIANT_RQ_ON_SEND", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    cqe.variant = RDMA_CQE_VARIANT_RC;
+    cqe.srfq = 1'b1;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_SEND_SRFQ", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    cqe.srfq = 1'b0;
+
+    cqe.rq_cqe = 1'b1;
+    cqe.srfq = 1'b1;
+    cqe.variant = RDMA_CQE_VARIANT_RQ_SRFQ;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_SRFQ_ON_PRIVATE_RQ", fixture,
+      fixture.cq, RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    cqe.srfq = 1'b0;
+    cqe.variant = RDMA_CQE_VARIANT_RC;
+
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_RECEIVE_VARIANT", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_ARGUMENT);
+    cqe.variant = RDMA_CQE_VARIANT_RQ_SRFQ;
+    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
+                         published, status);
+    check_rejected_publish_atomic("CQE_WRONG_RQ_CQE", fixture, fixture.cq,
+      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
+      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap, before_used, published, status,
+      RDMA_SC_INVALID_STATE);
+    cqe.rq_cqe = 1'b0;
+    cqe.variant = RDMA_CQE_VARIANT_RC;
+
     cqe.qpn = fixture.qp.local_qp_id + 1;
     publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
                          published, status);
@@ -3050,16 +3111,6 @@ class rdma_queue_data_engine_device_publish_test extends uvm_test;
       before_ci, before_ci_wrap, before_used, published, status,
       RDMA_SC_STALE_GENERATION);
     cqe.qp_h.generation = saved_generation;
-
-    cqe.rq_cqe = 1'b1;
-    publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,
-                         published, status);
-    check_rejected_publish_atomic("CQE_WRONG_RQ_CQE", fixture, fixture.cq,
-      RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_ROLE_CQ_RING,
-      fixture.cq.cqe_size_bytes, before_bytes, before_pi, before_pi_wrap,
-      before_ci, before_ci_wrap, before_used, published, status,
-      RDMA_SC_INVALID_STATE);
-    cqe.rq_cqe = 1'b0;
 
     cqe.wqe_index = posted.index + 1;
     publish_cqe_for_test(fixture.engine, fixture.cq.handle, cqe,

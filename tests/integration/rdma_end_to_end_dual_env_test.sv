@@ -172,10 +172,13 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     rx_env = rdma_queue_data_engine_fixture::type_id::create("rx_env");
     tx_env.mem = tx_mem_proxy;
     rx_env.mem = rx_mem_proxy;
-    tx_env.setup(status);
+    // CQ poll 的 consumer CI 只允许经 CQC context shadow 提交；双环境 fixture
+    // 显式启用该 backing，使 transport/high-traffic 子类与 queue-data 的真实
+    // admission 契约一致，而不是在 poll 入口落入已废弃的 MMIO fallback。
+    tx_env.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
     if (status == null || !status.ok())
       return;
-    rx_env.setup(status);
+    rx_env.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
     if (status == null || !status.ok())
       return;
 
@@ -239,11 +242,14 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     return packet;
   endfunction
 
-  // 功能：生成设备侧 CQE，分别表示发送 SQ 或接收 RQ 的 WQE 已完成。
+  // 功能：生成设备侧 CQE，分别表示发送 SQ 或接收 RQ 的 WQE 已完成，并依据冻结
+  //   QP transport 选择 RC、UD 或 RQ/SRFQ overlay，供双环境测试复用同一 authority
+  //   builder。
   // 输入/输出及副作用：qp、posted、rq_cqe、packet_index、polarity（输入）；返回
-  //   新建 CQE 值对象，不写入 CQ backing。
+  //   新建 detached CQE 值对象，不写入 CQ backing、runtime cursor 或 WQE ledger。
   // 失败/边界：posted 为空时仍生成占位 index=0，调用方必须在写 CQE 前检查
-  //   post status；polarity 必须来自目标 env 的公开 runtime query。
+  //   post status；receive CQE 固定使用 RQ/SRFQ，send CQE 的 UD QP 使用 UD、
+  //   RC/URC QP 使用 RC；polarity 必须来自目标 env 的公开 runtime query。
   function automatic rdma_hw_cqe_model make_cqe(
     rdma_qp qp,
     rdma_queue_post_result posted,
@@ -261,6 +267,13 @@ class rdma_end_to_end_dual_env_test extends uvm_test;
     cqe.wqe_index = posted == null ? 0 : posted.index;
     cqe.wqe_wrap = posted == null ? 0 : posted.wrap;
     cqe.rq_cqe = rq_cqe;
+    cqe.srfq = 1'b0;
+    if (rq_cqe)
+      cqe.variant = RDMA_CQE_VARIANT_RQ_SRFQ;
+    else if (qp != null && qp.transport == RDMA_TRANSPORT_UD)
+      cqe.variant = RDMA_CQE_VARIANT_UD;
+    else
+      cqe.variant = RDMA_CQE_VARIANT_RC;
     cqe.polarity = polarity;
     cqe.packet_opcode = 8'h01;
     cqe.ecode = RDMA_CMQ_SUCCESS_ECODE;

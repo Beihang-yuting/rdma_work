@@ -671,8 +671,8 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
            proxy.opaque_release_successes[mapping.iova.value];
   endfunction
 
-  // 功能：make_cqe_for_send 从一次已提交的真实 send WQE ledger 构造
-  //   CQE，使 publish/poll 只能释放匹配的 QP slot。
+  // 功能：make_cqe_for_send 从一次已提交的真实 send WQE ledger 构造显式 RC
+  //   variant CQE，使 publish/poll 只能释放匹配的 QP slot。
   // 输入/输出及副作用：qp/posted/polarity 为输入，status 为输出；
   //   返回 detached CQE model，其 wr_id/index/wrap 来自 post 结果，不修改 ledger。
   // 失败/边界：qp/handle/posted/status 缺失、post 未成功、factory 或 handle
@@ -711,6 +711,10 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
     cqe.wqe_index = posted.index;
     cqe.wqe_wrap = posted.wrap;
     cqe.rq_cqe = 1'b0;
+    // 本 helper 的所有调用方均由 create_transport_qp_for_cq(..., RC, ...)
+    // 建立目标 QP；把 RC authority 写入 model，避免 publish gate 依赖构造默认值。
+    cqe.srfq = 1'b0;
+    cqe.variant = RDMA_CQE_VARIANT_RC;
     cqe.polarity = polarity;
     cqe.packet_opcode = 8'h01;
     cqe.ecode = RDMA_CMQ_SUCCESS_ECODE;
@@ -1636,7 +1640,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
         disable profile_flow;
       end
       fixture.mem = proxy;
-      fixture.setup(step, 16, cqe_size, 16, 16);
+      // 真实 CQ poll 只能通过 CQC context shadow 提交 consumer CI；显式
+      // 打开 fixture 的 shadow backing，避免回退到已废弃的 MMIO consumer 路径。
+      fixture.setup(step, 16, cqe_size, 16, 16, 1'b1);
       retain_failure("real CQ fixture setup", step, first_failure);
       if (first_failure != null)
         disable profile_flow;
@@ -1974,7 +1980,9 @@ class rdma_queue_data_engine_host_mem_test extends uvm_test;
         disable event_flow;
       end
       fixture.mem = proxy;
-      fixture.setup(step, 16, 64, 16, 16);
+      // CEQ/AEQ 场景最终也会 poll 同一真实 CQ，因此沿用 CQC shadow
+      // authority，保持 event 与 CQ 的 consumer 提交契约一致。
+      fixture.setup(step, 16, 64, 16, 16, 1'b1);
       retain_failure("real event fixture setup", step, first_failure);
       if (first_failure != null)
         disable event_flow;

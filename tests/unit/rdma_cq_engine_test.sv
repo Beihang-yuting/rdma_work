@@ -225,8 +225,8 @@ class rdma_cq_engine_test extends uvm_test;
                  "CQ foreign configure failure mutated shared shadow")
   endtask
 
-  // 功能：make_publish_cqe 根据真实 outstanding SQ post 构造可发布 CQE，供 direct
-  //   delegate 与 facade 在等价初态下执行同一业务事务。
+  // 功能：make_publish_cqe 根据真实 outstanding SQ post 构造显式 RC variant CQE，
+  //   供 direct delegate 与 facade 在等价初态下执行同一业务事务。
   // 输入/输出及副作用：fixture、posted、polarity 为输入，model/status 为输出；
   //   仅分配 model/handle 快照，不推进 cursor、不写 backing、不释放 WQE ledger。
   // 失败/边界：fixture/QP/post 或分配不完整时返回非成功且 model 为 null；packed
@@ -261,6 +261,10 @@ class rdma_cq_engine_test extends uvm_test;
     model.wqe_index = posted.index;
     model.wqe_wrap = posted.wrap;
     model.rq_cqe = 1'b0;
+    // 两个等价 fixture 均由默认 RC QP/CQ lifecycle 建立；显式保留 RC overlay
+    // 与 send/SQ 标志，避免 facade 测试依赖 CQE model 的隐含初值。
+    model.srfq = 1'b0;
+    model.variant = RDMA_CQE_VARIANT_RC;
     model.polarity = polarity;
     model.packet_opcode = 8'h01;
     model.ecode = RDMA_CMQ_SUCCESS_ECODE;
@@ -786,6 +790,10 @@ class rdma_cq_engine_test extends uvm_test;
     cqe.wqe_index = posted.index;
     cqe.wqe_wrap = posted.wrap;
     cqe.rq_cqe = 1'b0;
+    // cq_flow 使用 fixture.setup() 的基础 RC QP；publish facade 仍须接收显式
+    // RC variant，而不是把 model 构造默认值当作 route authority。
+    cqe.srfq = 1'b0;
+    cqe.variant = RDMA_CQE_VARIANT_RC;
     status = fixture.engine.query_runtime_producer_polarity(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_polarity);
     if (status == null || !status.ok()) begin

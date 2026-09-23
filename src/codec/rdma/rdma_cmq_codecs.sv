@@ -6,6 +6,73 @@
 // 中文说明：rdma_cmq_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 功能：rdma_cmq_context_codec_key 根据 CMQ context-body opcode 生成唯一的
+//       registry key，把 opcode、image kind、对象类型和 variant 集中在两类 CMQ consumer
+//       共享的映射中。
+// 输入/输出及副作用：opcode 为 8 位驱动命令输入；函数返回值字段完整的
+//       rdma_codec_key，不访问 registry、不创建 codec，也不修改调用方对象或资源账本。
+// 失败/边界：未知或保留 opcode 返回 RDMA_IMAGE_NONE、object_type="invalid"、
+//       variant="invalid" 的 fail-closed key；六个已登记 context opcode 的字段必须与
+//       rdma_register_context_body_codecs 使用的 key 完全一致。
+function automatic rdma_codec_key rdma_cmq_context_codec_key(
+  input bit [7:0] opcode
+);
+  rdma_codec_key key;
+  key.hw_version = "rdma";
+  key.opcode = opcode;
+  key.image_kind = RDMA_IMAGE_NONE;
+  key.object_type = "invalid";
+  key.variant = "invalid";
+  case (opcode)
+    RDMA_OP_KEY_ALLOC: begin
+      key.image_kind = RDMA_IMAGE_MRT;
+      key.object_type = "mrt";
+      key.variant = "key_alloc";
+    end
+    RDMA_OP_MR_REGISTER: begin
+      key.image_kind = RDMA_IMAGE_MRT;
+      key.object_type = "mrt";
+      key.variant = "register";
+    end
+    RDMA_OP_CQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_CQC;
+      key.object_type = "cqc";
+      key.variant = "create";
+    end
+    RDMA_OP_CEQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_CEQC;
+      key.object_type = "ceqc";
+      key.variant = "create";
+    end
+    RDMA_OP_AEQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_AEQC;
+      key.object_type = "aeqc";
+      key.variant = "create";
+    end
+    RDMA_OP_SRFQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_SRQC;
+      key.object_type = "srqc";
+      key.variant = "create";
+    end
+    default: begin
+      // 默认值已完成 fail-closed 初始化；不把未知 opcode 猜测成 context body。
+    end
+  endcase
+  return key;
+endfunction
+
+// 功能：rdma_cmq_is_context_opcode 根据同一份 canonical key 判断 opcode 是否需要
+//       context-body registry，供 body encoder 与 request composer 共享 admission 分支。
+// 输入/输出及副作用：opcode 为 8 位驱动命令输入；函数只读取
+//       rdma_cmq_context_codec_key 的值映射并返回 bit，不登记、查找或修改任何状态。
+// 失败/边界：未知、保留或映射为 RDMA_IMAGE_NONE 的 opcode 返回 0；该判断必须与
+//       rdma_cmq_context_codec_key 的六个有效映射保持一致，不能回退到默认 codec。
+function automatic bit rdma_cmq_is_context_opcode(input bit [7:0] opcode);
+  rdma_codec_key key;
+  key = rdma_cmq_context_codec_key(opcode);
+  return key.image_kind != RDMA_IMAGE_NONE;
+endfunction
+
 class rdma_hw_cmq_envelope extends uvm_object;
   `uvm_object_utils(rdma_hw_cmq_envelope)
 
@@ -1855,60 +1922,24 @@ class rdma_hw_cmq_body_encoder extends uvm_object;
       `uvm_fatal("RDMA_CMQ_REGISTRY", status.convert2string())
   endfunction
 
-  // 功能：在 rdma_hw_cmq_body_encoder 中，context_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：opcode（输入）；context_key 读取 opcode 并使用字段 key.hw_version、key.opcode、key.image_kind、key.object_type、key.variant；函数返回 rdma_codec_key，不取得调用方资源所有权。
-// 失败/边界：context_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：在 rdma_hw_cmq_body_encoder 中，context_key 保留原 protected 入口，并转发到
+  //       package-scope 的 canonical CMQ context key helper，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_context_codec_key 生成的
+  //       rdma_codec_key，不访问 registry、不取得调用方资源所有权。
+  // 失败/边界：未知 opcode 由共享 helper 返回 RDMA_IMAGE_NONE/invalid key；该转发层
+  //       不补选默认 codec，也不改变既有 protected 扩展点的可见性。
   protected function rdma_codec_key context_key(bit [7:0] opcode);
-    rdma_codec_key key;
-    key.hw_version = "rdma";
-    key.opcode = opcode;
-    case (opcode)
-      RDMA_OP_KEY_ALLOC: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "key_alloc";
-      end
-      RDMA_OP_MR_REGISTER: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "register";
-      end
-      RDMA_OP_CQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CQC;
-        key.object_type = "cqc";
-        key.variant = "create";
-      end
-      RDMA_OP_CEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CEQC;
-        key.object_type = "ceqc";
-        key.variant = "create";
-      end
-      RDMA_OP_AEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_AEQC;
-        key.object_type = "aeqc";
-        key.variant = "create";
-      end
-      RDMA_OP_SRFQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_SRQC;
-        key.object_type = "srqc";
-        key.variant = "create";
-      end
-      default: begin
-        key.image_kind = RDMA_IMAGE_NONE;
-        key.object_type = "invalid";
-        key.variant = "invalid";
-      end
-    endcase
-    return key;
+    return rdma_cmq_context_codec_key(opcode);
   endfunction
 
-  // 功能：在 rdma_hw_cmq_body_encoder 中，is_context_opcode 判断 is_context_opcode 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：opcode（输入）；is_context_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：is_context_opcode 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：在 rdma_hw_cmq_body_encoder 中，is_context_opcode 保留原 protected 判定入口，
+  //       转发到与 context_key 相同的 canonical opcode 集合。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_is_context_opcode 的 bit 结果，
+  //       不访问 registry、不修改 encoder、model 或外部资源。
+  // 失败/边界：未知或保留 opcode 返回 0；该转发层不能把无效 key 解释为 light/context
+  //       codec，也不绕过共享 helper 的 fail-closed 默认分支。
   protected function bit is_context_opcode(bit [7:0] opcode);
-    return opcode inside {RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
-                          RDMA_OP_CQC_CREATE, RDMA_OP_CEQC_CREATE,
-                          RDMA_OP_AEQC_CREATE, RDMA_OP_SRFQC_CREATE};
+    return rdma_cmq_is_context_opcode(opcode);
   endfunction
 
   // 功能：在 rdma_hw_cmq_body_encoder 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
@@ -3031,60 +3062,24 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     return word;
   endfunction
 
-  // 功能：在 rdma_hw_cmq_request_composer 中，context_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：opcode（输入）；context_key 读取 opcode 并使用字段 key.hw_version、key.opcode、key.image_kind、key.object_type、key.variant；函数返回 rdma_codec_key，不取得调用方资源所有权。
-// 失败/边界：context_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：在 rdma_hw_cmq_request_composer 中，context_key 保留原 protected 入口，并转发到
+  //       package-scope 的 canonical CMQ context key helper，供请求校验和 registry lookup 使用。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_context_codec_key 生成的
+  //       rdma_codec_key，不访问 registry、不取得调用方资源所有权。
+  // 失败/边界：未知 opcode 由共享 helper 返回 RDMA_IMAGE_NONE/invalid key；该转发层
+  //       不补选默认 codec，也不改变既有 protected 扩展点的可见性。
   protected function rdma_codec_key context_key(bit [7:0] opcode);
-    rdma_codec_key key;
-    key.hw_version = "rdma";
-    key.opcode = opcode;
-    case (opcode)
-      RDMA_OP_KEY_ALLOC: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "key_alloc";
-      end
-      RDMA_OP_MR_REGISTER: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "register";
-      end
-      RDMA_OP_CQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CQC;
-        key.object_type = "cqc";
-        key.variant = "create";
-      end
-      RDMA_OP_CEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CEQC;
-        key.object_type = "ceqc";
-        key.variant = "create";
-      end
-      RDMA_OP_AEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_AEQC;
-        key.object_type = "aeqc";
-        key.variant = "create";
-      end
-      RDMA_OP_SRFQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_SRQC;
-        key.object_type = "srqc";
-        key.variant = "create";
-      end
-      default: begin
-        key.image_kind = RDMA_IMAGE_NONE;
-        key.object_type = "invalid";
-        key.variant = "invalid";
-      end
-    endcase
-    return key;
+    return rdma_cmq_context_codec_key(opcode);
   endfunction
 
-  // 功能：在 rdma_hw_cmq_request_composer 中，is_context_opcode 判断 is_context_opcode 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：opcode（输入）；is_context_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：is_context_opcode 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：在 rdma_hw_cmq_request_composer 中，is_context_opcode 保留原 protected 判定入口，
+  //       转发到与 context_key 相同的 canonical opcode 集合。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_is_context_opcode 的 bit 结果，
+  //       不访问 registry、不修改 composer、model 或外部资源。
+  // 失败/边界：未知或保留 opcode 返回 0；该转发层不能把无效 key 解释为 context codec，
+  //       也不绕过共享 helper 的 fail-closed 默认分支。
   protected function bit is_context_opcode(bit [7:0] opcode);
-    return opcode inside {RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
-                          RDMA_OP_CQC_CREATE, RDMA_OP_CEQC_CREATE,
-                          RDMA_OP_AEQC_CREATE, RDMA_OP_SRFQC_CREATE};
+    return rdma_cmq_is_context_opcode(opcode);
   endfunction
 
   // 功能：validate_context_identity 按 opcode 查找唯一 context-body codec，解码 body 并以

@@ -340,6 +340,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     );
     identity_hm.init_region(64'h0000_0007_0000_0000,
                             64'h0000_0007_00ff_ffff);
+    identity_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     identity_adapter = rdma_host_mem_adapter::type_id::create(
       "manager_identity_adapter"
     );
@@ -623,6 +624,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     queue_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("queue_hm");
     queue_hm.init_region(64'h0000_0008_0000_0000,
                          64'h0000_0008_00ff_ffff);
+    queue_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     queue_adapter = rdma_host_mem_adapter::type_id::create(
       "queue_host_mem_adapter"
     );
@@ -914,6 +916,9 @@ class rdma_host_mem_adapter_test extends uvm_test;
     hm.init_region(64'h0000_0001_0000_0000,
                    64'h0000_0001_00ff_ffff,
                    host_mem_pkg::MODE_LINEAR);
+    // 这些断言比较首个 backing、rebase 后的 cursor 和两个 manager 的数值地址；
+    // 明确使用 FIRST_FIT 只约束测试 fixture，不改变 host_mem 生产默认的随机策略。
+    hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     adapter = rdma_host_mem_adapter::type_id::create("adapter");
     adapter.mem = hm;
 
@@ -971,6 +976,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     );
     owner_clone_hm.init_region(64'h0000_0005_0000_0000,
                                64'h0000_0005_00ff_ffff);
+    owner_clone_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     owner_clone_adapter = rdma_host_mem_adapter::type_id::create(
       "owner_clone_adapter"
     );
@@ -1048,6 +1054,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
       );
     authority_clone_hm.init_region(64'h0000_0006_0000_0000,
                                    64'h0000_0006_00ff_ffff);
+    authority_clone_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     authority_clone_adapter = rdma_host_mem_adapter::type_id::create(
       "authority_clone_adapter"
     );
@@ -1425,6 +1432,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     offset_hm.init_region(64'h0000_0002_0000_0000,
                           64'h0000_0002_00ff_ffff,
                           host_mem_pkg::MODE_LINEAR);
+    offset_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     offset_adapter = rdma_host_mem_adapter::type_id::create("offset_adapter");
     offset_adapter.mem = offset_hm;
     offset_adapter.iova_base = 64'h0000_0000_4000_0000;
@@ -1512,6 +1520,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     overflow_hm.init_region(64'h0000_0003_0000_0000,
                             64'h0000_0003_00ff_ffff,
                             host_mem_pkg::MODE_LINEAR);
+    overflow_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     overflow_adapter = rdma_host_mem_adapter::type_id::create(
       "overflow_adapter"
     );
@@ -1548,9 +1557,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
     equal_hm_a.init_region(64'h0000_0005_0000_0000,
                            64'h0000_0005_000f_ffff,
                            host_mem_pkg::MODE_LINEAR);
+    equal_hm_a.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     equal_hm_b.init_region(64'h0000_0005_0000_0000,
                            64'h0000_0005_000f_ffff,
                            host_mem_pkg::MODE_LINEAR);
+    equal_hm_b.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     equal_adapter_a = rdma_host_mem_adapter::type_id::create(
       "equal_adapter_a"
     );
@@ -1602,6 +1613,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
       64'h0000_0006_000f_ffff,
       host_mem_pkg::MODE_LINEAR
     );
+    atomic_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     atomic_adapter = rdma_host_mem_adapter::type_id::create(
       "failure_atomic_adapter"
     );
@@ -1659,6 +1671,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
       64'h0000_0007_000f_ffff,
       host_mem_pkg::MODE_LINEAR
     );
+    foreign_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     foreign_adapter = rdma_host_mem_adapter::type_id::create(
       "failure_atomic_foreign_adapter"
     );

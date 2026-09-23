@@ -347,53 +347,6 @@ class rdma_cmq_codec_test extends uvm_test;
     return aeqc;
   endfunction
 
-  // 功能：在 rdma_cmq_codec_test 中，context_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：opcode（输入）；context_key 读取 opcode 并使用字段 key.hw_version、key.opcode、key.image_kind、key.object_type、key.variant；函数返回 rdma_codec_key，不取得调用方资源所有权。
-// 失败/边界：context_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
-  function automatic rdma_codec_key context_key(bit [7:0] opcode);
-    rdma_codec_key key;
-    key.hw_version = "rdma";
-    key.opcode = opcode;
-    case (opcode)
-      RDMA_OP_KEY_ALLOC: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "key_alloc";
-      end
-      RDMA_OP_MR_REGISTER: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "register";
-      end
-      RDMA_OP_CQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CQC;
-        key.object_type = "cqc";
-        key.variant = "create";
-      end
-      RDMA_OP_CEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CEQC;
-        key.object_type = "ceqc";
-        key.variant = "create";
-      end
-      RDMA_OP_AEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_AEQC;
-        key.object_type = "aeqc";
-        key.variant = "create";
-      end
-      RDMA_OP_SRFQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_SRQC;
-        key.object_type = "srqc";
-        key.variant = "create";
-      end
-      default: begin
-        key.image_kind = RDMA_IMAGE_NONE;
-        key.object_type = "invalid";
-        key.variant = "invalid";
-      end
-    endcase
-    return key;
-  endfunction
-
   // 功能：在 rdma_cmq_codec_test 中，encode_context 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：label（输入）、opcode（输入）、model（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode_context 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。

@@ -44,7 +44,8 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
   endfunction
 
   // 功能：make_cqe_for_outstanding_send 以已 post 的 SQ slot/wr_id 与 runtime
-  //   polarity 构造可由公开 publish_cqe 提交并由 poll 精确释放的 CQE model。
+  //   polarity 构造显式 RC variant 的 CQE model，供公开 publish_cqe 提交并由
+  //   poll 精确释放对应 SQ ledger。
   // 输入/输出及副作用：qp_h、qpn、posted、polarity 为输入，status 为输出；成功时
   //   返回 detached model，不读取或直接写入 CQ backing，也不修改 posted。
   // 失败/边界：QP、post status 或对象分配不完整时返回 null/非成功 status，不产生
@@ -86,6 +87,10 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     model.wqe_index = posted.index;
     model.wqe_wrap = posted.wrap;
     model.rq_cqe = 1'b0;
+    // 本 helper 仅服务 fixture 默认 RC QP 的 SQ completion；显式冻结 send
+    // overlay，避免 producer variant gate 依赖 model 构造的兼容默认值。
+    model.srfq = 1'b0;
+    model.variant = RDMA_CQE_VARIANT_RC;
     model.polarity = polarity;
     model.packet_opcode = 8'h01;
     model.ecode = RDMA_CMQ_SUCCESS_ECODE;
@@ -806,17 +811,21 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
   endtask
 
   // 功能：check_shared_srq_receive_cqe_e2e 在真实 shared-SRQ/QP/CQ lifecycle
-  //   route 上执行 post_recv→公开 publish_cqe(rq_cqe=1,srfq=1)→poll_cqe，
-  //   确认 receive completion 释放共享 SRQ ledger，而不是负责完成的 QP 私有 RQ。
+  //   route 上先验证 publish 与 poll 两侧 srfq/topology 相反的 CQE 都被原子
+  //   拒绝，再执行 post_recv→公开 publish_cqe(rq_cqe=1,srfq=1)→poll_cqe，确认
+  //   receive completion 释放共享 SRQ ledger，而不是负责完成的 QP 私有 RQ。
   // 输入/输出及副作用：无显式参数；任务创建带 CQC context shadow 的基础 fixture，
   //   通过本测试的独立 route helper 增加 fixture-scope SRQ 与 RC QP，发布/消费一条
-  //   SRFQ receive CQE，读取 SRQ、私有 RQ、CQ 的 occupancy/cursor 与 detached result，
-  //   最后按 QP→SRQ→基础 fixture 顺序释放全部资源。
+  //   SRFQ receive CQE，先由 probe 在已提交槽位中只翻转 wire bit，再读取 SRQ、
+  //   私有 RQ、CQ 的 occupancy/cursor 与 detached result，最后按 QP→SRQ→基础
+  //   fixture 顺序释放全部资源。
   // 失败/边界：setup、SRQ route、request/post、polarity、CQE 构造、publish、poll、
-  //   overlay/ledger/cursor 查询或第二次空轮询任一步失败均报告 UVM_ERROR；任何
-  //   early disable 都继续销毁已创建的 SRQ QP/SRQ，避免共享 CQ/PD 被提前释放。
+  //   hostile image 恢复、overlay/ledger/cursor 查询或第二次空轮询任一步失败均
+  //   报告 UVM_ERROR；任何 early disable 都继续销毁已创建的 SRQ QP/SRQ，避免共享
+  //   CQ/PD 被提前释放。
   task automatic check_shared_srq_receive_cqe_e2e();
     rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_probe probe;
     rdma_srq srq;
     rdma_qp srq_qp;
     rdma_post_recv_req request;
@@ -826,10 +835,13 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     rdma_hw_cqe_model cqe;
     rdma_queue_device_publish_result published;
     rdma_queue_completion_result completion;
+    rdma_queue_completion_result malformed_completion;
     rdma_status setup_status;
     rdma_status status;
     rdma_status clone_status;
     rdma_status cqe_status;
+    rdma_status malformed_status;
+    rdma_status malformed_poll_status;
     rdma_status cleanup_status;
     bit srq_created;
     bit srq_qp_created;
@@ -838,14 +850,41 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     int unsigned used;
     int unsigned producer_index;
     int unsigned consumer_index;
+    int unsigned before_srq_used;
+    int unsigned before_srq_pi;
+    int unsigned before_srq_ci;
+    int unsigned before_cq_used;
+    int unsigned before_cq_pi;
+    int unsigned before_cq_ci;
+    int unsigned poll_before_srq_used;
+    int unsigned poll_before_srq_pi;
+    int unsigned poll_before_srq_ci;
+    int unsigned poll_before_cq_used;
+    int unsigned poll_before_cq_pi;
+    int unsigned poll_before_cq_ci;
     bit pending;
+    bit before_srq_pending;
+    bit before_srq_pi_wrap;
+    bit before_srq_ci_wrap;
+    bit before_cq_pending;
+    bit before_cq_pi_wrap;
+    bit before_cq_ci_wrap;
+    bit poll_before_srq_pending;
+    bit poll_before_srq_pi_wrap;
+    bit poll_before_srq_ci_wrap;
+    bit poll_before_cq_pending;
+    bit poll_before_cq_pi_wrap;
+    bit poll_before_cq_ci_wrap;
     bit producer_wrap;
     bit consumer_wrap;
+    bit malformed_rejection_ok;
+    bit malformed_poll_rejection_ok;
     bit polarity;
 
     fixture = rdma_queue_data_engine_fixture::type_id::create(
       "shared_srq_receive_cqe_fixture");
     srq = null;
+    probe = null;
     srq_qp = null;
     srq_created = 1'b0;
     srq_qp_created = 1'b0;
@@ -859,13 +898,20 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
       end
 
       // CQ poll 的 CI/wrap 仍必须来自 CQC context shadow；SRQ route 额外借用
-      // 同一 CQ，但其 WQE ledger 由独立 SRQ runtime 拥有。
+      // 同一 CQ，但其 WQE ledger 由独立 SRQ runtime 拥有。最后一个参数启用
+      // focused probe，使测试能在已提交 CQE 上做受控 wire-image mutation；生产
+      // poll/publish 实现仍由同一基类 task 执行。
       fixture.setup(setup_status, 16, RDMA_CQE_BYTES, 16, 16,
-                    1'b1, 1'b0, 1'b0);
+                    1'b1, 1'b0, 1'b1);
       if (setup_status == null || !setup_status.ok()) begin
         `uvm_error("SHARED_SRQ_CQE_SETUP",
                    setup_status == null ? "null setup status" :
                    setup_status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      if (!$cast(probe, fixture.engine) || probe == null) begin
+        `uvm_error("SHARED_SRQ_CQE_PROBE",
+                   "shared-SRQ poll fixture did not create queue-data probe")
         disable shared_srq_receive_cqe_flow;
       end
 
@@ -971,6 +1017,92 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
         disable shared_srq_receive_cqe_flow;
       end
 
+      // 在真实 shared-SRQ route 上先投递一份 SRFQ 位相反的 CQE。该 hostile
+      // admission 必须在 producer reservation 前拒绝，且不能改变 SRQ/CQ 的
+      // occupancy 或 cursor；随后恢复原始 model，继续执行合法正向链。
+      status = fixture.engine.query_runtime_occupancy(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, before_srq_used,
+        before_srq_pending);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_BASELINE",
+                   status == null ? "null SRQ baseline status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      status = fixture.engine.query_runtime_cursors(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, before_srq_pi,
+        before_srq_pi_wrap, before_srq_ci, before_srq_ci_wrap);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_SRQ_CURSOR",
+                   status == null ? "null SRQ baseline cursor status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, before_cq_used,
+        before_cq_pending);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_CQ_BASELINE",
+                   status == null ? "null CQ baseline status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      status = fixture.engine.query_runtime_cursors(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, before_cq_pi,
+        before_cq_pi_wrap, before_cq_ci, before_cq_ci_wrap);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_CQ_CURSOR",
+                   status == null ? "null CQ baseline cursor status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      cqe.srfq = 1'b0;
+      malformed_rejection_ok = 1'b0;
+      malformed_status = null;
+      published = null;
+      fixture.engine.publish_cqe(fixture.cq.handle, cqe,
+                                  published, malformed_status);
+      if (malformed_status != null &&
+          malformed_status.code == RDMA_SC_INVALID_ARGUMENT &&
+          published == null)
+        malformed_rejection_ok = 1'b1;
+      status = fixture.engine.query_runtime_occupancy(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, used, pending);
+      if (!malformed_rejection_ok || status == null || !status.ok() ||
+          used != before_srq_used || pending != before_srq_pending)
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_SRFQ",
+                   malformed_status == null ?
+                   "SRFQ/topology mismatch was not rejected" :
+                   malformed_status.convert2string())
+      status = fixture.engine.query_runtime_cursors(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (!malformed_rejection_ok || status == null || !status.ok() ||
+          producer_index != before_srq_pi ||
+          producer_wrap != before_srq_pi_wrap ||
+          consumer_index != before_srq_ci ||
+          consumer_wrap != before_srq_ci_wrap)
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_SRQ_CURSOR",
+                   "SRQ cursor changed after rejected CQE")
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, pending);
+      if (!malformed_rejection_ok || status == null || !status.ok() ||
+          used != before_cq_used || pending != before_cq_pending)
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_CQ",
+                   "CQ occupancy changed after rejected CQE")
+      status = fixture.engine.query_runtime_cursors(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (!malformed_rejection_ok || status == null || !status.ok() ||
+          producer_index != before_cq_pi ||
+          producer_wrap != before_cq_pi_wrap ||
+          consumer_index != before_cq_ci ||
+          consumer_wrap != before_cq_ci_wrap)
+        `uvm_error("SHARED_SRQ_CQE_MISMATCH_CQ_CURSOR",
+                   "CQ cursor changed after rejected CQE")
+      cqe.srfq = 1'b1;
+
       published = null;
       fixture.engine.publish_cqe(fixture.cq.handle, cqe, published, status);
       if (status == null || !status.ok() || published == null ||
@@ -984,6 +1116,108 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
                    status.convert2string())
         disable shared_srq_receive_cqe_flow;
       end
+
+      // publish 已经把合法 CQE 提交到 slot/occupancy 后，probe 只改写该 committed
+      // image 的 qword0[58]，从而绕过 publish-side gate 直接验证 poll-side
+      // resolve_cqe_variant_for_image；probe 不触碰 CQ/SRQ runtime，故拒绝前后的
+      // cursor/occupancy 应保持完全一致。验证后立即恢复 srfq=1，再走真实 poll。
+      status = fixture.engine.query_runtime_occupancy(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, poll_before_srq_used,
+        poll_before_srq_pending);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_BASELINE",
+                   status == null ? "null SRQ poll baseline status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      status = fixture.engine.query_runtime_cursors(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, poll_before_srq_pi,
+        poll_before_srq_pi_wrap, poll_before_srq_ci,
+        poll_before_srq_ci_wrap);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_SRQ_CURSOR",
+                   status == null ? "null SRQ poll baseline cursor status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, poll_before_cq_used,
+        poll_before_cq_pending);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_CQ_BASELINE",
+                   status == null ? "null CQ poll baseline status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      status = fixture.engine.query_runtime_cursors(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, poll_before_cq_pi,
+        poll_before_cq_pi_wrap, poll_before_cq_ci,
+        poll_before_cq_ci_wrap);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_CQ_CURSOR",
+                   status == null ? "null CQ poll baseline cursor status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+
+      status = probe.probe_rewrite_committed_cqe_srfq_bit(
+        fixture.cq.handle, 1'b0);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLL_MUTATION",
+                   status == null ? "null CQE SRFQ mutation status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      malformed_completion = null;
+      malformed_poll_status = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0,
+                              malformed_completion, malformed_poll_status);
+      malformed_poll_rejection_ok =
+        malformed_poll_status != null &&
+        malformed_poll_status.code == RDMA_SC_INVALID_ARGUMENT &&
+        malformed_completion == null;
+      status = probe.probe_rewrite_committed_cqe_srfq_bit(
+        fixture.cq.handle, 1'b1);
+      if (status == null || !status.ok()) begin
+        `uvm_error("SHARED_SRQ_CQE_POLL_RESTORE",
+                   status == null ? "null CQE SRFQ restore status" :
+                   status.convert2string())
+        disable shared_srq_receive_cqe_flow;
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, used, pending);
+      if (!malformed_poll_rejection_ok || status == null || !status.ok() ||
+          used != poll_before_srq_used || pending != poll_before_srq_pending)
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_SRFQ",
+                   malformed_poll_status == null ?
+                   "poll-side SRFQ/topology mismatch was not rejected" :
+                   malformed_poll_status.convert2string())
+      status = fixture.engine.query_runtime_cursors(
+        srq.handle, RDMA_QUEUE_RUNTIME_SRQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (!malformed_poll_rejection_ok || status == null || !status.ok() ||
+          producer_index != poll_before_srq_pi ||
+          producer_wrap != poll_before_srq_pi_wrap ||
+          consumer_index != poll_before_srq_ci ||
+          consumer_wrap != poll_before_srq_ci_wrap)
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_SRQ_CURSOR",
+                   "SRQ cursor changed after poll-side rejected CQE")
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, pending);
+      if (!malformed_poll_rejection_ok || status == null || !status.ok() ||
+          used != poll_before_cq_used || pending != poll_before_cq_pending)
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_CQ",
+                   "CQ occupancy changed after poll-side rejected CQE")
+      status = fixture.engine.query_runtime_cursors(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (!malformed_poll_rejection_ok || status == null || !status.ok() ||
+          producer_index != poll_before_cq_pi ||
+          producer_wrap != poll_before_cq_pi_wrap ||
+          consumer_index != poll_before_cq_ci ||
+          consumer_wrap != poll_before_cq_ci_wrap)
+        `uvm_error("SHARED_SRQ_CQE_POLL_MISMATCH_CQ_CURSOR",
+                   "CQ cursor changed after poll-side rejected CQE")
 
       completion = null;
       fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
@@ -1395,6 +1629,306 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_ud_receive_replay_e2e 在真实 UD QP/RQ route 上注入一次 RQE
+  //   Host-memory 写失败，确认 post_recv 保存的 detached producer evidence 可被
+  //   caller-confirmed recovery 重放，随后再经 RQ/SRFQ CQE publish→poll 释放同一
+  //   UD 私有 RQ ledger。
+  // 输入/输出及副作用：无显式参数；任务创建带 CQC context shadow 的 lifecycle
+  //   fixture，切换共享 CQ 到 UD route，向 Host-memory/doorbell/runtime 写入并读取
+  //   detached evidence，最后由 fixture cleanup 释放 UD QP、CQ、PD 与 Function 资源。
+  // 失败/边界：基础 route 未切换、target-h/owner/epoch 不完整、首写未进入 pending、
+  //   未确认 retry 被接受、replay 未恢复 RQ image/cursor、CQE route/variant 不符或
+  //   RQ/CQ ledger 未各释放一项时报告 UVM_ERROR；任一 early disable 都继续执行
+  //   cleanup，不把失败的 post result 当成可完成 WQE。
+  task automatic check_ud_receive_replay_e2e();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_post_recv_req request;
+    rdma_queue_post_result posted;
+    rdma_queue_post_result recovered_posted;
+    rdma_queue_pending_operation pending;
+    rdma_hw_cqe_model cqe;
+    rdma_queue_device_publish_result published;
+    rdma_queue_completion_result completion;
+    rdma_status setup_status;
+    rdma_status status;
+    rdma_status cqe_status;
+    rdma_status clone_status;
+    rdma_status cleanup_status;
+    rdma_status injected;
+    rdma_handle target_copy;
+    byte expected_rqe[];
+    byte actual_rqe[];
+    int unsigned used;
+    int unsigned producer_index;
+    int unsigned consumer_index;
+    bit pending_flag;
+    bit producer_wrap;
+    bit consumer_wrap;
+    bit polarity;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create(
+      "ud_receive_replay_fixture");
+    begin : ud_receive_replay_flow
+      if (fixture == null) begin
+        `uvm_error("UD_RECV_REPLAY_FIXTURE",
+                   "UD receive replay fixture allocation failed")
+        disable ud_receive_replay_flow;
+      end
+
+      fixture.setup(setup_status, 16, RDMA_CQE_BYTES, 16, 16,
+                    1'b1, 1'b0, 1'b0);
+      if (setup_status == null || !setup_status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_SETUP",
+                   setup_status == null ? "null setup status" :
+                   setup_status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      fixture.setup_transport_qps(status);
+      if (status == null || !status.ok() || fixture.ud_qp == null ||
+          fixture.ud_qp.handle == null) begin
+        `uvm_error("UD_RECV_REPLAY_QP",
+                   status == null ? "UD transport QP setup failed" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+
+      // 同一 CQ 不能同时以 RC/UD 两种 variant 发布；先撤销基础 route，再
+      // 冻结 UD CQ/QP attachment，确保 receive CQE 的 SRFQ overlay 由真实 UD
+      // link authority 解析，而不是由测试默认 transport 猜测。
+      status = fixture.engine.detach(fixture.qp.handle);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_DETACH_QP",
+                   status == null ? "base QP detach failed" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      fixture.qp_attached = 1'b0;
+      status = fixture.engine.detach(fixture.cq.handle);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_DETACH_CQ",
+                   status == null ? "base CQ detach failed" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      fixture.cq_attached = 1'b0;
+      status = fixture.engine.attach_cq(fixture.cq.handle,
+                                        RDMA_TRANSPORT_UD);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_ATTACH_CQ",
+                   status == null ? "UD CQ attach failed" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      fixture.cq_attached = 1'b1;
+      status = fixture.engine.attach_qp(fixture.ud_qp.handle);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_ATTACH_QP",
+                   status == null ? "UD QP attach failed" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      fixture.ud_qp_attached = 1'b1;
+
+      request = fixture.make_recv(64'hbabe_cafe_0000_1320);
+      target_copy = null;
+      clone_status = clone_test_handle(fixture.ud_qp.handle, target_copy);
+      if (request == null || clone_status == null || !clone_status.ok() ||
+          target_copy == null) begin
+        `uvm_error("UD_RECV_REPLAY_REQUEST",
+                   clone_status == null ? "UD receive target clone failed" :
+                   clone_status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      request.target_h = target_copy;
+
+      injected = rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION, "injected UD receive RQE write failure");
+      status = fixture.mem.fail_next("write", injected);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_INJECT",
+                   status == null ? "null write-fault injection status" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      posted = null;
+      fixture.engine.post_recv(request, posted, status);
+      if (status == null || status.ok() || posted != null) begin
+        `uvm_error("UD_RECV_REPLAY_INITIAL_FAIL",
+                   status == null ? "null initial post status" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+
+      // 保存 recovery 的 immutable image；后续只比较实际 RQ slot，不从 request
+      // 重新编码，避免测试掩盖 replay 是否真正使用 admission-time evidence。
+      pending = null;
+      status = fixture.engine.query_runtime_pending(
+        fixture.ud_qp.handle, RDMA_QUEUE_RUNTIME_RQ, pending);
+      if (status == null || !status.ok() || pending == null ||
+          !pending.producer || pending.kind != RDMA_QUEUE_RUNTIME_RQ ||
+          pending.cursor == null || pending.cursor.index != 0 ||
+          pending.cursor.wrap != 1'b0 || pending.image == null ||
+          pending.image.bytes.size() != RDMA_WQE_BYTES) begin
+        `uvm_error("UD_RECV_REPLAY_PENDING",
+                   status == null ? "UD receive pending evidence unavailable" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      expected_rqe = new[pending.image.bytes.size()];
+      foreach (expected_rqe[i]) expected_rqe[i] = pending.image.bytes[i];
+
+      fixture.engine.recover_queue(
+        fixture.ud_qp.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING,
+        1'b0, status);
+      if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT) begin
+        `uvm_error("UD_RECV_REPLAY_CONFIRM",
+                   "unconfirmed UD receive recovery was accepted")
+        disable ud_receive_replay_flow;
+      end
+      fixture.engine.recover_queue(
+        fixture.ud_qp.handle, RDMA_QUEUE_RECOVERY_RETRY_PENDING,
+        1'b1, status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_RETRY",
+                   status == null ? "null UD recovery status" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+
+      used = 0;
+      pending_flag = 1'b1;
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.ud_qp.handle, RDMA_QUEUE_RUNTIME_RQ, used, pending_flag);
+      if (status == null || !status.ok() || used != 1 || pending_flag) begin
+        `uvm_error("UD_RECV_REPLAY_CREDIT",
+                   status == null ? "null UD RQ occupancy status" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      if (fixture.ud_qp.qp_plan == null || fixture.ud_qp.qp_plan.rq_ref == null ||
+          fixture.ud_qp.qp_plan.rq_ref.mapping == null)
+        status = rdma_status::make(
+          RDMA_SC_INVALID_STATE, "UD QP RQ backing is unavailable for replay readback");
+      else
+        status = fixture.mem.read(
+          fixture.ud_qp.qp_plan.rq_ref.mapping,
+          fixture.ud_qp.qp_plan.rq_ref.mapping_offset,
+          RDMA_WQE_BYTES, actual_rqe);
+      if (status == null || !status.ok() || actual_rqe.size() != expected_rqe.size())
+        `uvm_error("UD_RECV_REPLAY_IMAGE",
+                   status == null ? "UD RQE replay readback failed" :
+                   status.convert2string())
+      else begin
+        foreach (expected_rqe[i]) begin
+          if (actual_rqe[i] !== expected_rqe[i])
+            `uvm_error("UD_RECV_REPLAY_IMAGE",
+                       $sformatf("replayed RQE byte %0d differs from pending image",
+                                 i))
+        end
+      end
+
+      // recover_queue 不返回 post result；构造一个仅含 recovery cursor/WR 的
+      // detached witness，供 CQE helper 验证 poll release 的仍是同一 RQ slot。
+      recovered_posted = rdma_queue_post_result::type_id::create(
+        "ud_receive_recovered_posted");
+      target_copy = null;
+      clone_status = clone_test_handle(fixture.ud_qp.handle, target_copy);
+      if (recovered_posted == null || clone_status == null ||
+          !clone_status.ok() || target_copy == null) begin
+        `uvm_error("UD_RECV_REPLAY_WITNESS",
+                   clone_status == null ? "UD recovered witness clone failed" :
+                   clone_status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      recovered_posted.queue_h = target_copy;
+      recovered_posted.wr_id = request.wr_id;
+      recovered_posted.index = 0;
+      recovered_posted.wrap = 1'b0;
+      recovered_posted.status = rdma_status::success();
+      if (recovered_posted == null || recovered_posted.queue_h == null ||
+          recovered_posted.status == null || !recovered_posted.status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_WITNESS",
+                   "recovered UD receive witness is incomplete")
+        disable ud_receive_replay_flow;
+      end
+
+      polarity = 1'b0;
+      cqe_status = fixture.engine.query_runtime_producer_polarity(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, polarity);
+      if (cqe_status == null || !cqe_status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_POLARITY",
+                   cqe_status == null ? "null UD CQ polarity status" :
+                   cqe_status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      cqe = make_cqe_for_outstanding_receive(
+        fixture.ud_qp.handle, fixture.ud_qp.local_qp_id,
+        recovered_posted, polarity, cqe_status);
+      if (cqe_status == null || !cqe_status.ok() || cqe == null) begin
+        `uvm_error("UD_RECV_REPLAY_CQE",
+                   cqe_status == null ? "null UD receive CQE status" :
+                   cqe_status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      published = null;
+      fixture.engine.publish_cqe(fixture.cq.handle, cqe, published, status);
+      if (status == null || !status.ok() || published == null ||
+          published.image == null || !published.occupancy_valid ||
+          published.occupancy != 1) begin
+        `uvm_error("UD_RECV_REPLAY_PUBLISH",
+                   status == null ? "null UD receive publish status" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      completion = null;
+      fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
+      if (status == null || !status.ok() || completion == null ||
+          completion.cqe == null || completion.cqe.rq_cqe != 1'b1 ||
+          completion.cqe.variant != RDMA_CQE_VARIANT_RQ_SRFQ ||
+          completion.cqe.qpn != fixture.ud_qp.local_qp_id ||
+          completion.cqe.wr_id != request.wr_id ||
+          completion.released_slots.size() != 1 ||
+          completion.released_slots[0] == null ||
+          completion.released_slots[0].wr_id != request.wr_id ||
+          completion.completion_status == null ||
+          !completion.completion_status.ok()) begin
+        `uvm_error("UD_RECV_REPLAY_POLL",
+                   status == null ? "null UD receive poll status" :
+                   status.convert2string())
+        disable ud_receive_replay_flow;
+      end
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.ud_qp.handle, RDMA_QUEUE_RUNTIME_RQ, used, pending_flag);
+      if (status == null || !status.ok() || used != 0 || pending_flag)
+        `uvm_error("UD_RECV_REPLAY_RQ_RELEASE",
+                   status == null ? "null UD RQ release status" :
+                   status.convert2string())
+      status = fixture.engine.query_runtime_occupancy(
+        fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, pending_flag);
+      if (status == null || !status.ok() || used != 0 || pending_flag)
+        `uvm_error("UD_RECV_REPLAY_CQ_RELEASE",
+                   status == null ? "null UD CQ release status" :
+                   status.convert2string())
+      status = fixture.engine.query_runtime_cursors(
+        fixture.ud_qp.handle, RDMA_QUEUE_RUNTIME_RQ, producer_index,
+        producer_wrap, consumer_index, consumer_wrap);
+      if (status == null || !status.ok() || producer_index != 1 ||
+          producer_wrap != 1'b0 || consumer_index != 1 ||
+          consumer_wrap != 1'b0)
+        `uvm_error("UD_RECV_REPLAY_CURSOR",
+                   status == null ? "null UD RQ cursor status" :
+                   status.convert2string())
+    end
+
+    if (fixture != null && fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("UD_RECV_REPLAY_CLEANUP",
+                   cleanup_status == null ? "null cleanup status" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：run_phase 验证未配置拒绝、post→public publish_cqe→poll 的 WQE release，
   //   以及 consumer commit 后 CQ 为空的可观察结果。
   // 输入/输出及副作用：phase 为输入；任务创建 fixture、调用公开 API 并报告断言，
@@ -1421,6 +1955,7 @@ class rdma_queue_data_engine_poll_test extends uvm_test;
     check_cq_poll_wq_attachment_validator();
     check_private_rq_receive_cqe_e2e();
     check_shared_srq_receive_cqe_e2e();
+    check_ud_receive_replay_e2e();
     check_ud_send_cqe_e2e();
     engine = rdma_queue_data_engine::type_id::create("unconfigured_engine");
     completion = rdma_queue_completion_result::type_id::create("sentinel_cqe");

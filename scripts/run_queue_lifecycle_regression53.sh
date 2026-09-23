@@ -32,6 +32,8 @@ readonly CORE_TESTS=(
   rdma_aeqe_f5_e2e_test
   rdma_queue_host_codec_final_fix_test
   rdma_queue_producer_doorbell_final_fix_test
+  rdma_queue_host_producer_failure_final_fix_test
+  rdma_queue_host_producer_commit_failure_test
   rdma_queue_cqe_codec_final_fix_test
   rdma_queue_entry_image_final_fix_test
   rdma_queue_ceqe_codec_final_fix_test
@@ -148,7 +150,10 @@ if [[ ${1-} == "--list" ]]; then
     exit 2
   fi
   printf '%s\n' "${CORE_TESTS[@]}"
-  printf '%s\n' "${ENGINE_PROCESS_TESTS[@]}"
+  # engine 的首项就是 CORE_TESTS 中已列出的 logical test；公开发现清单
+  # 保持 exact-once，physical inventory 本身仍由完整 ENGINE_PROCESS_TESTS
+  # 交给 run_core_logical_test.sh 展开。
+  printf '%s\n' "${ENGINE_PROCESS_TESTS[@]:1}"
   printf '%s\n' "${UNIT_INTEGRATION_TESTS[@]}"
   exit 0
 fi
