@@ -1,25 +1,62 @@
 // 目录：测试层 unit/rdma_queue_backing_access_test.sv。
-// 职责：验证 rdma_queue_backing_access_test 对应模块的接口、错误路径和边界行为。
-// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
-// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+// 职责：验证 queue backing/QP backing 的绑定、分段解析及 Host-memory 访问原子性。
+// 依赖：依赖 rdma_queue_backing_access、UVM、rdma_mock_host_mem 和 DMA mapping fixture。
+// 所有权与生命周期：本测试创建 mock、mapping 与 backing；access 只借用它们，run_phase 结束后由 UVM 回收本地对象。
 
-// 中文说明：rdma_queue_backing_access_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 设计说明：把 null-status、权限和跨段失败放在同一 fixture 中，直接检查失败不会发布半绑定引用或触发部分后端 I/O。
+
+// 功能：构造故障注入用 queue backing reference，模拟扩展校验器返回空状态句柄。
+// 输入/输出及副作用：name（输入）；new 只初始化基类字段，不取得 mapping 或 Host-memory 所有权。
+// 失败/边界：该对象的 validate() 故意返回 null；attach_queue 必须将其转换为确定的 INVALID_STATE。
+class rdma_null_queue_backing_validate extends rdma_queue_backing_ref;
+  // 功能：创建 queue backing 故障注入对象，并复用基类的默认 role/ownership/geometry。
+  // 输入/输出及副作用：name（输入）；new 不修改外部 mapping，也不触发后端访问。
+  // 失败/边界：对象仅用于验证 null-status 防御，不能作为真实 queue backing 提交给设备。
+  function new(string name = "rdma_null_queue_backing_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 queue backing 的可覆写校验器返回空状态，覆盖 attach_queue 的扩展边界。
+  // 输入/输出及副作用：无显式输入；函数不修改 backing 字段，返回 null rdma_status 句柄。
+  // 失败/边界：返回 null 是故障注入结果；调用方不得继续调用 status.ok() 或写入 queue_ref。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造故障注入用 QP backing reference，模拟扩展校验器返回空状态句柄。
+// 输入/输出及副作用：name（输入）；new 只初始化基类字段，不取得 mapping 或 Host-memory 所有权。
+// 失败/边界：该对象的 validate() 故意返回 null；attach_qp 必须将其转换为确定的 INVALID_STATE。
+class rdma_null_qp_backing_validate extends rdma_qp_backing_ref;
+  // 功能：创建 QP backing 故障注入对象，并复用基类默认 role/ownership/geometry。
+  // 输入/输出及副作用：name（输入）；new 不修改外部 mapping，也不触发后端访问。
+  // 失败/边界：对象仅用于验证 null-status 防御，不能作为真实 QP backing 提交给设备。
+  function new(string name = "rdma_null_qp_backing_validate");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 QP backing 的可覆写校验器返回空状态，覆盖 attach_qp 的扩展边界。
+  // 输入/输出及副作用：无显式输入；函数不修改 backing 字段，返回 null rdma_status 句柄。
+  // 失败/边界：返回 null 是故障注入结果；调用方不得继续调用 status.ok() 或写入 qp_ref。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
 
 class rdma_queue_backing_access_test extends uvm_test;
   `uvm_component_utils(rdma_queue_backing_access_test)
 
-  // 功能：构造 rdma_queue_backing_access_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_backing_access_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_queue_backing_access_test 的 UVM 节点，供 run_phase 创建独立的 mock 与 backing 场景。
+  // 输入/输出及副作用：name、parent（输入）；仅传给 super.new 建立组件层级，不分配 mapping、Host-memory 或 access 对象。
+  // 失败/边界：parent 可为 null；构造完成不表示任何测试 fixture 已就绪，所有资源均在 run_phase 的本地作用域创建并由其持有。
   function new(string name = "rdma_queue_backing_access_test",
                uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：在 rdma_queue_backing_access_test 中，fn 从测试 fixture 返回预先构造的 Function/队列句柄或 DMA 上下文，保持调用方与 fixture 使用同一实例。
-  // 输入/输出及副作用：无显式参数；fn 读取局部计算结果，并使用字段 f、f.function_uid、f.object_id、f.generation；函数返回 rdma_function_handle，不取得调用方资源所有权。
-  // 失败/边界：fn 的结果直接由 return f 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：每次调用新建并返回固定 UID/object/generation 的 Function handle，作为本测试 DMA mapping 的 authority。
+  // 输入/输出及副作用：无输入；分配新的 `f`，写入 function_uid=0x1234、object_id=1、generation=2，并把该对象句柄交给调用者。
+  // 失败/边界：不缓存或复用先前 handle；本辅助函数假定 UVM factory 成功创建 f，若返回 null，随后的 f.function_uid 字段写入会立即发生空句柄失败，无法构造或返回可用对象。
   function automatic rdma_function_handle fn();
     rdma_function_handle f;
     f = rdma_function_handle::type_id::create("f");
@@ -29,9 +66,9 @@ class rdma_queue_backing_access_test extends uvm_test;
     return f;
   endfunction
 
-  // 功能：在 rdma_queue_backing_access_test 中，ctx 从测试 fixture 返回预先构造的 Function/队列句柄或 DMA 上下文，保持调用方与 fixture 使用同一实例。
-  // 输入/输出及副作用：无显式参数；ctx 读取局部计算结果，并使用字段 c、c.function_h、c.requester_bdf、c.pasid_valid、c.pasid、c.dma_domain_valid、c.dma_domain_id；函数返回 rdma_dma_request_context，不取得调用方资源所有权。
-  // 失败/边界：ctx 的结果直接由 return c 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：每次调用新建 DMA request context，并填入本测试固定的 requester、PASID、DMA domain 与新建 Function handle。
+  // 输入/输出及副作用：无输入；分配 `c`，调用 fn() 取得 c.function_h，写入 BDF 0x0102、有效 PASID 0x12345 和 domain 7，返回该新对象。
+  // 失败/边界：返回值不是共享 fixture；本辅助函数假定 c 与 fn() 的 factory 创建成功，若任一为 null，后续字段写入会立即发生空句柄失败，ctx 无法构造或返回可用 context。
   function automatic rdma_dma_request_context ctx();
     rdma_dma_request_context c;
     c = rdma_dma_request_context::type_id::create("ctx");
@@ -44,9 +81,9 @@ class rdma_queue_backing_access_test extends uvm_test;
     return c;
   endfunction
 
-  // 功能：call_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
-  // 输入/输出及副作用：mem（输入）、method_name（输入）；call_count 读取 mem、method_name 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：call_count 先检查 mem.calls[i] != null && mem.calls[i].method_name == method_name，再返回 count；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：统计 mock Host-memory 已记录且方法名等于 method_name 的调用数，供原子性断言比较 I/O 前后状态。
+  // 输入/输出及副作用：mem、method_name（输入）；只遍历 mem.calls 并返回局部 count，不修改 call log、mapping 或传入对象的所有权。
+  // 失败/边界：null call entry 被跳过；本函数不防御 mem 为 null，调用者必须提供已创建的 mock，否则解引用失败而不会产生可用计数。
   function automatic int unsigned call_count(
     rdma_mock_host_mem mem,
     string method_name
@@ -59,9 +96,9 @@ class rdma_queue_backing_access_test extends uvm_test;
     return count;
   endfunction
 
-  // 功能：在 rdma_queue_backing_access_test 中，expect_code 在测试中执行 expect_code 断言，比较输入结果与期望状态并报告可定位的失败信息。
-  // 输入/输出及副作用：label（输入）、status（输入）、expected（输入）；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：测试函数 expect_code 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：比较 status 的 code 与 expected，并以 label 产生可定位的 UVM error，统一本测试的状态断言格式。
+  // 输入/输出及副作用：label、status、expected（输入）；只读取 status/code；不修改 DUT 或 fixture，失配时调用 `uvm_error` 记录一条错误。
+  // 失败/边界：status 为 null 或 code 不匹配都会报错；函数不抛异常、不 drop objection，也不停止 run_phase，后续独立检查仍会执行。
   function automatic void expect_code(
     string label,
     rdma_status status,
@@ -111,9 +148,9 @@ class rdma_queue_backing_access_test extends uvm_test;
       `uvm_error("DEVICE_PREFLIGHT", "failed span was written")
   endtask
 
-  // 功能：在 rdma_queue_backing_access_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
-  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
-  // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
+  // 功能：构造两个相邻 DMA segment，依次覆盖 null 校验、重复/混合绑定、跨段读写、权限预检和 borrowed backing 不释放的契约。
+  // 输入/输出及副作用：phase（输入）；raise/drop objection 包围所有检查；task 创建并修改本地 mock、mapping、backing 与 access，UVM error 是可观察失败输出。
+  // 失败/边界：每个 expect_code/UVM 检查失配后仍继续执行剩余场景以收集错误；本 task 没有 configure/build/activate gate，唯一生命周期保证是结尾无条件 drop objection。
   task run_phase(uvm_phase phase);
     rdma_mock_host_mem mem;
     rdma_dma_mapping m0;
@@ -121,11 +158,15 @@ class rdma_queue_backing_access_test extends uvm_test;
     rdma_status status;
     rdma_queue_backing_ref backing;
     rdma_queue_backing_ref invalid_backing;
+    rdma_null_queue_backing_validate null_queue_backing;
     rdma_queue_backing_segment segment;
     rdma_queue_backing_segment invalid_segment;
     rdma_qp_backing_ref qp_backing;
+    rdma_null_qp_backing_validate null_qp_backing;
     rdma_queue_backing_access access;
     rdma_queue_backing_access invalid_access;
+    rdma_queue_backing_access null_queue_access;
+    rdma_queue_backing_access null_qp_access;
     rdma_queue_backing_span spans[$];
     byte data[];
     byte write_data[];
@@ -156,6 +197,24 @@ class rdma_queue_backing_access_test extends uvm_test;
     segment.ownership = backing.ownership;
     backing.additional_segments.push_back(segment);
 
+    // validate() 是可覆写边界；null status 必须在 attach 入口归一化，且
+    // 失败后 backing slot 仍应可接受一次合法绑定。
+    null_queue_access = rdma_queue_backing_access::type_id::create(
+      "null_queue_access"
+    );
+    status = null_queue_access.configure(fn(), mem);
+    expect_code("NULL_QUEUE_CONFIG", status, RDMA_SC_OK);
+    null_queue_backing = new("null_queue_backing");
+    write_calls = call_count(mem, "write");
+    read_calls = call_count(mem, "read");
+    status = null_queue_access.attach_queue(null_queue_backing);
+    expect_code("NULL_QUEUE_VALIDATE", status, RDMA_SC_INVALID_STATE);
+    if (call_count(mem, "write") != write_calls ||
+        call_count(mem, "read") != read_calls)
+      `uvm_error("NULL_QUEUE_BACKEND", "null queue validation touched Host memory")
+    status = null_queue_access.attach_queue(backing);
+    expect_code("NULL_QUEUE_RETRY", status, RDMA_SC_OK);
+
     access = rdma_queue_backing_access::type_id::create("access");
     status = access.configure(fn(), mem);
     expect_code("CONFIG", status, RDMA_SC_OK);
@@ -170,6 +229,24 @@ class rdma_queue_backing_access_test extends uvm_test;
     qp_backing.length = 4096;
     qp_backing.mapping_offset = 0;
     qp_backing.ownership = RDMA_OWNERSHIP_BORROWED;
+
+    // QP backing 也允许扩展校验器；null status 不能把 qp_ref 置为半有效引用。
+    null_qp_access = rdma_queue_backing_access::type_id::create(
+      "null_qp_access"
+    );
+    status = null_qp_access.configure(fn(), mem);
+    expect_code("NULL_QP_CONFIG", status, RDMA_SC_OK);
+    null_qp_backing = new("null_qp_backing");
+    write_calls = call_count(mem, "write");
+    read_calls = call_count(mem, "read");
+    status = null_qp_access.attach_qp(null_qp_backing);
+    expect_code("NULL_QP_VALIDATE", status, RDMA_SC_INVALID_STATE);
+    if (call_count(mem, "write") != write_calls ||
+        call_count(mem, "read") != read_calls)
+      `uvm_error("NULL_QP_BACKEND", "null QP validation touched Host memory")
+    status = null_qp_access.attach_qp(qp_backing);
+    expect_code("NULL_QP_RETRY", status, RDMA_SC_OK);
+
     status = access.attach_qp(qp_backing);
     expect_code("MIXED_ATTACH", status, RDMA_SC_INVALID_STATE);
 

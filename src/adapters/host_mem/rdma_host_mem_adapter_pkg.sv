@@ -58,10 +58,13 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：在 rdma_host_mem_allocation_identity 中，mark_release_complete 执行 mark_release_complete 的mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-    // 输入/输出及副作用：seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-    // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
-    function rdma_status mark_release_complete(
+    // 功能：在 rdma_host_mem_allocation_identity 中核对 release seal，并把
+    //   release_complete 从未完成原子地标记为已完成。
+    // 输入/输出及副作用：seal 为待核对的输入；成功时只更新本地
+    //   release_complete 位并返回 OK，不访问 Host-memory 或转移资源所有权。
+    // 失败/边界：seal 为空、未初始化、与保存的 release_seal 不同返回
+    //   INVALID_ARGUMENT；重复完成返回 INVALID_STATE，且保留原完成位。
+    virtual function rdma_status mark_release_complete(
       rdma_host_mem_release_seal seal
     );
       if (seal == null || release_seal == null || seal != release_seal)
@@ -132,7 +135,7 @@ package rdma_host_mem_adapter_pkg;
       if (status == null || !status.ok()) begin
         allocation_identity = null;
         if (status == null)
-          return rdma_status::make(
+          return rdma_status::make_direct(
             RDMA_SC_INVALID_STATE,
             "host memory allocation identity sealing returned null"
           );
@@ -141,10 +144,12 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：在 rdma_host_mem_mapping 中，mark_release_complete 执行 mark_release_complete 的mark_release_complete 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-    // 输入/输出及副作用：release_seal（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
-    //   返回结果。
-    // 失败/边界：mark_release_complete 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+    // 功能：在 rdma_host_mem_mapping 中把 release seal 校验委托给其
+    //   allocation_identity，作为 adapter 完成释放前的唯一幂等标记入口。
+    // 输入/输出及副作用：release_seal 为输入；成功时只更新内部 identity 的
+    //   release_complete 位并返回 status，不修改 mapping public 字段或 backing。
+    // 失败/边界：allocation_identity 为空返回 INVALID_STATE；seal 不匹配或
+    //   已完成时传播对应错误，失败不得改变 identity 的完成状态。
     function rdma_status mark_release_complete(
       rdma_host_mem_release_seal release_seal
     );
@@ -193,7 +198,12 @@ package rdma_host_mem_adapter_pkg;
 
       snapshot = null;
       status = make_authority_snapshot(typed_snapshot);
-      if (status != null && status.ok())
+      if (status == null)
+        return rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "host memory authority snapshot returned null status"
+        );
+      if (status.ok())
         snapshot = typed_snapshot;
       return status;
     endfunction
@@ -391,6 +401,25 @@ package rdma_host_mem_adapter_pkg;
       umem_allocations.delete();
     endfunction
 
+    // 功能：normalize_adapter_status 把 adapter 内部或可覆盖子对象返回的
+    //       rdma_status 统一转换为可安全解引用的非空对象。
+    // 输入/输出及副作用：candidate、operation 为输入；非空 candidate 原样返回，
+    //       null 则直接构造 INVALID_STATE，不调用 UVM factory，也不修改账本、mapping
+    //       或外部 host_mem 资源。
+    // 失败/边界：null 表示下游实现违反状态返回契约；调用方必须停止读取相关 output，
+    //       由本 helper 给出确定失败，避免在异常路径继续提交或释放资源。
+    protected function automatic rdma_status normalize_adapter_status(
+      rdma_status candidate,
+      string operation
+    );
+      if (candidate == null)
+        return rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          {"Host-memory adapter ", operation, " returned null status"}
+        );
+      return candidate;
+    endfunction
+
     // 功能：在 rdma_host_mem_adapter 中，clone_function_handle 将 rhs 中 rdma_host_mem_adapter 的值字段复制到当前对象，建立与源对象隔离的快照。
     // 输入/输出及副作用：source（输入）；clone_function_handle 读取 source 并使用字段 cloned_object；函数返回 rdma_function_handle，不取得调用方资源所有权。
     // 失败/边界：clone_function_handle 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
@@ -514,10 +543,13 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：validate_range 校验 allocation、offset、length、backing_address 与当前对象状态的一致性，并显式处理“allocation ledger entry is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-    // 输入/输出及副作用：allocation（输入）、offset（输入）、length（输入）、backing_address（输出）；validate_range 读取 allocation、offset、length、backing_address 并使用字段 backing_address、offset_end、address_sum、address_end，并写入 backing_address；函数返回 rdma_status，不取得调用方资源所有权。
-
-    // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+    // 功能：validate_range 验证 allocation authority 覆盖的 offset/length，并计算成功访问
+    //   对应的 backing_address。
+    // 输入/输出及副作用：allocation、offset、length（输入），backing_address（输出）；先将
+    //   输出清零，只读 allocation authority，不修改 allocation、adapter cursor 或外部 backing 资源。
+    // 失败/边界：allocation/authority 缺失、offset+length 超出 mapping、backing 地址加法或
+    //   访问末端溢出时返回 INVALID_STATE 或 DMA_TRANSLATION；length 为零是合法空范围并保持
+    //   backing_address 为零。
     protected function rdma_status validate_range(
       rdma_host_mem_allocation_record allocation,
       longint unsigned offset,
@@ -577,10 +609,14 @@ package rdma_host_mem_adapter_pkg;
       return 1'b0;
     endfunction
 
-    // 功能：choose_iova 根据 backing_address、size、alignment、selected_iova、committed_cursor 执行 rdma_status 结果转换，具体更新字段 selected_iova、committed_cursor、range_end、cursor、alignment_mask、aligned_cursor；失败时返回 RDMA_SC_RESOURCE_EXHAUSTED，保持已登记资源和输出不变。
-    // 输入/输出及副作用：backing_address（输入）、size（输入）、alignment（输入）、selected_iova（输出）、committed_cursor（输出）；choose_iova 读取 backing_address、size、alignment、selected_iova、committed_cursor 并使用字段 selected_iova、committed_cursor、range_end、cursor、alignment_mask、aligned_cursor，并写入 selected_iova、committed_cursor；函数返回 rdma_status，不取得调用方资源所有权。
-
-    // 失败/边界：choose_iova 返回 RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“identity IOVA range overflows 64 bits”“IOVA cursor is exhausted”；失败路径不提交部分状态或转移未声明资源。
+    // 功能：choose_iova 在 identity-IOVA 模式或 configured IOVA cursor 模式下计算对齐后的
+    //   候选范围，并返回候选地址及下一游标。
+    // 输入/输出及副作用：backing_address、size、alignment（输入），selected_iova、
+    //   committed_cursor（输出）；只读当前 allocator 账本，成功时不直接提交 next_iova，
+    //   失败时保留既有分配状态。
+    // 失败/边界：backing/range、cursor、alignment、allocation end 溢出或与 ACTIVE mapping
+    //   重叠时返回 RESOURCE_EXHAUSTED；调用方必须提供非零合法 alignment，并在 status 非成功
+    //   时忽略候选输出。
     protected function rdma_status choose_iova(
       bit [63:0] backing_address,
       int unsigned size,
@@ -652,7 +688,10 @@ package rdma_host_mem_adapter_pkg;
       if (request_context == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "DMA request context is null");
-      status = request_context.validate();
+      status = normalize_adapter_status(
+        request_context.validate(),
+        "DMA request validation"
+      );
       if (!status.ok())
         return status;
       if (mem == null)
@@ -687,8 +726,16 @@ package rdma_host_mem_adapter_pkg;
         );
       end
 
-      status = choose_iova(backing_address, size, alignment,
-                           selected_iova, committed_cursor);
+      status = normalize_adapter_status(
+        choose_iova(
+          backing_address,
+          size,
+          alignment,
+          selected_iova,
+          committed_cursor
+        ),
+        "IOVA selection"
+      );
       if (!status.ok()) begin
         mem.free(backing_address, `__FILE__, `__LINE__);
         return status;
@@ -708,7 +755,10 @@ package rdma_host_mem_adapter_pkg;
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "DMA mapping creation failed");
       end
-      status = allocated_mapping.initialize_allocation_identity(release_seal);
+      status = normalize_adapter_status(
+        allocated_mapping.initialize_allocation_identity(release_seal),
+        "allocation identity initialization"
+      );
       if (!status.ok()) begin
         mem.free(backing_address, `__FILE__, `__LINE__);
         return status;
@@ -743,7 +793,10 @@ package rdma_host_mem_adapter_pkg;
                                  "DMA mapping owner clone failed");
       end
 
-      status = allocated_mapping.make_authority_snapshot(authority);
+      status = normalize_adapter_status(
+        allocated_mapping.make_authority_snapshot(authority),
+        "allocation authority snapshot"
+      );
       if (!status.ok()) begin
         mem.free(backing_address, `__FILE__, `__LINE__);
         return status;
@@ -798,7 +851,10 @@ package rdma_host_mem_adapter_pkg;
       if (mem == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "host_mem API is not configured");
-      status = super.pin_umem(function_h, user_va, length, umem);
+      status = normalize_adapter_status(
+        super.pin_umem(function_h, user_va, length, umem),
+        "UMEM pin"
+      );
       if (!status.ok()) return status;
       record = rdma_host_mem_umem_record::type_id::create(
         $sformatf("umem_allocation_%0d", umem_allocations.size()));
@@ -832,11 +888,15 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：unpin_umem 回收真实 host_mem 页 backing，再执行 UMEM exactly-once unpin。
-    // 输入/输出及副作用：umem 为输入；成功首次调用逆序 free 页并将 ledger 置 inactive。
-    // 失败/边界：未知 UMEM 返回 DMA_TRANSLATION；重复调用保持幂等，不重复 free。
+    // 功能：unpin_umem 先撤销 UMEM pin，再回收真实 host_mem 页 backing，并将
+    //       对应 ledger 置 inactive。
+    // 输入/输出及副作用：umem 为输入；成功首次调用更新 UMEM 生命周期、逆序 free
+    //       页并退休记录；失败时不修改 backing 或 active 标志。
+    // 失败/边界：空/未知 UMEM 返回明确错误；下游 unpin 返回 null/error 时保留
+    //       pinned UMEM 和 backing 供安全重试，重复调用保持幂等且不重复 free。
     virtual function rdma_status unpin_umem(rdma_umem umem);
       rdma_status status;
+
       if (umem == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "UMEM to unpin is null");
@@ -846,13 +906,21 @@ package rdma_host_mem_adapter_pkg;
           continue;
         if (!umem_allocations[index].active)
           return rdma_status::success("UMEM backing was already released");
+
+        // 先完成 UMEM 状态迁移；只有成功才允许提交 backing free，避免
+        // null/error 返回造成“页已 free、UMEM 仍 pinned”的半提交状态。
+        status = normalize_adapter_status(
+          umem.unpin_pages(),
+          "UMEM unpin"
+        );
+        if (!status.ok())
+          return status;
+
         for (int rollback = umem_allocations[index].backing_addresses.size() - 1;
              rollback >= 0; rollback--)
           umem_allocations[index].backing_mem.free(
             umem_allocations[index].backing_addresses[rollback],
             `__FILE__, `__LINE__);
-        status = umem.unpin_pages();
-        if (!status.ok()) return status;
         umem_allocations[index].active = 1'b0;
         return rdma_status::success();
       end
@@ -872,11 +940,21 @@ package rdma_host_mem_adapter_pkg;
       bit [63:0] backing_address;
       rdma_status status;
 
-      status = validate_mapping(mapping, allocation_index);
+      status = normalize_adapter_status(
+        validate_mapping(mapping, allocation_index),
+        "mapping validation"
+      );
       if (!status.ok())
         return status;
-      status = validate_range(allocations[allocation_index], offset,
-                              data.size(), backing_address);
+      status = normalize_adapter_status(
+        validate_range(
+          allocations[allocation_index],
+          offset,
+          data.size(),
+          backing_address
+        ),
+        "write range validation"
+      );
       if (!status.ok())
         return status;
       if (data.size() == 0)
@@ -902,11 +980,21 @@ package rdma_host_mem_adapter_pkg;
       rdma_status status;
 
       data = new[0];
-      status = validate_mapping(mapping, allocation_index);
+      status = normalize_adapter_status(
+        validate_mapping(mapping, allocation_index),
+        "mapping validation"
+      );
       if (!status.ok())
         return status;
-      status = validate_range(allocations[allocation_index], offset, size,
-                              backing_address);
+      status = normalize_adapter_status(
+        validate_range(
+          allocations[allocation_index],
+          offset,
+          size,
+          backing_address
+        ),
+        "read range validation"
+      );
       if (!status.ok())
         return status;
       if (size == 0)
@@ -930,7 +1018,10 @@ package rdma_host_mem_adapter_pkg;
       rdma_host_mem_mapping concrete_mapping;
       rdma_status status;
 
-      status = validate_mapping(mapping, allocation_index);
+      status = normalize_adapter_status(
+        validate_mapping(mapping, allocation_index),
+        "mapping validation"
+      );
       if (!status.ok())
         return status;
       if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
@@ -960,6 +1051,78 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：只读确认 mapping 精确命中本 adapter 唯一 active opaque allocation，且 release seal 未完成。
+    // 输入/输出及副作用：mapping 为待释放 authority；只读 allocations 与 shared identity，不 seal/free 或改 mapping。
+    // 失败/边界：空/异型、未知、跨 adapter、重复 identity、已释放、无 backing 或已完成 seal 均拒绝。
+    virtual function rdma_status validate_failure_atomic_release(
+      rdma_dma_mapping mapping
+    );
+      rdma_host_mem_mapping concrete_mapping;
+      rdma_status status;
+      int allocation_index;
+      int unsigned match_count;
+      bit release_complete;
+
+      if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "failure-atomic host mapping has no allocation identity"
+        );
+      if (concrete_mapping.state != RDMA_MAPPING_ACTIVE)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host mapping is not active"
+        );
+
+      allocation_index = -1;
+      match_count = 0;
+      foreach (allocations[i]) begin
+        if (allocations[i] != null && allocations[i].authority != null &&
+            allocations[i].authority.same_allocation(concrete_mapping)) begin
+          allocation_index = i;
+          match_count++;
+        end
+      end
+      if (match_count == 0)
+        return rdma_status::make(
+          RDMA_SC_DMA_TRANSLATION,
+          "failure-atomic host mapping is not owned by this adapter"
+        );
+      if (match_count != 1)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host mapping identity is ambiguous"
+        );
+      if (!allocations[allocation_index].active ||
+          allocations[allocation_index].authority.state !=
+            RDMA_MAPPING_ACTIVE)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host allocation has already been released"
+        );
+      if (allocations[allocation_index].backing_mem == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host allocation has no backing manager"
+        );
+
+      release_complete = 1'b0;
+      status = concrete_mapping.release_completion_status(release_complete);
+      if (status == null)
+        return rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host release status is null"
+        );
+      if (!status.ok())
+        return status;
+      if (release_complete)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "failure-atomic host release is already complete"
+        );
+      return rdma_status::success();
+    endfunction
+
     // 功能：release_opaque 仅依据 mapping 内部 allocation identity 查找并
     //       释放 backing，供 router 在 manager 返回畸形 public 字段时回滚。
     // 输入/输出及副作用：mapping（输入）；成功时更新 adapter allocation ledger、
@@ -970,33 +1133,36 @@ package rdma_host_mem_adapter_pkg;
       rdma_host_mem_mapping concrete_mapping;
       rdma_status status;
       int allocation_index;
+      int unsigned match_count;
 
+      status = normalize_adapter_status(
+        validate_failure_atomic_release(mapping),
+        "failure-atomic release validation"
+      );
+      if (!status.ok())
+        return status;
       if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
         return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "opaque host mapping has no allocation identity"
+          RDMA_SC_INVALID_STATE,
+          "validated opaque host mapping lost its concrete type"
         );
       allocation_index = -1;
+      match_count = 0;
       foreach (allocations[i]) begin
         if (allocations[i] != null && allocations[i].authority != null &&
             allocations[i].authority.same_allocation(concrete_mapping)) begin
           allocation_index = i;
-          break;
+          match_count++;
         end
       end
-      if (allocation_index < 0)
-        return rdma_status::make(
-          RDMA_SC_DMA_TRANSLATION,
-          "opaque host mapping is not owned by this adapter"
-        );
-      if (!allocations[allocation_index].active)
+      if (match_count != 1 || allocation_index < 0)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
-          "opaque host mapping has already been released"
+          "validated opaque host mapping identity changed"
         );
       status = concrete_mapping.mark_release_complete(release_seal);
       if (status == null)
-        return rdma_status::make(
+        return rdma_status::make_direct(
           RDMA_SC_INVALID_STATE,
           "opaque host release completion marking returned null"
         );

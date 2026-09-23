@@ -6,6 +6,73 @@
 // 中文说明：rdma_cmq_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 功能：rdma_cmq_context_codec_key 根据 CMQ context-body opcode 生成唯一的
+//       registry key，把 opcode、image kind、对象类型和 variant 集中在两类 CMQ consumer
+//       共享的映射中。
+// 输入/输出及副作用：opcode 为 8 位驱动命令输入；函数返回值字段完整的
+//       rdma_codec_key，不访问 registry、不创建 codec，也不修改调用方对象或资源账本。
+// 失败/边界：未知或保留 opcode 返回 RDMA_IMAGE_NONE、object_type="invalid"、
+//       variant="invalid" 的 fail-closed key；六个已登记 context opcode 的字段必须与
+//       rdma_register_context_body_codecs 使用的 key 完全一致。
+function automatic rdma_codec_key rdma_cmq_context_codec_key(
+  input bit [7:0] opcode
+);
+  rdma_codec_key key;
+  key.hw_version = "rdma";
+  key.opcode = opcode;
+  key.image_kind = RDMA_IMAGE_NONE;
+  key.object_type = "invalid";
+  key.variant = "invalid";
+  case (opcode)
+    RDMA_OP_KEY_ALLOC: begin
+      key.image_kind = RDMA_IMAGE_MRT;
+      key.object_type = "mrt";
+      key.variant = "key_alloc";
+    end
+    RDMA_OP_MR_REGISTER: begin
+      key.image_kind = RDMA_IMAGE_MRT;
+      key.object_type = "mrt";
+      key.variant = "register";
+    end
+    RDMA_OP_CQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_CQC;
+      key.object_type = "cqc";
+      key.variant = "create";
+    end
+    RDMA_OP_CEQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_CEQC;
+      key.object_type = "ceqc";
+      key.variant = "create";
+    end
+    RDMA_OP_AEQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_AEQC;
+      key.object_type = "aeqc";
+      key.variant = "create";
+    end
+    RDMA_OP_SRFQC_CREATE: begin
+      key.image_kind = RDMA_IMAGE_SRQC;
+      key.object_type = "srqc";
+      key.variant = "create";
+    end
+    default: begin
+      // 默认值已完成 fail-closed 初始化；不把未知 opcode 猜测成 context body。
+    end
+  endcase
+  return key;
+endfunction
+
+// 功能：rdma_cmq_is_context_opcode 根据同一份 canonical key 判断 opcode 是否需要
+//       context-body registry，供 body encoder 与 request composer 共享 admission 分支。
+// 输入/输出及副作用：opcode 为 8 位驱动命令输入；函数只读取
+//       rdma_cmq_context_codec_key 的值映射并返回 bit，不登记、查找或修改任何状态。
+// 失败/边界：未知、保留或映射为 RDMA_IMAGE_NONE 的 opcode 返回 0；该判断必须与
+//       rdma_cmq_context_codec_key 的六个有效映射保持一致，不能回退到默认 codec。
+function automatic bit rdma_cmq_is_context_opcode(input bit [7:0] opcode);
+  rdma_codec_key key;
+  key = rdma_cmq_context_codec_key(opcode);
+  return key.image_kind != RDMA_IMAGE_NONE;
+endfunction
+
 class rdma_hw_cmq_envelope extends uvm_object;
   `uvm_object_utils(rdma_hw_cmq_envelope)
 
@@ -141,12 +208,13 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
     return value;
   endfunction
 
-  // 完成接收必须独立于可注入的 request registry；这里只接收完成解码器
-  // 已声明公共头/返回 payload 语义的 opcode。请求 registry 中存在但尚未
-  // 建立 CQE payload 契约的命令（例如 MW_ALLOC、QP_FLUSH）仍必须拒绝。
-  // 功能：判断 supported_opcode 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：opcode（输入）；supported_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：supported_opcode 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 完成接收必须独立于可注入的 request registry；这里只接受已经定义
+  // 公共 CQE 头或返回 payload 语义的 0.1.34 opcode。
+  // 功能：supported_opcode 判断 completion codec 是否拥有指定 opcode 的解码契约。
+  // 输入/输出及副作用：opcode 为 8 位驱动命令值输入；函数只读取固定支持集合，
+  //   返回 bit，不修改 request registry、completion image 或 CMQ ring。
+  // 失败/边界：未知 opcode，或仅有 request body 而没有 CQE payload 定义的命令，
+  //   一律返回 0；该函数本身不改变 ready/completion 输出。
   local function bit supported_opcode(bit [7:0] opcode);
     return opcode inside {
       RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
@@ -164,20 +232,48 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
       RDMA_OP_SRC_ADDR_QUERY,
       RDMA_OP_IFA_QUERY,
       RDMA_OP_OCC_PD_SEARCH,
-      RDMA_OP_OCC_PD_IDX_SEARCH
+      RDMA_OP_OCC_PD_IDX_SEARCH,
+      RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
+      RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
+      RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
+      RDMA_OP_OCC_UAQE,
+      RDMA_OP_IDX_OCC_QPC, RDMA_OP_IDX_OCC_CQC, RDMA_OP_IDX_OCC_MRT,
+      RDMA_OP_IDX_OCC_PBLE, RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
+      RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE, RDMA_OP_IDX_OCC_ORQE,
+      RDMA_OP_IDX_OCC_UAQE
     };
   endfunction
 
-  // 功能：在 rdma_hw_cmq_completion_codec 中，allowed_qword_mask 根据 opcode、对象类型或 profile 选择允许位掩码/有效 payload 范围，供保留位检查使用。
-  // 输入/输出及副作用：opcode（输入）、qword_index（输入）；allowed_qword_mask 读取 opcode、qword_index 并使用字段 ；函数返回 bit [63:0]，不取得调用方资源所有权。
-  // 失败/边界：allowed_qword_mask 先检查 qword_index == 0；qword_index inside {[2:7]}；qword_index inside {[2:5]}，再返回 64'h8000_3fff_ff00_0000；64'hffff_ffff_ffff_ffff；64'h0000_0000_0000_0000；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：allowed_qword_mask 按 opcode 和 qword_index 返回驱动 CQE 中可解释的
+  //   位所有权，供 inspect_completion 的四态 raw-mask 检查使用。
+  // 输入/输出及副作用：opcode 与 qword_index 为输入；函数只计算 bit [63:0] 掩码，
+  //   不修改 descriptor、completion 对象或 CMQ ring。
+  // 失败/边界：qword_index 超出 0..7、opcode 未声明 payload，或该 qword 仅含保留位
+  //   时返回零；调用方负责把掩码之外的 0/1/X/Z 位判为 codec 错误。
   local function bit [63:0] allowed_qword_mask(
     bit [7:0] opcode,
     int unsigned qword_index
   );
     if (qword_index == 0) begin
-      if (opcode inside {RDMA_OP_OCC_PD_SEARCH, RDMA_OP_OCC_PD_IDX_SEARCH})
-        return 64'h8000_3fff_ff00_0000 | 64'h0000_0000_00ff_0fff;
+      if (opcode inside {RDMA_OP_OCC_PD_SEARCH, RDMA_OP_OCC_PD_IDX_SEARCH,
+                         RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
+                         RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE,
+                         RDMA_OP_OCC_SGB, RDMA_OP_OCC_IRQE,
+                         RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
+                         RDMA_OP_OCC_UAQE,
+                         RDMA_OP_IDX_OCC_QPC, RDMA_OP_IDX_OCC_CQC,
+                         RDMA_OP_IDX_OCC_MRT, RDMA_OP_IDX_OCC_PBLE,
+                         RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
+                         RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE,
+                         RDMA_OP_IDX_OCC_ORQE, RDMA_OP_IDX_OCC_UAQE})
+        return 64'h8000_3fff_ff00_0000 |
+               64'h03ff_c000_00ff_0fff;
+      if (opcode inside {RDMA_OP_CEQC_QUERY, RDMA_OP_AEQC_QUERY})
+        return 64'h8000_3fff_ff00_0fff;
+      if (opcode == RDMA_OP_SRFQC_QUERY)
+        return 64'h8000_3fff_ff00_ffff;
+      if (opcode == RDMA_OP_IFA_QUERY)
+        return 64'hb000_3fff_ff00_0000;
       return 64'h8000_3fff_ff00_0000;
     end
     case (opcode)
@@ -187,10 +283,18 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
       RDMA_OP_CQC_QUERY:
         return 64'hffff_ffff_ffff_ffff;
       RDMA_OP_CEQC_QUERY,
-      RDMA_OP_AEQC_QUERY,
+      RDMA_OP_AEQC_QUERY:
+        case (qword_index)
+          0: return 64'h8000_3fff_ff00_0fff;
+          2, 3, 4, 5: return 64'hffff_ffff_ffff_ffff;
+          default: return 64'h0000_0000_0000_0000;
+        endcase
       RDMA_OP_SRFQC_QUERY:
-        if (qword_index inside {[2:5]})
-          return 64'hffff_ffff_ffff_ffff;
+        case (qword_index)
+          0: return 64'h8000_3fff_ff00_ffff;
+          2, 3, 4, 5: return 64'hffff_ffff_ffff_ffff;
+          default: return 64'h0000_0000_0000_0000;
+        endcase
       RDMA_OP_SRC_ADDR_QUERY: begin
         case (qword_index)
           // index/valid/SMAC，保留位 51:49 必须保持为零。
@@ -199,9 +303,12 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
           default: return 64'h0000_0000_0000_0000;
         endcase
       end
-      RDMA_OP_IFA_QUERY:
+      RDMA_OP_IFA_QUERY: begin
+        if (qword_index == 0)
+          return 64'hb000_3fff_ff00_0000;
         if (qword_index == 1)
           return 64'h07ff_ffff_ffff_ffff;
+      end
       RDMA_OP_OCC_PD_SEARCH,
       RDMA_OP_OCC_PD_IDX_SEARCH: begin
         case (qword_index)
@@ -230,16 +337,22 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
       RDMA_OP_IDX_OCC_EIRQE,
       RDMA_OP_IDX_OCC_ORQE,
       RDMA_OP_IDX_OCC_UAQE:
-        if (qword_index == 1)
-          return 64'h0000_00ff_ffff_ffff;
+        case (qword_index)
+          1: return 64'h0000_00ff_ffff_ffff;
+          3: return 64'hffff_ffff_ffff_ffff;
+          default: return 64'h0000_0000_0000_0000;
+        endcase
       default: return 64'h0000_0000_0000_0000;
     endcase
     return 64'h0000_0000_0000_0000;
   endfunction
 
-  // 功能：在 rdma_hw_cmq_completion_codec 中，returned_payload_bounds 根据 opcode、对象类型或 profile 选择允许位掩码/有效 payload 范围，供保留位检查使用。
-  // 输入/输出及副作用：opcode（输入）、first_byte（输出）、byte_count（输出）；returned_payload_bounds 读取 opcode、first_byte、byte_count 并使用字段 first_byte、byte_count，并写入 first_byte、byte_count；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：returned_payload_bounds 无返回值，仅执行 first_byte=0、byte_count=0、first_byte=16、byte_count=48；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：returned_payload_bounds 把每类查询/占用完成映射为 CQE payload 的起始
+  //   字节偏移和长度，供 inspect_completion 复制 detached payload。
+  // 输入/输出及副作用：opcode 为输入；first_byte 与 byte_count 为输出，入口先清零，
+  //   函数只写这两个结果，不持有 image、completion 或外部 backing。
+  // 失败/边界：KEY_QUERY=16/48、CQC_QUERY=8/56、CEQC/AEQC/SRFQC_QUERY=16/32、
+  //   SRC_ADDR_QUERY=8/24、IFA_QUERY=8/8、OCC 查询=8/24；未列出的 opcode 输出 0/0。
   local function void returned_payload_bounds(
     bit [7:0] opcode,
     output int unsigned first_byte,
@@ -273,7 +386,15 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
         byte_count = 8;
       end
       RDMA_OP_OCC_PD_SEARCH,
-      RDMA_OP_OCC_PD_IDX_SEARCH: begin
+      RDMA_OP_OCC_PD_IDX_SEARCH,
+      RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
+      RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
+      RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
+      RDMA_OP_OCC_UAQE,
+      RDMA_OP_IDX_OCC_QPC, RDMA_OP_IDX_OCC_CQC, RDMA_OP_IDX_OCC_MRT,
+      RDMA_OP_IDX_OCC_PBLE, RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
+      RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE, RDMA_OP_IDX_OCC_ORQE,
+      RDMA_OP_IDX_OCC_UAQE: begin
         // qword1 为 key，qword3 为 buffer；qword2 是驱动保留空洞。
         first_byte = 8;
         byte_count = 24;
@@ -285,10 +406,12 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_cmq_completion_codec 中，inspect_completion 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
-  // 输入/输出及副作用：image（输入）、expected_owner（输入）、ready（输出）、completion（输出）；inspect_completion 读取 image、expected_owner、ready、completion 并使用字段 ready、completion、qword0、owner、opcode、wrap、q、word，并写入 ready、completion；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：inspect_completion 返回 RDMA_SC_UNSUPPORTED_OPCODE、RDMA_SC_CODEC_ERROR；典型拒绝条件为“rdma CMQ completion image is null”“rdma CMQ completion length is not 64 bytes”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：inspect_completion 校验 64B CMQ CQE 的元数据、owner、opcode 和每个
+  //   qword 的四态 ownership mask，并把公共头与返回 payload 解码成 detached 对象。
+  // 输入/输出及副作用：image 与 expected_owner 为输入；ready 与 completion 为输出，
+  //   入口先分别置 0/null，成功时发布新建 completion，不取得 image backing 所有权。
+  // 失败/边界：image 为空、长度/元数据错误、opcode 未支持或保留位含 X/Z/非零时，
+  //   返回对应 RDMA_SC_* 错误并保持 ready=0、completion=null；owner 未匹配只返回成功且不消费 CQE。
   function rdma_status inspect_completion(
     rdma_hw_image image,
     bit expected_owner,
@@ -333,7 +456,8 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
 
     for (int unsigned q = 0; q < 8; q++) begin
       word = image_qword(image, q);
-      if ((word & ~allowed_qword_mask(opcode, q)) != 0)
+      if (!rdma_raw_qword_mask_is_valid(
+            word, allowed_qword_mask(opcode, q)))
         return codec_error($sformatf(
           "rdma CMQ completion qword %0d contains a reserved bit", q));
     end
@@ -486,6 +610,103 @@ class rdma_hw_object_id_command_body extends rdma_hw_model;
   endfunction
 endclass
 
+// CQC_DELETE 的 wire body 与 CQC_QUERY 不同：驱动会把 live CQC context
+// 的前 56 字节原样复制到 WQE。单独的 typed body 让调用方必须提供完整
+// context，避免把只有 CQN 的 legacy object body 错当成可发送请求。
+class rdma_hw_cqc_delete_body extends rdma_hw_model;
+  `uvm_object_utils(rdma_hw_cqc_delete_body)
+
+  rdma_cqc_model cqc_context;
+
+  // 功能：构造完整 CQC_DELETE body，并将嵌套 CQC context 初始化为空，等待
+  //   调用方显式绑定待删除 CQ 的 context snapshot。
+  // 输入/输出及副作用：name 为 UVM 实例名输入；只写入 cqc_context=null，
+  //   不取得 CQ、CEQ 或 Host-memory 的所有权。
+  // 失败/边界：构造成功不代表 body 可编码；未绑定 context 时 validate() 必须
+  //   返回 INVALID_ARGUMENT，防止发布仅含 CQN 的不完整 wire image。
+  function new(string name = "rdma_hw_cqc_delete_body");
+    super.new(name);
+    cqc_context = null;
+  endfunction
+
+  // 功能：复制 rhs 的完整 CQC_DELETE body，使用传统 UVM clone/copy 语义建立
+  //   与源 context 分离的嵌套快照。
+  // 输入/输出及副作用：rhs 为源对象输入；当前 cqc_context 被替换为新建的
+  //   rdma_cqc_model，源 body/context 与 registry 不被修改。
+  // 失败/边界：rhs 类型不符或 context clone/cast 失败时报告 UVM_FATAL；源
+  //   context 为空时目标保持为空，不伪造默认 CQC。
+  virtual function void do_copy(uvm_object rhs);
+    rdma_hw_cqc_delete_body source;
+    uvm_object cloned_object;
+    rdma_cqc_model cloned_context;
+
+    super.do_copy(rhs);
+    if (!$cast(source, rhs))
+      `uvm_fatal("RDMA_COPY_TYPE", "CQC delete body copy mismatch")
+
+    cqc_context = null;
+    if (source.cqc_context == null)
+      return;
+
+    cloned_object = source.cqc_context.clone();
+    if (cloned_object == null || !$cast(cloned_context, cloned_object))
+      `uvm_fatal("RDMA_COPY_TYPE", "CQC delete context clone mismatch")
+    cqc_context = cloned_context;
+  endfunction
+
+  // 功能：校验 CQC_DELETE body 的 exact wrapper、完整 CQC context 以及 CQ
+  //   handle 的驱动对象类型/位宽，作为专用 layout codec 的唯一输入门禁。
+  // 输入/输出及副作用：无显式参数；只读 cqc_context 及其嵌套字段，返回
+  //   rdma_status，不修改 context、resource registry 或生命周期状态。
+  // 失败/边界：null/派生 wrapper、context.validate() 失败、CQ handle 缺失、
+  //   kind 非 RDMA_RESOURCE_CQ 或 object ID 超过 21 位时返回 INVALID_ARGUMENT
+  //   或原始 validation status；失败路径不允许编码半成品。
+  virtual function rdma_status validate();
+    rdma_status status;
+
+    if (cqc_context == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQC delete requires a complete CQC context"
+      );
+    if (cqc_context.get_object_type() != rdma_cqc_model::get_type())
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQC delete context wrapper must be exact rdma_cqc_model"
+      );
+
+    status = cqc_context.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQC delete context validation returned null"
+      );
+    if (!status.ok())
+      return status;
+
+    return rdma_context_handle_status(
+      cqc_context.cq_h, RDMA_RESOURCE_CQ, 21, "CQC delete CQ"
+    );
+  endfunction
+
+  // 功能：生成包含 CQ object ID 与 context 状态摘要的 CQC_DELETE 诊断文本，
+  //   供日志、canonical 比较和恢复索引使用。
+  // 输入/输出及副作用：无显式参数；只读取 cqc_context/cq_h，返回稳定 string，
+  //   不修改任何对象或外部资源。
+  // 失败/边界：context 或 CQ handle 为空时返回带 null 标记的文本；该文本不
+  //   代替 validate()，也不应被当作 wire ABI 或安全 digest。
+  virtual function string describe();
+    return $sformatf(
+      "CQC delete(cqn=%0d state=%s depth=%0d cqe_size=%0d)",
+      (cqc_context == null || cqc_context.cq_h == null) ? 0 :
+        cqc_context.cq_h.object_id,
+      (cqc_context == null) ? "null" : cqc_context.state.name(),
+      (cqc_context == null) ? 0 : cqc_context.depth,
+      (cqc_context == null) ? 0 : cqc_context.cqe_size_bytes
+    );
+  endfunction
+endclass
+
 class rdma_hw_mr_deregister_body extends rdma_hw_model;
   `uvm_object_utils(rdma_hw_mr_deregister_body)
 
@@ -606,9 +827,11 @@ class rdma_hw_occ_flush_body extends rdma_hw_model;
     pd_backing = rhs_body.pd_backing;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“OCC PD backing is not 4 KiB aligned”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、pd_backing.value、mr_serial、qpn 并使用字段 vf_pattern、serial_pattern、qpn_pattern、qpn_pd_pattern、pd_pattern；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “OCC PD backing is not 4 KiB aligned”；“OCC flush does not match a supported driver command pattern”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：validate 按驱动的 VF、MR serial、QPN、QPN+PD 和 PD 五种 OCC flush 图案校验全部 selector 与 payload 字段。
+  // 输入/输出及副作用：无显式参数；只读取 selector、qpn、mr_serial 和 pd_backing，返回与匹配图案或对齐错误对应的 rdma_status，不修改模型或外部资源。
+  // 失败/边界：PD backing 非 4 KiB 对齐或字段组合不属于五种完整图案时
+  //   返回 RDMA_SC_INVALID_ARGUMENT；QPN 图案允许驱动为 SMI 保留的 QPN 0，
+  //   但仍要求 EIRQE/ORQE/UAQE 全部置位且其他字段为零。
   virtual function rdma_status validate();
     bit vf_pattern;
     bit serial_pattern;
@@ -631,7 +854,7 @@ class rdma_hw_occ_flush_body extends rdma_hw_model;
     qpn_pattern = !vf_flush && !mr_serial_flush &&
                   !qpc && !cqc && !mrt && !pble && !sqrqe &&
                   !sgb_irqe && eirqe && orqe && uaqe && !pd &&
-                  qpn != 0 && mr_serial == 0 && pd_backing.value == 0;
+                  mr_serial == 0 && pd_backing.value == 0;
     qpn_pd_pattern = !vf_flush && !mr_serial_flush &&
                      !qpc && !cqc && !mrt && !pble && !sqrqe &&
                      !sgb_irqe && !eirqe && !orqe && !uaqe && pd &&
@@ -835,10 +1058,12 @@ virtual class rdma_hw_cmq_light_layout_codec extends uvm_object;
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：在 rdma_hw_cmq_light_layout_codec 中，put 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输入）；put 读取 builder、word_byte_offset、lsb、width、value 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：put 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：put 通过 qword builder 写入 CMQ light-body 的一个已授权字段，并把底层字段写入
+  //   结果转换为该 codec 的诊断 status。
+  // 输入/输出及副作用：builder、word_byte_offset、lsb、width、value（输入）；成功时更新
+  //   builder 的 words/occupancy，函数不修改源 model 或取得外部资源所有权。
+  // 失败/边界：builder 未初始化或字段越界、值宽度不符、字段重叠时透传底层失败并包装为
+  //   CODEC_ERROR；调用方须在失败时丢弃正在构造的 image。
   protected function rdma_status put(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -861,6 +1086,7 @@ virtual class rdma_hw_cmq_light_layout_codec extends uvm_object;
     bit [7:0] opcode,
     rdma_hw_model model
   );
+
   // 功能：在 rdma_hw_cmq_light_layout_codec 中，encode_fields 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：opcode（输入）、model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode_fields 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
@@ -869,6 +1095,7 @@ virtual class rdma_hw_cmq_light_layout_codec extends uvm_object;
     rdma_hw_model model,
     rdma_hw_qword_builder builder
   );
+
   // 功能：在 rdma_hw_cmq_body_image 中，owner_generation 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
   // 输入/输出及副作用：model（输入）；owner_generation 读取 model 并使用字段 image、status、builder、allowed、payload、candidate、candidate.length、candidate.alignment；函数返回 int unsigned，不取得调用方资源所有权。
   // 失败/边界：owner_generation 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ light-body mask lookup failed”；“CMQ light body writes request envelope bits”；“CMQ light-body qword %0d writes outside its mask”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
@@ -876,9 +1103,12 @@ virtual class rdma_hw_cmq_light_layout_codec extends uvm_object;
     rdma_hw_model model
   );
 
-  // 功能：在 rdma_hw_cmq_light_layout_codec 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：opcode（输入）、model（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：rdma_hw_cmq_light_layout_codec::encode 为派生 layout codec 创建 64B
+  //   body image，先执行 opcode 专用校验/字段编码，再验证 body 与 envelope 的 ownership 不重叠。
+  // 输入/输出及副作用：opcode、model 为只读输入，image 为输出；函数只发布带
+  //   RDMA_IMAGE_CMQ_SQE 元数据的新 image，不修改 model 或其嵌套 handle。
+  // 失败/边界：opcode/model 校验失败、mask lookup 失败、字段越界、保留位非零、
+  //   envelope 位被 body 占用或序列化失败时返回错误，并保持 image=null。
   function rdma_status encode(
     bit [7:0] opcode,
     rdma_hw_model model,
@@ -904,10 +1134,10 @@ virtual class rdma_hw_cmq_light_layout_codec extends uvm_object;
       allowed = '0;
       if (!body_mask(RDMA_IMAGE_CMQ_SQE, opcode, 0, q, allowed))
         return codec_error("CMQ light-body mask lookup failed");
-      if ((words[q] & ~allowed) != 0)
+      if (!rdma_raw_qword_mask_is_valid(words[q], allowed))
         return codec_error($sformatf(
           "CMQ light-body qword %0d writes outside its mask", q));
-      if ((words[q] & request_envelope_mask(q)) != 0)
+      if ((words[q] & request_envelope_mask(q)) !== 64'b0)
         return codec_error("CMQ light body writes request envelope bits");
     end
     payload = new[0];
@@ -1271,6 +1501,129 @@ class rdma_hw_cmq_object_id_layout_codec
   endfunction
 endclass
 
+// CQC_DELETE 的 64B body 使用专用 layout：qword0 只有 CQN，qword1..7
+// 承载驱动从 CQC context 原样 memcpy 的前 56 字节。该 codec 不复用
+// object-ID codec，因而不会把 context 字段静默丢失或产生隐式错位。
+class rdma_hw_cmq_cqc_delete_layout_codec
+    extends rdma_hw_cmq_light_layout_codec;
+  protected rdma_hw_cqc_create_body_codec context_codec;
+
+  // 功能：构造 CQC_DELETE 专用 layout codec，并建立只读 context 编码器，
+  //   用于把完整 CQC model 转成驱动要求的 56-byte raw context。
+  // 输入/输出及副作用：name 为 UVM 实例名；context_codec 由本对象直接拥有，
+  //   不取得 CQC model、CQ handle 或 Host-memory 的所有权。
+  // 失败/边界：context codec 构造失败时 encode() 会返回 CODEC_ERROR；构造本身
+  //   不发布 image，也不接受 generic object-ID body 作为降级路径。
+  function new(string name = "rdma_hw_cmq_cqc_delete_layout_codec");
+    super.new(name);
+    context_codec = new("cmq_cqc_delete_context_codec");
+  endfunction
+
+  // 功能：校验 opcode 与 exact rdma_hw_cqc_delete_body wrapper，并执行完整
+  //   CQC context 的语义验证。
+  // 输入/输出及副作用：opcode/model 为只读输入；返回 rdma_status，不修改 body、
+  //   context 或 codec 状态。
+  // 失败/边界：opcode 不为 CQC_DELETE、model 为 null/派生或 body.validate()
+  //   失败时拒绝；generic rdma_hw_object_id_command_body 永不被隐式接受。
+  protected virtual function rdma_status validate_for_opcode(
+    bit [7:0] opcode,
+    rdma_hw_model model
+  );
+    rdma_hw_cqc_delete_body body;
+
+    if (opcode != RDMA_OP_CQC_DELETE)
+      return rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        "CQC delete codec opcode does not match"
+      );
+    if (model == null ||
+        model.get_object_type() != rdma_hw_cqc_delete_body::get_type() ||
+        !$cast(body, model))
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQC delete codec requires exact rdma_hw_cqc_delete_body"
+      );
+    return body.validate();
+  endfunction
+
+  // 功能：从 typed CQC_DELETE body 读取 CQ handle generation，供 CMQ image
+  //   代际校验拒绝旧 Function binding。
+  // 输入/输出及副作用：model 为只读输入；返回 generation 数值，不修改 body
+  //   或任何资源账本。
+  // 失败/边界：model/wrapper/context/CQ handle 任一缺失时返回 0；调用方必须将
+  //   该值视为未绑定并在上层继续执行 generation authority 检查。
+  protected virtual function int unsigned owner_generation(
+    rdma_hw_model model
+  );
+    rdma_hw_cqc_delete_body body;
+
+    if (model == null ||
+        model.get_object_type() != rdma_hw_cqc_delete_body::get_type() ||
+        !$cast(body, model) || body.cqc_context == null ||
+        body.cqc_context.cq_h == null)
+      return 0;
+    return body.cqc_context.cq_h.generation;
+  endfunction
+
+  // 功能：先用 CQC_CREATE context codec 编码完整 context，再按驱动 cmq.c
+  //   的 memcpy(wqe + 1, ctx, 56) 规则把 context image 的 qword1..7
+  //   （即 raw context qword0..6）放入 request qword1..7，并写入 CQN。
+  // 输入/输出及副作用：opcode/model 为只读输入，builder 为当前 64B body 的
+  //   可变写入器；成功时只更新 builder 的 qword0..7 ownership。
+  // 失败/边界：context codec 缺失、context image metadata/长度错误、字段越界或
+  //   memcpy overlap/range 错误时返回 CODEC_ERROR；context byte56..63 永不复制。
+  protected virtual function rdma_status encode_fields(
+    bit [7:0] opcode,
+    rdma_hw_model model,
+    rdma_hw_qword_builder builder
+  );
+    rdma_hw_cqc_delete_body body;
+    rdma_hw_image context_image;
+    byte unsigned context_bytes[];
+    rdma_status status;
+
+    if (!$cast(body, model) || body.cqc_context == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CQC delete body/context cast failed"
+      );
+    if (context_codec == null)
+      return rdma_status::make(
+        RDMA_SC_CODEC_ERROR,
+        "CQC delete context codec is not initialized"
+      );
+
+    context_image = null;
+    status = context_codec.encode(body.cqc_context, context_image);
+    if (!status.ok())
+      return status;
+    if (context_image == null ||
+        context_image.length != 64 ||
+        context_image.bytes.size() != 64 ||
+        context_image.image_kind != RDMA_IMAGE_CQC ||
+        context_image.endian != RDMA_ENDIAN_BIG)
+      return rdma_status::make(
+        RDMA_SC_CODEC_ERROR,
+        "CQC delete context image metadata is invalid"
+      );
+
+    status = put(builder, 0, 0, 21, body.cqc_context.cq_h.object_id);
+    if (!status.ok())
+      return status;
+
+    context_bytes = new[56];
+    // CQC_CREATE image 的 qword0 是独立的 CQN header，不属于驱动复制的
+    // raw context；从 byte8 开始才对应 ctx_addr.va 的 byte0。
+    for (int unsigned i = 0; i < 56; i++)
+      context_bytes[i] = context_image.bytes[8 + i];
+    status = builder.put_memcpy(8, context_bytes);
+    if (!status.ok())
+      return codec_error({"CQC delete context memcpy failed: ",
+                          status.message});
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_hw_cmq_mr_deregister_layout_codec
     extends rdma_hw_cmq_light_layout_codec;
 
@@ -1470,14 +1823,18 @@ class rdma_hw_cmq_light_body_codec extends uvm_object;
 
   protected rdma_hw_cmq_light_layout_codec codecs[256];
 
-  // 功能：构造 rdma_hw_cmq_light_body_codec，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：qpc_codec=new("cmq_qpc_layout")；mr_deregister_codec=new("cmq_mr_deregister_layout")；occ_flush_codec=new("cmq_occ_flush_layout")；object_id_codec=new(；empty_codec=new("cmq_tq_flush_layout")。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_cmq_light_body_codec 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_cmq_light_body_codec，并把 0.1.34 的 light-body opcode
+  //   映射到 QPC、MR、OCC、CQC_DELETE、object-ID 或 empty layout codec。
+  // 输入/输出及副作用：name 为 UVM 实例名输入；new 初始化 codecs[256] 和本对象
+  //   直接拥有的 codec 实例，不取得任何 CQ/QP/Host-memory 的所有权。
+  // 失败/边界：构造完成不代表某 opcode 可发送；未登记的 opcode 由 encode 返回
+  //   RDMA_SC_UNSUPPORTED_OPCODE，codec 实例创建失败由后续调用显式报告。
   function new(string name = "rdma_hw_cmq_light_body_codec");
     rdma_hw_cmq_qpc_layout_codec qpc_codec;
     rdma_hw_cmq_mr_deregister_layout_codec mr_deregister_codec;
     rdma_hw_cmq_occ_flush_layout_codec occ_flush_codec;
     rdma_hw_cmq_object_id_layout_codec object_id_codec;
+    rdma_hw_cmq_cqc_delete_layout_codec cqc_delete_codec;
     rdma_hw_cmq_empty_layout_codec empty_codec;
     super.new(name);
     foreach (codecs[i]) codecs[i] = null;
@@ -1490,10 +1847,8 @@ class rdma_hw_cmq_light_body_codec extends uvm_object;
     codecs[RDMA_OP_MR_DEREGISTER] = mr_deregister_codec;
     occ_flush_codec = new("cmq_occ_flush_layout");
     codecs[RDMA_OP_OCC_FLUSH] = occ_flush_codec;
-    object_id_codec = new(
-      "cmq_cqc_delete_layout", RDMA_OP_CQC_DELETE,
-      RDMA_RESOURCE_CQ, 21);
-    codecs[RDMA_OP_CQC_DELETE] = object_id_codec;
+    cqc_delete_codec = new("cmq_cqc_delete_layout");
+    codecs[RDMA_OP_CQC_DELETE] = cqc_delete_codec;
     object_id_codec = new(
       "cmq_cqc_query_layout", RDMA_OP_CQC_QUERY,
       RDMA_RESOURCE_CQ, 21);
@@ -1567,60 +1922,24 @@ class rdma_hw_cmq_body_encoder extends uvm_object;
       `uvm_fatal("RDMA_CMQ_REGISTRY", status.convert2string())
   endfunction
 
-  // 功能：在 rdma_hw_cmq_body_encoder 中，context_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：opcode（输入）；context_key 读取 opcode 并使用字段 key.hw_version、key.opcode、key.image_kind、key.object_type、key.variant；函数返回 rdma_codec_key，不取得调用方资源所有权。
-// 失败/边界：context_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：在 rdma_hw_cmq_body_encoder 中，context_key 保留原 protected 入口，并转发到
+  //       package-scope 的 canonical CMQ context key helper，供登记表去重和恢复路由使用。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_context_codec_key 生成的
+  //       rdma_codec_key，不访问 registry、不取得调用方资源所有权。
+  // 失败/边界：未知 opcode 由共享 helper 返回 RDMA_IMAGE_NONE/invalid key；该转发层
+  //       不补选默认 codec，也不改变既有 protected 扩展点的可见性。
   protected function rdma_codec_key context_key(bit [7:0] opcode);
-    rdma_codec_key key;
-    key.hw_version = "rdma";
-    key.opcode = opcode;
-    case (opcode)
-      RDMA_OP_KEY_ALLOC: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "key_alloc";
-      end
-      RDMA_OP_MR_REGISTER: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "register";
-      end
-      RDMA_OP_CQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CQC;
-        key.object_type = "cqc";
-        key.variant = "create";
-      end
-      RDMA_OP_CEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CEQC;
-        key.object_type = "ceqc";
-        key.variant = "create";
-      end
-      RDMA_OP_AEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_AEQC;
-        key.object_type = "aeqc";
-        key.variant = "create";
-      end
-      RDMA_OP_SRFQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_SRQC;
-        key.object_type = "srqc";
-        key.variant = "create";
-      end
-      default: begin
-        key.image_kind = RDMA_IMAGE_NONE;
-        key.object_type = "invalid";
-        key.variant = "invalid";
-      end
-    endcase
-    return key;
+    return rdma_cmq_context_codec_key(opcode);
   endfunction
 
-  // 功能：在 rdma_hw_cmq_body_encoder 中，is_context_opcode 判断 is_context_opcode 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：opcode（输入）；is_context_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：is_context_opcode 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：在 rdma_hw_cmq_body_encoder 中，is_context_opcode 保留原 protected 判定入口，
+  //       转发到与 context_key 相同的 canonical opcode 集合。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_is_context_opcode 的 bit 结果，
+  //       不访问 registry、不修改 encoder、model 或外部资源。
+  // 失败/边界：未知或保留 opcode 返回 0；该转发层不能把无效 key 解释为 light/context
+  //       codec，也不绕过共享 helper 的 fail-closed 默认分支。
   protected function bit is_context_opcode(bit [7:0] opcode);
-    return opcode inside {RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
-                          RDMA_OP_CQC_CREATE, RDMA_OP_CEQC_CREATE,
-                          RDMA_OP_AEQC_CREATE, RDMA_OP_SRFQC_CREATE};
+    return rdma_cmq_is_context_opcode(opcode);
   endfunction
 
   // 功能：在 rdma_hw_cmq_body_encoder 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
@@ -1712,8 +2031,9 @@ class rdma_cmq_opcode_descriptor extends uvm_object;
 
   // 功能：校验描述符长度、掩码和 completion payload slice 的自洽性。
   // 输入/输出及副作用：无显式输入；只读本对象字段，返回 bit，不推进 ring。
-  // 失败/边界：非 64B CMQ 图像、越界 slice、无请求/响应能力或请求掩码覆盖
-  //   envelope 保留位时返回 0。
+  // 失败/边界：非 64B CMQ 图像、越界 slice、请求/响应均未声明能力，或请求
+  //   掩码覆盖 envelope 保留位时返回 0；response-only descriptor 仍可通过本
+  //   校验，供真实 CQE 解码和字段审计使用。
   function bit valid();
     bit [63:0] envelope_mask;
     envelope_mask = 64'h8fff_3fff_0000_0000;
@@ -1721,12 +2041,12 @@ class rdma_cmq_opcode_descriptor extends uvm_object;
       return 1'b0;
     if (request_bytes != RDMA_CMQE_BYTES ||
         response_bytes != RDMA_CMQE_BYTES ||
-        !request_allowed || !response_allowed)
+        (!request_allowed && !response_allowed))
       return 1'b0;
     if (completion_payload_offset + completion_payload_length >
         response_bytes)
       return 1'b0;
-    if ((request_qword_masks[0] & envelope_mask) != 0)
+    if ((request_qword_masks[0] & envelope_mask) !== 64'b0)
       return 1'b0;
     return 1'b1;
   endfunction
@@ -1850,6 +2170,35 @@ class rdma_cmq_codec_registry extends uvm_object;
       RDMA_OP_CEQC_QUERY, RDMA_OP_AEQC_QUERY,
       RDMA_OP_SRC_ADDR_QUERY, RDMA_OP_IFA_QUERY,
       RDMA_OP_OCC_PD_SEARCH, RDMA_OP_OCC_PD_IDX_SEARCH,
+      RDMA_OP_SRFQC_QUERY,
+      RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
+      RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
+      RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
+      RDMA_OP_OCC_UAQE,
+      RDMA_OP_IDX_OCC_QPC, RDMA_OP_IDX_OCC_CQC, RDMA_OP_IDX_OCC_MRT,
+      RDMA_OP_IDX_OCC_PBLE, RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
+      RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE, RDMA_OP_IDX_OCC_ORQE,
+      RDMA_OP_IDX_OCC_UAQE
+    };
+  endfunction
+
+  // 功能：判断指定 opcode 是否已有本模型中的完整 request body encoder。
+  // 输入/输出及副作用：opcode 为驱动命令值输入；函数只读取固定的 0.1.34
+  //   encoder 登记集合并返回 bit，不修改 descriptor、registry 或 ring。
+  // 失败/边界：只有 context/light codec 已实际登记的命令返回 1；仅有 request
+  //   mask 或 completion decoder 的 opcode 返回 0。
+  static function bit has_request_encoder(bit [7:0] opcode);
+    return opcode inside {
+      RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
+      RDMA_OP_QPC_DELETE, RDMA_OP_QPC_QUERY,
+      RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
+      RDMA_OP_MR_DEREGISTER, RDMA_OP_OCC_FLUSH,
+      RDMA_OP_CQC_CREATE, RDMA_OP_CQC_DELETE,
+      RDMA_OP_CQC_QUERY, RDMA_OP_CEQC_CREATE,
+      RDMA_OP_CEQC_DELETE, RDMA_OP_CEQC_QUERY,
+      RDMA_OP_AEQC_CREATE, RDMA_OP_AEQC_DELETE,
+      RDMA_OP_AEQC_QUERY, RDMA_OP_TQ_FLUSH,
+      RDMA_OP_SRFQC_CREATE, RDMA_OP_SRFQC_DELETE,
       RDMA_OP_SRFQC_QUERY
     };
   endfunction
@@ -1864,6 +2213,7 @@ class rdma_cmq_codec_registry extends uvm_object;
       RDMA_OP_AEQC_MODIFY, RDMA_OP_SD_UPDATE, RDMA_OP_SD_QUERY,
       RDMA_OP_SRC_ADDR_UPDATE, RDMA_OP_SRC_ADDR_QUERY, RDMA_OP_STAT_QUERY,
       RDMA_OP_QPC_FORCE_DELETE, RDMA_OP_CQC_FORCE_DELETE,
+      RDMA_OP_OCC_FLUSH, RDMA_OP_TQ_FLUSH,
       RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
       RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
       RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
@@ -1893,7 +2243,7 @@ class rdma_cmq_codec_registry extends uvm_object;
     mask = '0;
     if (qword > 7) return mask;
     case (opcode)
-      RDMA_OP_MW_ALLOC, RDMA_OP_MW_DEALLOC: begin
+      RDMA_OP_MW_ALLOC: begin
         case (qword)
           0: begin
             // qword0 的 MRT 状态字段占用 62:61；bit63 属于
@@ -1903,8 +2253,23 @@ class rdma_cmq_codec_registry extends uvm_object;
           end
           1: mask[31:24] = '1;
           2: begin
-            mask[63:62] = '1; mask[61] = 1'b1;
-            mask[55:54] = '1; mask[48] = 1'b1;
+            // qword2 的有效片段为 [63:61]、[55:54]、bit48 和 [47:24]。
+            // 用整字面量表达，避免把位段冒号误识别成 case label。
+            mask = 64'hE0C1_FFFF_FF00_0000;
+          end
+          3: mask[63:56] = '1;
+        endcase
+      end
+      RDMA_OP_MW_DEALLOC: begin
+        case (qword)
+          0: begin
+            mask[62:61] = 2'b11;
+            mask[23:0] = '1;
+          end
+          1: mask[31:24] = '1;
+          2: begin
+            mask[63:62] = '1;
+            mask[48] = 1'b1;
             mask[47:24] = '1;
           end
           3: mask[63:56] = '1;
@@ -1924,7 +2289,8 @@ class rdma_cmq_codec_registry extends uvm_object;
       end
       RDMA_OP_CQC_MODIFY: begin
         if (qword == 0) begin
-          mask[62:60] = '1; mask[31:21] = '1;
+          mask[62:60] = '1;
+          mask[31:22] = '1;
           mask[20:0] = '1;
         end
       end
@@ -1936,8 +2302,12 @@ class rdma_cmq_codec_registry extends uvm_object;
         case (qword)
           0: mask[7:0] = '1;
           1: begin mask[32] = 1'b1; mask[31:24] = '1; end
-          2: mask[63:12] = '1;
-          3, 4, 5, 6, 7: mask = 64'hffff_ffff_ffff_ffff;
+          2: mask = 64'h0000_0000_0000_0000;
+          3: mask = 64'hffff_ffff_ffff_fe00;
+          4: mask = 64'h0000_0000_0000_0fff;
+          5: mask = 64'hffff_ffff_ffff_fff1;
+          6: mask = 64'h0000_0000_0000_0fff;
+          7: mask = 64'hffff_ffff_ffff_fff1;
         endcase
       end
       RDMA_OP_SRC_ADDR_UPDATE: begin
@@ -1957,7 +2327,11 @@ class rdma_cmq_codec_registry extends uvm_object;
       RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
       RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
       RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
-      RDMA_OP_OCC_UAQE,
+      RDMA_OP_OCC_UAQE:
+        if (qword == 1)
+          mask[39:0] = '1;
+        else if (qword == 3)
+          mask = 64'hffff_ffff_ffff_ffff;
       RDMA_OP_OCC_QPC_KICKOUT, RDMA_OP_OCC_CQC_KICKOUT,
       RDMA_OP_OCC_MRT_KICKOUT, RDMA_OP_OCC_PBLE_KICKOUT,
       RDMA_OP_OCC_SQRQE_KICKOUT, RDMA_OP_OCC_SGB_KICKOUT,
@@ -1968,19 +2342,36 @@ class rdma_cmq_codec_registry extends uvm_object;
       RDMA_OP_IDX_OCC_PBLE, RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
       RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE, RDMA_OP_IDX_OCC_ORQE,
       RDMA_OP_IDX_OCC_UAQE:
-        if (qword == 0) begin mask[23:16] = '1; mask[11:0] = '1; end
+        if (qword == 0) begin
+          mask[23:16] = '1;
+          mask[11:0] = '1;
+        end
+        else if (qword == 3)
+          mask = 64'hffff_ffff_ffff_ffff;
       RDMA_OP_IFA_UPDATE: begin
-        if (qword == 0) mask[61:60] = '1;
-        else if (qword inside {[1:4]}) mask = 64'hffff_ffff_ffff_ffff;
+        if (qword == 0)
+          mask[61:60] = '1;
+        else if (qword == 1) begin
+          // 驱动 cmq.h 的 IFA update 数据定义到 bit57；bit58 只属于
+          // IFA query response 的信息字段，不能混入 request ownership。
+          // 保留位若被置位，后续 raw mask 校验必须拒绝该请求。
+          mask = 64'h03ff_ffff_ffff_ffff;
+        end
       end
       RDMA_OP_IFA_QUERY:
         if (qword == 0) mask[61:60] = '1;
       RDMA_OP_OCC_PD_SEARCH:
-        if (qword == 1) mask[39:0] = '1;
-        else if (qword == 3) mask = 64'hffff_ffff_ffff_ffff;
+        if (qword == 1)
+          mask[39:0] = '1;
+        else if (qword == 3)
+          mask = 64'hffff_ffff_ffff_ffff;
       RDMA_OP_OCC_PD_IDX_SEARCH:
-        if (qword == 0) begin mask[23:16] = '1; mask[11:0] = '1; end
-        else if (qword == 3) mask = 64'hffff_ffff_ffff_ffff;
+        if (qword == 0) begin
+          mask[23:16] = '1;
+          mask[11:0] = '1;
+        end
+        else if (qword == 3)
+          mask = 64'hffff_ffff_ffff_ffff;
       RDMA_OP_OCC_PD_KICKOUT:
         if (qword == 1) mask = 64'hffff_ffff_ffff_ffff;
       RDMA_OP_NOP: mask = '0;
@@ -2008,18 +2399,32 @@ class rdma_cmq_codec_registry extends uvm_object;
         if (qword inside {[2:7]}) mask = '1;
       RDMA_OP_CQC_QUERY:
         if (qword inside {[1:7]}) mask = '1;
-      RDMA_OP_CEQC_QUERY, RDMA_OP_AEQC_QUERY, RDMA_OP_SRFQC_QUERY:
-        if (qword inside {[2:5]}) mask = '1;
+      RDMA_OP_CEQC_QUERY,
+      RDMA_OP_AEQC_QUERY:
+        if (qword == 0)
+          mask = 64'h8000_3fff_ff00_0fff;
+        else if (qword inside {[2:5]})
+          mask = '1;
+      RDMA_OP_SRFQC_QUERY:
+        if (qword == 0)
+          mask = 64'h8000_3fff_ff00_ffff;
+        else if (qword inside {[2:5]})
+          mask = '1;
       RDMA_OP_SRC_ADDR_QUERY: begin
         case (qword)
           1: mask = 64'hfff1_ffff_ffff_ffff;
           2, 3: mask = '1;
         endcase
       end
-      RDMA_OP_IFA_QUERY:
-        if (qword == 1) mask = 64'h07ff_ffff_ffff_ffff;
+      RDMA_OP_IFA_QUERY: begin
+        if (qword == 0)
+          mask = 64'hb000_3fff_ff00_0000;
+        else if (qword == 1)
+          mask = 64'h07ff_ffff_ffff_ffff;
+      end
       RDMA_OP_OCC_PD_SEARCH, RDMA_OP_OCC_PD_IDX_SEARCH: begin
-        if (qword == 0) mask |= 64'h0000_0000_00ff_0fff;
+        if (qword == 0)
+          mask |= 64'h03ff_c000_00ff_0fff;
         else if (qword == 1) mask = 64'h0000_00ff_ffff_ffff;
         else if (qword == 3) mask = '1;
       end
@@ -2031,7 +2436,12 @@ class rdma_cmq_codec_registry extends uvm_object;
       RDMA_OP_IDX_OCC_PBLE, RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
       RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE, RDMA_OP_IDX_OCC_ORQE,
       RDMA_OP_IDX_OCC_UAQE:
-        if (qword == 0) mask |= 64'h0000_0000_00ff_0fff;
+        if (qword == 0)
+          mask |= 64'h03ff_c000_00ff_0fff;
+        else if (qword == 1)
+          mask = 64'h0000_00ff_ffff_ffff;
+        else if (qword == 3)
+          mask = 64'hffff_ffff_ffff_ffff;
       default: ;
     endcase
     return mask;
@@ -2051,7 +2461,7 @@ class rdma_cmq_codec_registry extends uvm_object;
       descriptor.symbolic_name = opcode_name(i[7:0]);
       descriptor.request_bytes = RDMA_CMQE_BYTES;
       descriptor.response_bytes = RDMA_CMQE_BYTES;
-      descriptor.request_allowed = 1'b1;
+      descriptor.request_allowed = has_request_encoder(i[7:0]);
       descriptor.response_allowed = 1'b1;
       descriptor.default_error = RDMA_SC_UNKNOWN_HW_ERROR;
       for (int unsigned q = 1; q < 8; q++) begin
@@ -2085,6 +2495,17 @@ class rdma_cmq_codec_registry extends uvm_object;
           descriptor.completion_payload_offset = 8;
           descriptor.completion_payload_length = 24;
         end
+        RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
+        RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
+        RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
+        RDMA_OP_OCC_UAQE,
+        RDMA_OP_IDX_OCC_QPC, RDMA_OP_IDX_OCC_CQC, RDMA_OP_IDX_OCC_MRT,
+        RDMA_OP_IDX_OCC_PBLE, RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
+        RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE,
+        RDMA_OP_IDX_OCC_ORQE, RDMA_OP_IDX_OCC_UAQE: begin
+          descriptor.completion_payload_offset = 8;
+          descriptor.completion_payload_length = 24;
+        end
         default: begin
           descriptor.completion_payload_offset = 0;
           descriptor.completion_payload_length = 0;
@@ -2101,6 +2522,18 @@ class rdma_cmq_codec_registry extends uvm_object;
     ensure_initialized();
     return opcode <= MAX_OPCODE && descriptors[opcode] != null &&
            descriptors[opcode].valid();
+  endfunction
+
+  // 功能：查询指定 opcode 是否可由当前 CMQ request composer 编码并提交。
+  // 输入/输出及副作用：opcode 为输入；函数读取静态 descriptor 快照并返回 bit，
+  //   不修改 registry、body image 或 CMQ ring。
+  // 失败/边界：未知 opcode、descriptor 非法或没有已登记 body encoder 时返回 0；
+  //   completion-only opcode 仍可由 is_supported()/lookup() 查询，但不会通过本接口。
+  static function bit is_request_supported(bit [7:0] opcode);
+    ensure_initialized();
+    return opcode <= MAX_OPCODE && descriptors[opcode] != null &&
+           descriptors[opcode].valid() &&
+           descriptors[opcode].request_allowed;
   endfunction
 
   // 功能：按 opcode 返回 detached 描述符快照，供编码器、测试和 golden reader 使用。
@@ -2146,6 +2579,20 @@ class rdma_cmq_codec_registry extends uvm_object;
     ensure_initialized();
     for (int unsigned i = 0; i <= MAX_OPCODE; i++)
       if (is_supported(i[7:0])) opcodes.push_back(i[7:0]);
+  endfunction
+
+  // 功能：导出所有具备真实 request body encoder 的 opcode，供 composer 门禁和
+  //   capability golden 校验使用；completion-only opcode 不会出现在结果中。
+  // 输入/输出及副作用：opcodes 为输出动态队列；只写入静态 registry 的排序快照，
+  //   不推进 ring、不转移 image 所有权。
+  // 失败/边界：registry 未初始化或 descriptor 无效时输出空队列；调用方应先检查
+  //   validate()，并把空结果视为没有可发送命令。
+  static function void list_request_supported(output bit [7:0] opcodes[$]);
+    opcodes.delete();
+    ensure_initialized();
+    for (int unsigned i = 0; i <= MAX_OPCODE; i++)
+      if (is_request_supported(i[7:0]))
+        opcodes.push_back(i[7:0]);
   endfunction
 endclass
 
@@ -2222,7 +2669,7 @@ class rdma_hw_cmq_body_registry extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CMQ body input image kind is invalid");
     foreach (masks[q]) begin
-      if ((masks[q] & request_envelope_mask(q)) != 0)
+      if ((masks[q] & request_envelope_mask(q)) !== 64'b0)
         return rdma_status::make(
           RDMA_SC_CODEC_ERROR,
           $sformatf("CMQ body opcode 0x%02x overlaps envelope qword %0d",
@@ -2320,7 +2767,7 @@ function automatic rdma_status rdma_register_cmq_request_bodies(
   `CMQ_REGISTER_BODY(RDMA_OP_CQC_CREATE, RDMA_IMAGE_CQC,
                      RDMA_CQC_CREATE_BODY_MASK)
   `CMQ_REGISTER_BODY(RDMA_OP_CQC_DELETE, RDMA_IMAGE_CMQ_SQE,
-                     RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP)
+                     RDMA_CQC_DELETE_BODY_OWNERSHIP)
   `CMQ_REGISTER_BODY(RDMA_OP_CQC_QUERY, RDMA_IMAGE_CMQ_SQE,
                      RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP)
   `CMQ_REGISTER_BODY(RDMA_OP_CEQC_CREATE, RDMA_IMAGE_CEQC,
@@ -2357,9 +2804,12 @@ class rdma_hw_cmq_envelope_codec extends uvm_object;
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_hw_cmq_envelope_codec 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：envelope（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：rdma_hw_cmq_envelope_codec::encode 将 valid/VFID/wrap/index/opcode 六个
+  //   CMQ envelope 字段写入 64B builder，并验证 occupancy 只覆盖驱动 envelope 位。
+  // 输入/输出及副作用：envelope 为只读输入，image 为输出；成功时发布带
+  //   RDMA_IMAGE_CMQ_SQE 元数据的 detached image，不修改 envelope 或外部资源。
+  // 失败/边界：envelope 为空、validate 失败、builder 序列化失败或 occupancy 与
+  //   request_envelope_mask 不完全相等时返回错误，并保持 image=null。
   virtual function rdma_status encode(
     rdma_hw_cmq_envelope envelope,
     output rdma_hw_image image
@@ -2394,7 +2844,7 @@ class rdma_hw_cmq_envelope_codec extends uvm_object;
 `undef CMQ_ENVELOPE_PUT
     builder.get_occupancy(occupancy);
     foreach (occupancy[q]) begin
-      if (occupancy[q] != request_envelope_mask(q))
+      if (occupancy[q] !== request_envelope_mask(q))
         return rdma_status::make(
           RDMA_SC_CODEC_ERROR,
           $sformatf("CMQ envelope qword %0d authorship mask mismatch", q)
@@ -2474,14 +2924,23 @@ class rdma_hw_cmq_request_composer extends uvm_object;
       `uvm_fatal("RDMA_CMQ_REGISTRY", status.convert2string())
   endfunction
 
-  // 功能：build_body 按 opcode 选择已登记的 body codec，将 model 编码为 image；编码失败时保持 image 为空并返回错误状态。
-  // 输入/输出及副作用：opcode（输入）、model（输入）、image（输出）；build_body 读取 opcode、model、image 并使用输入参数和固定枚举/常量，并写入 image；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：build_body 的结果直接由 return mint_body(opcode, model, image) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：build_body 在 request composer 入口先查询静态 request descriptor，再把
+  //   opcode/model 转交给 exact body encoder 生成 64B body image。
+  // 输入/输出及副作用：opcode、model 为输入，image 为输出；入口先清空 image，成功
+  //   时由 mint_body 发布新 image，不修改 model、registry 或 CMQ ring。
+  // 失败/边界：未知 opcode 或 descriptor 没有 request encoder 时返回
+  //   RDMA_SC_UNSUPPORTED_OPCODE；body 校验/编码失败时保持 image=null 并透传原状态。
   function rdma_status build_body(
     bit [7:0] opcode,
     rdma_hw_model model,
     output rdma_hw_image image
   );
+    image = null;
+    if (!rdma_cmq_codec_registry::is_request_supported(opcode))
+      return rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        $sformatf("CMQ request opcode 0x%02x has no body encoder", opcode)
+      );
     return mint_body(opcode, model, image);
   endfunction
 
@@ -2603,65 +3062,32 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     return word;
   endfunction
 
-  // 功能：在 rdma_hw_cmq_request_composer 中，context_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：opcode（输入）；context_key 读取 opcode 并使用字段 key.hw_version、key.opcode、key.image_kind、key.object_type、key.variant；函数返回 rdma_codec_key，不取得调用方资源所有权。
-// 失败/边界：context_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：在 rdma_hw_cmq_request_composer 中，context_key 保留原 protected 入口，并转发到
+  //       package-scope 的 canonical CMQ context key helper，供请求校验和 registry lookup 使用。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_context_codec_key 生成的
+  //       rdma_codec_key，不访问 registry、不取得调用方资源所有权。
+  // 失败/边界：未知 opcode 由共享 helper 返回 RDMA_IMAGE_NONE/invalid key；该转发层
+  //       不补选默认 codec，也不改变既有 protected 扩展点的可见性。
   protected function rdma_codec_key context_key(bit [7:0] opcode);
-    rdma_codec_key key;
-    key.hw_version = "rdma";
-    key.opcode = opcode;
-    case (opcode)
-      RDMA_OP_KEY_ALLOC: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "key_alloc";
-      end
-      RDMA_OP_MR_REGISTER: begin
-        key.image_kind = RDMA_IMAGE_MRT;
-        key.object_type = "mrt";
-        key.variant = "register";
-      end
-      RDMA_OP_CQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CQC;
-        key.object_type = "cqc";
-        key.variant = "create";
-      end
-      RDMA_OP_CEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_CEQC;
-        key.object_type = "ceqc";
-        key.variant = "create";
-      end
-      RDMA_OP_AEQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_AEQC;
-        key.object_type = "aeqc";
-        key.variant = "create";
-      end
-      RDMA_OP_SRFQC_CREATE: begin
-        key.image_kind = RDMA_IMAGE_SRQC;
-        key.object_type = "srqc";
-        key.variant = "create";
-      end
-      default: begin
-        key.image_kind = RDMA_IMAGE_NONE;
-        key.object_type = "invalid";
-        key.variant = "invalid";
-      end
-    endcase
-    return key;
+    return rdma_cmq_context_codec_key(opcode);
   endfunction
 
-  // 功能：在 rdma_hw_cmq_request_composer 中，is_context_opcode 判断 is_context_opcode 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：opcode（输入）；is_context_opcode 读取 opcode 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：is_context_opcode 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：在 rdma_hw_cmq_request_composer 中，is_context_opcode 保留原 protected 判定入口，
+  //       转发到与 context_key 相同的 canonical opcode 集合。
+  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_is_context_opcode 的 bit 结果，
+  //       不访问 registry、不修改 composer、model 或外部资源。
+  // 失败/边界：未知或保留 opcode 返回 0；该转发层不能把无效 key 解释为 context codec，
+  //       也不绕过共享 helper 的 fail-closed 默认分支。
   protected function bit is_context_opcode(bit [7:0] opcode);
-    return opcode inside {RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
-                          RDMA_OP_CQC_CREATE, RDMA_OP_CEQC_CREATE,
-                          RDMA_OP_AEQC_CREATE, RDMA_OP_SRFQC_CREATE};
+    return rdma_cmq_is_context_opcode(opcode);
   endfunction
 
-  // 功能：validate_context_identity 校验 opcode、body 与当前对象状态的一致性，并显式处理“CMQ exact context-body codec lookup failed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：opcode（输入）、body（输入）；validate_context_identity 读取 opcode、body 并使用字段 status、decoded；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：validate_context_identity 按 opcode 查找唯一 context-body codec，解码 body 并以
+  //   精确类型校验请求的 context identity。
+  // 输入/输出及副作用：opcode、body（输入）；只读 registry 和 body，临时创建 decoded model，
+  //   成功只返回 status，不发布或修改 caller 的 body/model。
+  // 失败/边界：exact codec 缺失、lookup 返回错误/空 codec、body decode 失败或 decoded 为空时
+  //   返回 CODEC_ERROR；任何失败都阻止后续 context request 提交。
   protected function rdma_status validate_context_identity(
     bit [7:0] opcode,
     rdma_hw_image body
@@ -2680,10 +3106,12 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_image_metadata 校验 image、expected_kind、expected_length、expected_alignment、label 与当前对象状态的一致性，并显式处理“is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：image（输入）、expected_kind（输入）、expected_length（输入）、expected_alignment（输入）、label（输入）；validate_image_metadata 读取 image、expected_kind、expected_length、expected_alignment、label 并使用字段 rdma_status、value；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：validate_image_metadata 核对 context body image 的长度、对齐、端序、image kind、
+  //   硬件版本和所有 backing/target 元数据是否符合调用方期望。
+  // 输入/输出及副作用：image、expected_kind、expected_length、expected_alignment、label
+  //   （输入）；只读 image，返回带 label 的 rdma_status，不修改 bytes、metadata 或外部资源。
+  // 失败/边界：image 为空、长度或 byte 数不符、alignment/endian/kind/version 不符，或
+  //   write/backing/HMC/BAR target 非零时返回 CODEC_ERROR；失败阻止后续 body decode/compose。
   protected function rdma_status validate_image_metadata(
     rdma_hw_image image,
     rdma_image_kind_e expected_kind,
@@ -2709,7 +3137,6 @@ class rdma_hw_cmq_request_composer extends uvm_object;
 
   // 功能：validate_qpc_mode_image 校验 opcode、body、needs_signature 与当前对象状态的一致性，并显式处理“CMQ QPC body signature must initially be zero”；“CMQ QPC create must enable signature”；“CMQ state-only QPC modify has extra payload”；“CMQ full QPC modify must enable signature”；“CMQ full QPC modify has partial payload”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：opcode（输入）、body（输入）、needs_signature（输出）；validate_qpc_mode_image 读取 opcode、body、needs_signature 并使用字段 needs_signature、qword1、sign_en、signature、qword2、mode、partial_payload_nonzero、q，并写入 needs_signature；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   protected function rdma_status validate_qpc_mode_image(
     bit [7:0] opcode,
@@ -2728,7 +3155,7 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     qword1 = image_word(body, 1);
     sign_en = qword1[RDMA_CMQ_SIGN_EN_LSB];
     signature = qword1[RDMA_CMQ_SIGNATURE_LSB +: 8];
-    if (signature != 0)
+    if (signature !== 8'h00)
       return codec_error("CMQ QPC body signature must initially be zero");
     if (opcode == RDMA_OP_QPC_CREATE) begin
       if (!sign_en)
@@ -2740,26 +3167,30 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     mode = qword2[RDMA_CMQ_MODIFY_MODE_LSB +: 2];
     partial_payload_nonzero = 1'b0;
     for (int unsigned q = 4; q < 8; q++)
-      partial_payload_nonzero |= image_word(body, q) != 0;
+      partial_payload_nonzero |= image_word(body, q) !== 64'b0;
     case (mode)
       RDMA_QPC_MODIFY_STATE_ONLY: begin
-        if (sign_en || image_word(body, 3) != 0 ||
-            (qword2 & ~(64'h3 << RDMA_CMQ_MODIFY_MODE_LSB |
-                        64'h3 << RDMA_CMQ_WBE_TEMPLATE_COUNT_LSB)) != 0 ||
+        if (sign_en || image_word(body, 3) !== 64'b0 ||
+            !rdma_raw_qword_mask_is_valid(
+              qword2,
+              64'h3 << RDMA_CMQ_MODIFY_MODE_LSB |
+              64'h3 << RDMA_CMQ_WBE_TEMPLATE_COUNT_LSB) ||
             partial_payload_nonzero)
           return codec_error("CMQ state-only QPC modify has extra payload");
       end
       RDMA_QPC_MODIFY_FULL: begin
         if (!sign_en)
           return codec_error("CMQ full QPC modify must enable signature");
-        if ((qword2 & ~(64'h3 << RDMA_CMQ_MODIFY_MODE_LSB |
-                        64'h3 << RDMA_CMQ_WBE_TEMPLATE_COUNT_LSB)) != 0 ||
+        if (!rdma_raw_qword_mask_is_valid(
+              qword2,
+              64'h3 << RDMA_CMQ_MODIFY_MODE_LSB |
+              64'h3 << RDMA_CMQ_WBE_TEMPLATE_COUNT_LSB) ||
             partial_payload_nonzero)
           return codec_error("CMQ full QPC modify has partial payload");
         needs_signature = 1'b1;
       end
       RDMA_QPC_MODIFY_PARTIAL: begin
-        if (sign_en || image_word(body, 3) != 0)
+        if (sign_en || image_word(body, 3) !== 64'b0)
           return codec_error("CMQ partial QPC modify has signature/buffer");
       end
       default:
@@ -2768,9 +3199,18 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_qpc_signature_source 校验 source、body 与当前对象状态的一致性，并显式处理“rdma”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：source（输入）、body（输入）；validate_qpc_signature_source 读取 source、body 并使用字段 service_type、key.hw_version、key.image_kind、key.object_type、key.opcode、key.variant、status、decoded_model；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：validate_qpc_signature_source 解码 QPC signature source，并校验它与
+  //   CMQ QPC body 的共享 QP 身份、transport variant 和 full-modify WBE 模板一致。
+  // 输入/输出及副作用：source 和 body 须已由 compose_request 校验元数据与
+  //   长度；函数只读 source 的 service_type、qp_h.kind/object_id、transport，
+  //   以及 body 的 QPN、modify_mode、WBE 字段，返回 rdma_status，不修改输入或
+  //   转移资源所有权。
+  // 失败/边界：service_type 无映射、codec lookup/decode 或类型转换失败、QP handle
+  //   缺失或 kind 错误、QPN 低 21 位不一致，以及 full modify 的 transport/WBE
+  //   组合不受支持时返回 CODEC_ERROR；元数据不合法由调用者在进入本函数前
+  //   拒绝。
+  //   CMQ header 的 24-bit QPN 与 QPC context 的 21-bit QPN 不同宽，只比较 ABI
+  //   共有的低 21 位，不截断任一线上字段。
   protected function rdma_status validate_qpc_signature_source(
     rdma_hw_image source,
     rdma_hw_image body
@@ -2782,6 +3222,8 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     rdma_status status;
     bit [2:0] service_type;
     bit [23:0] body_qpn;
+    bit [20:0] body_qpc_qpn;
+    bit [20:0] source_qpc_qpn;
     bit [1:0] modify_mode;
     bit [1:0] wbe_template;
     bit [1:0] expected_wbe_template;
@@ -2809,10 +3251,18 @@ class rdma_hw_cmq_request_composer extends uvm_object;
       return codec_error({"QPC signature source decode failed: ",
                           (status == null) ? "null status" :
                                              status.message});
+    // 驱动的 CMQ header QPN 是 GENMASK(23, 0)，而 QPC context QPN
+    // 是 GENMASK_ULL(36, 16)。两者不是同宽字段：CMQ 保留完整 24-bit
+    // canonical 值，身份校验只比较 ABI 共同定义的低 21 位。
     body_qpn = (image_word(body, 0) >> RDMA_CMQ_QPN_LSB) & 24'hff_ffff;
     if (decoded_qpc.qp_h == null ||
-        decoded_qpc.qp_h.kind != RDMA_RESOURCE_QP ||
-        decoded_qpc.qp_h.object_id != body_qpn)
+        decoded_qpc.qp_h.kind != RDMA_RESOURCE_QP)
+      return codec_error(
+        "QPC signature source QPN does not match the CMQ body"
+      );
+    body_qpc_qpn = body_qpn[20:0];
+    source_qpc_qpn = decoded_qpc.qp_h.object_id[20:0];
+    if (source_qpc_qpn != body_qpc_qpn)
       return codec_error(
         "QPC signature source QPN does not match the CMQ body"
       );
@@ -2838,10 +3288,12 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_cmq_request_composer 中，compose_request 按 profile 的字段布局和端序把语义模型编码为硬件镜像，并在发布前检查长度与对齐。
-  // 输入/输出及副作用：envelope（输入）、body（输入）、qpc_signature_source（输入）、result（输出）；输入模型只读；成功时通过返回值或 output 发布完整
-  //   image/bytes，不修改源模型。
-  // 失败/边界：模型为空、字段越界、保留位非零或输出长度不足时返回编码错误，不发布部分图像。
+  // 功能：compose_request 将 envelope image 与已编码 body image 按 qword 合并，
+  //   校验 opcode/ownership/context authority，并在 QPC full/create 场景计算最终签名。
+  // 输入/输出及副作用：envelope、body、qpc_signature_source 为只读输入，result 为
+  //   输出；入口清空 result，成功时发布完整 64B RDMA_IMAGE_CMQ_SQE，不修改输入 image。
+  // 失败/边界：envelope 为空、opcode 无 encoder、body 元数据/掩码/identity 不符、
+  //   QPC signature source 缺失或多余、合并后含未拥有位时返回错误并保持 result=null。
   function rdma_status compose_request(
     rdma_hw_cmq_envelope envelope,
     rdma_hw_image body,
@@ -2865,6 +3317,12 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     result = null;
     if (envelope == null)
       return codec_error("CMQ envelope is null");
+    if (!rdma_cmq_codec_registry::is_request_supported(envelope.opcode))
+      return rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        $sformatf("CMQ request opcode 0x%02x has no body encoder",
+                  envelope.opcode)
+      );
     envelope_snapshot = new("cmq_envelope_snapshot");
     envelope_snapshot.valid = envelope.valid;
     envelope_snapshot.vfid_override = envelope.vfid_override;
@@ -2896,12 +3354,12 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     if (!status.ok()) return status;
     for (int unsigned q = 0; q < 8; q++) begin
       body_word = image_word(body, q);
-      if ((body_word & ~masks[q]) != 0)
+      if (!rdma_raw_qword_mask_is_valid(body_word, masks[q]))
         return codec_error($sformatf(
           "CMQ body qword %0d contains a bit outside opcode ownership", q));
     end
     for (int unsigned q = 0; q < 8; q++) begin
-      if ((request_envelope_mask(q) & masks[q]) != 0)
+      if ((request_envelope_mask(q) & masks[q]) !== 64'b0)
         return codec_error($sformatf(
           "CMQ envelope/body ownership overlaps in qword %0d", q));
     end
@@ -2954,7 +3412,8 @@ class rdma_hw_cmq_request_composer extends uvm_object;
 
     for (int unsigned q = 0; q < 8; q++) begin
       merged_word = image_word(candidate, q);
-      if ((merged_word & ~(request_envelope_mask(q) | masks[q])) != 0)
+      if (!rdma_raw_qword_mask_is_valid(
+            merged_word, request_envelope_mask(q) | masks[q]))
         return codec_error("composed CMQ request contains an unowned bit");
     end
     if (((image_word(candidate, 0) >> RDMA_CMQ_OPCODE_LSB) & 8'hff) !=

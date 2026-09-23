@@ -65,8 +65,8 @@ virtual class rdma_pcie_api extends uvm_object;
 
   // 功能：在 rdma_pcie_api 中，cfg_write32 把 cfg_write32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
   // 输入/输出及副作用：target（输入）、offset（输入）、data（输入）、byte_enable（输入）、status（输出）；cfg_write32 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-
-  // 失败/边界：cfg_write32 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 失败/边界：具体 backend 必须把配置空间拒绝、offset 越界、byte_enable 非法、
+  //   权限错误或超时写入 status；抽象接口本身不推进本地游标，也不掩盖失败证据。
   pure virtual task cfg_write32(
     rdma_bdf_t target,
     rdma_cfg_offset_t offset,

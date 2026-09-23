@@ -26,8 +26,10 @@ class rdma_env_config extends uvm_object;
   rdma_function_binding function_binding;
 
   // 功能：构造默认 core-only 配置，关闭全部外部适配器并建立确定的超时/profile。
-  // 输入输出及副作用：name 为 UVM 对象名；初始化标量、队列能力和空 region 列表，不取得外部资源所有权。
-  // 失败边界：构造不会验证 route/region；调用 validate() 或 env.configure() 时才报告非法配置。
+  // 输入/输出及副作用：name 为 UVM 对象名；初始化标量、队列能力和空 region 列表，
+  //   不取得外部 adapter、responder 或 Function snapshot 的所有权。
+  // 失败/边界：构造不会验证 mode、route 或 region；调用 validate() 或 env.configure()
+  //   时才报告非法配置，默认 core-only 模式不启用任何 adapter。
   function new(string name = "rdma_env_config");
     super.new(name);
     mode = RDMA_ENV_CORE_ONLY;
@@ -46,10 +48,15 @@ class rdma_env_config extends uvm_object;
   endfunction
 
   // 功能：校验模式、adapter enable/required 关系、超时和每个 responder region 的地址边界。
-  // 输入输出及副作用：读取当前配置并返回 rdma_status；不修改配置或外部账本。
-  // 失败边界：required 未同时 enabled、timeout/硬件版本为零、region 为空 owner、非法 route、size=0 或 65-bit 末地址溢出时拒绝。
+  // 输入/输出及副作用：读取当前配置并返回 rdma_status；不修改配置或外部账本。
+  // 失败/边界：required 未同时 enabled、timeout/硬件版本为零、region 为空 owner、
+  // 非法 route、size=0 或 65-bit 末地址溢出时拒绝；嵌套 validator 返回 null
+  // 时 fail-closed。
   function rdma_status validate();
     bit [64:0] end_ext;
+    rdma_status identity_status;
+    rdma_status binding_status;
+
     if (hardware_version == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "hardware version is zero");
     if (operation_timeout == 0)
@@ -83,12 +90,24 @@ class rdma_env_config extends uvm_object;
                                  "responder region end overflows 64 bits");
     end
     if (function_identity != null) begin
-      if (!function_identity.validate().ok())
+      identity_status = function_identity.validate();
+      if (identity_status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function identity validation returned null status"
+        );
+      if (!identity_status.ok())
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function identity snapshot is invalid");
     end
     if (function_binding != null) begin
-      if (!function_binding.validate().ok())
+      binding_status = function_binding.validate();
+      if (binding_status == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "Function binding validation returned null status"
+        );
+      if (!binding_status.ok())
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function binding snapshot is invalid");
       if (function_identity != null &&
@@ -106,8 +125,10 @@ class rdma_env_config extends uvm_object;
   endfunction
 
   // 功能：深拷贝配置对象，尤其是 responder value region 和 Function identity，形成 detached snapshot。
-  // 输入输出及副作用：rhs 为源 uvm_object；覆盖当前对象字段，源配置和其中的 region 句柄不被修改。
-  // 失败边界：rhs 类型错误或 region/identity clone 失败时触发 UVM fatal，避免发布半成品配置。
+  // 输入/输出及副作用：rhs 为源 uvm_object；函数覆盖当前对象的标量、queue profile、
+  //   detached responder region 和 Function identity/binding clone，源配置及其句柄不被修改。
+  // 失败/边界：rhs 不能 cast 为 rdma_env_config、region/identity/binding clone 或 region
+  //   factory 失败时触发 UVM fatal；本函数不返回 status，fatal 前的部分写入不应被发布。
   virtual function void do_copy(uvm_object rhs);
     rdma_env_config source;
     uvm_object clone_obj;

@@ -91,10 +91,17 @@ class rdma_hmc_ref extends uvm_object;
   rdma_hmc_fvm_addr_t address;
   longint unsigned size;
   int unsigned first_pbl_index;
+  // 驱动的 PBLE allocator 允许 index=0；该模型元数据位记录 index
+  // 是否来自 allocator lease，而不是把 0 当作“未设置”哨兵。它不进入
+  // CMQ/MRT wire image，只用于 authority/快照完整性校验。
+  bit index_valid;
   rdma_resource_ownership_e ownership;
   bit release_complete;
 
-  // 功能：构造 rdma_hmc_ref，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：owner=null；object_kind=RDMA_RESOURCE_MR；address='0；size=0；first_pbl_index=0；ownership=RDMA_OWNERSHIP_BORROWED；release_complete=1'b0。
+  // 功能：构造 rdma_hmc_ref，调用 super.new 建立 UVM 对象，并把默认值设为
+  //   owner=null、object_kind=RDMA_RESOURCE_MR、address='0、size=0、
+  //   first_pbl_index=0、index_valid=1'b0、
+  //   ownership=RDMA_OWNERSHIP_BORROWED、release_complete=1'b0。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_hmc_ref 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_hmc_ref");
@@ -104,19 +111,24 @@ class rdma_hmc_ref extends uvm_object;
     address = '0;
     size = 0;
     first_pbl_index = 0;
+    index_valid = 1'b0;
     ownership = RDMA_OWNERSHIP_BORROWED;
     release_complete = 1'b0;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“HMC reference owner is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、owner、owner.kind、object_kind、size、first_pbl_index、release_complete、ownership 并使用字段 rdma_status、owner、owner.kind、object_kind、size、first_pbl_index、release_complete、ownership；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“HMC reference owner is invalid”“MR HMC reference metadata is invalid”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：validate 校验当前字段与 HMC reference 状态的一致性，并显式处理
+  //   “HMC reference owner is invalid”等拒绝条件，返回 rdma_status。
+  // 输入/输出及副作用：无显式参数；读取 owner、object_kind、size、
+  //   first_pbl_index、index_valid、release_complete 和 ownership，返回状态，
+  //   不取得调用方资源所有权。
+  // 失败/边界：owner/metadata 无效或 allocator index validity 缺失时返回
+  //   RDMA_SC_INVALID_ARGUMENT；借用引用已释放时返回 RDMA_SC_INVALID_STATE；
+  //   index_valid=1 时 index=0 合法。
   virtual function rdma_status validate();
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "HMC reference owner is invalid");
-    if (object_kind != RDMA_RESOURCE_MR || size == 0 ||
-        first_pbl_index == 0)
+    if (object_kind != RDMA_RESOURCE_MR || size == 0 || !index_valid)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MR HMC reference metadata is invalid");
     if (release_complete && ownership == RDMA_OWNERSHIP_BORROWED)
@@ -147,6 +159,7 @@ class rdma_hmc_ref extends uvm_object;
     address = rhs_ref.address;
     size = rhs_ref.size;
     first_pbl_index = rhs_ref.first_pbl_index;
+    index_valid = rhs_ref.index_valid;
     ownership = rhs_ref.ownership;
     release_complete = rhs_ref.release_complete;
   endfunction

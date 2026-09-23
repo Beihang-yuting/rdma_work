@@ -1,0 +1,8 @@
+Source HEAD: 349a75750ea5a09f0ba18f011267f797798bc318
+Remote: ubuntu@10.11.10.53, login bash
+Command: scripts/run_vcs53.sh core rdma_cqe_size_codec_test
+Test blobs: CMQ 26a136a27800cc7e6c240e000532e2b8acaf7e53; CQE 3b0cf3a29d29a6328233974b5b79f1ca91eeba42
+Shell exit code: 0
+UVM counts: warning=0 error=0 fatal=0
+Summary: UVM report is pristine; PROCESS PASS; LOGICAL PASS
+Raw log SHA256: 306e67435b194d206bd4bee0443e231e8c7307afc6875d0d74b8e714109a7a4d

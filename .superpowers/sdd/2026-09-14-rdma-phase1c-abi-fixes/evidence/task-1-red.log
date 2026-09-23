@@ -1,0 +1,7 @@
+Phase 1C Task 1 RED evidence
+Host: ubuntu@10.11.10.53 (login bash via scripts/run_vcs53.sh)
+Command: scripts/run_vcs53.sh core rdma_cqe_size_codec_test
+Result: PROCESS FAIL / LOGICAL FAIL
+UVM: warning=0 error=2 fatal=0
+Errors: CQE_PROFILE_RELATIVE_DECODE, CQE_PROFILE_RELATIVE_BYTE0
+Meaning: pre-fix codec did not decode a 128B header at byte64/qword8.

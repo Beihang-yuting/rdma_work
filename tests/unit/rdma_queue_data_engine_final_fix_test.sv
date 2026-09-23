@@ -32,6 +32,97 @@ class rdma_final_null_cqe_decode_codec extends rdma_hw_cqe_codec;
     model = null;
     return null;
   endfunction
+
+  // 功能：在带显式 CQE variant 的真实 poll 入口返回 null decode status，覆盖
+  //       production consumer 实际调用的 profile/variant dispatch seam。
+  // 输入/输出及副作用：image、entry_size、variant 为输入，model 固定输出 null；
+  //       不修改 image、CQ runtime、backing、route 或任何 scheduler 状态。
+  // 失败/边界：所有输入都故意不接受并返回 null；consumer 必须把 null 归一化为
+  //       RDMA_SC_CODEC_ERROR，并在 CQ CI、WQE release 和 completion publish 前退出。
+  virtual function rdma_status decode_with_entry_bytes_variant(
+    rdma_hw_image image,
+    int unsigned entry_size,
+    rdma_cqe_variant_e variant,
+    output rdma_hw_model model
+  );
+    model = null;
+    return null;
+  endfunction
+endclass
+
+// 设计说明：host producer 的 WQE 与 doorbell 可能已经成功到达外部后端，
+//   但 runtime ledger commit 仍可能因锁、状态或 factory 故障拒绝。该 test-only
+//   engine 只在 queue-data 的 commit seam 注入一次确定性结果，不修改 runtime
+//   私有账本，也不替代公开 recovery/abort 生命周期。
+class rdma_queue_data_engine_host_commit_fault extends rdma_queue_data_engine;
+  `uvm_object_utils(rdma_queue_data_engine_host_commit_fault)
+
+  bit fail_commit_once;
+  bit return_null_once;
+  rdma_status injected_status;
+  int unsigned commit_calls;
+
+  // 功能：构造默认不注入故障的 host-producer commit probe。
+  // 输入/输出及副作用：name 为 UVM 对象名；只初始化本地 fault flag/counter，
+  //   不配置 engine、runtime、backing 或外部资源。
+  // 失败/边界：构造阶段不 arm 故障；未 configure 的对象仍由生产入口拒绝，
+  //   probe 不提供绕过 attachment/authority 的测试后门。
+  function new(string name = "rdma_queue_data_engine_host_commit_fault");
+    super.new(name);
+    fail_commit_once = 1'b0;
+    return_null_once = 1'b0;
+    injected_status = null;
+    commit_calls = 0;
+  endfunction
+
+  // 功能：arm_commit_failure 配置下一次 host-producer ledger commit 返回给定
+  //   错误或 null status，并清除上一次注入状态。
+  // 输入/输出及副作用：failure、return_null 为输入；只写 probe 自有 flag/status
+  //   快照，不访问 runtime、pending、Host-memory 或 PCIe。
+  // 失败/边界：failure 为空且 return_null=0 时仍使用 INVALID_STATE 默认错误；
+  //   注入只消费一次，后续 commit 委托生产 seam，避免污染其它 fixture。
+  function void arm_commit_failure(
+    rdma_status failure = null,
+    bit return_null = 1'b0
+  );
+    fail_commit_once = !return_null;
+    return_null_once = return_null;
+    injected_status = failure == null ?
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                        "injected host producer ledger commit failure") :
+      failure;
+  endfunction
+
+  // 功能：commit_host_producer_ledger 观察并按 arm 状态拒绝一次 producer ledger
+  //   提交，覆盖 WQE/readback 与 doorbell 已完成后的最后一个 commit 阶段。
+  // 输入/输出及副作用：attachment、cursor、request、wr_id、signaled、image 为
+  //   caller 冻结输入；每次调用递增 commit_calls，故障时不调用 runtime，未注入时
+  //   委托生产 seam 并由 runtime 负责 PI/used/slot mutation。
+  // 失败/边界：return_null_once 返回 null 供 caller 归一化；fail_commit_once
+  //   返回 detached injected_status；所有其它调用保持基类 status/ownership 语义。
+  protected virtual function rdma_status commit_host_producer_ledger(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot cursor,
+    rdma_semantic_request request,
+    longint unsigned wr_id,
+    bit signaled,
+    rdma_hw_image image
+  );
+    commit_calls++;
+    if (return_null_once) begin
+      return_null_once = 1'b0;
+      return null;
+    end
+    if (fail_commit_once) begin
+      fail_commit_once = 1'b0;
+      return injected_status == null ?
+        rdma_status::make(RDMA_SC_INVALID_STATE,
+                          "injected host producer ledger commit failure") :
+        injected_status;
+    end
+    return super.commit_host_producer_ledger(
+      attachment, cursor, request, wr_id, signaled, image);
+  endfunction
 endclass
 
 // 设计说明：本公共基类只封装 final-review 场景的 fixture 建立、按 key 故障与
@@ -57,18 +148,25 @@ class rdma_queue_data_engine_final_fix_test_base
     string label,
     output rdma_queue_data_engine_fixture fixture,
     output rdma_queue_consumer_fault_registry fault_registry,
-    output rdma_status status
+    output rdma_status status,
+    input bit use_host_commit_fault = 1'b0
   );
     fixture = null;
     fault_registry = null;
     reset_device_publish_factory_state();
+    if (use_host_commit_fault)
+      rdma_queue_data_engine::type_id::set_type_override(
+        rdma_queue_data_engine_host_commit_fault::get_type(), 1'b1);
     fixture = rdma_queue_data_engine_fixture::type_id::create(label);
     if (fixture == null) begin
       status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "final-fix fixture allocation failed");
       return;
     end
-    fixture.setup(status);
+    // CQ poll 的真实 0.1.34 路径通过 CQC shadow 发布 CI；该 final-fix fixture
+    // 必须显式提供 context backing，避免把“缺少驱动必需 authority”的配置拒绝
+    // 误报为 codec lookup/decode 故障。
+    fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
     track_fixture(fixture);
     if (status == null || !status.ok()) return;
     if (!$cast(fault_registry, fixture.registry) || fault_registry == null)
@@ -226,6 +324,336 @@ class rdma_queue_data_engine_final_fix_test_base
       fixture.qp_attached = 1'b0;
   endtask
 
+  // 功能：run_host_producer_hostile_matrix 对真实 SQ post_send 依次注入 WQE
+  //   backing write、readback、DMA visibility barrier、MMIO ordering barrier 和
+  //   MMIO write 故障，验证每个不可逆阶段都保留同一 producer recovery evidence。
+  // 输入/输出及副作用：无显式输入；每个 case 建立独立 codec fixture，调用一次
+  //   post_send，读取 SQ cursor/occupancy、pending、Host-memory 与 PCIe 账本，随后
+  //   通过公开 ABORT_AND_DETACH 隔离故障；不取得 queue、mapping 或 adapter 所有权。
+  // 失败/边界：write/readback case 必须保持 NO_SUBMIT 且只发生预期 Host-memory
+  //   I/O，doorbell case 必须保持 AMBIGUOUS 并呈现精确 barrier/MMIO 调用前缀；任一
+  //   status 为空、result 非空、PI/CI/used 错进、pending 缺失或 abort 失败均报告。
+  protected task automatic run_host_producer_hostile_matrix();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_consumer_fault_registry fault_registry;
+    rdma_queue_post_result result;
+    rdma_queue_pending_operation pending;
+    rdma_status setup_status;
+    rdma_status inject_status;
+    rdma_status post_status;
+    rdma_status cursor_status;
+    rdma_status occupancy_status;
+    rdma_status pending_status;
+    rdma_status abort_status;
+    rdma_status injected_failure;
+    rdma_queue_mmio_evidence_e expected_evidence;
+    rdma_status_code_e expected_code;
+    string case_label;
+    int unsigned fault_kind;
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned after_pi;
+    int unsigned after_ci;
+    int unsigned before_used;
+    int unsigned after_used;
+    int unsigned before_writes;
+    int unsigned before_reads;
+    int unsigned before_dma_barriers;
+    int unsigned before_mmio_barriers;
+    int unsigned before_mmio_writes;
+    int unsigned expected_write_delta;
+    int unsigned expected_read_delta;
+    int unsigned expected_dma_delta;
+    int unsigned expected_mmio_barrier_delta;
+    int unsigned expected_mmio_write_delta;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit after_pi_wrap;
+    bit after_ci_wrap;
+    bit before_pending;
+    bit after_pending;
+    bit contract_ok;
+
+    for (fault_kind = 0; fault_kind < 6; fault_kind++) begin
+      fixture = null;
+      fault_registry = null;
+      result = null;
+      pending = null;
+      case (fault_kind)
+        0: case_label = "write";
+        1: case_label = "read";
+        2: case_label = "readback_mismatch";
+        3: case_label = "dma_barrier";
+        4: case_label = "mmio_barrier";
+        5: case_label = "mmio_write";
+        default: case_label = "unknown";
+      endcase
+
+      setup_codec_fixture(
+        {"host_producer_", case_label, "_fixture"}, fixture,
+        fault_registry, setup_status);
+      if (setup_status == null || !setup_status.ok()) begin
+        `uvm_error("HOST_PRODUCER_MATRIX_SETUP",
+                   $sformatf("case=%s setup failed: %s", case_label,
+                             setup_status == null ? "<null>" :
+                             setup_status.convert2string()))
+        continue;
+      end
+
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_pi, before_pi_wrap,
+        before_ci, before_ci_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_used, before_pending);
+      before_writes = count_host_mem_calls(fixture.mem, "write");
+      before_reads = count_host_mem_calls(fixture.mem, "read");
+      before_dma_barriers = count_pcie_calls(
+        fixture.pcie, "dma_visibility_barrier");
+      before_mmio_barriers = count_pcie_calls(
+        fixture.pcie, "mmio_ordering_barrier");
+      before_mmio_writes = count_pcie_calls(fixture.pcie, "mmio_write");
+      if (cursor_status == null || !cursor_status.ok() ||
+          occupancy_status == null || !occupancy_status.ok() || before_pending) begin
+        `uvm_error("HOST_PRODUCER_MATRIX_BASELINE",
+                   $sformatf("case=%s baseline SQ state is unavailable",
+                             case_label))
+        continue;
+      end
+
+      injected_failure = rdma_status::make(
+        (fault_kind < 3) ? RDMA_SC_DMA_TRANSLATION :
+                           RDMA_SC_PCIE_COMPLETION,
+        {"injected host producer ", case_label, " failure"});
+      inject_status = rdma_status::success();
+      expected_code = injected_failure.code;
+      expected_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+      expected_write_delta = 1;
+      expected_read_delta = 0;
+      expected_dma_delta = 0;
+      expected_mmio_barrier_delta = 0;
+      expected_mmio_write_delta = 0;
+      case (fault_kind)
+        0: inject_status = fixture.mem.fail_next("write", injected_failure);
+        1: begin
+          inject_status = fixture.mem.fail_next("read", injected_failure);
+          expected_read_delta = 1;
+        end
+        2: begin
+          fixture.mem.corrupt_next_readback = 1'b1;
+          expected_code = RDMA_SC_DMA_TRANSLATION;
+          expected_read_delta = 1;
+        end
+        3: begin
+          inject_status = fixture.pcie.fail_next(
+            "dma_visibility_barrier", injected_failure);
+          expected_evidence = RDMA_QUEUE_MMIO_AMBIGUOUS;
+          expected_read_delta = 1;
+          expected_dma_delta = 1;
+        end
+        4: begin
+          inject_status = fixture.pcie.fail_next(
+            "mmio_ordering_barrier", injected_failure);
+          expected_evidence = RDMA_QUEUE_MMIO_AMBIGUOUS;
+          expected_read_delta = 1;
+          expected_dma_delta = 1;
+          expected_mmio_barrier_delta = 1;
+        end
+        5: begin
+          inject_status = fixture.pcie.fail_next("mmio_write", injected_failure);
+          expected_evidence = RDMA_QUEUE_MMIO_AMBIGUOUS;
+          expected_read_delta = 1;
+          expected_dma_delta = 1;
+          expected_mmio_barrier_delta = 1;
+          expected_mmio_write_delta = 1;
+        end
+        default: begin end
+      endcase
+      if (inject_status == null || !inject_status.ok()) begin
+        `uvm_error("HOST_PRODUCER_MATRIX_INJECT",
+                   $sformatf("case=%s fault arm failed", case_label))
+        continue;
+      end
+
+      fixture.engine.post_send(
+        fixture.make_send(64'hf147_0000_0000 + fault_kind), result, post_status);
+      cursor_status = fixture.engine.query_runtime_cursors(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_pi, after_pi_wrap,
+        after_ci, after_ci_wrap);
+      occupancy_status = fixture.engine.query_runtime_occupancy(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_used, after_pending);
+      pending = null;
+      pending_status = fixture.engine.query_runtime_pending(
+        fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, pending);
+      contract_ok = post_status != null &&
+                    post_status.code == expected_code && result == null &&
+                    cursor_status != null && cursor_status.ok() &&
+                    occupancy_status != null && occupancy_status.ok() &&
+                    pending_status != null && pending_status.ok() &&
+                    pending != null && pending.producer &&
+                    !pending.device_producer && pending.cursor != null &&
+                    pending.image != null &&
+                    pending.mmio_evidence == expected_evidence &&
+                    pending.mmio_maybe_submitted ==
+                      (expected_evidence == RDMA_QUEUE_MMIO_AMBIGUOUS) &&
+                    after_pi == before_pi && after_pi_wrap == before_pi_wrap &&
+                    after_ci == before_ci && after_ci_wrap == before_ci_wrap &&
+                    after_used == before_used && after_pending &&
+                    count_host_mem_calls(fixture.mem, "write") ==
+                      before_writes + expected_write_delta &&
+                    count_host_mem_calls(fixture.mem, "read") ==
+                      before_reads + expected_read_delta &&
+                    count_pcie_calls(fixture.pcie, "dma_visibility_barrier") ==
+                      before_dma_barriers + expected_dma_delta &&
+                    count_pcie_calls(fixture.pcie, "mmio_ordering_barrier") ==
+                      before_mmio_barriers + expected_mmio_barrier_delta &&
+                    count_pcie_calls(fixture.pcie, "mmio_write") ==
+                      before_mmio_writes + expected_mmio_write_delta;
+      if (!contract_ok)
+        `uvm_error("HOST_PRODUCER_MATRIX_CONTRACT",
+                   $sformatf("case=%s status=%s pending=%s evidence=%0d",
+                             case_label,
+                             post_status == null ? "<null>" :
+                             post_status.convert2string(),
+                             pending == null ? "<null>" : "present",
+                             pending == null ? -1 : pending.mmio_evidence));
+
+      fixture.engine.recover_queue(
+        fixture.qp.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH,
+        1'b0, abort_status);
+      if (abort_status == null || !abort_status.ok())
+        `uvm_error("HOST_PRODUCER_MATRIX_ABORT",
+                   $sformatf("case=%s abort failed: %s", case_label,
+                             abort_status == null ? "<null>" :
+                             abort_status.convert2string()))
+      else
+        fixture.qp_attached = 1'b0;
+    end
+  endtask
+
+  // 功能：run_host_producer_commit_fault 注入 ledger commit 拒绝，验证 WQE
+  //   write/readback、DMA/MMIO ordering 与 doorbell 已完成后，SQ 仍不推进 PI/used，
+  //   并保留带 route/epoch/cursor/image 的 AMBIGUOUS recovery evidence。
+  // 输入/输出及副作用：无显式输入；建立 commit-fault engine fixture，调用一次
+  //   post_send，读取公开 cursor/occupancy/pending 与 mock I/O 账本，最后通过公开
+  //   ABORT_AND_DETACH 收敛；不直接修改 runtime 私有字段。
+  // 失败/边界：commit seam 必须恰好调用一次；status/result、cursor、ledger、
+  //   pending evidence 或 abort 任一不符契约均报告 UVM_ERROR，故障后不得静默重发。
+  protected task automatic run_host_producer_commit_fault();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_consumer_fault_registry fault_registry;
+    rdma_queue_data_engine_host_commit_fault fault_engine;
+    rdma_queue_post_result result;
+    rdma_queue_pending_operation pending;
+    rdma_status setup_status;
+    rdma_status post_status;
+    rdma_status cursor_status;
+    rdma_status occupancy_status;
+    rdma_status pending_status;
+    rdma_status abort_status;
+    int unsigned before_pi;
+    int unsigned before_ci;
+    int unsigned after_pi;
+    int unsigned after_ci;
+    int unsigned before_used;
+    int unsigned after_used;
+    int unsigned before_writes;
+    int unsigned before_reads;
+    int unsigned before_dma_barriers;
+    int unsigned before_mmio_barriers;
+    int unsigned before_mmio_writes;
+    bit before_pi_wrap;
+    bit before_ci_wrap;
+    bit after_pi_wrap;
+    bit after_ci_wrap;
+    bit before_pending;
+    bit after_pending;
+    bit contract_ok;
+
+    setup_codec_fixture(
+      "host_producer_commit_fault_fixture", fixture, fault_registry,
+      setup_status, 1'b1);
+    if (setup_status == null || !setup_status.ok() ||
+        !$cast(fault_engine, fixture == null ? null : fixture.engine) ||
+        fault_engine == null) begin
+      `uvm_error("HOST_PRODUCER_COMMIT_SETUP",
+                 "commit-fault engine fixture setup failed")
+      return;
+    end
+    cursor_status = fixture.engine.query_runtime_cursors(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_pi, before_pi_wrap,
+      before_ci, before_ci_wrap);
+    occupancy_status = fixture.engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, before_used, before_pending);
+    before_writes = count_host_mem_calls(fixture.mem, "write");
+    before_reads = count_host_mem_calls(fixture.mem, "read");
+    before_dma_barriers = count_pcie_calls(
+      fixture.pcie, "dma_visibility_barrier");
+    before_mmio_barriers = count_pcie_calls(
+      fixture.pcie, "mmio_ordering_barrier");
+    before_mmio_writes = count_pcie_calls(fixture.pcie, "mmio_write");
+    if (cursor_status == null || !cursor_status.ok() ||
+        occupancy_status == null || !occupancy_status.ok() || before_pending) begin
+      `uvm_error("HOST_PRODUCER_COMMIT_BASELINE",
+                 "commit-fault baseline SQ state is unavailable")
+      return;
+    end
+
+    fault_engine.arm_commit_failure(
+      rdma_status::make(RDMA_SC_INVALID_STATE,
+                        "injected host producer ledger commit failure"));
+    fixture.engine.post_send(
+      fixture.make_send(64'hf148_0000), result, post_status);
+    cursor_status = fixture.engine.query_runtime_cursors(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_pi, after_pi_wrap,
+      after_ci, after_ci_wrap);
+    occupancy_status = fixture.engine.query_runtime_occupancy(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, after_used, after_pending);
+    pending = null;
+    pending_status = fixture.engine.query_runtime_pending(
+      fixture.qp.handle, RDMA_QUEUE_RUNTIME_SQ, pending);
+    contract_ok = post_status != null &&
+                  post_status.code == RDMA_SC_INVALID_STATE &&
+                  result == null && fault_engine.commit_calls == 1 &&
+                  cursor_status != null && cursor_status.ok() &&
+                  occupancy_status != null && occupancy_status.ok() &&
+                  pending_status != null && pending_status.ok() &&
+                  pending != null && pending.producer &&
+                  !pending.device_producer && pending.cursor != null &&
+                  pending.next_cursor != null && pending.image != null &&
+                  pending.route_valid && pending.epoch_valid &&
+                  pending.mmio_evidence == RDMA_QUEUE_MMIO_AMBIGUOUS &&
+                  pending.mmio_maybe_submitted &&
+                  after_pi == before_pi && after_pi_wrap == before_pi_wrap &&
+                  after_ci == before_ci && after_ci_wrap == before_ci_wrap &&
+                  after_used == before_used && after_pending &&
+                  count_host_mem_calls(fixture.mem, "write") ==
+                    before_writes + 1 &&
+                  count_host_mem_calls(fixture.mem, "read") ==
+                    before_reads + 1 &&
+                  count_pcie_calls(fixture.pcie, "dma_visibility_barrier") ==
+                    before_dma_barriers + 1 &&
+                  count_pcie_calls(fixture.pcie, "mmio_ordering_barrier") ==
+                    before_mmio_barriers + 1 &&
+                  count_pcie_calls(fixture.pcie, "mmio_write") ==
+                    before_mmio_writes + 1;
+    if (!contract_ok)
+      `uvm_error("HOST_PRODUCER_COMMIT_CONTRACT",
+                 $sformatf("status=%s calls=%0d pending=%s evidence=%0d",
+                           post_status == null ? "<null>" :
+                           post_status.convert2string(), fault_engine.commit_calls,
+                           pending == null ? "<null>" : "present",
+                           pending == null ? -1 : pending.mmio_evidence));
+
+    fixture.engine.recover_queue(
+      fixture.qp.handle, RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH,
+      1'b0, abort_status);
+    if (abort_status == null || !abort_status.ok())
+      `uvm_error("HOST_PRODUCER_COMMIT_ABORT",
+                 "commit-fault recovery abort failed")
+    else
+      fixture.qp_attached = 1'b0;
+  endtask
+
   // 功能：publish_one_cqe 通过真实 post_send/publish_cqe 在 CQ backing 建立一条
   //   与 SQ ledger 匹配的可消费 entry，供后续 decode/factory 故障观察。
   // 输入/输出及副作用：fixture 为输入、status 为输出；成功写入 CQ backing、CQ used
@@ -293,14 +721,19 @@ class rdma_queue_data_engine_final_fix_test_base
     if (status == null || status.code != RDMA_SC_CODEC_ERROR ||
         completion != null ||
         count_pcie_calls(fixture.pcie, "mmio_write") != mmio_before)
-      `uvm_error("CQE_NULL_LOOKUP", "CQE null lookup crossed poll commit")
+      `uvm_error("CQE_NULL_LOOKUP", $sformatf(
+        "CQE null lookup crossed poll commit: status=%s hits=%0d",
+        status == null ? "<null>" : status.convert2string(),
+        fault_registry.null_lookup_status_hit_count()))
     status = fixture.engine.query_runtime_occupancy(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, has_pending);
     if (status == null || !status.ok() || used != 1 || has_pending)
       `uvm_error("CQE_NULL_LOOKUP_STATE", "CQE lookup changed CQ state")
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
     if (status == null || !status.ok() || completion == null)
-      `uvm_error("CQE_NULL_LOOKUP_RETRY", "retained CQE was not consumable")
+      `uvm_error("CQE_NULL_LOOKUP_RETRY", $sformatf(
+        "retained CQE was not consumable: status=%s",
+        status == null ? "<null>" : status.convert2string()))
 
     setup_codec_fixture("cqe_decode_final_fix_fixture", fixture,
                         fault_registry, status);
@@ -321,7 +754,9 @@ class rdma_queue_data_engine_final_fix_test_base
     if (status == null || status.code != RDMA_SC_CODEC_ERROR ||
         completion != null ||
         count_pcie_calls(fixture.pcie, "mmio_write") != mmio_before)
-      `uvm_error("CQE_NULL_DECODE", "CQE null decode crossed poll commit")
+      `uvm_error("CQE_NULL_DECODE", $sformatf(
+        "CQE null decode crossed poll commit: status=%s",
+        status == null ? "<null>" : status.convert2string()))
     status = fixture.engine.query_runtime_occupancy(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, used, has_pending);
     if (status == null || !status.ok() || used != 1 || has_pending)
@@ -330,7 +765,9 @@ class rdma_queue_data_engine_final_fix_test_base
       `uvm_error("CQE_NULL_DECODE_RESTORE", "cannot restore CQE codec")
     fixture.engine.poll_cqe(fixture.cq.handle, 0, completion, status);
     if (status == null || !status.ok() || completion == null)
-      `uvm_error("CQE_NULL_DECODE_RETRY", "retained CQE was not consumable")
+      `uvm_error("CQE_NULL_DECODE_RETRY", $sformatf(
+        "retained CQE was not consumable: status=%s",
+        status == null ? "<null>" : status.convert2string()))
   endtask
 
   // 功能：run_entry_image_factory_fault 对 queue_entry_image 的一次 raw factory null
@@ -671,6 +1108,63 @@ class rdma_queue_producer_doorbell_final_fix_test
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     run_producer_doorbell_fault();
+    finish_final_fix_test();
+    phase.drop_objection(this);
+  endtask
+endclass
+
+class rdma_queue_host_producer_failure_final_fix_test
+  extends rdma_queue_data_engine_final_fix_test_base;
+  `uvm_component_utils(rdma_queue_host_producer_failure_final_fix_test)
+
+  // 功能：构造 host-producer hostile failure concrete UVM test，沿用 final-fix
+  //   基类的 fixture factory、tracked lifecycle 和 cleanup 入口。
+  // 输入/输出及副作用：name/parent 为输入；只建立 UVM component 层级，不创建
+  //   queue、mapping、Host-memory 或 PCIe 资源。
+  // 失败/边界：构造阶段不 arm 任一 fault；所有 fixture 与故障窗口由 run_phase
+  //   成对建立/关闭，未执行测试时不得遗留外部状态。
+  function new(string name = "rdma_queue_host_producer_failure_final_fix_test",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  // 功能：运行 host producer WQE write/readback 与 doorbell barrier/MMIO 的完整
+  //   hostile failure matrix，并在每个 case 后通过显式 abort 收敛 recovery。
+  // 输入/输出及副作用：phase 为输入；task 管理 objection，驱动真实 post_send
+  //   和公开 recovery API，不直接修改 runtime 私有字段。
+  // 失败/边界：任一阶段的 status/evidence/cursor/调用顺序不满足契约由 matrix
+  //   任务报告 UVM_ERROR；cleanup 失败仍由基类报告且始终 drop objection。
+  task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    run_host_producer_hostile_matrix();
+    finish_final_fix_test();
+    phase.drop_objection(this);
+  endtask
+endclass
+
+class rdma_queue_host_producer_commit_failure_test
+  extends rdma_queue_data_engine_final_fix_test_base;
+  `uvm_component_utils(rdma_queue_host_producer_commit_failure_test)
+
+  // 功能：构造 host-producer ledger commit failure concrete test。
+  // 输入/输出及副作用：name/parent 为输入；只建立 UVM component 层级，不创建
+  //   queue、mapping、Host-memory 或 PCIe 资源。
+  // 失败/边界：构造阶段不 arm commit fault；所有 fixture、pending 与 factory
+  //   override 均由 run_phase 成对建立和清理。
+  function new(string name = "rdma_queue_host_producer_commit_failure_test",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  // 功能：运行一次 WQE/doorbell 成功后 ledger commit 拒绝的 recovery contract，
+  //   并用公开 abort 释放故障 fixture。
+  // 输入/输出及副作用：phase 为输入；task 管理 objection，驱动真实 post_send、
+  //   query_runtime_pending 和 recover_queue，不直接改写 runtime 私有状态。
+  // 失败/边界：任一 commit 调用次数、I/O 序列、cursor/used、pending evidence 或
+  //   abort 不满足契约均由 UVM_ERROR 报告，cleanup 仍必须执行。
+  task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    run_host_producer_commit_fault();
     finish_final_fix_test();
     phase.drop_objection(this);
   endtask

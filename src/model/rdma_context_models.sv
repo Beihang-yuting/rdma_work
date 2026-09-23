@@ -30,7 +30,6 @@ endclass
 // incarnation IDs remain opaque registry identities and are not used here.
 // 功能：rdma_context_handle_status 校验 handle、expected_kind、object_id_width、label 与当前对象状态的一致性，并显式处理“handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：handle（输入）、expected_kind（输入）、object_id_width（输入）、label（输入）；rdma_context_handle_status 读取 handle、expected_kind、object_id_width、label 并使用字段 object_id_limit；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_context_handle_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_context_handle_status(
   rdma_handle handle,
@@ -116,6 +115,20 @@ function automatic rdma_status rdma_context_state_status(
   return rdma_status::success();
 endfunction
 
+// 功能：rdma_mr_state_status 校验 MRT 专用 INVLD/FREE/VLD 三态，避免把驱动的 FREE 状态误当成通用 context state。
+// 输入/输出及副作用：state（输入）、label（输入）；函数只读取枚举和标签并返回状态，不修改 MRT、句柄或资源账本。
+// 失败/边界：state 为 2'b11 时返回 RDMA_SC_INVALID_ARGUMENT；合法的 INVALID、FREE、VALID 三态均返回成功，label 只用于诊断文本。
+function automatic rdma_status rdma_mr_state_status(
+  rdma_mr_state_e state,
+  string label
+);
+  if (!(state inside {RDMA_MR_STATE_INVALID, RDMA_MR_STATE_FREE,
+                      RDMA_MR_STATE_VALID}))
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             {label, " MR state is invalid"});
+  return rdma_status::success();
+endfunction
+
 // 功能：rdma_object_mode_status 校验 mode、label 与当前对象状态的一致性，并显式处理“object mode is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：mode（输入）、label（输入）；rdma_object_mode_status 读取 mode、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
 // 失败/边界：rdma_object_mode_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
@@ -129,6 +142,24 @@ function automatic rdma_status rdma_object_mode_status(
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                              {label, " object mode is invalid"});
   return rdma_status::success();
+endfunction
+
+// 功能：rdma_context_nested_status 将 context model 依赖的 virtual validator
+//       返回值规范化为可安全消费的 rdma_status。
+// 输入/输出及副作用：status（输入）和 label（输入）；非空 status 原样返回，
+//       null status 转换为 INVALID_STATE，不修改任何模型、句柄或资源账本。
+// 失败/边界：null 表示下游扩展违反状态返回契约；调用方收到确定失败后不得
+//       继续读取下游对象或发布 context image。
+function automatic rdma_status rdma_context_nested_status(
+  rdma_status status,
+  string label
+);
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      {label, " validation returned null status"}
+    );
+  return status;
 endfunction
 
 // 功能：rdma_clone_page_layout_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
@@ -473,13 +504,18 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、remote_qpn、queues 并使用字段 rdma_status、remote_qpn、queues；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“URC QPC remote QPN is zero”“URC QPC queue configuration is null”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
+    rdma_status status;
+
     if (remote_qpn == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC QPC remote QPN is zero");
     if (queues == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC QPC queue configuration is null");
-    return queues.validate();
+    status = rdma_context_nested_status(
+      queues.validate(), "URC QPC queue configuration"
+    );
+    return status;
   endfunction
 
   // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
@@ -628,8 +664,11 @@ class rdma_qpc_model extends rdma_hw_model;
     if (behavior == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC behavior is null");
-    status = behavior.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      behavior.validate(), "QPC behavior"
+    );
+    if (!status.ok())
+      return status;
     if (path_mtu_bytes == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC path MTU is zero");
@@ -684,8 +723,11 @@ class rdma_qpc_model extends rdma_hw_model;
     if (address_vector == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC address vector is null");
-    status = address_vector.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      address_vector.validate(), "QPC address vector"
+    );
+    if (!status.ok())
+      return status;
     if (transport_ext == null || transport_ext.transport_kind() != transport)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QPC transport extension does not match");
@@ -706,9 +748,17 @@ class rdma_qpc_model extends rdma_hw_model;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "QPC transport is unsupported");
     endcase
-    status = transport_ext.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      transport_ext.validate(), "QPC transport extension"
+    );
+    if (!status.ok())
+      return status;
     if (transport == RDMA_TRANSPORT_URC) begin
+      if (urc_ext.queues == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "URC QPC queue configuration disappeared after validation"
+        );
       if (urc_ext.queues.rq_sequence_threshold_entries > rq_depth)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
@@ -758,7 +808,7 @@ class rdma_cq_shadow_snapshot extends uvm_object;
 
   // 功能：构造空 CQ shadow 快照，建立确定的零游标和未绑定 authority 默认状态。
   // 输入/输出及副作用：name 为 UVM 对象名；仅初始化本地字段，不访问或接管外部资源。
-  // 失败边界：空快照不能作为 flush authority；调用方必须先填充 cq_h、Function UID/generation/reset epoch。
+  // 失败/边界：空快照不能作为 flush authority；调用方必须先填充 cq_h、Function UID/generation/reset epoch。
   function new(string name = "rdma_cq_shadow_snapshot");
     super.new(name);
     cq_h = null;
@@ -773,7 +823,7 @@ class rdma_cq_shadow_snapshot extends uvm_object;
 
   // 功能：复制 source 的 CQ shadow 值字段，生成与 source 隔离的 authority/游标快照。
   // 输入/输出及副作用：rhs 为输入源对象；当前对象字段被覆盖，cq_h 通过 clone 脱离源对象。
-  // 失败边界：rhs 为空或类型不符触发 UVM fatal；句柄 clone 失败时不保留部分可信快照。
+  // 失败/边界：rhs 为空或类型不符触发 UVM fatal；句柄 clone 失败时不保留部分可信快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cq_shadow_snapshot source;
     super.do_copy(rhs);
@@ -789,10 +839,15 @@ class rdma_cq_shadow_snapshot extends uvm_object;
     \sequence = source.\sequence ;
   endfunction
 
-  // 功能：校验 CQ shadow 的 CQ handle 与 Function authority，供 flush 前置检查使用。
-  // 输入/输出及副作用：无显式参数；只读取本地字段并返回 rdma_status，不修改快照或外部账本。
-  // 失败边界：cq_h 为空/类型错误、UID 或 generation 为零、CQ 与快照 authority 不一致时返回 INVALID_ARGUMENT 或 STALE_GENERATION；游标值由拥有 CQ runtime 的调用方按 ring 深度约束。
-  function rdma_status validate();
+  // 功能：基础实现校验 CQ shadow 的 CQ handle 与 Function authority，供 flush 前置检查
+  //   使用；virtual override 会替换本函数体，成功的 override 必须调用 super.validate()
+  //   或作等价校验，保留 CQ kind、Function UID 与 generation 的比较后才能报告成功。
+  // 输入/输出及副作用：无显式参数；本函数体只读取本地字段并返回 rdma_status，不修改
+  //   快照或外部账本；virtual dispatch 后的派生实现自行定义其额外读取和副作用。
+  // 失败/边界：基础实现对 cq_h 为空/类型错误、UID 或 generation 为零、CQ 与快照
+  //   authority 不一致返回 INVALID_ARGUMENT 或 STALE_GENERATION；override 返回 null 或
+  //   非 OK 可短路，capture_urc_shadow() 会 fail-closed 且不复制游标证据。
+  virtual function rdma_status validate();
     rdma_status status;
     status = rdma_context_handle_status(cq_h, RDMA_RESOURCE_CQ, 21,
                                          "CQ shadow CQ");
@@ -900,12 +955,21 @@ class rdma_cqc_model extends rdma_hw_model;
     if (page_layout == null || producer == null || consumer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQC nested layout or ring is null");
-    status = page_layout.validate();
-    if (!status.ok()) return status;
-    status = producer.validate();
-    if (!status.ok()) return status;
-    status = consumer.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      page_layout.validate(), "CQC page layout"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_context_nested_status(
+      producer.validate(), "CQC producer ring"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_context_nested_status(
+      consumer.validate(), "CQC consumer ring"
+    );
+    if (!status.ok())
+      return status;
     if (producer.index >= depth || consumer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQC ring position is outside the depth");
@@ -929,7 +993,7 @@ class rdma_mrt_model extends rdma_hw_model;
 
   rdma_handle mr_h;
   rdma_handle pd_h;
-  rdma_context_state_e state;
+  rdma_mr_state_e state;
   rdma_iova_t iova;
   longint unsigned length;
   bit [31:0] lkey;
@@ -938,14 +1002,16 @@ class rdma_mrt_model extends rdma_hw_model;
   bit [1:0] object_type;
   rdma_mr_page_layout page_layout;
 
-  // 功能：构造 rdma_mrt_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mr_h=null；pd_h=null；state=RDMA_CONTEXT_INVALID；iova='0；length='0；lkey='0；rkey='0；access='0；其余字段按实现默认值初始化。
+  // 功能：构造 rdma_mrt_model，调用 super.new 建立 UVM 对象，并把默认值设为
+  //   mr_h=null、pd_h=null、state=RDMA_MR_STATE_INVALID、iova='0、length='0、
+  //   lkey='0、rkey='0、access='0；其余字段按实现默认值初始化。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_mrt_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_mrt_model");
     super.new(name);
     mr_h = null;
     pd_h = null;
-    state = RDMA_CONTEXT_INVALID;
+    state = RDMA_MR_STATE_INVALID;
     iova = '0;
     length = '0;
     lkey = '0;
@@ -977,7 +1043,8 @@ class rdma_mrt_model extends rdma_hw_model;
                                                   "MRT");
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“MRT MR”等拒绝条件，返回 rdma_status 供上层决定是否提交。
+  // 功能：validate 校验 MRT 的句柄、专用 state（INVLD/FREE/VLD）、长度、key
+  //   和 page layout 一致性，供 KEY_ALLOC/MR_REGISTER 提交前使用。
   // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、length、mr_h.object_id、lkey、rkey、page_layout 并使用字段 status、has_remote_right；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“MRT length is zero”“MRT length exceeds 46 bits”；失败路径不提交部分状态或转移未声明资源。
   virtual function rdma_status validate();
@@ -992,7 +1059,7 @@ class rdma_mrt_model extends rdma_hw_model;
     if (!status.ok()) return status;
     status = rdma_context_lifecycle_status(mr_h, pd_h, "MRT PD");
     if (!status.ok()) return status;
-    status = rdma_context_state_status(state, "MRT");
+    status = rdma_mr_state_status(state, "MRT");
     if (!status.ok()) return status;
     if (length == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1012,7 +1079,10 @@ class rdma_mrt_model extends rdma_hw_model;
     if (page_layout == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MRT page layout is null");
-    status = page_layout.validate();
+    // MRT wire images carry FIRST_PBL_IDX but not the allocator lease bit.
+    // Keep decode/encode at wire-shape scope; control-plane backing validation
+    // remains responsible for proving the external HMC/PBLE authority.
+    status = page_layout.validate_wire_shape();
     if (!status.ok()) return status;
     return rdma_status::success();
   endfunction
@@ -1109,8 +1179,11 @@ class rdma_srqc_model extends rdma_hw_model;
     if (producer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQC producer position is null");
-    status = producer.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      producer.validate(), "SRQC producer ring"
+    );
+    if (!status.ok())
+      return status;
     if (producer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQC producer position exceeds depth");
@@ -1189,12 +1262,21 @@ class rdma_ceqc_model extends rdma_hw_model;
     if (page_layout == null || producer == null || consumer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CEQC nested layout or ring is null");
-    status = page_layout.validate();
-    if (!status.ok()) return status;
-    status = producer.validate();
-    if (!status.ok()) return status;
-    status = consumer.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      page_layout.validate(), "CEQC page layout"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_context_nested_status(
+      producer.validate(), "CEQC producer ring"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_context_nested_status(
+      consumer.validate(), "CEQC consumer ring"
+    );
+    if (!status.ok())
+      return status;
     if (producer.index >= depth || consumer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CEQC ring position is outside the depth");
@@ -1272,12 +1354,21 @@ class rdma_aeqc_model extends rdma_hw_model;
     if (page_layout == null || producer == null || consumer == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "AEQC nested layout or ring is null");
-    status = page_layout.validate();
-    if (!status.ok()) return status;
-    status = producer.validate();
-    if (!status.ok()) return status;
-    status = consumer.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      page_layout.validate(), "AEQC page layout"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_context_nested_status(
+      producer.validate(), "AEQC producer ring"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_context_nested_status(
+      consumer.validate(), "AEQC consumer ring"
+    );
+    if (!status.ok())
+      return status;
     if (producer.index >= depth || consumer.index >= depth)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "AEQC ring position is outside the depth");
@@ -1350,7 +1441,7 @@ endclass
 
 // 功能：rdma_umem 管理一段用户虚拟地址范围的页 pin、引用计数和 exactly-once unpin。
 // 输入/输出及副作用：调用方设置 Function、VA、length、page_size 和权限；pin/unpin 只更新本地页账本。
-// 失败/边界：零长度、非页对齐、非法页大小或 stale Function 被拒绝；重复 pin/unpin 幂等且不重复计数。
+// 失败/边界：零长度、地址溢出、非法页大小或 stale Function 被拒绝；非页对齐范围按对齐 DMA span 建立页描述，重复 pin/unpin 幂等且不重复计数。
 class rdma_umem extends uvm_object;
   `uvm_object_utils(rdma_umem)
 
@@ -1358,6 +1449,7 @@ class rdma_umem extends uvm_object;
   longint unsigned user_va;
   longint unsigned length;
   int unsigned page_size;
+  longint unsigned first_page_offset;
   rdma_dma_permission_t permissions;
   int unsigned generation;
   rdma_resource_ownership_e ownership;
@@ -1377,6 +1469,7 @@ class rdma_umem extends uvm_object;
     user_va = 0;
     length = 0;
     page_size = 4096;
+    first_page_offset = 0;
     permissions = '0;
     generation = 0;
     ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
@@ -1388,10 +1481,14 @@ class rdma_umem extends uvm_object;
     detached = 1'b0;
   endfunction
 
-  // 功能：校验 UMEM 的 Function authority、地址范围、页粒度和权限。
-  // 输入/输出及副作用：只读本地字段并返回状态，不 pin/unpin 或修改引用计数。
-  // 失败/边界：Function 为空/类型错误、长度未覆盖整数页、VA 未对齐或权限为空返回错误。
+  // 功能：校验 UMEM 的 Function authority、原始 VA 范围、页粒度和权限，并确认
+  //   对齐后的 DMA span 不溢出。
+  // 输入/输出及副作用：只读 function_h、user_va、length、page_size、permissions
+  //   和 generation；返回状态，不 pin/unpin 或修改引用计数。
+  // 失败/边界：Function 为空/类型错误、零长度、页大小非法、VA+length 溢出、DMA 权限为空或代际过期返回明确错误；原始 VA/length 不要求页对齐。
   function rdma_status validate();
+    bit [65:0] aligned_span;
+
     if (function_h == null || function_h.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UMEM Function authority is invalid");
@@ -1399,9 +1496,14 @@ class rdma_umem extends uvm_object;
         (page_size & (page_size - 1'b1)) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UMEM length or page size is invalid");
-    if ((user_va % page_size) != 0 || (length % page_size) != 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "UMEM address range is not page aligned");
+    if (length - 1 > 64'hffff_ffff_ffff_ffff - user_va)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM address range overflows");
+    aligned_span = {2'b0, (user_va % page_size)} +
+                   {2'b0, length} + page_size - 1;
+    if (aligned_span[65:64] != 0)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM aligned DMA span overflows");
     if (!(permissions.device_read || permissions.device_write))
       return rdma_status::make(RDMA_SC_DMA_PERMISSION,
                                "UMEM has no device DMA permission");
@@ -1411,22 +1513,34 @@ class rdma_umem extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：pin_pages 创建每个 page_size 粒度的页描述符并建立一次 pin 引用。
-  // 输入/输出及副作用：成功时填充 pages、pinned、refcount 和 pin_count；不拥有外部 host-mem 页。
-  // 失败/边界：已 pin 调用直接成功；校验或页对象创建失败时清空部分页并保持未 pin。
+  // 功能：pin_pages 按 Linux ib_umem 的对齐区间创建每个 page_size 粒度的页
+  //   描述符，并建立一次 pin 引用。
+  // 输入/输出及副作用：成功时填充 first_page_offset、pages、pinned、refcount
+  //   和 pin_count；页描述符保存对齐后的 host_va/iova，不拥有外部 host-mem 页。
+  // 失败/边界：已 pin 调用直接成功；校验、页数溢出或页对象创建失败时清空部分页并保持未 pin，原始非对齐 VA/length 本身不被拒绝。
   function rdma_status pin_pages();
     rdma_status status;
     longint unsigned page_count;
+    longint unsigned page_offset;
+    longint unsigned mapped_base;
+    bit [65:0] aligned_span;
     rdma_umem_page page;
 
     if (pinned)
       return rdma_status::success("UMEM pages were already pinned");
     status = validate();
     if (!status.ok()) return status;
-    page_count = length / page_size;
+    page_offset = user_va % page_size;
+    aligned_span = {2'b0, page_offset} + {2'b0, length} + page_size - 1;
+    if (aligned_span[65:64] != 0)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM aligned DMA span overflows");
+    page_count = aligned_span / page_size;
     if (page_count == 0 || page_count > 64'hffff_ffff)
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "UMEM page count is out of range");
+    mapped_base = user_va - page_offset;
+    first_page_offset = page_offset;
     pages.delete();
     for (int unsigned index = 0; index < page_count; index++) begin
       page = rdma_umem_page::type_id::create(
@@ -1436,7 +1550,7 @@ class rdma_umem extends uvm_object;
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "UMEM page descriptor allocation failed");
       end
-      page.host_va = user_va + index * page_size;
+      page.host_va = mapped_base + index * page_size;
       page.iova.value = page.host_va;
       page.backing_addr.value = page.host_va;
       page.length = page_size;
@@ -1504,31 +1618,106 @@ class rdma_umem extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：检查给定 IOVA/长度是否完全落在一个已 pin 的 UMEM 页序列中。
-  // 输入/输出及副作用：first_iova、access_length 为输入；只读页账本并返回状态。
-  // 失败/边界：范围溢出、越界、跨越无效页或代际不符均返回 DMA_TRANSLATION/STALE_GENERATION。
+  // 功能：检查给定 DMA IOVA/长度是否完全落在本 UMEM 的原始用户范围及其已 pin 页序列中。
+  // 输入/输出及副作用：first_iova、access_length 为输入；只读 first_page_offset、pages 和生命周期字段，不修改 pin/refcount。
+  // 失败/边界：范围溢出、首尾页 padding、页描述符无效、页间 gap/重叠、跨越
+  //   未 pin 页或代际不符均返回 DMA_TRANSLATION/STALE_GENERATION；该接口只接受
+  //   连续 DMA span，PBL2 的非连续逻辑访问必须由带页表翻译的上层路径处理。
   function rdma_status check_range(rdma_iova_t first_iova,
                                    longint unsigned access_length);
+    longint unsigned logical_start;
+    longint unsigned logical_end;
     longint unsigned end_iova;
-    longint unsigned mapping_end;
+    longint unsigned page_start;
+    longint unsigned page_end;
+    longint unsigned next_page_start;
+    longint unsigned cursor;
+    longint unsigned remaining;
+    longint unsigned covered;
+    longint unsigned page_offset;
+    bit found_start;
+
     if (!pinned || pages.size() == 0)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "UMEM has no pinned pages");
+    if (page_size == 0 || (page_size & (page_size - 1'b1)) != 0 ||
+        first_page_offset >= page_size)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "UMEM page geometry is invalid");
     if (access_length == 0 ||
         first_iova.value > 64'hffff_ffff_ffff_ffff - (access_length - 1))
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                "UMEM range is empty or overflows");
-    end_iova = first_iova.value + access_length - 1;
-    mapping_end = pages[$].iova.value + pages[$].length - 1;
-    if (first_iova.value < pages[0].iova.value || end_iova > mapping_end)
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "UMEM range is outside pinned pages");
+
     foreach (pages[index]) begin
-      if (pages[index].generation != generation || !pages[index].pinned)
+      if (pages[index] == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "UMEM page descriptor is null");
+      if (pages[index].generation != generation)
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "UMEM page generation is stale");
+      if (!pages[index].pinned || pages[index].refcount == 0)
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "UMEM page is stale or unpinned");
+      if (pages[index].length == 0 || pages[index].length > page_size ||
+          (pages[index].iova.value % page_size) != 0 ||
+          (pages[index].host_va % page_size) != 0)
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "UMEM page geometry is invalid");
+      if (pages[index].iova.value >
+          64'hffff_ffff_ffff_ffff - (pages[index].length - 1))
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "UMEM page range overflows");
     end
-    return rdma_status::success();
+
+    page_offset = first_page_offset;
+    if (pages[0].iova.value > 64'hffff_ffff_ffff_ffff - page_offset)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM first page offset overflows");
+    logical_start = pages[0].iova.value + page_offset;
+    if (logical_start >
+        64'hffff_ffff_ffff_ffff - (length - 1))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM logical range overflows");
+    logical_end = logical_start + length - 1;
+    end_iova = first_iova.value + access_length - 1;
+    if (first_iova.value < logical_start || end_iova > logical_end)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "UMEM range is outside original user span");
+
+    cursor = first_iova.value;
+    remaining = access_length;
+    found_start = 1'b0;
+    for (int unsigned index = 0; index < pages.size(); index++) begin
+      page_start = pages[index].iova.value;
+      page_end = page_start + pages[index].length - 1;
+
+      if (!found_start) begin
+        if (cursor < page_start || cursor > page_end)
+          continue;
+        found_start = 1'b1;
+      end
+
+      if (cursor < page_start || cursor > page_end)
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "UMEM range starts in a page gap");
+      covered = page_end - cursor + 1;
+      if (covered >= remaining)
+        return rdma_status::success();
+      remaining -= covered;
+      if (index + 1 >= pages.size())
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "UMEM range exceeds pinned pages");
+
+      next_page_start = pages[index + 1].iova.value;
+      if (page_end == 64'hffff_ffff_ffff_ffff ||
+          next_page_start != page_end + 1)
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "UMEM pinned pages are not contiguous");
+      cursor = page_end + 1;
+    end
+    return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                             "UMEM range does not resolve to pinned pages");
   endfunction
 endclass
 
@@ -1551,6 +1740,7 @@ class rdma_pbl extends uvm_object;
   rdma_iova_t directory_iovas[$];
   rdma_iova_t page_iovas[$];
   rdma_umem_page page_entries[$];
+  rdma_hmc_ref hmc_ref;
   rdma_resource_ownership_e ownership;
   int unsigned generation;
   bit active;
@@ -1575,6 +1765,7 @@ class rdma_pbl extends uvm_object;
     directory_iovas.delete();
     page_iovas.delete();
     page_entries.delete();
+    hmc_ref = null;
     ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     generation = 0;
     active = 1'b0;
@@ -1582,10 +1773,18 @@ class rdma_pbl extends uvm_object;
     release_count = 0;
   endfunction
 
-  // 功能：校验 PBL 的 Function、目录、叶子页和 UMEM 生命周期证据。
-  // 输入/输出及副作用：只读本地字段并返回状态，不修改 active/released。
-  // 失败/边界：目录为空、层级不足、页数不符、页跨界或代际不匹配返回错误。
+  // 功能：校验 PBL 的 Function、目录、叶子页、PBL mode 和 UMEM/HMC 生命周期证据。
+  // 输入/输出及副作用：只读本地字段、page_layout、page_entries、hmc_ref 和 UMEM 引用并返回状态，不修改 active/released。
+  // 失败/边界：PBL0/PBL1 的直接 payload 若带目录或 HMC 会拒绝；PBL2 缺失有效 HMC lease、页数/目录不符、页跨界或代际不匹配返回错误。
   function rdma_status validate();
+    rdma_status status;
+    bit [64:0] directory_bytes;
+    longint unsigned directory_count;
+    bit dma_contiguous;
+    longint unsigned previous_start;
+    longint unsigned previous_end;
+    longint unsigned current_end;
+
     if (!active || released)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "PBL is not active");
@@ -1597,13 +1796,92 @@ class rdma_pbl extends uvm_object;
         page_count != page_entries.size() || page_iovas.size() != page_count)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "PBL page directory is incomplete");
-    if (level_count < 2 || directory_iovas.size() == 0)
+    if (page_size == 0 || (page_size & (page_size - 1'b1)) != 0 ||
+        page_size != umem_ref.page_size || total_length == 0 ||
+        total_length != umem_ref.length || page_layout == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "PBL is not multilevel");
+                               "PBL geometry snapshot is inconsistent");
     if (generation != function_h.generation ||
         generation != umem_ref.generation)
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "PBL generation is stale");
+    if (page_entries[0] == null ||
+        first_iova.value != page_entries[0].iova.value)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "PBL first IOVA does not match its first page");
+    status = rdma_context_nested_status(
+      page_layout.validate(), "PBL page layout"
+    );
+    if (!status.ok())
+      return status;
+    case (mode)
+      RDMA_MR_PBL0: begin
+        if (page_count == 0 || level_count != 1 ||
+            directory_iovas.size() != 0 || hmc_ref != null ||
+            directory_iova.value != 0 || page_layout.pbl_mode != RDMA_MR_PBL0)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL0 direct payload is inconsistent");
+        if (page_layout.pba0.value != first_iova.value)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL0 PBA does not match its first page");
+      end
+      RDMA_MR_PBL1:
+      begin
+        if (page_count != 2 || level_count != 1 ||
+            directory_iovas.size() != 0 || hmc_ref != null ||
+            directory_iova.value != 0 || page_layout.pbl_mode != RDMA_MR_PBL1)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL1 direct payload is inconsistent");
+        if (page_layout.pba0.value != page_entries[0].iova.value ||
+            page_layout.pba1.value != page_entries[1].iova.value ||
+            page_entries[1].iova.value ==
+              page_entries[0].iova.value + page_size)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL1 PBAs do not match a two-block gap");
+      end
+      RDMA_MR_PBL2: begin
+        if (page_count <= 2 || level_count != 3 || directory_iovas.size() == 0 ||
+            hmc_ref == null || page_layout.pbl_mode != RDMA_MR_PBL2)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL2 HMC payload is incomplete");
+        status = rdma_context_nested_status(
+          hmc_ref.validate(), "PBL HMC reference"
+        );
+        if (!status.ok())
+          return status;
+        if ((hmc_ref.address.value & 64'hfff) != 0 ||
+            directory_iova.value != hmc_ref.address.value ||
+            directory_iovas[0].value != directory_iova.value)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL2 directory address is inconsistent");
+        directory_bytes = {1'b0, page_count} * 64'd8;
+        directory_count = (directory_bytes + 4095) / 4096;
+        if (directory_count == 0 || directory_iovas.size() != directory_count ||
+            hmc_ref.size < directory_count * 4096)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL2 HMC directory capacity is insufficient");
+        for (int unsigned directory = 0;
+             directory < directory_iovas.size(); directory++) begin
+          if ((directory_iovas[directory].value & 64'hfff) != 0 ||
+              hmc_ref.address.value >
+                64'hffff_ffff_ffff_ffff - directory * 4096 ||
+              directory_iovas[directory].value !=
+                hmc_ref.address.value + directory * 4096)
+            return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                     "PBL2 directory pages are not contiguous");
+        end
+        if (hmc_ref.owner.function_uid != function_h.function_uid ||
+            hmc_ref.owner.object_id != function_h.object_id ||
+            hmc_ref.owner.generation != generation ||
+            page_layout.first_pbl_index != hmc_ref.first_pbl_index ||
+            !page_layout.first_pbl_index_valid || !hmc_ref.index_valid)
+          return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                   "PBL2 HMC lease authority is stale");
+      end
+      default:
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "PBL mode is invalid");
+    endcase
     foreach (page_entries[index]) begin
       if (page_entries[index] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1617,7 +1895,50 @@ class rdma_pbl extends uvm_object;
           !page_entries[index].pinned)
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "PBL page authority is stale");
+      if (page_iovas[index].value != page_entries[index].iova.value)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "PBL page IOVA snapshot is stale");
+      if (page_entries[index].iova.value >
+          64'hffff_ffff_ffff_ffff - (page_entries[index].length - 1))
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "PBL page range overflows");
+      if (index != 0) begin
+        previous_start = page_entries[index - 1].iova.value;
+        previous_end = previous_start +
+                       page_entries[index - 1].length - 1;
+        current_end = page_entries[index].iova.value +
+                      page_entries[index].length - 1;
+        if (page_entries[index].iova.value <= previous_end &&
+            previous_start <= current_end)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL page entries overlap");
+      end
     end
+
+    dma_contiguous = 1'b1;
+    for (int unsigned index = 1; index < page_entries.size(); index++) begin
+      if (page_entries[index - 1].iova.value >
+          64'hffff_ffff_ffff_ffff - page_size ||
+          page_entries[index].iova.value !=
+            page_entries[index - 1].iova.value + page_size) begin
+        dma_contiguous = 1'b0;
+        break;
+      end
+    end
+    case (mode)
+      RDMA_MR_PBL0:
+        if (!dma_contiguous)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL0 pages are not physically contiguous");
+      RDMA_MR_PBL1,
+      RDMA_MR_PBL2:
+        if (dma_contiguous)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "PBL mode requires a non-contiguous DMA span");
+      default:
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "PBL mode is invalid");
+    endcase
     return rdma_status::success();
   endfunction
 
@@ -1634,27 +1955,50 @@ class rdma_pbl extends uvm_object;
   endfunction
 endclass
 
-// 功能：rdma_pbl_builder::build_multilevel 将 UMEM 页序列组织为受检查的二级/三级目录。
-// 输入/输出及副作用：umem 为输入、pbl 为输出；成功时创建目录 IOVA 快照，不改变 UMEM pin/refcount。
-// 失败/边界：未 pin、页地址不齐、页跨界、目录溢出或 Function stale 时在提交前返回错误。
+// 功能：rdma_pbl_builder::build_multilevel 将 UMEM DMA block 序列按真实连续性组织为 PBL0/PBL1/PBL2。
+// 输入/输出及副作用：umem 和可选 hmc_ref 为输入，pbl 为输出；成功时创建页和目录快照，不改变 UMEM pin/refcount 或 HMC 所有权。
+// 失败/边界：未 pin、页地址不齐、目录缺少驱动 allocator lease、页跨界或 Function stale 时在提交前返回错误，不伪造 PBL2 地址。
 class rdma_pbl_builder;
+  // 功能：判断 UMEM 的 DMA block 是否按 page_size 逐页连续，供 PBL mode 选择使用。
+  // 输入/输出及副作用：umem 为只读输入；函数比较相邻 page_entries 的 IOVA，不修改页或资源账本。
+  // 失败/边界：空 UMEM、页数为零或缺失页描述符返回 false；任一相邻 IOVA 不等于前一页加 page_size 即判定为非连续。
+  static function bit dma_blocks_are_contiguous(rdma_umem umem);
+    if (umem == null || umem.pages.size() == 0)
+      return 1'b0;
+    for (int unsigned index = 1; index < umem.pages.size(); index++) begin
+      if (umem.pages[index] == null || umem.pages[index - 1] == null ||
+          umem.pages[index - 1].iova.value >
+            64'hffff_ffff_ffff_ffff - umem.page_size ||
+          umem.pages[index].iova.value !=
+            umem.pages[index - 1].iova.value + umem.page_size)
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
   // 功能：根据页数构建每级最多 512 项的 PBL 目录并验证所有叶子页。
-  // 输入/输出及副作用：umem 只读；pbl 输出新对象，失败时保持 null，不释放调用方资源。
-  // 失败/边界：页数大于 512 使用三级目录；目录 IOVA 从 UMEM 首地址之后的 4 KiB 对齐空间合成。
+  // 输入/输出及副作用：umem、hmc_ref 为只读输入；pbl 输出新对象，失败时保持 null，不释放调用方 UMEM/HMC 资源。
+  // 失败/边界：连续 block 使用 PBL0，恰好两个非连续 block 使用 PBL1，其余非
+  //   连续 block 必须提供有效 HMC/PBLE lease 才使用 PBL2；不会从 UMEM 尾部伪造
+  //   目录 IOVA。
   static function rdma_status build_multilevel(rdma_umem umem,
-                                                output rdma_pbl pbl);
+                                                output rdma_pbl pbl,
+                                                input rdma_hmc_ref hmc_ref = null);
     rdma_status status;
     rdma_pbl candidate;
-    longint unsigned directory_count;
-    longint unsigned directory_base;
     longint unsigned page_count;
+    longint unsigned directory_count;
+    bit contiguous;
 
     pbl = null;
     if (umem == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "PBL build UMEM is null");
-    status = umem.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      umem.validate(), "PBL build UMEM"
+    );
+    if (!status.ok())
+      return status;
     if (!umem.pinned || umem.pages.size() == 0)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "PBL build requires pinned UMEM");
@@ -1670,16 +2014,58 @@ class rdma_pbl_builder;
     candidate.total_length = umem.length;
     candidate.first_iova.value = umem.pages[0].iova.value;
     candidate.page_count = page_count;
-    candidate.level_count = (page_count <= 512) ? 2 : 3;
-    candidate.mode = (page_count <= 512) ? RDMA_MR_PBL1 : RDMA_MR_PBL2;
-    directory_count = (page_count + 511) / 512;
-    directory_base = (umem.pages[$].iova.value + umem.page_size + 4095) &
-                     ~64'hfff;
-    for (int unsigned index = 0; index < directory_count; index++) begin
-      candidate.directory_iovas.push_back('{value:
-        directory_base + index * 4096});
+    contiguous = dma_blocks_are_contiguous(umem);
+    if (contiguous) begin
+      candidate.mode = RDMA_MR_PBL0;
+      candidate.level_count = 1;
+      candidate.page_layout.pbl_mode = RDMA_MR_PBL0;
+      candidate.page_layout.pba0 = umem.pages[0].iova;
     end
-    candidate.directory_iova = candidate.directory_iovas[0];
+    else if (page_count == 2) begin
+      candidate.mode = RDMA_MR_PBL1;
+      candidate.level_count = 1;
+      candidate.page_layout.pbl_mode = RDMA_MR_PBL1;
+      candidate.page_layout.pba0 = umem.pages[0].iova;
+      candidate.page_layout.pba1 = umem.pages[1].iova;
+    end
+    else begin
+      if (hmc_ref == null)
+        return rdma_status::make(
+          RDMA_SC_INVALID_STATE,
+          "PBL2 build requires an allocator-provided HMC lease"
+        );
+      status = rdma_context_nested_status(
+        hmc_ref.validate(), "PBL build HMC reference"
+      );
+      if (!status.ok())
+        return status;
+      if (hmc_ref.owner.function_uid != umem.function_h.function_uid ||
+          hmc_ref.owner.generation != umem.generation)
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "PBL2 HMC lease does not own UMEM");
+      candidate.mode = RDMA_MR_PBL2;
+      candidate.level_count = 3;
+      candidate.hmc_ref = hmc_ref;
+      candidate.directory_iova.value = hmc_ref.address.value;
+      directory_count = ((page_count * 8) + 4095) / 4096;
+      if (directory_count == 0 ||
+          hmc_ref.size < directory_count * 4096 ||
+          (hmc_ref.address.value & 64'hfff) != 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "PBL2 HMC lease cannot cover directory");
+      for (int unsigned directory = 0;
+           directory < directory_count; directory++) begin
+        if (hmc_ref.address.value >
+            64'hffff_ffff_ffff_ffff - directory * 4096)
+          return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                   "PBL2 directory address overflows");
+        candidate.directory_iovas.push_back('{value:
+          hmc_ref.address.value + directory * 4096});
+      end
+      candidate.page_layout.pbl_mode = RDMA_MR_PBL2;
+      candidate.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+      candidate.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
+    end
     foreach (umem.pages[index]) begin
       status = umem.pages[index].validate_page(umem.page_size,
                                                 umem.generation);
@@ -1689,8 +2075,11 @@ class rdma_pbl_builder;
     end
     candidate.active = 1'b1;
     candidate.released = 1'b0;
-    status = candidate.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      candidate.validate(), "PBL build candidate"
+    );
+    if (!status.ok())
+      return status;
     pbl = candidate;
     return rdma_status::success();
   endfunction
@@ -1753,10 +2142,16 @@ class rdma_mw_binding extends uvm_object;
     if (umem == null || pbl == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MW bind backing is null");
-    status = umem.validate();
-    if (!status.ok()) return status;
-    status = pbl.validate();
-    if (!status.ok()) return status;
+    status = rdma_context_nested_status(
+      umem.validate(), "MW bind UMEM"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_context_nested_status(
+      pbl.validate(), "MW bind PBL"
+    );
+    if (!status.ok())
+      return status;
     if (pbl.umem_ref != umem)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "MW PBL does not reference UMEM");

@@ -95,12 +95,14 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
       this, "rx_composition_env", "cfg", rx_composition_cfg);
   endfunction
 
-  // 功能：把双 fixture 的真实 host-mem/net adapter 和 Function 快照接入
-  //   rdma_env 组合对象，并重新冻结一次配置，使组合层成为本轮数据面 authority。
-  // 输入/输出及副作用：无显式输入；更新两个 cfg/env 的快照和借用 adapter 句柄，
-  //   成功时不修改 fixture、host-memory mapping 或网络统计。
-  // 失败/边界：fixture identity/binding 缺失、配置校验失败或组合对象为空时返回
-  //   明确错误；任一路径均不得发布半成品组合状态。
+  // 功能：把双 fixture 的真实 host-mem/net adapter、CQC context shadow 和
+  //   Function 快照接入 rdma_env 组合对象，并重新冻结一次配置，使组合层成为
+  //   本轮数据面 authority。
+  // 输入/输出及副作用：无显式输入；更新两个 cfg/env 的快照、借用 adapter 句柄
+  //   与 context backing 引用，成功时不修改 fixture、host-memory mapping 或网络统计。
+  // 失败/边界：fixture identity/binding/context backing 缺失、配置校验失败或
+  //   组合对象为空时返回明确错误；任一路径均不得发布半成品组合状态，且 CQ poll
+  //   不得在缺少 CQC shadow backing 时退回 legacy consumer doorbell。
   task automatic configure_composition_envs(output rdma_status status);
     rdma_function_identity tx_identity;
     rdma_function_identity rx_identity;
@@ -150,11 +152,11 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     // lifecycle 资源，正向 CQE 必须由组合 engine 的公开 publish 路径生成。
     status = tx_composition_env.bind_data_path(
       tx_env.manager, tx_env.binding, tx_env.mem, tx_env.scheduler,
-      tx_env.registry, 2us);
+      tx_env.registry, 2us, tx_env.contexts);
     if (status == null || !status.ok()) return;
     status = rx_composition_env.bind_data_path(
       rx_env.manager, rx_env.binding, rx_env.mem, rx_env.scheduler,
-      rx_env.registry, 2us);
+      rx_env.registry, 2us, rx_env.contexts);
     if (status == null || !status.ok()) return;
     status = tx_composition_env.queue_data.attach_cq(
       tx_env.cq.handle, RDMA_TRANSPORT_RC);
@@ -402,11 +404,12 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     return request;
   endfunction
 
-  // 功能：将已发送的语义 request 映射为 net_packet 可编码的 transport/opcode
-  //   观察值，并填入 QPN、PSN 和 payload。
+  // 功能：将语义 request 映射为 net_packet 可编码或可拒绝的
+  //   transport/opcode 观察值，并填入 QPN、PSN 和 payload。
   // 输入/输出及副作用：transport、opcode、index、payload（输入）；返回独立
   //   rdma_packet，不推进 sink 或 adapter 统计。
-  // 失败/边界：未知组合返回 CUSTOM/NAK 观察值，由 adapter 的 fail-closed 校验拒绝。
+  // 失败/边界：未知组合返回 CUSTOM/NAK 观察值；URC RDMA_READ 仍可构造为
+  //   wire-capability negative fixture，但必须由 net_packet adapter 在发送入口拒绝。
   function automatic rdma_packet make_transport_packet(
     rdma_transport_e transport,
     rdma_work_opcode_e opcode,
@@ -486,11 +489,73 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     return packet;
   endfunction
 
+  // 功能：run_urc_read_wire_rejection 在不触碰 SQ/RQ/CQ 的前提下，把一个
+  //   URC RDMA_READ request 交给真实 net_packet adapter，验证 UC wire profile
+  //   的 unsupported-opcode 边界只发生在网络编码层。
+  // 输入/输出及副作用：status 为输出；本 task 构造独立 rdma_packet 并调用
+  //   tx_net.send_packet，读取 tx_net.send_sequence、last_sent_packet 与
+  //   tx_sink.sent_count，不创建 pending、推进 queue cursor 或写 host-memory。
+  // 失败/边界：adapter/packet/status 为空或返回非 RDMA_SC_UNSUPPORTED_OPCODE 时
+  //   失败；send_sequence 是 adapter 的编码尝试计数，拒绝请求允许只增加一次，
+  //   但 sink.sent_count 与 last_sent_packet 必须保持同一对象，不能发布半包。
+  task automatic run_urc_read_wire_rejection(output rdma_status status);
+    byte unsigned payload[$];
+    rdma_packet request;
+    rdma_status send_status;
+    longint unsigned before_sequence;
+    int unsigned before_sent_count;
+    packet before_last_sent;
+
+    status = rdma_status::success();
+    if (tx_net == null || tx_sink == null) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "URC READ wire rejection adapter or sink is missing");
+      return;
+    end
+    make_payload(case_counter, payload);
+    request = make_transport_packet(
+      RDMA_TRANSPORT_URC, RDMA_WR_RDMA_READ, case_counter, payload);
+    if (request == null) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "URC READ wire rejection packet construction returned null");
+      return;
+    end
+    before_sequence = tx_net.send_sequence;
+    before_sent_count = tx_sink.sent_count;
+    before_last_sent = tx_net.last_sent_packet;
+    tx_net.send_packet(request, send_status);
+    if (send_status == null ||
+        send_status.code != RDMA_SC_UNSUPPORTED_OPCODE) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        $sformatf("URC READ wire rejection returned %s",
+                  send_status == null ? "null" : send_status.convert2string()));
+      return;
+    end
+    if (tx_net.send_sequence != before_sequence + 1) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        $sformatf("URC READ reject changed attempt sequence unexpectedly: %0d -> %0d",
+                  before_sequence, tx_net.send_sequence));
+      return;
+    end
+    if (tx_sink.sent_count != before_sent_count ||
+        tx_net.last_sent_packet != before_last_sent) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "URC READ reject published a network packet or changed sink accounting");
+      return;
+    end
+    status = rdma_status::success();
+  endtask
+
   // 功能：构造 READ response 或 Atomic ACK response，模拟远端 responder 在
   // 完成请求后返回的 RoCEv2 数据面报文。
   // 输入/输出及副作用：opcode、index、payload、original_value 为输入；返回
   //   独立 packet，不推进 sink、queue 或 host-memory 统计。
-  // 失败边界：仅接受 RC READ response/Atomic ACK；其他 opcode 返回 NAK 观察值，
+  // 失败/边界：仅接受 RC READ response/Atomic ACK；其他 opcode 返回 NAK 观察值，
   //   调用方必须停止当前 case。
   function automatic rdma_packet make_response_packet(
     rdma_network_opcode_e opcode,
@@ -622,12 +687,15 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
     status = rdma_status::success();
   endtask
 
-  // 功能：执行一个 transport/opcode case：post RQ/SQ、host-memory payload、
-  //   net_packet loopback、双端 CQE poll，并校验 queue cursor/wrap/credit 结果。
+  // 功能：执行一个 queue-level transport/opcode case：post RQ/SQ、host-memory
+  //   payload、net_packet loopback、双端 CQE poll，并校验 queue cursor/wrap/credit
+  //   结果；仅把核心语义层拒绝的组合作为 queue-level negative case。
   // 输入/输出及副作用：transport、opcode（输入）；status（输出）；成功时各环
   //   推进一个事务并释放 outstanding，失败时保持首个错误并停止该 case。
-  // 失败/边界：UD 非 SEND 以及 CUSTOM/保留 transport 必须 fail-closed；任何
-  //   unsupported 请求不得写 host-memory、推进 PI 或产生 CQE。
+  // 失败/边界：UD 非 SEND 以及 CUSTOM/保留 transport 必须在 SQ 入口 fail-closed；
+  //   任何 queue-level unsupported 请求不得写 host-memory、推进 PI 或产生 CQE。
+  //   仅由外部 net_packet wire capability 拒绝的 URC RDMA_READ 由独立 helper
+  //   在发送层验证，不能在本 task 中先 post 一个必然无法编码的 SQE。
   task automatic run_transport_case(
     rdma_transport_e transport,
     rdma_work_opcode_e opcode,
@@ -1351,14 +1419,15 @@ class rdma_end_to_end_transport_test extends rdma_end_to_end_dual_env_test;
         end
       end
       if (transport_matrix_ok) begin
-        // 负向契约：UD RDMA_WRITE 和 URC RDMA_READ 都必须在入口被拒绝，
-        // 且不推进 SQ/RQ；后者对应外部 net_packet 的 UC wire 能力边界。
+        // 负向契约：UD RDMA_WRITE 由核心 queue-data 入口拒绝且不推进 SQ/RQ；
+        // URC RDMA_READ 则保留核心语义白名单，改由 net_packet wire capability
+        // 在不触碰 SQ 的独立发送层 fixture 中拒绝。
         case_counter = TRANSPORT_CASES;
         run_transport_case(RDMA_TRANSPORT_UD, RDMA_WR_RDMA_WRITE, status);
         if (status == null || !status.ok())
           `uvm_error("E2E_TRANSPORT_UNSUPPORTED", "UD RDMA_WRITE was not rejected")
         case_counter = TRANSPORT_CASES + 1;
-        run_transport_case(RDMA_TRANSPORT_URC, RDMA_WR_RDMA_READ, status);
+        run_urc_read_wire_rejection(status);
         if (status == null || !status.ok())
           `uvm_error("E2E_TRANSPORT_UNSUPPORTED", "URC RDMA_READ was not rejected")
       end

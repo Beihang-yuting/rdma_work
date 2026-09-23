@@ -1203,6 +1203,8 @@ class rdma_control_plane_test extends uvm_test;
                lhs.hmc_refs[i].size != rhs.hmc_refs[i].size ||
                lhs.hmc_refs[i].first_pbl_index !=
                  rhs.hmc_refs[i].first_pbl_index ||
+               lhs.hmc_refs[i].index_valid !=
+                 rhs.hmc_refs[i].index_valid ||
                lhs.hmc_refs[i].ownership != rhs.hmc_refs[i].ownership ||
                lhs.hmc_refs[i].release_complete !=
                  rhs.hmc_refs[i].release_complete)
@@ -1234,6 +1236,7 @@ class rdma_control_plane_test extends uvm_test;
     hmc_ref.address = address;
     hmc_ref.size = size;
     hmc_ref.first_pbl_index = first_pbl_index;
+    hmc_ref.index_valid = 1'b1;
     hmc_ref.ownership = RDMA_OWNERSHIP_BORROWED;
     hmc_ref.release_complete = 1'b0;
     return hmc_ref;
@@ -1304,7 +1307,6 @@ class rdma_control_plane_test extends uvm_test;
 
   // 功能：setup_owned_mr_case 更新字段 control、manager、mock_cmq、key_policy、key_policy.fixed_key、host_mem、binding、status、pd_request、request，并在提交前保持 Function authority、generation 和资源所有权约束。
   // 输入/输出及副作用：prefix（输入）、inject_host_mem（输入）、control（输出）、manager（输出）、mock_cmq（输出）、key_policy（输出）、host_mem（输出）、binding（输出）、request（输出）、dma_context（输出）、pd（输出）、baseline_allocations（输出）、baseline_leaks（输出）；setup_owned_mr_case 驱动下游事务，并写入 control、manager、mock_cmq、key_policy、host_mem、binding、request、dma_context、pd、baseline_allocations、baseline_leaks；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：setup_owned_mr_case 失败或超时通过 control、manager、mock_cmq、key_policy、host_mem、binding、request、dma_context、pd、baseline_allocations、baseline_leaks 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic setup_owned_mr_case(
     string prefix,
@@ -1405,7 +1407,6 @@ class rdma_control_plane_test extends uvm_test;
 
   // 功能：setup_deregister_mr_case 更新字段 control、manager、mock_cmq、key_policy、key_policy.fixed_key、host_mem、hmc、hmc_base.value、status、binding，并在提交前保持 Function authority、generation 和资源所有权约束。
   // 输入/输出及副作用：prefix（输入）、pbl_mode（输入）、ownership（输入）、control（输出）、manager（输出）、mock_cmq（输出）、host_mem（输出）、hmc（输出）、binding（输出）、pd（输出）、mr（输出）、mapping（输出）、hmc_address（输出）、baseline_allocations（输出）；setup_deregister_mr_case 驱动下游事务，并写入 control、manager、mock_cmq、host_mem、hmc、binding、pd、mr、mapping、hmc_address、baseline_allocations；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：setup_deregister_mr_case 失败或超时通过 control、manager、mock_cmq、host_mem、hmc、binding、pd、mr、mapping、hmc_address、baseline_allocations 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic setup_deregister_mr_case(
     string prefix,
@@ -1518,10 +1519,12 @@ class rdma_control_plane_test extends uvm_test;
       hmc_ref.address = hmc_address;
       hmc_ref.size = lease_size;
       hmc_ref.first_pbl_index = 28'h000_0900;
+      hmc_ref.index_valid = 1'b1;
       hmc_ref.ownership = ownership;
       hmc_ref.release_complete = 1'b0;
       backing.hmc_refs.push_back(hmc_ref);
       backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+      backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     end
 
     if (ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
@@ -3518,6 +3521,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     injected_status = rdma_status::make(
       RDMA_SC_UNKNOWN_HW_ERROR, "injected KEY_ALLOC failure"
     );
@@ -3638,6 +3642,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     mock_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
 
     control.register_mr(binding, request, backing, mr, result);
@@ -3958,6 +3963,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     backing.backing_refs[0].mapping.owner_h = null;
     original_iova = request.iova.value;
     original_length = request.length;
@@ -4042,6 +4048,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     original_backing_address =
       backing.backing_refs[0].mapping.backing_addr.value;
     original_hmc_size = backing.hmc_refs[0].size;
@@ -4165,6 +4172,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     blocking_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     fork
       begin
@@ -4273,6 +4281,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     blocking_cmq.gate_opcode(RDMA_OP_KEY_ALLOC);
     fork
       begin
@@ -4632,6 +4641,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     manager.fail_next_release_reserved(release_failure);
     mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, hardware_failure);
     control.register_mr(binding, request, backing, mr, result);
@@ -4698,6 +4708,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     manager.fail_next_release_reserved(release_failure);
     manager.fail_next_mark_error(mark_error_failure);
     mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, hardware_failure);
@@ -4749,6 +4760,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     manager.fail_next_mark_error(mark_error_failure);
     mock_cmq.timeout_opcode(RDMA_OP_KEY_ALLOC);
     control.register_mr(binding, request, backing, mr, result);
@@ -4796,6 +4808,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     manager.fail_next_activate(mark_error_failure);
     manager.fail_next_finalize_release(release_failure);
     control.register_mr(binding, request, backing, mr, result);
@@ -5385,6 +5398,7 @@ class rdma_control_plane_test extends uvm_test;
     hmc_ref.owner.function_uid++;
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     expect_pre_cmq_reject("REJECT_HMC_OWNER", control, mock_cmq,
                           binding, request, backing,
                           RDMA_SC_INVALID_ARGUMENT);
@@ -5400,6 +5414,7 @@ class rdma_control_plane_test extends uvm_test;
     hmc_ref.owner.generation++;
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     expect_pre_cmq_reject("REJECT_HMC_GENERATION", control, mock_cmq,
                           binding, request, backing,
                           RDMA_SC_STALE_GENERATION);
@@ -5415,6 +5430,7 @@ class rdma_control_plane_test extends uvm_test;
     hmc_ref.object_kind = RDMA_RESOURCE_PD;
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     expect_pre_cmq_reject("REJECT_HMC_KIND", control, mock_cmq,
                           binding, request, backing,
                           RDMA_SC_INVALID_ARGUMENT);
@@ -5429,6 +5445,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index + 1'b1;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     expect_pre_cmq_reject("REJECT_HMC_INDEX", control, mock_cmq,
                           binding, request, backing,
                           RDMA_SC_INVALID_ARGUMENT);
@@ -5444,6 +5461,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     expect_pre_cmq_reject("REJECT_HMC_INDEX_WIDTH", control, mock_cmq,
                           binding, request, backing,
                           RDMA_SC_INVALID_ARGUMENT);
@@ -5461,6 +5479,7 @@ class rdma_control_plane_test extends uvm_test;
     );
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
     expect_pre_cmq_reject("REJECT_HMC_ACTIVE", control, mock_cmq,
                           binding, request, backing,
                           RDMA_SC_INVALID_STATE);
@@ -5584,10 +5603,12 @@ class rdma_control_plane_test extends uvm_test;
     hmc_ref.address = hmc_address;
     hmc_ref.size = lease_size;
     hmc_ref.first_pbl_index = 28'h012_3456;
+    hmc_ref.index_valid = 1'b1;
     hmc_ref.ownership = RDMA_OWNERSHIP_BORROWED;
     hmc_ref.release_complete = 1'b0;
     backing.hmc_refs.push_back(hmc_ref);
     backing.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    backing.page_layout.first_pbl_index_valid = hmc_ref.index_valid;
 
     control.register_mr(binding, request, backing, mr, result);
     expect_result("PBL2_REGISTER", result, RDMA_SC_OK);
@@ -5836,7 +5857,6 @@ class rdma_control_plane_test extends uvm_test;
 
   // 功能：在 rdma_control_plane_test 中，run_deregister_generation_fence 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：prefix（输入）、pbl_mode（输入）、gated_opcode（输入）、expected_presence（输入）、expected_pending_step（输入）、expected_command_count（输入）；run_deregister_generation_fence 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：run_deregister_generation_fence 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task automatic run_deregister_generation_fence(
     string prefix,

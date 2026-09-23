@@ -3,6 +3,86 @@
 // 依赖：rdma_core_pkg、queue-data fixture、XTR v1 CQE codec 和 mock Host-memory 后端。
 // 所有权与生命周期：测试只拥有本地 fixture；CQ facade 不拥有 runtime 或 backing mapping。
 
+// 功能：提供 CQ facade 的 hostile delegate seam，模拟 poll/publish/resize 返回
+//   null 或显式失败 status，同时夹带未认证 completion/result。
+// 输入/输出及副作用：注入模式和调用计数由测试控制；各 seam 不访问 runtime、
+//   backing 或 cursor，只写 output 对象并记录调用次数。
+// 失败/边界：null 模式必须归一化为 INVALID_STATE，失败模式必须保留原 code/
+//   message；poll/publish 的 result 在两种模式下都必须被 facade 清空。
+class rdma_cq_hostile_facade extends rdma_cq_engine;
+  `uvm_object_utils(rdma_cq_hostile_facade)
+
+  bit inject_failure_status;
+  int unsigned poll_calls;
+  int unsigned publish_calls;
+  int unsigned resize_calls;
+
+  // 功能：构造 CQ hostile facade，默认注入 null status 故障。
+  // 输入/输出及副作用：name 为输入；仅初始化模式与计数，不分配 CQ 或 backing。
+  // 失败/边界：必须先通过父类 configure 建立 authority，才能调用三个 seam。
+  function new(string name = "rdma_cq_hostile_facade");
+    super.new(name);
+    inject_failure_status = 1'b0;
+    poll_calls = 0;
+    publish_calls = 0;
+    resize_calls = 0;
+  endfunction
+
+  // 功能：模拟 CQ poll delegate 返回未认证 completion 与 null/失败 status。
+  // 输入/输出及副作用：cq_h/timeout 为输入；result 被设置为测试对象，status
+  //   按模式输出；不读取 CQ backing、不推进 CI。
+  // 失败/边界：任何模式都不得被调用方视为成功事务；公开 poll_cqe 必须清空
+  //   result 并规范化 null status。
+  protected virtual task call_delegate_poll_cqe(
+    rdma_handle cq_h,
+    time timeout,
+    output rdma_queue_completion_result result,
+    output rdma_status status
+  );
+    poll_calls++;
+    result = rdma_queue_completion_result::type_id::create(
+      "cq_untrusted_poll_result");
+    status = inject_failure_status ?
+      rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                        "injected CQ poll failure") : null;
+  endtask
+
+  // 功能：模拟 CQ publish delegate 返回未认证 publish result 与 null/失败 status。
+  // 输入/输出及副作用：cq_h/model 为输入；result/status 按模式输出；不预留槽位、
+  //   不写 CQ backing、不提交 producer cursor。
+  // 失败/边界：公开 publish_cqe 必须丢弃 result；null 归一化为 INVALID_STATE，
+  //   显式失败保留原始错误。
+  protected virtual task call_delegate_publish_cqe(
+    rdma_handle cq_h,
+    rdma_hw_cqe_model model,
+    output rdma_queue_device_publish_result result,
+    output rdma_status status
+  );
+    publish_calls++;
+    result = rdma_queue_device_publish_result::type_id::create(
+      "cq_untrusted_publish_result");
+    status = inject_failure_status ?
+      rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                        "injected CQ publish failure") : null;
+  endtask
+
+  // 功能：模拟 CQ resize delegate 返回 null/失败 status，验证 resize 边界归一化。
+  // 输入/输出及副作用：cq_h/new_depth/new_cqe_bytes 为输入；仅递增计数并返回
+  //   status，不修改 attachment geometry 或旧 runtime。
+  // 失败/边界：null 必须由公开 resize 归一化为 INVALID_STATE，显式失败必须原样
+  //   传播；调用方不能据此认为 ring 已切换。
+  protected virtual function rdma_status call_delegate_resize_cq(
+    rdma_handle cq_h,
+    int unsigned new_depth,
+    int unsigned new_cqe_bytes
+  );
+    resize_calls++;
+    return inject_failure_status ?
+      rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
+                        "injected CQ resize failure") : null;
+  endfunction
+endclass
+
 class rdma_cq_engine_test extends uvm_test;
   `uvm_component_utils(rdma_cq_engine_test)
 
@@ -41,8 +121,112 @@ class rdma_cq_engine_test extends uvm_test;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_publish_cqe 根据真实 outstanding SQ post 构造可发布 CQE，供 direct
-  //   delegate 与 facade 在等价初态下执行同一业务事务。
+  // 功能：验证 configure 与 configure_shared 共享唯一 delegate 所有权；两种
+  //   调用顺序都拒绝 foreign engine，并允许同一 engine 补齐独立配置。
+  // 输入/输出及副作用：fixture 提供真实 binding/CQ/delegate；task 创建两个 facade
+  //   和一个只借用相同依赖的 foreign engine，不访问 foreign runtime/backing。
+  // 失败/边界：foreign 失败必须保持既有配置原子不变；随后同 engine 配置和 shadow
+  //   flush 必须成功并保留初始游标，证明 delegate/authority/shadow 未被替换。
+  task automatic check_dual_configuration_delegate_ownership(
+    rdma_queue_data_engine_fixture fixture
+  );
+    rdma_cq_engine configure_first;
+    rdma_cq_engine shared_first;
+    rdma_queue_data_engine foreign_engine;
+    rdma_function_identity identity;
+    rdma_handle cq_h;
+    rdma_cq_shadow_snapshot shadow;
+    rdma_status status;
+
+    configure_first = rdma_cq_engine::type_id::create("cq_configure_first");
+    shared_first = rdma_cq_engine::type_id::create("cq_shared_first");
+    foreign_engine = rdma_queue_data_engine::type_id::create(
+      "cq_foreign_delegate");
+    identity = fixture.binding.function_identity_snapshot();
+    if (configure_first == null || shared_first == null ||
+        foreign_engine == null || identity == null) begin
+      `uvm_error("CQ_DUAL_CONFIG_FACTORY",
+                 "CQ dual-configuration fixture allocation failed")
+      return;
+    end
+    foreign_engine.manager = fixture.manager;
+    foreign_engine.binding = fixture.binding;
+    foreign_engine.host_mem = fixture.mem;
+    foreign_engine.doorbells = fixture.scheduler;
+    foreign_engine.registry = fixture.registry;
+
+    // configure_shared 要求非零 reset epoch；该 helper 只验证两个配置入口的
+    // delegate 原子性，不把 detached identity 写回 fixture 的活动 binding。
+    identity.reset_epoch = 1;
+    cq_h = rdma_handle::type_id::create("cq_dual_config_handle");
+    cq_h.kind = RDMA_RESOURCE_CQ;
+    cq_h.function_uid = identity.function_uid;
+    cq_h.generation = identity.generation;
+    cq_h.object_id = 12;
+
+    status = configure_first.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 2us, fixture.engine);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQ_DUAL_CONFIG_FIRST",
+                 "CQ configure-first setup failed")
+      return;
+    end
+    status = configure_first.configure_shared(
+      cq_h, null, RDMA_TRANSPORT_RC, identity,
+      7, 3, 2'b1, 64'h71, foreign_engine);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("CQ_CONFIGURE_THEN_FOREIGN_SHARED",
+                 "CQ configure_shared replaced configured delegate")
+    status = configure_first.configure_shared(
+      cq_h, null, RDMA_TRANSPORT_RC, identity,
+      7, 3, 2'b1, 64'h71, fixture.engine);
+    if (status == null || !status.ok())
+      `uvm_error("CQ_CONFIGURE_THEN_SAME_SHARED", $sformatf(
+                 "CQ configure_shared rejected identical delegate: %s",
+                 status == null ? "<null>" : status.convert2string()))
+    else begin
+      shadow = null;
+      status = configure_first.flush_shadow(shadow);
+      if (status == null || !status.ok() || shadow == null ||
+          shadow.sq_ci != 7 || shadow.rq_ci != 3 ||
+          shadow.\sequence != 64'h71)
+        `uvm_error("CQ_CONFIGURE_THEN_SHARED_ATOMIC",
+                   "CQ foreign shared failure mutated existing configuration")
+    end
+
+    status = shared_first.configure_shared(
+      cq_h, null, RDMA_TRANSPORT_RC, identity,
+      9, 4, 2'b10, 64'h92, fixture.engine);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQ_DUAL_SHARED_FIRST", $sformatf(
+                 "CQ shared-first setup failed: %s",
+                 status == null ? "<null>" : status.convert2string()))
+      return;
+    end
+    status = shared_first.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 2us, foreign_engine);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT)
+      `uvm_error("CQ_SHARED_THEN_FOREIGN_CONFIGURE",
+                 "CQ configure replaced shared delegate")
+    status = shared_first.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 2us, fixture.engine);
+    if (status == null || !status.ok())
+      `uvm_error("CQ_SHARED_THEN_SAME_CONFIGURE",
+                 "CQ configure rejected identical shared delegate")
+    shadow = null;
+    status = shared_first.flush_shadow(shadow);
+    if (status == null || !status.ok() || shadow == null ||
+        shadow.sq_ci != 9 || shadow.rq_ci != 4 ||
+        shadow.\sequence != 64'h92)
+      `uvm_error("CQ_SHARED_THEN_CONFIGURE_ATOMIC",
+                 "CQ foreign configure failure mutated shared shadow")
+  endtask
+
+  // 功能：make_publish_cqe 根据真实 outstanding SQ post 构造显式 RC variant CQE，
+  //   供 direct delegate 与 facade 在等价初态下执行同一业务事务。
   // 输入/输出及副作用：fixture、posted、polarity 为输入，model/status 为输出；
   //   仅分配 model/handle 快照，不推进 cursor、不写 backing、不释放 WQE ledger。
   // 失败/边界：fixture/QP/post 或分配不完整时返回非成功且 model 为 null；packed
@@ -77,6 +261,10 @@ class rdma_cq_engine_test extends uvm_test;
     model.wqe_index = posted.index;
     model.wqe_wrap = posted.wrap;
     model.rq_cqe = 1'b0;
+    // 两个等价 fixture 均由默认 RC QP/CQ lifecycle 建立；显式保留 RC overlay
+    // 与 send/SQ 标志，避免 facade 测试依赖 CQE model 的隐含初值。
+    model.srfq = 1'b0;
+    model.variant = RDMA_CQE_VARIANT_RC;
     model.polarity = polarity;
     model.packet_opcode = 8'h01;
     model.ecode = RDMA_CMQ_SUCCESS_ECODE;
@@ -118,8 +306,10 @@ class rdma_cq_engine_test extends uvm_test;
         `uvm_error("CQ_DELEGATE_FIXTURE", "CQ equivalence fixture allocation failed")
         disable delegate_equivalence_flow;
       end
-      direct_fixture.setup(direct_status);
-      facade_fixture.setup(facade_status);
+      // 正向等价性场景必须显式提供 CQC context backing；真实驱动的 CQ CI
+      // 通过 host-memory shadow 回写，不再使用 CQ consumer MMIO doorbell。
+      direct_fixture.setup(direct_status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
+      facade_fixture.setup(facade_status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
       if (direct_status == null || !direct_status.ok() ||
           facade_status == null || !facade_status.ok()) begin
         `uvm_error("CQ_DELEGATE_SETUP", "CQ equivalence fixture setup failed")
@@ -256,7 +446,8 @@ class rdma_cq_engine_test extends uvm_test;
         `uvm_error("CQ_STRIDE_FACTORY", "stride fixture allocation failed")
         disable stride_flow;
       end
-      fixture.setup(status, 16, cqe_size, 16, 16);
+      // stride 正向场景验证真实 CQC shadow publication，因此 backing 不能省略。
+      fixture.setup(status, 16, cqe_size, 16, 16, 1'b1);
       if (status == null || !status.ok()) begin
         `uvm_error("CQ_STRIDE_SETUP", status == null ?
                    "stride setup returned null" : status.convert2string())
@@ -392,7 +583,9 @@ class rdma_cq_engine_test extends uvm_test;
           completion.released_slots[0].wr_id != 64'h6000 + cqe_size ||
           completion.released_slots[0].index != 0 ||
           completion.released_slots[0].wrap) begin
-        `uvm_error("CQ_STRIDE_POLL0", "first stride completion did not poll")
+        `uvm_error("CQ_STRIDE_POLL0", $sformatf(
+          "first stride completion did not poll: cqe_size=%0d status=%s",
+          cqe_size, status == null ? "<null>" : status.convert2string()))
         disable stride_flow;
       end
       completion = null;
@@ -439,23 +632,30 @@ class rdma_cq_engine_test extends uvm_test;
     check_cqe_stride_profile(128);
   endtask
 
-  // 功能：配置 CQ facade，向共享 CQ runtime 发布一条 CQE并验证 CI 只提交一次，
+  // 功能：配置 CQ facade，验证配置生命周期为 one-shot，向共享 CQ runtime 发布一条 CQE并验证 CI 只提交一次，
   //   同时执行 direct/facade producer 等价性与配置门禁矩阵。
   // 输入/输出及副作用：phase 为输入；task 通过 objection、日志和
   //   断言暴露结果，并在统一 epilogue 释放 fixture 持有的全部资源。
-  // 失败/边界：CQE owner、QPN 或 Function 不匹配时不应发布
+  // 失败/边界：第二次 configure 必须返回 INVALID_STATE 且保留首个 delegate；CQE owner、QPN 或 Function 不匹配时不应发布
   //   completion；任一 setup/post/publish 失败仍必须 cleanup，非零 timeout
   //   的空槽位必须返回 TIMEOUT。
   task run_phase(uvm_phase phase);
     rdma_queue_data_engine_fixture fixture;
     rdma_cq_engine facade;
     rdma_cq_engine unconfigured_facade;
+    rdma_cq_engine inactive_facade;
     rdma_queue_post_result posted;
     rdma_queue_completion_result completion;
     rdma_queue_device_publish_result published;
     rdma_hw_cqe_model cqe;
     rdma_status status;
     rdma_status cleanup_status;
+    rdma_status stale_status;
+    rdma_cq_hostile_facade hostile_facade;
+    rdma_queue_completion_result hostile_completion;
+    int unsigned hostile_calls_before_stale;
+    rdma_reset_epoch_t saved_reset_epoch;
+    longint unsigned saved_function_uid;
     bit producer_polarity;
 
     phase.raise_objection(this);
@@ -467,11 +667,25 @@ class rdma_cq_engine_test extends uvm_test;
         `uvm_error("CQ_FIXTURE", "queue-data fixture allocation failed")
         disable cq_flow;
       end
-      fixture.setup(status);
+    // 主 CQ facade 流程覆盖真实 shadow CI 提交；缺失 backing 的拒绝路径由
+    // 专门的 device-publish/context-contract 测试负责，避免混淆两种契约。
+    fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
       if (status == null || !status.ok()) begin
         `uvm_error("CQ_FIXTURE", "queue-data fixture setup failed")
         disable cq_flow;
       end
+
+    // RED：CQ facade 必须拒绝非 ACTIVE Function binding；validate() 返回 OK
+    // 不能绕过显式 state 门禁或保存不可用的 delegate。
+    inactive_facade = rdma_cq_engine::type_id::create("cq_inactive_facade");
+    fixture.binding.state = RDMA_BIND_DISCOVERED;
+    status = inactive_facade.configure(fixture.manager, fixture.binding,
+                                        fixture.mem, fixture.scheduler,
+                                        fixture.registry, 2us, fixture.engine);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("CQ_CONFIGURE_ACTIVE_GATE",
+                 "CQ facade accepted a non-ACTIVE Function binding")
+    fixture.binding.state = RDMA_BIND_ACTIVE;
 
     facade = rdma_cq_engine::type_id::create("cq_facade");
     status = facade.configure(fixture.manager, fixture.binding, fixture.mem,
@@ -481,6 +695,81 @@ class rdma_cq_engine_test extends uvm_test;
       `uvm_error("CQ_CONFIGURE", "CQ facade configuration failed")
       disable cq_flow;
     end
+
+    // RED/GREEN：hostile CQ seam 同时覆盖 null status 与显式失败 status；两者
+    // 都携带未认证 result，facade 必须 fail-closed 且保留显式失败错误。
+    hostile_facade = rdma_cq_hostile_facade::type_id::create("cq_hostile_facade");
+    status = hostile_facade.configure(
+      fixture.manager, fixture.binding, fixture.mem, fixture.scheduler,
+      fixture.registry, 2us, fixture.engine);
+    if (status == null || !status.ok()) begin
+      `uvm_error("CQ_HOSTILE_CONFIG", "CQ hostile facade configuration failed")
+      disable cq_flow;
+    end
+    hostile_completion = null;
+    hostile_facade.poll_cqe(fixture.cq.handle, hostile_completion, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        hostile_completion != null)
+      `uvm_error("CQ_NULL_POLL_DELEGATE",
+                 "CQ facade exposed null-status poll result")
+
+    hostile_facade.publish_cqe(fixture.cq.handle, null, published, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE || published != null)
+      `uvm_error("CQ_NULL_PUBLISH_DELEGATE",
+                 "CQ facade exposed null-status publish result")
+
+    status = hostile_facade.resize(fixture.cq.handle, 16, RDMA_CQE_BYTES);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("CQ_NULL_RESIZE_DELEGATE",
+                 "CQ facade exposed null-status resize result")
+
+    hostile_facade.inject_failure_status = 1'b1;
+    hostile_completion = null;
+    hostile_facade.poll_cqe(fixture.cq.handle, hostile_completion, status);
+    if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        status.message != "injected CQ poll failure" || hostile_completion != null)
+      `uvm_error("CQ_FAILURE_POLL_DELEGATE",
+                 "CQ facade did not clear failed poll result")
+    published = null;
+    hostile_facade.publish_cqe(fixture.cq.handle, null, published, status);
+    if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        status.message != "injected CQ publish failure" || published != null)
+      `uvm_error("CQ_FAILURE_PUBLISH_DELEGATE",
+                 "CQ facade did not clear failed publish result")
+    status = hostile_facade.resize(fixture.cq.handle, 16, RDMA_CQE_BYTES);
+    if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+        status.message != "injected CQ resize failure")
+      `uvm_error("CQ_FAILURE_RESIZE_DELEGATE",
+                 "CQ facade did not preserve failed resize status")
+
+    status = facade.configure(fixture.manager, fixture.binding, fixture.mem,
+                              fixture.scheduler, fixture.registry, 2us,
+                              fixture.engine);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("CQ_CONFIGURE_GATE", "configured CQ facade accepted reconfiguration")
+
+    // RED：frozen Function coordinates are the stale-authority source of truth;
+    // report STALE_GENERATION before binding.validate() can classify mirror drift.
+    saved_function_uid = fixture.binding.function_uid;
+    fixture.binding.function_uid = saved_function_uid ^ 64'h1;
+    completion = null;
+    facade.poll_cqe(fixture.cq.handle, completion, stale_status);
+    if (stale_status == null || stale_status.code != RDMA_SC_STALE_GENERATION ||
+        completion != null)
+      `uvm_error("CQ_STALE_ORDER",
+                 "CQ facade did not report stale authority before validation")
+    fixture.binding.function_uid = saved_function_uid;
+
+    // RED：已配置 CQ facade 在 binding 失活后必须阻断 poll，不能因为
+    // frozen UID/generation/epoch 仍相同而继续读取 CQ ring。
+    fixture.binding.state = RDMA_BIND_DISCOVERED;
+    completion = null;
+    facade.poll_cqe(fixture.cq.handle, completion, stale_status);
+    if (stale_status == null || stale_status.code != RDMA_SC_INVALID_STATE ||
+        completion != null)
+      `uvm_error("CQ_LIVE_ACTIVE_GATE",
+                 "CQ facade continued after Function binding became inactive")
+    fixture.binding.state = RDMA_BIND_ACTIVE;
 
     fixture.engine.post_send(fixture.make_send(64'h5050), posted, status);
     if (status == null || !status.ok() || posted == null) begin
@@ -501,6 +790,10 @@ class rdma_cq_engine_test extends uvm_test;
     cqe.wqe_index = posted.index;
     cqe.wqe_wrap = posted.wrap;
     cqe.rq_cqe = 1'b0;
+    // cq_flow 使用 fixture.setup() 的基础 RC QP；publish facade 仍须接收显式
+    // RC variant，而不是把 model 构造默认值当作 route authority。
+    cqe.srfq = 1'b0;
+    cqe.variant = RDMA_CQE_VARIANT_RC;
     status = fixture.engine.query_runtime_producer_polarity(
       fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, producer_polarity);
     if (status == null || !status.ok()) begin
@@ -551,7 +844,35 @@ class rdma_cq_engine_test extends uvm_test;
       `uvm_error("CQ_PUBLISH_UNCONFIGURED", "unconfigured CQ facade published")
 
     check_publish_delegate_equivalence();
+    check_dual_configuration_delegate_ownership(fixture);
     check_variable_cqe_strides();
+
+    // reset epoch 只能单调前进。先释放主 fixture 持有的生命周期资源，再把漂移
+    // 场景放在本流程末尾，避免测试为了继续执行而尝试回退 epoch。
+    if (fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("CQ_CLEANUP_BEFORE_RESET_DRIFT", cleanup_status == null ?
+                   "fixture cleanup returned null" :
+                   cleanup_status.convert2string())
+    end
+
+    // RED/GREEN：reset epoch 漂移必须在 CQ delegate seam 前阻断，调用次数保持
+    //   不变，证明 poll/publish 没有读取 ring 或产生设备副作用。
+    hostile_calls_before_stale = hostile_facade.poll_calls;
+    saved_reset_epoch = fixture.binding.function_reset_epoch();
+    status = fixture.advance_binding_reset_epoch(saved_reset_epoch + 1);
+    if (status == null || !status.ok())
+      `uvm_error("CQ_RESET_EPOCH_SETUP", "CQ reset epoch drift setup failed")
+    else begin
+      hostile_completion = null;
+      hostile_facade.poll_cqe(fixture.cq.handle, hostile_completion, status);
+      if (status == null || status.code != RDMA_SC_STALE_GENERATION ||
+          hostile_completion != null ||
+          hostile_facade.poll_calls != hostile_calls_before_stale)
+        `uvm_error("CQ_RESET_EPOCH_GATE",
+                   "CQ facade called poll delegate after reset epoch drift")
+    end
     end
 
     if (fixture != null && fixture.needs_cleanup()) begin

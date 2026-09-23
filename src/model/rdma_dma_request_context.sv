@@ -47,31 +47,67 @@ class rdma_dma_request_context extends uvm_object;
     queue_role = '0;
   endfunction
 
+  // 功能：normalize_validation_status 把本地校验链产生的 rdma_status 规范化为
+  //       可安全解引用的结果，保证可覆盖的状态工厂或 owner 校验器返回 null 时
+  //       仍以确定的 INVALID_STATE 结束请求校验。
+  // 输入/输出及副作用：candidate、boundary 为输入；非空 candidate 原样返回，
+  //       null 时直接构造一个独立的失败状态，不修改 request context 或外部资源。
+  // 失败/边界：candidate 为 null 表示下游状态构造违反非空契约；helper 不把 null
+  //       转成成功，也不调用可能再次被 hostile override 的 factory 创建路径。
+  function automatic rdma_status normalize_validation_status(
+    rdma_status candidate,
+    string boundary
+  );
+    if (candidate == null)
+      return rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        {"DMA request validation returned null status at ", boundary}
+      );
+    return candidate;
+  endfunction
+
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“DMA request Function is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、function_h、function_h.kind、function_h.generation、route_valid、route、pasid_valid、pasid 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“DMA request Function is invalid”“DMA request Function generation is zero”；失败路径不提交部分状态或转移未声明资源。
-
   function rdma_status validate();
     rdma_status status;
 
-    if (function_h == null || function_h.kind != RDMA_RESOURCE_FUNCTION)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "DMA request Function is invalid");
-    if (function_h.generation == 0)
-      return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                               "DMA request Function generation is zero");
-    if (route_valid && !rdma_route_key_valid(route))
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
-                               "DMA request route is invalid");
-    if (!pasid_valid && pasid != 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "invalid PASID must be zero");
+    if (function_h == null || function_h.kind != RDMA_RESOURCE_FUNCTION) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "DMA request Function is invalid"
+      );
+      return normalize_validation_status(status, "Function validation");
+    end
+    if (function_h.generation == 0) begin
+      status = rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "DMA request Function generation is zero"
+      );
+      return normalize_validation_status(status, "Function generation");
+    end
+    if (route_valid && !rdma_route_key_valid(route)) begin
+      status = rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "DMA request route is invalid"
+      );
+      return normalize_validation_status(status, "route validation");
+    end
+    if (!pasid_valid && pasid != 0) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "invalid PASID must be zero"
+      );
+      return normalize_validation_status(status, "PASID validation");
+    end
     if (owner_h != null) begin
       status = rdma_handle_owner_status(owner_h, function_h);
+      status = normalize_validation_status(status, "owner validation");
       if (!status.ok())
         return status;
     end
-    return rdma_status::success();
+    status = rdma_status::success();
+    return normalize_validation_status(status, "success construction");
   endfunction
 
   // 功能：将 rhs 中 rdma_dma_request_context 的值字段复制到当前对象，建立与源对象隔离的快照。

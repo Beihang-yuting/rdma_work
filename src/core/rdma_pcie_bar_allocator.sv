@@ -62,16 +62,58 @@ class rdma_pcie_bar_allocator extends uvm_object;
   endfunction
 
   // 功能：构造统一 allocator 状态码并标记 PCIe 来源，供调用方诊断失败阶段。
-  // 输入/输出及副作用：code/message（输入）；返回 detached rdma_status，不修改资源账本。
-  // 失败/边界：该函数不掩盖原始错误码，也不对 message 做重试或降级处理。
+  // 输入/输出及副作用：code/message（输入）；返回 detached rdma_status，不修改资源账本；
+  //   status factory 失败时在本地安装等值 fallback。
+  // 失败/边界：该函数不掩盖原始错误码，也不对 message 做重试或降级处理；null/错误
+  //   status override 只影响对象来源，不得把业务错误码改成成功。
   protected function automatic rdma_status make_status(
     rdma_status_code_e code,
     string message
   );
     rdma_status result;
-    result = rdma_status::make(code, message);
+    uvm_object raw_result;
+
+    // 不经 typed registry::create()，避免 status factory 的 null/错误 override
+    // 在 allocator 已经拒绝请求后再升级成 FCTTYP fatal。
+    raw_result = factory_create_object_nonfatal(rdma_status::get_type(),
+                                                "pcie_allocator_status");
+    if (raw_result == null || !$cast(result, raw_result))
+      result = new("pcie_allocator_status_fallback");
+    result.category = rdma_status::category_for(code);
+    result.code = code;
+    result.hardware_code = '0;
+    result.hardware_code_valid = 1'b0;
     result.source_engine = RDMA_ENGINE_PCIE;
+    result.function_uid = '0;
+    result.generation = '0;
+    result.resource_id = '0;
+    result.command_id = '0;
+    result.wr_id = '0;
+    result.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO
+                                           : RDMA_SEVERITY_ERROR;
+    result.retryable = 1'b0;
+    result.message = message;
     return result;
+  endfunction
+
+  // 功能：通过 UVM raw factory 创建 allocator 需要的对象，绕过 typed registry
+  //   在 null/错误动态类型时产生的 FCTTYP fatal。
+  // 输入/输出及副作用：requested_type、name（输入）；返回原始 uvm_object，不修改
+  //   aperture、next_lease_id 或 lease 账本，也不转移 factory wrapper 所有权。
+  // 失败/边界：requested_type 或全局 factory 为空、factory 返回 null 时返回 null；
+  //   返回对象的类型转换由调用方显式执行，不能把失败对象当作 lease/status 使用。
+  protected function uvm_object factory_create_object_nonfatal(
+    uvm_object_wrapper requested_type,
+    string name
+  );
+    uvm_factory factory;
+
+    if (requested_type == null)
+      return null;
+    factory = uvm_factory::get();
+    if (factory == null)
+      return null;
+    return factory.create_object_by_type(requested_type, "", name);
   endfunction
 
   // 功能：配置全局 64-bit MMIO aperture，并清空旧 lease，建立新的分配代际。
@@ -181,6 +223,8 @@ class rdma_pcie_bar_allocator extends uvm_object;
     bit [64:0] aperture_span_wide;
     rdma_pcie_bar_lease conflict;
     rdma_pcie_bar_lease created;
+    uvm_object raw_created;
+    longint unsigned candidate_lease_id;
 
     lease = null;
     if (!configured)
@@ -204,6 +248,9 @@ class rdma_pcie_bar_allocator extends uvm_object;
     if ({1'b0, size} > aperture_span_wide)
       return make_status(RDMA_SC_RESOURCE_EXHAUSTED,
                          "PCIe BAR size exceeds aperture");
+    if (next_lease_id == 0)
+      return make_status(RDMA_SC_RESOURCE_EXHAUSTED,
+                         "PCIe BAR lease ID space is exhausted");
 
     candidate = aperture_base.value;
     for (int unsigned attempt = 0; attempt <= m_leases.size() + 1; attempt++) begin
@@ -218,15 +265,33 @@ class rdma_pcie_bar_allocator extends uvm_object;
         return make_status(RDMA_SC_RESOURCE_EXHAUSTED,
                            "PCIe BAR lease exceeds aperture");
       if (!find_overlap(aligned, size, conflict)) begin
-        created = rdma_pcie_bar_lease::type_id::create(
-          $sformatf("bar_lease_%0d", next_lease_id));
-        created.lease_id = next_lease_id++;
+        // 先在本地 candidate 中完成 factory/type 检查和字段填充；只有全部
+        // 校验通过后才写入 m_leases、推进 next_lease_id 和发布 output lease。
+        candidate_lease_id = next_lease_id;
+        raw_created = factory_create_object_nonfatal(
+          rdma_pcie_bar_lease::get_type(),
+          $sformatf("bar_lease_%0d", candidate_lease_id)
+        );
+        if (raw_created == null || !$cast(created, raw_created))
+          return make_status(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            "PCIe BAR lease factory returned null or wrong type"
+          );
+        // Lease 是 allocator 的内部值对象，不提供可覆盖 subtype 的扩展契约；
+        // 即使派生对象可 cast 到 base，也必须拒绝，避免未知字段/行为进入账本。
+        if (created.get_object_type() != rdma_pcie_bar_lease::get_type())
+          return make_status(
+            RDMA_SC_INVALID_STATE,
+            "PCIe BAR lease factory returned unsupported subtype"
+          );
+        created.lease_id = candidate_lease_id;
         created.owner_pf_bdf = owner_pf_bdf;
         created.base.value = aligned;
         created.size = size;
         created.alignment = alignment;
         created.active = 1'b1;
         m_leases.push_back(created);
+        next_lease_id = candidate_lease_id + 1'b1;
         lease = created;
         return make_status(RDMA_SC_OK, "PCIe BAR lease allocated");
       end

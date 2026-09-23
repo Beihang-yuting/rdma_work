@@ -1,11 +1,13 @@
 // 目录：核心执行层 core/rdma_cmq_engine.sv。
-// 职责：实现 rdma_cmq_engine 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：管理 CMQ backing、ring/slot 账本、提交/完成/恢复状态，并在 prepare
+//   生命周期安装无状态 transport facade。
+// 依赖：依赖 CMQ model/profile、Host-memory adapter、doorbell scheduler、
+//   rdma_cmq_transport 与共享 submission evidence。
+// 所有权与生命周期：engine 拥有本地锁、快照、账本和每次 prepare 新建的
+//   facade；Host-memory/profile/scheduler 是非拥有引用，backing 由 adapter 管理。
 
-// 中文说明：rdma_cmq_engine.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
+// 设计说明：slot 状态只描述 CMQ ring 中单个位置的可回收阶段；完整的
+//   publication/recovery authority 仍由 engine 的 journal、counter 和锁共同维护。
 typedef enum bit [2:0] {
   CMQ_SLOT_FREE,
   CMQ_SLOT_PUBLISHED,
@@ -14,6 +16,68 @@ typedef enum bit [2:0] {
   CMQ_SLOT_LATE_COMPLETED,
   CMQ_SLOT_RESET_CANCELLED
 } rdma_cmq_slot_state_e;
+
+// 功能：把完整 Function incarnation 与 engine/batch 单调身份编码为固定宽度、
+//   小写十六进制的外部 journal key，避免同 route 或同 Function 的 engine 实例串线。
+// 输入/输出及副作用：identity、engine_instance_id、engine_incarnation 和 batch_id
+//   为只读输入；batch_key/failure_reason 入口清空，成功仅发布 batch_key。
+// 失败/边界：identity 为空、runtime subtype/route/UID/generation 非法，或三个
+//   engine/batch 标量任一为零时返回 0；不保留 partial key、不调用 factory。
+function automatic bit rdma_cmq_format_batch_key(
+  input rdma_function_identity identity,
+  input longint unsigned engine_instance_id,
+  input longint unsigned engine_incarnation,
+  input longint unsigned batch_id,
+  output string batch_key,
+  output string failure_reason
+);
+  batch_key = "";
+  failure_reason = "";
+  if (identity == null ||
+      identity.get_object_type() != rdma_function_identity::get_type() ||
+      !rdma_cmq_identity_shape_valid(identity)) begin
+    failure_reason = "CMQ batch Function identity is invalid or unsupported";
+    return 1'b0;
+  end
+  if (engine_instance_id == 0) begin
+    failure_reason = "CMQ batch engine instance ID is zero";
+    return 1'b0;
+  end
+  if (engine_incarnation == 0) begin
+    failure_reason = "CMQ batch engine incarnation is zero";
+    return 1'b0;
+  end
+  if (batch_id == 0) begin
+    failure_reason = "CMQ batch ID is zero";
+    return 1'b0;
+  end
+
+  batch_key = $sformatf(
+    {"root=%04h|host=%08h|kind=%01h|parent=%04h:%02h:%02h.%01h|",
+     "vf=%04h|bdf=%04h:%02h:%02h.%01h|gfid=%08h|uid=%016h|",
+     "gen=%08h|reset=%016h|engine=%016h|inc=%016h|batch=%016h"},
+    identity.key.root_id,
+    identity.key.host_topology_key,
+    identity.key.function_kind,
+    identity.key.parent_pf_bdf.segment,
+    identity.key.parent_pf_bdf.bus,
+    identity.key.parent_pf_bdf.device,
+    identity.key.parent_pf_bdf.function_num,
+    identity.key.vf_index,
+    identity.key.bdf.segment,
+    identity.key.bdf.bus,
+    identity.key.bdf.device,
+    identity.key.bdf.function_num,
+    identity.global_function_id,
+    identity.function_uid,
+    identity.generation,
+    identity.reset_epoch,
+    engine_instance_id,
+    engine_incarnation,
+    batch_id
+  );
+  return 1'b1;
+endfunction
 
 class rdma_cmq_slot_record extends uvm_object;
   `uvm_object_utils(rdma_cmq_slot_record)
@@ -25,10 +89,17 @@ class rdma_cmq_slot_record extends uvm_object;
   rdma_cmq_ticket ticket;
   rdma_cmq_expected_response expected;
   bit [4:0] command_token;
+  // 设计说明：runtime slot 只保存到 retained journal authority 的稳定定位值；
+  //   batch_key 与压缩后的 item 下标必须成对安装，禁止从 request_index 或
+  //   当前 Function/runtime 重新推断，以免 timeout/reset 跨批次回写。
+  string batch_key;
+  int unsigned journal_item_index;
 
-  // 功能：构造 rdma_cmq_slot_record，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：slot_sequence=0；sq_index=0；sq_wrap=1'b0；state=CMQ_SLOT_FREE；ticket=null；expected=null；command_token='0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_cmq_slot_record 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造空闲 slot record，并把 journal locator 初始化为空 key/零下标。
+  // 输入/输出及副作用：name 传给 uvm_object；清零 slot/ticket/token/locator，
+  //   不登记 runtime 或 retained journal 行。
+  // 失败/边界：默认对象没有发布 authority；batch_key 为空时即使下标为零也
+  //   不能定位 journal，不接管 Host-memory、PCIe 或 manager 生命周期。
   function new(string name = "rdma_cmq_slot_record");
     super.new(name);
     slot_sequence = 0;
@@ -38,6 +109,8 @@ class rdma_cmq_slot_record extends uvm_object;
     ticket = null;
     expected = null;
     command_token = '0;
+    batch_key = "";
+    journal_item_index = 0;
   endfunction
 
   // 功能：将 rhs 中 rdma_cmq_slot_record 的值字段复制到当前对象，建立与源对象隔离的快照。
@@ -65,9 +138,387 @@ class rdma_cmq_slot_record extends uvm_object;
                    "CMQ slot expected response clone mismatch")
     end
     command_token = rhs_record.command_token;
+    batch_key = rhs_record.batch_key;
+    journal_item_index = rhs_record.journal_item_index;
   endfunction
 endclass
 
+// 设计说明：单项预分配发布值把 journal request index 与既有 slot/registry
+//   发布键绑定；它只由 engine 锁内拥有，不形成第二份提交 authority。
+class rdma_cmq_preallocated_publish_item extends uvm_object;
+  `uvm_object_utils(rdma_cmq_preallocated_publish_item)
+
+  int unsigned request_index;
+  rdma_cmq_slot_record slot_record;
+  string command_key;
+  string entry_key;
+  bit [4:0] command_token;
+
+  // 功能：构造空的 CMQ 预分配发布单项，等待原子安装入口填入完整 slot 与键。
+  // 输入/输出及副作用：name 传给 uvm_object；清零 request/token 并清空引用和文本。
+  // 失败/边界：默认对象是 partial value，不能安装或发布到 runtime registry。
+  function new(string name = "rdma_cmq_preallocated_publish_item");
+    super.new(name);
+    request_index = 0;
+    slot_record = null;
+    command_key = "";
+    entry_key = "";
+    command_token = '0;
+  endfunction
+endclass
+
+// 设计说明：批次预分配发布值保存 authentic MMIO arm 原子提交所需的固定
+//   sequence/profile 格式和有序单项；安装后由 arm 消费，PRE rollback、
+//   journal 删除或 reset 也会回收。arm 后 journal 仍可继续保留恢复证据。
+class rdma_cmq_preallocated_publish_batch extends uvm_object;
+  `uvm_object_utils(rdma_cmq_preallocated_publish_batch)
+
+  string batch_key;
+  longint unsigned attempt_id;
+  longint unsigned final_sequence;
+  bit profile_format_valid;
+  rdma_byte_endian_e profile_endian;
+  int unsigned profile_hardware_version;
+  rdma_cmq_preallocated_publish_item items[$];
+
+  // 功能：构造空的 CMQ 批次预分配发布值，默认没有有效 profile 格式或单项。
+  // 输入/输出及副作用：name 传给 uvm_object；清空 key/items 并将计数与格式置零。
+  // 失败/边界：默认对象不能安装；必须与同批 journal record 一一匹配后才可发布。
+  function new(string name = "rdma_cmq_preallocated_publish_batch");
+    super.new(name);
+    batch_key = "";
+    attempt_id = 0;
+    final_sequence = 0;
+    profile_format_valid = 1'b0;
+    profile_endian = RDMA_ENDIAN_LITTLE;
+    profile_hardware_version = 0;
+    items.delete();
+  endfunction
+endclass
+
+// 设计说明：reset candidate 把每个将被隔离的 runtime slot 与其 retained
+//   journal item 的稳定定位、取消 completion 一起预建；它不拥有 runtime
+//   registry，commit 前不会把任何句柄写回 engine。
+class rdma_cmq_reset_item_candidate extends uvm_object;
+  `uvm_object_utils(rdma_cmq_reset_item_candidate)
+
+  string batch_key;
+  // The journal index is the compressed, admitted-item position.  It is
+  // deliberately separate from request_index, which is caller supplied and
+  // may contain gaps after local rejection.
+  int unsigned journal_item_index;
+  int unsigned request_index;
+  int unsigned slot_index;
+  string command_key;
+  string entry_key;
+  rdma_cmq_completion cancellation_completion;
+
+  // 功能：构造一个未绑定 journal 的 reset 单项候选，清空定位键和取消结果。
+  // 输入/输出及副作用：name 仅设置 UVM 名称；本构造不修改 engine ledger，也不取得外部 backing 所有权。
+  // 失败/边界：默认候选没有 batch/slot authority，不能直接提交；调用方必须在 release 前完成全部字段校验。
+  function new(string name = "rdma_cmq_reset_item_candidate");
+    super.new(name);
+    batch_key = "";
+    journal_item_index = 0;
+    request_index = 0;
+    slot_index = 0;
+    command_key = "";
+    entry_key = "";
+    cancellation_completion = null;
+  endfunction
+endclass
+
+// 设计说明：reset batch candidate 保存一个 batch 的旧 journal 行、完整 proof
+//   和 detached 返回 proof；proof 只在 backing release 成功后安装到 retained row。
+class rdma_cmq_reset_batch_candidate extends uvm_object;
+  `uvm_object_utils(rdma_cmq_reset_batch_candidate)
+
+  string batch_key;
+  rdma_cmq_batch_submission_record quarantined_record;
+  rdma_cmq_reset_isolation_proof journal_proof;
+  rdma_cmq_reset_isolation_proof returned_proof;
+  rdma_cmq_submission_state_e reduced_state;
+
+  // 功能：构造一个未提交的 reset batch 候选，初始化 proof/record 句柄和 reducer 结果。
+  // 输入/输出及副作用：name 仅设置 UVM 名称；构造不插入 journal、不推进 proof counter。
+  // 失败/边界：空 batch_key 或 null proof/record 只能作为 staging 中间值，不能进入 commit。
+  function new(string name = "rdma_cmq_reset_batch_candidate");
+    super.new(name);
+    batch_key = "";
+    quarantined_record = null;
+    journal_proof = null;
+    returned_proof = null;
+    reduced_state = RDMA_CMQ_SUBMISSION_STAGED;
+  endfunction
+endclass
+
+// 设计说明：reset candidate 是 release 前唯一的本地事务图，聚合旧 backing
+//   authority、逐项取消结果、逐 batch proof 及 caller 输出；commit 只消费这张图。
+class rdma_cmq_reset_candidate extends uvm_object;
+  `uvm_object_utils(rdma_cmq_reset_candidate)
+
+  rdma_function_identity isolated_identity;
+  rdma_dma_mapping backing_release_authority;
+  // Non-owning pre-release witnesses used only to revalidate the engine after
+  // the adapter call returns.  The detached authority above is the sole value
+  // passed to release; these handles never become engine-reachable state.
+  rdma_dma_mapping runtime_backing_mapping;
+  rdma_host_mem_api backing_release_service;
+  rdma_host_mem_api runtime_host_mem;
+  bit backing_release_opaque;
+  rdma_cmq_engine_state_e runtime_state;
+  longint unsigned engine_incarnation;
+  longint unsigned runtime_publish_seq;
+  longint unsigned runtime_retire_seq;
+  longint unsigned runtime_cq_consume_seq;
+  longint unsigned runtime_batch_id_counter;
+  longint unsigned runtime_attempt_id_counter;
+  longint unsigned runtime_reset_proof_id_counter;
+  int unsigned runtime_journal_count;
+  int unsigned runtime_ticket_index_count;
+  int unsigned runtime_preallocation_count;
+  int unsigned runtime_observer_count;
+  int unsigned runtime_slot_count;
+  int unsigned runtime_token_count;
+  int unsigned runtime_command_count;
+  int unsigned runtime_entry_count;
+  int unsigned runtime_terminal_fifo_count;
+  int unsigned runtime_diagnostic_fifo_count;
+  int unsigned runtime_late_fifo_count;
+  string runtime_fenced_batch_key;
+  string runtime_fence_reason;
+  rdma_cmq_reset_item_candidate items[$];
+  rdma_cmq_reset_batch_candidate batches[$];
+  rdma_cmq_completion returned_completions[$];
+
+  // 功能：构造空 reset candidate，准备承载旧 incarnation 的 detached staging 图。
+  // 输入/输出及副作用：name 仅设置 UVM 名称；所有队列清空，不触碰 engine 或 Host-memory。
+  // 失败/边界：默认 candidate 不含 release authority，不能调用 release/commit；失败 staging 必须整体丢弃。
+  function new(string name = "rdma_cmq_reset_candidate");
+    super.new(name);
+    isolated_identity = null;
+    backing_release_authority = null;
+    runtime_backing_mapping = null;
+    backing_release_service = null;
+    runtime_host_mem = null;
+    backing_release_opaque = 1'b0;
+    runtime_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
+    engine_incarnation = 0;
+    runtime_publish_seq = 0;
+    runtime_retire_seq = 0;
+    runtime_cq_consume_seq = 0;
+    runtime_batch_id_counter = 0;
+    runtime_attempt_id_counter = 0;
+    runtime_reset_proof_id_counter = 0;
+    runtime_journal_count = 0;
+    runtime_ticket_index_count = 0;
+    runtime_preallocation_count = 0;
+    runtime_observer_count = 0;
+    runtime_slot_count = 0;
+    runtime_token_count = 0;
+    runtime_command_count = 0;
+    runtime_entry_count = 0;
+    runtime_terminal_fifo_count = 0;
+    runtime_diagnostic_fifo_count = 0;
+    runtime_late_fifo_count = 0;
+    runtime_fenced_batch_key = "";
+    runtime_fence_reason = "";
+    items.delete();
+    batches.delete();
+    returned_completions.delete();
+  endfunction
+endclass
+
+typedef class rdma_cmq_engine;
+
+// 设计说明：observer 是 scheduler 进入 MMIO_MAYBE_VISIBLE 前的一次性
+//   capability；它仅保存 engine 非拥有句柄和冻结标量，真实 authority
+//   由 engine 内 exact-object registry 与 journal 联合认证。
+class rdma_cmq_mmio_arm_observer
+  extends rdma_doorbell_submission_observer;
+  local rdma_cmq_engine owner;
+  local string capability_key;
+  local string batch_key;
+  local longint unsigned attempt_id;
+  local longint unsigned engine_incarnation;
+  local bit configured;
+
+  // 功能：构造尚未配置的 MMIO arm observer，建立空 authority 起点。
+  // 输入/输出及副作用：name 传给父类；owner/key 清空，ID 和 configured 清零。
+  // 失败/边界：构造不登记 capability、不取得 engine 所有权；configure 成功前
+  //   回调只能报稳定非法调用诊断。
+  function new(string name = "rdma_cmq_mmio_arm_observer");
+    super.new(name);
+    owner = null;
+    capability_key = "";
+    batch_key = "";
+    attempt_id = 0;
+    engine_incarnation = 0;
+    configured = 1'b0;
+  endfunction
+
+  // 功能：一次性冻结 observer 的 owner、capability/batch key 和 attempt/incarnation。
+  // 输入/输出及副作用：五个 *_arg 为输入；首次完整配置时写入
+  //   local 字段并返回 OK，owner_arg 仍由外部拥有。
+  // 失败/边界：已配置返回 RESOURCE_BUSY；null owner、空 key 或零 ID
+  //   返回 INVALID_ARGUMENT，两类失败均不改写任何 local 字段。
+  function rdma_status configure(
+    input rdma_cmq_engine owner_arg,
+    input string capability_key_arg,
+    input string batch_key_arg,
+    input longint unsigned attempt_id_arg,
+    input longint unsigned engine_incarnation_arg
+  );
+    if (configured)
+      return rdma_cmq_direct_status(
+        RDMA_SC_RESOURCE_BUSY, "CMQ MMIO arm observer is already configured"
+      );
+    if (owner_arg == null || capability_key_arg.len() == 0 ||
+        batch_key_arg.len() == 0 || attempt_id_arg == 0 ||
+        engine_incarnation_arg == 0)
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ MMIO arm observer configuration is incomplete"
+      );
+
+    owner = owner_arg;
+    capability_key = capability_key_arg;
+    batch_key = batch_key_arg;
+    attempt_id = attempt_id_arg;
+    engine_incarnation = engine_incarnation_arg;
+    configured = 1'b1;
+    return rdma_cmq_direct_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：查询 configure() 是否已成功冻结完整 capability 字段。
+  // 输入/输出及副作用：无输入；只读并返回 configured，不修改 observer。
+  // 失败/边界：初始或失败 configure 后返回 0，不根据其他字段推测。
+  function bit is_configured();
+    return configured;
+  endfunction
+
+  // 功能：返回 configure() 冻结的 engine 非拥有 owner 句柄供 identity 认证。
+  // 输入/输出及副作用：无输入；只读 owner 并返回 exact handle。
+  // 失败/边界：未配置时返回 null，不接管 engine 生命周期。
+  function rdma_cmq_engine owner_handle();
+    return owner;
+  endfunction
+
+  // 功能：返回冻结的 registry capability key 值供 exact-row 查找。
+  // 输入/输出及副作用：无输入；只读 capability_key，不修改 registry。
+  // 失败/边界：未配置时返回空字符串，字符串知识本身不授权。
+  function string get_capability_key();
+    return capability_key;
+  endfunction
+
+  // 功能：返回冻结的 journal batch key 值供 record 查找。
+  // 输入/输出及副作用：无输入；只读 batch_key，不查询 engine 状态。
+  // 失败/边界：未配置时返回空字符串，不用 key 重建 owner authority。
+  function string get_batch_key();
+    return batch_key;
+  endfunction
+
+  // 功能：返回冻结的 submission attempt ID 供 journal tuple 认证。
+  // 输入/输出及副作用：无输入；只读 attempt_id，不推进 engine counter。
+  // 失败/边界：未配置时返回零，零值不是有效 authority。
+  function longint unsigned get_attempt_id();
+    return attempt_id;
+  endfunction
+
+  // 功能：返回冻结的 engine incarnation 供拒绝 reset/reprepare 后旧能力。
+  // 输入/输出及副作用：无输入；只读 engine_incarnation，无外部副作用。
+  // 失败/边界：未配置时返回零，不回退查询 owner 当前代际。
+  function longint unsigned get_engine_incarnation();
+    return engine_incarnation;
+  endfunction
+
+  // 功能：在 scheduler 即将使 MMIO 可见时同步委托 owner 消费本 capability。
+  // 输入/输出及副作用：无输入/返回值；配置完整时传入 this，
+  //   由 owner 原子安装预分配 runtime 账本。
+  // 失败/边界：未配置或 null owner 只发布稳定 UVM_ERROR 并返回，
+  //   不解引用 owner；实现不得等待、分配、取锁或重入 scheduler/service。
+  extern virtual function void before_mmio_maybe_visible();
+endclass
+
+// 设计说明：observed submit 只在一次持锁提交中暂存 transport 原始证据与
+//   分类结果；operation_status 是本次调用独占的直接复制值，其他字段是纯标量。
+//   这里不保存 journal、observer 或外部服务句柄，PRE rollback 与最终账本
+//   写入仍由 engine 的 submit task 在原有提交点完成。
+typedef struct {
+  rdma_status operation_status;
+  rdma_status_code_e observation_code;
+  string observation_message;
+  rdma_submission_effect_e raw_effect;
+  bit rollback_pre;
+  rdma_cmq_submission_state_e state;
+  rdma_submission_effect_e cumulative_effect;
+  rdma_submission_effect_e attempt_effect;
+  bit publication_retry_safe;
+} rdma_cmq_submit_transport_decision_t;
+
+// 设计说明：逐项 candidate staging 在 submit_batch_observed 的同一锁内持有
+//   两个尚未安装的候选句柄、依赖队列和格式/失败游标。struct 本身不是 UVM
+//   对象或第二份 journal；候选对象仍由调用方创建，函数仅在调用期间借用。
+//   函数结束后把借用候选对象中暂存的条目、dependencies 与格式交给原
+//   task 的后续阶段；失败时整图随本次调用丢弃，不能留在持久账本中。
+typedef struct {
+  rdma_cmq_batch_submission_record record_candidate;
+  rdma_cmq_preallocated_publish_batch preallocated_candidate;
+  rdma_doorbell_dependency dependencies[$];
+  bit staged_profile_format_valid;
+  rdma_byte_endian_e staged_profile_endian;
+  int unsigned staged_profile_hardware_version;
+  rdma_status transaction_status;
+  bit transaction_failed;
+} rdma_cmq_submit_candidate_stage_t;
+
+// 设计说明：RETRY candidate staging 只在唯一 recovery 调用内借用 descriptor、
+//   dependency、observer 和 deadline 证据；它不是 journal/runtime 第二份账本。
+//   helper 成功后由原 task 在同一锁内执行 expected-attempt 重验和 CAS，失败时
+//   candidate 图不进入 engine registry，保留 pre-MMIO 的可回收生命周期。
+typedef struct {
+  rdma_doorbell_dependency dependencies[$];
+  rdma_doorbell_desc doorbell_snapshot_desc;
+  rdma_cmq_mmio_arm_observer observer;
+  longint unsigned candidate_attempt;
+  time minimum_remaining;
+  string capability_key;
+} rdma_cmq_recovery_candidate_stage_t;
+
+// 设计说明：expiry candidate stage 把逐 slot 的 timeout completion 与 journal
+//   detached 图集中保存，确保后续 slot 的 snapshot/reducer 失败时不会提前写入
+//   engine ledger。它只是锁内调用期 context，不拥有 slot、journal 或 FIFO。
+typedef struct {
+  rdma_cmq_slot_record staged_records[$];
+  rdma_cmq_completion staged_completions[$];
+  rdma_cmq_batch_submission_record staged_batches[$];
+  rdma_cmq_batch_submission_item_record staged_items[$];
+  rdma_cmq_completion staged_journal_completions[$];
+  rdma_cmq_submission_state_e staged_batch_states[$];
+  bit staged_recovery_required[$];
+  string staged_command_keys[$];
+} rdma_cmq_expiry_candidate_stage_t;
+
+// 设计说明：generation-cancel candidate stage 只保存严格取消路径中由
+//   PUBLISHED slot 预建的 completion、retained journal transition 和 exact
+//   command key；它不承担 poison/shutdown 清账，也不形成第二份 runtime ledger。
+//   所有句柄均在同一把 engine_lock 下借用，只有原 cancel 函数的 commit loop
+//   才能把这些候选写回 journal、FIFO、registry 与 slot state。
+typedef struct {
+  rdma_cmq_slot_record staged_records[$];
+  rdma_cmq_completion staged_completions[$];
+  rdma_cmq_batch_submission_record staged_batches[$];
+  rdma_cmq_batch_submission_item_record staged_items[$];
+  rdma_cmq_completion staged_journal_completions[$];
+  rdma_cmq_submission_state_e staged_batch_states[$];
+  bit staged_recovery_required[$];
+  string staged_command_keys[$];
+} rdma_cmq_generation_cancel_candidate_stage_t;
+
+// 设计说明：engine 是 CMQ runtime、journal、fence 与复位代际的唯一可变
+//   所有者；snapshot/value helper 不另建账本。每次 prepare 新建的 transport
+//   facade 由 engine 持有；Host-memory/profile/scheduler 是非拥有的配置期引用，
+//   任何发布须先通过锁内身份检查。
 class rdma_cmq_engine extends uvm_object;
   `uvm_object_utils(rdma_cmq_engine)
 
@@ -85,6 +536,7 @@ class rdma_cmq_engine extends uvm_object;
   protected rdma_dma_mapping backing_mapping;
   protected rdma_host_mem_api host_mem;
   protected rdma_doorbell_scheduler scheduler;
+  protected rdma_cmq_transport transport;
   protected rdma_cmq_hw_profile profile;
   protected longint unsigned publish_seq;
   protected longint unsigned retire_seq;
@@ -102,6 +554,10 @@ class rdma_cmq_engine extends uvm_object;
   // retried through the adapter's opaque allocation identity.  This bit is
   // retained only while the engine is POISONED with unreleased backing.
   protected bit backing_release_opaque;
+  // reset_observed owns an external release window; while set, every public
+  // lifecycle mutator must fail closed so no runtime graph can drift between
+  // candidate staging and allocation-free commit.
+  protected bit reset_release_in_progress;
   // The fixed CMQ profile API has no separate raw-CQE metadata hook.  A
   // profile therefore owns one endian/hardware-version format across its
   // SQE and CQE images.  Only a scheduler-successful batch may establish
@@ -109,12 +565,39 @@ class rdma_cmq_engine extends uvm_object;
   protected bit profile_image_format_valid;
   protected rdma_byte_endian_e profile_image_endian;
   protected int unsigned profile_hardware_version;
+  // journal identity counters are monotonic for the complete UVM-object
+  // lifetime.  The four tables and fence are protected by engine_lock and
+  // deliberately survive reset/reprepare while a retained row exists.
+  protected longint unsigned engine_instance_id;
+  protected longint unsigned engine_incarnation;
+  protected longint unsigned batch_id_counter;
+  protected longint unsigned attempt_id_counter;
+  protected longint unsigned reset_proof_id_counter;
+  protected rdma_cmq_batch_submission_record submission_journal[string];
+  protected string journal_batch_by_ticket[string];
+  protected rdma_cmq_preallocated_publish_batch
+    preallocated_publish_batches[string];
+  // 预分配 observer 行仅以 exact object identity 授权；字符串字段只是
+  //   查找键，成功 arm 与对应 preallocation 在同一无分配函数中消费。
+  protected rdma_cmq_mmio_arm_observer arm_observers[string];
+  // Approved non-owning seam: each row retains the exact profile service
+  // used to type/canonicalize only its own record.
+  protected rdma_cmq_hw_profile journal_profile_by_batch[string];
+  protected string fenced_batch_key;
+  protected string submission_fence_reason;
 
-  // 功能：构造 rdma_cmq_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：engine_lock=new(1)；engine_state=RDMA_CMQ_ENGINE_UNCONFIGURED；prepared_binding=null；dma_context=null；cmq_snapshot=null；backing_mapping=null；host_mem=null；scheduler=null；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_cmq_engine 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 UNCONFIGURED 的 CMQ engine，冻结 UVM instance ID，并初始化
+  //   单调 journal identities、四张 retained 表、fence 与短生命周期运行账本。
+  // 输入/输出及副作用：name 传给 uvm_object；engine_instance_id 在 super.new 后
+  //   只捕获一次；本对象拥有 engine_lock/表，外部 adapter/profile 引用均置 null。
+  // 失败/边界：构造不申请 Host-memory、不创建 facade 或配置 scheduler；instance ID
+  //   后续不复位，若其为零则 batch allocator fail-closed，prepare 前业务入口拒绝。
   function new(string name = "rdma_cmq_engine");
+    int unsigned captured_instance_id;
+
     super.new(name);
+    captured_instance_id = get_inst_id();
+    engine_instance_id = captured_instance_id;
     engine_lock = new(1);
     engine_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
     prepared_binding = null;
@@ -123,6 +606,7 @@ class rdma_cmq_engine extends uvm_object;
     backing_mapping = null;
     host_mem = null;
     scheduler = null;
+    transport = null;
     profile = null;
     publish_seq = 0;
     retire_seq = 0;
@@ -130,8 +614,20 @@ class rdma_cmq_engine extends uvm_object;
     profile_image_format_valid = 1'b0;
     profile_image_endian = RDMA_ENDIAN_LITTLE;
     profile_hardware_version = 0;
+    engine_incarnation = 0;
+    batch_id_counter = 0;
+    attempt_id_counter = 0;
+    reset_proof_id_counter = 0;
+    submission_journal.delete();
+    journal_batch_by_ticket.delete();
+    preallocated_publish_batches.delete();
+    arm_observers.delete();
+    journal_profile_by_batch.delete();
+    fenced_batch_key = "";
+    submission_fence_reason = "";
     last_poison = null;
     backing_release_opaque = 1'b0;
+    reset_release_in_progress = 1'b0;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
@@ -153,18 +649,41 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：poison_status 校验 message 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：message（输入）；poison_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：poison_status 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
+  // 功能：在 reset_observed 已把 backing release 交给外部 adapter 的窗口内，
+  //   为所有会读写 runtime graph 的公开生命周期入口提供统一的 fail-closed
+  //   检查，避免 release 与后续状态提交之间出现可观察重入。
+  // 输入/输出及副作用：无外部输入；只读 reset_release_in_progress，返回独立
+  //   成功或 INVALID_STATE 状态，不修改 engine、journal、FIFO 或 adapter。
+  // 失败/边界：gate 为 1 时返回 INVALID_STATE，调用方必须在已取得
+  //   engine_lock 后立即退出；gate 为 0 时返回 OK。该 helper 不负责取锁，
+  //   也不能替代 reset_observed 对 release 结果的 CAS 重验。
+  protected function rdma_status reset_release_gate_status();
+    if (reset_release_in_progress)
+      return invalid_state(
+        "CMQ lifecycle mutation is blocked during reset backing release"
+      );
+    return rdma_status::success();
+  endfunction
+
+  // 功能：遇到 ring 或 runtime 账本不变量破坏时将 engine 标记为 POISONED，
+  //   并返回带原始诊断的 INVALID_STATE 以阻止本次提交继续执行。
+  // 输入/输出及副作用：message 为错误诊断；清空 late_final_fifo、更新
+  //   engine_state，返回新建 status，不释放外部 backing 或安装 journal。
+  // 失败/边界：即使已经 POISONED 也再次清空晚到 FIFO 并返回独立状态；
+  //   调用方必须按所属路径持锁，不可把这个状态变更当作纯值检查。
   protected function rdma_status poison_status(string message);
     late_final_fifo.delete();
     engine_state = RDMA_CMQ_ENGINE_POISONED;
     return invalid_state(message);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，ring_used 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
-  // 输入/输出及副作用：used（输出）；ring_used 读取 used 并使用字段 used，并写入 used；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：ring_used 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ publish counter precedes retire counter”；“CMQ ring occupancy exceeds depth”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 设计说明：ring counter 失序不是普通容量不足；保持原提交优先级，
+  //   在读取逐项命令前 poison engine，并丢弃可能与错误账本关联的 late final。
+  // 功能：按 publish_seq-retire_seq 计算当前占用，并拒绝计数器逆序或超深度。
+  // 输入/输出及副作用：used 入口置零；计数器正常时输出差值和 OK；
+  //   不变量破坏时调用 poison_status 清 late_final_fifo、置 POISONED。
+  // 失败/边界：publish_seq<retire_seq 时 used 保持零；差值超过 CMQ_DEPTH
+  //   时 used 保留该差值，两种情况均返回准确 INVALID_STATE，不再执行提交。
   protected function rdma_status ring_used(output longint unsigned used);
     used = 0;
     if (publish_seq < retire_seq)
@@ -214,15 +733,22 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，poll_ledger_status 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
-  // 输入/输出及副作用：used（输出）；poll_ledger_status 读取 used 并使用字段 used、status、slot_count、token_count，并写入 used；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：poll_ledger_status 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
-  //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
+  // 功能：审计 CMQ runtime 的 ring/slot/entry/command/token 粗粒度账本；
+  //   token authority 覆盖 PUBLISHED 与 TIMED_OUT_QUARANTINED，但 command
+  //   registry 只覆盖仍可正常完成的 PUBLISHED slot。
+  // 输入/输出及副作用：used 输出 publish_seq-retire_seq；函数只读
+  //   slot state、entry/command 表和 token bitmap，异常时可通过 poison_status
+  //   清理 late FIFO 并把 engine 置为 POISONED。
+  // 失败/边界：counter 逆序/超深度、slot/entry 与 used 不等、
+  //   command 数不等于 PUBLISHED 数，或 token 数不等于
+  //   PUBLISHED+TIMED_OUT_QUARANTINED 数时 fail closed；空 ring 本身合法。
   protected function rdma_status poll_ledger_status(
     output longint unsigned used
   );
     rdma_status status;
     int unsigned slot_count;
+    int unsigned published_slot_count;
+    int unsigned quarantined_slot_count;
     int unsigned token_count;
 
     used = 0;
@@ -232,16 +758,26 @@ class rdma_cmq_engine extends uvm_object;
     if (cq_consume_seq < retire_seq || cq_consume_seq > publish_seq)
       return poison_status("CMQ completion counters are inconsistent");
     slot_count = 0;
+    published_slot_count = 0;
+    quarantined_slot_count = 0;
     token_count = 0;
     foreach (slots[i]) begin
-      if (slots[i] != null)
+      if (slots[i] != null) begin
         slot_count++;
+        if (slots[i].state == CMQ_SLOT_PUBLISHED)
+          published_slot_count++;
+        else if (slots[i].state inside {
+                   CMQ_SLOT_TIMED_OUT_QUARANTINED,
+                   CMQ_SLOT_RESET_CANCELLED
+                 })
+          quarantined_slot_count++;
+      end
       if (token_in_use[i])
         token_count++;
     end
     if (slot_count != used || entry_registry.num() != used ||
-        token_count != command_registry.num() ||
-        command_registry.num() > used)
+        command_registry.num() != published_slot_count ||
+        token_count != published_slot_count + quarantined_slot_count)
       return poison_status("CMQ polling ledger is inconsistent");
     return rdma_status::success();
   endfunction
@@ -276,6 +812,46 @@ class rdma_cmq_engine extends uvm_object;
     if (status == null)
       return invalid_argument("CMQ ticket validation returned null");
     return status;
+  endfunction
+
+  // 功能：slot_ring_geometry_matches 校验 slot record 的 ring index、sequence
+  //   和 wrap 是否共同指向调用方指定的 CMQ slot，集中维护 sequence 到 ring
+  //   几何的纯值映射。
+  // 输入/输出及副作用：record、expected_index（输入）只读；函数返回 bit，
+  //   不修改 record、slot ledger、token、journal、锁或 engine 状态，也不
+  //   取得任何外部资源所有权。
+  // 失败/边界：record 为空、sq_index 超出 CMQ_DEPTH、sq_index 不等于
+  //   expected_index，或 sequence 推导出的 index/wrap 与 record 不一致时返回 0；
+  //   本 helper 不执行 $isunknown、ticket trust、generation、registry、token 或
+  //   route 校验，调用方必须先保留这些门禁及其失败优先级。
+  protected function bit slot_ring_geometry_matches(
+    input rdma_cmq_slot_record record,
+    input int unsigned expected_index
+  );
+    if (record == null || record.sq_index >= CMQ_DEPTH)
+      return 1'b0;
+    return record.sq_index == expected_index &&
+           record.sq_index == (record.slot_sequence % CMQ_DEPTH) &&
+           record.sq_wrap == ((record.slot_sequence / CMQ_DEPTH) % 2);
+  endfunction
+
+  // 功能：在已完成 ticket trust 与 slot identity 门禁后，比较 slot record
+  //   和其 ticket 共同携带的 sequence/index/wrap/command-token 四元组，确认
+  //   两份定位值仍指向同一个 CMQ ring 位置和命令。
+  // 输入/输出及副作用：record 为只读 slot record；返回四元组是否逐字段相等，
+  //   不修改 record、ticket、engine ledger，也不取得任何外部资源所有权。
+  // 失败/边界：record 或 record.ticket 为空时返回 0；本函数不代替调用方的
+  //   null、$isunknown、ring geometry、generation、registry、token 或 route
+  //   校验，调用方必须保留这些门禁及原有错误优先级。
+  protected function bit slot_ticket_tuple_matches(
+    input rdma_cmq_slot_record record
+  );
+    if (record == null || record.ticket == null)
+      return 1'b0;
+    return record.ticket.sq_index == record.sq_index &&
+           record.ticket.slot_sequence == record.slot_sequence &&
+           record.ticket.sq_wrap == record.sq_wrap &&
+           record.ticket.command_id[4:0] == record.command_token;
   endfunction
 
   // 功能：在 rdma_cmq_engine 中，command_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
@@ -352,6 +928,7 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status validation_status;
     rdma_status snapshot_status;
+    rdma_status identity_status;
     rdma_cmq_ticket ticket_snapshot;
     uvm_object payload_snapshot;
 
@@ -413,7 +990,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：make_timeout_status 校验 ticket、message、timeout_status 与当前对象状态的一致性，并显式处理“CMQ timeout status ticket authority is missing”；“CMQ timeout status construction failed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：ticket（输入）、message（输入）、timeout_status（输出）；make_timeout_status 读取 ticket、message、timeout_status 并使用字段 timeout_status、timeout_status.source_engine、timeout_status.function_uid、timeout_status.generation、timeout_status.resource_id、timeout_status.command_id，并写入 timeout_status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：make_timeout_status 返回 RDMA_SC_TIMEOUT；具体拒绝条件包括 “CMQ timeout status ticket authority is missing”；“CMQ timeout status construction failed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status make_timeout_status(
     rdma_cmq_ticket ticket,
@@ -574,9 +1150,12 @@ class rdma_cmq_engine extends uvm_object;
     return -1;
   endfunction
 
-  // 功能：ticket_has_engine_authority 比较 ticket 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
+  // 功能：ticket_has_engine_authority 比较 ticket 与当前 authority/状态字段，使用
+  //   same_handle 复用 CMQ incarnation 判定，返回布尔结果供上层执行精确分支。
   // 输入/输出及副作用：ticket（输入）；ticket_has_engine_authority 读取 ticket 并使用字段 prepared_binding、cmq_snapshot、cmq_snapshot.handle、kind、function_uid、prepared_binding.function_uid、object_id、prepared_binding.global_function_id；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：ticket_has_engine_authority 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 失败/边界：ticket_has_engine_authority 的 ticket、binding、snapshot 或 CMQ
+  //   handle 前置条件不满足，或 same_handle 判定 incarnation 不一致时返回 0；
+  //   该路径不隐式重试，也不转移未声明资源。
   protected function bit ticket_has_engine_authority(
     rdma_cmq_ticket ticket
   );
@@ -588,7 +1167,7 @@ class rdma_cmq_engine extends uvm_object;
         ticket.function_h.function_uid != prepared_binding.function_uid ||
         ticket.function_h.object_id != prepared_binding.global_function_id ||
         ticket.function_h.generation != prepared_binding.generation ||
-        !ticket.cmq_h.same_instance(cmq_snapshot.handle))
+        !same_handle(ticket.cmq_h, cmq_snapshot.handle))
       return 1'b0;
     if (terminal_index(ticket) >= 0 || late_diagnostic_index(ticket) >= 0 ||
         late_final_index(ticket) >= 0 || ticket_is_outstanding(ticket))
@@ -614,6 +1193,423 @@ class rdma_cmq_engine extends uvm_object;
            command_registry[software_key] != null &&
            command_registry[software_key].ticket != null &&
            same_ticket_value(command_registry[software_key].ticket, ticket);
+  endfunction
+
+  // 设计说明：reconcile/wait 的恢复 authority 来自 retained journal，而不是
+  //   当前 command/entry registry。该 helper 把稳定 ticket index 与完整 ticket
+  //   值比较集中到一个锁内入口，避免旧 incarnation 在 reprepare 后被误判未知。
+  // 功能：按 journal_batch_by_ticket 的稳定 key 定位唯一 retained batch/item，
+  //   并验证 caller ticket 与 journal ticket 的全部公开字段相等。
+  // 输入/输出及副作用：ticket 为只读 caller 输入；batch_record/journal_item 为
+  //   engine-owned 非拥有输出，journal_item_index 输出命中的压缩下标；只读
+  //   journal/index/profile，不执行 I/O、分配或生命周期迁移。
+  // 失败/边界：ticket 为空/shape 非法、全局 index 孤立、目标 row 损坏、完整值无
+  //   匹配或多重匹配分别返回 INVALID_ARGUMENT/INVALID_STATE；所有输出保持 null/0。
+  protected function rdma_status locate_journal_item_by_ticket_locked(
+    input rdma_cmq_ticket ticket,
+    output rdma_cmq_batch_submission_record batch_record,
+    output rdma_cmq_batch_submission_item_record journal_item,
+    output int unsigned journal_item_index
+  );
+    string ticket_key;
+    string batch_key;
+    rdma_status status;
+    int unsigned match_count;
+
+    batch_record = null;
+    journal_item = null;
+    journal_item_index = 0;
+    if (!rdma_cmq_ticket_shape_valid(ticket))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal ticket locator received an invalid ticket"
+      );
+    ticket_key = command_key(ticket);
+    if (ticket_key.len() == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal ticket key is empty"
+      );
+    status = journal_ticket_index_targets_locked();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket locator index check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    if (!journal_batch_by_ticket.exists(ticket_key))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal ticket is not installed"
+      );
+    batch_key = journal_batch_by_ticket[ticket_key];
+    if (batch_key.len() == 0 || !submission_journal.exists(batch_key))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket index target is missing"
+      );
+    status = submission_journal_invariant_locked(batch_key);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket locator invariant returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    batch_record = submission_journal[batch_key];
+    if (batch_record == null || batch_record.batch_key != batch_key)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket locator batch row is inconsistent"
+      );
+    match_count = 0;
+    foreach (batch_record.items[i]) begin
+      if (batch_record.items[i] != null &&
+          same_ticket_detached_value(batch_record.items[i].ticket, ticket)) begin
+        match_count++;
+        journal_item = batch_record.items[i];
+        journal_item_index = i;
+      end
+    end
+    if (match_count == 0) begin
+      batch_record = null;
+      journal_item = null;
+      journal_item_index = 0;
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal ticket key matched but full ticket value differs"
+      );
+    end
+    if (match_count != 1) begin
+      batch_record = null;
+      journal_item = null;
+      journal_item_index = 0;
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket resolves to multiple retained items"
+      );
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：在 engine_lock 持有期间验证 observed result 与 retained journal 行的
+  //   完整身份及 state/phase/completion 组合，作为 execute 的唯一决策门禁。
+  // 输入/输出及副作用：submitted、batch_record、journal_item 为只读输入；返回
+  //   非空 status，不修改 journal 或任何 lifecycle 字段。
+  // 失败/边界：ticket、batch/attempt、Function/CMQ identity 或 retained reset
+  //   mapping 任一不一致，或 active pending 行的 incarnation/lifecycle 矛盾时
+  //   返回 INVALID_STATE；caller 的旧 status/effect/phase 只做 shape 检查，当前
+  //   lifecycle 与 operation status 以 retained journal 行为准。
+  protected function rdma_status validate_observed_item_locked(
+    input rdma_cmq_execution_result submitted,
+    input rdma_cmq_batch_submission_record batch_record,
+    input rdma_cmq_batch_submission_item_record journal_item
+  );
+    rdma_cmq_command_identity expected_command_identity;
+    rdma_status dma_status;
+    string identity_failure;
+
+    if (submitted == null || batch_record == null || journal_item == null ||
+        submitted.ticket == null || journal_item.ticket == null ||
+        batch_record.function_identity == null || batch_record.cmq_h == null ||
+        journal_item.command == null || journal_item.recovery_owner == null ||
+        journal_item.dma_context == null || journal_item.status == null ||
+        submitted.batch_key != batch_record.batch_key ||
+        submitted.batch_id != batch_record.batch_id ||
+        submitted.attempt_id != batch_record.attempt_id ||
+        batch_record.engine_instance_id != engine_instance_id ||
+        !same_ticket_detached_value(submitted.ticket, journal_item.ticket) ||
+        !same_handle_value(batch_record.cmq_h, journal_item.ticket.cmq_h) ||
+        (journal_item.completion != null &&
+         (journal_item.completion.ticket == null ||
+          journal_item.completion.status == null ||
+          !rdma_cmq_ticket_shape_valid(journal_item.completion.ticket) ||
+          !rdma_cmq_status_shape_valid(journal_item.completion.status) ||
+          !same_ticket_detached_value(journal_item.completion.ticket,
+                                      journal_item.ticket) ||
+          !same_status_value(journal_item.completion.status,
+                             journal_item.status) ||
+          journal_item.completion.ticket != journal_item.ticket ||
+          journal_item.completion.status != journal_item.status)))
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed journal identity mismatch"
+      );
+
+    // submitted 是 caller-owned detached 快照；它的 lifecycle/status/effect 可以
+    // 在取得锁前过时，但身份图、枚举 shape 和 completion 内部 alias
+    //   不能损坏。
+    if (!rdma_cmq_ticket_shape_valid(submitted.ticket) ||
+        !rdma_cmq_status_shape_valid(submitted.status) ||
+        !rdma_cmq_status_shape_valid(submitted.observation_status) ||
+        !rdma_cmq_submission_effect_valid(submitted.submission_effect) ||
+        !rdma_cmq_submission_effect_valid(submitted.attempt_effect) ||
+        !rdma_cmq_completion_phase_valid(submitted.completion_phase) ||
+        !rdma_cmq_frozen_owner_shape_valid(submitted.recovery_owner) ||
+        submitted.dma_context == null || submitted.dma_context.function_h == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted detached graph is malformed"
+      );
+    dma_status = submitted.dma_context.validate();
+    if (dma_status == null || !dma_status.ok() ||
+        !same_handle_value(submitted.dma_context.function_h,
+                           submitted.ticket.function_h))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted DMA identity is malformed"
+      );
+
+    // delegated result 可以携带旧的 state/effect 投影，但自身仍须满足基本
+    //   组合；
+    // 当前 lifecycle 与 operation status 的唯一 authority 是下方 retained row。
+    if (submitted.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        submitted.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED) begin
+      if (submitted.submission_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+          submitted.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+          submitted.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          submitted.completion != null || submitted.batch_id == 0 ||
+          submitted.attempt_id == 0)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed submitted PRE effect contradicts retained identity"
+        );
+    end
+    if (submitted.completion_phase == RDMA_CMQ_COMPLETION_UNOBSERVED &&
+        (submitted.submission_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+         submitted.attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED ||
+         submitted.completion != null ||
+         submitted.recovery_required != 1'b1))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted UNOBSERVED envelope is malformed"
+      );
+    if (submitted.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+        (submitted.completion != null ||
+         !(submitted.submission_effect inside {
+           RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+           RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+         }) || !(submitted.attempt_effect inside {
+           RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+           RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+         })))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted pending envelope is malformed"
+      );
+    if (submitted.completion != null &&
+        (submitted.completion.ticket == null || submitted.completion.status == null ||
+         !rdma_cmq_ticket_shape_valid(submitted.completion.ticket) ||
+         !rdma_cmq_status_shape_valid(submitted.completion.status) ||
+         !same_ticket_detached_value(submitted.completion.ticket,
+                                     submitted.ticket) ||
+         !same_status_value(submitted.completion.status, submitted.status) ||
+         submitted.completion.ticket != submitted.ticket ||
+         submitted.completion.status != submitted.status))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submitted completion alias is malformed"
+      );
+
+    if (!rdma_cmq_identity_shape_valid(batch_record.function_identity) ||
+        !rdma_cmq_status_shape_valid(journal_item.status) ||
+        !rdma_cmq_frozen_owner_shape_valid(journal_item.recovery_owner) ||
+        journal_item.ticket.function_h == null ||
+        !same_handle_value(journal_item.ticket.function_h,
+                           submitted.ticket.function_h) ||
+        journal_item.ticket.function_h.function_uid !=
+          batch_record.function_identity.function_uid ||
+        journal_item.ticket.function_h.object_id !=
+          batch_record.function_identity.global_function_id ||
+        journal_item.ticket.function_h.generation !=
+          batch_record.function_identity.generation ||
+        journal_item.dma_context.reset_epoch !=
+          batch_record.function_identity.reset_epoch ||
+        journal_item.dma_context.function_h == null ||
+        journal_item.dma_context.function_h.function_uid !=
+          batch_record.function_identity.function_uid ||
+        journal_item.dma_context.function_h.object_id !=
+          batch_record.function_identity.global_function_id ||
+        journal_item.dma_context.function_h.generation !=
+          batch_record.function_identity.generation ||
+        journal_item.dma_context.reset_epoch !=
+          batch_record.function_identity.reset_epoch ||
+        !same_journal_dma_context_detached_value(
+          submitted.dma_context, journal_item.dma_context
+        ) ||
+        !same_journal_owner_detached_value(
+          submitted.recovery_owner, journal_item.recovery_owner
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed Function or recovery authority mismatch"
+      );
+
+    if (batch_record.cmq_h.kind != RDMA_RESOURCE_CMQ ||
+        batch_record.cmq_h.function_uid !=
+          batch_record.function_identity.function_uid ||
+        batch_record.cmq_h.generation !=
+          batch_record.function_identity.generation ||
+        !same_handle_value(batch_record.cmq_h, submitted.ticket.cmq_h) ||
+        journal_item.dependency_mapping == null ||
+        journal_item.dependency_mapping.function_h == null ||
+        !journal_item.dependency_mapping.epoch_valid ||
+        journal_item.dependency_mapping.reset_epoch !=
+          batch_record.function_identity.reset_epoch)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed CMQ or reset mapping authority mismatch"
+      );
+
+    expected_command_identity = new("cmq_observed_expected_command_identity");
+    if (!expected_command_identity.capture_from(
+          journal_item.command, identity_failure
+        ) || submitted.command_identity == null ||
+        !same_journal_command_identity_value(
+          submitted.command_identity, expected_command_identity
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        (identity_failure.len() == 0) ?
+          "CMQ observed command identity mismatch" :
+          {"CMQ observed command identity is invalid: ", identity_failure}
+      );
+
+    if (journal_item.dependency_mapping == null ||
+        journal_item.dependency_mapping.reset_epoch !=
+          batch_record.function_identity.reset_epoch)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed DMA mapping reset evidence is stale"
+      );
+    if (!rdma_cmq_submission_state_valid(journal_item.state) ||
+        !rdma_cmq_completion_phase_valid(journal_item.completion_phase) ||
+        !rdma_cmq_submission_effect_valid(journal_item.submission_effect) ||
+        !rdma_cmq_submission_effect_valid(journal_item.attempt_effect))
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed lifecycle evidence is malformed"
+      );
+    if (journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+        } && batch_record.engine_incarnation != engine_incarnation)
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed pending incarnation mismatch"
+      );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          journal_item.completion != null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed host-visible lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_COMPLETED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_TERMINAL ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed completed lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_TIMEOUT ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed timeout lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_LATE_COMPLETED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed late lifecycle mismatch"
+        );
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED)
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_RESET_CANCELLED ||
+          journal_item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE, "CMQ observed reset lifecycle mismatch"
+        );
+    if (journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+        } && (journal_item.completion_phase != RDMA_CMQ_COMPLETION_PENDING ||
+              journal_item.completion != null))
+      return journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed pending lifecycle mismatch"
+      );
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：从 retained item 的 completion authority 生成一次全新 detached completion
+  //   snapshot，供 wait/reconcile 在 FIFO 已消费或 engine 已 reprepare 后继续读取。
+  // 输入/输出及副作用：batch_record/journal_item 为锁内只读 retained 输入，
+  //   completion 为 caller-owned 输出；使用该 batch 保存的 exact profile，绝不
+  //   借用当前 profile 或转移 journal completion 句柄。
+  // 失败/边界：batch/item/completion/profile 缺失、生命周期 phase 不含 completion、
+  //   profile snapshot seam 或 ticket/status alias 校验失败时返回非 OK 且输出 null。
+  protected function rdma_status snapshot_retained_completion_locked(
+    input rdma_cmq_batch_submission_record batch_record,
+    input rdma_cmq_batch_submission_item_record journal_item,
+    output rdma_cmq_completion completion
+  );
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    rdma_cmq_hw_profile retained_profile;
+    rdma_status status;
+
+    completion = null;
+    if (batch_record == null || journal_item == null ||
+        journal_item.completion == null || journal_item.completion.ticket == null ||
+        journal_item.completion.status == null ||
+        !journal_profile_by_batch.exists(batch_record.batch_key) ||
+        journal_profile_by_batch[batch_record.batch_key] == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ retained completion authority is incomplete"
+      );
+    retained_profile = journal_profile_by_batch[batch_record.batch_key];
+    snapshot_context = new();
+    status = snapshot_completion_with_profile_locked(
+      journal_item.completion, snapshot_context, retained_profile,
+      completion
+    );
+    if (status == null || !status.ok() || completion == null)
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ retained completion snapshot returned null status"
+      ) : journal_status(status.code, status.message);
+    if (completion.ticket == null || completion.status == null ||
+        !same_ticket_detached_value(completion.ticket, journal_item.ticket)) begin
+      completion = null;
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ retained completion snapshot ticket is inconsistent"
+      );
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：把 retained item 的 operation status 复制成 caller-owned direct status，
+  //   不触碰 completion/FIFO，也不让 caller 修改 journal status 节点。
+  // 输入/输出及副作用：journal_item 为锁内只读输入，status 为新建输出；只复制
+  //   status 的公开字段，不访问当前 runtime 或外部 adapter。
+  // 失败/边界：item/status shape 非法时返回 INVALID_STATE/null；成功结果与 retained
+  //   status 值相等但不共享对象 identity。
+  protected function rdma_status snapshot_retained_operation_status_locked(
+    input rdma_cmq_batch_submission_item_record journal_item,
+    output rdma_status status
+  );
+    status = null;
+    if (journal_item == null ||
+        !rdma_cmq_status_shape_valid(journal_item.status))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ retained operation status is null or malformed"
+      );
+    status = copy_submit_status_direct(
+      journal_item.status, "cmq_reconcile_operation_status"
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ retained operation status snapshot returned null"
+      );
+    return journal_status(RDMA_SC_OK);
   endfunction
 
   // 功能：make_late_diagnostic 创建独立的 rdma_status；根据 record、raw_cqe、diagnostic 设置字段 diagnostic、status、diagnostic.kind、diagnostic.ticket、diagnostic.raw_cqe，返回对象仅由调用方持有，不转移外部资源所有权。
@@ -780,10 +1776,17 @@ class rdma_cmq_engine extends uvm_object;
     );
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，poison 构造并发布 detached 诊断证据，清空 late-final 队列后把 engine 原子切换为 POISONED。
-  // 输入/输出及副作用：kind（输入）、message（输入）、raw_cqe（输入）、null（输入）；poison 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：poison 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
+  // 功能：在 rdma_cmq_engine 中，poison 先丢弃不可再交付的 late-final FIFO，构造
+  //   detached 诊断候选，并在候选及 last_poison 快照都成功时发布诊断后把 engine
+  //   切换为 POISONED。
+  // 输入/输出及副作用：kind、message、raw_cqe 和可选 trusted_ticket 为输入；函数
+  //   读取 prepared binding/cmq snapshot，可能清空本对象拥有的 late_final_fifo、更新
+  //   last_poison、diagnostic_fifo 和 engine_state，并返回独立 rdma_status；不取得
+  //   ticket、raw_cqe 或调用方对象的所有权。
+  // 失败/边界：primary diagnostic、无 ticket fallback 或 last_poison clone 任一步
+  //   返回 null/失败时，不安装半成品 diagnostic，保留已有 diagnostic/last_poison，
+  //   但仍 fail-closed 置 POISONED，并返回 INVALID_STATE；全部 staging 成功时返回
+  //   原始 CODEC_ERROR failure。入口清空 late_final_fifo 即使 staging 失败也不可回滚。
   protected function rdma_status poison(
     rdma_cmq_diagnostic_kind_e kind,
     string message,
@@ -807,16 +1810,18 @@ class rdma_cmq_engine extends uvm_object;
     if (trusted_ticket != null)
       failure.command_id = trusted_ticket.command_id;
 
-    // Stage both owned objects before publishing any poison state.  The FIFO
-    // item is caller-owned after poll(), while last_poison remains engine
-    // authority, so they must never share a root or nested object.
+    // Stage both owned objects before publishing a new diagnostic.  The FIFO item
+    // is caller-owned after poll(), while last_poison remains engine authority,
+    // so they must never share a root or nested object.  An unrecoverable staging
+    // failure still poisons the engine, but leaves the previous diagnostic intact.
     status = make_diagnostic(
       kind, trusted_ticket, failure, raw_cqe, diagnostic
     );
     if (status == null || !status.ok() || diagnostic == null) begin
       // If a trusted ticket was itself inconsistent, preserve raw evidence
-      // without claiming that association.  The fallback remains a complete,
-      // detached diagnostic rather than publishing a partial poison state.
+      // without claiming that association.  The fallback is a complete,
+      // detached diagnostic when it succeeds; otherwise no partial diagnostic
+      // is published and the engine remains fail-closed POISONED.
       failure.command_id = 0;
       status = make_diagnostic(
         RDMA_CMQ_DIAG_POISON, null, failure, raw_cqe, diagnostic
@@ -840,25 +1845,46 @@ class rdma_cmq_engine extends uvm_object;
     return failure;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，expire_locked 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：无显式参数；expire_locked 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：expire_locked 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ expiry slot authority is incomplete”“CMQ expiry slot ledger is inconsistent”；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status expire_locked();
+  // 设计说明：expiry 的前半段只能构造 detached timeout/journal 图，不能让一个
+  //   后续 slot 的 clone/reducer 失败留下前面 slot 的部分可见状态；提交顺序仍由
+  //   expire_locked 在全部 staging 成功后统一执行。
+  // 功能：审计 polling ledger，按 slot 顺序收集已过期 PUBLISHED row 的 timeout
+  //   completion、retained journal transition 和 command key，形成一次候选 batch。
+  // 输入/输出及副作用：stage 为调用期输出；函数读取 slot/registry/token/journal
+  //   authority，可能创建 detached completion/journal candidate，但不写共享
+  //   journal、FIFO、command registry、slot state、token 或 cursor，也不取放锁。
+  // 失败/边界：ledger、slot locator、deadline、timeout completion 或 journal
+  //   staging 任一步返回 null/non-OK 即整体失败；未过期 row 跳过，X/Z deadline
+  //   按原 authority failure 拒绝，失败时 stage 仅是不可见的局部候选。
+  protected function automatic rdma_status
+  stage_expiry_candidates_locked(
+    output rdma_cmq_expiry_candidate_stage_t stage
+  );
     rdma_status status;
     longint unsigned ledger_used;
-    rdma_cmq_slot_record staged_records[CMQ_DEPTH];
-    rdma_cmq_completion staged_completions[CMQ_DEPTH];
-    string staged_command_keys[CMQ_DEPTH];
-    int unsigned staged_tokens[CMQ_DEPTH];
-    int unsigned staged_count;
+
+    stage.staged_records.delete();
+    stage.staged_completions.delete();
+    stage.staged_batches.delete();
+    stage.staged_items.delete();
+    stage.staged_journal_completions.delete();
+    stage.staged_batch_states.delete();
+    stage.staged_recovery_required.delete();
+    stage.staged_command_keys.delete();
 
     status = poll_ledger_status(ledger_used);
     if (status == null || !status.ok())
-      return (status == null) ?
-        invalid_state("CMQ expiry ledger audit returned null status") : status;
-    staged_count = 0;
+      return (status == null) ? invalid_state(
+        "CMQ expiry ledger audit returned null status"
+      ) : status;
     foreach (slots[i]) begin
       rdma_cmq_slot_record record;
+      rdma_cmq_completion timeout_completion;
+      rdma_cmq_batch_submission_record journal_batch;
+      rdma_cmq_batch_submission_item_record journal_item;
+      rdma_cmq_completion journal_completion;
+      rdma_cmq_submission_state_e reduced_batch_state;
+      bit recovery_required;
       string software_key;
       string hardware_key;
       int unsigned token_index;
@@ -886,38 +1912,81 @@ class rdma_cmq_engine extends uvm_object;
           command_registry[software_key] != record ||
           token_index >= CMQ_DEPTH || !token_in_use[token_index])
         return invalid_state("CMQ expiry slot ledger is inconsistent");
-      status = make_timeout_completion(
-        record, staged_completions[staged_count]
+      status = make_timeout_completion(record, timeout_completion);
+      if (status == null || !status.ok() || timeout_completion == null)
+        return (status == null) ? invalid_state(
+          "CMQ timeout completion helper returned null status"
+        ) : status;
+      status = stage_runtime_journal_transition_locked(
+        record, timeout_completion,
+        RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED,
+        RDMA_CMQ_COMPLETION_TIMEOUT,
+        journal_batch, journal_item, journal_completion,
+        recovery_required, reduced_batch_state
       );
-      if (status == null || !status.ok() ||
-          staged_completions[staged_count] == null)
-        return (status == null) ?
-          invalid_state("CMQ timeout completion helper returned null status") :
-          status;
-      staged_records[staged_count] = record;
-      staged_command_keys[staged_count] = software_key;
-      staged_tokens[staged_count] = token_index;
-      staged_count++;
-    end
-
-    for (int unsigned i = 0; i < staged_count; i++) begin
-      terminal_fifo.push_back(staged_completions[i]);
-      command_registry.delete(staged_command_keys[i]);
-      token_in_use[staged_tokens[i]] = 1'b0;
-      staged_records[i].state = CMQ_SLOT_TIMED_OUT_QUARANTINED;
+      if (status == null || !status.ok())
+        return (status == null) ? invalid_state(
+          "CMQ timeout journal staging returned null status"
+        ) : status;
+      stage.staged_records.push_back(record);
+      stage.staged_completions.push_back(timeout_completion);
+      stage.staged_batches.push_back(journal_batch);
+      stage.staged_items.push_back(journal_item);
+      stage.staged_journal_completions.push_back(journal_completion);
+      stage.staged_batch_states.push_back(reduced_batch_state);
+      stage.staged_recovery_required.push_back(recovery_required);
+      stage.staged_command_keys.push_back(software_key);
     end
     return rdma_status::success();
   endfunction
 
-  // 功能：strict_cancel_ledger_status 校验 generation 与当前对象状态的一致性，并显式处理“CMQ cancel ledger audit returned null status”；“CMQ cancel ticket authority is untrusted”；“CMQ cancel slot authority is inconsistent”；“CMQ cancel entry registry is inconsistent”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：generation（输入）；strict_cancel_ledger_status 读取 generation 并使用字段 status、published_slot_count、token_count、record、hardware_key、software_key；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：strict_cancel_ledger_status 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ cancel ledger audit returned null status”；“CMQ cancel ticket authority is untrusted”；“CMQ cancel slot authority is inconsistent”；“CMQ cancel entry registry is inconsistent”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：expire_locked 根据当前证据转换 timeout 事务或恢复状态，并保持重试、
+  //   复位和所有权边界一致。
+  // 输入/输出及副作用：无显式参数；可能更新 engine-owned 状态，返回 rdma_status，
+  //   不取得调用方资源所有权。
+  // 失败/边界：返回 INVALID_STATE；slot authority、slot ledger 或候选 staging
+  //   不完整时拒绝，失败路径不提交部分状态、不隐式重试。
+  protected function rdma_status expire_locked();
+    rdma_status status;
+    rdma_cmq_expiry_candidate_stage_t stage;
+
+    status = stage_expiry_candidates_locked(stage);
+    if (status == null || !status.ok())
+      return (status == null) ? invalid_state(
+        "CMQ expiry candidate staging returned null status"
+      ) : status;
+    for (int unsigned i = 0; i < stage.staged_records.size(); i++) begin
+      // journal completion 是恢复 authority，必须先于只用于交付顺序的 FIFO 发布。
+      commit_runtime_journal_transition_locked(
+        stage.staged_batches[i], stage.staged_items[i],
+        stage.staged_journal_completions[i],
+        RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED,
+        RDMA_CMQ_COMPLETION_TIMEOUT,
+        stage.staged_recovery_required[i], stage.staged_batch_states[i]
+      );
+      terminal_fifo.push_back(stage.staged_completions[i]);
+      command_registry.delete(stage.staged_command_keys[i]);
+      stage.staged_records[i].state = CMQ_SLOT_TIMED_OUT_QUARANTINED;
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在 strict cancellation 前逐 slot 审计 generation、entry、
+  //   command 与 token 的 exact membership；PUBLISHED 和 timeout quarantine 都必须
+  //   保留各自的 token incarnation，只有 PUBLISHED 可留在 command registry。
+  // 输入/输出及副作用：generation 是待取消的 Function generation；
+  //   函数只读 runtime 账本并返回 rdma_status，损坏时 poison engine，
+  //   不构造 cancellation completion。
+  // 失败/边界：poll 粗审计失败、ticket/Function/CMQ/locator 不可信、
+  //   slot/entry/key 不一致、published command 缺失、timeout command 残留、
+  //   token bit/incarnation 不一致或总数不等时返回 INVALID_STATE 并 poison。
   protected function rdma_status strict_cancel_ledger_status(
     int unsigned generation
   );
     rdma_status status;
     longint unsigned ledger_used;
     int unsigned published_slot_count;
+    int unsigned quarantined_slot_count;
     int unsigned token_count;
 
     status = poll_ledger_status(ledger_used);
@@ -926,6 +1995,7 @@ class rdma_cmq_engine extends uvm_object;
         poison_status("CMQ cancel ledger audit returned null status") :
         status;
     published_slot_count = 0;
+    quarantined_slot_count = 0;
     token_count = 0;
     foreach (slots[i]) begin
       rdma_cmq_slot_record record;
@@ -953,16 +2023,15 @@ class rdma_cmq_engine extends uvm_object;
             CMQ_SLOT_PUBLISHED,
             CMQ_SLOT_COMPLETED,
             CMQ_SLOT_TIMED_OUT_QUARANTINED,
-            CMQ_SLOT_LATE_COMPLETED
+            CMQ_SLOT_LATE_COMPLETED,
+            CMQ_SLOT_RESET_CANCELLED
           }) ||
-          record.sq_index >= CMQ_DEPTH || record.sq_index != i ||
-          record.sq_index != (record.slot_sequence % CMQ_DEPTH) ||
-          record.sq_wrap !=
-            ((record.slot_sequence / CMQ_DEPTH) % 2) ||
-          record.ticket.sq_index != record.sq_index ||
-          record.ticket.slot_sequence != record.slot_sequence ||
-          record.ticket.sq_wrap != record.sq_wrap ||
-          record.ticket.command_id[4:0] != record.command_token ||
+          !slot_ring_geometry_matches(record, i) ||
+          !slot_ticket_tuple_matches(record) ||
+          record.batch_key.len() == 0 ||
+          !submission_journal.exists(record.batch_key) ||
+          record.journal_item_index >=
+            submission_journal[record.batch_key].items.size() ||
           record.ticket.function_h.generation != generation ||
           prepared_binding == null ||
           !prepared_binding.accepts(record.ticket.function_h) ||
@@ -979,21 +2048,116 @@ class rdma_cmq_engine extends uvm_object;
         if (!command_registry.exists(software_key) ||
             command_registry[software_key] != record ||
             record.command_token >= CMQ_DEPTH ||
-            !token_in_use[record.command_token])
+            !token_in_use[record.command_token] ||
+            token_incarnation[record.command_token] !=
+              record.ticket.command_id[63:5])
           return poison_status(
             "CMQ cancel published command ledger is inconsistent"
           );
       end
-      else if (command_registry.exists(software_key))
-        return poison_status(
-          "CMQ cancel terminal command remains in the registry"
-        );
+      else begin
+        if (command_registry.exists(software_key))
+          return poison_status(
+            "CMQ cancel terminal command remains in the registry"
+          );
+        if (record.state inside {
+              CMQ_SLOT_TIMED_OUT_QUARANTINED,
+              CMQ_SLOT_RESET_CANCELLED
+            }) begin
+          quarantined_slot_count++;
+          if (record.command_token >= CMQ_DEPTH ||
+              !token_in_use[record.command_token] ||
+              token_incarnation[record.command_token] !=
+                record.ticket.command_id[63:5])
+            return poison_status(
+              "CMQ cancel quarantined token ledger is inconsistent"
+            );
+        end
+      end
     end
     if (published_slot_count != command_registry.num() ||
-        published_slot_count != token_count)
+        published_slot_count + quarantined_slot_count != token_count)
       return poison_status(
-        "CMQ cancel published command membership is inconsistent"
+        "CMQ cancel reserved command membership is inconsistent"
       );
+    return rdma_status::success();
+  endfunction
+
+  // 功能：为严格 generation cancellation 预建所有 PUBLISHED slot 的取消
+  //   completion 与 retained journal transition，按照 slot 顺序写入 candidate。
+  // 输入/输出及副作用：generation 为已审计的当前 Function generation；stage
+  //   为输出，接收 detached completion、非拥有的 journal batch/item、recovery
+  //   reducer 结果和 command key；函数只读 slots/journal 并调用无外部 I/O 的 staging
+  //   helper，不修改 journal、FIFO、registry、token 或 slot 状态。
+  // 失败/边界：generation 不应与当前 binding 脱节；slot 数超过 CMQ_DEPTH、
+  //   make_cancel_completion 返回 null/non-OK，或 journal transition staging
+  //   失败时返回对应错误；partial stage 只存在于调用期 output，调用方不得
+  //   进入 commit loop，也不会把失败候选写入 engine-owned ledger。
+  protected function rdma_status
+  stage_generation_cancel_candidates_locked(
+    input int unsigned generation,
+    output rdma_cmq_generation_cancel_candidate_stage_t stage
+  );
+    rdma_status status;
+
+    stage.staged_records.delete();
+    stage.staged_completions.delete();
+    stage.staged_batches.delete();
+    stage.staged_items.delete();
+    stage.staged_journal_completions.delete();
+    stage.staged_batch_states.delete();
+    stage.staged_recovery_required.delete();
+    stage.staged_command_keys.delete();
+    if (prepared_binding == null)
+      return invalid_state("CMQ cancel candidate generation authority is missing");
+    if (generation != prepared_binding.generation)
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "CMQ cancel candidate generation is stale"
+      );
+
+    foreach (slots[i]) begin
+      rdma_cmq_slot_record record;
+      rdma_cmq_completion completion;
+      rdma_cmq_batch_submission_record batch_record;
+      rdma_cmq_batch_submission_item_record journal_item;
+      rdma_cmq_completion journal_completion;
+      rdma_cmq_submission_state_e reduced_batch_state;
+      bit recovery_required;
+
+      record = slots[i];
+      if (record == null || record.state != CMQ_SLOT_PUBLISHED)
+        continue;
+      if (stage.staged_records.size() >= CMQ_DEPTH)
+        return invalid_state(
+          "CMQ cancel candidate count exceeds ring depth"
+        );
+      completion = null;
+      status = make_cancel_completion(record, completion);
+      if (status == null || !status.ok() || completion == null)
+        return (status == null) ? invalid_state(
+          "CMQ cancel completion helper returned null"
+        ) : status;
+      status = stage_runtime_journal_transition_locked(
+        record, completion,
+        RDMA_CMQ_SUBMISSION_RESET_QUARANTINED,
+        RDMA_CMQ_COMPLETION_RESET_CANCELLED,
+        batch_record, journal_item, journal_completion,
+        recovery_required, reduced_batch_state
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? invalid_state(
+          "CMQ cancel journal staging returned null"
+        ) : status;
+      stage.staged_records.push_back(record);
+      stage.staged_completions.push_back(completion);
+      stage.staged_batches.push_back(batch_record);
+      stage.staged_items.push_back(journal_item);
+      stage.staged_journal_completions.push_back(journal_completion);
+      stage.staged_batch_states.push_back(reduced_batch_state);
+      stage.staged_recovery_required.push_back(recovery_required);
+      stage.staged_command_keys.push_back(command_key(record.ticket));
+    end
     return rdma_status::success();
   endfunction
 
@@ -1023,27 +2187,30 @@ class rdma_cmq_engine extends uvm_object;
         cmq_snapshot == null || cmq_snapshot.handle == null ||
         !same_handle(record.ticket.cmq_h, cmq_snapshot.handle) ||
         record.ticket.function_h.generation != generation ||
-        record.sq_index >= CMQ_DEPTH || record.sq_index != slot_index ||
-        record.sq_index != (record.slot_sequence % CMQ_DEPTH) ||
-        record.sq_wrap != ((record.slot_sequence / CMQ_DEPTH) % 2) ||
-        record.ticket.sq_index != record.sq_index ||
-        record.ticket.slot_sequence != record.slot_sequence ||
-        record.ticket.sq_wrap != record.sq_wrap ||
-        record.ticket.command_id[4:0] != record.command_token)
+        !slot_ring_geometry_matches(record, slot_index) ||
+        !slot_ticket_tuple_matches(record))
       return 1'b0;
     return 1'b1;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，cancel_generation_locked 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：generation（输入）、recover_poisoned_ledger（输入）；cancel_generation_locked 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：cancel_generation_locked 返回 RDMA_SC_STALE_GENERATION；具体拒绝条件包括 “CMQ generation authority is missing”；“CMQ cancel ledger audit returned null status”；“CMQ cancel slot authority is inconsistent”；“CMQ cancel token authority is inconsistent”；“CMQ cancel completion helper returned null”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：在 rdma_cmq_engine 中，cancel_generation_locked 先审计整张 runtime
+  //   ledger，再把仍为 PUBLISHED 的 exact journal item 转成 reset cancellation，
+  //   让旧 generation 进入 QUIESCED；timeout tombstone 与其 slot/token authority
+  //   继续保留，等待 late completion 或 observed reset 再隔离。
+  // 输入/输出及副作用：generation、recover_poisoned_ledger 为输入；严格路径先
+  //   预建 completion/journal transition，再在锁内提交 FIFO、command registry 与
+  //   slot state；poison recovery 路径仅用于 shutdown 的 best-effort 清账。
+  // 失败/边界：generation 不匹配返回 STALE_GENERATION；严格审计、slot/entry/token
+  //   authority、journal predecessor 或 completion snapshot 任一不完整时 fail closed，
+  //   不发布 FIFO、不修改 journal/runtime；timeout/reset quarantine 不会被重复取消。
   protected function rdma_status cancel_generation_locked(
     int unsigned generation,
     bit recover_poisoned_ledger
   );
     rdma_status status;
     rdma_cmq_completion staged_completions[CMQ_DEPTH];
-    bit staged_command_keys[string];
+    rdma_cmq_generation_cancel_candidate_stage_t strict_stage;
+    bit recovery_command_keys[string];
     int unsigned staged_count;
 
     if (prepared_binding == null)
@@ -1072,85 +2239,71 @@ class rdma_cmq_engine extends uvm_object;
         if (!recovery_record_is_trusted(record, i, generation))
           continue;
         software_key = command_key(record.ticket);
-        if (staged_command_keys.exists(software_key))
+        if (recovery_command_keys.exists(software_key))
           continue;
         status = make_cancel_completion(
           record, staged_completions[staged_count]
         );
         if (status != null && status.ok() &&
             staged_completions[staged_count] != null) begin
-          staged_command_keys[software_key] = 1'b1;
+          recovery_command_keys[software_key] = 1'b1;
           staged_count++;
         end
       end
     end
     else begin
-      foreach (slots[i]) begin
-        rdma_cmq_slot_record record;
-
-        record = slots[i];
-        if (record == null)
-          continue;
-        if (record.state != CMQ_SLOT_PUBLISHED)
-          continue;
-        if (record.ticket == null || record.ticket.function_h == null ||
-            record.ticket.cmq_h == null ||
-            record.ticket.function_h.generation != generation)
-          return invalid_state("CMQ cancel slot authority is inconsistent");
-        if (record.command_token >= CMQ_DEPTH ||
-            !token_in_use[record.command_token])
-          return invalid_state("CMQ cancel token authority is inconsistent");
-        status = make_cancel_completion(
-          record, staged_completions[staged_count]
-        );
-        if (status == null || !status.ok() ||
-            staged_completions[staged_count] == null)
-          return (status == null) ?
-            invalid_state("CMQ cancel completion helper returned null") :
-            status;
-        staged_count++;
-      end
+      status = stage_generation_cancel_candidates_locked(
+        generation, strict_stage
+      );
+      if (status == null || !status.ok())
+        return (status == null) ?
+          invalid_state("CMQ cancel candidate staging returned null status") :
+          status;
     end
 
-    for (int unsigned i = 0; i < staged_count; i++)
-      terminal_fifo.push_back(staged_completions[i]);
-    foreach (slots[i]) begin
-      rdma_cmq_slot_record record;
-      int unsigned token_index;
-
-      record = slots[i];
-      if (record == null)
-        continue;
-      if (!recover_poisoned_ledger &&
-          record.state == CMQ_SLOT_PUBLISHED) begin
-        token_index = record.command_token;
-        token_in_use[token_index] = 1'b0;
-        record.state = CMQ_SLOT_RESET_CANCELLED;
-      end
-      // Strict cancellation must not write the token bitmap for quarantine:
-      // that token may name a newer command.  Poison recovery clears the
-      // whole current-generation bitmap after removing every slot.
-      slots[i] = null;
-    end
     if (recover_poisoned_ledger) begin
+      // Shutdown/poison recovery has no completion output contract.  It may
+      // conservatively discard trusted cancellation evidence while clearing
+      // every runtime container after the caller has retained release authority.
+      for (int unsigned i = 0; i < staged_count; i++)
+        terminal_fifo.push_back(staged_completions[i]);
+      foreach (slots[i])
+        slots[i] = null;
       foreach (token_in_use[i])
         token_in_use[i] = 1'b0;
+      command_registry.delete();
+      entry_registry.delete();
+      publish_seq = 0;
+      retire_seq = 0;
+      cq_consume_seq = 0;
+      profile_image_format_valid = 1'b0;
+      profile_image_endian = RDMA_ENDIAN_LITTLE;
+      profile_hardware_version = 0;
     end
-    command_registry.delete();
-    entry_registry.delete();
-    publish_seq = 0;
-    retire_seq = 0;
-    cq_consume_seq = 0;
-    profile_image_format_valid = 1'b0;
-    profile_image_endian = RDMA_ENDIAN_LITTLE;
-    profile_hardware_version = 0;
+    else begin
+      // Journal evidence is committed before delivery FIFO publication.  The
+      // runtime slot/entry/token graph remains authoritative until a later
+      // reset or shutdown explicitly proves old hardware isolation.
+      for (int unsigned i = 0; i < strict_stage.staged_records.size(); i++) begin
+        commit_runtime_journal_transition_locked(
+          strict_stage.staged_batches[i], strict_stage.staged_items[i],
+          strict_stage.staged_journal_completions[i],
+          RDMA_CMQ_SUBMISSION_RESET_QUARANTINED,
+          RDMA_CMQ_COMPLETION_RESET_CANCELLED,
+          strict_stage.staged_recovery_required[i],
+          strict_stage.staged_batch_states[i]
+        );
+        terminal_fifo.push_back(strict_stage.staged_completions[i]);
+        command_registry.delete(strict_stage.staged_command_keys[i]);
+        strict_stage.staged_records[i].state = CMQ_SLOT_RESET_CANCELLED;
+      end
+    end
     engine_state = RDMA_CMQ_ENGINE_QUIESCED;
     return rdma_status::success();
   endfunction
 
   // 功能：prospective_retirement_status 校验 prospective_record、prospective_retire_seq 与当前对象状态的一致性，并显式处理“CMQ prospective retirement record is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：prospective_record（输入）、prospective_retire_seq（输出）；prospective_retirement_status 读取 prospective_record、prospective_retire_seq 并使用字段 prospective_retire_seq、index、record，并写入 prospective_retire_seq；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：prospective_retirement_status 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ prospective retirement record is null”；“CMQ retirement slot ledger is inconsistent”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status prospective_retirement_status(
     rdma_cmq_slot_record prospective_record,
@@ -1209,20 +2362,121 @@ class rdma_cmq_engine extends uvm_object;
     end
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_handle 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_handle 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected same_handle 扩展点，并委托共享契约比较资源 incarnation。
+  // 输入/输出及副作用：lhs/rhs 为只读 handle；返回 rdma_cmq_same_handle_instance 的结果，不读写 engine 状态。
+  // 失败/边界：任一输入为 null 时共享契约返回 0；转发不证明两个句柄引用 alias。
   protected function bit same_handle(rdma_handle lhs, rdma_handle rhs);
-    if (lhs == null || rhs == null)
-      return 1'b0;
-    return lhs.same_instance(rhs);
+    return rdma_cmq_same_handle_instance(lhs, rhs);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_bdf 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_bdf 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected detached-handle 比较 seam，并转发到共享值契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 handle；返回 kind、Function UID、object ID 与 generation 的比较结果，不修改 engine。
+  // 失败/边界：null 或任一字段含 X/Z 时共享契约返回 0；值相等不授予 alias authority。
+  protected function bit same_handle_value(
+    input rdma_handle lhs,
+    input rdma_handle rhs
+  );
+    return rdma_cmq_same_handle_value(lhs, rhs);
+  endfunction
+
+  // 功能：保留 engine 的 protected status 比较 seam，委托共享契约检查完整诊断值。
+  // 输入/输出及副作用：lhs/rhs 为只读 status；返回 shape 与全部现有字段的比较结果，不修改 engine 或 status。
+  // 失败/边界：null、不支持 subtype 或非法 required-status shape 返回 0；本转发不检查对象 alias。
+  protected function bit same_status_value(
+    input rdma_status lhs,
+    input rdma_status rhs
+  );
+    return rdma_cmq_same_status_value(lhs, rhs);
+  endfunction
+
+  // 功能：判断 command 是否使用 profile 的 context-body codec；当生产 profile
+  //   的五种低层 body canonicalizer 无法处理 MRT/CQC 等 context model 时，
+  //   允许 journal 使用已编码 SQE image 作为稳定的 authority 投影。
+  // 输入/输出及副作用：command/body 为只读输入；仅检查 opcode 与 exact
+  //   context model dynamic type，不修改 command、body 或 engine 状态。
+  // 失败/边界：command/opcode/body 为空、opcode 不是已注册 context opcode，或
+  //   body 类型与 opcode 不匹配时返回 0；未知模型不得通过此 fallback。
+  protected function bit context_body_fallback_supported(
+    input rdma_cmq_command_desc command,
+    input rdma_hw_model body
+  );
+    rdma_mrt_model mrt;
+    rdma_cqc_model cqc;
+    rdma_srqc_model srqc;
+    rdma_ceqc_model ceqc;
+    rdma_aeqc_model aeqc;
+
+    if (command == null || command.opcode_key == null || body == null)
+      return 1'b0;
+    case (command.opcode_key.opcode)
+      RDMA_OP_KEY_ALLOC,
+      RDMA_OP_MR_REGISTER:
+        return $cast(mrt, body);
+      RDMA_OP_CQC_CREATE:
+        return $cast(cqc, body);
+      RDMA_OP_SRFQC_CREATE:
+        return $cast(srqc, body);
+      RDMA_OP_CEQC_CREATE:
+        return $cast(ceqc, body);
+      RDMA_OP_AEQC_CREATE:
+        return $cast(aeqc, body);
+      default:
+        return 1'b0;
+    endcase
+  endfunction
+
+  // 功能：生成 journal authority 所需的 command body canonical projection。
+  //   先委托 retained profile 的五种明确 V1 body seam；对已注册 MRT/CQC/
+  //   SRQC/CEQC/AEQC context command，仅在 profile 已成功编码 detached SQE
+  //   后以 CONTEXT-IMAGE-V1 标签和复制后的 SQE bytes 作为显式 fallback。
+  // 输入/输出及副作用：profile_service、command、encoded_image 为只读输入；
+  //   schema_tag/field_bytes 入口清空，成功时发布新 tag/byte array，不保留输入引用。
+  // 失败/边界：profile/cmd/image 缺失、profile canonicalization 返回 null、
+  //   context 类型不匹配或 image shape 非法时返回原始失败 status；该 fallback
+  //   不接受未知 body，也不把 EMPTY schema 冒充 context authority。
+  protected function rdma_status canonicalize_journal_body(
+    input rdma_cmq_hw_profile profile_service,
+    input rdma_cmq_command_desc command,
+    input rdma_hw_image encoded_image,
+    output string schema_tag,
+    output byte unsigned field_bytes[]
+  );
+    rdma_status status;
+
+    schema_tag = "";
+    field_bytes = new[0];
+    if (profile_service == null || command == null ||
+        command.body == null || encoded_image == null)
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal body canonicalization source is incomplete"
+      );
+    status = profile_service.canonicalize_command_body(
+      command.body, schema_tag, field_bytes
+    );
+    if (status == null)
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal body canonicalization returned null status"
+      );
+    if (status.ok())
+      return status;
+    if (!context_body_fallback_supported(command, command.body) ||
+        !rdma_cmq_image_shape_valid(encoded_image))
+      return status;
+
+    schema_tag = "CMQ-BODY-CONTEXT-IMAGE-V1";
+    field_bytes = new[encoded_image.bytes.size()];
+    foreach (encoded_image.bytes[i])
+      field_bytes[i] = encoded_image.bytes[i];
+    return rdma_cmq_direct_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：保留 engine 的 protected BDF 比较入口，转发到共享结构值契约。
+  // 输入/输出及副作用：lhs/rhs 为 rdma_bdf_t 值；返回共享 helper 的 `==` 结果，不修改 route 或 engine。
+  // 失败/边界：转发不验证 BDF 是否可路由，也不把原有比较改为 case equality。
   protected function bit same_bdf(rdma_bdf_t lhs, rdma_bdf_t rhs);
-    return lhs == rhs;
+    return rdma_cmq_same_bdf_value(lhs, rhs);
   endfunction
 
   // 功能：在 rdma_cmq_engine 中，clone_binding_snapshot 将 rhs 中 rdma_cmq_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
@@ -1414,7 +2668,6 @@ class rdma_cmq_engine extends uvm_object;
   // 功能：mapping_authority_status 校验 mapping、request_context 与当前对象状态的一致性，并显式处理“CMQ host memory returned a null mapping”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：mapping（输入）、request_context（输入）；mapping_authority_status 读取 mapping、request_context 并使用字段 expected_permissions；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：mapping_authority_status 返回 RDMA_SC_DMA_TRANSLATION、RDMA_SC_STALE_GENERATION、RDMA_SC_DMA_PERMISSION、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ host memory returned a null mapping”“CMQ DMA authority context is missing”；失败路径不提交部分状态或转移未声明资源。
-
   protected function rdma_status mapping_authority_status(
     rdma_dma_mapping mapping,
     rdma_dma_request_context request_context
@@ -1564,130 +2817,85 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::make(failure_code, message);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_byte_queue 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_byte_queue 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected byte-queue 比较 seam，转发到共享 cardinality/元素契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 byte queue；返回长度与全部元素的比较结果，不修改 queue 或 engine。
+  // 失败/边界：长度或任一元素不同时返回 0；两个空 queue 仍返回 1。
   protected function bit same_byte_queue(
     byte unsigned lhs[$],
     byte unsigned rhs[$]
   );
-    if (lhs.size() != rhs.size())
-      return 1'b0;
-    foreach (lhs[i])
-      if (lhs[i] != rhs[i])
-        return 1'b0;
-    return 1'b1;
+    return rdma_cmq_same_byte_queue_value(lhs, rhs);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_string_queue 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_string_queue 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected string-queue 比较 seam，转发到共享 cardinality/元素契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 string queue；返回长度与全部文本的比较结果，不修改 queue 或 engine。
+  // 失败/边界：长度或任一文本不同时返回 0；两个空 queue 仍返回 1。
   protected function bit same_string_queue(
     string lhs[$],
     string rhs[$]
   );
-    if (lhs.size() != rhs.size())
-      return 1'b0;
-    foreach (lhs[i])
-      if (lhs[i] != rhs[i])
-        return 1'b0;
-    return 1'b1;
+    return rdma_cmq_same_string_queue_value(lhs, rhs);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_image_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_image_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected image 比较 seam，并委托共享契约比较 bytes、metadata、targets 与 summary。
+  // 输入/输出及副作用：lhs/rhs 为只读 image；返回完整现有值比较结果，不复制 image 或读写 engine 状态。
+  // 失败/边界：null 或任一已列入字段不同时返回 0；转发不新增 image shape gate。
   protected function bit same_image_value(
     rdma_hw_image lhs,
     rdma_hw_image rhs
   );
-    if (lhs == null || rhs == null)
-      return 1'b0;
-    return same_byte_queue(lhs.bytes, rhs.bytes) &&
-           lhs.length == rhs.length &&
-           lhs.alignment == rhs.alignment &&
-           lhs.endian == rhs.endian &&
-           lhs.image_kind == rhs.image_kind &&
-           lhs.hardware_version == rhs.hardware_version &&
-           lhs.function_generation == rhs.function_generation &&
-           lhs.write_target_kind == rhs.write_target_kind &&
-           lhs.backing_target.value == rhs.backing_target.value &&
-           lhs.hmc_target.value == rhs.hmc_target.value &&
-           lhs.bar_target.value == rhs.bar_target.value &&
-           same_string_queue(lhs.field_summary, rhs.field_summary);
+    return rdma_cmq_same_image_value(lhs, rhs);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_expected_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_expected_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected expected-response 比较 seam，转发到共享 opcode/variant 值契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 expected response；返回共享 helper 结果，不修改 engine 或对象。
+  // 失败/边界：任一输入为 null 时返回 0；转发不新增 expected-response shape gate。
   protected function bit same_expected_value(
     rdma_cmq_expected_response lhs,
     rdma_cmq_expected_response rhs
   );
-    if (lhs == null || rhs == null)
-      return 1'b0;
-    return lhs.hardware_opcode == rhs.hardware_opcode &&
-           lhs.variant == rhs.variant;
+    return rdma_cmq_same_expected_value(lhs, rhs);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_opcode_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_opcode_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected opcode-key 比较 seam，委托共享 profile/opcode/variant 值契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 opcode key；返回共享 helper 结果，不修改 profile registry 或 engine。
+  // 失败/边界：任一 key 为 null 时返回 0；转发不执行 validate 或新增 shape gate。
   protected function bit same_opcode_value(
     rdma_cmq_opcode_key lhs,
     rdma_cmq_opcode_key rhs
   );
-    if (lhs == null || rhs == null)
-      return 1'b0;
-    return lhs.profile_name == rhs.profile_name &&
-           lhs.opcode == rhs.opcode && lhs.variant == rhs.variant;
+    return rdma_cmq_same_opcode_value(lhs, rhs);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_mapping_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_mapping_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected mapping 比较 seam，委托共享 instance-authority 与标量值契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 DMA mapping；返回 Function/owner instance 与原有映射字段的比较结果，不修改 engine。
+  // 失败/边界：mapping 或必需嵌套 handle 为 null 时返回 0；转发不扩大到 route/epoch/UMEM 字段。
   protected function bit same_mapping_value(
     rdma_dma_mapping lhs,
     rdma_dma_mapping rhs
   );
-    if (lhs == null || rhs == null ||
-        lhs.function_h == null || rhs.function_h == null ||
-        lhs.owner_h == null || rhs.owner_h == null)
-      return 1'b0;
-    return lhs.function_h.same_instance(rhs.function_h) &&
-           lhs.requester_bdf == rhs.requester_bdf &&
-           lhs.pasid_valid == rhs.pasid_valid &&
-           lhs.pasid == rhs.pasid &&
-           lhs.dma_domain_valid == rhs.dma_domain_valid &&
-           lhs.dma_domain_id == rhs.dma_domain_id &&
-           lhs.backing_addr.value == rhs.backing_addr.value &&
-           lhs.iova.value == rhs.iova.value &&
-           lhs.size == rhs.size &&
-           lhs.direction == rhs.direction &&
-           lhs.permissions == rhs.permissions &&
-           lhs.state == rhs.state &&
-           lhs.owner_h.same_instance(rhs.owner_h);
+    return rdma_cmq_same_mapping_instance_value(lhs, rhs);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中由 same_ticket_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_ticket_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：保留 engine 的 protected ticket instance 比较 seam，转发到共享 command/handle/slot/opcode/deadline 契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 ticket；返回嵌套 handle same_instance 与现有标量的比较结果，不修改 journal。
+  // 失败/边界：ticket 或 Function/CMQ handle 为 null 时返回 0；opcode_key 为 null
+  //   时由嵌套 opcode comparator 返回 0；转发不新增 ticket shape gate 或 alias 断言。
   protected function bit same_ticket_value(
     rdma_cmq_ticket lhs,
     rdma_cmq_ticket rhs
   );
-    if (lhs == null || rhs == null ||
-        lhs.function_h == null || rhs.function_h == null ||
-        lhs.cmq_h == null || rhs.cmq_h == null)
-      return 1'b0;
-    return lhs.command_id == rhs.command_id &&
-           lhs.function_h.same_instance(rhs.function_h) &&
-           lhs.cmq_h.same_instance(rhs.cmq_h) &&
-           lhs.slot_sequence == rhs.slot_sequence &&
-           lhs.sq_index == rhs.sq_index &&
-           lhs.sq_wrap == rhs.sq_wrap &&
-           same_opcode_value(lhs.opcode_key, rhs.opcode_key) &&
-           lhs.absolute_deadline == rhs.absolute_deadline;
+    return rdma_cmq_same_ticket_instance_value(lhs, rhs);
+  endfunction
+
+  // 功能：保留 engine 的 protected detached-ticket 比较 seam，委托共享公开 immutable-value 契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 ticket；返回 detached handle、command、slot、opcode 与 deadline 比较结果，不修改账本。
+  // 失败/边界：ticket/句柄/key 为 null、handle 含 X/Z 或任一值不同时返回 0；本转发不授予 alias authority。
+  protected function bit same_ticket_detached_value(
+    input rdma_cmq_ticket lhs,
+    input rdma_cmq_ticket rhs
+  );
+    return rdma_cmq_same_ticket_detached_value(lhs, rhs);
   endfunction
 
   // 功能：在 rdma_cmq_engine 中由 same_dependency_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
@@ -1707,342 +2915,54 @@ class rdma_cmq_engine extends uvm_object;
            lhs.ready == rhs.ready;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，handle_value_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：handle（输入）；handle_value_key 可能更新本对象明确拥有的状态；函数返回 string，不取得调用方资源所有权。
-// 失败/边界：handle_value_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：保留 engine 的 protected handle 值键 seam，转发到共享 model contract。
+  // 输入/输出及副作用：handle 原样传入；返回 package helper 的 string，不修改 engine 或 handle。
+  // 失败/边界：null sentinel 与字段格式完全由 package helper 决定；本层不增加校验或回退。
   protected function automatic string handle_value_key(rdma_handle handle);
-    if (handle == null)
-      return "<null-handle>";
-    return $sformatf("%0d:%016h:%08h:%08h", handle.kind,
-                     handle.function_uid, handle.object_id,
-                     handle.generation);
+    return rdma_cmq_handle_value_key(handle);
   endfunction
 
-  // 功能：判断 has_exact_object_type 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：value（输入）、expected_type（输入）；has_exact_object_type 读取 value、expected_type 并使用字段 actual_type；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：has_exact_object_type 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：保留 engine 的 protected exact-type seam，转发到共享 model contract。
+  // 输入/输出及副作用：value/expected_type 原样传入；返回 wrapper identity 比较结果，不改状态。
+  // 失败/边界：null 与 subtype 拒绝语义由 package helper 决定；本层不改用 cast 或 type name。
   protected function automatic bit has_exact_object_type(
     uvm_object value,
     uvm_object_wrapper expected_type
   );
-    uvm_object_wrapper actual_type;
-
-    if (value == null || expected_type == null)
-      return 1'b0;
-    actual_type = value.get_object_type();
-    return actual_type != null && actual_type == expected_type;
+    return rdma_cmq_has_exact_object_type(value, expected_type);
   endfunction
 
-  // 功能：判断 has_optional_exact_object_type 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：value（输入）、expected_type（输入）；has_optional_exact_object_type 读取 value、expected_type 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：has_optional_exact_object_type 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：保留 engine 的 protected optional exact-type seam，转发到共享 model contract。
+  // 输入/输出及副作用：value/expected_type 原样传入；返回 optional wrapper 检查结果，不改状态。
+  // 失败/边界：null value 优先成功及非空 exact-type 拒绝由 package helper 保持。
   protected function automatic bit has_optional_exact_object_type(
     uvm_object value,
     uvm_object_wrapper expected_type
   );
-    return value == null || has_exact_object_type(value, expected_type);
+    return rdma_cmq_has_optional_exact_object_type(value, expected_type);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，core_body_shell_is_exact 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
-  // 输入/输出及副作用：body（输入）；core_body_shell_is_exact 读取 body 并使用字段 rdma_function_handle、rdma_handle、rdma_urc_queue_config、rdma_page_table_layout、rdma_ring_position、rdma_mr_page_layout、rdma_cmq_sqe_model、rdma_qpc_model；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：core_body_shell_is_exact 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：保留 engine 的 protected core-body shape seam，转发到共享 model contract。
+  // 输入/输出及副作用：body 原样传入；返回七类 body 的 exact shell 检查结果，不改状态。
+  // 失败/边界：null、unsupported、required/optional nested 与 transport 分支由 package helper 决定。
   protected function automatic bit core_body_shell_is_exact(
     rdma_hw_model body
   );
-    rdma_cmq_sqe_model sqe;
-    rdma_qpc_model qpc;
-    rdma_qpc_urc_ext urc_ext;
-    rdma_cqc_model cqc;
-    rdma_mrt_model mrt;
-    rdma_srqc_model srqc;
-    rdma_ceqc_model ceqc;
-    rdma_aeqc_model aeqc;
-
-    if (body == null)
-      return 1'b0;
-    if (has_exact_object_type(body, rdma_cmq_sqe_model::get_type())) begin
-      if (!$cast(sqe, body)) return 1'b0;
-      return has_exact_object_type(
-               sqe.function_h, rdma_function_handle::get_type()
-             ) &&
-             has_optional_exact_object_type(
-               sqe.target_h, rdma_handle::get_type()
-             );
-    end
-    if (has_exact_object_type(body, rdma_qpc_model::get_type())) begin
-      if (!$cast(qpc, body)) return 1'b0;
-      if (!has_exact_object_type(qpc.qp_h, rdma_handle::get_type()) ||
-          !has_exact_object_type(qpc.pd_h, rdma_handle::get_type()) ||
-          !has_exact_object_type(qpc.send_cq_h, rdma_handle::get_type()) ||
-          !has_exact_object_type(qpc.recv_cq_h, rdma_handle::get_type()) ||
-          !has_optional_exact_object_type(
-            qpc.srq_h, rdma_handle::get_type()
-          ) ||
-          !has_exact_object_type(
-            qpc.address_vector, rdma_address_vector::get_type()
-          ) ||
-          !has_exact_object_type(
-            qpc.behavior, rdma_qpc_behavior::get_type()
-          ))
-        return 1'b0;
-      if (has_exact_object_type(qpc.transport_ext,
-                                rdma_qpc_rc_ext::get_type()) ||
-          has_exact_object_type(qpc.transport_ext,
-                                rdma_qpc_ud_ext::get_type()))
-        return 1'b1;
-      if (!has_exact_object_type(qpc.transport_ext,
-                                 rdma_qpc_urc_ext::get_type()) ||
-          !$cast(urc_ext, qpc.transport_ext))
-        return 1'b0;
-      return has_exact_object_type(
-        urc_ext.queues, rdma_urc_queue_config::get_type()
-      );
-    end
-    if (has_exact_object_type(body, rdma_cqc_model::get_type())) begin
-      if (!$cast(cqc, body)) return 1'b0;
-      return has_exact_object_type(cqc.cq_h, rdma_handle::get_type()) &&
-             has_optional_exact_object_type(
-               cqc.ceq_h, rdma_handle::get_type()
-             ) &&
-             has_exact_object_type(
-               cqc.page_layout, rdma_page_table_layout::get_type()
-             ) &&
-             has_exact_object_type(
-               cqc.producer, rdma_ring_position::get_type()
-             ) &&
-             has_exact_object_type(
-               cqc.consumer, rdma_ring_position::get_type()
-             );
-    end
-    if (has_exact_object_type(body, rdma_mrt_model::get_type())) begin
-      if (!$cast(mrt, body)) return 1'b0;
-      return has_exact_object_type(mrt.mr_h, rdma_handle::get_type()) &&
-             has_exact_object_type(mrt.pd_h, rdma_handle::get_type()) &&
-             has_exact_object_type(
-               mrt.page_layout, rdma_mr_page_layout::get_type()
-             );
-    end
-    if (has_exact_object_type(body, rdma_srqc_model::get_type())) begin
-      if (!$cast(srqc, body)) return 1'b0;
-      return has_exact_object_type(srqc.srq_h, rdma_handle::get_type()) &&
-             has_exact_object_type(srqc.pd_h, rdma_handle::get_type()) &&
-             has_exact_object_type(
-               srqc.producer, rdma_ring_position::get_type()
-             );
-    end
-    if (has_exact_object_type(body, rdma_ceqc_model::get_type())) begin
-      if (!$cast(ceqc, body)) return 1'b0;
-      return has_exact_object_type(ceqc.ceq_h, rdma_handle::get_type()) &&
-             has_exact_object_type(
-               ceqc.page_layout, rdma_page_table_layout::get_type()
-             ) &&
-             has_exact_object_type(
-               ceqc.producer, rdma_ring_position::get_type()
-             ) &&
-             has_exact_object_type(
-               ceqc.consumer, rdma_ring_position::get_type()
-             );
-    end
-    if (has_exact_object_type(body, rdma_aeqc_model::get_type())) begin
-      if (!$cast(aeqc, body)) return 1'b0;
-      return has_exact_object_type(aeqc.aeq_h, rdma_handle::get_type()) &&
-             has_exact_object_type(
-               aeqc.page_layout, rdma_page_table_layout::get_type()
-             ) &&
-             has_exact_object_type(
-               aeqc.producer, rdma_ring_position::get_type()
-             ) &&
-             has_exact_object_type(
-               aeqc.consumer, rdma_ring_position::get_type()
-             );
-    end
-    return 1'b0;
+    return rdma_cmq_core_body_shell_is_exact(body);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，nested_value_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：value（输入）；nested_value_key 读取 value 并使用字段 result；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：nested_value_key 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：保留 engine 的 protected nested 值键 seam，转发到共享 model contract。
+  // 输入/输出及副作用：value 原样传入；返回 package helper 的稳定 string，不改对象或 engine。
+  // 失败/边界：null/unsupported sentinel、字段格式与 URC queues 递归由 package helper 保持。
   protected function automatic string nested_value_key(uvm_object value);
-    rdma_handle handle;
-    rdma_ring_position ring;
-    rdma_page_table_layout page_layout;
-    rdma_address_vector address_vector;
-    rdma_urc_queue_config queues;
-    rdma_mr_page_layout mr_page_layout;
-    rdma_qpc_behavior behavior;
-    rdma_qpc_rc_ext rc_ext;
-    rdma_qpc_ud_ext ud_ext;
-    rdma_qpc_urc_ext urc_ext;
-    string result;
-
-    if (value == null)
-      return "<null-object>";
-    if (has_exact_object_type(value, rdma_handle::get_type()) &&
-        $cast(handle, value))
-      return {"handle:", handle_value_key(handle)};
-    if (has_exact_object_type(value, rdma_ring_position::get_type()) &&
-        $cast(ring, value))
-      return $sformatf("ring:%0d:%0b", ring.index, ring.wrap);
-    if (has_exact_object_type(value, rdma_page_table_layout::get_type()) &&
-        $cast(page_layout, value))
-      return $sformatf("page:%0d:%016h:%016h:%0b:%016h:%0b",
-                       page_layout.mode, page_layout.sd_base.value,
-                       page_layout.current_base.value,
-                       page_layout.current_valid,
-                       page_layout.next_base.value,
-                       page_layout.next_valid);
-    if (has_exact_object_type(value, rdma_address_vector::get_type()) &&
-        $cast(address_vector, value)) begin
-      result = $sformatf(
-        "av:%0d:%0d:%0d:%0d:%012h:%0b:%0b:%0b:%0b:%0b:%0b:%03h:%02h:%05h:%02h:%04h",
-        address_vector.source_address_index, address_vector.source_vport,
-        address_vector.destination_vport,
-        address_vector.destination_port,
-        address_vector.destination_mac, address_vector.ipv6,
-        address_vector.vlan_enable, address_vector.cfi,
-        address_vector.lag_enable, address_vector.tunnel_enable,
-        address_vector.forwarding_enable, address_vector.vlan_id,
-        address_vector.traffic_class, address_vector.flow_label,
-        address_vector.hop_limit, address_vector.udp_source_port
-      );
-      foreach (address_vector.destination_ip[i])
-        result = {result,
-                  $sformatf(":%02h", address_vector.destination_ip[i])};
-      return result;
-    end
-    if (has_exact_object_type(value, rdma_urc_queue_config::get_type()) &&
-        $cast(queues, value))
-      return $sformatf(
-        "urcq:%016h:%016h:%016h:%0d:%0d:%0d:%0d:%0d:%0d",
-        queues.rsq_backing.value, queues.rdsq_backing.value,
-        queues.dsq_backing.value, queues.rsq_depth, queues.rdsq_depth,
-        queues.rdsq_fetch_count, queues.dsq_fetch_count,
-        queues.rq_sequence_threshold_entries,
-        queues.sq_completion_threshold_entries
-      );
-    if (has_exact_object_type(value, rdma_mr_page_layout::get_type()) &&
-        $cast(mr_page_layout, value))
-      return $sformatf(
-        "mrpage:%0d:%0d:%016h:%016h:%0d:%0d:%0b:%0b:%0b:%0d:%0d",
-        mr_page_layout.pbl_mode, mr_page_layout.host_page_size,
-        mr_page_layout.pba0.value, mr_page_layout.pba1.value,
-        mr_page_layout.first_pbl_index, mr_page_layout.address_mode,
-        mr_page_layout.odp, mr_page_layout.invalidate_enable,
-        mr_page_layout.payload_vf_enable,
-        mr_page_layout.payload_vf_id, mr_page_layout.mr_serial
-      );
-    if (has_exact_object_type(value, rdma_qpc_behavior::get_type()) &&
-        $cast(behavior, value))
-      return $sformatf("behavior:%0d:%0b:%0b:%0b:%0b:%0b:%0d",
-                       behavior.transport_version,
-                       behavior.migration_enable,
-                       behavior.tx_endian_swap, behavior.rx_endian_swap,
-                       behavior.read_after_write_fence,
-                       behavior.atomic_after_atomic_fence,
-                       behavior.\priority );
-    if (has_exact_object_type(value, rdma_qpc_rc_ext::get_type()) &&
-        $cast(rc_ext, value))
-      return $sformatf("rc:%06h:%06h:%06h:%0d:%0d",
-                       rc_ext.remote_qpn, rc_ext.send_psn,
-                       rc_ext.recv_psn, rc_ext.retry_count,
-                       rc_ext.rnr_retry_count);
-    if (has_exact_object_type(value, rdma_qpc_ud_ext::get_type()) &&
-        $cast(ud_ext, value))
-      return $sformatf("ud:%08h", ud_ext.qkey);
-    if (has_exact_object_type(value, rdma_qpc_urc_ext::get_type()) &&
-        $cast(urc_ext, value))
-      return $sformatf("urc:%06h:%06h:%06h:%06h:%06h:%s",
-                       urc_ext.remote_qpn, urc_ext.rbsn, urc_ext.dbsn,
-                       urc_ext.rpsn, urc_ext.dpsn,
-                       nested_value_key(urc_ext.queues));
-    return "";
+    return rdma_cmq_nested_value_key(value);
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，body_value_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：body（输入）；body_value_key 读取 body 并使用字段 value、rdma_cmq_sqe_model、rdma_qpc_model、rdma_cqc_model、rdma_mrt_model、rdma_srqc_model、rdma_ceqc_model、rdma_aeqc_model；函数返回 string，不取得调用方资源所有权。
-// 失败/边界：body_value_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：保留 engine 的 protected body 值键 seam，转发到共享 model contract。
+  // 输入/输出及副作用：body 原样传入；返回 package helper 的稳定 string，不改对象或 engine。
+  // 失败/边界：null/unsupported sentinel 与 SQE context 递归由 package helper 保持，本层不检测环。
   protected function automatic string body_value_key(rdma_hw_model body);
-    rdma_cmq_sqe_model sqe;
-    rdma_qpc_model qpc;
-    rdma_cqc_model cqc;
-    rdma_mrt_model mrt;
-    rdma_srqc_model srqc;
-    rdma_ceqc_model ceqc;
-    rdma_aeqc_model aeqc;
-
-    if (body == null)
-      return "<null-body>";
-    if (has_exact_object_type(body, rdma_cmq_sqe_model::get_type()) &&
-        $cast(sqe, body))
-      return $sformatf("sqe:%0d:%016h:%08h:%s:%s:%s", sqe.opcode,
-                       sqe.command_id, sqe.flags,
-                       handle_value_key(sqe.function_h),
-                       handle_value_key(sqe.target_h),
-                       (sqe.context_model == null) ? "<null-context>" :
-                         body_value_key(sqe.context_model));
-    if (has_exact_object_type(body, rdma_qpc_model::get_type()) &&
-        $cast(qpc, body))
-      return $sformatf(
-        "qpc:%s:%s:%s:%s:%s:%0d:%0d:%0d:%0d:%0d:%04h:%02h:%0h:%0d:%0d:%0d:%016h:%016h:%016h:%0d:%0d:%s:%0b:%0b:%0b:%s:%s",
-        handle_value_key(qpc.qp_h), handle_value_key(qpc.pd_h),
-        handle_value_key(qpc.send_cq_h),
-        handle_value_key(qpc.recv_cq_h), handle_value_key(qpc.srq_h),
-        qpc.transport, qpc.state, qpc.host_id, qpc.vf_id,
-        qpc.stat_index, qpc.pkey, qpc.qp_sequence, qpc.access,
-        qpc.path_mtu_bytes, qpc.sq_depth, qpc.rq_depth,
-        qpc.sq_backing.value, qpc.rq_backing.value,
-        qpc.context_backing.value, qpc.sq_mode, qpc.rq_mode,
-        nested_value_key(qpc.address_vector), qpc.signature_enable,
-        qpc.tx_flow_control, qpc.rx_flow_control,
-        nested_value_key(qpc.behavior),
-        nested_value_key(qpc.transport_ext)
-      );
-    if (has_exact_object_type(body, rdma_cqc_model::get_type()) &&
-        $cast(cqc, body))
-      return $sformatf(
-        "cqc:%s:%s:%0d:%0d:%0d:%0d:%s:%s:%s:%0b:%0b:%0h:%0h:%0h:%016h",
-        handle_value_key(cqc.cq_h), handle_value_key(cqc.ceq_h),
-        cqc.state, cqc.depth, cqc.cqe_size_bytes, cqc.threshold,
-        nested_value_key(cqc.page_layout),
-        nested_value_key(cqc.producer), nested_value_key(cqc.consumer),
-        cqc.urc_enable, cqc.load_ci_done, cqc.last_arm_sequence,
-        cqc.arm_sequence, cqc.arm_state, cqc.shadow_backing.value
-      );
-    if (has_exact_object_type(body, rdma_mrt_model::get_type()) &&
-        $cast(mrt, body))
-      return $sformatf(
-        "mrt:%s:%s:%0d:%016h:%016h:%08h:%08h:%0h:%0h:%s",
-        handle_value_key(mrt.mr_h), handle_value_key(mrt.pd_h),
-        mrt.state, mrt.iova.value, mrt.length, mrt.lkey, mrt.rkey,
-        mrt.access, mrt.object_type, nested_value_key(mrt.page_layout)
-      );
-    if (has_exact_object_type(body, rdma_srqc_model::get_type()) &&
-        $cast(srqc, body))
-      return $sformatf(
-        "srqc:%s:%s:%0d:%0d:%0d:%0d:%0d:%016h:%016h:%s:%0h",
-        handle_value_key(srqc.srq_h), handle_value_key(srqc.pd_h),
-        srqc.state, srqc.depth, srqc.load_pi_threshold,
-        srqc.limit_threshold, srqc.object_mode,
-        srqc.srfq_backing.value, srqc.shadow_backing.value,
-        nested_value_key(srqc.producer), srqc.arm_sequence
-      );
-    if (has_exact_object_type(body, rdma_ceqc_model::get_type()) &&
-        $cast(ceqc, body))
-      return $sformatf("ceqc:%s:%0d:%0d:%0d:%s:%s:%s",
-                       handle_value_key(ceqc.ceq_h), ceqc.state,
-                       ceqc.depth, ceqc.vector_id,
-                       nested_value_key(ceqc.page_layout),
-                       nested_value_key(ceqc.producer),
-                       nested_value_key(ceqc.consumer));
-    if (has_exact_object_type(body, rdma_aeqc_model::get_type()) &&
-        $cast(aeqc, body))
-      return $sformatf("aeqc:%s:%0d:%0d:%0d:%s:%s:%s",
-                       handle_value_key(aeqc.aeq_h), aeqc.state,
-                       aeqc.depth, aeqc.vector_id,
-                       nested_value_key(aeqc.page_layout),
-                       nested_value_key(aeqc.producer),
-                       nested_value_key(aeqc.consumer));
-    return "";
+    return rdma_cmq_body_value_key(body);
   endfunction
 
   // 功能：在 rdma_cmq_engine 中由 same_body_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
@@ -2095,77 +3015,14 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，append_body_graph_nodes 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：body（输入）、nodes（引用）；append_body_graph_nodes 可能更新本对象明确拥有的状态，并写入 nodes；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：append_body_graph_nodes 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：保留 engine 的 protected body graph 枚举 seam，转发到共享 model contract。
+  // 输入/输出及副作用：body/nodes 原样传入；package helper 向 caller-owned queue 追加非拥有引用。
+  // 失败/边界：null no-op、unsupported root-only、顺序/no-clear/no-dedup 语义均由 package helper保持。
   protected function automatic void append_body_graph_nodes(
     rdma_hw_model body,
     ref uvm_object nodes[$]
   );
-    rdma_cmq_sqe_model sqe;
-    rdma_qpc_model qpc;
-    rdma_qpc_urc_ext urc_ext;
-    rdma_cqc_model cqc;
-    rdma_mrt_model mrt;
-    rdma_srqc_model srqc;
-    rdma_ceqc_model ceqc;
-    rdma_aeqc_model aeqc;
-
-    if (body == null)
-      return;
-    nodes.push_back(body);
-    if (has_exact_object_type(body, rdma_cmq_sqe_model::get_type()) &&
-        $cast(sqe, body)) begin
-      if (sqe.function_h != null) nodes.push_back(sqe.function_h);
-      if (sqe.target_h != null) nodes.push_back(sqe.target_h);
-    end
-    else if (has_exact_object_type(body, rdma_qpc_model::get_type()) &&
-             $cast(qpc, body)) begin
-      if (qpc.qp_h != null) nodes.push_back(qpc.qp_h);
-      if (qpc.pd_h != null) nodes.push_back(qpc.pd_h);
-      if (qpc.send_cq_h != null) nodes.push_back(qpc.send_cq_h);
-      if (qpc.recv_cq_h != null) nodes.push_back(qpc.recv_cq_h);
-      if (qpc.srq_h != null) nodes.push_back(qpc.srq_h);
-      if (qpc.address_vector != null) nodes.push_back(qpc.address_vector);
-      if (qpc.behavior != null) nodes.push_back(qpc.behavior);
-      if (qpc.transport_ext != null) nodes.push_back(qpc.transport_ext);
-      if ($cast(urc_ext, qpc.transport_ext) && urc_ext.queues != null)
-        nodes.push_back(urc_ext.queues);
-    end
-    else if (has_exact_object_type(body, rdma_cqc_model::get_type()) &&
-             $cast(cqc, body)) begin
-      if (cqc.cq_h != null) nodes.push_back(cqc.cq_h);
-      if (cqc.ceq_h != null) nodes.push_back(cqc.ceq_h);
-      if (cqc.page_layout != null) nodes.push_back(cqc.page_layout);
-      if (cqc.producer != null) nodes.push_back(cqc.producer);
-      if (cqc.consumer != null) nodes.push_back(cqc.consumer);
-    end
-    else if (has_exact_object_type(body, rdma_mrt_model::get_type()) &&
-             $cast(mrt, body)) begin
-      if (mrt.mr_h != null) nodes.push_back(mrt.mr_h);
-      if (mrt.pd_h != null) nodes.push_back(mrt.pd_h);
-      if (mrt.page_layout != null) nodes.push_back(mrt.page_layout);
-    end
-    else if (has_exact_object_type(body, rdma_srqc_model::get_type()) &&
-             $cast(srqc, body)) begin
-      if (srqc.srq_h != null) nodes.push_back(srqc.srq_h);
-      if (srqc.pd_h != null) nodes.push_back(srqc.pd_h);
-      if (srqc.producer != null) nodes.push_back(srqc.producer);
-    end
-    else if (has_exact_object_type(body, rdma_ceqc_model::get_type()) &&
-             $cast(ceqc, body)) begin
-      if (ceqc.ceq_h != null) nodes.push_back(ceqc.ceq_h);
-      if (ceqc.page_layout != null) nodes.push_back(ceqc.page_layout);
-      if (ceqc.producer != null) nodes.push_back(ceqc.producer);
-      if (ceqc.consumer != null) nodes.push_back(ceqc.consumer);
-    end
-    else if (has_exact_object_type(body, rdma_aeqc_model::get_type()) &&
-             $cast(aeqc, body)) begin
-      if (aeqc.aeq_h != null) nodes.push_back(aeqc.aeq_h);
-      if (aeqc.page_layout != null) nodes.push_back(aeqc.page_layout);
-      if (aeqc.producer != null) nodes.push_back(aeqc.producer);
-      if (aeqc.consumer != null) nodes.push_back(aeqc.consumer);
-    end
+    rdma_cmq_append_body_graph_nodes(body, nodes);
   endfunction
 
   // 功能：在 rdma_cmq_engine 中，body_graph_detached 检查嵌套 body/graph 引用是否已经 detached，防止编码或恢复阶段残留可变别名。
@@ -2220,115 +3077,42 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：checked_function_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_function_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_kind、source_type_name、saved_function_uid、saved_object_id、saved_generation、cloned_object、source.kind，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：checked_function_snapshot 先检查 source == null；cloned_object == null || !$cast(snapshot, cloned_object，再返回 snapshot_failure(failure_code, {label, " Function is null"})；rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：保留 engine 的 protected Function snapshot seam，
+  // 转发到共享有类型快照契约。
+  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
+  // helper 先清空并在成功时接收独立 Function handle；engine 不保存引用。
+  // 失败/边界：null、clone/type/self 契约失败或四个身份字段漂移时，
+  // 原样返回 package helper 按 failure_code 构造的状态，不发布 partial snapshot。
   protected function rdma_status checked_function_snapshot(
     rdma_function_handle source,
     string label,
     rdma_status_code_e failure_code,
     output rdma_function_handle snapshot
   );
-    uvm_object cloned_object;
-    string source_type_name;
-    rdma_resource_kind_e saved_kind;
-    longint unsigned saved_function_uid;
-    int unsigned saved_object_id;
-    int unsigned saved_generation;
-
-    snapshot = null;
-    if (source == null)
-      return snapshot_failure(failure_code, {label, " Function is null"});
-    saved_kind = source.kind;
-    source_type_name = source.get_type_name();
-    saved_function_uid = source.function_uid;
-    saved_object_id = source.object_id;
-    saved_generation = source.generation;
-    cloned_object = source.clone();
-    source.kind = saved_kind;
-    source.function_uid = saved_function_uid;
-    source.object_id = saved_object_id;
-    source.generation = saved_generation;
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source || snapshot.get_type_name() != source_type_name) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " Function snapshot clone contract failed"}
-      );
-    end
-    if (source.kind != saved_kind ||
-        source.function_uid != saved_function_uid ||
-        source.object_id != saved_object_id ||
-        source.generation != saved_generation ||
-        snapshot.kind != saved_kind ||
-        snapshot.function_uid != saved_function_uid ||
-        snapshot.object_id != saved_object_id ||
-        snapshot.generation != saved_generation) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " Function snapshot changed its source value"}
-      );
-    end
-    return rdma_status::success();
+    return rdma_cmq_checked_function_snapshot(
+      source, label, failure_code, snapshot
+    );
   endfunction
 
-  // 功能：checked_handle_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_handle_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_kind、source_type_name、saved_function_uid、saved_object_id、saved_generation、cloned_object、source.kind，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：checked_handle_snapshot 先检查 source == null；cloned_object == null || !$cast(snapshot, cloned_object，再返回 snapshot_failure(failure_code, {label, " handle is null"})；rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：保留 engine 的 protected handle snapshot seam，
+  // 转发到共享有类型快照契约。
+  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
+  // helper 先清空并在成功时接收独立 handle；engine 不保存引用。
+  // 失败/边界：null、clone/type/self 契约失败或四个身份字段漂移时，
+  // 原样返回 package helper 按 failure_code 构造的状态，不发布 partial snapshot。
   protected function rdma_status checked_handle_snapshot(
     rdma_handle source,
     string label,
     rdma_status_code_e failure_code,
     output rdma_handle snapshot
   );
-    uvm_object cloned_object;
-    string source_type_name;
-    rdma_resource_kind_e saved_kind;
-    longint unsigned saved_function_uid;
-    int unsigned saved_object_id;
-    int unsigned saved_generation;
-
-    snapshot = null;
-    if (source == null)
-      return snapshot_failure(failure_code, {label, " handle is null"});
-    saved_kind = source.kind;
-    source_type_name = source.get_type_name();
-    saved_function_uid = source.function_uid;
-    saved_object_id = source.object_id;
-    saved_generation = source.generation;
-    cloned_object = source.clone();
-    source.kind = saved_kind;
-    source.function_uid = saved_function_uid;
-    source.object_id = saved_object_id;
-    source.generation = saved_generation;
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source || snapshot.get_type_name() != source_type_name) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " handle snapshot clone contract failed"}
-      );
-    end
-    if (source.kind != saved_kind ||
-        source.function_uid != saved_function_uid ||
-        source.object_id != saved_object_id ||
-        source.generation != saved_generation ||
-        snapshot.kind != saved_kind ||
-        snapshot.function_uid != saved_function_uid ||
-        snapshot.object_id != saved_object_id ||
-        snapshot.generation != saved_generation) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " handle snapshot changed its source value"}
-      );
-    end
-    return rdma_status::success();
+    return rdma_cmq_checked_handle_snapshot(
+      source, label, failure_code, snapshot
+    );
   endfunction
 
   // 功能：nested_object_status 校验 source、label、failure_code 与当前对象状态的一致性，并显式处理“is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）；nested_object_status 读取 source、label、failure_code 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：nested_object_status 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status nested_object_status(
     uvm_object source,
@@ -2376,7 +3160,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：checked_nested_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_nested_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、source_type_name、saved_value、source_wrapper、saved_source、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_nested_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_nested_snapshot(
     uvm_object source,
@@ -2432,7 +3215,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：checked_transport_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_transport_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、source_type_name、saved_value、saved_queues、source_urc.queues、source_wrapper、saved_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_transport_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_transport_snapshot(
     rdma_qpc_transport_ext source,
@@ -2786,7 +3568,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：checked_outer_body_clone 复制 source、saved_value、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、saved_value（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_outer_body_clone 读取 source、saved_value、label、failure_code、snapshot 并使用字段 snapshot、source_type_name、source_wrapper、saved_object、saved_shell_value、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_outer_body_clone 先检查 !clear_body_references(source, saved_references；saved_object == null || !$cast(saved_body, saved_object；!restore_body_references(source, saved_references，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
   protected function rdma_status checked_outer_body_clone(
     rdma_hw_model source,
@@ -2849,7 +3630,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：checked_qpc_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_qpc_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_value、status、srq_snapshot、cloned_qpc.qp_h、cloned_qpc.pd_h、cloned_qpc.send_cq_h、cloned_qpc.recv_cq_h，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_qpc_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_qpc_snapshot(
     rdma_qpc_model source,
@@ -2948,7 +3728,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：checked_context_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_context_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、handle0_snapshot、handle1_snapshot、nested0_snapshot、nested1_snapshot、nested2_snapshot、saved_value、status，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_context_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_context_snapshot(
     rdma_hw_model source,
@@ -3152,71 +3931,26 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：checked_opcode_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_opcode_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、saved_profile_name、saved_opcode、saved_variant、cloned_object、source.profile_name、source.opcode，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：checked_opcode_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：保留 engine 的 protected opcode snapshot seam，
+  // 转发到共享有类型快照契约。
+  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
+  // helper 先清空并在成功时接收独立 opcode key；engine 不保存引用。
+  // 失败/边界：source validate 状态的 code/message 优先原样传播；其余 null、
+  // clone/self/cast、字段漂移或 snapshot validate 失败也由 helper 保持原错误顺序，
+  // 不发布 partial snapshot。
   protected function rdma_status checked_opcode_snapshot(
     rdma_cmq_opcode_key source,
     string label,
     rdma_status_code_e failure_code,
     output rdma_cmq_opcode_key snapshot
   );
-    rdma_status status;
-    uvm_object cloned_object;
-    string saved_profile_name;
-    bit [31:0] saved_opcode;
-    string saved_variant;
-
-    snapshot = null;
-    if (source == null)
-      return snapshot_failure(failure_code, {label, " opcode key is null"});
-    status = source.validate();
-    if (status == null)
-      return snapshot_failure(
-        failure_code, {label, " opcode validation returned null"}
-      );
-    if (!status.ok())
-      return status;
-    saved_profile_name = source.profile_name;
-    saved_opcode = source.opcode;
-    saved_variant = source.variant;
-    cloned_object = source.clone();
-    source.profile_name = saved_profile_name;
-    source.opcode = saved_opcode;
-    source.variant = saved_variant;
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " opcode snapshot clone contract failed"}
-      );
-    end
-    if (source.profile_name != saved_profile_name ||
-        source.opcode != saved_opcode || source.variant != saved_variant ||
-        snapshot.profile_name != saved_profile_name ||
-        snapshot.opcode != saved_opcode ||
-        snapshot.variant != saved_variant) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " opcode snapshot changed its source value"}
-      );
-    end
-    status = snapshot.validate();
-    if (status == null) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " opcode snapshot validation returned null"}
-      );
-    end
-    if (!status.ok())
-      snapshot = null;
-    return status;
+    return rdma_cmq_checked_opcode_snapshot(
+      source, label, failure_code, snapshot
+    );
   endfunction
 
   // 功能：checked_profile_body_snapshot 复制 source、label、snapshot、staging_invariant_failed 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、label（输入）、snapshot（输出）、staging_invariant_failed（输出）；checked_profile_body_snapshot 读取 source、label、snapshot、staging_invariant_failed 并使用字段 snapshot、source_type、status、staging_invariant_failed、snapshot_type，并写入 snapshot、staging_invariant_failed；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_profile_body_snapshot 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status checked_profile_body_snapshot(
     rdma_hw_model source,
@@ -3273,7 +4007,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：checked_body_snapshot 复制 source、label、failure_code、snapshot、staging_invariant_failed 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）、staging_invariant_failed（输出）；checked_body_snapshot 读取 source、label、failure_code、snapshot、staging_invariant_failed 并使用字段 snapshot、staging_invariant_failed、status、saved_body_value、saved_opcode、saved_command_id、saved_flags、target_snapshot，并写入 snapshot、staging_invariant_failed；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：checked_body_snapshot 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status checked_body_snapshot(
     rdma_hw_model source,
@@ -3407,67 +4140,39 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：checked_image_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_image_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、saved_value、saved_value.bytes、saved_value.length、saved_value.alignment、saved_value.endian、saved_value.image_kind、saved_value.hardware_version，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：checked_image_snapshot 先检查 source == null；saved_value == null；cloned_object == null || !$cast(snapshot, cloned_object，再返回 snapshot_failure(failure_code, {label, " image is null"})；rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：保留 engine 的 protected image snapshot seam，
+  // 转发到共享有类型 factory/clone 契约。
+  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
+  // helper 先清空并在成功时接收可转换的等值非自别名 image，
+  // 不要求保留 source runtime subtype；engine 不保存引用。
+  // 失败/边界：null、saved-value factory 失败、clone/cast/self 契约失败或公开值漂移时
+  // 原样返回 helper 状态；本 seam 不额外执行 image shape 校验。
   protected function rdma_status checked_image_snapshot(
     rdma_hw_image source,
     string label,
     rdma_status_code_e failure_code,
     output rdma_hw_image snapshot
   );
-    uvm_object cloned_object;
-    rdma_hw_image saved_value;
+    return rdma_cmq_checked_image_snapshot(
+      source, label, failure_code, snapshot
+    );
+  endfunction
 
-    snapshot = null;
-    if (source == null)
-      return snapshot_failure(failure_code, {label, " image is null"});
-    saved_value = rdma_hw_image::type_id::create({label, "_saved"});
-    if (saved_value == null)
-      return snapshot_failure(
-        failure_code, {label, " image value capture failed"}
-      );
-    saved_value.bytes = source.bytes;
-    saved_value.length = source.length;
-    saved_value.alignment = source.alignment;
-    saved_value.endian = source.endian;
-    saved_value.image_kind = source.image_kind;
-    saved_value.hardware_version = source.hardware_version;
-    saved_value.function_generation = source.function_generation;
-    saved_value.write_target_kind = source.write_target_kind;
-    saved_value.backing_target = source.backing_target;
-    saved_value.hmc_target = source.hmc_target;
-    saved_value.bar_target = source.bar_target;
-    saved_value.field_summary = source.field_summary;
-    cloned_object = source.clone();
-    source.bytes = saved_value.bytes;
-    source.length = saved_value.length;
-    source.alignment = saved_value.alignment;
-    source.endian = saved_value.endian;
-    source.image_kind = saved_value.image_kind;
-    source.hardware_version = saved_value.hardware_version;
-    source.function_generation = saved_value.function_generation;
-    source.write_target_kind = saved_value.write_target_kind;
-    source.backing_target = saved_value.backing_target;
-    source.hmc_target = saved_value.hmc_target;
-    source.bar_target = saved_value.bar_target;
-    source.field_summary = saved_value.field_summary;
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " image snapshot clone contract failed"}
-      );
-    end
-    if (!same_image_value(source, saved_value) ||
-        !same_image_value(snapshot, saved_value)) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " image snapshot changed its source value"}
-      );
-    end
-    return rdma_status::success();
+  // 功能：保留 engine 的 protected canonical image seam，
+  // 转发到先 clone、后重建 exact base image 的共享契约。
+  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package helper
+  // 先清空并在成功时接收与 source/factory candidate 无别名的 exact rdma_hw_image。
+  // 失败/边界：底层 image factory/clone 失败时原样传播；shape 或重建值失配仅在
+  // 消费 clone 契约后拒绝，不改变可观测 factory/clone 次数。
+  protected function rdma_status checked_canonical_image_snapshot(
+    rdma_hw_image source,
+    string label,
+    rdma_status_code_e failure_code,
+    output rdma_hw_image snapshot
+  );
+    return rdma_cmq_checked_canonical_image_snapshot(
+      source, label, failure_code, snapshot
+    );
   endfunction
 
   // 功能：checked_completion_payload_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
@@ -3520,14 +4225,22 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：checked_completion_ticket_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_completion_ticket_snapshot 读取 source、snapshot 并使用字段 snapshot、saved_command_id、saved_slot_sequence、saved_sq_index、saved_sq_wrap、saved_absolute_deadline、snapshot.command_id、status，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：checked_completion_ticket_snapshot 返回 RDMA_SC_INVALID_STATE；具体拒绝条件包括 “CMQ completion ticket authority is incomplete”；“CMQ completion ticket construction failed”；“CMQ completion ticket snapshot validation failed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：先经 factory 候选与 nested clone 契约复制 completion ticket，
+  //   再直接构造 exact rdma_cmq_ticket base 值，使 runtime factory override
+  //   不泄漏进 retained-journal nonfatal snapshot authority。
+  // 输入/输出及副作用：source 为只读 ticket；snapshot 入口清空，成功时
+  //   返回与 source/factory candidate 外层及 nested handle/opcode 无别名的
+  //   canonical 值；不更新 slot、journal 或 token 账本。
+  // 失败/边界：source/nested authority 缺失、factory 构造失败、Function/
+  //   CMQ/opcode clone 返回 null/self/变值、source 被改写，或 candidate/canonical
+  //   validate/shape 失败时返回 INVALID_STATE 且不发布 partial snapshot。
   protected function rdma_status checked_completion_ticket_snapshot(
     rdma_cmq_ticket source,
     output rdma_cmq_ticket snapshot
   );
     rdma_status status;
+    rdma_cmq_ticket factory_snapshot;
+    rdma_cmq_ticket canonical_snapshot;
     longint unsigned saved_command_id;
     longint unsigned saved_slot_sequence;
     int unsigned saved_sq_index;
@@ -3543,15 +4256,15 @@ class rdma_cmq_engine extends uvm_object;
     saved_sq_index = source.sq_index;
     saved_sq_wrap = source.sq_wrap;
     saved_absolute_deadline = source.absolute_deadline;
-    snapshot = rdma_cmq_ticket::type_id::create(
+    factory_snapshot = rdma_cmq_ticket::type_id::create(
       "cmq_polled_completion_ticket"
     );
-    if (snapshot == null)
+    if (factory_snapshot == null)
       return invalid_state("CMQ completion ticket construction failed");
-    snapshot.command_id = saved_command_id;
+    factory_snapshot.command_id = saved_command_id;
     status = checked_function_snapshot(
       source.function_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
-      snapshot.function_h
+      factory_snapshot.function_h
     );
     if (!status.ok()) begin
       snapshot = null;
@@ -3559,24 +4272,24 @@ class rdma_cmq_engine extends uvm_object;
     end
     status = checked_handle_snapshot(
       source.cmq_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
-      snapshot.cmq_h
+      factory_snapshot.cmq_h
     );
     if (!status.ok()) begin
       snapshot = null;
       return status;
     end
-    snapshot.slot_sequence = saved_slot_sequence;
-    snapshot.sq_index = saved_sq_index;
-    snapshot.sq_wrap = saved_sq_wrap;
+    factory_snapshot.slot_sequence = saved_slot_sequence;
+    factory_snapshot.sq_index = saved_sq_index;
+    factory_snapshot.sq_wrap = saved_sq_wrap;
     status = checked_opcode_snapshot(
       source.opcode_key, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
-      snapshot.opcode_key
+      factory_snapshot.opcode_key
     );
     if (!status.ok()) begin
       snapshot = null;
       return status;
     end
-    snapshot.absolute_deadline = saved_absolute_deadline;
+    factory_snapshot.absolute_deadline = saved_absolute_deadline;
     if (source.command_id != saved_command_id ||
         source.slot_sequence != saved_slot_sequence ||
         source.sq_index != saved_sq_index || source.sq_wrap != saved_sq_wrap ||
@@ -3586,76 +4299,59 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ completion ticket snapshot changed its source value"
       );
     end
-    status = snapshot.validate();
+    status = factory_snapshot.validate();
     if (status == null || !status.ok()) begin
       snapshot = null;
       return invalid_state("CMQ completion ticket snapshot validation failed");
     end
+    canonical_snapshot = new("cmq_polled_completion_ticket_canonical");
+    canonical_snapshot.command_id = factory_snapshot.command_id;
+    canonical_snapshot.function_h = factory_snapshot.function_h;
+    canonical_snapshot.cmq_h = factory_snapshot.cmq_h;
+    canonical_snapshot.slot_sequence = factory_snapshot.slot_sequence;
+    canonical_snapshot.sq_index = factory_snapshot.sq_index;
+    canonical_snapshot.sq_wrap = factory_snapshot.sq_wrap;
+    canonical_snapshot.opcode_key = factory_snapshot.opcode_key;
+    canonical_snapshot.absolute_deadline = factory_snapshot.absolute_deadline;
+    if (!rdma_cmq_ticket_shape_valid(canonical_snapshot) ||
+        !same_ticket_value(canonical_snapshot, source) ||
+        canonical_snapshot.function_h == source.function_h ||
+        canonical_snapshot.cmq_h == source.cmq_h ||
+        canonical_snapshot.opcode_key == source.opcode_key) begin
+      snapshot = null;
+      return invalid_state(
+        "CMQ completion ticket canonical value is invalid"
+      );
+    end
+    snapshot = canonical_snapshot;
     return rdma_status::success();
   endfunction
 
-  // 功能：checked_expected_snapshot 复制 source、label、failure_code、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、label（输入）、failure_code（输入）、snapshot（输出）；checked_expected_snapshot 读取 source、label、failure_code、snapshot 并使用字段 snapshot、status、saved_hardware_opcode、saved_variant、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：checked_expected_snapshot 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：保留 engine 的 protected expected-response snapshot ABI，转发共享
+  // typed contract，供既有 submission staging 与测试子类继续调用。
+  // 输入/输出及副作用：source/label/failure_code/snapshot 原样转发；engine 不保存
+  // 引用或状态，package helper 负责清空输出、clone、恢复 source 与发布 candidate。
+  // 失败/边界：source validation、clone-contract、mutation latch、candidate validation
+  // 与精确消息优先级全部由 helper 保持；本 seam 不补充重试或替代状态。
   protected function rdma_status checked_expected_snapshot(
     rdma_cmq_expected_response source,
     string label,
     rdma_status_code_e failure_code,
     output rdma_cmq_expected_response snapshot
   );
-    uvm_object cloned_object;
-    rdma_status status;
-    bit [31:0] saved_hardware_opcode;
-    string saved_variant;
-
-    snapshot = null;
-    if (source == null)
-      return snapshot_failure(
-        failure_code, {label, " expected response is null"}
-      );
-    status = source.validate();
-    if (status == null)
-      return snapshot_failure(
-        failure_code, {label, " expected validation returned null"}
-      );
-    if (!status.ok())
-      return status;
-    saved_hardware_opcode = source.hardware_opcode;
-    saved_variant = source.variant;
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " expected snapshot clone contract failed"}
-      );
-    end
-    if (source.hardware_opcode != saved_hardware_opcode ||
-        source.variant != saved_variant ||
-        snapshot.hardware_opcode != saved_hardware_opcode ||
-        snapshot.variant != saved_variant) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " expected snapshot changed its source value"}
-      );
-    end
-    status = snapshot.validate();
-    if (status == null) begin
-      snapshot = null;
-      return snapshot_failure(
-        failure_code, {label, " expected snapshot validation returned null"}
-      );
-    end
-    if (!status.ok())
-      snapshot = null;
-    return status;
+    return rdma_cmq_checked_expected_snapshot(
+      source, label, failure_code, snapshot
+    );
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，snapshot_command_value 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：source（输入）、snapshot（输出）、staging_invariant_failed（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为
-  //   detached 快照，读取不取得外部资源所有权。
-  // 失败/边界：snapshot_command_value 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：snapshot_command_value 逐层验证 command shell/body/signature 的 clone
+  //   契约，并把 signature 重建为 journal digest 可接受的 exact image。
+  // 输入/输出及副作用：source 为只读 command；snapshot 成功时输出完整
+  //   detached 图；staging_invariant_failed 仅标识 body profile 契约故障；不转移
+  //   caller body/image 所有权，也不修改 shell 标量。
+  // 失败/边界：null source、Function/opcode/body/signature clone 返回
+  //   null/self/变值、signature canonical 形状非法或 final validate 失败时不发布
+  //   partial snapshot；持久 factory override 不得把派生 image 泄漏到 journal。
   protected function rdma_status snapshot_command_value(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot,
@@ -3710,7 +4406,7 @@ class rdma_cmq_engine extends uvm_object;
       return status;
     signature_snapshot = null;
     if (source.qpc_signature_source != null) begin
-      status = checked_image_snapshot(
+      status = checked_canonical_image_snapshot(
         source.qpc_signature_source, "CMQ command signature",
         RDMA_SC_INVALID_ARGUMENT, signature_snapshot
       );
@@ -3840,10 +4536,15 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_ticket_value 创建独立的 rdma_status；根据 name、command_id、function_h、cmq_h、slot_sequence、sq_index、sq_wrap、opcode_key、absolute_deadline、ticket 设置字段 ticket、ticket.command_id、status、ticket.slot_sequence、ticket.sq_index、ticket.sq_wrap、ticket.absolute_deadline、cloned_object，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）、command_id（输入）、function_h（输入）、cmq_h（输入）、slot_sequence（输入）、sq_index（输入）、sq_wrap（输入）、opcode_key（输入）、absolute_deadline（输入）、ticket（输出）；输入字段被复制到返回值或
-  //   output；生成结果与输入隔离，不隐式修改调用方对象。
-  // 失败/边界：make_ticket_value 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ ticket construction failed”“CMQ ticket validation failed”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：make_ticket_value 先经 UVM factory 构造并 clone 候选 ticket，使测试可观测
+  //   factory/clone 故障；候选通过后再直接构造 exact rdma_cmq_ticket，
+  //   作为 journal digest 可接受的 canonical authority 值。
+  // 输入/输出及副作用：command_id、Function/CMQ handle、slot_sequence、SQ
+  //   位置、opcode_key 与 absolute_deadline 为输入；ticket 先清空，成功时输出
+  //   与输入及 factory 候选图均无别名的 exact base 值，不改写输入。
+  // 失败/边界：factory 构造、nested 快照、validate/clone 契约、direct
+  //   canonical 快照或最终形状任一失败均返回 INVALID_STATE；已武装
+  //   clone-self 故障仍在 canonicalization 前被消费，且失败不发布部分 ticket。
   protected function rdma_status make_ticket_value(
     string name,
     longint unsigned command_id,
@@ -3859,6 +4560,11 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status status;
     uvm_object cloned_object;
     rdma_cmq_ticket detached_ticket;
+    rdma_cmq_ticket canonical_ticket;
+    rdma_handle function_snapshot_base;
+    rdma_handle cmq_snapshot;
+    rdma_function_handle function_snapshot;
+    rdma_cmq_opcode_key opcode_snapshot;
 
     ticket = rdma_cmq_ticket::type_id::create(name);
     if (ticket == null)
@@ -3905,13 +4611,41 @@ class rdma_cmq_engine extends uvm_object;
       ticket = null;
       return invalid_state("CMQ ticket snapshot clone contract failed");
     end
-    ticket = detached_ticket;
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          detached_ticket.function_h, 1'b0, function_snapshot_base
+        ) || !$cast(function_snapshot, function_snapshot_base) ||
+        !rdma_cmq_try_snapshot_handle_direct(
+          detached_ticket.cmq_h, 1'b0, cmq_snapshot
+        ) || !rdma_cmq_try_snapshot_opcode_key_direct(
+          detached_ticket.opcode_key, opcode_snapshot
+        )) begin
+      ticket = null;
+      return invalid_state("CMQ ticket canonical snapshot failed");
+    end
+    canonical_ticket = new({name, "_canonical"});
+    canonical_ticket.command_id = detached_ticket.command_id;
+    canonical_ticket.function_h = function_snapshot;
+    canonical_ticket.cmq_h = cmq_snapshot;
+    canonical_ticket.slot_sequence = detached_ticket.slot_sequence;
+    canonical_ticket.sq_index = detached_ticket.sq_index;
+    canonical_ticket.sq_wrap = detached_ticket.sq_wrap;
+    canonical_ticket.opcode_key = opcode_snapshot;
+    canonical_ticket.absolute_deadline = detached_ticket.absolute_deadline;
+    if (!rdma_cmq_ticket_shape_valid(canonical_ticket) ||
+        !same_ticket_value(canonical_ticket, detached_ticket)) begin
+      ticket = null;
+      return invalid_state("CMQ ticket canonical value is invalid");
+    end
+    ticket = canonical_ticket;
     return rdma_status::success();
   endfunction
 
   // 功能：checked_slot_context_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_slot_context_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：checked_slot_context_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ slot context source is null”；“CMQ slot context snapshot clone contract failed”；“CMQ slot context snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 失败/边界：checked_slot_context_snapshot 返回函数体规定的失败状态；具体
+  //   拒绝条件包括 source 为空、clone 返回 null/self、Function/CMQ handle 经
+  //   same_handle 比较后身份漂移、字段值改变或保留 alias；失败路径不提交
+  //   部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_slot_context_snapshot(
     rdma_cmq_slot_context source,
     output rdma_cmq_slot_context snapshot
@@ -3928,9 +4662,9 @@ class rdma_cmq_engine extends uvm_object;
       return invalid_state("CMQ slot context snapshot clone contract failed");
     end
     if (snapshot.function_h == null || source.function_h == null ||
-        !snapshot.function_h.same_instance(source.function_h) ||
+        !same_handle(snapshot.function_h, source.function_h) ||
         snapshot.cmq_h == null || source.cmq_h == null ||
-        !snapshot.cmq_h.same_instance(source.cmq_h) ||
+        !same_handle(snapshot.cmq_h, source.cmq_h) ||
         snapshot.backing_addr.value != source.backing_addr.value ||
         snapshot.relative_offset != source.relative_offset ||
         snapshot.slot_sequence != source.slot_sequence ||
@@ -3944,36 +4678,93 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：checked_record_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-  // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_record_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：checked_record_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ slot record source is null”；“CMQ slot record snapshot clone contract failed”；“CMQ slot record snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：checked_record_snapshot 先验证 factory-backed slot record clone 契约，
+  //   再直接重建 exact rdma_cmq_slot_record/ticket/expected 值供预分配发布。
+  // 输入/输出及副作用：source 为只读候选；snapshot 先清空，成功时输出
+  //   与 source/factory clone 都无别名的 exact graph，不修改 slot/ticket 输入。
+  // 失败/边界：source/ticket/expected 不完整，clone 返回 null/self/变值，
+  //   nested direct snapshot 失败，或 canonical record 不等值时返回 INVALID_STATE；
+  //   factory clone-self 故障仍在 exact 重建前可观测，失败不发布部分图。
   protected function rdma_status checked_record_snapshot(
     rdma_cmq_slot_record source,
     output rdma_cmq_slot_record snapshot
   );
     uvm_object cloned_object;
+    rdma_cmq_slot_record factory_snapshot;
+    rdma_cmq_slot_record canonical_snapshot;
+    rdma_cmq_ticket canonical_ticket;
+    rdma_cmq_expected_response canonical_expected;
+    rdma_handle function_snapshot_base;
+    rdma_handle cmq_snapshot;
+    rdma_function_handle function_snapshot;
+    rdma_cmq_opcode_key opcode_snapshot;
+    rdma_status status;
 
     snapshot = null;
     if (source == null)
       return invalid_state("CMQ slot record source is null");
     cloned_object = source.clone();
-    if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-        snapshot == source) begin
+    if (cloned_object == null || !$cast(factory_snapshot, cloned_object) ||
+        factory_snapshot == source) begin
       snapshot = null;
       return invalid_state("CMQ slot record snapshot clone contract failed");
     end
-    if (snapshot.slot_sequence != source.slot_sequence ||
-        snapshot.sq_index != source.sq_index ||
-        snapshot.sq_wrap != source.sq_wrap ||
-        snapshot.state != source.state ||
-        snapshot.command_token != source.command_token ||
-        !same_ticket_value(snapshot.ticket, source.ticket) ||
-        !same_expected_value(snapshot.expected, source.expected) ||
-        snapshot.ticket == source.ticket ||
-        snapshot.expected == source.expected) begin
+    if (factory_snapshot.slot_sequence != source.slot_sequence ||
+        factory_snapshot.sq_index != source.sq_index ||
+        factory_snapshot.sq_wrap != source.sq_wrap ||
+        factory_snapshot.state != source.state ||
+        factory_snapshot.command_token != source.command_token ||
+        factory_snapshot.batch_key != source.batch_key ||
+        factory_snapshot.journal_item_index != source.journal_item_index ||
+        !same_ticket_value(factory_snapshot.ticket, source.ticket) ||
+        !same_expected_value(factory_snapshot.expected, source.expected) ||
+        factory_snapshot.ticket == source.ticket ||
+        factory_snapshot.expected == source.expected) begin
       snapshot = null;
       return invalid_state("CMQ slot record snapshot changed value");
     end
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          factory_snapshot.ticket.function_h, 1'b0, function_snapshot_base
+        ) || !$cast(function_snapshot, function_snapshot_base) ||
+        !rdma_cmq_try_snapshot_handle_direct(
+          factory_snapshot.ticket.cmq_h, 1'b0, cmq_snapshot
+        ) || !rdma_cmq_try_snapshot_opcode_key_direct(
+          factory_snapshot.ticket.opcode_key, opcode_snapshot
+        )) begin
+      return invalid_state("CMQ slot record ticket canonical snapshot failed");
+    end
+    canonical_ticket = new("cmq_slot_record_canonical_ticket");
+    canonical_ticket.command_id = factory_snapshot.ticket.command_id;
+    canonical_ticket.function_h = function_snapshot;
+    canonical_ticket.cmq_h = cmq_snapshot;
+    canonical_ticket.slot_sequence = factory_snapshot.ticket.slot_sequence;
+    canonical_ticket.sq_index = factory_snapshot.ticket.sq_index;
+    canonical_ticket.sq_wrap = factory_snapshot.ticket.sq_wrap;
+    canonical_ticket.opcode_key = opcode_snapshot;
+    canonical_ticket.absolute_deadline =
+      factory_snapshot.ticket.absolute_deadline;
+    canonical_expected = new("cmq_slot_record_canonical_expected");
+    canonical_expected.hardware_opcode =
+      factory_snapshot.expected.hardware_opcode;
+    canonical_expected.variant = factory_snapshot.expected.variant;
+    status = canonical_expected.validate();
+    if (!rdma_cmq_ticket_shape_valid(canonical_ticket) || status == null ||
+        !status.ok() ||
+        !same_ticket_value(canonical_ticket, factory_snapshot.ticket) ||
+        !same_expected_value(canonical_expected, factory_snapshot.expected))
+      return invalid_state("CMQ slot record canonical value is invalid");
+    canonical_snapshot = new("cmq_slot_record_canonical_snapshot");
+    canonical_snapshot.slot_sequence = factory_snapshot.slot_sequence;
+    canonical_snapshot.sq_index = factory_snapshot.sq_index;
+    canonical_snapshot.sq_wrap = factory_snapshot.sq_wrap;
+    canonical_snapshot.state = factory_snapshot.state;
+    canonical_snapshot.ticket = canonical_ticket;
+    canonical_snapshot.expected = canonical_expected;
+    canonical_snapshot.command_token = factory_snapshot.command_token;
+    canonical_snapshot.batch_key = factory_snapshot.batch_key;
+    canonical_snapshot.journal_item_index =
+      factory_snapshot.journal_item_index;
+    snapshot = canonical_snapshot;
     return rdma_status::success();
   endfunction
 
@@ -4005,7 +4796,10 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：checked_doorbell_desc_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
   // 输入/输出及副作用：source（输入）、snapshot（输出）；checked_doorbell_desc_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：checked_doorbell_desc_snapshot 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ doorbell descriptor source is null”；“CMQ doorbell descriptor snapshot changed value”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 失败/边界：checked_doorbell_desc_snapshot 返回函数体规定的失败状态；具体
+  //   拒绝条件包括 source 为空、clone 返回 null/self、Function/target handle 经
+  //   same_handle 比较后身份漂移、字段或 nested dependency 值改变，或保留 alias；
+  //   失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   protected function rdma_status checked_doorbell_desc_snapshot(
     rdma_doorbell_desc source,
     output rdma_doorbell_desc snapshot
@@ -4025,9 +4819,9 @@ class rdma_cmq_engine extends uvm_object;
     end
     if (snapshot.kind != source.kind ||
         snapshot.function_h == null || source.function_h == null ||
-        !snapshot.function_h.same_instance(source.function_h) ||
+        !same_handle(snapshot.function_h, source.function_h) ||
         snapshot.target_h == null || source.target_h == null ||
-        !snapshot.target_h.same_instance(source.target_h) ||
+        !same_handle(snapshot.target_h, source.target_h) ||
         snapshot.notify_bar_id != source.notify_bar_id ||
         snapshot.relative_offset != source.relative_offset ||
         snapshot.width != source.width || snapshot.endian != source.endian ||
@@ -4060,7 +4854,6 @@ class rdma_cmq_engine extends uvm_object;
 
   // 功能：sqe_metadata_status 校验 image、expected_backing_target 与当前对象状态的一致性，并显式处理“CMQ profile returned a null SQE”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：image（输入）、expected_backing_target（输入）；sqe_metadata_status 读取 image、expected_backing_target 并使用字段 rdma_status、prepared_binding.generation、value；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：sqe_metadata_status 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ profile returned a null SQE”“CMQ SQE is not exactly 64 bytes”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status sqe_metadata_status(
     rdma_hw_image image,
@@ -4242,9 +5035,3071 @@ class rdma_cmq_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，clear_configuration 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：clear_configuration 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 设计说明：journal 的公开/hostile-factory 路径必须始终返回直接构造的
+  //   status；集中 helper 只统一类别字段，不改变下游错误码或重试语义。
+  // 功能：直接构造指定 code/message 的 journal status，绕开 raw UVM factory。
+  // 输入/输出及副作用：code/message 为只读输入；返回调用方拥有的新 status。
+  // 失败/边界：未知 code 由 rdma_cmq_direct_status 保守归类；始终返回非空值。
+  protected function rdma_status journal_status(
+    rdma_status_code_e code,
+    string message = ""
+  );
+    return rdma_cmq_direct_status(code, message);
+  endfunction
+
+  // 功能：保留 engine 的 protected retained-owner 比较 seam，并转发共享 journal 值契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 owner；返回公开字段与资源 incarnation 比较结果，
+  //   不修改 engine、owner 或 journal。
+  // 失败/边界：shape 非法、required handle/identity 缺失或字段漂移时共享契约返回 0；
+  //   same_instance() 比较 incarnation 值，不证明两个 handle 是同一对象 alias。
+  protected function bit same_journal_owner_value(
+    rdma_cmq_recovery_owner lhs,
+    rdma_cmq_recovery_owner rhs
+  );
+    return rdma_cmq_same_journal_owner_value(lhs, rhs);
+  endfunction
+
+  // 功能：保留 engine 的 protected detached-owner 比较 seam，并转发共享 journal 值契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 owner；返回完整 immutable 公开值比较结果，
+  //   不恢复 resource handle alias 或修改 engine。
+  // 失败/边界：shape 非法、required handle/identity 缺失或字段漂移时共享契约返回 0；
+  //   同一结果图内应保留的 owner 节点 alias 仍由调用方验证。
+  protected function bit same_journal_owner_detached_value(
+    input rdma_cmq_recovery_owner lhs,
+    input rdma_cmq_recovery_owner rhs
+  );
+    return rdma_cmq_same_journal_owner_detached_value(lhs, rhs);
+  endfunction
+
+  // 功能：保留 engine 的 protected DMA-context instance 比较 seam，并转发共享契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 context；返回 Function/owner incarnation 与
+  //   requester、route、epoch、queue-role 等公开投影比较结果，不执行 DMA。
+  // 失败/边界：null、Function 缺失、optional owner 形状不一致或字段漂移时共享契约
+  //   返回 0；不做 validation、outer exact-type gate 或对象 alias 判断。
+  protected function bit same_journal_dma_context_value(
+    rdma_dma_request_context lhs,
+    rdma_dma_request_context rhs
+  );
+    return rdma_cmq_same_journal_dma_context_value(lhs, rhs);
+  endfunction
+
+  // 功能：保留 engine 的 protected detached DMA-context 比较 seam，并转发共享契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 context；返回 Function/owner handle 值与
+  //   requester、route、epoch、queue-role 等公开投影比较结果，不修改 context。
+  // 失败/边界：null、Function 缺失、optional owner 形状不一致或字段漂移时共享契约
+  //   返回 0；不做 validation、outer exact-type gate 或嵌套 handle alias 恢复。
+  protected function bit same_journal_dma_context_detached_value(
+    input rdma_dma_request_context lhs,
+    input rdma_dma_request_context rhs
+  );
+    return rdma_cmq_same_journal_dma_context_detached_value(lhs, rhs);
+  endfunction
+
+  // 功能：保留 engine 的 protected mapping-public 比较 seam，并转发共享 journal 契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 mapping；返回公开 authority/range/state、
+  //   外部 UMEM/PBL/MW 引用与 page metadata 比较结果，不修改 mapping 或 engine。
+  // 失败/边界：null、Function 缺失、optional owner 形状不一致或公开字段漂移时共享
+  //   契约返回 0；不做 validation、outer exact-type gate 或私有 release-authority 比较。
+  protected function bit same_journal_mapping_public_value(
+    rdma_dma_mapping lhs,
+    rdma_dma_mapping rhs
+  );
+    return rdma_cmq_same_journal_mapping_public_value(lhs, rhs);
+  endfunction
+
+  // 功能：保留 engine 的 protected command-identity 比较 seam，并转发共享契约。
+  // 输入/输出及副作用：lhs/rhs 为只读 identity；返回七个既有标量/文本字段比较结果，
+  //   不修改 execution result、journal 或 engine。
+  // 失败/边界：null、非 Function kind、零 UID/generation、空 profile/variant 或字段漂移
+  //   时共享契约返回 0；不做 outer exact-type gate 或额外 canonicalization。
+  protected function bit same_journal_command_identity_value(
+    rdma_cmq_command_identity lhs,
+    rdma_cmq_command_identity rhs
+  );
+    return rdma_cmq_same_journal_command_identity_value(lhs, rhs);
+  endfunction
+
+  // 功能：直接复制 DMA request context 及两个嵌套 handle，供 journal 图拥有 detached 值。
+  // 输入/输出及副作用：source 为只读输入，snapshot 入口清空；成功发布新 context。
+  // 失败/边界：null/未知 outer subtype、source validate 失败、handle subtype 不受支持，
+  //   或候选值/分离校验失败时返回 INVALID_ARGUMENT/null，不调用 clone/copy/factory。
+  protected function rdma_status snapshot_journal_dma_context_locked(
+    input rdma_dma_request_context source,
+    output rdma_dma_request_context snapshot
+  );
+    rdma_dma_request_context candidate;
+    rdma_handle function_snapshot_base;
+    rdma_handle owner_snapshot;
+    rdma_status status;
+
+    snapshot = null;
+    if (source == null ||
+        source.get_object_type() != rdma_dma_request_context::get_type())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal DMA context is null or unsupported"
+      );
+    status = source.validate();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal DMA context validation returned null"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          source.function_h, 1'b0, function_snapshot_base
+        ) || !rdma_cmq_try_snapshot_handle_direct(
+          source.owner_h, 1'b1, owner_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal DMA context nested snapshot failed"
+      );
+
+    candidate = new("journal_dma_context_snapshot");
+    if (!$cast(candidate.function_h, function_snapshot_base))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal DMA Function snapshot subtype is invalid"
+      );
+    candidate.requester_bdf = source.requester_bdf;
+    candidate.pasid_valid = source.pasid_valid;
+    candidate.pasid = source.pasid;
+    candidate.dma_domain_valid = source.dma_domain_valid;
+    candidate.dma_domain_id = source.dma_domain_id;
+    candidate.route = source.route;
+    candidate.reset_epoch = source.reset_epoch;
+    candidate.route_valid = source.route_valid;
+    candidate.epoch_valid = source.epoch_valid;
+    candidate.owner_h = owner_snapshot;
+    candidate.queue_role_valid = source.queue_role_valid;
+    candidate.queue_role = source.queue_role;
+    if (!same_journal_dma_context_value(source, candidate) ||
+        candidate.function_h == source.function_h ||
+        (source.owner_h != null && candidate.owner_h == source.owner_h))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal DMA context snapshot is unequal or aliased"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 设计说明：mapping 的 concrete adapter 私有 allocation identity 不能由 engine
+  //   猜测；先取得 opaque release-authority subtype，再显式覆盖全部公开投影。
+  // 功能：通过 adapter seam 复制 mapping 私有 authority，并直接复制所有公开字段/handle。
+  // 输入/输出及副作用：source 为非拥有输入，snapshot 入口清空；adapter seam 仅做
+  //   authority snapshot/equivalence 查询，成功结果由 journal 图拥有。
+  // 失败/边界：seam null/error、自别名/错误 subtype、嵌套 handle 或完整公开值验证
+  //   失败时返回非空错误与 null；绝不降级成 base mapping 或 digest 替代品。
+  protected function rdma_status snapshot_journal_mapping_locked(
+    input rdma_dma_mapping source,
+    output rdma_dma_mapping snapshot
+  );
+    rdma_dma_mapping candidate;
+    rdma_handle function_snapshot_base;
+    rdma_handle owner_snapshot;
+    rdma_status status;
+
+    snapshot = null;
+    if (source == null)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal mapping is null"
+      );
+    status = source.snapshot_release_authority(candidate);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal mapping authority snapshot returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    if (candidate == null || candidate == source ||
+        candidate.get_object_type() != source.get_object_type())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal mapping authority snapshot is null, aliased or sliced"
+      );
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          source.function_h, 1'b0, function_snapshot_base
+        ) || !rdma_cmq_try_snapshot_handle_direct(
+          source.owner_h, 1'b1, owner_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal mapping nested handle snapshot failed"
+      );
+    if (!$cast(candidate.function_h, function_snapshot_base))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal mapping Function snapshot subtype is invalid"
+      );
+    candidate.requester_bdf = source.requester_bdf;
+    candidate.pasid_valid = source.pasid_valid;
+    candidate.pasid = source.pasid;
+    candidate.dma_domain_valid = source.dma_domain_valid;
+    candidate.dma_domain_id = source.dma_domain_id;
+    candidate.route = source.route;
+    candidate.reset_epoch = source.reset_epoch;
+    candidate.route_valid = source.route_valid;
+    candidate.epoch_valid = source.epoch_valid;
+    candidate.backing_addr = source.backing_addr;
+    candidate.iova = source.iova;
+    candidate.size = source.size;
+    candidate.direction = source.direction;
+    candidate.permissions = source.permissions;
+    candidate.state = source.state;
+    candidate.owner_h = owner_snapshot;
+    candidate.umem_ref = source.umem_ref;
+    candidate.pbl_ref = source.pbl_ref;
+    candidate.mw_ref = source.mw_ref;
+    candidate.umem_backed = source.umem_backed;
+    candidate.umem_page_count = source.umem_page_count;
+
+    status = source.release_authority_status(candidate);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal mapping authority verification returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    if (!same_journal_mapping_public_value(source, candidate) ||
+        candidate.function_h == source.function_h ||
+        (source.owner_h != null && candidate.owner_h == source.owner_h))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal mapping snapshot changed public value or retained an alias"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：使用指定 exact profile service 复制 command body，再直接构造 command shell。
+  // 输入/输出及副作用：source、已 canonicalize 的 detached_owner、context/profile
+  //   为输入，snapshot 入口清空；成功发布完整 detached command。
+  // 失败/边界：未知 body、profile seam null/error、outer/nested subtype 非法、owner
+  //   不等值/仍别名或 shell 字段漂移时原子失败；不调用 generic clone/copy/factory。
+  protected function rdma_status snapshot_command_with_profile_locked(
+    input rdma_cmq_command_desc source,
+    input rdma_cmq_recovery_owner detached_owner,
+    input rdma_cmq_nonfatal_snapshot_context ctx_snapshot,
+    input rdma_cmq_hw_profile profile_service,
+    output rdma_cmq_command_desc snapshot
+  );
+    rdma_cmq_command_desc candidate;
+    rdma_hw_model body_snapshot;
+    rdma_handle function_snapshot_base;
+    rdma_cmq_opcode_key opcode_snapshot;
+    rdma_hw_image signature_snapshot;
+    rdma_status status;
+    bit context_body;
+
+    snapshot = null;
+    if (source == null || ctx_snapshot == null || profile_service == null ||
+        source.get_object_type() != rdma_cmq_command_desc::get_type())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal command source/context/profile is invalid"
+      );
+
+    context_body = has_exact_object_type(source.body,
+                                         rdma_cqc_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_mrt_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_srqc_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_ceqc_model::get_type()) ||
+                   has_exact_object_type(source.body,
+                                         rdma_aeqc_model::get_type());
+    if (context_body)
+      status = checked_context_snapshot(
+        source.body, "CMQ journal command body", RDMA_SC_INVALID_ARGUMENT,
+        body_snapshot
+      );
+    else
+      status = profile_service.snapshot_command_body(
+        source.body, body_snapshot
+      );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal command body snapshot returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    if (body_snapshot == null || body_snapshot == source.body ||
+        (context_body &&
+         (!same_body_value(source.body, body_snapshot) ||
+          !body_graph_detached(source.body, body_snapshot))) ||
+        (!context_body &&
+         (!profile_service.same_command_body_value(
+            source.body, body_snapshot
+          ) || !profile_service.command_body_graph_detached(
+            source.body, body_snapshot
+          ))))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal command body snapshot contract failed"
+      );
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          source.function_h, 1'b0, function_snapshot_base
+        ) || !rdma_cmq_try_snapshot_opcode_key_direct(
+          source.opcode_key, opcode_snapshot
+        ) || !rdma_cmq_try_snapshot_image_direct(
+          source.qpc_signature_source, 1'b1, signature_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal command shell nested snapshot failed"
+      );
+    if (detached_owner == null || detached_owner == source.recovery_owner ||
+        !same_journal_owner_value(source.recovery_owner, detached_owner) ||
+        source.timeout == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal command owner or timeout is invalid"
+      );
+
+    candidate = new("journal_command_snapshot");
+    if (!$cast(candidate.function_h, function_snapshot_base))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal command Function snapshot subtype is invalid"
+      );
+    candidate.opcode_key = opcode_snapshot;
+    candidate.body = body_snapshot;
+    candidate.qpc_signature_source = signature_snapshot;
+    candidate.vfid_override = source.vfid_override;
+    candidate.use_vfid = source.use_vfid;
+    candidate.timeout = source.timeout;
+    candidate.recovery_owner = detached_owner;
+    if (candidate.function_h == source.function_h ||
+        candidate.opcode_key == source.opcode_key ||
+        (source.qpc_signature_source != null &&
+         candidate.qpc_signature_source == source.qpc_signature_source) ||
+        !same_handle(candidate.function_h, source.function_h) ||
+        !same_opcode_value(candidate.opcode_key, source.opcode_key) ||
+        (source.qpc_signature_source != null &&
+         !same_image_value(candidate.qpc_signature_source,
+                           source.qpc_signature_source)) ||
+        candidate.vfid_override != source.vfid_override ||
+        candidate.use_vfid != source.use_vfid ||
+        candidate.timeout != source.timeout)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal command snapshot is unequal or aliased"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：用 engine 当前 profile 委托 command journal snapshot 的固定公开 seam。
+  // 输入/输出及副作用：source/detached_owner/context 为输入，snapshot 为输出；
+  //   本函数不取锁，调用方须已持 engine_lock 或处于串行 probe。
+  // 失败/边界：当前 profile 缺失或 typed body/shell 拒绝时输出 null 与非空错误。
+  protected function rdma_status snapshot_command_for_journal_locked(
+    input rdma_cmq_command_desc source,
+    input rdma_cmq_recovery_owner detached_owner,
+    input rdma_cmq_nonfatal_snapshot_context ctx_snapshot,
+    output rdma_cmq_command_desc snapshot
+  );
+    return snapshot_command_with_profile_locked(
+      source, detached_owner, ctx_snapshot, profile, snapshot
+    );
+  endfunction
+
+  // 设计说明：retained completion 不能把 profile/测试 factory 产生的 raw-CQE
+  //   subtype 直接带入 journal 图；先把已认证的公开字段投影成 exact base image，
+  //   再交给 nonfatal snapshot context 复制，才能同时保持 hostile subtype 隔离与
+  //   timeout/reset completion 的 null raw-CQE 语义。该 helper 是纯值阶段，不拥有
+  //   completion、profile、engine ledger 或外部 backing 的生命周期。
+  // 功能：把可选 completion.raw_cqe 复制为 canonical CMQ CQE image，并验证固定
+  //   长度、image/target metadata、generation 与 ticket Function generation 一致。
+  // 输入/输出及副作用：source 为只读 completion 输入；canonical_raw_cqe 先清空，
+  //   raw-CQE 缺失时返回 OK+null，存在时返回新建 base image；函数只复制字段和
+  //   执行 shape/value 检查，不取锁、不调用 profile/factory、不修改 source/engine。
+  // 失败/边界：非 CMQ CQE、长度/target 非法、ticket 或 Function 缺失、generation
+  //   不一致或 image 值漂移返回 INVALID_ARGUMENT；source/raw null 是 timeout/reset
+  //   合法边界并返回成功，不把 null raw 当作 malformed hardware completion。
+  protected function rdma_status canonicalize_completion_raw_cqe(
+    input rdma_cmq_completion source,
+    output rdma_hw_image canonical_raw_cqe
+  );
+    canonical_raw_cqe = null;
+    if (source == null || source.raw_cqe == null)
+      return journal_status(RDMA_SC_OK);
+
+    canonical_raw_cqe = new("cmq_completion_canonical_raw_cqe");
+    canonical_raw_cqe.bytes = source.raw_cqe.bytes;
+    canonical_raw_cqe.length = source.raw_cqe.length;
+    canonical_raw_cqe.alignment = source.raw_cqe.alignment;
+    canonical_raw_cqe.endian = source.raw_cqe.endian;
+    canonical_raw_cqe.image_kind = source.raw_cqe.image_kind;
+    canonical_raw_cqe.hardware_version = source.raw_cqe.hardware_version;
+    canonical_raw_cqe.function_generation =
+      source.raw_cqe.function_generation;
+    canonical_raw_cqe.write_target_kind =
+      source.raw_cqe.write_target_kind;
+    canonical_raw_cqe.backing_target = source.raw_cqe.backing_target;
+    canonical_raw_cqe.hmc_target = source.raw_cqe.hmc_target;
+    canonical_raw_cqe.bar_target = source.raw_cqe.bar_target;
+    canonical_raw_cqe.field_summary = source.raw_cqe.field_summary;
+    if (!rdma_cmq_image_shape_valid(canonical_raw_cqe) ||
+        canonical_raw_cqe.length != CMQE_BYTES ||
+        canonical_raw_cqe.image_kind != RDMA_IMAGE_CMQ_CQE ||
+        canonical_raw_cqe.write_target_kind != RDMA_HW_TARGET_NONE ||
+        canonical_raw_cqe.backing_target.value != 0 ||
+        canonical_raw_cqe.hmc_target.value != 0 ||
+        canonical_raw_cqe.bar_target.value != 0 ||
+        source.ticket == null || source.ticket.function_h == null ||
+        canonical_raw_cqe.function_generation !=
+          source.ticket.function_h.generation ||
+        !same_image_value(canonical_raw_cqe, source.raw_cqe))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ completion raw CQE canonicalization failed"
+      );
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：使用指定 profile 先复制可选 typed payload，再由 context 构造 completion shell。
+  // 输入/输出及副作用：source/context/profile 为只读输入，snapshot 入口清空；
+  //   ticket/status canonical aliases 由 context 维护。
+  // 失败/边界：未知 payload、profile seam null/error、completion subtype/shape 或
+  //   payload 分离验证失败时原子返回错误；null source/payload 按契约允许。
+  protected function rdma_status snapshot_completion_with_profile_locked(
+    input rdma_cmq_completion source,
+    input rdma_cmq_nonfatal_snapshot_context ctx_snapshot,
+    input rdma_cmq_hw_profile profile_service,
+    output rdma_cmq_completion snapshot
+  );
+    uvm_object payload_snapshot;
+    rdma_cmq_completion candidate;
+    rdma_cmq_completion canonical_source;
+    rdma_hw_image canonical_raw_cqe;
+    rdma_status status;
+    string failure_reason;
+
+    snapshot = null;
+    if (ctx_snapshot == null || profile_service == null)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ completion snapshot context or profile is null"
+      );
+    payload_snapshot = null;
+    if (source != null && source.decoded_response != null) begin
+      status = profile_service.snapshot_completion_payload(
+        source.decoded_response, payload_snapshot
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ completion payload snapshot returned null status"
+        );
+      if (!status.ok())
+        return journal_status(status.code, status.message);
+      if (payload_snapshot == null ||
+          payload_snapshot == source.decoded_response ||
+          !profile_service.same_completion_payload_value(
+            source.decoded_response, payload_snapshot
+          ) || !profile_service.completion_payload_graph_detached(
+            source.decoded_response, payload_snapshot
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ completion payload snapshot contract failed"
+        );
+    end
+    status = canonicalize_completion_raw_cqe(source, canonical_raw_cqe);
+    if (status == null || !status.ok())
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ completion raw-CQE canonicalization returned null status"
+      ) : status;
+    if (source != null && canonical_raw_cqe != null) begin
+      canonical_source = new("cmq_completion_canonical_source");
+      canonical_source.ticket = source.ticket;
+      canonical_source.status = source.status;
+      canonical_source.raw_cqe = canonical_raw_cqe;
+      canonical_source.decoded_response = source.decoded_response;
+    end
+    else
+      canonical_source = source;
+    if (!ctx_snapshot.try_snapshot_completion_shell(
+          canonical_source, payload_snapshot, candidate, failure_reason
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        {"CMQ completion shell snapshot failed: ", failure_reason}
+      );
+    if (source != null && (candidate == null || candidate == source))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ completion shell snapshot is null or aliased"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：用当前 engine profile 委托 completion result snapshot 的固定公开 seam。
+  // 输入/输出及副作用：source/context 为输入，snapshot 为输出；不取锁或修改 profile。
+  // 失败/边界：profile 缺失、未知 payload 或 shell 非法时输出 null 与非空错误。
+  protected function rdma_status snapshot_completion_for_result_locked(
+    input rdma_cmq_completion source,
+    input rdma_cmq_nonfatal_snapshot_context ctx_snapshot,
+    output rdma_cmq_completion snapshot
+  );
+    return snapshot_completion_with_profile_locked(
+      source, ctx_snapshot, profile, snapshot
+    );
+  endfunction
+
+  // 功能：为一次 runtime completion/timeout/late transition 只读定位唯一
+  //   retained journal item，预建 journal-owned completion，并用 Task 9 reducer
+  //   与 recovery classifier 计算完整目标标量；本函数不发布任何状态。
+  // 输入/输出及副作用：slot_record/source_completion/target_state/target_phase
+  //   为只读输入；成功返回 exact batch/item 非拥有句柄、独立 completion、
+  //   recovery_required 与 reduced_batch_state，不修改 slot、FIFO 或 journal。
+  // 失败/边界：locator 为空/越界、四表 invariant、ticket/slot/token 不等、
+  //   非法前驱迁移、profile snapshot 或 reducer/classifier 失败时返回非 OK，
+  //   所有输出清空；不从 request_index/current runtime 猜测 journal authority。
+  protected function rdma_status stage_runtime_journal_transition_locked(
+    input rdma_cmq_slot_record slot_record,
+    input rdma_cmq_completion source_completion,
+    input rdma_cmq_submission_state_e target_state,
+    input rdma_cmq_completion_phase_e target_phase,
+    output rdma_cmq_batch_submission_record batch_record,
+    output rdma_cmq_batch_submission_item_record journal_item,
+    output rdma_cmq_completion journal_completion,
+    output bit recovery_required,
+    output rdma_cmq_submission_state_e reduced_batch_state
+  );
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    rdma_cmq_batch_submission_item_record reducer_items[$];
+    rdma_cmq_batch_submission_item_record reducer_item;
+    rdma_cmq_hw_profile retained_profile;
+    rdma_status status;
+    bit predecessor_valid;
+
+    batch_record = null;
+    journal_item = null;
+    journal_completion = null;
+    recovery_required = 1'b1;
+    reduced_batch_state = RDMA_CMQ_SUBMISSION_STAGED;
+    if (slot_record == null || source_completion == null ||
+        slot_record.batch_key.len() == 0 ||
+        !submission_journal.exists(slot_record.batch_key) ||
+        !journal_profile_by_batch.exists(slot_record.batch_key))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime slot journal locator is missing or unknown"
+      );
+    status = submission_journal_invariant_locked(slot_record.batch_key);
+    if (status == null || !status.ok())
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime journal invariant returned null status"
+      ) : journal_status(status.code, status.message);
+
+    batch_record = submission_journal[slot_record.batch_key];
+    retained_profile = journal_profile_by_batch[slot_record.batch_key];
+    if (batch_record == null || retained_profile == null ||
+        slot_record.journal_item_index >= batch_record.items.size()) begin
+      batch_record = null;
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime slot journal item index is out of range"
+      );
+    end
+    journal_item = batch_record.items[slot_record.journal_item_index];
+    if (journal_item == null || journal_item.ticket == null ||
+        source_completion.ticket == null || source_completion.status == null ||
+        !same_ticket_value(slot_record.ticket, journal_item.ticket) ||
+        !same_ticket_value(source_completion.ticket, journal_item.ticket) ||
+        journal_item.slot_sequence != slot_record.slot_sequence ||
+        journal_item.slot_index != slot_record.sq_index ||
+        journal_item.slot_wrap != slot_record.sq_wrap ||
+        journal_item.command_token != slot_record.command_token ||
+        journal_item.entry_key != entry_key(
+          slot_record.sq_index, slot_record.sq_wrap
+        )) begin
+      batch_record = null;
+      journal_item = null;
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime slot and retained journal item disagree"
+      );
+    end
+
+    predecessor_valid = 1'b0;
+    case (target_state)
+      RDMA_CMQ_SUBMISSION_COMPLETED,
+      RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED:
+        predecessor_valid = journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+        } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+        journal_item.completion == null &&
+        (target_phase == RDMA_CMQ_COMPLETION_TERMINAL ||
+         target_phase == RDMA_CMQ_COMPLETION_TIMEOUT);
+      RDMA_CMQ_SUBMISSION_LATE_COMPLETED:
+        predecessor_valid = journal_item.state ==
+                              RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED &&
+                            journal_item.completion_phase ==
+                              RDMA_CMQ_COMPLETION_TIMEOUT &&
+                            journal_item.completion != null &&
+                            target_phase ==
+                              RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY;
+      RDMA_CMQ_SUBMISSION_RESET_QUARANTINED:
+        // Strict generation cancellation only owns a still-live published
+        // predecessor.  A timeout tombstone is already terminal evidence and
+        // remains quarantined until late completion or observed reset; the
+        // reset candidate has a separate mutation-free path for that latter
+        // transition.
+        predecessor_valid = journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+        } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+        journal_item.completion == null &&
+        target_phase == RDMA_CMQ_COMPLETION_RESET_CANCELLED;
+      default: predecessor_valid = 1'b0;
+    endcase
+    if (!predecessor_valid) begin
+      batch_record = null;
+      journal_item = null;
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime journal lifecycle predecessor is invalid"
+      );
+    end
+
+    snapshot_context = new();
+    status = snapshot_completion_with_profile_locked(
+      source_completion, snapshot_context, retained_profile,
+      journal_completion
+    );
+    if (status == null) begin
+      batch_record = null;
+      journal_item = null;
+      journal_completion = null;
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime journal completion snapshot returned null status"
+      );
+    end
+    if (!status.ok()) begin
+      batch_record = null;
+      journal_item = null;
+      journal_completion = null;
+      return journal_status(status.code, status.message);
+    end
+    if (journal_completion == null ||
+        journal_completion.ticket == null ||
+        journal_completion.status == null ||
+        !same_ticket_value(journal_completion.ticket, journal_item.ticket)) begin
+      batch_record = null;
+      journal_item = null;
+      journal_completion = null;
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime journal completion snapshot is incomplete"
+      );
+    end
+    status = rdma_cmq_classify_recovery_required(
+      target_state, target_phase, journal_item.submission_effect, 1'b0,
+      journal_item.recovery_owner.is_legacy_unmigrated(), recovery_required
+    );
+    if (status == null || !status.ok()) begin
+      batch_record = null;
+      journal_item = null;
+      journal_completion = null;
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime journal recovery classifier returned null status"
+      ) : journal_status(status.code, status.message);
+    end
+
+    foreach (batch_record.items[i]) begin
+      reducer_item = new($sformatf("cmq_lifecycle_reducer_item_%0d", i));
+      reducer_item.state = (i == slot_record.journal_item_index) ?
+        target_state : batch_record.items[i].state;
+      reducer_items.push_back(reducer_item);
+    end
+    status = rdma_cmq_reduce_batch_state(
+      reducer_items, reduced_batch_state
+    );
+    if (status == null || !status.ok()) begin
+      batch_record = null;
+      journal_item = null;
+      journal_completion = null;
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ runtime journal reducer returned null status"
+      ) : journal_status(status.code, status.message);
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：把已完整 staging 的 lifecycle completion 与标量写入 exact retained
+  //   item，并更新 reducer 产生的 batch aggregate；该提交只做句柄/标量赋值。
+  // 输入/输出及副作用：batch_record/journal_item/journal_completion 为 engine-owned
+  //   staged 句柄；target/recovery/reduced 为预计算值；成功同步更新 journal aliases。
+  // 失败/边界：调用方必须先由 stage_runtime_journal_transition_locked() 认证；
+  //   本函数无返回值、不分配、不调用外部服务，也不触碰 FIFO/runtime slot。
+  protected function void commit_runtime_journal_transition_locked(
+    input rdma_cmq_batch_submission_record batch_record,
+    input rdma_cmq_batch_submission_item_record journal_item,
+    input rdma_cmq_completion journal_completion,
+    input rdma_cmq_submission_state_e target_state,
+    input rdma_cmq_completion_phase_e target_phase,
+    input bit recovery_required,
+    input rdma_cmq_submission_state_e reduced_batch_state
+  );
+    journal_completion.ticket = journal_item.ticket;
+    journal_item.status = journal_completion.status;
+    journal_item.completion = journal_completion;
+    journal_item.state = target_state;
+    journal_item.completion_phase = target_phase;
+    journal_item.reset_isolation_confirmed = 1'b0;
+    journal_item.recovery_required = recovery_required;
+    batch_record.state = reduced_batch_state;
+  endfunction
+
+  // 功能：在调用方的单一 context 中直接复制 reset proof 的 identity、tuple 与 owner 图。
+  // 输入/输出及副作用：source/context 为输入，snapshot 入口清空；重算 proof_digest
+  //   后才发布 candidate，重复 owner 复用同一 detached 节点。
+  // 失败/边界：outer subtype、ID/key/state、tuple cardinality、owner/identity 或 digest
+  //   任一无效时返回 INVALID_ARGUMENT/null；下游 null status 转 INVALID_STATE。
+  protected function rdma_status snapshot_reset_proof_with_context_locked(
+    input rdma_cmq_reset_isolation_proof source,
+    input rdma_cmq_nonfatal_snapshot_context ctx_snapshot,
+    output rdma_cmq_reset_isolation_proof snapshot
+  );
+    rdma_cmq_reset_isolation_proof candidate;
+    rdma_function_identity isolated_identity_snapshot;
+    rdma_function_identity replacement_identity_snapshot;
+    rdma_cmq_recovery_owner owner_snapshot;
+    rdma_cmq_recovery_owner owners_snapshot[$];
+    rdma_cmq_journal_digest_t computed_digest;
+    rdma_status status;
+    string failure_reason;
+
+    snapshot = null;
+    if (source == null || ctx_snapshot == null ||
+        source.get_object_type() != rdma_cmq_reset_isolation_proof::get_type())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof source or snapshot context is invalid"
+      );
+    if (source.proof_key.len() == 0 || source.batch_key.len() == 0 ||
+        source.proof_id == 0 || source.batch_id == 0 ||
+        source.attempt_id == 0 || source.engine_instance_id == 0 ||
+        source.engine_incarnation == 0 || source.batch_digest == '0 ||
+        source.proof_digest == '0 || !source.backing_release_confirmed ||
+        !(source.state inside {RDMA_CMQ_RESET_PROOF_AWAITING_REBIND,
+                               RDMA_CMQ_RESET_PROOF_READY}) ||
+        source.isolated_request_indices.size() == 0 ||
+        source.isolated_request_indices.size() !=
+          source.isolated_image_digests.size() ||
+        source.isolated_request_indices.size() !=
+          source.isolated_authority_digests.size() ||
+        source.isolated_request_indices.size() !=
+          source.isolated_recovery_owners.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof fixed projection or tuple cardinality is invalid"
+      );
+    if ((source.state == RDMA_CMQ_RESET_PROOF_AWAITING_REBIND &&
+         source.replacement_identity != null) ||
+        (source.state == RDMA_CMQ_RESET_PROOF_READY &&
+         (source.replacement_identity == null ||
+          !source.replacement_identity.same_function(
+            source.isolated_identity
+          ) || source.replacement_identity.reset_epoch <=
+            source.isolated_identity.reset_epoch)))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof replacement transition is invalid"
+      );
+    if (!rdma_cmq_try_snapshot_identity_direct(
+          source.isolated_identity, isolated_identity_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof isolated identity snapshot failed"
+      );
+    replacement_identity_snapshot = null;
+    if (source.replacement_identity != null &&
+        !rdma_cmq_try_snapshot_identity_direct(
+          source.replacement_identity, replacement_identity_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof replacement identity snapshot failed"
+      );
+    foreach (source.isolated_recovery_owners[i]) begin
+      if (!ctx_snapshot.try_snapshot_recovery_owner(
+            source.isolated_recovery_owners[i], owner_snapshot,
+            failure_reason
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          {"CMQ reset proof owner snapshot failed: ", failure_reason}
+        );
+      owners_snapshot.push_back(owner_snapshot);
+    end
+    status = rdma_cmq_compute_reset_proof_digest(
+      source.proof_key, source.proof_id, source.batch_key,
+      source.batch_id, source.attempt_id, source.engine_instance_id,
+      source.engine_incarnation, source.isolated_identity,
+      source.batch_digest, source.isolated_request_indices,
+      source.isolated_image_digests, source.isolated_authority_digests,
+      source.isolated_recovery_owners, computed_digest
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ reset proof digest computation returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    if (computed_digest != source.proof_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof carried digest does not match its source graph"
+      );
+
+    candidate = new("journal_reset_proof_snapshot");
+    candidate.proof_key = source.proof_key;
+    candidate.proof_id = source.proof_id;
+    candidate.batch_key = source.batch_key;
+    candidate.batch_id = source.batch_id;
+    candidate.attempt_id = source.attempt_id;
+    candidate.engine_instance_id = source.engine_instance_id;
+    candidate.engine_incarnation = source.engine_incarnation;
+    candidate.isolated_identity = isolated_identity_snapshot;
+    candidate.replacement_identity = replacement_identity_snapshot;
+    candidate.batch_digest = source.batch_digest;
+    candidate.isolated_request_indices = source.isolated_request_indices;
+    candidate.isolated_image_digests = source.isolated_image_digests;
+    candidate.isolated_authority_digests =
+      source.isolated_authority_digests;
+    candidate.isolated_recovery_owners = owners_snapshot;
+    candidate.proof_digest = source.proof_digest;
+    candidate.state = source.state;
+    candidate.backing_release_confirmed =
+      source.backing_release_confirmed;
+    if (candidate == source ||
+        candidate.isolated_identity == source.isolated_identity ||
+        (source.replacement_identity != null &&
+         candidate.replacement_identity == source.replacement_identity))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof snapshot retained a source graph alias"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：为 reset proof 公开 snapshot seam 创建唯一 direct-new context 并原子发布图。
+  // 输入/输出及副作用：source 为只读输入，snapshot 入口清空；不登记 proof authority。
+  // 失败/边界：任何 nested/digest 拒绝保持 output null，并返回稳定非空 status。
+  protected function rdma_status snapshot_reset_proof_locked(
+    input rdma_cmq_reset_isolation_proof source,
+    output rdma_cmq_reset_isolation_proof snapshot
+  );
+    rdma_cmq_nonfatal_snapshot_context ctx_snapshot;
+
+    snapshot = null;
+    ctx_snapshot = new();
+    return snapshot_reset_proof_with_context_locked(
+      source, ctx_snapshot, snapshot
+    );
+  endfunction
+
+  // 功能：直接复制可选 command identity 标量，供 execution result 保留诊断身份。
+  // 输入/输出及副作用：source 为输入，snapshot 入口清空；成功发布新 base 对象。
+  // 失败/边界：null 按可选值成功；未知 subtype、无效文本/身份或值漂移原子失败。
+  protected function rdma_status snapshot_journal_command_identity_locked(
+    input rdma_cmq_command_identity source,
+    output rdma_cmq_command_identity snapshot
+  );
+    rdma_cmq_command_identity candidate;
+
+    snapshot = null;
+    if (source == null)
+      return journal_status(RDMA_SC_OK);
+    if (source.get_object_type() != rdma_cmq_command_identity::get_type())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ command identity runtime subtype is unsupported"
+      );
+    candidate = new("journal_command_identity_snapshot");
+    candidate.function_kind = source.function_kind;
+    candidate.function_uid = source.function_uid;
+    candidate.global_function_id = source.global_function_id;
+    candidate.generation = source.generation;
+    candidate.profile_name = source.profile_name;
+    candidate.opcode = source.opcode;
+    candidate.variant = source.variant;
+    if (!same_journal_command_identity_value(source, candidate))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ command identity source is incomplete or changed"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：直接构造完整 execution result，并用一个 context 保留 ticket/status/owner alias。
+  // 输入/输出及副作用：source 为只读输入，snapshot 入口清空；profile 仅复制
+  //   completion typed payload，不参与 retry/proof/lifecycle authority。
+  // 失败/边界：outer/nested subtype、profile payload seam 或 required status 失败时
+  //   返回非空错误与 null；不调用 raw factory、generic clone/copy。
+  protected function rdma_status snapshot_execution_result_locked(
+    input rdma_cmq_execution_result source,
+    output rdma_cmq_execution_result snapshot
+  );
+    rdma_cmq_nonfatal_snapshot_context ctx_snapshot;
+    rdma_cmq_execution_result candidate;
+    rdma_cmq_ticket ticket_snapshot;
+    rdma_cmq_completion completion_snapshot;
+    rdma_status status_snapshot;
+    rdma_status observation_snapshot;
+    rdma_cmq_command_identity command_identity_snapshot;
+    rdma_cmq_recovery_owner owner_snapshot;
+    rdma_dma_request_context dma_snapshot;
+    rdma_cmq_hw_profile snapshot_profile;
+    rdma_status status;
+    string failure_reason;
+
+    snapshot = null;
+    if (source == null ||
+        source.get_object_type() != rdma_cmq_execution_result::get_type())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ execution result source is null or unsupported"
+      );
+    ctx_snapshot = new();
+    snapshot_profile = profile;
+    if (source.batch_key.len() != 0 &&
+        journal_profile_by_batch.exists(source.batch_key) &&
+        journal_profile_by_batch[source.batch_key] != null)
+      snapshot_profile = journal_profile_by_batch[source.batch_key];
+    if (!ctx_snapshot.try_snapshot_optional_ticket(
+          source.ticket, ticket_snapshot, failure_reason
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        {"CMQ execution result ticket snapshot failed: ", failure_reason}
+      );
+    status = snapshot_completion_with_profile_locked(
+      source.completion, ctx_snapshot, snapshot_profile, completion_snapshot
+    );
+    if (status == null || !status.ok())
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ execution result completion snapshot returned null status"
+      ) : journal_status(status.code, status.message);
+    if (!ctx_snapshot.try_snapshot_required_status(
+          source.status, status_snapshot, failure_reason
+        ) || !ctx_snapshot.try_snapshot_required_status(
+          source.observation_status, observation_snapshot, failure_reason
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        {"CMQ execution result status snapshot failed: ", failure_reason}
+      );
+    status = snapshot_journal_command_identity_locked(
+      source.command_identity, command_identity_snapshot
+    );
+    if (status == null || !status.ok())
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ execution command identity snapshot returned null status"
+      ) : journal_status(status.code, status.message);
+    owner_snapshot = null;
+    if (source.recovery_owner != null &&
+        !ctx_snapshot.try_snapshot_recovery_owner(
+          source.recovery_owner, owner_snapshot, failure_reason
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        {"CMQ execution owner snapshot failed: ", failure_reason}
+      );
+    dma_snapshot = null;
+    if (source.dma_context != null) begin
+      status = snapshot_journal_dma_context_locked(
+        source.dma_context, dma_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ execution DMA snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+    end
+
+    candidate = new("journal_execution_result_snapshot");
+    candidate.ticket = ticket_snapshot;
+    candidate.completion = completion_snapshot;
+    candidate.status = status_snapshot;
+    candidate.observation_status = observation_snapshot;
+    candidate.command_identity = command_identity_snapshot;
+    candidate.recovery_owner = owner_snapshot;
+    candidate.dma_context = dma_snapshot;
+    candidate.submission_effect = source.submission_effect;
+    candidate.attempt_effect = source.attempt_effect;
+    candidate.completion_phase = source.completion_phase;
+    candidate.batch_key = source.batch_key;
+    candidate.batch_id = source.batch_id;
+    candidate.attempt_id = source.attempt_id;
+    candidate.recovery_required = source.recovery_required;
+    if (candidate == source ||
+        (source.ticket != null && candidate.ticket == source.ticket) ||
+        (source.completion != null &&
+         candidate.completion == source.completion) ||
+        candidate.status == source.status ||
+        candidate.observation_status == source.observation_status ||
+        (source.recovery_owner != null &&
+         candidate.recovery_owner == source.recovery_owner))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ execution result snapshot retained a source alias"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：用指定 retained profile 和单一 context 直接复制完整 batch journal record。
+  // 输入/输出及副作用：source/profile 为输入，snapshot 入口清空；成功 graph 拥有
+  //   detached binding/handles/images/items，重复 ticket/status/owner 保持 canonical alias。
+  // 失败/边界：required node/subtype、mapping opaque authority、typed body/payload 或
+  //   alias topology 失败时不发布 partial record，返回具体非空 status。
+  protected function rdma_status snapshot_journal_record_with_profile_locked(
+    input rdma_cmq_batch_submission_record source,
+    input rdma_cmq_hw_profile profile_service,
+    output rdma_cmq_batch_submission_record snapshot
+  );
+    rdma_cmq_nonfatal_snapshot_context ctx_snapshot;
+    rdma_cmq_batch_submission_record candidate;
+    rdma_function_identity identity_snapshot;
+    rdma_function_binding binding_snapshot;
+    rdma_handle cmq_snapshot;
+    rdma_hw_image doorbell_snapshot;
+    rdma_cmq_reset_isolation_proof proof_snapshot;
+    rdma_dma_mapping mapping_snapshots[rdma_dma_mapping];
+    rdma_status status;
+    string failure_reason;
+
+    snapshot = null;
+    if (source == null || profile_service == null ||
+        source.get_object_type() != rdma_cmq_batch_submission_record::get_type() ||
+        source.function_identity == null || source.binding == null ||
+        source.cmq_h == null || source.doorbell_image == null)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal record source or profile is null or unsupported"
+      );
+    if (source.batch_key.len() == 0 || source.batch_id == 0 ||
+        source.attempt_id == 0 || source.engine_instance_id == 0 ||
+        source.engine_incarnation == 0 || source.items.size() == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal record fixed identity or item list is incomplete"
+      );
+    ctx_snapshot = new();
+    if (!rdma_cmq_try_snapshot_identity_direct(
+          source.function_identity, identity_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal record Function identity snapshot failed"
+      );
+    status = source.binding.snapshot_complete_nonfatal(binding_snapshot);
+    if (status == null || !status.ok() || binding_snapshot == null)
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal binding snapshot returned null status"
+      ) : journal_status(status.code, status.message);
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          source.cmq_h, 1'b0, cmq_snapshot
+        ) || !rdma_cmq_try_snapshot_image_direct(
+          source.doorbell_image, 1'b0, doorbell_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal record CMQ/doorbell snapshot failed"
+      );
+
+    candidate = new("journal_record_snapshot");
+    candidate.batch_key = source.batch_key;
+    candidate.batch_id = source.batch_id;
+    candidate.attempt_id = source.attempt_id;
+    candidate.engine_instance_id = source.engine_instance_id;
+    candidate.engine_incarnation = source.engine_incarnation;
+    candidate.function_identity = identity_snapshot;
+    candidate.binding = binding_snapshot;
+    candidate.cmq_h = cmq_snapshot;
+    candidate.start_sequence = source.start_sequence;
+    candidate.end_sequence = source.end_sequence;
+    candidate.doorbell_image = doorbell_snapshot;
+    candidate.final_pi = source.final_pi;
+    candidate.final_polarity = source.final_polarity;
+    candidate.batch_digest = source.batch_digest;
+    candidate.state = source.state;
+    candidate.submission_effect = source.submission_effect;
+    candidate.attempt_effect = source.attempt_effect;
+    candidate.observer_armed = source.observer_armed;
+    candidate.publication_retry_safe = source.publication_retry_safe;
+
+    foreach (source.items[i]) begin
+      rdma_cmq_batch_submission_item_record source_item;
+      rdma_cmq_batch_submission_item_record item_snapshot;
+      rdma_cmq_recovery_owner owner_snapshot;
+      rdma_cmq_command_desc command_snapshot;
+      rdma_cmq_ticket ticket_snapshot;
+      rdma_dma_request_context dma_snapshot;
+      rdma_hw_image sqe_snapshot;
+      rdma_dma_mapping mapping_snapshot;
+      rdma_hw_image dependency_snapshot;
+      rdma_cmq_completion completion_snapshot;
+      rdma_status item_status_snapshot;
+
+      source_item = source.items[i];
+      if (source_item == null ||
+          source_item.get_object_type() !=
+            rdma_cmq_batch_submission_item_record::get_type() ||
+          source_item.command == null || source_item.ticket == null ||
+          source_item.recovery_owner == null ||
+          source_item.command.recovery_owner !=
+            source_item.recovery_owner ||
+          source_item.dma_context == null || source_item.sqe_image == null ||
+          source_item.dependency_mapping == null ||
+          source_item.dependency_image == null || source_item.status == null)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ journal item %0d graph is incomplete", i)
+        );
+      if (!ctx_snapshot.try_snapshot_recovery_owner(
+            source_item.recovery_owner, owner_snapshot, failure_reason
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          {"CMQ journal owner snapshot failed: ", failure_reason}
+        );
+      status = snapshot_command_with_profile_locked(
+        source_item.command, owner_snapshot, ctx_snapshot, profile_service,
+        command_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal command snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+      if (!ctx_snapshot.try_snapshot_optional_ticket(
+            source_item.ticket, ticket_snapshot, failure_reason
+          ) || ticket_snapshot == null)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          {"CMQ journal ticket snapshot failed: ", failure_reason}
+        );
+      status = snapshot_journal_dma_context_locked(
+        source_item.dma_context, dma_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal DMA snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+      if (!rdma_cmq_try_snapshot_image_direct(
+            source_item.sqe_image, 1'b0, sqe_snapshot
+          ) || !rdma_cmq_try_snapshot_image_direct(
+            source_item.dependency_image, 1'b0, dependency_snapshot
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal item image snapshot failed"
+        );
+      if (mapping_snapshots.exists(source_item.dependency_mapping)) begin
+        mapping_snapshot =
+          mapping_snapshots[source_item.dependency_mapping];
+      end
+      else begin
+        status = snapshot_journal_mapping_locked(
+          source_item.dependency_mapping, mapping_snapshot
+        );
+        if (status == null || !status.ok())
+          return (status == null) ? journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ journal mapping snapshot returned null status"
+          ) : journal_status(status.code, status.message);
+        mapping_snapshots[source_item.dependency_mapping] =
+          mapping_snapshot;
+      end
+      status = snapshot_completion_with_profile_locked(
+        source_item.completion, ctx_snapshot, profile_service,
+        completion_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal completion snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+      if (!ctx_snapshot.try_snapshot_required_status(
+            source_item.status, item_status_snapshot, failure_reason
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          {"CMQ journal item status snapshot failed: ", failure_reason}
+        );
+
+      item_snapshot = new($sformatf("journal_item_snapshot_%0d", i));
+      item_snapshot.request_index = source_item.request_index;
+      item_snapshot.command = command_snapshot;
+      item_snapshot.ticket = ticket_snapshot;
+      item_snapshot.recovery_owner = owner_snapshot;
+      item_snapshot.dma_context = dma_snapshot;
+      item_snapshot.sqe_image = sqe_snapshot;
+      item_snapshot.dependency_mapping = mapping_snapshot;
+      item_snapshot.dependency_offset = source_item.dependency_offset;
+      item_snapshot.dependency_image = dependency_snapshot;
+      item_snapshot.slot_sequence = source_item.slot_sequence;
+      item_snapshot.slot_index = source_item.slot_index;
+      item_snapshot.slot_wrap = source_item.slot_wrap;
+      item_snapshot.command_token = source_item.command_token;
+      item_snapshot.token_incarnation = source_item.token_incarnation;
+      item_snapshot.entry_key = source_item.entry_key;
+      item_snapshot.image_digest = source_item.image_digest;
+      item_snapshot.authority_digest = source_item.authority_digest;
+      item_snapshot.dependency_replay_safe =
+        source_item.dependency_replay_safe;
+      item_snapshot.state = source_item.state;
+      item_snapshot.submission_effect = source_item.submission_effect;
+      item_snapshot.attempt_effect = source_item.attempt_effect;
+      item_snapshot.completion_phase = source_item.completion_phase;
+      item_snapshot.reset_isolation_confirmed =
+        source_item.reset_isolation_confirmed;
+      item_snapshot.recovery_required = source_item.recovery_required;
+      item_snapshot.completion = completion_snapshot;
+      item_snapshot.status = item_status_snapshot;
+      if (item_snapshot.command.recovery_owner !=
+            item_snapshot.recovery_owner ||
+          (source_item.completion != null &&
+           source_item.completion.ticket == source_item.ticket &&
+           item_snapshot.completion.ticket != item_snapshot.ticket) ||
+          (source_item.completion != null &&
+           source_item.completion.status == source_item.status &&
+           item_snapshot.completion.status != item_snapshot.status))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal item canonical alias topology changed"
+        );
+      candidate.items.push_back(item_snapshot);
+    end
+
+    proof_snapshot = null;
+    if (source.reset_isolation_proof != null) begin
+      status = snapshot_reset_proof_with_context_locked(
+        source.reset_isolation_proof, ctx_snapshot, proof_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal reset proof snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+    end
+    candidate.reset_isolation_proof = proof_snapshot;
+    if (candidate == source || candidate.function_identity ==
+          source.function_identity || candidate.binding == source.binding ||
+        candidate.cmq_h == source.cmq_h ||
+        candidate.doorbell_image == source.doorbell_image ||
+        candidate.items.size() != source.items.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal record snapshot is partial or aliased"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：用当前 profile 建立 journal record detached snapshot 的固定公开 seam。
+  // 输入/输出及副作用：source 为只读输入，snapshot 为输出；本函数不取锁。
+  // 失败/边界：当前 profile 缺失或任一完整图门禁失败时保持 output null。
+  protected function rdma_status snapshot_journal_record_locked(
+    input rdma_cmq_batch_submission_record source,
+    output rdma_cmq_batch_submission_record snapshot
+  );
+    return snapshot_journal_record_with_profile_locked(
+      source, profile, snapshot
+    );
+  endfunction
+
+  // 功能：直接复制 recovery request，并以当前 profile 重算每项与批次 digest 后发布。
+  // 输入/输出及副作用：source 为只读输入，snapshot 入口清空；一个 direct-new
+  //   context 保留 items/proof 中重复 ticket/owner，mapping 保留 opaque authority。
+  // 失败/边界：固定字段、cardinality、profile name/body、carried digest、proof 或
+  //   任一 nested snapshot 失败时输出 null；未知 polymorph 非致命返回 INVALID_ARGUMENT。
+  protected function rdma_status snapshot_recovery_request_locked(
+    input rdma_cmq_submission_recovery_request source,
+    output rdma_cmq_submission_recovery_request snapshot
+  );
+    rdma_cmq_nonfatal_snapshot_context ctx_snapshot;
+    rdma_cmq_submission_recovery_request candidate;
+    rdma_function_identity identity_snapshot;
+    rdma_function_binding binding_snapshot;
+    rdma_handle cmq_snapshot;
+    rdma_hw_image doorbell_snapshot;
+    rdma_cmq_reset_isolation_proof proof_snapshot;
+    rdma_dma_mapping mapping_snapshots[rdma_dma_mapping];
+    int unsigned request_indices[$];
+    rdma_cmq_journal_digest_t image_digests[$];
+    rdma_cmq_journal_digest_t authority_digests[$];
+    rdma_cmq_journal_digest_t computed_batch_digest;
+    rdma_status status;
+    string profile_name;
+    string failure_reason;
+
+    snapshot = null;
+    if (source == null || profile == null ||
+        source.get_object_type() !=
+          rdma_cmq_submission_recovery_request::get_type() ||
+        source.batch_key.len() == 0 || source.batch_id == 0 ||
+        source.expected_attempt_id == 0 ||
+        source.expected_function_identity == null || source.binding == null ||
+        source.cmq_h == null || source.doorbell_image == null ||
+        source.items.size() == 0 ||
+        !(source.action inside {RDMA_CMQ_RECOVERY_RETRY_PUBLISH,
+                                RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION}))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request fixed projection is incomplete or unsupported"
+      );
+    profile_name = profile.profile_name();
+    if (profile_name.len() == 0 ||
+        rdma_cmq_string_has_separator(profile_name))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request profile name is invalid"
+      );
+
+    foreach (source.items[i]) begin
+      rdma_cmq_submission_recovery_item source_item;
+      rdma_cmq_journal_digest_t computed_image_digest;
+      rdma_cmq_journal_digest_t computed_authority_digest;
+      string body_tag;
+      byte unsigned body_bytes[];
+
+      source_item = source.items[i];
+      if (source_item == null ||
+          source_item.get_object_type() !=
+            rdma_cmq_submission_recovery_item::get_type() ||
+          source_item.command == null || source_item.ticket == null ||
+          source_item.recovery_owner == null ||
+          source_item.command.recovery_owner !=
+            source_item.recovery_owner ||
+          source_item.dma_context == null || source_item.sqe_image == null ||
+          source_item.dependency_mapping == null ||
+          source_item.dependency_image == null ||
+          source_item.command.opcode_key == null ||
+          source_item.ticket.opcode_key == null ||
+          source_item.command.opcode_key.profile_name != profile_name ||
+          source_item.ticket.opcode_key.profile_name != profile_name)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ recovery request item %0d is incomplete", i)
+        );
+      status = canonicalize_journal_body(
+        profile, source_item.command, source_item.sqe_image,
+        body_tag, body_bytes
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery request body canonicalization returned null status"
+        );
+      if (!status.ok())
+        return journal_status(status.code, status.message);
+      status = rdma_cmq_compute_item_digests(
+        source_item.command, body_tag, body_bytes, source_item.ticket,
+        source_item.recovery_owner, source.expected_function_identity,
+        source_item.dma_context, source_item.sqe_image,
+        source_item.dependency_mapping, source_item.dependency_offset,
+        source_item.dependency_image, computed_image_digest,
+        computed_authority_digest
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery request item digest returned null status"
+        );
+      if (!status.ok())
+        return journal_status(status.code, status.message);
+      if (computed_image_digest != source_item.image_digest ||
+          computed_authority_digest != source_item.authority_digest)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery request item carried digest is inconsistent"
+        );
+      request_indices.push_back(source_item.request_index);
+      image_digests.push_back(computed_image_digest);
+      authority_digests.push_back(computed_authority_digest);
+    end
+    status = rdma_cmq_compute_batch_digest(
+      source.expected_function_identity, source.binding, source.cmq_h,
+      source.doorbell_image, source.final_pi, source.final_polarity,
+      source.start_sequence, source.end_sequence, request_indices,
+      image_digests, authority_digests, computed_batch_digest
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery request batch digest returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    if (computed_batch_digest != source.batch_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request carried batch digest is inconsistent"
+      );
+
+    ctx_snapshot = new();
+    if (!rdma_cmq_try_snapshot_identity_direct(
+          source.expected_function_identity, identity_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request identity snapshot failed"
+      );
+    status = source.binding.snapshot_complete_nonfatal(binding_snapshot);
+    if (status == null || !status.ok() || binding_snapshot == null)
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery request binding snapshot returned null status"
+      ) : journal_status(status.code, status.message);
+    if (!rdma_cmq_try_snapshot_handle_direct(
+          source.cmq_h, 1'b0, cmq_snapshot
+        ) || !rdma_cmq_try_snapshot_image_direct(
+          source.doorbell_image, 1'b0, doorbell_snapshot
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request CMQ/doorbell snapshot failed"
+      );
+
+    candidate = new("journal_recovery_request_snapshot");
+    candidate.batch_key = source.batch_key;
+    candidate.batch_id = source.batch_id;
+    candidate.expected_attempt_id = source.expected_attempt_id;
+    candidate.expected_function_identity = identity_snapshot;
+    candidate.binding = binding_snapshot;
+    candidate.cmq_h = cmq_snapshot;
+    candidate.start_sequence = source.start_sequence;
+    candidate.end_sequence = source.end_sequence;
+    candidate.doorbell_image = doorbell_snapshot;
+    candidate.final_pi = source.final_pi;
+    candidate.final_polarity = source.final_polarity;
+    candidate.batch_digest = source.batch_digest;
+    candidate.action = source.action;
+
+    foreach (source.items[i]) begin
+      rdma_cmq_submission_recovery_item source_item;
+      rdma_cmq_submission_recovery_item item_snapshot;
+      rdma_cmq_recovery_owner owner_snapshot;
+      rdma_cmq_command_desc command_snapshot;
+      rdma_cmq_ticket ticket_snapshot;
+      rdma_dma_request_context dma_snapshot;
+      rdma_hw_image sqe_snapshot;
+      rdma_dma_mapping mapping_snapshot;
+      rdma_hw_image dependency_snapshot;
+
+      source_item = source.items[i];
+      if (!ctx_snapshot.try_snapshot_recovery_owner(
+            source_item.recovery_owner, owner_snapshot, failure_reason
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          {"CMQ recovery request owner snapshot failed: ", failure_reason}
+        );
+      status = snapshot_command_with_profile_locked(
+        source_item.command, owner_snapshot, ctx_snapshot, profile,
+        command_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery request command snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+      if (!ctx_snapshot.try_snapshot_optional_ticket(
+            source_item.ticket, ticket_snapshot, failure_reason
+          ) || ticket_snapshot == null)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          {"CMQ recovery request ticket snapshot failed: ", failure_reason}
+        );
+      status = snapshot_journal_dma_context_locked(
+        source_item.dma_context, dma_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery request DMA snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+      if (!rdma_cmq_try_snapshot_image_direct(
+            source_item.sqe_image, 1'b0, sqe_snapshot
+          ) || !rdma_cmq_try_snapshot_image_direct(
+            source_item.dependency_image, 1'b0, dependency_snapshot
+          ))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery request image snapshot failed"
+        );
+      if (mapping_snapshots.exists(source_item.dependency_mapping)) begin
+        mapping_snapshot =
+          mapping_snapshots[source_item.dependency_mapping];
+      end
+      else begin
+        status = snapshot_journal_mapping_locked(
+          source_item.dependency_mapping, mapping_snapshot
+        );
+        if (status == null || !status.ok())
+          return (status == null) ? journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ recovery request mapping snapshot returned null status"
+          ) : journal_status(status.code, status.message);
+        mapping_snapshots[source_item.dependency_mapping] =
+          mapping_snapshot;
+      end
+      item_snapshot = new($sformatf(
+        "journal_recovery_item_snapshot_%0d", i
+      ));
+      item_snapshot.request_index = source_item.request_index;
+      item_snapshot.command = command_snapshot;
+      item_snapshot.ticket = ticket_snapshot;
+      item_snapshot.recovery_owner = owner_snapshot;
+      item_snapshot.dma_context = dma_snapshot;
+      item_snapshot.sqe_image = sqe_snapshot;
+      item_snapshot.dependency_mapping = mapping_snapshot;
+      item_snapshot.dependency_offset = source_item.dependency_offset;
+      item_snapshot.dependency_image = dependency_snapshot;
+      item_snapshot.image_digest = source_item.image_digest;
+      item_snapshot.authority_digest = source_item.authority_digest;
+      if (item_snapshot.command.recovery_owner !=
+          item_snapshot.recovery_owner)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery request command/owner alias changed"
+        );
+      candidate.items.push_back(item_snapshot);
+    end
+
+    proof_snapshot = null;
+    if (source.reset_isolation_proof != null) begin
+      status = snapshot_reset_proof_with_context_locked(
+        source.reset_isolation_proof, ctx_snapshot, proof_snapshot
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery request proof snapshot returned null status"
+        ) : journal_status(status.code, status.message);
+      if (source.reset_isolation_proof.batch_key != source.batch_key ||
+          source.reset_isolation_proof.batch_id != source.batch_id ||
+          source.reset_isolation_proof.attempt_id !=
+            source.expected_attempt_id ||
+          source.reset_isolation_proof.batch_digest != source.batch_digest)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery request reset proof does not identify this batch"
+        );
+    end
+    candidate.reset_isolation_proof = proof_snapshot;
+    if (candidate == source || candidate.expected_function_identity ==
+          source.expected_function_identity ||
+        candidate.binding == source.binding || candidate.cmq_h == source.cmq_h ||
+        candidate.doorbell_image == source.doorbell_image ||
+        candidate.items.size() != source.items.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request snapshot is partial or aliased"
+      );
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：保留 engine protected seam，并将完整 Function binding journal 投影比较
+  // 转发给 model 层唯一实现，维持两个 recovery caller 的既有扩展边界。
+  // 输入/输出及副作用：lhs/rhs 为只读 binding；package helper 会创建短生命周期
+  // identity/status，返回比较结果，不修改 binding、journal、锁或 engine 状态。
+  // 失败/边界：null、非 exact base wrapper、identity/BAR 缺失、owner null parity/
+  // runtime wrapper/incarnation 或任一字段漂移返回 0；本转发不增加 validate、digest、
+  // I/O 或新的错误映射；两侧 owner 同为 null 仍按既有契约接受。
+  protected function bit same_journal_binding_value(
+    input rdma_function_binding lhs,
+    input rdma_function_binding rhs
+  );
+    return rdma_cmq_same_journal_binding_value(lhs, rhs);
+  endfunction
+
+  // 功能：比较 recovery request 与 journal item 的四个独立重算 digest，并在
+  //   digest 全部可信后逐字段复验 command/body/owner/ticket/DMA/image/mapping。
+  // 输入/输出及副作用：request_item、journal_item 与四个 recomputed digest
+  //   均为只读输入；返回非空 status，不修改 graph、counter 或外部 adapter。
+  // 失败/边界：carried/recomputed/cross-graph digest 不一致、command-owner alias
+  //   破坏或任一完整值漂移返回 INVALID_ARGUMENT；null/partial graph 亦拒绝。
+  protected function rdma_status validate_recovery_item_match_locked(
+    input rdma_cmq_submission_recovery_item request_item,
+    input rdma_cmq_batch_submission_item_record journal_item,
+    input rdma_cmq_journal_digest_t recomputed_request_image_digest,
+    input rdma_cmq_journal_digest_t recomputed_request_authority_digest,
+    input rdma_cmq_journal_digest_t recomputed_journal_image_digest,
+    input rdma_cmq_journal_digest_t recomputed_journal_authority_digest
+  );
+    if (request_item == null || journal_item == null ||
+        request_item.command == null || journal_item.command == null ||
+        request_item.ticket == null || journal_item.ticket == null ||
+        request_item.recovery_owner == null ||
+        journal_item.recovery_owner == null ||
+        request_item.dma_context == null || journal_item.dma_context == null ||
+        request_item.sqe_image == null || journal_item.sqe_image == null ||
+        request_item.dependency_mapping == null ||
+        journal_item.dependency_mapping == null ||
+        request_item.dependency_image == null ||
+        journal_item.dependency_image == null)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery item full-value graph is incomplete"
+      );
+    if (request_item.image_digest !== recomputed_request_image_digest ||
+        request_item.authority_digest !==
+          recomputed_request_authority_digest ||
+        journal_item.image_digest !== recomputed_journal_image_digest ||
+        journal_item.authority_digest !==
+          recomputed_journal_authority_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery item carried digest does not match its graph"
+      );
+    if (recomputed_request_image_digest !==
+          recomputed_journal_image_digest ||
+        recomputed_request_authority_digest !==
+          recomputed_journal_authority_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request and journal item digests disagree"
+      );
+    if (request_item.command.recovery_owner !=
+          request_item.recovery_owner ||
+        journal_item.command.recovery_owner !=
+          journal_item.recovery_owner ||
+        request_item.request_index != journal_item.request_index ||
+        !same_handle(request_item.command.function_h,
+                     journal_item.command.function_h) ||
+        !same_opcode_value(request_item.command.opcode_key,
+                           journal_item.command.opcode_key) ||
+        !same_body_value(request_item.command.body,
+                         journal_item.command.body) ||
+        ((request_item.command.qpc_signature_source == null) !=
+         (journal_item.command.qpc_signature_source == null)) ||
+        (request_item.command.qpc_signature_source != null &&
+         !same_image_value(request_item.command.qpc_signature_source,
+                           journal_item.command.qpc_signature_source)) ||
+        request_item.command.vfid_override !=
+          journal_item.command.vfid_override ||
+        request_item.command.use_vfid != journal_item.command.use_vfid ||
+        request_item.command.timeout != journal_item.command.timeout ||
+        !same_journal_owner_value(request_item.recovery_owner,
+                                  journal_item.recovery_owner) ||
+        !same_ticket_value(request_item.ticket, journal_item.ticket) ||
+        !same_journal_dma_context_value(request_item.dma_context,
+                                        journal_item.dma_context) ||
+        !same_image_value(request_item.sqe_image,
+                          journal_item.sqe_image) ||
+        !same_journal_mapping_public_value(
+          request_item.dependency_mapping,
+          journal_item.dependency_mapping
+        ) ||
+        request_item.dependency_offset != journal_item.dependency_offset ||
+        !same_image_value(request_item.dependency_image,
+                          journal_item.dependency_image))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request and journal item full values disagree"
+      );
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 设计说明：graph、digest、完整字段与 protected handle/binding/image/status seam
+  // 保留在 engine，末尾 ordered item tuple 仅调用无状态 package 谓词；前面 graph
+  // gate 保证 package 的额外空值/cardinality 防护不会改变原失败优先级。
+  // 功能：在 batch digest 分别重算后按既有优先级比较 request 与 journal 的完整
+  // 固定值，最后以共享 tuple 谓词判断有序 item 三列。
+  // 输入/输出及副作用：request、journal_record 和两个 recomputed batch digest
+  // 为只读输入；直接创建返回 status，binding 比较还会创建瞬态 identity/status；
+  // 不检查 mutable lifecycle、更新 journal 或执行恢复动作。
+  // 失败/边界：graph 缺失或空/不等长 item 优先拒绝，其次 carried、cross digest，
+  // 再是完整字段、tuple 漂移；各自返回既有 INVALID_ARGUMENT 精确 message，成功
+  // 返回 OK，不把 hash equality 当 authority，不绕开四个 protected seam。
+  protected function rdma_status validate_recovery_batch_match_locked(
+    input rdma_cmq_submission_recovery_request request,
+    input rdma_cmq_batch_submission_record journal_record,
+    input rdma_cmq_journal_digest_t recomputed_request_batch_digest,
+    input rdma_cmq_journal_digest_t recomputed_journal_batch_digest
+  );
+    if (request == null || journal_record == null ||
+        request.expected_function_identity == null ||
+        journal_record.function_identity == null || request.binding == null ||
+        journal_record.binding == null || request.cmq_h == null ||
+        journal_record.cmq_h == null || request.doorbell_image == null ||
+        journal_record.doorbell_image == null || request.items.size() == 0 ||
+        request.items.size() != journal_record.items.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery batch full-value graph is incomplete"
+      );
+    if (request.batch_digest !== recomputed_request_batch_digest ||
+        journal_record.batch_digest !== recomputed_journal_batch_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery batch carried digest does not match its graph"
+      );
+    if (recomputed_request_batch_digest !==
+        recomputed_journal_batch_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request and journal batch digests disagree"
+      );
+    if (request.batch_key != journal_record.batch_key ||
+        request.batch_id != journal_record.batch_id ||
+        !request.expected_function_identity.same_incarnation(
+          journal_record.function_identity
+        ) || !same_journal_binding_value(request.binding,
+                                          journal_record.binding) ||
+        !same_handle(request.cmq_h, journal_record.cmq_h) ||
+        !same_image_value(request.doorbell_image,
+                          journal_record.doorbell_image) ||
+        request.final_pi != journal_record.final_pi ||
+        request.final_polarity != journal_record.final_polarity ||
+        request.start_sequence != journal_record.start_sequence ||
+        request.end_sequence != journal_record.end_sequence)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request and journal batch full values disagree"
+      );
+    if (!rdma_cmq_recovery_batch_ordered_item_tuple_matches(
+          request, journal_record
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery batch ordered item tuple disagrees"
+      );
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：为 recovery staging 直接构造 fail-closed execution result outer 值。
+  // 输入/输出及副作用：name 仅作为新对象名；返回调用方拥有的 result，不查询
+  //   journal、factory 或外部 service。
+  // 失败/边界：production direct-new 始终非空；virtual seam 允许测试在 CAS 前
+  //   注入 null，调用方必须发布 emergency aligned fallback。
+  protected virtual function rdma_cmq_execution_result
+  make_recovery_result_locked(input string name);
+    rdma_cmq_execution_result result;
+
+    result = new(name);
+    return result;
+  endfunction
+
+  // 功能：为 recovery result staging 创建 frozen owner 的 detached 完整值。
+  // 输入/输出及副作用：name/source 为只读输入；成功返回新 owner，不修改 source
+  //   或 authoritative journal。
+  // 失败/边界：source null、legacy 以外的坏 shape 或 nested snapshot 失败返回 null；
+  //   virtual seam 只用于 CAS 前候选构造故障测试。
+  protected virtual function rdma_cmq_recovery_owner
+  make_recovery_owner_locked(
+    input string name,
+    input rdma_cmq_recovery_owner source
+  );
+    rdma_cmq_nonfatal_snapshot_context ctx_snapshot;
+    rdma_cmq_recovery_owner snapshot;
+    string failure_reason;
+
+    ctx_snapshot = new();
+    if (!ctx_snapshot.try_snapshot_recovery_owner(
+          source, snapshot, failure_reason
+        ))
+      return null;
+    snapshot.set_name(name);
+    return snapshot;
+  endfunction
+
+  // 功能：为 recovery descriptor staging 直接构造空 doorbell outer 值。
+  // 输入/输出及副作用：name 只命名候选；返回调用方拥有的新 descriptor，
+  //   不调用 scheduler 或修改 attempt counter。
+  // 失败/边界：production direct-new 始终非空；virtual seam 可在唯一 CAS 前
+  //   注入 null，调用方须保持 retained authority 不变。
+  protected virtual function rdma_doorbell_desc
+  make_recovery_doorbell_locked(input string name);
+    rdma_doorbell_desc doorbell;
+
+    doorbell = new(name);
+    return doorbell;
+  endfunction
+
+  // 功能：为 candidate attempt 直接构造尚未配置的一次性 MMIO observer。
+  // 输入/输出及副作用：name 只命名候选；返回独立 observer，不登记 capability。
+  // 失败/边界：production direct-new 始终非空；virtual seam 可返回 null 或已配置
+  //   对象以覆盖 configure 失败，任何失败都必须发生在 CAS/I/O 前。
+  protected virtual function rdma_cmq_mmio_arm_observer
+  make_recovery_observer_locked(input string name);
+    rdma_cmq_mmio_arm_observer observer;
+
+    observer = new(name);
+    return observer;
+  endfunction
+
+  // 功能：用指定 profile 对 record 的 immutable digest 与 mutable lifecycle evidence
+  //   执行同一份完整 invariant，区分首次安装和合法 retry 后的 attempt 关系。
+  // 输入/输出及副作用：source/profile_service/initial_install 为只读输入；调用
+  //   profile canonicalize body，重算 item/batch digest、batch state 与 recovery bit。
+  // 失败/边界：key/shape/enum/reducer/classifier、owner attempt、required completion
+  //   alias、polymorph 或 digest 任一不一致返回非空失败；不修改 source 或 journal。
+  protected function rdma_status validate_submission_record_locked(
+    input rdma_cmq_batch_submission_record source,
+    input rdma_cmq_hw_profile profile_service,
+    input bit initial_install
+  );
+    string expected_batch_key;
+    string format_failure;
+    string service_name;
+    bit key_formatted;
+    bit request_seen[int unsigned];
+    bit ticket_seen[string];
+    int unsigned request_indices[$];
+    rdma_cmq_journal_digest_t image_digests[$];
+    rdma_cmq_journal_digest_t authority_digests[$];
+    rdma_cmq_journal_digest_t computed_batch_digest;
+    rdma_cmq_submission_state_e reduced_batch_state;
+    rdma_status status;
+
+    if (source == null || profile_service == null ||
+        source.get_object_type() != rdma_cmq_batch_submission_record::get_type() ||
+        source.function_identity == null || source.binding == null ||
+        source.cmq_h == null || source.doorbell_image == null ||
+        source.batch_key.len() == 0 || source.batch_id == 0 ||
+        source.attempt_id == 0 || source.engine_instance_id == 0 ||
+        source.engine_incarnation == 0 || source.items.size() == 0 ||
+        source.start_sequence >= source.end_sequence ||
+        source.end_sequence - source.start_sequence != source.items.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal record fixed projection is incomplete or inconsistent"
+      );
+    if (source.engine_instance_id != engine_instance_id)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal record belongs to a different engine instance"
+      );
+    key_formatted = rdma_cmq_format_batch_key(
+      source.function_identity, source.engine_instance_id,
+      source.engine_incarnation, source.batch_id, expected_batch_key,
+      format_failure
+    );
+    if (!key_formatted || expected_batch_key != source.batch_key)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        key_formatted ? "CMQ journal batch key is not canonical" :
+                        {"CMQ journal batch key formatting failed: ",
+                         format_failure}
+      );
+    service_name = profile_service.profile_name();
+    if (service_name.len() == 0 ||
+        rdma_cmq_string_has_separator(service_name))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal retained profile name is invalid"
+      );
+    if (!rdma_cmq_submission_state_valid(source.state) ||
+        !rdma_cmq_submission_effect_valid(source.submission_effect) ||
+        !rdma_cmq_submission_effect_valid(source.attempt_effect))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal batch mutable evidence contains an invalid enum"
+      );
+
+    foreach (source.items[i]) begin
+      rdma_cmq_batch_submission_item_record item;
+      rdma_cmq_journal_digest_t computed_image_digest;
+      rdma_cmq_journal_digest_t computed_authority_digest;
+      bit classified_recovery_required;
+      string body_tag;
+      byte unsigned body_bytes[];
+      string ticket_key;
+
+      item = source.items[i];
+      if (item == null ||
+          item.get_object_type() !=
+            rdma_cmq_batch_submission_item_record::get_type() ||
+          item.command == null || item.ticket == null ||
+          item.recovery_owner == null ||
+          item.command.recovery_owner != item.recovery_owner ||
+          item.dma_context == null || item.sqe_image == null ||
+          item.dependency_mapping == null || item.dependency_image == null ||
+          item.status == null || item.command.opcode_key == null ||
+          item.ticket.opcode_key == null || item.entry_key.len() == 0 ||
+          item.command.opcode_key.profile_name != service_name ||
+          item.ticket.opcode_key.profile_name != service_name ||
+          item.slot_sequence != item.ticket.slot_sequence ||
+          item.slot_index != item.ticket.sq_index ||
+          item.slot_wrap != item.ticket.sq_wrap ||
+          item.token_incarnation != source.engine_incarnation[58:0])
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ journal item %0d projection is incomplete", i)
+        );
+      if (!rdma_cmq_submission_state_valid(item.state) ||
+          !rdma_cmq_submission_effect_valid(item.submission_effect) ||
+          !rdma_cmq_submission_effect_valid(item.attempt_effect) ||
+          !rdma_cmq_completion_phase_valid(item.completion_phase))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d mutable evidence has an invalid enum", i
+          )
+        );
+      if (!rdma_cmq_frozen_owner_shape_valid(item.recovery_owner))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ journal item %0d recovery owner is invalid", i)
+        );
+      if (!item.recovery_owner.is_legacy_unmigrated() &&
+          (item.recovery_owner.admission_attempt_id > source.attempt_id ||
+           (initial_install &&
+            item.recovery_owner.admission_attempt_id != source.attempt_id)))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d owner attempt is not valid for the batch",
+            i
+          )
+        );
+      if (item.completion_phase inside {
+            RDMA_CMQ_COMPLETION_TERMINAL,
+            RDMA_CMQ_COMPLETION_TIMEOUT,
+            RDMA_CMQ_COMPLETION_RESET_CANCELLED,
+            RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY
+          } && item.completion == null)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ journal item %0d requires a completion", i)
+        );
+      if (item.completion != null &&
+          (item.completion.ticket != item.ticket ||
+           item.completion.status != item.status))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d completion aliases are inconsistent", i
+          )
+        );
+      status = rdma_cmq_classify_recovery_required(
+        item.state, item.completion_phase, item.submission_effect,
+        item.reset_isolation_confirmed,
+        item.recovery_owner.is_legacy_unmigrated(),
+        classified_recovery_required
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal recovery classifier returned null status"
+        );
+      if (!status.ok())
+        return journal_status(RDMA_SC_INVALID_ARGUMENT, status.message);
+      if (classified_recovery_required != item.recovery_required)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf(
+            "CMQ journal item %0d recovery classification disagrees", i
+          )
+        );
+      if (request_seen.exists(item.request_index))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal record contains a duplicate request index"
+        );
+      request_seen[item.request_index] = 1'b1;
+      if (!rdma_cmq_ticket_shape_valid(item.ticket))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal record contains an invalid ticket"
+        );
+      ticket_key = command_key(item.ticket);
+      if (ticket_key.len() == 0 || ticket_seen.exists(ticket_key))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal record contains a duplicate or empty ticket key"
+        );
+      ticket_seen[ticket_key] = 1'b1;
+      status = canonicalize_journal_body(
+        profile_service, item.command, item.sqe_image,
+        body_tag, body_bytes
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal body canonicalization returned null status"
+        );
+      if (!status.ok())
+        return journal_status(status.code, status.message);
+      status = rdma_cmq_compute_item_digests(
+        item.command, body_tag, body_bytes, item.ticket,
+        item.recovery_owner, source.function_identity, item.dma_context,
+        item.sqe_image, item.dependency_mapping, item.dependency_offset,
+        item.dependency_image, computed_image_digest,
+        computed_authority_digest
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal item digest computation returned null status"
+        );
+      if (!status.ok())
+        return journal_status(status.code, status.message);
+      if (computed_image_digest != item.image_digest ||
+          computed_authority_digest != item.authority_digest)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ journal item carried digest does not match its graph"
+        );
+      request_indices.push_back(item.request_index);
+      image_digests.push_back(computed_image_digest);
+      authority_digests.push_back(computed_authority_digest);
+    end
+    status = rdma_cmq_reduce_batch_state(source.items, reduced_batch_state);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal batch state reducer returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_ARGUMENT, status.message);
+    if (reduced_batch_state != source.state)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal batch state disagrees with its item reduction"
+      );
+    status = rdma_cmq_compute_batch_digest(
+      source.function_identity, source.binding, source.cmq_h,
+      source.doorbell_image, source.final_pi, source.final_polarity,
+      source.start_sequence, source.end_sequence, request_indices,
+      image_digests, authority_digests, computed_batch_digest
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal batch digest computation returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    if (computed_batch_digest != source.batch_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal carried batch digest does not match its graph"
+      );
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：验证并直接复制与 detached record 一一对应的预分配发布批次。
+  // 输入/输出及副作用：source、source_record、record_snapshot 为输入，snapshot
+  //   入口清空；成功复用 record_snapshot ticket 以维持 engine-owned alias。
+  // 失败/边界：批次/SQE-CQE 格式/cardinality、slot/key/token 或 expected-response
+  //   任一 partial/漂移时返回 INVALID_ARGUMENT/null；doorbell 使用独立 codec 格式，
+  //   已由 record 校验与 digest 约束，不与 profile 的 SQE/CQE 格式强制相等。
+  protected function rdma_status snapshot_preallocated_publish_batch_locked(
+    input rdma_cmq_preallocated_publish_batch source,
+    input rdma_cmq_batch_submission_record source_record,
+    input rdma_cmq_batch_submission_record record_snapshot,
+    output rdma_cmq_preallocated_publish_batch snapshot
+  );
+    rdma_cmq_preallocated_publish_batch candidate;
+
+    snapshot = null;
+    if (source == null || source_record == null || record_snapshot == null ||
+        source.get_object_type() !=
+          rdma_cmq_preallocated_publish_batch::get_type() ||
+        source.batch_key != source_record.batch_key ||
+        source.batch_key != record_snapshot.batch_key ||
+        source.attempt_id != source_record.attempt_id ||
+        source.final_sequence != source_record.end_sequence ||
+        !source.profile_format_valid ||
+        !(source.profile_endian inside {RDMA_ENDIAN_LITTLE,
+                                        RDMA_ENDIAN_BIG}) ||
+        source.profile_hardware_version == 0 ||
+        source.items.size() != source_record.items.size() ||
+        record_snapshot.items.size() != source_record.items.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ preallocated publication batch is incomplete or inconsistent"
+      );
+    candidate = new("journal_preallocated_batch_snapshot");
+    candidate.batch_key = source.batch_key;
+    candidate.attempt_id = source.attempt_id;
+    candidate.final_sequence = source.final_sequence;
+    candidate.profile_format_valid = source.profile_format_valid;
+    candidate.profile_endian = source.profile_endian;
+    candidate.profile_hardware_version =
+      source.profile_hardware_version;
+    foreach (source.items[i]) begin
+      rdma_cmq_preallocated_publish_item source_item;
+      rdma_cmq_preallocated_publish_item item_snapshot;
+      rdma_cmq_slot_record slot_snapshot;
+      rdma_cmq_expected_response expected_snapshot;
+
+      source_item = source.items[i];
+      if (source_item == null || source_record.items[i] == null ||
+          record_snapshot.items[i] == null ||
+          source_item.get_object_type() !=
+            rdma_cmq_preallocated_publish_item::get_type() ||
+          source_item.slot_record == null ||
+          source_item.slot_record.get_object_type() !=
+            rdma_cmq_slot_record::get_type() ||
+          source_item.slot_record.ticket == null ||
+          source_item.slot_record.expected == null ||
+          source_item.slot_record.expected.get_object_type() !=
+            rdma_cmq_expected_response::get_type() ||
+          source_item.request_index !=
+            source_record.items[i].request_index ||
+          !same_ticket_value(source_item.slot_record.ticket,
+                             source_record.items[i].ticket) ||
+          source_item.slot_record.slot_sequence !=
+            source_record.items[i].slot_sequence ||
+          source_item.slot_record.sq_index !=
+            source_record.items[i].slot_index ||
+          source_item.slot_record.sq_wrap !=
+            source_record.items[i].slot_wrap ||
+          source_item.slot_record.state != CMQ_SLOT_PUBLISHED ||
+          source_item.slot_record.command_token !=
+            source_record.items[i].command_token ||
+          source_item.slot_record.batch_key != source_record.batch_key ||
+          source_item.slot_record.journal_item_index != i ||
+          source_item.command_key != command_key(
+            source_record.items[i].ticket
+          ) || source_item.entry_key != source_record.items[i].entry_key ||
+          source_item.command_token !=
+            source_record.items[i].command_token ||
+          source_record.items[i].sqe_image.endian !=
+            source.profile_endian ||
+          source_record.items[i].sqe_image.hardware_version !=
+            source.profile_hardware_version ||
+          source_record.items[i].dependency_image.endian !=
+            source.profile_endian ||
+          source_record.items[i].dependency_image.hardware_version !=
+            source.profile_hardware_version)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          $sformatf("CMQ preallocated publication item %0d is partial", i)
+        );
+      expected_snapshot = new($sformatf(
+        "journal_preallocated_expected_%0d", i
+      ));
+      expected_snapshot.hardware_opcode =
+        source_item.slot_record.expected.hardware_opcode;
+      expected_snapshot.variant = source_item.slot_record.expected.variant;
+      if (expected_snapshot.variant.len() == 0 ||
+          rdma_cmq_string_has_separator(expected_snapshot.variant))
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ preallocated expected response is invalid"
+        );
+      slot_snapshot = new($sformatf(
+        "journal_preallocated_slot_%0d", i
+      ));
+      slot_snapshot.slot_sequence = source_item.slot_record.slot_sequence;
+      slot_snapshot.sq_index = source_item.slot_record.sq_index;
+      slot_snapshot.sq_wrap = source_item.slot_record.sq_wrap;
+      slot_snapshot.state = source_item.slot_record.state;
+      slot_snapshot.ticket = record_snapshot.items[i].ticket;
+      slot_snapshot.expected = expected_snapshot;
+      slot_snapshot.command_token = source_item.slot_record.command_token;
+      slot_snapshot.batch_key = source_item.slot_record.batch_key;
+      slot_snapshot.journal_item_index =
+        source_item.slot_record.journal_item_index;
+      item_snapshot = new($sformatf(
+        "journal_preallocated_item_%0d", i
+      ));
+      item_snapshot.request_index = source_item.request_index;
+      item_snapshot.slot_record = slot_snapshot;
+      item_snapshot.command_key = source_item.command_key;
+      item_snapshot.entry_key = source_item.entry_key;
+      item_snapshot.command_token = source_item.command_token;
+      candidate.items.push_back(item_snapshot);
+    end
+    snapshot = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：检查指定 key 的 record/profile 主行是否同生同在，并区分 arm 前/后
+  //   preallocation 生命周期：未 arm record 必须有预分配行，已 arm record 可已消费。
+  // 输入/输出及副作用：batch_key 为输入，row_set_present 为输出；只读
+  //   record/preallocation/profile，成功以 0/1 区分完整缺席和完整存在。
+  // 失败/边界：空 key 返回 INVALID_ARGUMENT；record/profile 孤行、null 行、
+  //   无 record 的 preallocation，或 observer_armed=0 却缺 preallocation 返回 INVALID_STATE。
+  protected function rdma_status journal_row_set_existence_locked(
+    input string batch_key,
+    output bit row_set_present
+  );
+    bit record_present;
+    bit preallocation_present;
+    bit profile_present;
+
+    row_set_present = 1'b0;
+    if (batch_key.len() == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is empty"
+      );
+    record_present = submission_journal.exists(batch_key);
+    preallocation_present = preallocated_publish_batches.exists(batch_key);
+    profile_present = journal_profile_by_batch.exists(batch_key);
+    if (record_present != profile_present)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal record/profile rows are orphaned"
+      );
+    if (!record_present) begin
+      if (preallocation_present)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal preallocation row is orphaned"
+        );
+      return journal_status(RDMA_SC_OK);
+    end
+    if (submission_journal[batch_key] == null ||
+        journal_profile_by_batch[batch_key] == null ||
+        (preallocation_present &&
+         preallocated_publish_batches[batch_key] == null))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal record/preallocation/profile row contains null"
+      );
+    // preallocation 只在首次 arm/retry 的 pre-MMIO 窗口提供 runtime 安装值。
+    // 一旦 completion/timeout/late/reset 已把证据写入 retained item，reset
+    // commit 会有意删除旧 runtime/preallocation；这些终态仍必须可查询。
+    if (!preallocation_present &&
+        !submission_journal[batch_key].observer_armed &&
+        submission_journal[batch_key].state inside {
+          RDMA_CMQ_SUBMISSION_STAGED,
+          RDMA_CMQ_SUBMISSION_PENDING_EFFECT,
+          RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED
+        })
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ unarmed journal record has no preallocation row"
+      );
+    row_set_present = 1'b1;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：全局确认每条 ticket index 都指向一组完整、非空的 retained 主表行。
+  // 输入/输出及副作用：无输入；遍历 journal_batch_by_ticket 并只读三张主表，
+  //   返回直接构造的 status，不形成 ticket key 或修改任何 retained 状态。
+  // 失败/边界：空 index/target、目标主表缺失、部分存在、null 行或 helper null
+  //   status 均返回 INVALID_STATE；空 index 表是合法状态。
+  protected function rdma_status journal_ticket_index_targets_locked();
+    bit target_present;
+    rdma_status status;
+
+    foreach (journal_batch_by_ticket[ticket_key]) begin
+      string target_batch_key;
+
+      target_batch_key = journal_batch_by_ticket[ticket_key];
+      if (ticket_key.len() == 0 || target_batch_key.len() == 0)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal ticket index contains an empty key or target"
+        );
+      status = journal_row_set_existence_locked(
+        target_batch_key, target_present
+      );
+      if (status == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal ticket target check returned null status"
+        );
+      if (!status.ok() || !target_present)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          status.ok() ?
+            "CMQ journal ticket index targets a missing row set" :
+            status.message
+        );
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：检查一个 batch 的 record/ticket-index/preallocation/profile 四表一致性。
+  // 输入/输出及副作用：batch_key 为输入；先全局审计 index target，再只读该
+  //   batch 的完整主表与每个 retained ticket，始终在 key 形成前验证 ticket shape。
+  // 失败/边界：完整缺失返回 INVALID_ARGUMENT；orphan/null/坏 ticket、索引路由或
+  //   cardinality 不一致返回 INVALID_STATE，不触发 null-object access 或自动修复。
+  protected function rdma_status submission_journal_invariant_locked(
+    input string batch_key
+  );
+    rdma_cmq_batch_submission_record record;
+    bit row_set_present;
+    int unsigned indexed_count;
+    rdma_status status;
+
+    if (batch_key.len() == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not present"
+      );
+    status = journal_ticket_index_targets_locked();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket target invariant returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    status = journal_row_set_existence_locked(batch_key, row_set_present);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal row-set invariant returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    if (!row_set_present)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not present"
+      );
+    record = submission_journal[batch_key];
+    if (record == null || record.batch_key != batch_key)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal batch row is inconsistent"
+      );
+    if (preallocated_publish_batches.exists(batch_key) &&
+        (preallocated_publish_batches[batch_key].batch_key != batch_key ||
+         preallocated_publish_batches[batch_key].items.size() !=
+           record.items.size()))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal preallocation row is inconsistent"
+      );
+    foreach (record.items[i]) begin
+      string ticket_key;
+
+      if (record.items[i] == null ||
+          !rdma_cmq_ticket_shape_valid(record.items[i].ticket))
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal retained item or ticket shape is invalid"
+        );
+      ticket_key = command_key(record.items[i].ticket);
+      if (!journal_batch_by_ticket.exists(ticket_key) ||
+          journal_batch_by_ticket[ticket_key] != batch_key)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal retained ticket index is missing or misrouted"
+        );
+    end
+    indexed_count = 0;
+    foreach (journal_batch_by_ticket[ticket_key]) begin
+      if (journal_batch_by_ticket[ticket_key] == batch_key)
+        indexed_count++;
+    end
+    if (indexed_count != record.items.size())
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal retained ticket index cardinality is inconsistent"
+      );
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：在锁内为当前 engine incarnation 分配下一个非零 batch ID 与 canonical key。
+  // 输入/输出及副作用：identity 为输入，batch_key/batch_id 入口清空；成功才推进
+  //   batch_id_counter，不安装 journal 行。
+  // 失败/边界：identity/engine/incarnation 无效、counter 耗尽、formatter 或四表 key
+  //   冲突时输出保持空/零且 counter 不变。
+  protected function rdma_status allocate_batch_identity_locked(
+    input rdma_function_identity identity,
+    output string batch_key,
+    output longint unsigned batch_id
+  );
+    longint unsigned candidate_id;
+    bit row_set_present;
+    string candidate_key;
+    string failure_reason;
+    rdma_status status;
+
+    batch_key = "";
+    batch_id = 0;
+    if (engine_instance_id == 0 || engine_incarnation == 0 ||
+        identity == null ||
+        identity.get_object_type() != rdma_function_identity::get_type() ||
+        !rdma_cmq_identity_shape_valid(identity))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ batch allocation identity or engine incarnation is invalid"
+      );
+    if (batch_id_counter == 64'hffff_ffff_ffff_ffff)
+      return journal_status(
+        RDMA_SC_RESOURCE_EXHAUSTED, "CMQ batch IDs are exhausted"
+      );
+    candidate_id = batch_id_counter + 1'b1;
+    if (!rdma_cmq_format_batch_key(
+          identity, engine_instance_id, engine_incarnation, candidate_id,
+          candidate_key, failure_reason
+        ))
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        {"CMQ batch key allocation failed: ", failure_reason}
+      );
+    status = journal_ticket_index_targets_locked();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ batch allocation ticket target check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    status = journal_row_set_existence_locked(
+      candidate_key, row_set_present
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ batch allocation row-set check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    if (row_set_present)
+      return journal_status(
+        RDMA_SC_RESOURCE_BUSY, "CMQ batch key is already allocated"
+      );
+    batch_id_counter = candidate_id;
+    batch_key = candidate_key;
+    batch_id = candidate_id;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：在锁内分配下一个 engine-lifetime attempt ID，成功值始终非零且不复用。
+  // 输入/输出及副作用：attempt_id 入口清零；成功推进 attempt_id_counter 并发布值。
+  // 失败/边界：counter 已为 64 位最大值时返回 RESOURCE_EXHAUSTED，状态不变。
+  protected function rdma_status allocate_attempt_id_locked(
+    output longint unsigned attempt_id
+  );
+    attempt_id = 0;
+    if (attempt_id_counter == 64'hffff_ffff_ffff_ffff)
+      return journal_status(
+        RDMA_SC_RESOURCE_EXHAUSTED, "CMQ attempt IDs are exhausted"
+      );
+    attempt_id_counter++;
+    attempt_id = attempt_id_counter;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：在锁内分配下一个 engine-lifetime reset-proof ID，保持非零单调身份。
+  // 输入/输出及副作用：proof_id 入口清零；成功推进 reset_proof_id_counter。
+  // 失败/边界：counter 最大值时返回 RESOURCE_EXHAUSTED，不回绕或发布 partial 值。
+  protected function rdma_status allocate_reset_proof_id_locked(
+    output longint unsigned proof_id
+  );
+    proof_id = 0;
+    if (reset_proof_id_counter == 64'hffff_ffff_ffff_ffff)
+      return journal_status(
+        RDMA_SC_RESOURCE_EXHAUSTED, "CMQ reset proof IDs are exhausted"
+      );
+    reset_proof_id_counter++;
+    proof_id = reset_proof_id_counter;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：把完整 source record、ticket index、预分配值和 exact profile 作为一个原子行组安装。
+  // 输入/输出及副作用：record/preallocated 为非拥有输入；成功后四张表拥有 detached
+  //   record/preallocation，profile 表仅保存安装时 service 的非拥有句柄。
+  // 失败/边界：未配置 profile、candidate digest/graph/cardinality、batch/ticket collision
+  //   或 snapshot seam 失败时零行提交；duplicate key/ticket 返回 RESOURCE_BUSY。
+  protected function rdma_status install_submission_journal_locked(
+    input rdma_cmq_batch_submission_record record,
+    input rdma_cmq_preallocated_publish_batch preallocated
+  );
+    rdma_cmq_batch_submission_record record_snapshot;
+    rdma_cmq_preallocated_publish_batch preallocated_snapshot;
+    bit row_set_present;
+    string candidate_ticket_keys[$];
+    rdma_status status;
+
+    if (record == null || preallocated == null)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal installation source record or preallocation is null"
+      );
+    if (profile == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal installation has no active profile service"
+      );
+    status = journal_row_set_existence_locked(
+      record.batch_key, row_set_present
+    );
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal installation row-set check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    status = journal_ticket_index_targets_locked();
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal installation ticket target check returned null status"
+      );
+    if (!status.ok())
+      return journal_status(RDMA_SC_INVALID_STATE, status.message);
+    if (row_set_present)
+      return journal_status(
+        RDMA_SC_RESOURCE_BUSY, "CMQ journal batch key is already installed"
+      );
+
+    status = validate_submission_record_locked(record, profile, 1'b1);
+    if (status == null || !status.ok())
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal candidate validation returned null status"
+      ) : journal_status(status.code, status.message);
+    foreach (record.items[i]) begin
+      string ticket_key;
+
+      ticket_key = command_key(record.items[i].ticket);
+      if (journal_batch_by_ticket.exists(ticket_key))
+        return journal_status(
+          RDMA_SC_RESOURCE_BUSY,
+          "CMQ journal ticket identity is already installed"
+        );
+      candidate_ticket_keys.push_back(ticket_key);
+    end
+
+    status = snapshot_journal_record_with_profile_locked(
+      record, profile, record_snapshot
+    );
+    if (status == null || !status.ok() || record_snapshot == null)
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal candidate snapshot returned null status"
+      ) : journal_status(status.code, status.message);
+    status = validate_submission_record_locked(
+      record_snapshot, profile, 1'b1
+    );
+    if (status == null || !status.ok())
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal detached candidate validation returned null status"
+      ) : journal_status(status.code, status.message);
+    status = snapshot_preallocated_publish_batch_locked(
+      preallocated, record, record_snapshot, preallocated_snapshot
+    );
+    if (status == null || !status.ok() || preallocated_snapshot == null)
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ preallocated publication snapshot returned null status"
+      ) : journal_status(status.code, status.message);
+
+    // 所有可能失败的构造、canonicalization 与 collision 检查已经完成；以下
+    // 连续赋值在 engine_lock 下形成不可观察到中间态的单次 publication commit。
+    submission_journal[record.batch_key] = record_snapshot;
+    preallocated_publish_batches[record.batch_key] =
+      preallocated_snapshot;
+    journal_profile_by_batch[record.batch_key] = profile;
+    foreach (candidate_ticket_keys[i])
+      journal_batch_by_ticket[candidate_ticket_keys[i]] = record.batch_key;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 设计说明：该公开入口只因独立声明的 observer 需要同步回调而公开；
+  //   调用方已持 engine_lock，因此认证先完整收集只读证据，通过后才做
+  //   无失败的句柄转移与标量状态迁移，禁止任何构造或外部重入。
+  // 功能：认证 exact registered observer 及 journal tuple，包括 slot 中的
+  //   batch key/压缩 item 下标；把预分配 slot/token/command/entry 安装到
+  //   runtime，并把 batch/items 推进到 PUBLISH_AMBIGUOUS。
+  // 输入/输出及副作用：observer 为非拥有输入；成功推进 publish_seq 一次、
+  //   安装预建句柄/索引、更新 MMIO_MAYBE_VISIBLE 证据，再删除 capability
+  //   与 preallocation 行；不取锁、不等待、不调用 scheduler/service/adapter。
+  // 失败/边界：null/未配置、owner/key/handle identity 伪造、tuple 漂移、
+  //   缺行、stale lifecycle、cursor/slot/token/registry 冲突或重复调用均只发布
+  //   RDMA_CMQ_MMIO_ARM_INVALID 且零状态变化；有效 capability 是无可恢复失败的内部不变量。
+  function void arm_submission_for_mmio(
+    input rdma_cmq_mmio_arm_observer observer
+  );
+    rdma_cmq_batch_submission_record record;
+    rdma_cmq_preallocated_publish_batch preallocated;
+    string capability_key;
+    string batch_key;
+    bit valid;
+    rdma_submission_effect_e armed_cumulative;
+
+    record = null;
+    preallocated = null;
+    capability_key = "";
+    batch_key = "";
+    valid = observer != null;
+    if (reset_release_in_progress) begin
+      `uvm_error("RDMA_CMQ_MMIO_ARM_INVALID",
+                 "CMQ MMIO arm is blocked during reset backing release")
+      return;
+    end
+    if (valid) begin
+      valid = observer.is_configured() && observer.owner_handle() == this;
+      if (valid) begin
+        capability_key = observer.get_capability_key();
+        batch_key = observer.get_batch_key();
+        valid = capability_key.len() != 0 && batch_key.len() != 0 &&
+                observer.get_attempt_id() != 0 &&
+                observer.get_engine_incarnation() != 0 &&
+                arm_observers.exists(capability_key) &&
+                arm_observers[capability_key] == observer &&
+                submission_journal.exists(batch_key) &&
+                preallocated_publish_batches.exists(batch_key) &&
+                journal_profile_by_batch.exists(batch_key);
+      end
+      if (valid) begin
+        record = submission_journal[batch_key];
+        preallocated = preallocated_publish_batches[batch_key];
+        valid = record != null && preallocated != null &&
+                journal_profile_by_batch[batch_key] != null;
+      end
+      if (valid)
+        valid = record.batch_key == batch_key &&
+                record.attempt_id == observer.get_attempt_id() &&
+                record.engine_incarnation ==
+                  observer.get_engine_incarnation() &&
+                engine_incarnation == observer.get_engine_incarnation() &&
+                record.state == RDMA_CMQ_SUBMISSION_PENDING_EFFECT &&
+                record.observer_armed == 1'b0 &&
+                record.submission_effect inside {
+                  RDMA_SUBMIT_EFFECT_UNOBSERVED,
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+                } && record.attempt_effect inside {
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+                  RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+                } &&
+                record.items.size() != 0 &&
+                record.start_sequence == publish_seq &&
+                record.end_sequence > record.start_sequence &&
+                record.end_sequence - record.start_sequence ==
+                  record.items.size() &&
+                preallocated.batch_key == batch_key &&
+                preallocated.attempt_id == observer.get_attempt_id() &&
+                preallocated.final_sequence == record.end_sequence &&
+                preallocated.profile_format_valid &&
+                preallocated.profile_endian inside {
+                  RDMA_ENDIAN_LITTLE, RDMA_ENDIAN_BIG
+                } && preallocated.profile_hardware_version != 0 &&
+                preallocated.items.size() == record.items.size();
+      if (valid)
+        valid = rdma_cmq_fold_attempt_effect(
+          record.submission_effect,
+          RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+          armed_cumulative
+        );
+      if (valid && profile_image_format_valid)
+        valid = profile_image_endian == preallocated.profile_endian &&
+                profile_hardware_version ==
+                  preallocated.profile_hardware_version;
+      if (valid) begin
+        foreach (record.items[i]) begin
+          rdma_cmq_batch_submission_item_record item;
+          rdma_cmq_preallocated_publish_item preallocated_item;
+
+          item = record.items[i];
+          preallocated_item = preallocated.items[i];
+          if (item == null || preallocated_item == null ||
+              preallocated_item.slot_record == null) begin
+            valid = 1'b0;
+            break;
+          end
+          if (item.state != RDMA_CMQ_SUBMISSION_PENDING_EFFECT ||
+              item.submission_effect != record.submission_effect ||
+              item.attempt_effect != record.attempt_effect ||
+              item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+              item.reset_isolation_confirmed || !item.recovery_required ||
+              preallocated_item.request_index != item.request_index ||
+              preallocated_item.command_key.len() == 0 ||
+              preallocated_item.entry_key.len() == 0 ||
+              preallocated_item.entry_key != item.entry_key ||
+              preallocated_item.command_token != item.command_token ||
+              preallocated_item.slot_record.ticket != item.ticket ||
+              preallocated_item.slot_record.slot_sequence !=
+                item.slot_sequence ||
+              preallocated_item.slot_record.sq_index != item.slot_index ||
+              preallocated_item.slot_record.sq_wrap != item.slot_wrap ||
+              preallocated_item.slot_record.state != CMQ_SLOT_PUBLISHED ||
+              preallocated_item.slot_record.expected == null ||
+              preallocated_item.slot_record.command_token !=
+                item.command_token ||
+              preallocated_item.slot_record.batch_key != batch_key ||
+              preallocated_item.slot_record.journal_item_index != i ||
+              item.slot_index >= CMQ_DEPTH ||
+              slots[item.slot_index] != null ||
+              token_in_use[item.command_token] ||
+              command_registry.exists(preallocated_item.command_key) ||
+              entry_registry.exists(preallocated_item.entry_key)) begin
+            valid = 1'b0;
+            break;
+          end
+          for (int unsigned prior = 0; prior < i; prior++) begin
+            if (preallocated.items[prior] == null ||
+                preallocated.items[prior].slot_record == null ||
+                preallocated.items[prior].slot_record.sq_index ==
+                  preallocated_item.slot_record.sq_index ||
+                preallocated.items[prior].command_token ==
+                  preallocated_item.command_token ||
+                preallocated.items[prior].command_key ==
+                  preallocated_item.command_key ||
+                preallocated.items[prior].entry_key ==
+                  preallocated_item.entry_key) begin
+              valid = 1'b0;
+              break;
+            end
+          end
+          if (!valid)
+            break;
+        end
+      end
+    end
+
+    // The arm entry deliberately does not take engine_lock because it is called
+    // from scheduler/MMIO context.  Recheck the release gate immediately before
+    // the allocation-free publication commit so a concurrent reset cannot expose
+    // a slot after backing ownership has moved to the adapter.
+    if (reset_release_in_progress)
+      valid = 1'b0;
+    if (!valid) begin
+      `uvm_error("RDMA_CMQ_MMIO_ARM_INVALID",
+                 "CMQ MMIO arm capability is invalid")
+      return;
+    end
+
+    // 全部认证、cardinality 与冲突检查已完成；以下路径只转移
+    // 预建句柄、写标量和删关联行，不包含 new/factory/format/wait/lock/
+    // scheduler/service/adapter 调用，不存在可观察的 partial failure。
+    foreach (record.items[i]) begin
+      rdma_cmq_batch_submission_item_record item;
+      rdma_cmq_preallocated_publish_item preallocated_item;
+      int unsigned slot_index;
+      int unsigned token_index;
+
+      item = record.items[i];
+      preallocated_item = preallocated.items[i];
+      slot_index = preallocated_item.slot_record.sq_index;
+      token_index = preallocated_item.command_token;
+      slots[slot_index] = preallocated_item.slot_record;
+      token_in_use[token_index] = 1'b1;
+      command_registry[preallocated_item.command_key] =
+        preallocated_item.slot_record;
+      entry_registry[preallocated_item.entry_key] =
+        preallocated_item.slot_record;
+      item.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+      item.submission_effect = armed_cumulative;
+      item.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      item.completion_phase = RDMA_CMQ_COMPLETION_PENDING;
+      item.recovery_required = 1'b1;
+    end
+    publish_seq = preallocated.final_sequence;
+    profile_image_format_valid = preallocated.profile_format_valid;
+    profile_image_endian = preallocated.profile_endian;
+    profile_hardware_version = preallocated.profile_hardware_version;
+    record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+    record.submission_effect = armed_cumulative;
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    record.observer_armed = 1'b1;
+    if (fenced_batch_key == batch_key) begin
+      fenced_batch_key = "";
+      submission_fence_reason = "";
+    end
+    arm_observers.delete(capability_key);
+    preallocated_publish_batches.delete(batch_key);
+  endfunction
+
+  // 功能：在完整结构预检后同步删除一个 batch 的 record/index/preallocation/profile 行。
+  // 输入/输出及副作用：batch_key 为输入；成功删除该批次四表和全部 ticket 索引。
+  // 失败/边界：未知 key 返回 INVALID_ARGUMENT；任一 retained invariant 损坏返回
+  //   INVALID_STATE 且不删任何行，重复删除不伪装成幂等成功。
+  protected function rdma_status remove_submission_journal_locked(
+    input string batch_key
+  );
+    rdma_cmq_batch_submission_record record;
+    string ticket_keys[$];
+    rdma_status status;
+
+    if (batch_key.len() == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not installed"
+      );
+    status = submission_journal_invariant_locked(batch_key);
+    if (status == null || !status.ok())
+      return (status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal removal invariant returned null status"
+      ) : journal_status(status.code, status.message);
+    record = submission_journal[batch_key];
+    foreach (record.items[i])
+      ticket_keys.push_back(command_key(record.items[i].ticket));
+
+    foreach (ticket_keys[i])
+      journal_batch_by_ticket.delete(ticket_keys[i]);
+    submission_journal.delete(batch_key);
+    preallocated_publish_batches.delete(batch_key);
+    journal_profile_by_batch.delete(batch_key);
+    if (fenced_batch_key == batch_key) begin
+      fenced_batch_key = "";
+      submission_fence_reason = "";
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：锁内按 batch key 重验 retained profile/digest 并发布一份完整 detached record。
+  // 输入/输出及副作用：batch_key 为输入，record 入口清空；只读四表与 exact profile。
+  // 失败/边界：未知 key 为 INVALID_ARGUMENT；结构、profile name/seam、stored graph 或
+  //   carried digest 损坏统一转 INVALID_STATE/null，不回退当前 profile。
+  protected function rdma_status query_submission_journal_locked(
+    input string batch_key,
+    output rdma_cmq_batch_submission_record record
+  );
+    rdma_cmq_batch_submission_record candidate;
+    rdma_cmq_hw_profile retained_profile;
+    rdma_status status;
+
+    record = null;
+    if (batch_key.len() == 0)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal batch key is not installed"
+      );
+    status = submission_journal_invariant_locked(batch_key);
+    if (status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal invariant returned null status"
+      );
+    if (!status.ok())
+      return journal_status(status.code, status.message);
+    retained_profile = journal_profile_by_batch[batch_key];
+    if (retained_profile == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal retained profile service is missing"
+      );
+    status = validate_submission_record_locked(
+      submission_journal[batch_key], retained_profile, 1'b0
+    );
+    if (status == null || !status.ok())
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        (status == null) ?
+          "CMQ retained journal validation returned null status" :
+          status.message
+      );
+    status = snapshot_journal_record_with_profile_locked(
+      submission_journal[batch_key], retained_profile, candidate
+    );
+    if (status == null || !status.ok() || candidate == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        (status == null) ?
+          "CMQ retained journal snapshot returned null status" :
+          status.message
+      );
+    status = validate_submission_record_locked(
+      candidate, retained_profile, 1'b0
+    );
+    if (status == null || !status.ok())
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        (status == null) ?
+          "CMQ detached journal validation returned null status" :
+          status.message
+      );
+    record = candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：按 canonical batch key 查询 engine-owned journal 并返回 detached snapshot。
+  // 输入/输出及副作用：batch_key 为输入，record/status 为输出；入口清空 record，
+  //   获取且仅获取现有 engine_lock，成功后调用方独占返回图。
+  // 失败/边界：未知 key 为 INVALID_ARGUMENT；retained metadata/profile/digest 损坏为
+  //   INVALID_STATE；所有路径释放锁且不发布 partial graph。
+  task query_submission_journal(
+    input string batch_key,
+    output rdma_cmq_batch_submission_record record,
+    output rdma_status status
+  );
+    record = null;
+    status = journal_status(
+      RDMA_SC_INVALID_STATE, "CMQ journal query did not complete"
+    );
+    engine_lock.get(1);
+    status = query_submission_journal_locked(batch_key, record);
+    if (status == null) begin
+      record = null;
+      status = journal_status(
+        RDMA_SC_INVALID_STATE, "CMQ journal query returned null status"
+      );
+    end
+    engine_lock.put(1);
+  endtask
+
+  // 功能：以 caller ticket 稳定 key 定位 batch，先验证 retained graph 再比较全值。
+  // 输入/输出及副作用：ticket 为 detached 只读输入，record/status 为输出；持锁
+  //   审计全局 index，并只在 validated local candidate 唯一匹配后发布 record。
+  // 失败/边界：坏/未知 caller 或 valid retained 上的全值不匹配为 INVALID_ARGUMENT；
+  //   orphan/index 歧义与任意 retained corruption 为 INVALID_STATE/null output。
+  task query_submission_journal_by_ticket(
+    input rdma_cmq_ticket ticket,
+    output rdma_cmq_batch_submission_record record,
+    output rdma_status status
+  );
+    rdma_cmq_batch_submission_record candidate;
+    rdma_cmq_ticket ticket_snapshot;
+    string ticket_key;
+    string batch_key;
+    int unsigned match_count;
+
+    record = null;
+    status = journal_status(
+      RDMA_SC_INVALID_STATE, "CMQ journal ticket query did not complete"
+    );
+    engine_lock.get(1);
+    if (!rdma_cmq_ticket_shape_valid(ticket)) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT, "CMQ journal query ticket is invalid"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    status = checked_completion_ticket_snapshot(ticket, ticket_snapshot);
+    if (status == null || !status.ok() || ticket_snapshot == null) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        (status == null) ?
+          "CMQ journal query ticket snapshot returned null status" :
+          {"CMQ journal query ticket snapshot failed: ", status.message}
+      );
+      engine_lock.put(1);
+      return;
+    end
+    ticket_key = command_key(ticket_snapshot);
+    status = journal_ticket_index_targets_locked();
+    if (status == null) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket target check returned null status"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    if (!status.ok()) begin
+      status = journal_status(RDMA_SC_INVALID_STATE, status.message);
+      engine_lock.put(1);
+      return;
+    end
+    if (!journal_batch_by_ticket.exists(ticket_key)) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal query ticket is not installed"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    batch_key = journal_batch_by_ticket[ticket_key];
+    status = query_submission_journal_locked(batch_key, candidate);
+    if (status == null) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket query returned null status"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    if (!status.ok()) begin
+      record = null;
+      engine_lock.put(1);
+      return;
+    end
+    match_count = 0;
+    foreach (candidate.items[i]) begin
+      if (same_ticket_value(ticket_snapshot, candidate.items[i].ticket))
+        match_count++;
+    end
+    if (match_count == 0) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ journal ticket key matched but full ticket value differs"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    if (match_count != 1) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal ticket resolves to more than one retained item"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    record = candidate;
+    status = journal_status(RDMA_SC_OK);
+    engine_lock.put(1);
+  endtask
+
+  // 功能：查询 submission fence 的 exact key/reason 值，不暴露 journal 对象句柄。
+  // 输入/输出及副作用：active/batch_key/reason/status 为输出；持现有 engine_lock
+  //   读取两个字符串，空/空表示 inactive，非空/非空表示 active。
+  // 失败/边界：仅一项非空说明内部 fence partial，返回 INVALID_STATE 且清空输出；
+  //   重复查询不改变 fence、journal 或 lifecycle。
+  task query_submission_fence(
+    output bit active,
+    output string batch_key,
+    output string reason,
+    output rdma_status status
+  );
+    active = 1'b0;
+    batch_key = "";
+    reason = "";
+    status = journal_status(
+      RDMA_SC_INVALID_STATE, "CMQ submission fence query did not complete"
+    );
+    engine_lock.get(1);
+    if ((fenced_batch_key.len() == 0) !=
+        (submission_fence_reason.len() == 0)) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ submission fence key/reason state is partial"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    if (fenced_batch_key.len() != 0) begin
+      active = 1'b1;
+      batch_key = fenced_batch_key;
+      reason = submission_fence_reason;
+    end
+    status = journal_status(RDMA_SC_OK);
+    engine_lock.put(1);
+  endtask
+
+  // 功能：清空一次 active runtime 的配置、facade、格式 authority 和短生命周期
+  //   ring 账本，使后续 prepare 可创建新 incarnation。
+  // 输入/输出及副作用：无输入和返回值；清空协作者引用、ring counter、FIFO、
+  //   registry 与 slot/token；保留 engine/journal 单调 ID、四表、profile 行和 fence。
+  // 失败/边界：函数不调用 adapter release，调用方必须先处理 backing 所有权；
+  //   重复清理幂等，且不得静默删除仍需诊断/恢复的 retained journal record。
   protected function void clear_configuration();
     prepared_binding = null;
     dma_context = null;
@@ -4252,6 +8107,7 @@ class rdma_cmq_engine extends uvm_object;
     backing_mapping = null;
     host_mem = null;
     scheduler = null;
+    transport = null;
     profile = null;
     publish_seq = 0;
     retire_seq = 0;
@@ -4266,10 +8122,25 @@ class rdma_cmq_engine extends uvm_object;
     late_final_fifo.delete();
     last_poison = null;
     backing_release_opaque = 1'b0;
+    reset_release_in_progress = 1'b0;
     foreach (slots[i]) begin
       slots[i] = null;
       token_in_use[i] = 1'b0;
     end
+  endfunction
+
+  // 功能：在 opaque backing 已经成功释放但 reset candidate 的 runtime CAS
+  //   失败时，把所有可能指向已释放 allocation 的本地引用原子清空，并把
+  //   engine 留在仅可诊断的 POISONED 状态。
+  // 输入/输出及副作用：无输入/返回值；调用 clear_configuration() 清理 runtime
+  //   graph、FIFO、slot/token 与协作者引用，再写入 POISONED 状态；不分配对象、
+  //   不调用 adapter/scheduler，也不触碰 retained journal authority。
+  // 失败/边界：仅允许在 release 已返回成功且 gate 仍由当前 reset 持有时调用；
+  //   helper 不尝试第二次 release 或制造 reset proof，重复调用保持无外部 I/O。
+  protected function void poison_released_runtime_drift_locked();
+    clear_configuration();
+    engine_state = RDMA_CMQ_ENGINE_POISONED;
+    reset_release_in_progress = 1'b0;
   endfunction
 
   // 功能：执行 retain_release_authority 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
@@ -4344,10 +8215,13 @@ class rdma_cmq_engine extends uvm_object;
     return cleanup_failure;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，prepare 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
-  // 输入/输出及副作用：binding（输入）、cmq（输入）、pasid_valid（输入）、pasid（输入）、host_mem（输入）、scheduler（输入）、profile（输入）、runtime_desc（输出）、status（输出）；prepare 驱动下游事务，并写入 runtime_desc、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
-  // 失败/边界：prepare 失败或超时通过 runtime_desc、status 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：验证 PREPARED binding/CMQ/profile，配置本 incarnation 的新
+  //   transport，申请并清零 backing，最后原子提交 runtime 与协作者引用。
+  // 输入/输出及副作用：binding/cmq/pasid/host_mem/scheduler/profile 为非拥有
+  //   输入；成功驱动一次 allocate/zero-write，原子发布 runtime_desc 并把
+  //   engine_incarnation 恰好推进一次；失败不推进 incarnation。
+  // 失败/边界：重复 prepare、incarnation 溢出、空依赖、authority/profile/facade
+  //   配置失败在外部 I/O 前拒绝；allocate 后失败走 rollback，候选 transport 不安装。
   task prepare(
     rdma_function_binding binding,
     rdma_cmq cmq,
@@ -4365,13 +8239,27 @@ class rdma_cmq_engine extends uvm_object;
     rdma_dma_mapping mapping_candidate;
     rdma_cmq_runtime_desc runtime_candidate;
     rdma_cmq_runtime_desc published_runtime;
+    rdma_cmq_transport transport_candidate;
     byte zeros[];
 
     runtime_desc = null;
     status = invalid_state("CMQ prepare did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_UNCONFIGURED) begin
       status = invalid_state("CMQ engine is already configured");
+      engine_lock.put(1);
+      return;
+    end
+    if (engine_incarnation == 64'hffff_ffff_ffff_ffff) begin
+      status = journal_status(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "CMQ engine incarnation IDs are exhausted"
+      );
       engine_lock.put(1);
       return;
     end
@@ -4420,6 +8308,24 @@ class rdma_cmq_engine extends uvm_object;
     end
     status = make_request_context(binding_candidate, cmq_candidate,
                                   pasid_valid, pasid, context_candidate);
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
+
+    // facade 在任何 Host-memory I/O 前完成一次性配置；只有 prepare 的最终
+    //   commit 才把 candidate 装入 engine，所有早退和 rollback 都无法留下旧引用。
+    transport_candidate = rdma_cmq_transport::type_id::create(
+      "cmq_transport_candidate"
+    );
+    if (transport_candidate == null) begin
+      status = invalid_state("CMQ transport construction failed");
+      engine_lock.put(1);
+      return;
+    end
+    status = transport_candidate.configure(scheduler);
+    if (status == null)
+      status = invalid_state("CMQ transport configure returned null status");
     if (!status.ok()) begin
       engine_lock.put(1);
       return;
@@ -4488,6 +8394,7 @@ class rdma_cmq_engine extends uvm_object;
     backing_mapping = mapping_candidate;
     this.host_mem = host_mem;
     this.scheduler = scheduler;
+    this.transport = transport_candidate;
     this.profile = profile;
     publish_seq = 0;
     retire_seq = 0;
@@ -4504,11 +8411,67 @@ class rdma_cmq_engine extends uvm_object;
       slots[i] = null;
       token_in_use[i] = 1'b0;
     end
+    engine_incarnation++;
     engine_state = RDMA_CMQ_ENGINE_PREPARED;
     runtime_desc = published_runtime;
     status = rdma_status::success();
     engine_lock.put(1);
   endtask
+
+  // 功能：在新 incarnation 已成功 ACTIVE 后，把同一 immutable Function 且
+  //       reset epoch 严格递增的 retained AWAITING_REBIND proof 绑定到该
+  //       replacement identity，并提升为 READY。
+  // 输入/输出及副作用：replacement_identity 为已校验的 ACTIVE detached
+  //       identity；只修改匹配 journal row 的 proof state/replacement 字段，
+  //       不触碰 backing、fence、attempt 或 scheduler。
+  // 失败/边界：不同 Function、相同/回退 epoch、PREPARED-only 或损坏 tuple/
+  //       digest 的 proof 均保持 AWAITING_REBIND；promotion 不创建第二份
+  //       proof authority，也不因单行不匹配阻断 ACTIVE 建立。
+  protected function void promote_reset_proofs_ready_locked(
+    input rdma_function_identity replacement_identity
+  );
+    rdma_function_identity replacement_snapshot;
+    rdma_status status;
+
+    if (replacement_identity == null ||
+        !rdma_cmq_identity_shape_valid(replacement_identity))
+      return;
+    if (!rdma_cmq_try_snapshot_identity_direct(
+          replacement_identity, replacement_snapshot
+        ) || replacement_snapshot == null)
+      return;
+
+    foreach (submission_journal[batch_key]) begin
+      rdma_cmq_batch_submission_record row;
+      rdma_cmq_reset_isolation_proof proof;
+      rdma_cmq_journal_digest_t computed_digest;
+
+      row = submission_journal[batch_key];
+      if (row == null || row.reset_isolation_proof == null)
+        continue;
+      proof = row.reset_isolation_proof;
+      if (proof.state != RDMA_CMQ_RESET_PROOF_AWAITING_REBIND ||
+          !proof.backing_release_confirmed ||
+          proof.engine_instance_id != engine_instance_id ||
+          proof.engine_incarnation >= engine_incarnation ||
+          proof.isolated_identity == null ||
+          !replacement_snapshot.same_function(proof.isolated_identity) ||
+          replacement_snapshot.reset_epoch <= proof.isolated_identity.reset_epoch)
+        continue;
+      status = rdma_cmq_compute_reset_proof_digest(
+        proof.proof_key, proof.proof_id, proof.batch_key, proof.batch_id,
+        proof.attempt_id, proof.engine_instance_id,
+        proof.engine_incarnation, proof.isolated_identity,
+        proof.batch_digest, proof.isolated_request_indices,
+        proof.isolated_image_digests, proof.isolated_authority_digests,
+        proof.isolated_recovery_owners, computed_digest
+      );
+      if (status == null || !status.ok() || computed_digest !== proof.proof_digest)
+        continue;
+      proof.replacement_identity = replacement_snapshot;
+      proof.state = RDMA_CMQ_RESET_PROOF_READY;
+    end
+  endfunction
 
   // 功能：在 rdma_cmq_engine 中，activate 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
   // 输入/输出及副作用：active_binding（输入）、status（输出）；activate 先依据 engine_state != RDMA_CMQ_ENGINE_PREPARED；!status.ok(；prepared_binding == null 校验 active_binding、status；成功时更新本对象配置/状态并保存非拥有引用，返回 无直接返回值。
@@ -4521,6 +8484,11 @@ class rdma_cmq_engine extends uvm_object;
 
     status = invalid_state("CMQ activate did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_PREPARED) begin
       status = invalid_state("CMQ engine is not PREPARED");
       engine_lock.put(1);
@@ -4596,168 +8564,689 @@ class rdma_cmq_engine extends uvm_object;
     end
     prepared_binding = binding_candidate;
     engine_state = RDMA_CMQ_ENGINE_ACTIVE;
+    promote_reset_proofs_ready_locked(
+      prepared_binding.function_identity_snapshot()
+    );
     status = rdma_status::success();
     engine_lock.put(1);
   endtask
 
-  // 功能：在 rdma_cmq_engine 中，submit 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：request（输入）、ticket（输出）、status（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
-  //   journal，并通过 output 返回结果。
-  // 失败/边界：submit 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
-  task submit(
-    rdma_cmq_command_desc request,
-    output rdma_cmq_ticket ticket,
-    output rdma_status status
+  // 功能：直接复制 submit 路径要返回或写入 journal 的完整 status 标量，
+  //   避免 transport 已发生副作用后再依赖 UVM factory/clone。
+  // 输入/输出及副作用：source/name 为只读输入；返回调用方拥有的新 status，
+  //   不修改 source，也不读取共享 last_* 证据。
+  // 失败/边界：source 为 null、runtime subtype 或枚举 shape 非法时返回独立
+  //   INVALID_STATE；函数始终返回非空对象。
+  protected function rdma_status copy_submit_status_direct(
+    input rdma_status source,
+    input string name
   );
-    rdma_cmq_command_desc requests[];
-    rdma_cmq_ticket tickets[];
-    rdma_status item_statuses[];
-    rdma_status batch_status;
+    rdma_status snapshot;
 
-    ticket = null;
-    status = invalid_state("CMQ submit did not complete");
-    requests = new[1];
-    requests[0] = request;
-    submit_batch(requests, tickets, item_statuses, batch_status);
-    if (item_statuses.size() != 1 || tickets.size() != 1) begin
-      status = invalid_state("CMQ one-item batch returned misaligned outputs");
-      return;
-    end
-    if (item_statuses[0] == null) begin
-      status = invalid_state("CMQ one-item batch returned null item status");
-      return;
-    end
-    if (!item_statuses[0].ok()) begin
-      status = rdma_cmq_clone_status_value(item_statuses[0]);
-      return;
-    end
-    if (batch_status == null) begin
-      status = invalid_state("CMQ one-item batch returned null batch status");
-      return;
-    end
-    if (!batch_status.ok()) begin
-      status = rdma_cmq_clone_status_value(batch_status);
-      return;
-    end
-    if (tickets[0] == null) begin
-      status = invalid_state("CMQ one-item batch published no ticket");
-      return;
-    end
-    ticket = tickets[0];
-    status = rdma_status::success();
-  endtask
+    if (!rdma_cmq_status_shape_valid(source))
+      return rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed submit status is null or malformed"
+      );
 
-  // 功能：在 rdma_cmq_engine 中，submit_batch 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：requests（输入）、tickets（输出）、item_statuses（输出）、batch_status（输出）；输入 request/image/cursor 决定写入内容；成功时更新
-  //   PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-  // 失败/边界：submit_batch 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
-  task submit_batch(
-    input rdma_cmq_command_desc requests[],
-    output rdma_cmq_ticket tickets[],
-    output rdma_status item_statuses[],
-    output rdma_status batch_status
+    snapshot = new(name);
+    snapshot.category = source.category;
+    snapshot.code = source.code;
+    snapshot.hardware_code = source.hardware_code;
+    snapshot.hardware_code_valid = source.hardware_code_valid;
+    snapshot.source_engine = source.source_engine;
+    snapshot.function_uid = source.function_uid;
+    snapshot.generation = source.generation;
+    snapshot.resource_id = source.resource_id;
+    snapshot.command_id = source.command_id;
+    snapshot.wr_id = source.wr_id;
+    snapshot.severity = source.severity;
+    snapshot.retryable = source.retryable;
+    snapshot.message = source.message;
+    return snapshot;
+  endfunction
+
+  // 设计说明：transport 的 operation status 与 attempted effect 是独立证据；
+  //   malformed 字段仅降级自身，不能擦除另一字段的有效 PRE/MMIO 事实。
+  // 功能：将 observed envelope 解码为本次 submit 的直接复制 operation status、
+  //   原始 effect 和初始 observation，并判定未 arm 的确证 PRE rollback。
+  // 输入/输出及副作用：transport_result 为非拥有只读输入，observer_armed 只来自
+  //   retained journal 的真实回调；decision 是调用方独占局部输出，仅分配 status。
+  // 失败/边界：null envelope 或非法 status/effect 分别保留原有精确诊断；
+  //   X/Z 或 spare effect 降级为 UNOBSERVED，不依据 envelope 自报 callback arm；
+  //   只有未 arm 且有效 PRE effect 才置 rollback_pre，不修改 engine 账本。
+  protected function void decode_observed_transport_evidence(
+    input rdma_doorbell_submission_result transport_result,
+    input bit observer_armed,
+    output rdma_cmq_submit_transport_decision_t decision
   );
-    rdma_cmq_ticket caller_tickets[CMQ_DEPTH];
-    rdma_cmq_slot_record tentative_records[CMQ_DEPTH];
-    rdma_status tentative_success_statuses[CMQ_DEPTH];
-    rdma_doorbell_dependency dependencies[$];
-    int unsigned original_indices[CMQ_DEPTH];
-    bit [4:0] tentative_tokens[CMQ_DEPTH];
-    time tentative_deadlines[CMQ_DEPTH];
-    bit tentative_token_reserved[CMQ_DEPTH];
-    bit preserve_item_status[];
-    int unsigned success_count;
-    rdma_function_handle active_function;
-    rdma_handle doorbell_encode_target;
-    rdma_hw_image doorbell_image;
-    rdma_hw_image doorbell_snapshot;
-    rdma_doorbell_desc doorbell_candidate;
-    rdma_doorbell_desc doorbell_snapshot_desc;
-    rdma_doorbell_result doorbell_result;
+    decision.operation_status = null;
+    decision.observation_code = RDMA_SC_OK;
+    decision.observation_message = "";
+    decision.raw_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    decision.rollback_pre = 1'b0;
+    decision.state = RDMA_CMQ_SUBMISSION_STAGED;
+    decision.cumulative_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    decision.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    decision.publication_retry_safe = 1'b0;
+
+    if (transport_result == null) begin
+      decision.operation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed transport returned a null envelope"
+      );
+      decision.observation_code = RDMA_SC_INVALID_STATE;
+      decision.observation_message =
+        "CMQ observed transport envelope is missing";
+    end
+    else begin
+      if (rdma_cmq_status_shape_valid(transport_result.status)) begin
+        decision.operation_status = copy_submit_status_direct(
+          transport_result.status, "cmq_transport_operation_status"
+        );
+      end
+      else begin
+        decision.operation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed transport returned a malformed operation status"
+        );
+        decision.observation_code = RDMA_SC_INVALID_STATE;
+        decision.observation_message =
+          "CMQ observed transport operation status is malformed";
+      end
+
+      if (rdma_cmq_submission_effect_valid(
+            transport_result.submission_effect
+          )) begin
+        decision.raw_effect = transport_result.submission_effect;
+      end
+      else begin
+        decision.observation_code = RDMA_SC_INVALID_STATE;
+        decision.observation_message =
+          (decision.observation_message.len() == 0) ?
+            "CMQ observed transport effect is malformed" :
+            "CMQ observed transport status and effect are malformed";
+      end
+    end
+
+    decision.rollback_pre = !observer_armed &&
+      decision.raw_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+  endfunction
+
+  // 设计说明：PRE rollback 在调用本函数前完成；owner replayability 由原 task
+  //   在锁内只读扫描，不能由 classifier 接管 journal 写权限。分类仅计算
+  //   authentic arm、原始 effect 和 retry-safe 三者的最终组合。
+  // 功能：把非 PRE 的 transport 证据分类为 retained batch state、累计/本次
+  //   effect、重试标记及最终 observation，保持 operation status 原句柄。
+  // 输入/输出及副作用：observer_armed/retry_safe 是调用方锁内冻结的输入，
+  //   evidence 为解码值；decision 为新的栈局部输出，不修改输入或 engine 状态。
+  // 失败/边界：真实 arm 后非 MMIO effect 强制 MAYBE_VISIBLE，raw UNOBSERVED
+  //   的 attempt 仍为 UNOBSERVED；未 arm 却自报 MMIO 禁止重试；其他未 arm
+  //   UNOBSERVED 保留原 retry_safe 候选；PRE 必须先由 submit task 回滚。
+  protected function void classify_observed_transport_effect(
+    input bit observer_armed,
+    input bit retry_safe,
+    input rdma_cmq_submit_transport_decision_t evidence,
+    output rdma_cmq_submit_transport_decision_t decision
+  );
+    decision = evidence;
+    if (observer_armed) begin
+      decision.publication_retry_safe = 1'b0;
+      if (evidence.raw_effect == RDMA_SUBMIT_EFFECT_MMIO_VISIBLE) begin
+        decision.state = RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED;
+        decision.cumulative_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+        decision.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+      end
+      else if (evidence.raw_effect ==
+               RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE) begin
+        decision.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+        decision.cumulative_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+        decision.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      end
+      else begin
+        decision.observation_code = RDMA_SC_INVALID_STATE;
+        decision.observation_message =
+          "CMQ transport effect contradicts an authentic MMIO arm";
+        decision.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+        decision.cumulative_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+        decision.attempt_effect =
+          (evidence.raw_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED) ?
+            RDMA_SUBMIT_EFFECT_UNOBSERVED :
+            RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+      end
+    end
+    else begin
+      decision.state = RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+      decision.publication_retry_safe = retry_safe;
+      if (evidence.raw_effect inside {
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+          }) begin
+        decision.cumulative_effect = evidence.raw_effect;
+        decision.attempt_effect = evidence.raw_effect;
+      end
+      else begin
+        decision.cumulative_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        decision.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        decision.observation_code = RDMA_SC_INVALID_STATE;
+        if (evidence.raw_effect inside {
+              RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE,
+              RDMA_SUBMIT_EFFECT_MMIO_VISIBLE
+            }) begin
+          decision.publication_retry_safe = 1'b0;
+          decision.observation_message =
+            "CMQ transport reported MMIO effect without authentic arm";
+        end
+        else begin
+          decision.observation_message =
+            "CMQ transport effect could not be observed after delegation";
+        end
+      end
+    end
+  endfunction
+
+  // 功能：为一个 input-aligned submit item 直接建立本地拒绝默认结果，
+  //   operation 与 observation status 从构造时起始终互相独立且非空。
+  // 输入/输出及副作用：name 仅用于新对象诊断名；返回调用方拥有的 result。
+  // 失败/边界：默认值表示尚未发布的 PRE_SUBMIT_REJECTED，ticket/IDs 为空且
+  //   recovery_required=0；后续 admission 必须显式覆盖 operation evidence。
+  protected function rdma_cmq_execution_result new_submit_result_direct(
+    input string name
+  );
+    rdma_cmq_execution_result result;
+
+    result = new(name);
+    result.status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ submit item was not admitted"
+    );
+    result.observation_status = rdma_cmq_direct_status(RDMA_SC_OK);
+    result.submission_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.attempt_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+    result.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+    result.recovery_required = 1'b0;
+    return result;
+  endfunction
+
+  // 功能：从 retained journal item 构造完整 detached observed result，
+  //   并把 operation outcome 与本次 observation health 分开发布。
+  // 输入/输出及副作用：record/item/observation_code/message 为输入；result
+  //   入口清空，成功由既有 nonfatal snapshot seam 发布独立 ticket/owner/DMA/status。
+  // 失败/边界：record/item/command identity 不完整，或嵌套 snapshot 拒绝时返回
+  //   非空错误与 null result；不修改 journal 或 lifecycle evidence。
+  protected function rdma_status build_observed_result_locked(
+    input rdma_cmq_batch_submission_record record,
+    input rdma_cmq_batch_submission_item_record item,
+    input rdma_status_code_e observation_code,
+    input string observation_message,
+    output rdma_cmq_execution_result result
+  );
+    rdma_cmq_execution_result source;
+    rdma_cmq_command_identity command_identity;
+    string failure_reason;
+
+    result = null;
+    if (record == null || item == null || item.command == null ||
+        item.status == null)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed result source journal item is incomplete"
+      );
+
+    command_identity = new("cmq_observed_command_identity");
+    if (!command_identity.capture_from(item.command, failure_reason))
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        {"CMQ observed command identity capture failed: ", failure_reason}
+      );
+
+    source = new("cmq_observed_result_source");
+    source.ticket = item.ticket;
+    source.completion = item.completion;
+    source.status = item.status;
+    source.observation_status = rdma_cmq_direct_status(
+      observation_code, observation_message
+    );
+    source.command_identity = command_identity;
+    source.recovery_owner = item.recovery_owner;
+    source.dma_context = item.dma_context;
+    source.submission_effect = item.submission_effect;
+    source.attempt_effect = item.attempt_effect;
+    source.completion_phase = item.completion_phase;
+    source.batch_key = record.batch_key;
+    source.batch_id = record.batch_id;
+    source.attempt_id = record.attempt_id;
+    source.recovery_required = item.recovery_required;
+    return snapshot_execution_result_locked(source, result);
+  endfunction
+
+  // 功能：为 recovery aligned result 直接复制 ticket 全部身份、slot、opcode 与
+  //   absolute deadline 字段，允许把含 X 的 deadline 原样带回拒绝结果。
+  // 输入/输出及副作用：name/source 为只读输入；成功返回拥有独立嵌套 handle/key
+  //   的 ticket，不修改 request、journal 或 deadline。
+  // 失败/边界：source/required nested 值缺失或 direct snapshot/cast 失败返回 null；
+  //   本函数不把非法 deadline 解释为授权，只负责保留 aligned diagnostics。
+  protected function rdma_cmq_ticket make_recovery_ticket_locked(
+    input string name,
+    input rdma_cmq_ticket source
+  );
+    rdma_cmq_ticket candidate;
+    rdma_handle function_snapshot_base;
+    rdma_handle cmq_snapshot;
+    rdma_cmq_opcode_key opcode_snapshot;
+
+    if (source == null || source.function_h == null ||
+        source.cmq_h == null || source.opcode_key == null ||
+        !rdma_cmq_try_snapshot_handle_direct(
+          source.function_h, 1'b0, function_snapshot_base
+        ) || !rdma_cmq_try_snapshot_handle_direct(
+          source.cmq_h, 1'b0, cmq_snapshot
+        ) || !rdma_cmq_try_snapshot_opcode_key_direct(
+          source.opcode_key, opcode_snapshot
+        ))
+      return null;
+    candidate = new(name);
+    if (!$cast(candidate.function_h, function_snapshot_base))
+      return null;
+    candidate.command_id = source.command_id;
+    candidate.cmq_h = cmq_snapshot;
+    candidate.slot_sequence = source.slot_sequence;
+    candidate.sq_index = source.sq_index;
+    candidate.sq_wrap = source.sq_wrap;
+    candidate.opcode_key = opcode_snapshot;
+    candidate.absolute_deadline = source.absolute_deadline;
+    return candidate;
+  endfunction
+
+  // 功能：在任何 stale/action/authority 返回前为已结构对齐请求构造等长同序
+  //   execution results；request ticket 失败时改从 retained ticket 创建 detached fallback。
+  // 输入/输出及副作用：request/record 为只读输入，results 入口按 request 大小重建；
+  //   只分配本地候选，不修改 retained row、counter、observer 或外部 I/O。
+  // 失败/边界：任一 maker/snapshot/capture 失败仍用 direct-new 保留非空 aligned
+  //   outer/ticket shell，并返回首个失败 status；绝不把 retained ticket 引用返回 caller。
+  protected function rdma_status stage_recovery_results_locked(
+    input rdma_cmq_submission_recovery_request request,
+    input rdma_cmq_batch_submission_record record,
+    output rdma_cmq_execution_result results[]
+  );
+    rdma_status first_failure;
+
+    results = new[request.items.size()];
+    first_failure = null;
+    foreach (results[i]) begin
+      rdma_cmq_execution_result result;
+      rdma_cmq_ticket ticket_snapshot;
+      rdma_cmq_recovery_owner owner_snapshot;
+      rdma_dma_request_context dma_snapshot;
+      rdma_cmq_command_identity command_identity;
+      rdma_status nested_status;
+      string failure_reason;
+
+      result = make_recovery_result_locked(
+        $sformatf("cmq_recovery_result_%0d", i)
+      );
+      if (result == null) begin
+        result = new($sformatf("cmq_recovery_emergency_result_%0d", i));
+        if (first_failure == null)
+          first_failure = journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ recovery result candidate construction failed"
+          );
+      end
+      ticket_snapshot = make_recovery_ticket_locked(
+        $sformatf("cmq_recovery_ticket_%0d", i), request.items[i].ticket
+      );
+      if (ticket_snapshot == null) begin
+        if (first_failure == null)
+          first_failure = journal_status(
+            RDMA_SC_INVALID_ARGUMENT,
+            "CMQ recovery aligned ticket snapshot failed"
+          );
+        ticket_snapshot = make_recovery_ticket_locked(
+          $sformatf("cmq_recovery_retained_ticket_%0d", i),
+          record.items[i].ticket
+        );
+      end
+      if (ticket_snapshot == null) begin
+        ticket_snapshot = new($sformatf(
+          "cmq_recovery_emergency_ticket_%0d", i
+        ));
+        ticket_snapshot.command_id = request.items[i].ticket.command_id;
+        ticket_snapshot.slot_sequence =
+          request.items[i].ticket.slot_sequence;
+        ticket_snapshot.sq_index = request.items[i].ticket.sq_index;
+        ticket_snapshot.sq_wrap = request.items[i].ticket.sq_wrap;
+        ticket_snapshot.absolute_deadline =
+          request.items[i].ticket.absolute_deadline;
+      end
+      owner_snapshot = make_recovery_owner_locked(
+        $sformatf("cmq_recovery_owner_%0d", i),
+        request.items[i].recovery_owner
+      );
+      if (owner_snapshot == null && first_failure == null)
+        first_failure = journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery owner candidate construction failed"
+        );
+      dma_snapshot = null;
+      nested_status = snapshot_journal_dma_context_locked(
+        request.items[i].dma_context, dma_snapshot
+      );
+      if ((nested_status == null || !nested_status.ok() ||
+           dma_snapshot == null) && first_failure == null)
+        first_failure = (nested_status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery DMA snapshot returned null status"
+        ) : journal_status(nested_status.code, nested_status.message);
+      command_identity = new($sformatf(
+        "cmq_recovery_command_identity_%0d", i
+      ));
+      if (!command_identity.capture_from(
+            request.items[i].command, failure_reason
+          )) begin
+        command_identity = null;
+        if (first_failure == null)
+          first_failure = journal_status(
+            RDMA_SC_INVALID_ARGUMENT,
+            {"CMQ recovery command identity capture failed: ",
+             failure_reason}
+          );
+      end
+
+      result.ticket = ticket_snapshot;
+      result.completion = null;
+      result.status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ recovery attempt did not commit"
+      );
+      result.observation_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      result.command_identity = command_identity;
+      result.recovery_owner = owner_snapshot;
+      result.dma_context = dma_snapshot;
+      result.submission_effect = record.items[i].submission_effect;
+      result.attempt_effect = record.items[i].attempt_effect;
+      result.completion_phase = record.items[i].completion_phase;
+      result.batch_key = record.batch_key;
+      result.batch_id = record.batch_id;
+      result.attempt_id = record.attempt_id;
+      result.recovery_required = 1'b1;
+      results[i] = result;
+    end
+    return (first_failure == null) ? journal_status(RDMA_SC_OK) :
+                                     first_failure;
+  endfunction
+
+  // 功能：把一个 located/aligned recovery 拒绝同步投影到每个预建 result，保留
+  //   可靠 observation OK、当前 attempt identity 与 retained cumulative evidence。
+  // 输入/输出及副作用：results 中 outer 值被就地更新；code/message 为只读输入；
+  //   不改变 ticket/owner/DMA、journal、fence、counter 或 capability registry。
+  // 失败/边界：null result 被忽略以避免二次异常；调用方只可在 staging 已保证
+  //   aligned outer 后使用，INVALID/unknown code 仍由 direct status 保守封装。
+  protected function void reject_recovery_results_locked(
+    input rdma_cmq_execution_result results[],
+    input rdma_status_code_e code,
+    input string message
+  );
+    foreach (results[i]) begin
+      if (results[i] != null) begin
+        results[i].status = rdma_cmq_direct_status(code, message);
+        results[i].observation_status = rdma_cmq_direct_status(RDMA_SC_OK);
+        results[i].recovery_required = 1'b1;
+      end
+    end
+  endfunction
+
+  // 功能：通过 model contract 比较 request-carried 与 authoritative retained reset
+  //   proof，保留 engine protected seam 供既有调用与测试扩展点使用。
+  // 输入/输出及副作用：lhs/rhs 为只读输入；只转发并返回完整公开值 equality，
+  //   不 mint、推进或登记 proof，也不访问 retry mapping/fence/observer。
+  // 失败/边界：null、tuple cardinality、identity/owner 或任一固定/排除字段漂移
+  //   返回 0；package comparator 不额外 validate 或重算 digest。
+  protected function bit same_reset_isolation_proof_value(
+    input rdma_cmq_reset_isolation_proof lhs,
+    input rdma_cmq_reset_isolation_proof rhs
+  );
+    return rdma_cmq_same_reset_isolation_proof_value(lhs, rhs);
+  endfunction
+
+  // 功能：把 authoritative retained READY reset proof 重新绑定到当前 journal
+  //   batch identity、engine/Function incarnation 与完整 ordered item authority tuple。
+  // 输入/输出及副作用：proof/record 为锁内只读输入；逐项比较 request index、
+  //   image/authority digest 和完整 frozen owner 值，只返回 detached status。
+  // 失败/边界：null、非 READY、backing 未释放、固定身份/tuple cardinality 或任一
+  //   item 值漂移返回 INVALID_ARGUMENT；不 mint proof、不更新 lifecycle 或访问 I/O。
+  protected function rdma_status
+  validate_reset_isolation_proof_binding_locked(
+    input rdma_cmq_reset_isolation_proof proof,
+    input rdma_cmq_batch_submission_record record
+  );
+    int unsigned quarantined_count;
+    int unsigned match_count;
+    bit matched[int unsigned];
+    rdma_cmq_journal_digest_t computed_digest;
     rdma_status status;
-    rdma_status transaction_status;
-    rdma_status successful_batch_status;
-    longint unsigned final_sequence;
-    int unsigned final_pi;
-    bit final_polarity;
-    time minimum_remaining;
-    time remaining;
-    longint unsigned used;
-    bit transaction_failed;
-    bit staged_profile_format_valid;
-    rdma_byte_endian_e staged_profile_endian;
-    int unsigned staged_profile_hardware_version;
 
-    tickets = new[requests.size()];
-    item_statuses = new[requests.size()];
-    preserve_item_status = new[requests.size()];
-    foreach (tickets[i]) begin
-      tickets[i] = null;
-      item_statuses[i] = invalid_state("CMQ batch item was not published");
-      preserve_item_status[i] = 1'b0;
-    end
-    batch_status = invalid_state("CMQ batch submit did not complete");
-    success_count = 0;
-    transaction_failed = 1'b0;
-    transaction_status = null;
-    successful_batch_status = null;
-    staged_profile_format_valid = 1'b0;
-    staged_profile_endian = RDMA_ENDIAN_LITTLE;
-    staged_profile_hardware_version = 0;
-    dependencies.delete();
-    foreach (tentative_token_reserved[i]) begin
-      tentative_token_reserved[i] = 1'b0;
-      caller_tickets[i] = null;
-      tentative_records[i] = null;
-      tentative_success_statuses[i] = null;
-      original_indices[i] = 0;
-      tentative_tokens[i] = '0;
-      tentative_deadlines[i] = 0;
-    end
+    if (proof == null || record == null || record.function_identity == null ||
+        proof.state != RDMA_CMQ_RESET_PROOF_READY ||
+        !proof.backing_release_confirmed ||
+        proof.batch_key != record.batch_key ||
+        proof.batch_id != record.batch_id ||
+        proof.attempt_id != record.attempt_id ||
+        proof.engine_instance_id != record.engine_instance_id ||
+        proof.engine_incarnation != record.engine_incarnation ||
+        proof.isolated_identity == null ||
+        !proof.isolated_identity.same_incarnation(
+          record.function_identity
+        ) || proof.batch_digest !== record.batch_digest ||
+        proof.isolated_request_indices.size() == 0 ||
+        proof.isolated_request_indices.size() !=
+          proof.isolated_image_digests.size() ||
+        proof.isolated_request_indices.size() !=
+          proof.isolated_authority_digests.size() ||
+        proof.isolated_request_indices.size() !=
+          proof.isolated_recovery_owners.size())
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset isolation proof does not bind the retained batch"
+      );
 
-    engine_lock.get(1);
+    quarantined_count = 0;
+    foreach (record.items[i]) begin
+      if (record.items[i] == null)
+        return journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ reset proof retained item is null"
+        );
+      if (record.items[i].state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED)
+        quarantined_count++;
+    end
+    if (proof.isolated_request_indices.size() != quarantined_count)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof tuple does not cover exactly quarantined items"
+      );
+
+    status = rdma_cmq_compute_reset_proof_digest(
+      proof.proof_key, proof.proof_id, proof.batch_key, proof.batch_id,
+      proof.attempt_id, proof.engine_instance_id, proof.engine_incarnation,
+      proof.isolated_identity, proof.batch_digest,
+      proof.isolated_request_indices, proof.isolated_image_digests,
+      proof.isolated_authority_digests, proof.isolated_recovery_owners,
+      computed_digest
+    );
+    if (status == null || !status.ok() || computed_digest !== proof.proof_digest)
+      return journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ reset proof digest does not match retained authority"
+      );
+
+    if (proof.replacement_identity == null ||
+        !proof.replacement_identity.same_function(
+          proof.isolated_identity
+        ) || proof.replacement_identity.reset_epoch <=
+          proof.isolated_identity.reset_epoch)
+      return journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ reset proof replacement identity is not a newer same Function"
+      );
+
+    foreach (proof.isolated_request_indices[p]) begin
+      match_count = 0;
+      foreach (record.items[i]) begin
+        if (record.items[i].request_index ==
+              proof.isolated_request_indices[p]) begin
+          match_count++;
+          if (matched.exists(i))
+            return journal_status(
+              RDMA_SC_INVALID_ARGUMENT,
+              "CMQ reset proof tuple repeats a journal item"
+            );
+          matched[i] = 1'b1;
+          if (record.items[i].state !=
+                RDMA_CMQ_SUBMISSION_RESET_QUARANTINED ||
+              record.items[i].completion_phase !=
+                RDMA_CMQ_COMPLETION_RESET_CANCELLED ||
+              record.items[i].completion == null ||
+              proof.isolated_image_digests[p] !==
+                record.items[i].image_digest ||
+              proof.isolated_authority_digests[p] !==
+                record.items[i].authority_digest ||
+              !same_journal_owner_value(
+                proof.isolated_recovery_owners[p],
+                record.items[i].recovery_owner
+              ))
+            return journal_status(
+              RDMA_SC_INVALID_ARGUMENT,
+              $sformatf(
+                "CMQ reset isolation proof item %0d does not bind journal",
+                p
+              )
+            );
+        end
+      end
+      if (match_count != 1)
+        return journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ reset proof request index is absent or ambiguous"
+        );
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 设计说明：只在 observed submit 已创建逐项默认结果并取得 engine_lock 后调用；
+  //   按原有顺序先挡 reset release，再检查 ACTIVE、完整 authority、retained
+  //   fence、Function handle 与 ring counter。这里不取得/释放锁，也不分配 ID；
+  //   fence 是 batch OK、逐项 BUSY 的提前拒绝，不走事务失败回填。
+  // 功能：对非空 observed batch 执行锁内准入，并在拒绝时填好 batch_status 与
+  //   每项独立 status；成功时提供当前 Function handle 和 ring 占用供 staging 使用。
+  // 输入/输出及副作用：results 与 batch_status 为调用方现有输出的 ref；
+  //   active_function、used 为仅成功后使用的 output；读取 engine authority/fence，
+  //   ring_used 的计数器异常会置 engine_state 为 POISONED 并清 late_final_fifo。
+  // 失败/边界：六个拒绝分支返回 0，保持 reset gate、非 ACTIVE、六项缺失
+  //   authority、fence、null Function、ring 失序/超深度的状态与错误优先级；
+  //   成功返回 1；调用者必须且只须在返回 0 时解锁一次并立即退出。
+  protected function automatic bit admit_observed_batch_locked(
+    ref rdma_cmq_execution_result results[],
+    ref rdma_status batch_status,
+    output rdma_function_handle active_function,
+    output longint unsigned used
+  );
+    rdma_status status;
+
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      batch_status = copy_submit_status_direct(
+        status, "cmq_reset_release_gate_batch_status"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          status, $sformatf("cmq_reset_release_gate_item_%0d", i)
+        );
+      return 1'b0;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
-      batch_status = invalid_state("CMQ submit requires an ACTIVE engine");
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
-      engine_lock.put(1);
-      return;
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ submit requires an ACTIVE engine"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_inactive_item_%0d", i)
+        );
+      return 1'b0;
     end
-    if (prepared_binding == null || cmq_snapshot == null ||
-        backing_mapping == null || scheduler == null || profile == null) begin
-      batch_status = invalid_state("CMQ ACTIVE publication authority is missing");
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
-      engine_lock.put(1);
-      return;
+    if (prepared_binding == null || dma_context == null ||
+        cmq_snapshot == null || backing_mapping == null ||
+        transport == null || profile == null) begin
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ ACTIVE publication authority is missing"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_missing_authority_item_%0d", i)
+        );
+      return 1'b0;
     end
+    if (fenced_batch_key.len() != 0) begin
+      foreach (results[i])
+        results[i].status = rdma_cmq_direct_status(
+          RDMA_SC_RESOURCE_BUSY,
+          "CMQ submission is fenced by a retained batch"
+        );
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      return 1'b0;
+    end
+
     active_function = prepared_binding.make_handle();
     if (active_function == null) begin
-      batch_status = invalid_state("CMQ ACTIVE Function handle is missing");
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
-      engine_lock.put(1);
-      return;
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ ACTIVE Function handle is missing"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_missing_function_item_%0d", i)
+        );
+      return 1'b0;
     end
     status = ring_used(used);
-    if (!status.ok()) begin
-      batch_status = rdma_cmq_clone_status_value(status);
-      foreach (item_statuses[i])
-        item_statuses[i] = rdma_cmq_clone_status_value(batch_status);
-      engine_lock.put(1);
-      return;
+    if (status == null || !status.ok()) begin
+      batch_status = copy_submit_status_direct(
+        status, "cmq_ring_status"
+      );
+      foreach (results[i])
+        results[i].status = copy_submit_status_direct(
+          batch_status, $sformatf("cmq_ring_item_%0d", i)
+        );
+      return 1'b0;
     end
-    if (requests.size() == 0) begin
-      batch_status = rdma_status::success();
-      engine_lock.put(1);
-      return;
-    end
-    staged_profile_format_valid = profile_image_format_valid;
-    staged_profile_endian = profile_image_endian;
-    staged_profile_hardware_version = profile_hardware_version;
+    return 1'b1;
+  endfunction
 
-    foreach (requests[i]) begin : stage_each_request
+  // 设计说明：本 helper 由持有 engine_lock 的 observed submit 调用，按原始请求索引
+  //   逐项压缩候选。局部拒绝用 continue 保留精确结果，整批不变量故障用 break
+  //   留给原 task 回填；两处 poison_status 必须在原序号/依赖溢出位置更新
+  //   engine_state 和 late_final_fifo，不能把它伪装成纯值计算。
+  // 功能：暂存每项 command 的身份、slot、SQE、ticket、dependency 与未安装的
+  //   journal/preallocation 条目，同时冻结本批 profile 格式，保持虚拟 compose hook。
+  // 输入/输出及副作用：commands、active_function、used 为持锁输入；results 与
+  //   local_result_finalized 按输入索引原位更新；stage 借用调用方候选句柄并累积
+  //   dependencies、profile 格式和 transaction_status/failed，不安装共享账本。
+  // 失败/边界：普通 command snapshot 拒绝、无效命令、容量/token/地址与非 OK
+  //   compose 仅逐项拒绝；command snapshot 的 staging invariant、后续 candidate
+  //   snapshot/shape、null compose、格式/依赖不变量或 poison 才终止全批。
+  //   已定稿局部结果不被上层失败回填覆盖；仅在原锁内、transport 前调用。
+  protected function automatic void stage_observed_candidates_locked(
+    input rdma_cmq_command_desc commands[],
+    input rdma_function_handle active_function,
+    input longint unsigned used,
+    ref rdma_cmq_execution_result results[],
+    ref bit local_result_finalized[],
+    ref rdma_cmq_submit_candidate_stage_t stage
+  );
+    rdma_status status;
+
+    foreach (commands[i]) begin : stage_observed_command
       rdma_cmq_command_desc command_snapshot;
+      rdma_cmq_command_identity command_identity;
       rdma_cmq_slot_context slot_context;
       rdma_cmq_slot_context slot_context_snapshot;
       rdma_hw_image profile_sqe;
@@ -4765,12 +9254,14 @@ class rdma_cmq_engine extends uvm_object;
       rdma_cmq_expected_response profile_expected;
       rdma_cmq_expected_response expected_snapshot;
       rdma_cmq_ticket authority_ticket;
-      rdma_cmq_ticket caller_ticket;
-      rdma_cmq_slot_record record_candidate;
-      rdma_cmq_slot_record record_snapshot;
+      rdma_cmq_slot_record slot_candidate;
+      rdma_cmq_slot_record slot_snapshot;
       rdma_doorbell_dependency dependency_candidate;
       rdma_doorbell_dependency dependency_snapshot;
       rdma_dma_mapping dependency_mapping;
+      rdma_cmq_batch_submission_item_record item;
+      rdma_cmq_preallocated_publish_item publish_item;
+      bit [58:0] candidate_token_incarnation;
       time absolute_deadline;
       longint unsigned slot_sequence;
       longint unsigned relative_offset;
@@ -4781,17 +9272,18 @@ class rdma_cmq_engine extends uvm_object;
       bit sq_wrap;
       bit token_found;
       bit snapshot_invariant_failed;
+      string identity_failure;
 
       command_snapshot = null;
+      command_identity = null;
       slot_context_snapshot = null;
       profile_sqe = null;
       sqe_snapshot = null;
       profile_expected = null;
       expected_snapshot = null;
       authority_ticket = null;
-      caller_ticket = null;
-      record_candidate = null;
-      record_snapshot = null;
+      slot_candidate = null;
+      slot_snapshot = null;
       dependency_candidate = null;
       dependency_snapshot = null;
       dependency_mapping = null;
@@ -4799,129 +9291,156 @@ class rdma_cmq_engine extends uvm_object;
       selected_token = 0;
       snapshot_invariant_failed = 1'b0;
 
-      status = snapshot_command_value(requests[i], command_snapshot,
-                                      snapshot_invariant_failed);
+      status = snapshot_command_value(
+        commands[i], command_snapshot, snapshot_invariant_failed
+      );
+      if (status == null)
+        status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ command snapshot returned null status"
+        );
       if (!status.ok()) begin
         if (snapshot_invariant_failed) begin
-          transaction_status = status;
-          transaction_failed = 1'b1;
+          stage.transaction_status = status;
+          stage.transaction_failed = 1'b1;
           break;
         end
-        item_statuses[i] = rdma_cmq_clone_status_value(status);
-        preserve_item_status[i] = 1'b1;
+        results[i].status = copy_submit_status_direct(
+          status, $sformatf("cmq_local_snapshot_reject_%0d", i)
+        );
+        local_result_finalized[i] = 1'b1;
         continue;
       end
+
+      command_identity = new($sformatf("cmq_command_identity_%0d", i));
+      if (!command_identity.capture_from(
+            command_snapshot, identity_failure
+          )) begin
+        stage.transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          {"CMQ command identity capture failed: ", identity_failure}
+        );
+        stage.transaction_failed = 1'b1;
+        break;
+      end
+      results[i].command_identity = command_identity;
       if (command_snapshot.function_h.kind != active_function.kind ||
           command_snapshot.function_h.function_uid !=
             active_function.function_uid ||
-          command_snapshot.function_h.object_id != active_function.object_id) begin
-        item_statuses[i] = invalid_argument(
+          command_snapshot.function_h.object_id !=
+            active_function.object_id) begin
+        results[i].status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_ARGUMENT,
           "CMQ command Function identity does not match ACTIVE binding"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
       if (command_snapshot.function_h.generation !=
           active_function.generation) begin
-        item_statuses[i] = rdma_status::make(
+        results[i].status = rdma_cmq_direct_status(
           RDMA_SC_STALE_GENERATION,
           "CMQ command Function generation does not match ACTIVE binding"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
       if (command_snapshot.opcode_key.profile_name !=
           profile.profile_name()) begin
-        item_statuses[i] = rdma_status::make(
+        results[i].status = rdma_cmq_direct_status(
           RDMA_SC_UNSUPPORTED_OPCODE,
           "CMQ command opcode profile does not match ACTIVE profile"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
       if ($isunknown(command_snapshot.timeout)) begin
-        item_statuses[i] = invalid_argument(
+        results[i].status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_ARGUMENT,
           "CMQ command timeout contains an unknown bit"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
       absolute_deadline = $time + command_snapshot.timeout;
       if ($isunknown(absolute_deadline) || absolute_deadline == 0 ||
           absolute_deadline < $time) begin
-        item_statuses[i] = invalid_argument(
+        results[i].status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_ARGUMENT,
           "CMQ command absolute deadline overflows simulation time"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
-      if ((used + success_count) == CMQ_DEPTH) begin
-        item_statuses[i] = rdma_status::make(
+      if ((used + stage.record_candidate.items.size()) == CMQ_DEPTH) begin
+        results[i].status = rdma_cmq_direct_status(
           RDMA_SC_QUEUE_FULL, "CMQ submission ring is full"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
-
-      // Include the current candidate in the producer precheck.  A sequence
-      // at UINT64_MAX cannot be published because its dependency ID is the
-      // checked sequence + 1, so fail before constructing either value.
-      if (publish_seq >=
-          (64'hffff_ffff_ffff_ffff - success_count)) begin
-        transaction_status = poison_status(
+      if (publish_seq >= 64'hffff_ffff_ffff_ffff -
+                         stage.record_candidate.items.size()) begin
+        stage.transaction_status = poison_status(
           "CMQ producer sequence addition overflows"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
 
       for (int unsigned token_index = 0;
            token_index < CMQ_DEPTH; token_index++) begin
+        bit staged_token;
+
+        staged_token = 1'b0;
+        foreach (stage.record_candidate.items[prior]) begin
+          if (stage.record_candidate.items[prior].command_token == token_index)
+            staged_token = 1'b1;
+        end
         if (!token_found && !token_in_use[token_index] &&
-            !tentative_token_reserved[token_index] &&
+            !staged_token &&
             token_incarnation[token_index] != {59{1'b1}}) begin
           token_found = 1'b1;
           selected_token = token_index;
         end
       end
       if (!token_found) begin
-        item_statuses[i] = rdma_status::make(
-          RDMA_SC_RESOURCE_EXHAUSTED, "CMQ command tokens are exhausted"
+        results[i].status = rdma_cmq_direct_status(
+          RDMA_SC_RESOURCE_EXHAUSTED,
+          "CMQ command tokens are exhausted"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
-      token_incarnation[selected_token]++;
-      tentative_token_reserved[selected_token] = 1'b1;
-      command_id = {token_incarnation[selected_token],
+      candidate_token_incarnation =
+        token_incarnation[selected_token] + 1'b1;
+      command_id = {candidate_token_incarnation,
                     selected_token[4:0]};
       if (command_id == 0) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_status::make(
+        results[i].status = rdma_cmq_direct_status(
           RDMA_SC_RESOURCE_EXHAUSTED, "CMQ command ID is exhausted"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
 
-      slot_sequence = publish_seq + success_count;
+      slot_sequence = publish_seq + stage.record_candidate.items.size();
       if (slot_sequence == 64'hffff_ffff_ffff_ffff) begin
-        transaction_status = poison_status(
+        stage.transaction_status = poison_status(
           "CMQ dependency identifier addition overflows"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
       sq_index = slot_sequence % CMQ_DEPTH;
       sq_wrap = (slot_sequence / CMQ_DEPTH) & 1'b1;
       relative_offset = longint'(sq_index) * CMQE_BYTES;
       if (backing_mapping.backing_addr.value >
-          (64'hffff_ffff_ffff_ffff - relative_offset)) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_status::make(
+          64'hffff_ffff_ffff_ffff - relative_offset) begin
+        results[i].status = rdma_cmq_direct_status(
           RDMA_SC_DMA_TRANSLATION, "CMQ SQE backing address overflows"
         );
-        preserve_item_status[i] = 1'b1;
+        local_result_finalized[i] = 1'b1;
         continue;
       end
       expected_backing_target = backing_mapping.backing_addr.value +
@@ -4931,28 +9450,32 @@ class rdma_cmq_engine extends uvm_object;
         $sformatf("cmq_slot_context_%0d", slot_sequence)
       );
       if (slot_context == null) begin
-        transaction_status = invalid_state(
-          "CMQ slot context construction failed"
+        stage.transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE, "CMQ slot context construction failed"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
       status = checked_function_snapshot(
         active_function, "CMQ submission slot", RDMA_SC_INVALID_STATE,
         slot_context.function_h
       );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_slot_function_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
       status = checked_handle_snapshot(
-        cmq_snapshot.handle, "CMQ submission slot", RDMA_SC_INVALID_STATE,
-        slot_context.cmq_h
+        cmq_snapshot.handle, "CMQ submission slot",
+        RDMA_SC_INVALID_STATE, slot_context.cmq_h
       );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_slot_handle_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
       slot_context.backing_addr = backing_mapping.backing_addr;
@@ -4962,76 +9485,91 @@ class rdma_cmq_engine extends uvm_object;
       slot_context.sq_wrap = sq_wrap;
       status = slot_context.validate();
       if (status == null || !status.ok()) begin
-        transaction_status = invalid_state(
-          "CMQ slot context validation failed"
+        stage.transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE, "CMQ slot context validation failed"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
-      status = checked_slot_context_snapshot(slot_context,
-                                             slot_context_snapshot);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      status = checked_slot_context_snapshot(
+        slot_context, slot_context_snapshot
+      );
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_slot_snapshot_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
 
-      status = profile.compose_sqe(command_snapshot, slot_context_snapshot,
-                                   profile_sqe, profile_expected);
+      status = profile.compose_sqe(
+        command_snapshot, slot_context_snapshot,
+        profile_sqe, profile_expected
+      );
       if (status == null) begin
-        transaction_status = invalid_state(
-          "CMQ SQE composition returned null status"
+        stage.transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE, "CMQ SQE composition returned null status"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
       if (!status.ok()) begin
-        tentative_token_reserved[selected_token] = 1'b0;
-        item_statuses[i] = rdma_cmq_clone_status_value(status);
-        preserve_item_status[i] = 1'b1;
+        results[i].status = copy_submit_status_direct(
+          status, $sformatf("cmq_local_compose_reject_%0d", i)
+        );
+        local_result_finalized[i] = 1'b1;
         continue;
       end
       status = sqe_metadata_status(profile_sqe, expected_backing_target);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_sqe_metadata_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
-      status = checked_image_snapshot(
+      status = checked_canonical_image_snapshot(
         profile_sqe, "CMQ SQE", RDMA_SC_INVALID_STATE, sqe_snapshot
       );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_sqe_snapshot_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
       status = sqe_metadata_status(sqe_snapshot, expected_backing_target);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_sqe_snapshot_metadata_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
-      if (!staged_profile_format_valid) begin
-        staged_profile_format_valid = 1'b1;
-        staged_profile_endian = sqe_snapshot.endian;
-        staged_profile_hardware_version = sqe_snapshot.hardware_version;
+      if (!stage.staged_profile_format_valid) begin
+        stage.staged_profile_format_valid = 1'b1;
+        stage.staged_profile_endian = sqe_snapshot.endian;
+        stage.staged_profile_hardware_version = sqe_snapshot.hardware_version;
       end
-      else if (sqe_snapshot.endian != staged_profile_endian ||
+      else if (sqe_snapshot.endian != stage.staged_profile_endian ||
                sqe_snapshot.hardware_version !=
-                 staged_profile_hardware_version) begin
-        transaction_status = invalid_state(
+                 stage.staged_profile_hardware_version) begin
+        stage.transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
           "CMQ profile changed its profile-wide SQE/CQE image format"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
       status = checked_expected_snapshot(
         profile_expected, "CMQ profile", RDMA_SC_INVALID_STATE,
         expected_snapshot
       );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_expected_snapshot_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
 
@@ -5041,44 +9579,37 @@ class rdma_cmq_engine extends uvm_object;
         sq_wrap, command_snapshot.opcode_key, absolute_deadline,
         authority_ticket
       );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
-        break;
-      end
-      status = make_ticket_value(
-        $sformatf("cmq_caller_ticket_%0d", command_id), command_id,
-        active_function, cmq_snapshot.handle, slot_sequence, sq_index,
-        sq_wrap, command_snapshot.opcode_key, absolute_deadline,
-        caller_ticket
-      );
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_ticket_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
 
-      record_candidate = rdma_cmq_slot_record::type_id::create(
+      slot_candidate = rdma_cmq_slot_record::type_id::create(
         $sformatf("cmq_slot_record_%0d", slot_sequence)
       );
-      if (record_candidate == null) begin
-        transaction_status = invalid_state(
-          "CMQ slot record construction failed"
+      if (slot_candidate == null) begin
+        stage.transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE, "CMQ slot record construction failed"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
-      record_candidate.slot_sequence = slot_sequence;
-      record_candidate.sq_index = sq_index;
-      record_candidate.sq_wrap = sq_wrap;
-      record_candidate.state = CMQ_SLOT_PUBLISHED;
-      record_candidate.ticket = authority_ticket;
-      record_candidate.expected = expected_snapshot;
-      record_candidate.command_token = selected_token[4:0];
-      status = checked_record_snapshot(record_candidate, record_snapshot);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      slot_candidate.slot_sequence = slot_sequence;
+      slot_candidate.sq_index = sq_index;
+      slot_candidate.sq_wrap = sq_wrap;
+      slot_candidate.state = CMQ_SLOT_PUBLISHED;
+      slot_candidate.ticket = authority_ticket;
+      slot_candidate.expected = expected_snapshot;
+      slot_candidate.command_token = selected_token[4:0];
+      status = checked_record_snapshot(slot_candidate, slot_snapshot);
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_slot_record_snapshot_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
 
@@ -5086,15 +9617,17 @@ class rdma_cmq_engine extends uvm_object;
         $sformatf("cmq_dependency_%0d", slot_sequence + 1'b1)
       );
       status = make_mapping_snapshot(
-        backing_mapping, $sformatf("cmq_dependency_mapping_%0d",
-                                   slot_sequence), dependency_mapping
+        backing_mapping, $sformatf(
+          "cmq_dependency_mapping_%0d", slot_sequence
+        ), dependency_mapping
       );
-      if (dependency_candidate == null || !status.ok() ||
-          dependency_mapping == null) begin
-        transaction_status = invalid_state(
+      if (dependency_candidate == null || status == null ||
+          !status.ok() || dependency_mapping == null) begin
+        stage.transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
           "CMQ scheduler dependency construction failed"
         );
-        transaction_failed = 1'b1;
+        stage.transaction_failed = 1'b1;
         break;
       end
       dependency_candidate.dependency_id = slot_sequence + 1'b1;
@@ -5103,116 +9636,197 @@ class rdma_cmq_engine extends uvm_object;
       dependency_candidate.relative_offset = relative_offset;
       dependency_candidate.image = sqe_snapshot;
       dependency_candidate.ready = 1'b1;
-      status = checked_dependency_snapshot(dependency_candidate,
-                                           dependency_snapshot);
-      if (!status.ok()) begin
-        transaction_status = status;
-        transaction_failed = 1'b1;
+      status = checked_dependency_snapshot(
+        dependency_candidate, dependency_snapshot
+      );
+      if (status == null || !status.ok()) begin
+        stage.transaction_status = copy_submit_status_direct(
+          status, "cmq_dependency_snapshot_status"
+        );
+        stage.transaction_failed = 1'b1;
         break;
       end
 
-      original_indices[success_count] = i;
-      tentative_tokens[success_count] = selected_token[4:0];
-      tentative_deadlines[success_count] = absolute_deadline;
-      caller_tickets[success_count] = caller_ticket;
-      tentative_records[success_count] = record_snapshot;
-      tentative_success_statuses[success_count] = rdma_status::success();
-      dependencies.push_back(dependency_snapshot);
-      success_count++;
-    end
+      item = new($sformatf("cmq_submission_item_%0d", i));
+      item.request_index = i;
+      item.command = command_snapshot;
+      item.ticket = authority_ticket;
+      item.recovery_owner = null;
+      item.dma_context = dma_context;
+      item.sqe_image = sqe_snapshot;
+      item.dependency_mapping = backing_mapping;
+      item.dependency_offset = relative_offset;
+      item.dependency_image = sqe_snapshot;
+      item.slot_sequence = slot_sequence;
+      item.slot_index = sq_index;
+      item.slot_wrap = sq_wrap;
+      item.command_token = selected_token[4:0];
+      item.token_incarnation = engine_incarnation[58:0];
+      item.entry_key = entry_key(sq_index, sq_wrap);
+      item.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+      item.submission_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      item.attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      item.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+      item.reset_isolation_confirmed = 1'b0;
+      item.recovery_required = 1'b1;
+      item.completion = null;
+      item.status = rdma_cmq_direct_status(RDMA_SC_OK);
+      stage.record_candidate.items.push_back(item);
 
-    if (!transaction_failed && success_count == 0) begin
-      batch_status = rdma_status::success();
-      engine_lock.put(1);
-      return;
+      publish_item = new($sformatf("cmq_publish_item_%0d", i));
+      publish_item.request_index = i;
+      publish_item.slot_record = slot_snapshot;
+      publish_item.command_key = command_key(authority_ticket);
+      publish_item.entry_key = item.entry_key;
+      publish_item.command_token = selected_token[4:0];
+      stage.preallocated_candidate.items.push_back(publish_item);
+      stage.dependencies.push_back(dependency_snapshot);
     end
+  endfunction
+
+  // 设计说明：此阶段只处理已压缩的非空候选，在原 task 的 engine_lock 内、
+  //   ID 分配和 journal 安装之前运行。profile 的 virtual encoder 只收到
+  //   detached handle；即使同时返回 null/失败 status，也先检查它是否改写
+  //   该 handle，再按 source metadata → canonical snapshot → snapshot metadata
+  //   的原顺序拒绝，不能把这些边界合并成一次宽松校验。
+  // 功能：依据 publish_seq 和 admitted_count 算出最终 ring 位置，编码并冻结
+  //   本批 CMQ doorbell image，供原 task 后续构造 descriptor/journal 使用。
+  // 输入/输出及副作用：admitted_count 是已经过 staging 的候选条目数；
+  //   final_sequence/final_pi/final_polarity/doorbell_snapshot 为成功输出；
+  //   transaction_status/transaction_failed 原位记录首个失败；调用 profile
+  //   encoder 可能分配局部 image/status，但不安装账本、不取放锁或执行 I/O。
+  // 失败/边界：handle snapshot、篡改、null/失败编码状态、source metadata、
+  //   canonical snapshot 或 snapshot metadata 任一步失败即跳过后续步骤；
+  //   失败时输出值不得作为 publication authority 使用，原 task 负责统一
+  //   回填和解锁。本 helper 仅在原锁内且 admitted_count 非零时调用。
+  protected function automatic void stage_observed_doorbell_image_locked(
+    input int unsigned admitted_count,
+    output longint unsigned final_sequence,
+    output int unsigned final_pi,
+    output bit final_polarity,
+    output rdma_hw_image doorbell_snapshot,
+    ref rdma_status transaction_status,
+    ref bit transaction_failed
+  );
+    rdma_handle doorbell_encode_target;
+    rdma_hw_image doorbell_image;
+    rdma_status status;
 
     if (!transaction_failed) begin
-      if (publish_seq >
-          (64'hffff_ffff_ffff_ffff - success_count)) begin
-        transaction_status = poison_status(
-          "CMQ final producer sequence overflows"
+      final_sequence = publish_seq + admitted_count;
+      final_pi = final_sequence % CMQ_DEPTH;
+      final_polarity = (final_sequence / CMQ_DEPTH) & 1'b1;
+      status = checked_handle_snapshot(
+        cmq_snapshot.handle, "CMQ doorbell encoder",
+        RDMA_SC_INVALID_STATE, doorbell_encode_target
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_handle_status"
         );
         transaction_failed = 1'b1;
       end
-      else begin
-        final_sequence = publish_seq + success_count;
-        final_pi = final_sequence % CMQ_DEPTH;
-        final_polarity = (final_sequence / CMQ_DEPTH) & 1'b1;
-        status = checked_handle_snapshot(
-          cmq_snapshot.handle, "CMQ doorbell encoder",
-          RDMA_SC_INVALID_STATE, doorbell_encode_target
+    end
+    if (!transaction_failed) begin
+      doorbell_image = null;
+      status = profile.encode_doorbell(
+        doorbell_encode_target, final_pi, final_polarity, doorbell_image
+      );
+      if (!same_handle(doorbell_encode_target, cmq_snapshot.handle)) begin
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ doorbell encoder changed its detached handle input"
         );
-        if (!status.ok()) begin
-          transaction_status = status;
-          transaction_failed = 1'b1;
-        end
-        else begin
-          doorbell_image = null;
-          status = profile.encode_doorbell(
-            doorbell_encode_target, final_pi, final_polarity, doorbell_image
-          );
-          if (!same_handle(doorbell_encode_target, cmq_snapshot.handle)) begin
-            transaction_status = invalid_state(
-              "CMQ doorbell encoder changed its detached handle input"
-            );
-            transaction_failed = 1'b1;
-          end
-          else begin
-            if (status == null)
-              status = invalid_state(
-                "CMQ doorbell encoding returned null status"
-              );
-            if (!status.ok()) begin
-              transaction_status = status;
-              transaction_failed = 1'b1;
-            end
-          end
-        end
+        transaction_failed = 1'b1;
+      end
+      else if (status == null || !status.ok()) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ doorbell encoding returned null status"
+        ) : copy_submit_status_direct(status, "cmq_doorbell_encode_status");
+        transaction_failed = 1'b1;
       end
     end
-
     if (!transaction_failed) begin
       status = doorbell_metadata_status(doorbell_image);
-      if (!status.ok()) begin
-        transaction_status = invalid_state(
-          {"CMQ doorbell profile output is invalid: ", status.message}
+      if (status == null || !status.ok()) begin
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          {"CMQ doorbell profile output is invalid: ",
+           (status == null) ? "null status" : status.message}
         );
         transaction_failed = 1'b1;
       end
     end
     if (!transaction_failed) begin
-      status = checked_image_snapshot(
+      status = checked_canonical_image_snapshot(
         doorbell_image, "CMQ doorbell", RDMA_SC_INVALID_STATE,
         doorbell_snapshot
       );
-      if (!status.ok()) begin
-        transaction_status = status;
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_snapshot_status"
+        );
         transaction_failed = 1'b1;
       end
     end
     if (!transaction_failed) begin
       status = doorbell_metadata_status(doorbell_snapshot);
-      if (!status.ok()) begin
-        transaction_status = invalid_state(
-          {"CMQ doorbell snapshot metadata is invalid: ", status.message}
+      if (status == null || !status.ok()) begin
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          {"CMQ doorbell snapshot metadata is invalid: ",
+           (status == null) ? "null status" : status.message}
         );
         transaction_failed = 1'b1;
       end
     end
+  endfunction
 
+  // 设计说明：此阶段只借用原锁内已经冻结的 image、压缩后的 record 和依赖；
+  //   先按 item 顺序逐次读取 $time，首个过期即终止，不能先构造 descriptor
+  //   或把 deadline 检查移到 image 编码之前。全部存活时才让 UVM factory 创建
+  //   descriptor，按 Function → target → 完整值快照的顺序拒绝；ID、journal
+  //   和 transport 仍由原 task 在 helper 返回后唯一负责。
+  // 功能：为 observed batch 计算最短剩余 deadline，并构造、冻结发布前的
+  //   doorbell descriptor，供原 task 后续身份分配与 transport 使用。
+  // 输入/输出及副作用：record_candidate、active_function、doorbell_snapshot 和
+  //   dependencies 仅借用调用期值；doorbell_snapshot_desc 入口清空、成功输出
+  //   detached 描述符；transaction_status/transaction_failed 原位保存首个失败。
+  //   factory 和 snapshot 可分配局部对象，不修改 engine 账本、不取放锁或执行 I/O。
+  // 失败/边界：上游已失败时只清空输出；任一 ticket 的 absolute_deadline
+  //   不晚于当前 $time 返回 TIMEOUT 且不触发 descriptor factory；否则依次拒绝
+  //   candidate 构造失败、Function 快照失败、target 快照失败及 descriptor
+  //   clone/值快照失败。失败输出不可使用，原 task 负责保留逐项本地拒绝并统一回填。
+  protected function automatic void stage_observed_doorbell_descriptor_locked(
+    input rdma_cmq_batch_submission_record record_candidate,
+    input rdma_function_handle active_function,
+    input rdma_hw_image doorbell_snapshot,
+    input rdma_doorbell_dependency dependencies[$],
+    output rdma_doorbell_desc doorbell_snapshot_desc,
+    ref rdma_status transaction_status,
+    ref bit transaction_failed
+  );
+    rdma_doorbell_desc doorbell_candidate;
+    rdma_status status;
+    time minimum_remaining;
+    time remaining;
+
+    minimum_remaining = 0;
     if (!transaction_failed) begin
-      minimum_remaining = 0;
-      for (int unsigned success_index = 0;
-           success_index < success_count; success_index++) begin
-        if ($time >= tentative_deadlines[success_index]) begin
-          transaction_status = rdma_status::make(
-            RDMA_SC_TIMEOUT, "CMQ batch deadline expired before publication"
+      foreach (record_candidate.items[i]) begin
+        if ($time >= record_candidate.items[i].ticket.absolute_deadline) begin
+          transaction_status = rdma_cmq_direct_status(
+            RDMA_SC_TIMEOUT,
+            "CMQ batch deadline expired before publication"
           );
           transaction_failed = 1'b1;
           break;
         end
-        remaining = tentative_deadlines[success_index] - $time;
+        remaining = record_candidate.items[i].ticket.absolute_deadline -
+                    $time;
         if (minimum_remaining == 0 || remaining < minimum_remaining)
           minimum_remaining = remaining;
       end
@@ -5225,7 +9839,8 @@ class rdma_cmq_engine extends uvm_object;
         "cmq_batch_doorbell_candidate"
       );
       if (doorbell_candidate == null) begin
-        transaction_status = invalid_state(
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
           "CMQ doorbell descriptor construction failed"
         );
         transaction_failed = 1'b1;
@@ -5237,8 +9852,10 @@ class rdma_cmq_engine extends uvm_object;
         active_function, "CMQ doorbell descriptor", RDMA_SC_INVALID_STATE,
         doorbell_candidate.function_h
       );
-      if (!status.ok()) begin
-        transaction_status = status;
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_function_status"
+        );
         transaction_failed = 1'b1;
       end
     end
@@ -5247,14 +9864,17 @@ class rdma_cmq_engine extends uvm_object;
         cmq_snapshot.handle, "CMQ doorbell descriptor",
         RDMA_SC_INVALID_STATE, doorbell_candidate.target_h
       );
-      if (!status.ok()) begin
-        transaction_status = status;
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_target_status"
+        );
         transaction_failed = 1'b1;
       end
     end
     if (!transaction_failed) begin
       doorbell_candidate.notify_bar_id = prepared_binding.notify_bar_id;
-      doorbell_candidate.relative_offset = doorbell_snapshot.bar_target.value;
+      doorbell_candidate.relative_offset =
+        doorbell_snapshot.bar_target.value;
       doorbell_candidate.width = doorbell_snapshot.length;
       doorbell_candidate.endian = doorbell_snapshot.endian;
       doorbell_candidate.payload_image = doorbell_snapshot;
@@ -5266,78 +9886,2058 @@ class rdma_cmq_engine extends uvm_object;
       doorbell_candidate.dependencies = dependencies;
       doorbell_candidate.timeout = minimum_remaining;
       doorbell_candidate.readback_policy = RDMA_DB_READBACK_NONE;
-      status = checked_doorbell_desc_snapshot(doorbell_candidate,
-                                              doorbell_snapshot_desc);
-      if (!status.ok()) begin
-        transaction_status = status;
+      status = checked_doorbell_desc_snapshot(
+        doorbell_candidate, doorbell_snapshot_desc
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_doorbell_descriptor_status"
+        );
         transaction_failed = 1'b1;
       end
     end
+  endfunction
+
+  // 设计说明：身份及游标元数据已由原 task 写入；此阶段只完善尚未安装的
+  //   candidate 图。按压缩 item 顺序冻结 owner、规范化 body、计算两种逐项摘要
+  //   和有序 batch 摘要；不能提前安装已处理的前缀，也不能在失败时回拨已分配 ID。
+  // 功能：完成 observed journal candidate 的 slot locator、恢复 authority、
+  //   dependency replayability、recovery_required 与有序 digest。
+  // 输入/输出及副作用：record_candidate/preallocated_candidate 借用同一调用期
+  //   detached 图并原位填字段；batch_key/attempt_id 从 record 元数据读取，
+  //   profile/backing_mapping 在调用方锁内借用；transaction_status 和
+  //   transaction_failed 原位记录首个失败；摘要队列仅在本函数内存活。
+  // 失败/边界：仅在原锁内、非空且逐项对齐的候选已分配非零身份后调用；
+  //   上游已失败时不访问图。具体 owner 冻结、journal command 校验、body
+  //   canonicalization、item digest 或 recovery classifier 首错即停止逐项处理，
+  //   并跳过 batch digest；batch digest 失败同样交回原 task 统一回填。
+  //   legacy sentinel 不冻结；失败可留下局部图前缀，但不安装 journal、
+  //   不登记 observer/fence、不分配或回拨 ID，也不取放锁或执行 I/O。
+  protected function automatic void finalize_observed_journal_candidate_locked(
+    input rdma_cmq_batch_submission_record record_candidate,
+    input rdma_cmq_preallocated_publish_batch preallocated_candidate,
+    ref rdma_status transaction_status,
+    ref bit transaction_failed
+  );
+    int unsigned request_indices[$];
+    rdma_cmq_journal_digest_t image_digests[$];
+    rdma_cmq_journal_digest_t authority_digests[$];
+    rdma_status status;
 
     if (!transaction_failed) begin
-      successful_batch_status = rdma_status::success();
-      doorbell_result = null;
-      scheduler.submit(prepared_binding, doorbell_snapshot_desc,
-                       doorbell_result,
-                       status);
-      if (status == null)
-        status = invalid_state("CMQ doorbell scheduler returned null status");
-      else if (status.ok() && doorbell_result == null)
-        status = invalid_state("CMQ doorbell scheduler returned no result");
-      if (!status.ok()) begin
-        transaction_status = status;
+      foreach (record_candidate.items[i]) begin
+        rdma_cmq_batch_submission_item_record item;
+        string body_tag;
+        byte unsigned body_bytes[];
+        bit classified_recovery;
+
+        item = record_candidate.items[i];
+        // batch identity 直到 admission 压缩完成后才分配；此处一次性把稳定
+        // journal locator 写入尚未安装的预分配 slot，request_index 不参与定位。
+        preallocated_candidate.items[i].slot_record.batch_key =
+          record_candidate.batch_key;
+        preallocated_candidate.items[i].slot_record.journal_item_index = i;
+        if (!item.command.recovery_owner.is_legacy_unmigrated()) begin
+          status = item.command.recovery_owner.freeze_for_journal(
+            record_candidate.function_identity, record_candidate.attempt_id
+          );
+          if (status == null || !status.ok()) begin
+            transaction_status = copy_submit_status_direct(
+              status, "cmq_recovery_owner_freeze_status"
+            );
+            transaction_failed = 1'b1;
+            break;
+          end
+        end
+        item.recovery_owner = item.command.recovery_owner;
+        status = item.command.validate_for_journal(
+          record_candidate.function_identity, record_candidate.attempt_id
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = copy_submit_status_direct(
+            status, "cmq_journal_command_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        item.dependency_replay_safe =
+          item.dependency_mapping == backing_mapping &&
+          item.dependency_offset ==
+            longint'(item.slot_index) * CMQE_BYTES &&
+          same_image_value(item.sqe_image, item.dependency_image) &&
+          item.dma_context.function_h.generation ==
+            record_candidate.function_identity.generation &&
+          item.dma_context.reset_epoch ==
+            record_candidate.function_identity.reset_epoch &&
+          item.dependency_mapping.function_h.generation ==
+            record_candidate.function_identity.generation &&
+          item.dependency_mapping.reset_epoch ==
+            record_candidate.function_identity.reset_epoch;
+        status = canonicalize_journal_body(
+          profile, item.command, item.sqe_image, body_tag, body_bytes
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = (status == null) ? rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ command body canonicalization returned null status"
+          ) : copy_submit_status_direct(
+            status, "cmq_command_canonical_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = rdma_cmq_compute_item_digests(
+          item.command, body_tag, body_bytes, item.ticket,
+          item.recovery_owner, record_candidate.function_identity,
+          item.dma_context, item.sqe_image, item.dependency_mapping,
+          item.dependency_offset, item.dependency_image,
+          item.image_digest, item.authority_digest
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = (status == null) ? rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ item digest returned null status"
+          ) : copy_submit_status_direct(status, "cmq_item_digest_status");
+          transaction_failed = 1'b1;
+          break;
+        end
+        status = rdma_cmq_classify_recovery_required(
+          item.state, item.completion_phase, item.submission_effect,
+          item.reset_isolation_confirmed,
+          item.recovery_owner.is_legacy_unmigrated(), classified_recovery
+        );
+        if (status == null || !status.ok()) begin
+          transaction_status = (status == null) ? rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ pending recovery classifier returned null status"
+          ) : copy_submit_status_direct(
+            status, "cmq_pending_recovery_status"
+          );
+          transaction_failed = 1'b1;
+          break;
+        end
+        item.recovery_required = classified_recovery;
+        request_indices.push_back(item.request_index);
+        image_digests.push_back(item.image_digest);
+        authority_digests.push_back(item.authority_digest);
+      end
+    end
+    if (!transaction_failed) begin
+      status = rdma_cmq_compute_batch_digest(
+        record_candidate.function_identity, record_candidate.binding,
+        record_candidate.cmq_h, record_candidate.doorbell_image,
+        record_candidate.final_pi, record_candidate.final_polarity,
+        record_candidate.start_sequence, record_candidate.end_sequence,
+        request_indices, image_digests, authority_digests,
+        record_candidate.batch_digest
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE, "CMQ batch digest returned null status"
+        ) : copy_submit_status_direct(status, "cmq_batch_digest_status");
+        transaction_failed = 1'b1;
+      end
+    end
+  endfunction
+
+  // 功能：提交输入对齐的 observed CMQ batch，在 transport 前安装完整 journal、
+  //   ticket index、preallocation、profile 与 authentic MMIO observer 图。
+  // 输入/输出及副作用：commands 为调用方输入；results 与 commands 等长同序，
+  //   batch_status 只描述 orchestration；成功 admission 可能写 Host-memory/MMIO，
+  //   并由 observer 或同步返回更新 engine-owned journal/fence/runtime；压缩后的
+  //   非空候选先经同锁 image/descriptor 阶段，再于 ID 分配后借用 journal
+  //   helper 冻结 owner 并计算摘要；失败 status 仍由本 task 集中回填。
+  // 失败/边界：空 batch 在取锁前无条件返回 OK；准入及 ID 分配之前的 staging
+  //   拒绝不分配 ID 或调用 transport；身份分配后失败可能留下单调 counter 空洞，
+  //   但不安装部分 journal；
+  //   encoder 改写 detached handle 优先于 null/失败状态，source 与 snapshot
+  //   metadata 先于 deadline；首个过期 ticket 先于 descriptor factory/clone
+  //   拒绝，任一步失败均阻止 ID 分配；
+  //   PRE effect 原子回滚，Host 可见、UNOBSERVED 或已 arm 结果保留恢复 authority；
+  //   malformed status/effect 分别降级且不覆盖另一字段中仍有效的操作或副作用证据；
+  //   legacy recovery owner 即使 dependency 可重放也不授予 automatic publication retry。
+  task submit_batch_observed(
+    input rdma_cmq_command_desc commands[],
+    output rdma_cmq_execution_result results[],
+    output rdma_status batch_status
+  );
+    rdma_cmq_batch_submission_record record_candidate;
+    rdma_cmq_batch_submission_record retained_record;
+    rdma_cmq_preallocated_publish_batch preallocated_candidate;
+    rdma_cmq_submit_candidate_stage_t candidate_stage;
+    rdma_cmq_mmio_arm_observer observer;
+    rdma_doorbell_desc doorbell_snapshot_desc;
+    rdma_doorbell_submission_result transport_result;
+    rdma_cmq_submit_transport_decision_t evidence;
+    rdma_cmq_submit_transport_decision_t decision;
+    rdma_function_binding journal_binding;
+    rdma_function_identity journal_identity;
+    rdma_function_handle active_function;
+    rdma_handle journal_cmq_h;
+    rdma_hw_image doorbell_snapshot;
+    bit local_result_finalized[];
+    rdma_status status;
+    rdma_status transaction_status;
+    rdma_status_code_e observation_code;
+    longint unsigned batch_id;
+    longint unsigned attempt_id;
+    longint unsigned final_sequence;
+    longint unsigned used;
+    int unsigned final_pi;
+    bit final_polarity;
+    bit transaction_failed;
+    bit observer_armed;
+    bit retry_safe;
+    string batch_key;
+    string capability_key;
+    string observation_message;
+
+    results = new[commands.size()];
+    batch_status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ observed batch did not complete"
+    );
+    if (commands.size() == 0) begin
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      return;
+    end
+
+    local_result_finalized = new[commands.size()];
+    foreach (results[i]) begin
+      results[i] = new_submit_result_direct(
+        $sformatf("cmq_observed_result_%0d", i)
+      );
+      local_result_finalized[i] = 1'b0;
+    end
+
+    transaction_failed = 1'b0;
+    transaction_status = null;
+    candidate_stage.staged_profile_format_valid = 1'b0;
+    candidate_stage.staged_profile_endian = RDMA_ENDIAN_LITTLE;
+    candidate_stage.staged_profile_hardware_version = 0;
+    candidate_stage.dependencies.delete();
+
+    engine_lock.get(1);
+    if (!admit_observed_batch_locked(
+          results, batch_status, active_function, used
+        )) begin
+      engine_lock.put(1);
+      return;
+    end
+    status = prepared_binding.snapshot_complete_nonfatal(journal_binding);
+    if (status == null || !status.ok() || journal_binding == null) begin
+      transaction_status = (status == null) ? rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ journal binding snapshot returned null status"
+      ) : copy_submit_status_direct(status, "cmq_binding_snapshot_status");
+      transaction_failed = 1'b1;
+    end
+    if (!transaction_failed) begin
+      status = journal_binding.snapshot_identity_nonfatal(journal_identity);
+      if (status == null || !status.ok() || journal_identity == null) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal Function identity snapshot returned null status"
+        ) : copy_submit_status_direct(
+          status, "cmq_identity_snapshot_status"
+        );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed &&
+        !rdma_cmq_try_snapshot_handle_direct(
+          cmq_snapshot.handle, 1'b0, journal_cmq_h
+        )) begin
+      transaction_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ journal handle snapshot failed"
+      );
+      transaction_failed = 1'b1;
+    end
+
+    record_candidate = new("cmq_submission_record_candidate");
+    preallocated_candidate = new("cmq_publish_batch_candidate");
+    if (!transaction_failed) begin
+      record_candidate.engine_instance_id = engine_instance_id;
+      record_candidate.engine_incarnation = engine_incarnation;
+      record_candidate.function_identity = journal_identity;
+      record_candidate.binding = journal_binding;
+      record_candidate.cmq_h = journal_cmq_h;
+      record_candidate.start_sequence = publish_seq;
+      record_candidate.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+      record_candidate.submission_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      record_candidate.attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      record_candidate.observer_armed = 1'b0;
+      record_candidate.publication_retry_safe = 1'b0;
+      candidate_stage.staged_profile_format_valid =
+        profile_image_format_valid;
+      candidate_stage.staged_profile_endian = profile_image_endian;
+      candidate_stage.staged_profile_hardware_version =
+        profile_hardware_version;
+    end
+
+    // 设计说明：两个 candidate 句柄只借给锁内逐项阶段；status/failed 回传到
+    //   原 task，才能沿用其唯一失败回填点。依赖队列和 profile 格式留在调用期
+    //   context 供 doorbell/预分配安装读取，所有 ID 仍在这一步之后分配。
+    if (!transaction_failed) begin
+      candidate_stage.record_candidate = record_candidate;
+      candidate_stage.preallocated_candidate = preallocated_candidate;
+      candidate_stage.transaction_status = transaction_status;
+      candidate_stage.transaction_failed = transaction_failed;
+      stage_observed_candidates_locked(
+        commands, active_function, used, results, local_result_finalized,
+        candidate_stage
+      );
+      transaction_status = candidate_stage.transaction_status;
+      transaction_failed = candidate_stage.transaction_failed;
+    end
+
+    if (!transaction_failed && record_candidate.items.size() == 0) begin
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      engine_lock.put(1);
+      return;
+    end
+
+    // 设计说明：all-local 快路已在上方结束；只有成功压缩出的候选才借用
+    //   原锁调用 image 阶段。失败状态回到原 task 的唯一 fanout 点，所有
+    //   deadline、ID 和安装步骤仍在 helper 返回之后执行。
+    if (!transaction_failed) begin
+      stage_observed_doorbell_image_locked(
+        record_candidate.items.size(), final_sequence, final_pi,
+        final_polarity, doorbell_snapshot, transaction_status,
+        transaction_failed
+      );
+    end
+
+    // 设计说明：image 阶段即使已失败，仍调用一次 pre-ID helper 清空暂存
+    //   descriptor 输出；它只在 transaction_failed 为 0 时访问 record ticket
+    //   或 factory。锁和统一 failure fanout 继续由当前 task 持有。
+    stage_observed_doorbell_descriptor_locked(
+      record_candidate, active_function, doorbell_snapshot,
+      candidate_stage.dependencies, doorbell_snapshot_desc,
+      transaction_status, transaction_failed
+    );
+
+    if (!transaction_failed) begin
+      status = allocate_batch_identity_locked(
+        record_candidate.function_identity, batch_key, batch_id
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_batch_identity_status"
+        );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed) begin
+      status = allocate_attempt_id_locked(attempt_id);
+      if (status == null || !status.ok()) begin
+        transaction_status = copy_submit_status_direct(
+          status, "cmq_attempt_identity_status"
+        );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed) begin
+      record_candidate.batch_key = batch_key;
+      record_candidate.batch_id = batch_id;
+      record_candidate.attempt_id = attempt_id;
+      record_candidate.end_sequence = final_sequence;
+      record_candidate.doorbell_image = doorbell_snapshot;
+      record_candidate.final_pi = final_pi;
+      record_candidate.final_polarity = final_polarity;
+      preallocated_candidate.batch_key = batch_key;
+      preallocated_candidate.attempt_id = attempt_id;
+      preallocated_candidate.final_sequence = final_sequence;
+      preallocated_candidate.profile_format_valid =
+        candidate_stage.staged_profile_format_valid;
+      preallocated_candidate.profile_endian =
+        candidate_stage.staged_profile_endian;
+      preallocated_candidate.profile_hardware_version =
+        candidate_stage.staged_profile_hardware_version;
+
+      // 借用尚未安装的局部图完成冻结和摘要；失败仍由下方唯一 fanout
+      // 回填，已分配身份不回拨，observer/journal 安装必须等待阶段成功。
+      finalize_observed_journal_candidate_locked(
+        record_candidate, preallocated_candidate, transaction_status,
+        transaction_failed
+      );
+    end
+
+    observer = null;
+    capability_key = "";
+    if (!transaction_failed) begin
+      capability_key = $sformatf(
+        "%s|attempt=%016h", batch_key, attempt_id
+      );
+      observer = new("cmq_submission_mmio_observer");
+      status = observer.configure(
+        this, capability_key, batch_key, attempt_id, engine_incarnation
+      );
+      if (status == null || !status.ok() ||
+          arm_observers.exists(capability_key)) begin
+        transaction_status = (status == null || status.ok()) ?
+          rdma_cmq_direct_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ MMIO observer construction or key collision failed"
+          ) : copy_submit_status_direct(
+            status, "cmq_observer_configure_status"
+          );
+        transaction_failed = 1'b1;
+      end
+    end
+    if (!transaction_failed) begin
+      status = install_submission_journal_locked(
+        record_candidate, preallocated_candidate
+      );
+      if (status == null || !status.ok()) begin
+        transaction_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ journal installation returned null status"
+        ) : copy_submit_status_direct(
+          status, "cmq_journal_installation_status"
+        );
         transaction_failed = 1'b1;
       end
     end
 
     if (transaction_failed) begin
       if (transaction_status == null)
-        transaction_status = invalid_state(
+        transaction_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
           "CMQ batch transaction failed without a status"
         );
-      foreach (tentative_token_reserved[token_index])
-        tentative_token_reserved[token_index] = 1'b0;
-      foreach (tickets[item_index]) begin
-        tickets[item_index] = null;
-        if (!preserve_item_status[item_index])
-          item_statuses[item_index] =
-            rdma_cmq_clone_status_value(transaction_status);
+      foreach (results[i]) begin
+        if (!local_result_finalized[i])
+          results[i].status = copy_submit_status_direct(
+            transaction_status,
+            $sformatf("cmq_transaction_failure_item_%0d", i)
+          );
       end
-      batch_status = rdma_cmq_clone_status_value(transaction_status);
+      batch_status = copy_submit_status_direct(
+        transaction_status, "cmq_transaction_failure_batch"
+      );
       engine_lock.put(1);
       return;
     end
 
-    for (int unsigned success_index = 0;
-         success_index < success_count; success_index++) begin
-      int unsigned original_index;
+    arm_observers[capability_key] = observer;
+    fenced_batch_key = batch_key;
+    submission_fence_reason =
+      "CMQ observed submission awaits authentic MMIO classification";
+    retained_record = submission_journal[batch_key];
+    foreach (retained_record.items[i]) begin
       int unsigned token_index;
-      int unsigned slot_index;
-      string published_command_key;
-      string published_entry_key;
 
-      original_index = original_indices[success_index];
-      token_index = tentative_tokens[success_index];
-      slot_index = tentative_records[success_index].sq_index;
-      token_in_use[token_index] = 1'b1;
-      slots[slot_index] = tentative_records[success_index];
-      published_command_key = command_key(slots[slot_index].ticket);
-      published_entry_key = entry_key(
-        slot_index, slots[slot_index].sq_wrap
-      );
-      command_registry[published_command_key] = slots[slot_index];
-      entry_registry[published_entry_key] = slots[slot_index];
-      tickets[original_index] = caller_tickets[success_index];
-      item_statuses[original_index] =
-        tentative_success_statuses[success_index];
-      tentative_token_reserved[token_index] = 1'b0;
+      token_index = retained_record.items[i].command_token;
+      token_incarnation[token_index] =
+        retained_record.items[i].ticket.command_id[63:5];
     end
-    publish_seq = final_sequence;
-    profile_image_format_valid = staged_profile_format_valid;
-    profile_image_endian = staged_profile_endian;
-    profile_hardware_version = staged_profile_hardware_version;
-    batch_status = successful_batch_status;
+
+    transport_result = null;
+    transport.submit_observed(
+      prepared_binding, doorbell_snapshot_desc, observer, transport_result
+    );
+    retained_record = submission_journal[batch_key];
+    observer_armed = retained_record != null &&
+                     retained_record.observer_armed;
+    if (!observer_armed)
+      arm_observers.delete(capability_key);
+
+    // 设计说明：decode 只发布局部证据；先消费未经 arm 的 PRE rollback，
+    //   再扫描 retained owner 和分类非 PRE effect。transport 与提交仍持有同一锁。
+    decode_observed_transport_evidence(
+      transport_result, observer_armed, evidence
+    );
+    if (evidence.rollback_pre) begin
+      foreach (retained_record.items[i]) begin
+        int unsigned request_index;
+
+        request_index = retained_record.items[i].request_index;
+        results[request_index].status = copy_submit_status_direct(
+          evidence.operation_status,
+          $sformatf("cmq_pre_rejected_item_%0d", request_index)
+        );
+        results[request_index].observation_status = rdma_cmq_direct_status(
+          evidence.observation_code, evidence.observation_message
+        );
+        results[request_index].submission_effect =
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+        results[request_index].attempt_effect =
+          RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+        results[request_index].completion_phase =
+          RDMA_CMQ_COMPLETION_NONE;
+        results[request_index].recovery_required = 1'b0;
+      end
+      status = remove_submission_journal_locked(batch_key);
+      if (status == null || !status.ok()) begin
+        batch_status = (status == null) ? rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ PRE rollback returned null status"
+        ) : copy_submit_status_direct(status, "cmq_pre_rollback_status");
+        engine_lock.put(1);
+        return;
+      end
+      batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
+      engine_lock.put(1);
+      return;
+    end
+
+    retry_safe = 1'b1;
+    // 设计说明：dependency replayability 只证明数据可重放，不能替代恢复 authority；
+    // journal 安装已验证 owner 完整 shape，因此这里的 LEGACY_UNMIGRATED workflow
+    // 必然是精确 sentinel；它保留人工 reconciliation 兼容性但没有自动 retry 授权。
+    foreach (retained_record.items[i]) begin
+      rdma_cmq_batch_submission_item_record retry_item;
+
+      retry_item = retained_record.items[i];
+      if (retry_item == null || !retry_item.dependency_replay_safe)
+        retry_safe = 1'b0;
+      if (retry_item == null || retry_item.recovery_owner == null)
+        retry_safe = 1'b0;
+      else if (retry_item.recovery_owner.workflow ===
+               RDMA_CMQ_WORKFLOW_LEGACY_UNMIGRATED)
+        retry_safe = 1'b0;
+    end
+    classify_observed_transport_effect(
+      observer_armed, retry_safe, evidence, decision
+    );
+
+    // 设计说明：分类阶段不持有 mutable journal；此处仍在原临界区的唯一
+    //   retained batch 提交点一次写入状态与 effect，随后才逐项生成结果。
+    observation_code = decision.observation_code;
+    observation_message = decision.observation_message;
+    retained_record.state = decision.state;
+    retained_record.publication_retry_safe =
+      decision.publication_retry_safe;
+    retained_record.submission_effect = decision.cumulative_effect;
+    retained_record.attempt_effect = decision.attempt_effect;
+
+    foreach (retained_record.items[i]) begin
+      rdma_cmq_batch_submission_item_record item;
+      rdma_cmq_execution_result detached_result;
+      bit classified_recovery;
+      int unsigned request_index;
+
+      item = retained_record.items[i];
+      item.state = retained_record.state;
+      item.submission_effect = retained_record.submission_effect;
+      item.attempt_effect = retained_record.attempt_effect;
+      item.completion_phase = observer_armed ?
+        RDMA_CMQ_COMPLETION_PENDING : RDMA_CMQ_COMPLETION_NONE;
+      item.status = copy_submit_status_direct(
+        decision.operation_status, $sformatf("cmq_journal_operation_%0d", i)
+      );
+      status = rdma_cmq_classify_recovery_required(
+        item.state, item.completion_phase, item.submission_effect,
+        item.reset_isolation_confirmed,
+        item.recovery_owner.is_legacy_unmigrated(), classified_recovery
+      );
+      if (status == null || !status.ok()) begin
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message = (status == null) ?
+          "CMQ retained recovery classifier returned null status" :
+          status.message;
+        item.recovery_required = 1'b1;
+      end
+      else begin
+        item.recovery_required = classified_recovery;
+      end
+      request_index = item.request_index;
+      status = build_observed_result_locked(
+        retained_record, item, observation_code, observation_message,
+        detached_result
+      );
+      if (status == null || !status.ok() || detached_result == null) begin
+        detached_result = new_submit_result_direct(
+          $sformatf("cmq_observed_fallback_%0d", request_index)
+        );
+        detached_result.status = copy_submit_status_direct(
+          item.status, $sformatf("cmq_observed_fallback_status_%0d", i)
+        );
+        detached_result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed result snapshot failed"
+        );
+        detached_result.submission_effect = item.submission_effect;
+        detached_result.attempt_effect = item.attempt_effect;
+        detached_result.completion_phase = item.completion_phase;
+        detached_result.batch_key = retained_record.batch_key;
+        detached_result.batch_id = retained_record.batch_id;
+        detached_result.attempt_id = retained_record.attempt_id;
+        detached_result.recovery_required = 1'b1;
+      end
+      results[request_index] = detached_result;
+    end
+    batch_status = rdma_cmq_direct_status(RDMA_SC_OK);
     engine_lock.put(1);
+  endtask
+
+  // 设计说明：locate/对齐、结果暂存和 stale/action 检查已经完成；本阶段
+  //   先让 request 图自证，再让 retained journal 图独立自证，最后比较两图
+  //   完整值。carried digest 不能替代源值重算，也不能替代完整值认证。
+  // 功能：按固定优先级认证 recovery request 与 retained journal 的逐项和
+  //   批次 authority，返回首个重算、carried digest 或跨图完整值失败。
+  // 输入/输出及副作用：request/record/profile_service 借用调用方锁内已定位的
+  //   图和 retained exact profile；摘要队列与计算结果只在函数内存活。返回
+  //   journal_status，不保存输入句柄、不主动改写两图或 engine 账本；
+  //   canonicalization 仍调用原 profile seam，其既有对象分配/测试计数行为不变。
+  // 失败/边界：调用方须已验证两图 item 数量/顺序、ticket 和 Function identity。
+  //   request item/batch 重算及 carried 检查先于 journal 对应步骤，随后才做
+  //   item/batch 完整值比较；每步首错立即返回，保留 null/非 OK 的原诊断。
+  //   不检查 action 授权或 reset proof，不取放锁、不提交 CAS、observer 或 I/O；
+  //   失败结果的对齐回填和解锁仍由原 recovery task 唯一负责。
+  protected function automatic rdma_status authenticate_recovery_graphs_locked(
+    input rdma_cmq_submission_recovery_request request,
+    input rdma_cmq_batch_submission_record record,
+    input rdma_cmq_hw_profile profile_service
+  );
+    int unsigned request_indices[$];
+    int unsigned journal_indices[$];
+    rdma_cmq_journal_digest_t request_image_digests[$];
+    rdma_cmq_journal_digest_t request_authority_digests[$];
+    rdma_cmq_journal_digest_t journal_image_digests[$];
+    rdma_cmq_journal_digest_t journal_authority_digests[$];
+    rdma_cmq_journal_digest_t request_batch_digest;
+    rdma_cmq_journal_digest_t journal_batch_digest;
+    rdma_status nested_status;
+    rdma_status status;
+
+    // request 图的每个 body 和 digest 仅从 request-owned 值重算；在所有 item
+    // 与 batch 重算完成前不读取 journal carried digest 作为可信输入。
+    foreach (request.items[i]) begin
+      string body_tag;
+      byte unsigned body_bytes[];
+      rdma_cmq_journal_digest_t image_digest;
+      rdma_cmq_journal_digest_t authority_digest;
+
+      nested_status = canonicalize_journal_body(
+        profile_service, request.items[i].command,
+        request.items[i].sqe_image, body_tag, body_bytes
+      );
+      if (nested_status != null && nested_status.ok())
+        nested_status = rdma_cmq_compute_item_digests(
+          request.items[i].command, body_tag, body_bytes,
+          request.items[i].ticket, request.items[i].recovery_owner,
+          request.expected_function_identity, request.items[i].dma_context,
+          request.items[i].sqe_image,
+          request.items[i].dependency_mapping,
+          request.items[i].dependency_offset,
+          request.items[i].dependency_image, image_digest, authority_digest
+        );
+      if (nested_status == null || !nested_status.ok()) begin
+        status = (nested_status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery request item recomputation returned null status"
+        ) : journal_status(nested_status.code, nested_status.message);
+        return status;
+      end
+      request_indices.push_back(request.items[i].request_index);
+      request_image_digests.push_back(image_digest);
+      request_authority_digests.push_back(authority_digest);
+    end
+    nested_status = rdma_cmq_compute_batch_digest(
+      request.expected_function_identity, request.binding, request.cmq_h,
+      request.doorbell_image, request.final_pi, request.final_polarity,
+      request.start_sequence, request.end_sequence, request_indices,
+      request_image_digests, request_authority_digests,
+      request_batch_digest
+    );
+    if (nested_status == null || !nested_status.ok()) begin
+      status = (nested_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery request batch recomputation returned null status"
+      ) : journal_status(nested_status.code, nested_status.message);
+      return status;
+    end
+    foreach (request.items[i]) begin
+      if (request.items[i].image_digest !== request_image_digests[i] ||
+          request.items[i].authority_digest !==
+            request_authority_digests[i]) begin
+        status = journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery request item carried digest is inconsistent"
+        );
+        return status;
+      end
+    end
+    if (request.batch_digest !== request_batch_digest) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request carried batch digest is inconsistent"
+      );
+      return status;
+    end
+
+    // journal 图使用 retained exact profile 从 journal-owned 值独立重算；只有其
+    // carried digest 自证后，才与 request recomputation 和完整值逐项比较。
+    foreach (record.items[i]) begin
+      string body_tag;
+      byte unsigned body_bytes[];
+      rdma_cmq_journal_digest_t image_digest;
+      rdma_cmq_journal_digest_t authority_digest;
+
+      nested_status = canonicalize_journal_body(
+        profile_service, record.items[i].command,
+        record.items[i].sqe_image, body_tag, body_bytes
+      );
+      if (nested_status != null && nested_status.ok())
+        nested_status = rdma_cmq_compute_item_digests(
+          record.items[i].command, body_tag, body_bytes,
+          record.items[i].ticket, record.items[i].recovery_owner,
+          record.function_identity, record.items[i].dma_context,
+          record.items[i].sqe_image, record.items[i].dependency_mapping,
+          record.items[i].dependency_offset,
+          record.items[i].dependency_image, image_digest, authority_digest
+        );
+      if (nested_status == null || !nested_status.ok()) begin
+        status = (nested_status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery journal item recomputation returned null status"
+        ) : journal_status(nested_status.code, nested_status.message);
+        return status;
+      end
+      journal_indices.push_back(record.items[i].request_index);
+      journal_image_digests.push_back(image_digest);
+      journal_authority_digests.push_back(authority_digest);
+    end
+    nested_status = rdma_cmq_compute_batch_digest(
+      record.function_identity, record.binding, record.cmq_h,
+      record.doorbell_image, record.final_pi, record.final_polarity,
+      record.start_sequence, record.end_sequence, journal_indices,
+      journal_image_digests, journal_authority_digests,
+      journal_batch_digest
+    );
+    if (nested_status == null || !nested_status.ok()) begin
+      status = (nested_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery journal batch recomputation returned null status"
+      ) : journal_status(nested_status.code, nested_status.message);
+      return status;
+    end
+    foreach (record.items[i]) begin
+      if (record.items[i].image_digest !== journal_image_digests[i] ||
+          record.items[i].authority_digest !==
+            journal_authority_digests[i]) begin
+        status = journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery journal item carried digest is inconsistent"
+        );
+        return status;
+      end
+    end
+    if (record.batch_digest !== journal_batch_digest) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery journal carried batch digest is inconsistent"
+      );
+      return status;
+    end
+
+    foreach (request.items[i]) begin
+      nested_status = validate_recovery_item_match_locked(
+        request.items[i], record.items[i], request_image_digests[i],
+        request_authority_digests[i], journal_image_digests[i],
+        journal_authority_digests[i]
+      );
+      if (nested_status == null || !nested_status.ok()) begin
+        status = (nested_status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery item full-value comparison returned null status"
+        ) : journal_status(nested_status.code, nested_status.message);
+        return status;
+      end
+    end
+    nested_status = validate_recovery_batch_match_locked(
+      request, record, request_batch_digest, journal_batch_digest
+    );
+    if (nested_status == null || !nested_status.ok()) begin
+      status = (nested_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery batch full-value comparison returned null status"
+      ) : journal_status(nested_status.code, nested_status.message);
+      return status;
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 设计说明：CONFIRM 在双图与 owner 授权之后只借用 retained 行做只读重验；
+  //   journal/lifecycle、READY、双份 proof 自证与全值、proof-to-row binding
+  //   必须按此顺序完成。最终 attempt 重验和 confirmation 提交仍由入口 task 负责。
+  // 功能：验证 reset confirmation 的未解决 concrete owner、RESET_CANCELLED
+  //   生命周期和 engine-minted READY proof 对同一 retained batch 的完整授权。
+  // 输入/输出及副作用：request、record、profile_service 为持锁调用方已完成
+  //   双图认证的非拥有句柄；仅返回首个 status，两个 proof digest 为局部暂存。
+  //   保留 profile/校验 seam 的既有调用，不改写输入图，不管理锁、results 或 I/O。
+  // 失败/边界：journal 无效、batch/item 非隔离终态、没有未解决 concrete owner、
+  //   proof 缺失/非 READY 为 INVALID_STATE；digest/完整值不符为 INVALID_ARGUMENT，
+  //   digest 或 binding 校验失败保留原 code/message；null status 按原边界映射。
+  //   不独立做 locate/action/owner 准入，也不替代调用方提交前的 attempt 重验。
+  protected function automatic rdma_status validate_reset_confirmation_locked(
+    input rdma_cmq_submission_recovery_request request,
+    input rdma_cmq_batch_submission_record record,
+    input rdma_cmq_hw_profile profile_service
+  );
+    rdma_cmq_journal_digest_t request_proof_digest;
+    rdma_cmq_journal_digest_t journal_proof_digest;
+    rdma_status nested_status;
+    rdma_status status;
+
+    nested_status = validate_submission_record_locked(
+      record, profile_service, 1'b0
+    );
+    if (nested_status == null || !nested_status.ok()) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        (nested_status == null) ?
+          "CMQ reset confirmation journal validation returned null" :
+          {"CMQ reset confirmation journal is invalid: ",
+           nested_status.message}
+      );
+      return status;
+    end
+    if (record.state != RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ reset confirmation requires a quarantined batch"
+      );
+      return status;
+    end
+    begin
+      bit concrete_pending;
+
+      concrete_pending = 1'b0;
+      foreach (record.items[i]) begin
+        if (record.items[i].recovery_owner.is_legacy_unmigrated() ||
+            record.items[i].reset_isolation_confirmed ||
+            !record.items[i].recovery_required)
+          continue;
+        if (record.items[i].state !=
+              RDMA_CMQ_SUBMISSION_RESET_QUARANTINED ||
+            record.items[i].completion_phase !=
+              RDMA_CMQ_COMPLETION_RESET_CANCELLED) begin
+          status = journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ reset confirmation item lifecycle is not unresolved"
+          );
+          return status;
+        end
+        concrete_pending = 1'b1;
+      end
+      if (!concrete_pending) begin
+        status = journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ reset confirmation has no unresolved concrete owner"
+        );
+        return status;
+      end
+    end
+    if (request.reset_isolation_proof == null ||
+        record.reset_isolation_proof == null ||
+        record.reset_isolation_proof.state !=
+          RDMA_CMQ_RESET_PROOF_READY ||
+        request.reset_isolation_proof.state !=
+          RDMA_CMQ_RESET_PROOF_READY) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ reset isolation proof is absent or not READY"
+      );
+      return status;
+    end
+    nested_status = rdma_cmq_compute_reset_proof_digest(
+      request.reset_isolation_proof.proof_key,
+      request.reset_isolation_proof.proof_id,
+      request.reset_isolation_proof.batch_key,
+      request.reset_isolation_proof.batch_id,
+      request.reset_isolation_proof.attempt_id,
+      request.reset_isolation_proof.engine_instance_id,
+      request.reset_isolation_proof.engine_incarnation,
+      request.reset_isolation_proof.isolated_identity,
+      request.reset_isolation_proof.batch_digest,
+      request.reset_isolation_proof.isolated_request_indices,
+      request.reset_isolation_proof.isolated_image_digests,
+      request.reset_isolation_proof.isolated_authority_digests,
+      request.reset_isolation_proof.isolated_recovery_owners,
+      request_proof_digest
+    );
+    if (nested_status != null && nested_status.ok())
+      nested_status = rdma_cmq_compute_reset_proof_digest(
+        record.reset_isolation_proof.proof_key,
+        record.reset_isolation_proof.proof_id,
+        record.reset_isolation_proof.batch_key,
+        record.reset_isolation_proof.batch_id,
+        record.reset_isolation_proof.attempt_id,
+        record.reset_isolation_proof.engine_instance_id,
+        record.reset_isolation_proof.engine_incarnation,
+        record.reset_isolation_proof.isolated_identity,
+        record.reset_isolation_proof.batch_digest,
+        record.reset_isolation_proof.isolated_request_indices,
+        record.reset_isolation_proof.isolated_image_digests,
+        record.reset_isolation_proof.isolated_authority_digests,
+        record.reset_isolation_proof.isolated_recovery_owners,
+        journal_proof_digest
+      );
+    if (nested_status == null || !nested_status.ok() ||
+        request.reset_isolation_proof.proof_digest !==
+          request_proof_digest ||
+        record.reset_isolation_proof.proof_digest !==
+          journal_proof_digest ||
+        request_proof_digest !== journal_proof_digest ||
+        request.reset_isolation_proof.batch_digest !==
+          request.batch_digest ||
+        !same_reset_isolation_proof_value(
+          request.reset_isolation_proof,
+          record.reset_isolation_proof
+        )) begin
+      status = (nested_status == null || nested_status.ok()) ?
+        journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ reset isolation proof authority does not match"
+        ) : journal_status(nested_status.code, nested_status.message);
+      return status;
+    end
+    nested_status = validate_reset_isolation_proof_binding_locked(
+      record.reset_isolation_proof, record
+    );
+    if (nested_status == null || !nested_status.ok()) begin
+      status = (nested_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ reset proof binding validation returned null status"
+      ) : journal_status(nested_status.code, nested_status.message);
+      return status;
+    end
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 设计说明：RETRY 的 live authority 与 preallocation 是唯一能证明 retained
+  //   journal 仍可被当前 engine 重放的 admission 层；它必须在 candidate、observer
+  //   和 transport staging 之前完成，并且不能把任何可变账本提前推进到 CAS 之外。
+  // 功能：在 engine_lock 内按旧顺序认证 RETRY 的 engine/binding/CMQ authority、
+  //   journal lifecycle、live/item mapping、fence、stale observer 以及 preallocated
+  //   row 和 slot/token/command/entry registry，返回是否准入并输出 retained row。
+  // 输入/输出及副作用：request、record、profile_service 是持锁调用方借用的图；
+  //   preallocated 成功时指向 preallocated_publish_batches 的 retained row，status
+  //   返回原拒绝 code/message（包括 OK+null mapping 的旧边界）。函数只调用 mapping
+  //   authority seam，不取放锁、不修改 counter/ledger、不构造 descriptor/observer。
+  // 失败/边界：任一 live authority、retryable lifecycle、mapping/replay、fence、
+  //   stale observer、preallocation 或 runtime registry 条件失败都返回 0；mapping
+  //   seam 返回非空 OK 但没有输出 mapping 时仍拒绝，且保留旧 status 为 OK 的契约。
+  //   preallocated 冲突先于 attempt overflow 检查；成功只表示 admission 完成，最终
+  //   expected-attempt 重验和唯一 CAS 仍由 recover_submission_observed 负责。
+  protected function automatic bit admit_retry_live_authority_locked(
+    input rdma_cmq_submission_recovery_request request,
+    input rdma_cmq_batch_submission_record record,
+    input rdma_cmq_hw_profile profile_service,
+    output rdma_cmq_preallocated_publish_batch preallocated,
+    output rdma_status status
+  );
+    rdma_dma_mapping live_mapping_authority;
+    rdma_status nested_status;
+
+    preallocated = null;
+    status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ recovery RETRY admission did not complete"
+    );
+    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE || prepared_binding == null ||
+        dma_context == null || cmq_snapshot == null ||
+        backing_mapping == null || transport == null || profile == null ||
+        !same_journal_binding_value(prepared_binding, record.binding) ||
+        !same_handle(cmq_snapshot.handle, record.cmq_h)) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery live Function or CMQ authority drifted"
+      );
+      return 1'b0;
+    end
+    nested_status = validate_submission_record_locked(
+      record, profile_service, 1'b0
+    );
+    if (nested_status == null || !nested_status.ok() ||
+        record.state !=
+          RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED ||
+        record.observer_armed || !record.publication_retry_safe ||
+        !(record.submission_effect inside {
+          RDMA_SUBMIT_EFFECT_UNOBSERVED,
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+          RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+        })) begin
+      status = (nested_status == null || nested_status.ok()) ?
+        journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery journal lifecycle is not retryable"
+        ) : journal_status(nested_status.code, nested_status.message);
+      return 1'b0;
+    end
+    nested_status = mapping_authority_status(backing_mapping, dma_context);
+    if (nested_status != null && nested_status.ok())
+      nested_status = backing_mapping.snapshot_release_authority(
+        live_mapping_authority
+      );
+    if (nested_status != null && nested_status.ok() &&
+        live_mapping_authority != null)
+      nested_status = backing_mapping.release_authority_status(
+        live_mapping_authority
+      );
+    if (nested_status == null || !nested_status.ok() ||
+        live_mapping_authority == null) begin
+      status = (nested_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery live mapping authority returned null status"
+      ) : journal_status(nested_status.code, nested_status.message);
+      return 1'b0;
+    end
+    foreach (record.items[i]) begin
+      if (record.items[i].state != record.state ||
+          record.items[i].submission_effect != record.submission_effect ||
+          record.items[i].completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          record.items[i].reset_isolation_confirmed ||
+          !record.items[i].recovery_required ||
+          !record.items[i].dependency_replay_safe ||
+          !same_journal_mapping_public_value(
+            backing_mapping, record.items[i].dependency_mapping
+          ) || !same_journal_mapping_public_value(
+            backing_mapping, request.items[i].dependency_mapping
+          )) begin
+        status = journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery item mapping or replay authority is invalid"
+        );
+        return 1'b0;
+      end
+      nested_status = backing_mapping.release_authority_status(
+        request.items[i].dependency_mapping
+      );
+      if (nested_status != null && nested_status.ok())
+        nested_status = backing_mapping.release_authority_status(
+          record.items[i].dependency_mapping
+        );
+      if (nested_status == null || !nested_status.ok()) begin
+        status = (nested_status == null) ? journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery item opaque mapping check returned null status"
+        ) : journal_status(nested_status.code, nested_status.message);
+        return 1'b0;
+      end
+    end
+    if (fenced_batch_key != record.batch_key ||
+        submission_fence_reason.len() == 0) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery batch does not own the active submission fence"
+      );
+      return 1'b0;
+    end
+    foreach (arm_observers[registered_key]) begin
+      if (arm_observers[registered_key] == null ||
+          arm_observers[registered_key].get_batch_key() == record.batch_key) begin
+        status = journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery found a stale MMIO observer capability"
+        );
+        return 1'b0;
+      end
+    end
+    if (!preallocated_publish_batches.exists(record.batch_key)) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery preallocated publication row is missing"
+      );
+      return 1'b0;
+    end
+    preallocated = preallocated_publish_batches[record.batch_key];
+    if (preallocated == null ||
+        preallocated.batch_key != record.batch_key ||
+        preallocated.attempt_id != record.attempt_id ||
+        preallocated.final_sequence != record.end_sequence ||
+        preallocated.items.size() != record.items.size() ||
+        record.start_sequence != publish_seq) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery preallocation is inconsistent with the journal"
+      );
+      return 1'b0;
+    end
+    foreach (record.items[i]) begin
+      rdma_cmq_preallocated_publish_item publish_item;
+
+      publish_item = preallocated.items[i];
+      if (publish_item == null || publish_item.slot_record == null ||
+          publish_item.slot_record.expected == null ||
+          publish_item.request_index != record.items[i].request_index ||
+          publish_item.slot_record.ticket != record.items[i].ticket ||
+          publish_item.slot_record.slot_sequence !=
+            record.items[i].slot_sequence ||
+          publish_item.slot_record.sq_index != record.items[i].slot_index ||
+          publish_item.slot_record.sq_wrap != record.items[i].slot_wrap ||
+          publish_item.slot_record.state != CMQ_SLOT_PUBLISHED ||
+          publish_item.slot_record.batch_key != record.batch_key ||
+          publish_item.slot_record.journal_item_index != i ||
+          publish_item.command_token != record.items[i].command_token ||
+          publish_item.command_key != command_key(record.items[i].ticket) ||
+          publish_item.entry_key != record.items[i].entry_key ||
+          record.items[i].slot_index >= CMQ_DEPTH ||
+          slots[record.items[i].slot_index] != null ||
+          token_in_use[record.items[i].command_token] ||
+          command_registry.exists(publish_item.command_key) ||
+          entry_registry.exists(publish_item.entry_key)) begin
+        status = journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery preallocation or runtime registry collides"
+        );
+        return 1'b0;
+      end
+    end
+    status = journal_status(RDMA_SC_OK);
+    return 1'b1;
+  endfunction
+
+  // 设计说明：RETRY candidate staging 将 ticket deadline、dependency descriptor、
+  //   detached doorbell snapshot 和未登记 observer 组成一次 call-local 候选图；
+  //   这些对象只有在原 task 的 expected-attempt 重验之后才允许进入 CAS/registry。
+  // 功能：按 retained record 和 candidate attempt 完成 deadline 校验、依赖队列、
+  //   doorbell descriptor 快照及 observer configure，并将成功候选写入 stage。
+  // 输入/输出及副作用：record 为锁内 retained journal 借用图，candidate_attempt
+  //   为调用方已计算的下一 attempt；stage 输出候选句柄、deadline 和 capability key，
+  //   status 输出原拒绝诊断。函数只创建 call-local candidate，不登记 observer、不
+  //   修改 journal/counter、不取放锁、不调用 transport。
+  // 失败/边界：X/Z、零值或过期 deadline、依赖/descriptor/observer null、嵌套快照
+  //   status 非 OK、observer key collision/configure 失败均返回 0；失败时 stage 不
+  //   对 engine registry 产生可见副作用。成功只代表 staging 完成，最终 stale 重验
+  //   和唯一 CAS 仍由 recover_submission_observed 负责。
+  protected function automatic bit stage_recovery_candidate_locked(
+    input rdma_cmq_batch_submission_record record,
+    input longint unsigned candidate_attempt,
+    output rdma_cmq_recovery_candidate_stage_t stage,
+    output rdma_status status
+  );
+    rdma_doorbell_dependency dependencies[$];
+    rdma_doorbell_desc doorbell_candidate;
+    rdma_doorbell_desc doorbell_snapshot_desc;
+    rdma_cmq_mmio_arm_observer observer;
+    rdma_function_handle descriptor_function_source;
+    rdma_handle descriptor_target;
+    rdma_status nested_status;
+    time minimum_remaining;
+    time remaining;
+    string capability_key;
+
+    stage.dependencies.delete();
+    stage.doorbell_snapshot_desc = null;
+    stage.observer = null;
+    stage.candidate_attempt = candidate_attempt;
+    stage.minimum_remaining = 0;
+    stage.capability_key = "";
+    status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ recovery candidate staging did not complete"
+    );
+
+    minimum_remaining = 0;
+    foreach (record.items[i]) begin
+      if ($isunknown(record.items[i].ticket.absolute_deadline)) begin
+        status = journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery ticket deadline contains X/Z"
+        );
+        return 1'b0;
+      end
+      if (record.items[i].ticket.absolute_deadline == 0 ||
+          record.items[i].ticket.absolute_deadline <= $time) begin
+        status = journal_status(
+          RDMA_SC_TIMEOUT,
+          "CMQ recovery ticket deadline is not strictly in the future"
+        );
+        return 1'b0;
+      end
+      remaining = record.items[i].ticket.absolute_deadline - $time;
+      if (minimum_remaining == 0 || remaining < minimum_remaining)
+        minimum_remaining = remaining;
+    end
+
+    dependencies.delete();
+    foreach (record.items[i]) begin
+      rdma_doorbell_dependency dependency;
+
+      dependency = new($sformatf("cmq_recovery_dependency_%0d", i));
+      dependency.dependency_id = record.items[i].slot_sequence + 1'b1;
+      dependency.stage = RDMA_DB_DEP_QUEUE_CONTEXT;
+      dependency.mapping = record.items[i].dependency_mapping;
+      dependency.relative_offset = record.items[i].dependency_offset;
+      dependency.image = record.items[i].dependency_image;
+      dependency.ready = 1'b1;
+      dependencies.push_back(dependency);
+    end
+    doorbell_candidate = make_recovery_doorbell_locked(
+      "cmq_recovery_doorbell_candidate"
+    );
+    descriptor_function_source = record.binding.make_handle();
+    if (doorbell_candidate == null || descriptor_function_source == null) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery doorbell descriptor construction failed"
+      );
+      return 1'b0;
+    end
+    nested_status = checked_function_snapshot(
+      descriptor_function_source, "CMQ recovery doorbell descriptor",
+      RDMA_SC_INVALID_STATE, doorbell_candidate.function_h
+    );
+    if (nested_status != null && nested_status.ok())
+      nested_status = checked_handle_snapshot(
+        record.cmq_h, "CMQ recovery doorbell descriptor",
+        RDMA_SC_INVALID_STATE, descriptor_target
+      );
+    if (nested_status == null || !nested_status.ok() ||
+        descriptor_target == null) begin
+      status = (nested_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery descriptor nested snapshot returned null status"
+      ) : journal_status(nested_status.code, nested_status.message);
+      return 1'b0;
+    end
+    doorbell_candidate.kind = RDMA_DOORBELL_CMQ_SQ;
+    doorbell_candidate.target_h = descriptor_target;
+    doorbell_candidate.notify_bar_id = record.binding.notify_bar_id;
+    doorbell_candidate.relative_offset =
+      record.doorbell_image.bar_target.value;
+    doorbell_candidate.width = record.doorbell_image.length;
+    doorbell_candidate.endian = record.doorbell_image.endian;
+    doorbell_candidate.payload_image = record.doorbell_image;
+    doorbell_candidate.barrier_policy = RDMA_DB_BARRIER_DMA_MMIO;
+    doorbell_candidate.write_combining_policy =
+      RDMA_DB_WRITE_NON_COMBINING;
+    doorbell_candidate.allow_merge = 1'b0;
+    doorbell_candidate.merge_requested = 1'b0;
+    doorbell_candidate.dependencies = dependencies;
+    doorbell_candidate.timeout = minimum_remaining;
+    doorbell_candidate.readback_policy = RDMA_DB_READBACK_NONE;
+    nested_status = checked_doorbell_desc_snapshot(
+      doorbell_candidate, doorbell_snapshot_desc
+    );
+    if (nested_status == null || !nested_status.ok() ||
+        doorbell_snapshot_desc == null) begin
+      status = (nested_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery descriptor validation returned null status"
+      ) : journal_status(nested_status.code, nested_status.message);
+      return 1'b0;
+    end
+
+    capability_key = $sformatf(
+      "%s|attempt=%016h", record.batch_key, candidate_attempt
+    );
+    observer = make_recovery_observer_locked(
+      "cmq_recovery_mmio_observer"
+    );
+    if (observer == null) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery observer construction failed"
+      );
+      return 1'b0;
+    end
+    nested_status = observer.configure(
+      this, capability_key, record.batch_key, candidate_attempt,
+      engine_incarnation
+    );
+    if (nested_status == null || !nested_status.ok() ||
+        arm_observers.exists(capability_key)) begin
+      status = (nested_status == null || nested_status.ok()) ?
+        journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery observer configuration or key collision failed"
+        ) : journal_status(nested_status.code, nested_status.message);
+      return 1'b0;
+    end
+
+    stage.dependencies = dependencies;
+    stage.doorbell_snapshot_desc = doorbell_snapshot_desc;
+    stage.observer = observer;
+    stage.minimum_remaining = minimum_remaining;
+    stage.capability_key = capability_key;
+    status = journal_status(RDMA_SC_OK);
+    return 1'b1;
+  endfunction
+
+  // 设计说明：恢复入口在同一 engine_lock 临界区内完成 locate、双图重算、完整值
+  //   认证、candidate staging、唯一 CAS 与 transport 调用。这样第二个相同 expected
+  //   attempt 只能在首个调用释放锁后观察新 attempt，并以 stale 结束。
+  // 功能：对 retained fenced submission 执行 RETRY_PUBLISH，或消费 engine-minted
+  //   READY reset proof 完成 CONFIRM_RESET_ISOLATION；CONFIRM 还会重验 retained
+  //   proof-to-row ordered tuple 与 RESET_QUARANTINED/RESET_CANCELLED 生命周期。
+  // 输入/输出及副作用：request 为 detached authority 图；results/status 入口立即
+  //   初始化。RETRY 成功 CAS 后推进一次 attempt、登记 observer 并可能写 Host/MMIO；
+  //   CONFIRM 不分配 attempt、不调用 I/O，只在全部重验后更新 confirmation/recovery bit。
+  //   双图重算和完整值比较借给同锁认证 helper；其首错仍由本 task 对齐回填。
+  //   CONFIRM 的 lifecycle/proof 重验也借给只读 helper，attempt 重验与提交保留在此。
+  // 失败/边界：无法 locate/结构对齐返回空 results；其后 stale、action、digest、
+  //   owner、proof/lifecycle、binding/mapping/fence/deadline/staging/collision 失败返回 aligned results，
+  //   且在唯一 CAS 前不修改 counter、journal、preallocation、observer 或外部 I/O。
+  task recover_submission_observed(
+    input rdma_cmq_submission_recovery_request request,
+    output rdma_cmq_execution_result results[],
+    output rdma_status status
+  );
+    rdma_cmq_batch_submission_record record;
+    rdma_cmq_preallocated_publish_batch preallocated;
+    rdma_cmq_recovery_candidate_stage_t recovery_stage;
+    rdma_cmq_hw_profile profile_service;
+    rdma_doorbell_submission_result transport_result;
+    rdma_status stage_status;
+    rdma_status nested_status;
+    rdma_status operation_status;
+    rdma_status owner_status;
+    rdma_status_code_e observation_code;
+    rdma_submission_effect_e prior_cumulative;
+    rdma_submission_effect_e current_attempt_effect;
+    rdma_submission_effect_e cumulative_effect;
+    rdma_submission_effect_e fold_evidence;
+    longint unsigned candidate_attempt;
+    string observation_message;
+    bit observer_armed;
+    bit retry_safe;
+    bit classified_recovery;
+
+    results = new[0];
+    status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ recovery did not complete"
+    );
+
+    engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
+    if (request == null ||
+        request.get_object_type() !=
+          rdma_cmq_submission_recovery_request::get_type() ||
+        request.batch_key.len() == 0 ||
+        !submission_journal.exists(request.batch_key)) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request does not locate a retained batch"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    record = submission_journal[request.batch_key];
+    if (record == null || record.batch_key != request.batch_key ||
+        request.batch_id == 0 || request.batch_id != record.batch_id ||
+        request.expected_function_identity == null ||
+        record.function_identity == null ||
+        !request.expected_function_identity.same_incarnation(
+          record.function_identity
+        ) || request.items.size() == 0 ||
+        request.items.size() != record.items.size()) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery request does not structurally match the retained batch"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    foreach (request.items[i]) begin
+      if (request.items[i] == null || record.items[i] == null ||
+          request.items[i].ticket == null || record.items[i].ticket == null ||
+          request.items[i].request_index != record.items[i].request_index) begin
+        status = journal_status(
+          RDMA_SC_INVALID_ARGUMENT,
+          "CMQ recovery item cardinality or order does not match"
+        );
+        engine_lock.put(1);
+        return;
+      end
+    end
+
+    stage_status = stage_recovery_results_locked(request, record, results);
+    if (stage_status == null || !stage_status.ok()) begin
+      status = (stage_status == null) ? journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery result staging returned null status"
+      ) : journal_status(stage_status.code, stage_status.message);
+      reject_recovery_results_locked(results, status.code, status.message);
+      engine_lock.put(1);
+      return;
+    end
+    if (request.expected_attempt_id != record.attempt_id) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE, "stale CMQ recovery attempt"
+      );
+      reject_recovery_results_locked(
+        results, status.code, "stale CMQ recovery attempt"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    if ($isunknown(request.action) ||
+        !(request.action inside {RDMA_CMQ_RECOVERY_RETRY_PUBLISH,
+                                 RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION})) begin
+      status = journal_status(
+        RDMA_SC_INVALID_ARGUMENT,
+        "CMQ recovery action is invalid or unsupported"
+      );
+      reject_recovery_results_locked(results, status.code, status.message);
+      engine_lock.put(1);
+      return;
+    end
+    if (!journal_profile_by_batch.exists(record.batch_key) ||
+        journal_profile_by_batch[record.batch_key] == null) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery retained profile authority is missing"
+      );
+      reject_recovery_results_locked(results, status.code, status.message);
+      engine_lock.put(1);
+      return;
+    end
+    profile_service = journal_profile_by_batch[record.batch_key];
+
+    status = authenticate_recovery_graphs_locked(
+      request, record, profile_service
+    );
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = journal_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery graph authentication returned null status"
+        );
+      reject_recovery_results_locked(results, status.code, status.message);
+      engine_lock.put(1);
+      return;
+    end
+
+    foreach (request.items[i]) begin
+      // 设计说明：CONFIRM 跳过已确认或不再需要恢复的项，只认证剩余项的
+      //   frozen owner 与 action 权限；RETRY 不跳过任何项。legacy sentinel
+      //   不提供具体恢复授权，不能用它替代未解决 workflow 的 owner 证据。
+      if (request.action == RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION &&
+          (record.items[i].reset_isolation_confirmed ||
+           !record.items[i].recovery_required))
+        continue;
+      owner_status = record.items[i].recovery_owner.validate_frozen(
+        record.function_identity,
+        record.items[i].recovery_owner.admission_attempt_id
+      );
+      if (owner_status != null && owner_status.ok())
+        owner_status = request.items[i].recovery_owner.validate_frozen(
+          record.function_identity,
+          record.items[i].recovery_owner.admission_attempt_id
+        );
+      if (owner_status == null || !owner_status.ok() ||
+          !record.items[i].recovery_owner.permits(request.action) ||
+          !request.items[i].recovery_owner.permits(request.action)) begin
+        status = (owner_status == null || owner_status.ok()) ?
+          journal_status(
+            RDMA_SC_INVALID_ARGUMENT,
+            "CMQ recovery owner does not authorize this action"
+          ) : journal_status(owner_status.code, owner_status.message);
+        reject_recovery_results_locked(results, status.code, status.message);
+        engine_lock.put(1);
+        return;
+      end
+    end
+
+    if (request.action == RDMA_CMQ_RECOVERY_CONFIRM_RESET_ISOLATION) begin
+      status = validate_reset_confirmation_locked(
+        request, record, profile_service
+      );
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ reset confirmation validation returned null status"
+          );
+        reject_recovery_results_locked(results, status.code, status.message);
+        engine_lock.put(1);
+        return;
+      end
+      if (request.expected_attempt_id != record.attempt_id) begin
+        status = journal_status(
+          RDMA_SC_INVALID_STATE, "stale CMQ recovery attempt"
+        );
+        reject_recovery_results_locked(
+          results, status.code, "stale CMQ recovery attempt"
+        );
+        engine_lock.put(1);
+        return;
+      end
+
+      foreach (record.items[i]) begin
+        if (!record.items[i].recovery_owner.is_legacy_unmigrated() &&
+            !record.items[i].reset_isolation_confirmed &&
+            record.items[i].recovery_required) begin
+          record.items[i].reset_isolation_confirmed = 1'b1;
+          record.items[i].recovery_required = 1'b0;
+        end
+        results[i].status = rdma_cmq_direct_status(RDMA_SC_OK);
+        results[i].observation_status = rdma_cmq_direct_status(RDMA_SC_OK);
+        results[i].submission_effect = record.items[i].submission_effect;
+        results[i].attempt_effect = record.items[i].attempt_effect;
+        results[i].completion_phase = record.items[i].completion_phase;
+        results[i].attempt_id = record.attempt_id;
+        results[i].recovery_required = record.items[i].recovery_required;
+      end
+      status = journal_status(RDMA_SC_OK);
+      engine_lock.put(1);
+      return;
+    end
+
+    if (!admit_retry_live_authority_locked(
+          request, record, profile_service, preallocated, status
+        )) begin
+      reject_recovery_results_locked(results, status.code, status.message);
+      engine_lock.put(1);
+      return;
+    end
+    if (attempt_id_counter == 64'hffff_ffff_ffff_ffff) begin
+      status = journal_status(
+        RDMA_SC_RESOURCE_EXHAUSTED, "CMQ attempt IDs are exhausted"
+      );
+      reject_recovery_results_locked(results, status.code, status.message);
+      engine_lock.put(1);
+      return;
+    end
+    candidate_attempt = attempt_id_counter + 1'b1;
+
+    if (!stage_recovery_candidate_locked(
+          record, candidate_attempt, recovery_stage, status
+        )) begin
+      reject_recovery_results_locked(results, status.code, status.message);
+      engine_lock.put(1);
+      return;
+    end
+
+    // 所有 fallible staging 已完成。以下连续赋值是唯一 locked CAS commit；
+    // admission owner provenance 与 ticket absolute deadline 保持逐位不变。
+    if (request.expected_attempt_id != record.attempt_id) begin
+      status = journal_status(
+        RDMA_SC_INVALID_STATE, "stale CMQ recovery attempt"
+      );
+      reject_recovery_results_locked(
+        results, status.code, "stale CMQ recovery attempt"
+      );
+      engine_lock.put(1);
+      return;
+    end
+    prior_cumulative = record.submission_effect;
+    attempt_id_counter = candidate_attempt;
+    record.attempt_id = candidate_attempt;
+    record.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+    record.observer_armed = 1'b0;
+    record.publication_retry_safe = 1'b0;
+    preallocated.attempt_id = candidate_attempt;
+    foreach (record.items[i]) begin
+      record.items[i].state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+      record.items[i].attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      record.items[i].completion_phase = RDMA_CMQ_COMPLETION_NONE;
+      record.items[i].completion = null;
+      record.items[i].reset_isolation_confirmed = 1'b0;
+      record.items[i].recovery_required = 1'b1;
+      record.items[i].status = rdma_cmq_direct_status(RDMA_SC_OK);
+      results[i].attempt_id = candidate_attempt;
+      results[i].submission_effect = prior_cumulative;
+      results[i].attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      results[i].completion_phase = RDMA_CMQ_COMPLETION_NONE;
+      results[i].recovery_required = 1'b1;
+    end
+    arm_observers[recovery_stage.capability_key] =
+      recovery_stage.observer;
+
+    transport_result = null;
+    transport.submit_observed(
+      record.binding, recovery_stage.doorbell_snapshot_desc,
+      recovery_stage.observer, transport_result
+    );
+    observer_armed = record.observer_armed;
+    if (!observer_armed)
+      arm_observers.delete(recovery_stage.capability_key);
+
+    observation_code = RDMA_SC_OK;
+    observation_message = "";
+    current_attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    if (transport_result == null) begin
+      operation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ recovery transport returned a null envelope"
+      );
+      observation_code = RDMA_SC_INVALID_STATE;
+      observation_message = "CMQ recovery transport envelope is missing";
+    end
+    else begin
+      if (rdma_cmq_status_shape_valid(transport_result.status))
+        operation_status = copy_submit_status_direct(
+          transport_result.status, "cmq_recovery_operation_status"
+        );
+      else begin
+        operation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery transport operation status is malformed"
+        );
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message =
+          "CMQ recovery transport operation status is malformed";
+      end
+      if (rdma_cmq_submission_effect_valid(
+            transport_result.submission_effect
+          ))
+        current_attempt_effect = transport_result.submission_effect;
+      else begin
+        current_attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message =
+          "CMQ recovery transport effect is malformed";
+      end
+    end
+
+    retry_safe = 1'b1;
+    if (observer_armed) begin
+      record.publication_retry_safe = 1'b0;
+      if (current_attempt_effect == RDMA_SUBMIT_EFFECT_MMIO_VISIBLE) begin
+        record.state = RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED;
+        fold_evidence = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+      end
+      else begin
+        record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+        fold_evidence = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+        if (current_attempt_effect !=
+              RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE &&
+            current_attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED) begin
+          current_attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+          observation_code = RDMA_SC_INVALID_STATE;
+          observation_message =
+            "CMQ recovery transport effect contradicts authentic MMIO arm";
+        end
+      end
+      if (!rdma_cmq_fold_attempt_effect(
+            record.submission_effect, fold_evidence, cumulative_effect
+          ))
+        cumulative_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    end
+    else begin
+      record.state = RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+      if (!(current_attempt_effect inside {
+            RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED,
+            RDMA_SUBMIT_EFFECT_UNOBSERVED,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+          })) begin
+        current_attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        retry_safe = 1'b0;
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message =
+          "CMQ recovery transport reported MMIO without authentic arm";
+      end
+      if (!rdma_cmq_fold_attempt_effect(
+            prior_cumulative, current_attempt_effect, cumulative_effect
+          ))
+        cumulative_effect = prior_cumulative;
+      record.publication_retry_safe = retry_safe;
+    end
+    record.submission_effect = cumulative_effect;
+    record.attempt_effect = current_attempt_effect;
+
+    foreach (record.items[i]) begin
+      record.items[i].state = record.state;
+      record.items[i].submission_effect = cumulative_effect;
+      record.items[i].attempt_effect = current_attempt_effect;
+      record.items[i].completion_phase = observer_armed ?
+        RDMA_CMQ_COMPLETION_PENDING : RDMA_CMQ_COMPLETION_NONE;
+      record.items[i].status = copy_submit_status_direct(
+        operation_status, $sformatf("cmq_recovery_journal_status_%0d", i)
+      );
+      nested_status = rdma_cmq_classify_recovery_required(
+        record.items[i].state, record.items[i].completion_phase,
+        record.items[i].submission_effect,
+        record.items[i].reset_isolation_confirmed,
+        record.items[i].recovery_owner.is_legacy_unmigrated(),
+        classified_recovery
+      );
+      if (nested_status == null || !nested_status.ok()) begin
+        classified_recovery = 1'b1;
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message = (nested_status == null) ?
+          "CMQ recovery classifier returned null status" :
+          nested_status.message;
+      end
+      record.items[i].recovery_required = classified_recovery;
+      results[i].status = copy_submit_status_direct(
+        operation_status, $sformatf("cmq_recovery_result_status_%0d", i)
+      );
+      results[i].observation_status = rdma_cmq_direct_status(
+        observation_code, observation_message
+      );
+      results[i].submission_effect = cumulative_effect;
+      results[i].attempt_effect = current_attempt_effect;
+      results[i].completion_phase = record.items[i].completion_phase;
+      results[i].attempt_id = candidate_attempt;
+      results[i].recovery_required = classified_recovery;
+    end
+    status = journal_status(RDMA_SC_OK);
+    engine_lock.put(1);
+  endtask
+
+  // 功能：执行单条 command 的 observed 生命周期，并在提交返回后依据锁内
+  //   retained journal 行决定立即返回或等待精确 pending 项。
+  // 输入/输出及副作用：command 为只读输入，result 为 caller-owned detached 图；
+  //   submit_observed 只调用一次，armed pending 才调用 wait_for，终态仅快照 journal。
+  // 失败/边界：STAGED/PENDING_EFFECT、缺失 journal、坏 envelope 或 authority 变化均
+  //   fail-closed；不会把 ticket/FIFO/status 当作 wait 判据，也不读写 last_* seam。
+  task execute_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    rdma_cmq_execution_result submitted;
+    rdma_cmq_batch_submission_record batch_record;
+    rdma_cmq_batch_submission_item_record journal_item;
+    rdma_cmq_completion waited_completion;
+    rdma_status waited_status;
+    rdma_status lookup_status;
+    rdma_status snapshot_status;
+    rdma_status identity_status;
+    int unsigned item_index;
+    bit armed_pending;
+
+    result = new_submit_result_direct("cmq_execute_observed_fallback");
+    submit_observed(command, submitted);
+    if (submitted == null) begin
+      result.status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed submit returned null result"
+      );
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed submit returned null result"
+      );
+      result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+      result.recovery_required = 1'b1;
+      return;
+    end
+
+    // 只有完整的零 identity PRE_SUBMIT_REJECTED/NONE envelope 才能直接返回；
+    // delegated submit 若缺少 identity 却宣称已提交，必须转换为 UNOBSERVED。
+    if (submitted.ticket == null || submitted.batch_key.len() == 0) begin
+      if (submitted.ticket == null && submitted.completion == null &&
+          submitted.command_identity == null &&
+          submitted.recovery_owner == null && submitted.dma_context == null &&
+          submitted.batch_key.len() == 0 && submitted.batch_id == 0 &&
+          submitted.attempt_id == 0 &&
+          submitted.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
+          submitted.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+          submitted.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+          submitted.recovery_required == 1'b0 && submitted.status != null &&
+          submitted.observation_status != null &&
+          rdma_cmq_status_shape_valid(submitted.status) &&
+          rdma_cmq_status_shape_valid(submitted.observation_status) &&
+          submitted.status.code != RDMA_SC_OK &&
+          submitted.observation_status.code == RDMA_SC_OK)
+        result = submitted;
+      else begin
+        result = submitted;
+        result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+        result.recovery_required = 1'b1;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed submit returned malformed zero-identity envelope"
+        );
+      end
+      return;
+    end
+
+    engine_lock.get(1);
+    lookup_status = locate_journal_item_by_ticket_locked(
+      submitted.ticket, batch_record, journal_item, item_index
+    );
+    if (lookup_status == null || !lookup_status.ok() ||
+        batch_record == null || journal_item == null) begin
+      engine_lock.put(1);
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed journal lookup failed"
+      );
+      return;
+    end
+    identity_status = validate_observed_item_locked(
+      submitted, batch_record, journal_item
+    );
+    if (identity_status == null || !identity_status.ok()) begin
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        (identity_status == null) ?
+          "CMQ observed journal validation returned null status" :
+          identity_status.message
+      );
+      engine_lock.put(1);
+      return;
+    end
+
+    if (journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_STAGED,
+          RDMA_CMQ_SUBMISSION_PENDING_EFFECT
+        }) begin
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_INVALID_STATE,
+        "CMQ observed item has pending external effect", result
+      );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ observed pending item snapshot returned null status" :
+            snapshot_status.message
+        );
+      end
+      engine_lock.put(1);
+      return;
+    end
+
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          journal_item.completion != null) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed host-visible item has terminal evidence"
+        );
+        engine_lock.put(1);
+        return;
+      end
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_OK,
+        "CMQ retained host-visible journal observed", result
+      );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ retained host-visible snapshot returned null status" :
+            snapshot_status.message
+        );
+      end
+      engine_lock.put(1);
+      return;
+    end
+
+    if (journal_item.completion != null && journal_item.completion_phase inside {
+          RDMA_CMQ_COMPLETION_TERMINAL,
+          RDMA_CMQ_COMPLETION_TIMEOUT,
+          RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+          RDMA_CMQ_COMPLETION_RESET_CANCELLED
+        }) begin
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_OK,
+        "CMQ retained journal completion observed", result
+      );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ retained completion snapshot returned null status" :
+            snapshot_status.message
+        );
+      end
+      engine_lock.put(1);
+      return;
+    end
+
+    armed_pending = journal_item.state inside {
+      RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+      RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+    } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING;
+    engine_lock.put(1);
+    if (!armed_pending) begin
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed journal lifecycle is malformed"
+      );
+      return;
+    end
+
+    // wait_for 在锁外执行；它完成后再次按同一 ticket 读取 retained journal。
+    waited_completion = null;
+    waited_status = null;
+    wait_for(submitted.ticket, waited_completion, waited_status);
+    engine_lock.get(1);
+    lookup_status = locate_journal_item_by_ticket_locked(
+      submitted.ticket, batch_record, journal_item, item_index
+    );
+    if (lookup_status != null && lookup_status.ok() &&
+        journal_item != null && journal_item.completion != null &&
+        journal_item.completion_phase inside {
+          RDMA_CMQ_COMPLETION_TERMINAL,
+          RDMA_CMQ_COMPLETION_TIMEOUT,
+          RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+          RDMA_CMQ_COMPLETION_RESET_CANCELLED
+        }) begin
+      snapshot_status = build_observed_result_locked(
+        batch_record, journal_item, RDMA_SC_OK,
+        "CMQ retained journal completion observed after wait", result
+      );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ retained completion snapshot returned null status" :
+            snapshot_status.message
+        );
+      end
+    end
+    else begin
+      snapshot_status = (journal_item == null) ? null :
+        build_observed_result_locked(
+          batch_record, journal_item, RDMA_SC_INVALID_STATE,
+          "CMQ observed wait produced no retained completion", result
+        );
+      if (snapshot_status == null || !snapshot_status.ok()) begin
+        result = submitted;
+        result.observation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          (snapshot_status == null) ?
+            "CMQ observed wait produced no retained snapshot" :
+            snapshot_status.message
+        );
+      end
+    end
+    engine_lock.put(1);
+  endtask
+
+  // 功能：把一个 command 包装为恰好一次 observed batch 调用并返回其唯一结果。
+  // 输入/输出及副作用：command 为输入，result 为输出；所有 journal、transport
+  //   与 fence 副作用完全由 submit_batch_observed() 产生。
+  // 失败/边界：batch 返回错位/null 结果时发布非空 INVALID_STATE fallback；
+  //   不做第二次提交，也不写共享 last_* 证据。
+  virtual task submit_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    rdma_cmq_command_desc commands[];
+    rdma_cmq_execution_result results[];
+    rdma_status batch_status;
+
+    result = new_submit_result_direct("cmq_single_observed_fallback");
+    commands = new[1];
+    commands[0] = command;
+    submit_batch_observed(commands, results, batch_status);
+    if (results.size() != 1 || results[0] == null) begin
+      result.status = (batch_status == null) ? rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ one-item observed batch returned no result"
+      ) : copy_submit_status_direct(
+        batch_status, "cmq_single_observed_batch_status"
+      );
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ one-item observed batch returned no result"
+      );
+      result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+      result.recovery_required = 1'b1;
+      return;
+    end
+    result = results[0];
+  endtask
+
+  // 功能：把 observed batch 的 ticket/operation status 单向投影到 legacy 输出，
+  //   transport 与 journal transaction 仍只执行一次。
+  // 输入/输出及副作用：requests 为输入；tickets/item_statuses 与请求等长，
+  //   batch_status 直接承接 observed orchestration 状态。
+  // 失败/边界：result/ticket/status 形状异常时该项返回 INVALID_STATE 与 null ticket；
+  //   投影不重试、不反向修改 observed result 或 journal。
+  task submit_batch(
+    input rdma_cmq_command_desc requests[],
+    output rdma_cmq_ticket tickets[],
+    output rdma_status item_statuses[],
+    output rdma_status batch_status
+  );
+    rdma_cmq_execution_result observed_results[];
+
+    submit_batch_observed(requests, observed_results, batch_status);
+    tickets = new[requests.size()];
+    item_statuses = new[requests.size()];
+    foreach (tickets[i]) begin
+      rdma_cmq_nonfatal_snapshot_context snapshot_context;
+      string failure_reason;
+
+      tickets[i] = null;
+      item_statuses[i] = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ legacy batch observed result is missing"
+      );
+      if (i >= observed_results.size() || observed_results[i] == null)
+        continue;
+      item_statuses[i] = copy_submit_status_direct(
+        observed_results[i].status,
+        $sformatf("cmq_legacy_item_status_%0d", i)
+      );
+      snapshot_context = new();
+      if (!snapshot_context.try_snapshot_optional_ticket(
+            observed_results[i].ticket, tickets[i], failure_reason
+          )) begin
+        tickets[i] = null;
+        item_statuses[i] = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          {"CMQ legacy ticket projection failed: ", failure_reason}
+        );
+      end
+    end
+    if (batch_status == null)
+      batch_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        "CMQ observed batch returned null orchestration status"
+      );
+  endtask
+
+  // 功能：把单条 observed result 单向投影为 legacy ticket/status，保证只调用
+  //   submit_observed() 一次且不重新推断 transport effect。
+  // 输入/输出及副作用：request 为输入；ticket/status 为 detached legacy 输出；
+  //   journal/fence/runtime 副作用由 observed 入口原样保留。
+  // 失败/边界：result/status/ticket snapshot 异常时返回 null ticket 与独立
+  //   INVALID_STATE；operation failure 原样返回且不以 batch 状态覆盖。
+  task submit(
+    input rdma_cmq_command_desc request,
+    output rdma_cmq_ticket ticket,
+    output rdma_status status
+  );
+    rdma_cmq_execution_result observed_result;
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    string failure_reason;
+
+    ticket = null;
+    status = rdma_cmq_direct_status(
+      RDMA_SC_INVALID_STATE, "CMQ legacy submit did not complete"
+    );
+    submit_observed(request, observed_result);
+    if (observed_result == null) begin
+      status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE, "CMQ observed submit returned null result"
+      );
+      return;
+    end
+    status = copy_submit_status_direct(
+      observed_result.status, "cmq_legacy_submit_status"
+    );
+    snapshot_context = new();
+    if (!snapshot_context.try_snapshot_optional_ticket(
+          observed_result.ticket, ticket, failure_reason
+        )) begin
+      ticket = null;
+      status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        {"CMQ legacy submit ticket projection failed: ", failure_reason}
+      );
+    end
   endtask
 
   // 功能：在 rdma_cmq_engine 中，expire 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
@@ -5350,6 +11950,11 @@ class rdma_cmq_engine extends uvm_object;
     completions.delete();
     status = invalid_state("CMQ expire did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
       status = invalid_state("CMQ expire requires an ACTIVE engine");
       engine_lock.put(1);
@@ -5361,24 +11966,137 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：在 rdma_cmq_engine 中，poll_locked 读取并解码队列条目，校验 owner/identity 后提交 consumer index，成功提交后才发布 completion/event。
-  // 输入/输出及副作用：status（输出）；poll_locked 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：poll_locked 遇到队列为空、owner/identity 失配或 CI/MMIO 提交失败时不发布 completion/event。
-  //   空句柄、队列为空、owner 不匹配或 doorbell 失败时不发布半成品结果。
+  // 设计说明：CQE 经过 owner、opcode、token、locator 和 prospective-retire
+  //   校验后，正常完成与超时晚到完成只在交付种类和 slot 终态上分叉；
+  //   journal transition、FIFO/registry/token 提交必须继续由 engine 锁内的
+  //   唯一阶段按固定顺序完成，避免 poll_locked 同时承担读取和账本提交细节。
+  // 功能：提交一个已经完成全部输入校验的 CQE completion；为 PUBLISHED row
+  //   构造 terminal completion，为 TIMED_OUT_QUARANTINED row 构造 late
+  //   diagnostic/completion，并把对应 journal、交付 FIFO、registry、token 与
+  //   slot 状态原子地推进到原有终态。
+  // 输入/输出及副作用：record、raw_snapshot、decoded、software_key 与
+  //   token_index 是锁内已认证输入；函数读取并更新 engine-owned journal、
+  //   terminal/diagnostic/late FIFO、command_registry、token_in_use 和
+  //   record.state，返回独立 rdma_status，不取得外部资源所有权。
+  // 失败/边界：completion/diagnostic 构造、journal staging 或 reducer 返回
+  //   null/non-OK 时不执行该 CQE 的 commit；调用方不得推进 cq_consume_seq，
+  //   也不得把失败当作可重试的部分状态。成功时严格保持 journal 先于 FIFO、
+  //   registry/token 再于 delivery、slot 终态最后的原提交顺序。
+  protected function rdma_status commit_polled_completion_locked(
+    rdma_cmq_slot_record record,
+    rdma_hw_image raw_snapshot,
+    rdma_cmq_decoded_cqe decoded,
+    string software_key,
+    int unsigned token_index
+  );
+    rdma_status completion_status;
+    rdma_status diagnostic_status;
+    rdma_cmq_completion completion;
+    rdma_cmq_diagnostic diagnostic;
+    rdma_cmq_batch_submission_record journal_batch;
+    rdma_cmq_batch_submission_item_record journal_item;
+    rdma_cmq_completion journal_completion;
+    rdma_cmq_submission_state_e reduced_batch_state;
+    bit recovery_required;
+
+    completion = null;
+    diagnostic = null;
+    if (record == null || raw_snapshot == null || decoded == null ||
+        software_key.len() == 0 || token_index >= CMQ_DEPTH)
+      return invalid_state("CMQ polled completion commit authority is incomplete");
+    if (!(record.state inside {
+            CMQ_SLOT_PUBLISHED,
+            CMQ_SLOT_TIMED_OUT_QUARANTINED
+          }))
+      return invalid_state("CMQ polled completion slot state is not terminal");
+
+    if (record.state == CMQ_SLOT_PUBLISHED) begin
+      completion_status = make_polled_completion(
+        record, raw_snapshot, decoded, completion
+      );
+      if (completion_status == null || !completion_status.ok() ||
+          completion == null)
+        return (completion_status == null) ? invalid_state(
+          "CMQ completion construction returned null status"
+        ) : completion_status;
+      completion_status = stage_runtime_journal_transition_locked(
+        record, completion, RDMA_CMQ_SUBMISSION_COMPLETED,
+        RDMA_CMQ_COMPLETION_TERMINAL, journal_batch, journal_item,
+        journal_completion, recovery_required, reduced_batch_state
+      );
+      if (completion_status == null || !completion_status.ok())
+        return (completion_status == null) ? invalid_state(
+          "CMQ normal completion journal staging returned null status"
+        ) : completion_status;
+      commit_runtime_journal_transition_locked(
+        journal_batch, journal_item, journal_completion,
+        RDMA_CMQ_SUBMISSION_COMPLETED, RDMA_CMQ_COMPLETION_TERMINAL,
+        recovery_required, reduced_batch_state
+      );
+      terminal_fifo.push_back(completion);
+      command_registry.delete(software_key);
+      token_in_use[token_index] = 1'b0;
+      record.state = CMQ_SLOT_COMPLETED;
+    end
+    else begin
+      diagnostic_status = make_late_diagnostic(
+        record, raw_snapshot, diagnostic
+      );
+      if (diagnostic_status == null || !diagnostic_status.ok() ||
+          diagnostic == null)
+        return (diagnostic_status == null) ? invalid_state(
+          "CMQ late diagnostic returned null status"
+        ) : diagnostic_status;
+      completion_status = make_polled_completion(
+        record, raw_snapshot, decoded, completion
+      );
+      if (completion_status == null || !completion_status.ok() ||
+          completion == null)
+        return (completion_status == null) ? invalid_state(
+          "CMQ late final completion construction returned null status"
+        ) : completion_status;
+      completion_status = stage_runtime_journal_transition_locked(
+        record, completion, RDMA_CMQ_SUBMISSION_LATE_COMPLETED,
+        RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY, journal_batch, journal_item,
+        journal_completion, recovery_required, reduced_batch_state
+      );
+      if (completion_status == null || !completion_status.ok())
+        return (completion_status == null) ? invalid_state(
+          "CMQ late completion journal staging returned null status"
+        ) : completion_status;
+      commit_runtime_journal_transition_locked(
+        journal_batch, journal_item, journal_completion,
+        RDMA_CMQ_SUBMISSION_LATE_COMPLETED,
+        RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+        recovery_required, reduced_batch_state
+      );
+      diagnostic_fifo.push_back(diagnostic);
+      late_final_fifo.push_back(completion);
+      token_in_use[token_index] = 1'b0;
+      record.state = CMQ_SLOT_LATE_COMPLETED;
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：按 CQ consumer 顺序读取并解码 ready CQE，把正常完成或
+  //   same-incarnation 超时晚到完成先写入 exact retained journal item，
+  //   再发布 delivery FIFO/诊断并推进 CQ/retire cursor。
+  // 输入/输出及副作用：status 输出整个 poll 的首个失败或 OK；
+  //   函数读 Host-memory CQ backing/调用 profile，成功后更新 journal、
+  //   terminal/diagnostic/late FIFO、command/token/entry/slot 账本及 consumer cursor。
+  // 失败/边界：engine/mapping/profile/ledger 不完整、CQ read/decode 失败、
+  //   owner/opcode/slot/token/locator 不匹配或 journal snapshot/reducer 失败时，
+  //   不消费当前 CQE，不发布该项 FIFO；not-ready CQE 正常返回 OK。
   protected task poll_locked(output rdma_status status);
     byte data[];
     rdma_status read_status;
     rdma_status inspect_status;
     rdma_status validation_status;
-    rdma_status completion_status;
-    rdma_status diagnostic_status;
     rdma_status retirement_status;
     rdma_hw_image raw_cqe;
     rdma_hw_image raw_snapshot;
     rdma_cmq_decoded_cqe decoded;
     rdma_cmq_slot_record record;
-    rdma_cmq_completion completion;
-    rdma_cmq_diagnostic diagnostic;
     longint unsigned read_offset;
     int unsigned cq_index;
     int unsigned token_index;
@@ -5558,7 +12276,9 @@ class rdma_cmq_engine extends uvm_object;
           break;
         end
         token_index = record.command_token;
-        if (token_index >= CMQ_DEPTH || !token_in_use[token_index]) begin
+        if (token_index >= CMQ_DEPTH || !token_in_use[token_index] ||
+            token_incarnation[token_index] !=
+              record.ticket.command_id[63:5]) begin
           status = poison(
             RDMA_CMQ_DIAG_POISON,
             "CMQ decoded CQE command token is inconsistent", raw_snapshot,
@@ -5572,6 +12292,17 @@ class rdma_cmq_engine extends uvm_object;
           status = poison(
             RDMA_CMQ_DIAG_POISON,
             "CMQ quarantined command remains in the command registry",
+            raw_snapshot, record.ticket
+          );
+          break;
+        end
+        token_index = record.command_token;
+        if (token_index >= CMQ_DEPTH || !token_in_use[token_index] ||
+            token_incarnation[token_index] !=
+              record.ticket.command_id[63:5]) begin
+          status = poison(
+            RDMA_CMQ_DIAG_POISON,
+            "CMQ quarantined completion token incarnation is inconsistent",
             raw_snapshot, record.ticket
           );
           break;
@@ -5591,47 +12322,14 @@ class rdma_cmq_engine extends uvm_object;
         break;
       end
 
-      if (record.state == CMQ_SLOT_PUBLISHED) begin
-        completion_status = make_polled_completion(
-          record, raw_snapshot, decoded, completion
-        );
-        if (completion_status == null || !completion_status.ok() ||
-            completion == null) begin
-          status = (completion_status == null) ?
-            invalid_state("CMQ completion construction returned null status") :
-            completion_status;
-          break;
-        end
-        terminal_fifo.push_back(completion);
-        command_registry.delete(software_key);
-        token_in_use[token_index] = 1'b0;
-        record.state = CMQ_SLOT_COMPLETED;
-      end
-      else begin
-        diagnostic_status = make_late_diagnostic(
-          record, raw_snapshot, diagnostic
-        );
-        if (diagnostic_status == null || !diagnostic_status.ok() ||
-            diagnostic == null) begin
-          status = (diagnostic_status == null) ?
-            invalid_state("CMQ late diagnostic returned null status") :
-            diagnostic_status;
-          break;
-        end
-        completion_status = make_polled_completion(
-          record, raw_snapshot, decoded, completion
-        );
-        if (completion_status == null || !completion_status.ok() ||
-            completion == null) begin
-          status = (completion_status == null) ?
-            invalid_state(
-              "CMQ late final completion construction returned null status"
-            ) : completion_status;
-          break;
-        end
-        diagnostic_fifo.push_back(diagnostic);
-        late_final_fifo.push_back(completion);
-        record.state = CMQ_SLOT_LATE_COMPLETED;
+      status = commit_polled_completion_locked(
+        record, raw_snapshot, decoded, software_key, token_index
+      );
+      if (status == null || !status.ok()) begin
+        status = (status == null) ? invalid_state(
+          "CMQ polled completion commit returned null status"
+        ) : status;
+        break;
       end
       cq_consume_seq++;
       commit_retired_prefix(prospective_retire_seq);
@@ -5656,6 +12354,11 @@ class rdma_cmq_engine extends uvm_object;
     diagnostics.delete();
     status = invalid_state("CMQ poll did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
       status = invalid_state("CMQ poll requires an ACTIVE engine");
       while (diagnostic_fifo.size() != 0)
@@ -5680,6 +12383,61 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
+  // 设计说明：wait_for 从 retained journal 读取 terminal completion 的几个
+  //   分支必须共享同一 detached snapshot/copy 规则；只有正常 delivery 分支
+  //   需要按 ticket 删除 terminal FIFO，reset 竞争分支则不能触碰 FIFO。
+  //   helper 因此只封装值投影和可选 delivery-order 消费，不拥有生命周期锁。
+  // 功能：从已定位的 retained batch/item 构造独立 completion 与 operation
+  //   status，并按 consume_terminal_fifo 选择性删除匹配 terminal FIFO 行。
+  // 输入/输出及副作用：batch_record、journal_item、ticket_snapshot 为锁内
+  //   canonical 输入；completion、projected_status 为 detached 输出；函数只
+  //   读取 retained row，最多修改 engine-owned terminal_fifo，不取放锁、不
+  //   推进 journal/cursor，也不取得外部资源所有权。
+  // 失败/边界：定位输入为空、completion snapshot 非 OK/null 或 status copy
+  //   返回 null 时返回明确 INVALID_STATE；FIFO 中没有匹配行不构成失败，调用方
+  //   仍可交付 retained completion。status_label 只用于区分既有诊断上下文。
+  protected function rdma_status
+  project_wait_retained_completion_locked(
+    input rdma_cmq_batch_submission_record batch_record,
+    input rdma_cmq_batch_submission_item_record journal_item,
+    input rdma_cmq_ticket ticket_snapshot,
+    input bit consume_terminal_fifo,
+    input string status_label,
+    input string copy_failure_message,
+    output rdma_cmq_completion completion,
+    output rdma_status projected_status
+  );
+    rdma_status snapshot_status;
+    rdma_cmq_completion detached_completion;
+    int fifo_index;
+
+    completion = null;
+    projected_status = null;
+    if (batch_record == null || journal_item == null ||
+        ticket_snapshot == null)
+      return invalid_state("CMQ wait completion projection authority is missing");
+    snapshot_status = snapshot_retained_completion_locked(
+      batch_record, journal_item, detached_completion
+    );
+    if (snapshot_status == null || !snapshot_status.ok() ||
+        detached_completion == null || detached_completion.status == null)
+      return (snapshot_status == null) ? invalid_state(
+        "CMQ wait retained completion snapshot returned null status"
+      ) : snapshot_status;
+    if (consume_terminal_fifo) begin
+      fifo_index = terminal_index(ticket_snapshot);
+      if (fifo_index >= 0)
+        terminal_fifo.delete(fifo_index);
+    end
+    completion = detached_completion;
+    projected_status = copy_submit_status_direct(
+      detached_completion.status, status_label
+    );
+    if (projected_status == null)
+      return invalid_state(copy_failure_message);
+    return rdma_status::success();
+  endfunction
+
   // 功能：控制 wait_for 对应的等待、异常或同步边界，按超时/捕获结果返回状态，不吞掉原始错误。
   // 输入/输出及副作用：ticket（输入）、completion（输出）、status（输出）；wait_for 驱动下游事务，并写入 completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：wait_for 超时或异常必须返回原始错误证据；不得无限等待或跳过同步边界。
@@ -5690,16 +12448,28 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status validation_status;
     rdma_status expiry_status;
+    rdma_status poll_status;
+    rdma_status projection_status;
     rdma_cmq_ticket ticket_snapshot;
+    rdma_cmq_batch_submission_record frozen_batch;
+    rdma_cmq_batch_submission_item_record frozen_item;
+    rdma_cmq_batch_submission_record current_batch;
+    rdma_cmq_batch_submission_item_record current_item;
+    rdma_function_identity frozen_identity;
+    rdma_function_identity current_identity;
+    int unsigned frozen_item_index;
+    int unsigned current_item_index;
     int fifo_index;
     time remaining;
     time wait_time;
+    bit journal_located;
+    bit fallback_outstanding;
 
     completion = null;
     status = invalid_state("CMQ wait did not complete");
     engine_lock.get(1);
-    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
-      status = invalid_state("CMQ wait requires an ACTIVE engine");
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
       engine_lock.put(1);
       return;
     end
@@ -5724,51 +12494,279 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    fifo_index = terminal_index(ticket_snapshot);
-    if (fifo_index < 0 && !ticket_is_outstanding(ticket_snapshot)) begin
-      status = invalid_argument("CMQ wait ticket is unknown or delivered");
-      engine_lock.put(1);
-      return;
-    end
 
-    forever begin
-      fifo_index = terminal_index(ticket_snapshot);
-      if (fifo_index >= 0) begin
-        completion = terminal_fifo[fifo_index];
-        terminal_fifo.delete(fifo_index);
-        status = rdma_status::success();
+    // 首次锁内定位必须先冻结 retained row；ticket handle 后续可被 caller
+    // 改写，waiter 只使用此 canonical snapshot。
+    validation_status = locate_journal_item_by_ticket_locked(
+      ticket_snapshot, frozen_batch, frozen_item, frozen_item_index
+    );
+    journal_located = validation_status != null && validation_status.ok();
+    fallback_outstanding = 1'b0;
+    if (journal_located) begin
+      if (frozen_batch.function_identity == null ||
+          !rdma_cmq_try_snapshot_identity_direct(
+            frozen_batch.function_identity, frozen_identity
+          )) begin
+        status = invalid_state("CMQ wait retained Function snapshot failed");
         engine_lock.put(1);
         return;
       end
-      expiry_status = expire_locked();
-      if (expiry_status == null)
-        status = invalid_state("CMQ expiry helper returned null status");
-      else if (!expiry_status.ok())
-        status = expiry_status;
-      else begin
-        poll_locked(status);
-      end
-      fifo_index = terminal_index(ticket_snapshot);
-      if (fifo_index >= 0) begin
-        completion = terminal_fifo[fifo_index];
-        terminal_fifo.delete(fifo_index);
-        status = rdma_status::success();
+      if (frozen_item == null || frozen_item.ticket == null) begin
+        status = invalid_state("CMQ wait retained item is incomplete");
         engine_lock.put(1);
         return;
       end
-      if (status == null || !status.ok()) begin
-        if (status == null)
-          status = invalid_state("CMQ wait helper returned null status");
+      if (frozen_item.state inside {
+            RDMA_CMQ_SUBMISSION_STAGED,
+            RDMA_CMQ_SUBMISSION_PENDING_EFFECT
+          }) begin
+        status = invalid_state("CMQ wait ticket is not observable yet");
         engine_lock.put(1);
         return;
       end
-      if (!ticket_is_outstanding(ticket_snapshot)) begin
+      if (frozen_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
+        status = invalid_state("CMQ wait ticket was not published");
+        engine_lock.put(1);
+        return;
+      end
+      if (frozen_item.completion != null &&
+          frozen_item.completion_phase inside {
+            RDMA_CMQ_COMPLETION_TERMINAL,
+            RDMA_CMQ_COMPLETION_TIMEOUT,
+            RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+            RDMA_CMQ_COMPLETION_RESET_CANCELLED
+          }) begin
+        // A FIFO row is delivery order only.  Snapshot from journal first, then
+        // consume the matching FIFO row so another ticket remains untouched.
+        projection_status = project_wait_retained_completion_locked(
+          frozen_batch, frozen_item, ticket_snapshot, 1'b1,
+          "cmq_wait_terminal_status",
+          "CMQ wait terminal status snapshot failed",
+          completion, status
+        );
+        if (projection_status == null || !projection_status.ok()) begin
+          status = (projection_status == null) ? invalid_state(
+            "CMQ wait completion projection returned null status"
+          ) : projection_status;
+          engine_lock.put(1);
+          return;
+        end
+        engine_lock.put(1);
+        return;
+      end
+      if (!(frozen_item.state inside {
+            RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+            RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+          }) || frozen_item.completion_phase !=
+            RDMA_CMQ_COMPLETION_PENDING) begin
+        status = invalid_state("CMQ wait retained lifecycle is not pending");
+        engine_lock.put(1);
+        return;
+      end
+      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
+          engine_incarnation != frozen_batch.engine_incarnation) begin
+        status = invalid_state("CMQ wait pending ticket belongs to old engine");
+        engine_lock.put(1);
+        return;
+      end
+    end
+    else begin
+      // Compatibility for pre-journal test/facade completions.  This fallback
+      // is intentionally limited to the current active runtime and never lets
+      // a post-reset ticket inspect a newly prepared backing.
+      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+        status = invalid_state("CMQ wait requires an ACTIVE engine");
+        engine_lock.put(1);
+        return;
+      end
+      fallback_outstanding = ticket_is_outstanding(ticket_snapshot);
+      if (!fallback_outstanding && terminal_index(ticket_snapshot) < 0) begin
         status = invalid_argument("CMQ wait ticket is unknown or delivered");
         engine_lock.put(1);
         return;
       end
+      if (prepared_binding == null ||
+          !rdma_cmq_try_snapshot_identity_direct(
+            prepared_binding.function_identity_snapshot(), frozen_identity
+          )) begin
+        status = invalid_state("CMQ wait Function snapshot failed");
+        engine_lock.put(1);
+        return;
+      end
+    end
+
+    forever begin
+      if (journal_located) begin
+        // Re-read the exact retained row before every delivery/side effect.
+        validation_status = locate_journal_item_by_ticket_locked(
+          ticket_snapshot, current_batch, current_item, current_item_index
+        );
+        if (validation_status == null || !validation_status.ok() ||
+            current_batch == null || current_item == null ||
+            current_item_index != frozen_item_index ||
+            current_batch.batch_key != frozen_batch.batch_key ||
+            current_batch.engine_incarnation != frozen_batch.engine_incarnation ||
+            current_batch.function_identity == null ||
+            !current_batch.function_identity.same_incarnation(frozen_identity)) begin
+          // A reset may have won between iterations.  Only a retained reset
+          // completion is allowed to cross that boundary.
+          if (validation_status != null && validation_status.ok() &&
+              current_item != null &&
+              current_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
+            projection_status = project_wait_retained_completion_locked(
+              current_batch, current_item, ticket_snapshot, 1'b0,
+              "cmq_wait_reset_status",
+              "CMQ wait reset status snapshot failed",
+              completion, status
+            );
+            if (projection_status != null && projection_status.ok()) begin
+              engine_lock.put(1);
+              return;
+            end
+          end
+          status = invalid_state("CMQ wait retained authority changed");
+          engine_lock.put(1);
+          return;
+        end
+        frozen_batch = current_batch;
+        frozen_item = current_item;
+        if (current_item.completion != null &&
+            current_item.completion_phase inside {
+              RDMA_CMQ_COMPLETION_TERMINAL,
+              RDMA_CMQ_COMPLETION_TIMEOUT,
+              RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
+              RDMA_CMQ_COMPLETION_RESET_CANCELLED
+            }) begin
+          projection_status = project_wait_retained_completion_locked(
+            current_batch, current_item, ticket_snapshot, 1'b1,
+            "cmq_wait_completion_status",
+            "CMQ wait completion status snapshot failed",
+            completion, status
+          );
+          if (projection_status == null || !projection_status.ok()) begin
+            status = (projection_status == null) ? invalid_state(
+              "CMQ wait completion projection returned null status"
+            ) : projection_status;
+            engine_lock.put(1);
+            return;
+          end
+          engine_lock.put(1);
+          return;
+        end
+        if (current_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
+          status = invalid_state("CMQ reset item has no retained completion");
+          engine_lock.put(1);
+          return;
+        end
+        if (!(current_item.state inside {
+              RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+              RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+            }) || current_item.completion_phase !=
+              RDMA_CMQ_COMPLETION_PENDING) begin
+          status = invalid_state("CMQ wait pending lifecycle is invalid");
+          engine_lock.put(1);
+          return;
+        end
+        // Revalidate current runtime Function identity and incarnation before
+        // invoking expiry/poll, which may read CQ backing or mutate journal.
+        current_identity = null;
+        if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
+            engine_incarnation != frozen_batch.engine_incarnation ||
+            prepared_binding == null ||
+            !rdma_cmq_try_snapshot_identity_direct(
+              prepared_binding.function_identity_snapshot(), current_identity
+            ) || current_identity == null ||
+            !current_identity.same_incarnation(frozen_identity) ||
+            !ticket_has_engine_authority(ticket_snapshot)) begin
+          status = invalid_state("CMQ wait current runtime authority changed");
+          engine_lock.put(1);
+          return;
+        end
+      end
+      else if (terminal_index(ticket_snapshot) >= 0) begin
+        // Legacy FIFO fallback has no retained graph; consume only its exact
+        // row and preserve the historical one-shot delivery semantics.
+        fifo_index = terminal_index(ticket_snapshot);
+        completion = terminal_fifo[fifo_index];
+        terminal_fifo.delete(fifo_index);
+        if (completion == null || completion.status == null) begin
+          completion = null;
+          status = invalid_state("CMQ wait legacy completion is incomplete");
+        end
+        else
+          status = copy_submit_status_direct(
+            completion.status, "cmq_wait_legacy_status"
+          );
+        engine_lock.put(1);
+        return;
+      end
+
+      expiry_status = expire_locked();
+      if (expiry_status == null || !expiry_status.ok()) begin
+        status = (expiry_status == null) ? invalid_state(
+          "CMQ wait expiry helper returned null status"
+        ) : expiry_status;
+        engine_lock.put(1);
+        return;
+      end
+      poll_status = rdma_status::success();
+      poll_locked(poll_status);
+      if (poll_status == null || !poll_status.ok()) begin
+        status = (poll_status == null) ? invalid_state(
+          "CMQ wait poll helper returned null status"
+        ) : poll_status;
+        engine_lock.put(1);
+        return;
+      end
+
+      // The next loop rereads journal/FIFO.  A deadline transition is thus
+      // delivered as the retained non-null RDMA_SC_TIMEOUT completion.
+      if ($time >= ticket_snapshot.absolute_deadline &&
+          journal_located) begin
+        validation_status = locate_journal_item_by_ticket_locked(
+          ticket_snapshot, current_batch, current_item, current_item_index
+        );
+        if (validation_status != null && validation_status.ok() &&
+            current_item != null && current_item.completion != null &&
+            current_item.completion_phase == RDMA_CMQ_COMPLETION_TIMEOUT)
+          continue;
+        if (current_item != null &&
+            current_item.state inside {
+              RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+              RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+            }) begin
+          // expire_locked should have transitioned an owned slot; if it did
+          // not, fail closed rather than manufacturing a status without evidence.
+          status = invalid_state("CMQ wait deadline transition is missing");
+          engine_lock.put(1);
+          return;
+        end
+      end
+
+      if (journal_located && !ticket_is_outstanding(ticket_snapshot) &&
+          terminal_index(ticket_snapshot) < 0) begin
+        // A reset/terminal transition will be observed at the top of the next
+        // iteration; absent both evidence and runtime authority is delivery loss.
+        validation_status = locate_journal_item_by_ticket_locked(
+          ticket_snapshot, current_batch, current_item, current_item_index
+        );
+        if (validation_status == null || !validation_status.ok() ||
+            current_item == null || current_item.completion == null) begin
+          status = invalid_argument("CMQ wait ticket is unknown or delivered");
+          engine_lock.put(1);
+          return;
+        end
+      end
+      if ($isunknown(ticket_snapshot.absolute_deadline) ||
+          ticket_snapshot.absolute_deadline == 0) begin
+        status = invalid_argument("CMQ wait ticket deadline is invalid");
+        engine_lock.put(1);
+        return;
+      end
       if ($time >= ticket_snapshot.absolute_deadline) begin
-        status = invalid_state("CMQ wait deadline produced no completion");
+        // Top-of-loop expiry should have installed a completion.  Keep the
+        // invariant explicit and never return INVALID_STATE as a timeout.
+        status = invalid_state("CMQ wait deadline transition is unavailable");
         engine_lock.put(1);
         return;
       end
@@ -5777,7 +12775,30 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       #(wait_time);
       engine_lock.get(1);
-      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+      status = reset_release_gate_status();
+      if (!status.ok()) begin
+        engine_lock.put(1);
+        return;
+      end
+      if (journal_located) begin
+        validation_status = locate_journal_item_by_ticket_locked(
+          ticket_snapshot, current_batch, current_item, current_item_index
+        );
+        if (validation_status == null || !validation_status.ok() ||
+            current_batch == null || current_item == null ||
+            current_item_index != frozen_item_index ||
+            current_batch.batch_key != frozen_batch.batch_key ||
+            current_batch.engine_incarnation != frozen_batch.engine_incarnation ||
+            current_batch.function_identity == null ||
+            !current_batch.function_identity.same_incarnation(frozen_identity)) begin
+          status = invalid_state("CMQ wait retained authority changed after unlock");
+          engine_lock.put(1);
+          return;
+        end
+        // Revalidation before the next loop's CQ access is intentional; the
+        // loop will additionally check current ACTIVE runtime identity.
+      end
+      else if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
         status = invalid_state("CMQ engine changed state during wait");
         engine_lock.put(1);
         return;
@@ -5785,10 +12806,136 @@ class rdma_cmq_engine extends uvm_object;
     end
   endtask
 
-  // 功能：在 rdma_cmq_engine 中，reconcile_ticket 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：ticket（输入）、terminal_known（输出）、completion（输出）、status（输出）；输入 action/epoch/handle
-  //   决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
+  // 设计说明：reconcile_ticket 的 pending 处理可能驱动当前 runtime；其后的
+  //   状态分类只读取已经定位的 retained item，并把 caller 输出做 detached
+  //   projection。把这段纯分类单独隔离，可让 lock/expire/poll orchestration
+  //   与 completion snapshot 规则各自保持唯一 owner。
+  // 功能：按 retained journal item 的 lifecycle state/phase 分类 reconcile
+  //   结果，构造 operation-status 或 detached terminal completion，并返回
+  //   terminal_known 与 completion 输出；该阶段不取放 engine_lock、不推进
+  //   journal/FIFO/cursor，也不触发新的 runtime 操作。
+  // 输入/输出及副作用：batch_record、journal_item、pending_active 为锁内已
+  //   定位输入；terminal_known、completion、projected_status 为输出。helper
+  //   只调用受控 snapshot/copy helper，输出图与 retained row 隔离，不接管外部
+  //   资源所有权。
+  // 失败/边界：null retained row、STAGED/PENDING_EFFECT、pending/terminal
+  //   phase 与 completion 形状不一致、completion/status snapshot 或 copy 返回
+  //   null/non-OK 时返回 INVALID_STATE；HOST_VISIBLE_NOT_PUBLISHED 与仍 pending
+  //   的合法 operation failure 通过 projected_status 原样传播而不是误报结构错。
+  protected function rdma_status
+  project_reconciled_journal_item_locked(
+    input rdma_cmq_batch_submission_record batch_record,
+    input rdma_cmq_batch_submission_item_record journal_item,
+    input bit pending_active,
+    output bit terminal_known,
+    output rdma_cmq_completion completion,
+    output rdma_status projected_status
+  );
+    rdma_status snapshot_status;
+    rdma_status operation_status;
+    rdma_cmq_completion detached_completion;
+    bit terminal_row;
+
+    terminal_known = 1'b0;
+    completion = null;
+    projected_status = invalid_state(
+      "CMQ ticket reconcile projection did not complete"
+    );
+    if (journal_item == null || batch_record == null)
+      return invalid_state("CMQ reconcile retained item is missing");
+    if (journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_STAGED,
+          RDMA_CMQ_SUBMISSION_PENDING_EFFECT
+        })
+      return invalid_state(
+        "CMQ reconcile item is staged or has a pending external effect"
+      );
+
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+          journal_item.completion != null)
+        return invalid_state(
+          "CMQ unarmed reconcile item has terminal evidence"
+        );
+      snapshot_status = snapshot_retained_operation_status_locked(
+        journal_item, operation_status
+      );
+      if (snapshot_status == null || !snapshot_status.ok() ||
+          operation_status == null)
+        return (snapshot_status == null) ? invalid_state(
+          "CMQ unarmed reconcile status snapshot returned null"
+        ) : snapshot_status;
+      projected_status = operation_status;
+      return rdma_status::success();
+    end
+
+    if (pending_active) begin
+      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_PENDING ||
+          journal_item.completion != null ||
+          !(journal_item.state inside {
+            RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+            RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+          }))
+        return invalid_state("CMQ reconcile pending item is malformed");
+      snapshot_status = snapshot_retained_operation_status_locked(
+        journal_item, operation_status
+      );
+      if (snapshot_status == null || !snapshot_status.ok() ||
+          operation_status == null)
+        return (snapshot_status == null) ? invalid_state(
+          "CMQ pending reconcile status snapshot returned null"
+        ) : snapshot_status;
+      projected_status = operation_status;
+      return rdma_status::success();
+    end
+
+    terminal_row = 1'b0;
+    case (journal_item.state)
+      RDMA_CMQ_SUBMISSION_COMPLETED:
+        terminal_row = journal_item.completion_phase ==
+                       RDMA_CMQ_COMPLETION_TERMINAL;
+      RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED:
+        terminal_row = journal_item.completion_phase ==
+                       RDMA_CMQ_COMPLETION_TIMEOUT;
+      RDMA_CMQ_SUBMISSION_LATE_COMPLETED:
+        terminal_row = journal_item.completion_phase ==
+                       RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY;
+      RDMA_CMQ_SUBMISSION_RESET_QUARANTINED:
+        terminal_row = journal_item.completion_phase ==
+                       RDMA_CMQ_COMPLETION_RESET_CANCELLED;
+      default:
+        terminal_row = 1'b0;
+    endcase
+    if (!terminal_row || journal_item.completion == null)
+      return invalid_state("CMQ reconcile retained lifecycle is malformed");
+
+    snapshot_status = snapshot_retained_completion_locked(
+      batch_record, journal_item, detached_completion
+    );
+    if (snapshot_status == null || !snapshot_status.ok() ||
+        detached_completion == null || detached_completion.status == null)
+      return (snapshot_status == null) ? invalid_state(
+        "CMQ reconcile retained completion snapshot returned null"
+      ) : snapshot_status;
+    operation_status = copy_submit_status_direct(
+      detached_completion.status, "cmq_reconcile_terminal_status"
+    );
+    if (operation_status == null)
+      return invalid_state("CMQ reconcile terminal status snapshot failed");
+    terminal_known = 1'b1;
+    completion = detached_completion;
+    projected_status = operation_status;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在 rdma_cmq_engine 中，reconcile_ticket 以 retained journal 的单项
+  //   生命周期为唯一观察依据，按状态返回未发布 operation status 或终态 completion。
+  // 输入/输出及副作用：ticket 为 caller 的只读输入；terminal_known、completion、
+  //   status 为 detached 输出。只有当前 ACTIVE incarnation 的 PENDING 项会调用
+  //   一次 expire_locked()/poll_locked()；终态、未发布和复位证据只读 journal。
+  // 失败/边界：坏 ticket、journal index 歧义、STAGED/PENDING_EFFECT、旧 pending
+  //   缺少当前 runtime authority 或 retained graph 不完整时 fail closed；不删除
+  //   FIFO/journal completion、不重试发布、不敲 doorbell，重复终态观察保持幂等。
   task reconcile_ticket(
     rdma_cmq_ticket ticket,
     output bit terminal_known,
@@ -5797,128 +12944,142 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status validation_status;
     rdma_status helper_status;
+    rdma_status projection_status;
     rdma_cmq_ticket ticket_snapshot;
-    rdma_cmq_completion staged_completion;
-    int fifo_index;
-    int final_index;
+    rdma_cmq_batch_submission_record batch_record;
+    rdma_cmq_batch_submission_item_record journal_item;
+    rdma_cmq_nonfatal_snapshot_context snapshot_context;
+    rdma_function_identity current_identity;
+    string failure_reason;
+    int unsigned journal_item_index;
+    bit pending_active;
 
     terminal_known = 1'b0;
     completion = null;
     status = invalid_state("CMQ ticket reconcile did not complete");
     engine_lock.get(1);
-    if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
-      status = invalid_state("CMQ ticket reconcile requires an ACTIVE engine");
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
       engine_lock.put(1);
       return;
     end
-    validation_status = ticket_trust_status(ticket);
-    if (validation_status == null || !validation_status.ok()) begin
+    if (ticket == null) begin
+      status = invalid_argument("CMQ reconcile ticket is null");
+      engine_lock.put(1);
+      return;
+    end
+    if (!rdma_cmq_ticket_shape_valid(ticket)) begin
       status = invalid_argument("CMQ reconcile ticket is invalid");
       engine_lock.put(1);
       return;
     end
-    validation_status = checked_completion_ticket_snapshot(
-      ticket, ticket_snapshot
-    );
-    if (validation_status == null || !validation_status.ok()) begin
-      status = (validation_status == null) ?
-        invalid_state("CMQ reconcile ticket snapshot returned null status") :
-        validation_status;
-      engine_lock.put(1);
-      return;
-    end
-    if (!ticket_has_engine_authority(ticket_snapshot)) begin
-      status = invalid_argument("CMQ reconcile ticket is unknown or stale");
-      engine_lock.put(1);
-      return;
-    end
 
-    helper_status = expire_locked();
-    if (helper_status == null || !helper_status.ok()) begin
-      status = (helper_status == null) ?
-        invalid_state("CMQ reconcile expiry returned null status") :
-        helper_status;
-      engine_lock.put(1);
-      return;
-    end
-    poll_locked(helper_status);
-    if (helper_status == null || !helper_status.ok()) begin
-      status = (helper_status == null) ?
-        invalid_state("CMQ reconcile poll returned null status") :
-        helper_status;
-      engine_lock.put(1);
-      return;
-    end
-
-    fifo_index = terminal_index(ticket_snapshot);
-    if (fifo_index >= 0) begin
-      staged_completion = terminal_fifo[fifo_index];
-      if (staged_completion == null || staged_completion.status == null) begin
-        status = invalid_state("CMQ reconcile terminal completion is incomplete");
-        engine_lock.put(1);
-        return;
-      end
-      status = rdma_cmq_clone_status_value(staged_completion.status);
-      if (status == null) begin
-        status = invalid_state("CMQ reconcile terminal status copy failed");
-        engine_lock.put(1);
-        return;
-      end
-      terminal_fifo.delete(fifo_index);
-      completion = staged_completion;
-      terminal_known = 1'b1;
-      engine_lock.put(1);
-      return;
-    end
-
-    fifo_index = late_diagnostic_index(ticket_snapshot);
-    if (fifo_index >= 0) begin
-      final_index = late_final_index(ticket_snapshot);
-      if (final_index < 0) begin
-        status = invalid_state(
-          "CMQ late reconcile final completion is missing"
-        );
-        engine_lock.put(1);
-        return;
-      end
-      staged_completion = late_final_fifo[final_index];
-      if (diagnostic_fifo[fifo_index] == null ||
-          diagnostic_fifo[fifo_index].ticket == null ||
-          diagnostic_fifo[fifo_index].status == null ||
-          diagnostic_fifo[fifo_index].raw_cqe == null ||
-          staged_completion == null || staged_completion.ticket == null ||
-          staged_completion.status == null ||
-          staged_completion.raw_cqe == null ||
-          staged_completion.decoded_response == null ||
-          !same_ticket_value(diagnostic_fifo[fifo_index].ticket,
-                             staged_completion.ticket)) begin
-        status = invalid_state("CMQ late reconcile pair is incomplete");
-        engine_lock.put(1);
-        return;
-      end
-      status = rdma_cmq_clone_status_value(staged_completion.status);
-      if (status == null) begin
-        status = invalid_state("CMQ late reconcile status copy failed");
-        engine_lock.put(1);
-        return;
-      end
-      diagnostic_fifo.delete(fifo_index);
-      late_final_fifo.delete(final_index);
-      completion = staged_completion;
-      terminal_known = 1'b1;
-      engine_lock.put(1);
-      return;
-    end
-
-    if (late_final_index(ticket_snapshot) >= 0) begin
-      status = invalid_state(
-        "CMQ late reconcile diagnostic is missing"
+    // 用 direct nonfatal seam 冻结 caller ticket；reconcile 不应因当前
+    // runtime 已 reset，或因 delivery FIFO 已被其他消费者清空，而改变查询值。
+    snapshot_context = new();
+    if (!snapshot_context.try_snapshot_optional_ticket(
+          ticket, ticket_snapshot, failure_reason
+        ) || ticket_snapshot == null) begin
+      status = invalid_argument(
+        {"CMQ reconcile ticket snapshot failed: ", failure_reason}
       );
       engine_lock.put(1);
       return;
     end
 
-    status = rdma_status::success();
+    // 先查稳定 ticket index，再决定是否需要当前 runtime authority；这是
+    // old reset/timeout/late ticket 能跨 reprepare 被观察的关键顺序。
+    validation_status = locate_journal_item_by_ticket_locked(
+      ticket_snapshot, batch_record, journal_item,
+      journal_item_index
+    );
+    if (validation_status == null || !validation_status.ok()) begin
+      status = (validation_status == null) ? invalid_state(
+        "CMQ reconcile journal locator returned null status"
+      ) : validation_status;
+      engine_lock.put(1);
+      return;
+    end
+
+    pending_active =
+      journal_item.state inside {
+        RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+        RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+      } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+      journal_item.completion == null;
+
+    if (pending_active) begin
+      // 只有同一 ACTIVE engine incarnation 的真实 published item 才能
+      // 触发一次 expire/poll；unarmed fenced row 与旧 incarnation 直接失败。
+      current_identity = null;
+      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
+          prepared_binding == null || cmq_snapshot == null ||
+          cmq_snapshot.handle == null ||
+          batch_record.engine_incarnation != engine_incarnation ||
+          batch_record.function_identity == null ||
+          !rdma_cmq_try_snapshot_identity_direct(
+            prepared_binding.function_identity_snapshot(), current_identity
+          ) || current_identity == null ||
+          !batch_record.function_identity.same_incarnation(current_identity) ||
+          !same_handle(cmq_snapshot.handle, batch_record.cmq_h) ||
+          !ticket_has_engine_authority(ticket_snapshot)) begin
+        status = invalid_state(
+          "CMQ reconcile pending ticket lacks current runtime authority"
+        );
+        engine_lock.put(1);
+        return;
+      end
+
+      helper_status = expire_locked();
+      if (helper_status == null || !helper_status.ok()) begin
+        status = (helper_status == null) ? invalid_state(
+          "CMQ reconcile expiry returned null status"
+        ) : helper_status;
+        engine_lock.put(1);
+        return;
+      end
+      helper_status = rdma_status::success();
+      poll_locked(helper_status);
+      if (helper_status == null || !helper_status.ok()) begin
+        status = (helper_status == null) ? invalid_state(
+          "CMQ reconcile poll returned null status"
+        ) : helper_status;
+        engine_lock.put(1);
+        return;
+      end
+
+      // expire/poll 可能同时推进其他 slot；只重新读取原 ticket 对应的
+      // retained item，绝不从 FIFO 顺序或 slot index 猜测结果。
+      validation_status = locate_journal_item_by_ticket_locked(
+        ticket_snapshot, batch_record, journal_item,
+        journal_item_index
+      );
+      if (validation_status == null || !validation_status.ok()) begin
+        status = (validation_status == null) ? invalid_state(
+          "CMQ reconcile journal reread returned null status"
+        ) : validation_status;
+        engine_lock.put(1);
+        return;
+      end
+      pending_active =
+        journal_item.state inside {
+          RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+          RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+        } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+        journal_item.completion == null;
+    end
+
+    projection_status = project_reconciled_journal_item_locked(
+      batch_record, journal_item, pending_active, terminal_known,
+      completion, status
+    );
+    if (projection_status == null || !projection_status.ok()) begin
+      status = (projection_status == null) ? invalid_state(
+        "CMQ reconcile projection returned null status"
+      ) : projection_status;
+      engine_lock.put(1);
+      return;
+    end
     engine_lock.put(1);
   endtask
 
@@ -5933,6 +13094,11 @@ class rdma_cmq_engine extends uvm_object;
     completions.delete();
     status = invalid_state("CMQ generation cancel did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (!(engine_state inside {
           RDMA_CMQ_ENGINE_PREPARED,
           RDMA_CMQ_ENGINE_ACTIVE,
@@ -5952,22 +13118,724 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 
-  // 功能：在 rdma_cmq_engine 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：completions（输出）、status（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
-  task reset(
+  // 功能：判断 retained journal item 是否必须在 reset 中转换为
+  // RESET_QUARANTINED，并保留一份 cancellation completion。
+  // 输入/输出及副作用：state 为只读生命周期状态；函数只返回分类结果，不修改 item、slot 或 proof。
+  // 失败/边界：STAGED/PENDING_EFFECT 也必须有完整 concrete effect 才能进入 reset staging；已完成/已隔离状态不重复取消。
+  protected function bit reset_item_requires_quarantine(
+    input rdma_cmq_submission_state_e state
+  );
+    return state inside {
+      RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED,
+      RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+      RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED,
+      RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED,
+      RDMA_CMQ_SUBMISSION_RESET_QUARANTINED
+    };
+  endfunction
+
+  // 功能：在 CMQ reset staging 中判断 retained item 是否仍需转换为
+  //   RESET_QUARANTINED；它复用 state 分类，并排除已经完成 reset isolation
+  //   confirmation 的 RESET_QUARANTINED item，供 affected/proof/reducer/cancel
+  //   四个阶段使用同一条 quarantine admission 规则。
+  // 输入/输出及副作用：state 与 reset_isolation_confirmed 为只读输入；函数返回
+  //   bit，不修改 journal item、proof、slot、completion 或任何 engine 账本，也不
+  //   取得锁和外部资源所有权。
+  // 失败/边界：state 不在 reset_item_requires_quarantine 的集合时返回 0；已处于
+  //   RESET_QUARANTINED 且 reset_isolation_confirmed=1 时返回 0，未确认的
+  //   RESET_QUARANTINED 仍返回 1；函数不验证 recovery owner、completion phase
+  //   或 recovery_required，调用方必须保留各自的结构和生命周期门禁。
+  protected function bit reset_item_needs_quarantine(
+    input rdma_cmq_submission_state_e state,
+    input bit reset_isolation_confirmed
+  );
+    return reset_item_requires_quarantine(state) &&
+           !(state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED &&
+             reset_isolation_confirmed);
+  endfunction
+
+  // 功能：在 observed reset staging 前以只读方式核对当前 runtime 的
+  //   slot/entry/command/token/cursor 图与 retained journal 的 exact locator，
+  //   让损坏的 POISONED/QUIESCED authority 在任何 release I/O 前 fail closed。
+  // 输入/输出及副作用：无外部输出；函数只读 engine ledger、当前 binding/CMQ
+  //   snapshot 与 journal，返回成功或具体 INVALID_STATE，不 poison、不清 FIFO、
+  //   不修复任何容器。
+  // 失败/边界：counter 逆序/越深、CQ 游标越界、slot incarnation/locator/ticket
+  //   漂移、entry/command/token membership 不精确、journal phase 不匹配或出现
+  //   stray token/registry row 时拒绝；空 runtime ledger 合法。
+  protected function rdma_status reset_runtime_ledger_status_locked();
+    longint unsigned used;
+    int unsigned slot_count;
+    int unsigned published_slot_count;
+    int unsigned quarantined_slot_count;
+    int unsigned token_count;
+
+    if (publish_seq < retire_seq)
+      return invalid_state("CMQ reset runtime publish counter precedes retire");
+    used = publish_seq - retire_seq;
+    if (used > CMQ_DEPTH)
+      return invalid_state("CMQ reset runtime ring occupancy exceeds depth");
+    if (cq_consume_seq < retire_seq || cq_consume_seq > publish_seq)
+      return invalid_state("CMQ reset runtime completion counters are inconsistent");
+
+    slot_count = 0;
+    published_slot_count = 0;
+    quarantined_slot_count = 0;
+    token_count = 0;
+    foreach (slots[i]) begin
+      rdma_cmq_slot_record record;
+      rdma_cmq_batch_submission_record batch_record;
+      rdma_cmq_batch_submission_item_record journal_item;
+      string hardware_key;
+      string software_key;
+
+      if (token_in_use[i])
+        token_count++;
+      record = slots[i];
+      if (record == null)
+        continue;
+      slot_count++;
+      if ($isunknown(record.slot_sequence) ||
+          $isunknown(record.sq_index) ||
+          $isunknown(record.sq_wrap) ||
+          $isunknown(record.state) ||
+          $isunknown(record.command_token) ||
+          record.sq_index != i || record.sq_index >= CMQ_DEPTH ||
+          record.sq_index != (record.slot_sequence % CMQ_DEPTH) ||
+          record.sq_wrap != ((record.slot_sequence / CMQ_DEPTH) % 2) ||
+          record.ticket == null || record.expected == null ||
+          record.batch_key.len() == 0 ||
+          record.journal_item_index >= CMQ_DEPTH ||
+          prepared_binding == null || cmq_snapshot == null ||
+          cmq_snapshot.handle == null)
+        return invalid_state("CMQ reset runtime slot authority is incomplete");
+      if (!rdma_cmq_ticket_shape_valid(record.ticket) ||
+          record.ticket.sq_index != record.sq_index ||
+          record.ticket.slot_sequence != record.slot_sequence ||
+          record.ticket.sq_wrap != record.sq_wrap ||
+          record.ticket.command_id[4:0] != record.command_token ||
+          record.ticket.function_h.generation != prepared_binding.generation ||
+          !prepared_binding.accepts(record.ticket.function_h) ||
+          !same_handle(record.ticket.cmq_h, cmq_snapshot.handle))
+        return invalid_state("CMQ reset runtime ticket authority is inconsistent");
+      if (!submission_journal.exists(record.batch_key) ||
+          submission_journal[record.batch_key] == null)
+        return invalid_state("CMQ reset runtime journal locator is unknown");
+      batch_record = submission_journal[record.batch_key];
+      if (record.journal_item_index >= batch_record.items.size())
+        return invalid_state("CMQ reset runtime journal item index is invalid");
+      journal_item = batch_record.items[record.journal_item_index];
+      if (journal_item == null || journal_item.ticket == null ||
+          !same_ticket_value(record.ticket, journal_item.ticket) ||
+          journal_item.slot_sequence != record.slot_sequence ||
+          journal_item.slot_index != record.sq_index ||
+          journal_item.slot_wrap != record.sq_wrap ||
+          journal_item.command_token != record.command_token)
+        return invalid_state("CMQ reset runtime slot/journal locator disagrees");
+
+      hardware_key = entry_key(record.sq_index, record.sq_wrap);
+      if (!entry_registry.exists(hardware_key) ||
+          entry_registry[hardware_key] != record)
+        return invalid_state("CMQ reset runtime entry registry is inconsistent");
+      software_key = command_key(record.ticket);
+      case (record.state)
+        CMQ_SLOT_PUBLISHED: begin
+          published_slot_count++;
+          if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_PENDING ||
+              journal_item.completion != null ||
+              !command_registry.exists(software_key) ||
+              command_registry[software_key] != record ||
+              record.command_token >= CMQ_DEPTH ||
+              !token_in_use[record.command_token] ||
+              token_incarnation[record.command_token] !=
+                record.ticket.command_id[63:5])
+            return invalid_state("CMQ reset runtime published membership is inconsistent");
+        end
+        CMQ_SLOT_TIMED_OUT_QUARANTINED: begin
+          quarantined_slot_count++;
+          if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_TIMEOUT ||
+              journal_item.completion == null ||
+              command_registry.exists(software_key) ||
+              record.command_token >= CMQ_DEPTH ||
+              !token_in_use[record.command_token] ||
+              token_incarnation[record.command_token] !=
+                record.ticket.command_id[63:5])
+            return invalid_state("CMQ reset runtime timeout membership is inconsistent");
+        end
+        CMQ_SLOT_RESET_CANCELLED: begin
+          quarantined_slot_count++;
+          if (journal_item.completion_phase !=
+                RDMA_CMQ_COMPLETION_RESET_CANCELLED ||
+              journal_item.completion == null ||
+              command_registry.exists(software_key) ||
+              record.command_token >= CMQ_DEPTH ||
+              !token_in_use[record.command_token] ||
+              token_incarnation[record.command_token] !=
+                record.ticket.command_id[63:5])
+            return invalid_state("CMQ reset runtime cancellation membership is inconsistent");
+        end
+        CMQ_SLOT_COMPLETED: begin
+          if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_TERMINAL ||
+              journal_item.completion == null ||
+              command_registry.exists(software_key) ||
+              (record.command_token < CMQ_DEPTH &&
+               token_in_use[record.command_token]))
+            return invalid_state("CMQ reset runtime completed membership is inconsistent");
+        end
+        CMQ_SLOT_LATE_COMPLETED: begin
+          if (journal_item.completion_phase !=
+                RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY ||
+              journal_item.completion == null ||
+              command_registry.exists(software_key) ||
+              (record.command_token < CMQ_DEPTH &&
+               token_in_use[record.command_token]))
+            return invalid_state("CMQ reset runtime late membership is inconsistent");
+        end
+        default:
+          return invalid_state("CMQ reset runtime slot state is unsupported");
+      endcase
+    end
+    if (slot_count != used || entry_registry.num() != slot_count ||
+        command_registry.num() != published_slot_count ||
+        token_count != published_slot_count + quarantined_slot_count)
+      return invalid_state("CMQ reset runtime ledger membership is inconsistent");
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在任何 engine-owned 状态变化前预建 reset candidate；它收集旧
+  //   Function/backing、逐项取消 completion、batch proof 和 detached 返回图。
+  // 输入/输出及副作用：candidate 为输出；只读当前 journal/profile/runtime，所有
+  //   new/clone/摘要计算均写入本地 candidate，不改 map、FIFO、counter、fence 或 state。
+  // 失败/边界：缺 backing/Function、journal invariant/digest/owner 损坏、proof tuple
+  //   不完整、ID 预估溢出或任一 snapshot/cancellation 构造失败均返回错误且输出 null。
+  protected function rdma_status stage_reset_candidate_locked(
+    output rdma_cmq_reset_candidate candidate
+  );
+    rdma_cmq_reset_candidate staged_candidate;
+    rdma_function_identity isolated_identity;
+    rdma_status status;
+    longint unsigned next_proof_id;
+    longint unsigned max_id;
+    string affected_batch_keys[$];
+
+    candidate = null;
+    max_id = 64'hffff_ffff_ffff_ffff;
+    if (!(engine_state inside {
+          RDMA_CMQ_ENGINE_PREPARED,
+          RDMA_CMQ_ENGINE_ACTIVE,
+          RDMA_CMQ_ENGINE_QUIESCED,
+          RDMA_CMQ_ENGINE_POISONED
+        }))
+      return invalid_state("CMQ reset candidate engine state is not resettable");
+    if (prepared_binding == null || backing_mapping == null || host_mem == null)
+      return invalid_state("CMQ reset candidate release authority is missing");
+    if (!rdma_cmq_try_snapshot_identity_direct(
+          prepared_binding.function_identity_snapshot(), isolated_identity
+        ))
+      return invalid_state("CMQ reset candidate Function snapshot failed");
+    staged_candidate = new("cmq_reset_candidate");
+    if (staged_candidate == null)
+      return invalid_state("CMQ reset candidate construction failed");
+    staged_candidate.isolated_identity = isolated_identity;
+    // 释放必须使用 adapter 产生的 opaque authority 快照，而不是把
+    // engine 当前可变 public mapping 句柄直接带出锁外。
+    status = backing_mapping.snapshot_release_authority(
+      staged_candidate.backing_release_authority
+    );
+    if (status == null || !status.ok() ||
+        staged_candidate.backing_release_authority == null)
+      return (status == null) ? invalid_state(
+        "CMQ reset backing authority snapshot returned null"
+      ) : status;
+    status = host_mem.validate_failure_atomic_release(
+      staged_candidate.backing_release_authority
+    );
+    if (status == null || !status.ok())
+      return (status == null) ? invalid_state(
+        "CMQ reset backing authority equivalence returned null"
+      ) : status;
+    // A poisoned runtime is still resettable only when its local authority is
+    // internally self-consistent.  This audit is deliberately read-only so a
+    // malformed slot/token/registry cannot be "recovered" by clearing it
+    // before the backing release transaction has succeeded.
+    status = reset_runtime_ledger_status_locked();
+    if (status == null || !status.ok())
+      return (status == null) ? invalid_state(
+        "CMQ reset runtime ledger audit returned null"
+      ) : status;
+    staged_candidate.runtime_backing_mapping = backing_mapping;
+    staged_candidate.backing_release_service = host_mem;
+    staged_candidate.runtime_host_mem = host_mem;
+    staged_candidate.backing_release_opaque = backing_release_opaque;
+    staged_candidate.runtime_state = engine_state;
+    staged_candidate.engine_incarnation = engine_incarnation;
+    staged_candidate.runtime_publish_seq = publish_seq;
+    staged_candidate.runtime_retire_seq = retire_seq;
+    staged_candidate.runtime_cq_consume_seq = cq_consume_seq;
+    staged_candidate.runtime_batch_id_counter = batch_id_counter;
+    staged_candidate.runtime_attempt_id_counter = attempt_id_counter;
+    staged_candidate.runtime_reset_proof_id_counter = reset_proof_id_counter;
+    staged_candidate.runtime_journal_count = submission_journal.num();
+    staged_candidate.runtime_ticket_index_count = journal_batch_by_ticket.num();
+    staged_candidate.runtime_preallocation_count =
+      preallocated_publish_batches.num();
+    staged_candidate.runtime_observer_count = arm_observers.num();
+    staged_candidate.runtime_command_count = command_registry.num();
+    staged_candidate.runtime_entry_count = entry_registry.num();
+    staged_candidate.runtime_terminal_fifo_count = terminal_fifo.size();
+    staged_candidate.runtime_diagnostic_fifo_count = diagnostic_fifo.size();
+    staged_candidate.runtime_late_fifo_count = late_final_fifo.size();
+    foreach (slots[slot_i]) begin
+      if (slots[slot_i] != null)
+        staged_candidate.runtime_slot_count++;
+      if (token_in_use[slot_i])
+        staged_candidate.runtime_token_count++;
+    end
+    staged_candidate.runtime_fenced_batch_key = fenced_batch_key;
+    staged_candidate.runtime_fence_reason = submission_fence_reason;
+
+    // 先只读扫描 retained rows，确定 N；counter 只有 commit 才能推进。
+    foreach (submission_journal[batch_key]) begin
+      rdma_cmq_batch_submission_record row;
+      rdma_cmq_hw_profile retained_profile;
+      bit affected;
+
+      row = submission_journal[batch_key];
+      if (row == null || row.engine_incarnation != engine_incarnation)
+        continue;
+      status = submission_journal_invariant_locked(batch_key);
+      if (status == null || !status.ok())
+        return (status == null) ? invalid_state(
+          "CMQ reset candidate journal invariant returned null"
+        ) : status;
+      retained_profile = journal_profile_by_batch[batch_key];
+      if (retained_profile == null)
+        return invalid_state("CMQ reset candidate retained profile is missing");
+      status = validate_submission_record_locked(row, retained_profile, 1'b0);
+      if (status == null || !status.ok())
+        return (status == null) ? invalid_state(
+          "CMQ reset candidate retained record validation returned null"
+        ) : status;
+      affected = 1'b0;
+      foreach (row.items[i]) begin
+        if (row.items[i] == null)
+          return invalid_state("CMQ reset candidate journal item is null");
+        if (row.items[i].state inside {
+              RDMA_CMQ_SUBMISSION_STAGED,
+              RDMA_CMQ_SUBMISSION_PENDING_EFFECT
+            })
+          return invalid_state(
+            "CMQ reset candidate contains an unobserved external effect"
+          );
+        if (reset_item_needs_quarantine(
+              row.items[i].state, row.items[i].reset_isolation_confirmed
+            ))
+          affected = 1'b1;
+      end
+      if (affected)
+        affected_batch_keys.push_back(batch_key);
+    end
+    if (affected_batch_keys.size() > (max_id - reset_proof_id_counter))
+      return journal_status(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "CMQ reset proof IDs would overflow"
+      );
+
+    // Existing delivery FIFO rows are copied before reset clears delivery order.
+    foreach (terminal_fifo[fifo_i]) begin
+      rdma_cmq_completion detached;
+      rdma_cmq_nonfatal_snapshot_context ctx_snapshot;
+      rdma_cmq_hw_profile fifo_profile;
+
+      if (terminal_fifo[fifo_i] == null || terminal_fifo[fifo_i].ticket == null)
+        return invalid_state("CMQ reset terminal FIFO contains an incomplete row");
+      fifo_profile = profile;
+      if (journal_batch_by_ticket.exists(command_key(
+            terminal_fifo[fifo_i].ticket
+          ))) begin
+        string fifo_batch_key;
+        fifo_batch_key = journal_batch_by_ticket[command_key(
+          terminal_fifo[fifo_i].ticket
+        )];
+        if (journal_profile_by_batch.exists(fifo_batch_key))
+          fifo_profile = journal_profile_by_batch[fifo_batch_key];
+      end
+      if (fifo_profile == null)
+        return invalid_state("CMQ reset FIFO retained profile is missing");
+      ctx_snapshot = new();
+      status = snapshot_completion_with_profile_locked(
+        terminal_fifo[fifo_i], ctx_snapshot, fifo_profile, detached
+      );
+      if (status == null || !status.ok() || detached == null)
+        return (status == null) ? invalid_state(
+          "CMQ reset FIFO completion snapshot returned null"
+        ) : status;
+      staged_candidate.returned_completions.push_back(detached);
+    end
+
+    next_proof_id = reset_proof_id_counter;
+    foreach (affected_batch_keys[b]) begin
+      rdma_cmq_batch_submission_record row;
+      rdma_cmq_hw_profile retained_profile;
+      rdma_cmq_reset_batch_candidate batch_candidate;
+      rdma_cmq_reset_isolation_proof proof;
+      rdma_cmq_reset_isolation_proof proof_snapshot;
+      rdma_function_identity proof_identity;
+      rdma_cmq_submission_state_e reduced_state;
+      rdma_cmq_batch_submission_item_record reducer_items[$];
+      longint unsigned proof_id;
+      string proof_key;
+      string failure_reason;
+
+      next_proof_id++;
+      proof_id = next_proof_id;
+      row = submission_journal[affected_batch_keys[b]];
+      retained_profile = journal_profile_by_batch[affected_batch_keys[b]];
+      if (row == null || retained_profile == null)
+        return invalid_state("CMQ reset candidate batch row/profile is missing");
+      if (!rdma_cmq_try_snapshot_identity_direct(
+            row.function_identity, proof_identity
+          ))
+        return invalid_state("CMQ reset candidate proof identity snapshot failed");
+      proof_key = $sformatf("%s|proof=%016h", row.batch_key, proof_id);
+      proof = new($sformatf("cmq_reset_journal_proof_%0d", b));
+      if (proof == null)
+        return invalid_state("CMQ reset proof construction failed");
+      proof.proof_key = proof_key;
+      proof.proof_id = proof_id;
+      proof.batch_key = row.batch_key;
+      proof.batch_id = row.batch_id;
+      proof.attempt_id = row.attempt_id;
+      proof.engine_instance_id = row.engine_instance_id;
+      proof.engine_incarnation = row.engine_incarnation;
+      proof.isolated_identity = proof_identity;
+      proof.replacement_identity = null;
+      proof.batch_digest = row.batch_digest;
+      proof.state = RDMA_CMQ_RESET_PROOF_AWAITING_REBIND;
+      proof.backing_release_confirmed = 1'b1;
+      foreach (row.items[i]) begin
+        rdma_cmq_recovery_owner owner_snapshot;
+
+        // The proof tuple names only items isolated by this reset.  Terminal
+        // COMPLETED/LATE rows remain retained evidence but are not new
+        // quarantine obligations and therefore are intentionally omitted.
+        if (row.items[i] == null)
+          return invalid_state("CMQ reset proof journal item is null");
+        if (!reset_item_needs_quarantine(
+              row.items[i].state, row.items[i].reset_isolation_confirmed
+            ))
+          continue;
+
+        if (row.items[i].recovery_owner == null)
+          return invalid_state("CMQ reset proof recovery owner is missing");
+        owner_snapshot = make_recovery_owner_locked(
+          $sformatf("cmq_reset_proof_owner_%0d_%0d", b, i),
+          row.items[i].recovery_owner
+        );
+        if (owner_snapshot == null)
+          return invalid_state("CMQ reset proof owner snapshot failed");
+        proof.isolated_request_indices.push_back(row.items[i].request_index);
+        proof.isolated_image_digests.push_back(row.items[i].image_digest);
+        proof.isolated_authority_digests.push_back(
+          row.items[i].authority_digest
+        );
+        proof.isolated_recovery_owners.push_back(owner_snapshot);
+      end
+      status = rdma_cmq_compute_reset_proof_digest(
+        proof.proof_key, proof.proof_id, proof.batch_key, proof.batch_id,
+        proof.attempt_id, proof.engine_instance_id, proof.engine_incarnation,
+        proof.isolated_identity, proof.batch_digest,
+        proof.isolated_request_indices, proof.isolated_image_digests,
+        proof.isolated_authority_digests, proof.isolated_recovery_owners,
+        proof.proof_digest
+      );
+      if (status == null || !status.ok())
+        return (status == null) ? invalid_state(
+          "CMQ reset proof digest computation returned null"
+        ) : status;
+      status = snapshot_reset_proof_locked(proof, proof_snapshot);
+      if (status == null || !status.ok() || proof_snapshot == null)
+        return (status == null) ? invalid_state(
+          "CMQ reset proof detached snapshot returned null"
+        ) : status;
+
+      batch_candidate = new($sformatf("cmq_reset_batch_%0d", b));
+      if (batch_candidate == null)
+        return invalid_state("CMQ reset batch candidate construction failed");
+      batch_candidate.batch_key = row.batch_key;
+      batch_candidate.quarantined_record = row;
+      batch_candidate.journal_proof = proof;
+      batch_candidate.returned_proof = proof_snapshot;
+
+      foreach (row.items[i]) begin
+        rdma_cmq_batch_submission_item_record reducer_item;
+        bit needs_reset;
+
+        reducer_item = new($sformatf("cmq_reset_reducer_%0d_%0d", b, i));
+        if (reducer_item == null)
+          return invalid_state("CMQ reset reducer candidate construction failed");
+        needs_reset = reset_item_needs_quarantine(
+          row.items[i].state, row.items[i].reset_isolation_confirmed
+        );
+        reducer_item.state = needs_reset ?
+          RDMA_CMQ_SUBMISSION_RESET_QUARANTINED : row.items[i].state;
+        reducer_items.push_back(reducer_item);
+      end
+      status = rdma_cmq_reduce_batch_state(reducer_items, reduced_state);
+      if (status == null || !status.ok())
+        return (status == null) ? invalid_state(
+          "CMQ reset batch reducer returned null"
+        ) : status;
+      batch_candidate.reduced_state = reduced_state;
+
+      foreach (row.items[i]) begin
+        rdma_cmq_batch_submission_item_record item;
+        rdma_cmq_slot_record slot_candidate;
+        rdma_cmq_completion cancellation;
+        rdma_cmq_completion detached_cancellation;
+        rdma_cmq_nonfatal_snapshot_context ctx_snapshot;
+        rdma_cmq_reset_item_candidate item_candidate;
+        bit needs_reset;
+        bit timeout_tombstone;
+
+        item = row.items[i];
+        needs_reset = reset_item_needs_quarantine(
+          item.state, item.reset_isolation_confirmed
+        );
+        if (!needs_reset)
+          continue;
+        // A strict generation cancel may already have installed the retained
+        // RESET_CANCELLED completion.  Observed reset still includes that
+        // item in the proof tuple, but must not mint or return a duplicate.
+        if (item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED)
+          continue;
+        timeout_tombstone =
+          item.state == RDMA_CMQ_SUBMISSION_TIMED_OUT_QUARANTINED;
+        if (item.ticket == null || item.command_token >= CMQ_DEPTH ||
+            item.entry_key.len() == 0 ||
+            (timeout_tombstone &&
+             (item.completion == null ||
+              item.completion_phase != RDMA_CMQ_COMPLETION_TIMEOUT ||
+              item.completion.ticket != item.ticket ||
+              item.completion.status != item.status)) ||
+            (!timeout_tombstone && item.completion != null))
+          return invalid_state("CMQ reset item cancellation authority is incomplete");
+        slot_candidate = new($sformatf("cmq_reset_slot_%0d_%0d", b, i));
+        slot_candidate.slot_sequence = item.slot_sequence;
+        slot_candidate.sq_index = item.slot_index;
+        slot_candidate.sq_wrap = item.slot_wrap;
+        // A timeout tombstone already owns the quarantined slot/token.  The
+        // candidate only borrows that identity to construct a new reset
+        // completion; it does not replay cancellation side effects.
+        slot_candidate.state = timeout_tombstone ?
+          CMQ_SLOT_TIMED_OUT_QUARANTINED : CMQ_SLOT_PUBLISHED;
+        slot_candidate.ticket = item.ticket;
+        slot_candidate.command_token = item.command_token;
+        slot_candidate.batch_key = row.batch_key;
+        slot_candidate.journal_item_index = i;
+        status = make_cancel_completion(slot_candidate, cancellation);
+        if (status == null || !status.ok() || cancellation == null)
+          return (status == null) ? invalid_state(
+            "CMQ reset cancellation completion returned null"
+          ) : status;
+        ctx_snapshot = new();
+        status = snapshot_completion_with_profile_locked(
+          cancellation, ctx_snapshot, retained_profile, detached_cancellation
+        );
+        if (status == null || !status.ok() || detached_cancellation == null)
+          return (status == null) ? invalid_state(
+            "CMQ reset cancellation snapshot returned null"
+          ) : status;
+        item_candidate = new($sformatf("cmq_reset_item_%0d_%0d", b, i));
+        if (item_candidate == null)
+          return invalid_state("CMQ reset item candidate construction failed");
+        item_candidate.batch_key = row.batch_key;
+        item_candidate.journal_item_index = i;
+        item_candidate.request_index = item.request_index;
+        item_candidate.slot_index = item.slot_index;
+        item_candidate.command_key = command_key(item.ticket);
+        item_candidate.entry_key = item.entry_key;
+        item_candidate.cancellation_completion = cancellation;
+        staged_candidate.items.push_back(item_candidate);
+        staged_candidate.returned_completions.push_back(detached_cancellation);
+      end
+      staged_candidate.batches.push_back(batch_candidate);
+    end
+    candidate = staged_candidate;
+    return journal_status(RDMA_SC_OK);
+  endfunction
+
+  // 功能：把已通过 backing release 的 reset candidate 无失败地写回 retained
+  //   rows，并清空旧 runtime/fence/preallocation authority。
+  // 输入/输出及副作用：candidate 为锁内完整输入；写入 journal item/batch、proof counter
+  //   和既有 runtime 容器，不创建对象、不调用 adapter/scheduler，不返回 status。
+  // 失败/边界：调用方必须先完成 stage、validator 与 release；若 candidate 缺少任一
+  //   prebuilt handle 属于内部 invariant 破坏，函数只保守跳过该句柄而不做外部 I/O。
+  protected function void commit_reset_candidate_locked(
+    input rdma_cmq_reset_candidate candidate
+  );
+    if (candidate == null)
+      return;
+    foreach (candidate.batches[b]) begin
+      rdma_cmq_reset_batch_candidate batch_candidate;
+
+      batch_candidate = candidate.batches[b];
+      if (batch_candidate == null || batch_candidate.quarantined_record == null)
+        continue;
+      foreach (candidate.items[i]) begin
+        rdma_cmq_reset_item_candidate item_candidate;
+        rdma_cmq_batch_submission_item_record item;
+
+        item_candidate = candidate.items[i];
+        if (item_candidate == null || item_candidate.batch_key !=
+              batch_candidate.batch_key)
+          continue;
+        if (item_candidate.journal_item_index >=
+              batch_candidate.quarantined_record.items.size())
+          continue;
+        item = batch_candidate.quarantined_record.items[
+          item_candidate.journal_item_index
+        ];
+        if (item == null || item_candidate.cancellation_completion == null)
+          continue;
+        // The retained journal contract requires completion.ticket and
+        // item.ticket to be the same authoritative handle.  The candidate
+        // completion was detached for caller delivery during staging, so
+        // restore this engine-owned alias only at the allocation-free commit.
+        item_candidate.cancellation_completion.ticket = item.ticket;
+        item.status = item_candidate.cancellation_completion.status;
+        item.completion = item_candidate.cancellation_completion;
+        item.state = RDMA_CMQ_SUBMISSION_RESET_QUARANTINED;
+        item.completion_phase = RDMA_CMQ_COMPLETION_RESET_CANCELLED;
+        item.reset_isolation_confirmed =
+          item.recovery_owner != null &&
+          item.recovery_owner.is_legacy_unmigrated();
+        item.recovery_required = !item.reset_isolation_confirmed;
+      end
+      batch_candidate.quarantined_record.reset_isolation_proof =
+        batch_candidate.journal_proof;
+      batch_candidate.quarantined_record.state = batch_candidate.reduced_state;
+      batch_candidate.quarantined_record.observer_armed = 1'b0;
+    end
+    reset_proof_id_counter += candidate.batches.size();
+    arm_observers.delete();
+    preallocated_publish_batches.delete();
+    fenced_batch_key = "";
+    submission_fence_reason = "";
+    clear_configuration();
+    engine_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
+  endfunction
+
+  // 设计说明：backing release 在锁外执行，返回后必须用同一把锁重验 candidate
+  //   捕获的 runtime 代际、账本规模和 retained row，才能把外部释放结果安全地
+  //   接回本 engine。该 helper 只读两侧快照，不把 CAS 重验变成第二个提交点。
+  // 功能：比较 reset candidate 与当前 engine 的完整 runtime authority，确认释放
+  //   期间没有并发生命周期漂移，并验证每个待隔离 batch 仍指向原 retained row。
+  // 输入/输出及副作用：candidate 为锁内 staged reset 图；返回 bit 表示所有
+  //   state、mapping/host_mem、代际、counter、表/队列计数、fence、slot/token
+  //   计数及 batch identity 检查是否通过；函数不写 engine、不取放锁、不调用 I/O。
+  // 失败/边界：candidate 为 null、任一 scalar/count 不一致、slot/token 数漂移、
+  //   batch 缺失、retained row 非 exact alias、incarnation 或 isolated identity
+  //   不一致均返回 0；短路顺序和 `!==` retained-row 比较保持 reset 原契约。
+  protected function automatic bit reset_candidate_runtime_matches_locked(
+    input rdma_cmq_reset_candidate candidate
+  );
+    bit runtime_unchanged;
+
+    if (candidate == null)
+      return 1'b0;
+    runtime_unchanged =
+      engine_state == candidate.runtime_state &&
+      backing_mapping === candidate.runtime_backing_mapping &&
+      host_mem === candidate.runtime_host_mem &&
+      backing_release_opaque == candidate.backing_release_opaque &&
+      engine_incarnation == candidate.engine_incarnation &&
+      publish_seq == candidate.runtime_publish_seq &&
+      retire_seq == candidate.runtime_retire_seq &&
+      cq_consume_seq == candidate.runtime_cq_consume_seq &&
+      batch_id_counter == candidate.runtime_batch_id_counter &&
+      attempt_id_counter == candidate.runtime_attempt_id_counter &&
+      reset_proof_id_counter == candidate.runtime_reset_proof_id_counter &&
+      submission_journal.num() == candidate.runtime_journal_count &&
+      journal_batch_by_ticket.num() == candidate.runtime_ticket_index_count &&
+      preallocated_publish_batches.num() ==
+        candidate.runtime_preallocation_count &&
+      arm_observers.num() == candidate.runtime_observer_count &&
+      command_registry.num() == candidate.runtime_command_count &&
+      entry_registry.num() == candidate.runtime_entry_count &&
+      terminal_fifo.size() == candidate.runtime_terminal_fifo_count &&
+      diagnostic_fifo.size() == candidate.runtime_diagnostic_fifo_count &&
+      late_final_fifo.size() == candidate.runtime_late_fifo_count &&
+      fenced_batch_key == candidate.runtime_fenced_batch_key &&
+      submission_fence_reason == candidate.runtime_fence_reason;
+    if (runtime_unchanged) begin
+      int unsigned current_slot_count;
+      int unsigned current_token_count;
+
+      current_slot_count = 0;
+      current_token_count = 0;
+      foreach (slots[slot_i]) begin
+        if (slots[slot_i] != null)
+          current_slot_count++;
+        if (token_in_use[slot_i])
+          current_token_count++;
+      end
+      runtime_unchanged =
+        current_slot_count == candidate.runtime_slot_count &&
+        current_token_count == candidate.runtime_token_count;
+    end
+    if (runtime_unchanged) begin
+      foreach (candidate.batches[b]) begin
+        rdma_cmq_batch_submission_record retained_row;
+
+        if (candidate.batches[b] == null ||
+            candidate.batches[b].quarantined_record == null ||
+            !submission_journal.exists(candidate.batches[b].batch_key)) begin
+          runtime_unchanged = 1'b0;
+          break;
+        end
+        retained_row = submission_journal[candidate.batches[b].batch_key];
+        if (retained_row !== candidate.batches[b].quarantined_record ||
+            retained_row.engine_incarnation != candidate.engine_incarnation ||
+            retained_row.function_identity == null ||
+            candidate.isolated_identity == null ||
+            !retained_row.function_identity.same_incarnation(
+              candidate.isolated_identity
+            )) begin
+          runtime_unchanged = 1'b0;
+          break;
+        end
+      end
+    end
+    return runtime_unchanged;
+  endfunction
+
+  // 功能：执行 failure-atomic observed reset：先校验 release capability，再
+  //   staging、backing release 和 allocation-free commit，最后发布 detached outputs。
+  // 输入/输出及副作用：completions/proofs/status 为输出；成功释放旧 backing、隔离
+  //   retained rows 并返回取消 completion/proof 快照，失败清空 outputs 且不改 engine。
+  // 失败/边界：UNCONFIGURED 幂等成功；validator/release 返回 null 或 non-OK 时不
+  //   调用 destructive cancel/clear，保留 runtime/journal/fence/counter/handles 原值。
+  task reset_observed(
     output rdma_cmq_completion completions[$],
+    output rdma_cmq_reset_isolation_proof proofs[],
     output rdma_status status
   );
+    rdma_cmq_reset_candidate candidate;
     rdma_status release_status;
-    bit was_poisoned;
+    rdma_status validation_status;
+    bit candidate_runtime_unchanged;
 
     completions.delete();
-    status = invalid_state("CMQ reset did not complete");
+    proofs = new[0];
+    status = invalid_state("CMQ observed reset did not complete");
     engine_lock.get(1);
-    was_poisoned = (engine_state == RDMA_CMQ_ENGINE_POISONED);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
-      clear_configuration();
       status = rdma_status::success();
       engine_lock.put(1);
       return;
@@ -5978,57 +13846,227 @@ class rdma_cmq_engine extends uvm_object;
           RDMA_CMQ_ENGINE_QUIESCED,
           RDMA_CMQ_ENGINE_POISONED
         })) begin
-      status = invalid_state("CMQ engine state cannot be reset");
+      status = invalid_state("CMQ engine state cannot be observed-reset");
       engine_lock.put(1);
       return;
     end
-    if (prepared_binding != null) begin
-      status = cancel_generation_locked(
-        prepared_binding.generation, was_poisoned
-      );
-      if (status == null || !status.ok()) begin
-        if (status == null)
-          status = invalid_state("CMQ reset cancellation returned null");
-        engine_lock.put(1);
-        return;
-      end
-    end
-    late_final_fifo.delete();
-    if (backing_mapping == null || host_mem == null) begin
-      engine_state = RDMA_CMQ_ENGINE_POISONED;
+    if (host_mem == null || backing_mapping == null) begin
       status = invalid_state("CMQ reset release authority is missing");
       engine_lock.put(1);
       return;
     end
-    if (backing_release_opaque)
-      release_status = host_mem.release_opaque(backing_mapping);
+    validation_status = host_mem.validate_failure_atomic_release(
+      backing_mapping
+    );
+    if (validation_status == null || !validation_status.ok()) begin
+      status = (validation_status == null) ? invalid_state(
+        "CMQ reset release validator returned null status"
+      ) : validation_status;
+      engine_lock.put(1);
+      return;
+    end
+    status = stage_reset_candidate_locked(candidate);
+    if (status == null || !status.ok() || candidate == null) begin
+      status = (status == null) ? invalid_state(
+        "CMQ reset candidate staging returned null status"
+      ) : status;
+      engine_lock.put(1);
+      return;
+    end
+    // Outputs and all detached graphs are sized before the external release;
+    // release failure can therefore clear them without allocating or mutating rows.
+    proofs = new[candidate.batches.size()];
+    foreach (candidate.batches[i])
+      proofs[i] = candidate.batches[i].returned_proof;
+    foreach (candidate.returned_completions[i])
+      completions.push_back(candidate.returned_completions[i]);
+
+    // Keep the gate asserted for the entire external release window.  Any
+    // lifecycle entry that was queued behind engine_lock will observe it before
+    // touching the staged runtime graph.
+    reset_release_in_progress = 1'b1;
+
+    // The adapter call is intentionally outside engine_lock.  The candidate
+    // retains only detached release authority plus local witnesses; no
+    // engine-owned graph is exposed to the adapter.
+    engine_lock.put(1);
+    if (candidate.backing_release_service == null)
+      release_status = invalid_state(
+        "CMQ reset candidate release service is missing"
+      );
     else
-      release_status = host_mem.\release (backing_mapping);
-    if (release_status == null) begin
-      retain_release_authority(backing_mapping, host_mem,
-                               backing_release_opaque);
-      status = invalid_state("CMQ reset release returned null status");
+      release_status = candidate.backing_release_service.release_opaque(
+        candidate.backing_release_authority
+      );
+
+    engine_lock.get(1);
+    if (release_status == null || !release_status.ok()) begin
+      completions.delete();
+      proofs.delete();
+      reset_release_in_progress = 1'b0;
+      status = (release_status == null) ? invalid_state(
+        "CMQ reset release returned null status"
+      ) : release_status;
       engine_lock.put(1);
       return;
     end
-    if (!release_status.ok()) begin
-      retain_release_authority(backing_mapping, host_mem,
-                               backing_release_opaque);
-      status = release_status;
+
+    // Any concurrent lifecycle change invalidates the staged graph.  In the
+    // normal SV execution model release_opaque is non-blocking, but this
+    // explicit CAS-style revalidation protects future adapters that yield.
+    candidate_runtime_unchanged =
+      reset_candidate_runtime_matches_locked(candidate);
+    if (!candidate_runtime_unchanged) begin
+      completions.delete();
+      proofs.delete();
+      // release_opaque() has already retired the allocation.  The staged
+      // candidate is no longer safe to commit after a runtime drift, so drop
+      // every runtime/backing alias and leave an explicitly poisoned engine.
+      poison_released_runtime_drift_locked();
+      status = invalid_state(
+        "CMQ reset runtime authority changed during backing release"
+      );
       engine_lock.put(1);
       return;
     end
-    while (terminal_fifo.size() != 0)
-      completions.push_back(terminal_fifo.pop_front());
-    clear_configuration();
-    engine_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
+
+    commit_reset_candidate_locked(candidate);
     status = rdma_status::success();
     engine_lock.put(1);
   endtask
 
-  // 功能：在 rdma_cmq_engine 中，state 在锁保护下返回当前 engine/runtime 状态，不改变队列或恢复账本。
-  // 输入/输出及副作用：无显式参数；state 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_cmq_engine_state_e，不取得调用方资源所有权。
-  // 失败/边界：state 是只读访问器，返回 engine_state；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：按唯一 proof_key 扫描 retained journal，返回 proof 的 detached 快照，
+  //   不建立第二张 proof authority table。
+  // 输入/输出及副作用：proof_key 为只读输入；proof/status 为输出；只读 journal/profile
+  //   并执行 uniqueness/full-value snapshot，不调用 adapter、scheduler 或 reset。
+  // 失败/边界：空/未知 key 返回 INVALID_ARGUMENT；重复 key、损坏 batch/proof 或
+  //   snapshot 失败返回 INVALID_STATE，且不发布 partial proof。
+  task query_reset_isolation_proof(
+    input string proof_key,
+    output rdma_cmq_reset_isolation_proof proof,
+    output rdma_status status
+  );
+    rdma_cmq_reset_isolation_proof source;
+    int unsigned match_count;
+
+    proof = null;
+    status = invalid_state("CMQ reset proof query did not complete");
+    if (proof_key.len() == 0) begin
+      status = invalid_argument("CMQ reset proof key is empty");
+      return;
+    end
+    engine_lock.get(1);
+    match_count = 0;
+    foreach (submission_journal[batch_key]) begin
+      rdma_cmq_batch_submission_record row;
+      rdma_cmq_hw_profile retained_profile;
+      rdma_cmq_reset_isolation_proof row_proof_snapshot;
+      rdma_status row_status;
+      bit row_set_present;
+
+      row = submission_journal[batch_key];
+      if (row == null)
+        continue;
+      if (row.reset_isolation_proof != null &&
+          row.reset_isolation_proof.proof_key == proof_key) begin
+        row_status = journal_row_set_existence_locked(
+          batch_key, row_set_present
+        );
+        if (row_status == null || !row_status.ok() || !row_set_present) begin
+          status = (row_status == null) ? journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ reset proof journal row invariant returned null"
+          ) : journal_status(RDMA_SC_INVALID_STATE, row_status.message);
+          engine_lock.put(1);
+          return;
+        end
+        if (!journal_profile_by_batch.exists(batch_key) ||
+            journal_profile_by_batch[batch_key] == null) begin
+          status = journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ reset proof retained profile is missing"
+          );
+          engine_lock.put(1);
+          return;
+        end
+        retained_profile = journal_profile_by_batch[batch_key];
+        row_status = validate_submission_record_locked(
+          row, retained_profile, 1'b0
+        );
+        if (row_status == null || !row_status.ok()) begin
+          status = (row_status == null) ? journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ reset proof retained journal validation returned null"
+          ) : journal_status(RDMA_SC_INVALID_STATE, row_status.message);
+          engine_lock.put(1);
+          return;
+        end
+        row_status = snapshot_reset_proof_locked(
+          row.reset_isolation_proof, row_proof_snapshot
+        );
+        if (row_status == null || !row_status.ok() ||
+            row_proof_snapshot == null ||
+            row_proof_snapshot.batch_key != row.batch_key ||
+            row_proof_snapshot.batch_id != row.batch_id ||
+            row_proof_snapshot.attempt_id != row.attempt_id ||
+            row_proof_snapshot.engine_instance_id != row.engine_instance_id ||
+            row_proof_snapshot.engine_incarnation != row.engine_incarnation ||
+            row.function_identity == null ||
+            row_proof_snapshot.isolated_identity == null ||
+            !row_proof_snapshot.isolated_identity.same_incarnation(
+              row.function_identity
+            )) begin
+          status = journal_status(
+            RDMA_SC_INVALID_STATE,
+            "CMQ reset proof retained value does not bind its journal row"
+          );
+          engine_lock.put(1);
+          return;
+        end
+        match_count++;
+        source = row.reset_isolation_proof;
+      end
+    end
+    if (match_count == 0) begin
+      status = invalid_argument("CMQ reset proof key is not retained");
+      engine_lock.put(1);
+      return;
+    end
+    if (match_count != 1) begin
+      status = invalid_state("CMQ reset proof key is not unique");
+      engine_lock.put(1);
+      return;
+    end
+    status = snapshot_reset_proof_locked(source, proof);
+    if (status == null)
+      status = invalid_state("CMQ reset proof snapshot returned null status");
+    engine_lock.put(1);
+  endtask
+
+  // 功能：在 rdma_cmq_engine 中把 legacy reset 调用转发到一次
+  //   reset_observed()，保留历史 completion/status 投影并建立新生命周期边界。
+  // 输入/输出及副作用：completions 与 status 为输出；内部临时
+  //   ignored_proofs 接收 observed proof 输出后立即丢弃，调用方不取得 proof 所有权。
+  // 失败/边界：validator、staging、backing release 或 commit 失败时传播
+  //   reset_observed() 的非空 status；wrapper 不重复 cancel、release 或清理 runtime。
+  task reset(
+    output rdma_cmq_completion completions[$],
+    output rdma_status status
+  );
+    rdma_cmq_reset_isolation_proof ignored_proofs[];
+
+    // Legacy callers receive exactly the historical completion/status
+    // projection.  All lifecycle, release and proof authority lives in the
+    // single observed-reset transaction; this wrapper must not cancel twice.
+    reset_observed(completions, ignored_proofs, status);
+  endtask
+
+  // 功能：返回当前 engine_state，供调用方在静止窗口核对 ACTIVE、POISONED
+  //   或 reset 后的生命周期阶段，不推进 ring/journal/fence。
+  // 输入/输出及副作用：无参数；直接读取 engine_state 并返回原枚举值，
+  //   不取 engine_lock、不分配 snapshot、不更新外部 adapter。
+  // 失败/边界：没有错误状态或额外枚举映射；并发调用方不得把无锁返回值
+  //   当作与 journal、cursor 或 reset epoch 一致的原子快照。
   function rdma_cmq_engine_state_e state();
     return engine_state;
   endfunction
@@ -6048,16 +14086,22 @@ class rdma_cmq_engine extends uvm_object;
     return snapshot;
   endfunction
 
-  // 功能：published_count 只读当前账本/队列状态并计算 longint unsigned 计数或可用容量，不推进任何事务游标。
-  // 输入/输出及副作用：无显式参数；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
+  // 功能：返回 rdma_cmq_engine 已发布的累计 sequence，供测试和诊断观察
+  //   publication 进度，不重新计算或推进任何 ledger 状态。
+  // 输入/输出及副作用：无参数；只读 publish_seq 并返回 longint unsigned，
+  //   不写入 engine、队列、外部 adapter 或 scheduler。
+  // 失败/边界：这是纯只读访问器，不具备失败分支；其值仅在 engine 生命周期
+  //   内单调更新，调用方不得把它当作可写 cursor 或独立 authority。
   function longint unsigned published_count();
     return publish_seq;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，retired_count 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：无显式参数；retired_count 可能更新本对象明确拥有的状态；函数返回 longint unsigned，不取得调用方资源所有权。
-  // 失败/边界：retired_count 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：返回 rdma_cmq_engine 已按有序规则退休的累计 sequence，供
+  //   completion/ledger 诊断读取当前 retire 进度。
+  // 输入/输出及副作用：无参数；只读 retire_seq 并返回 longint unsigned，
+  //   不释放记录、不删除 registry，也不取得外部资源所有权。
+  // 失败/边界：这是纯只读访问器，不具备失败分支；返回值只反映 engine
+  //   已提交的 retire cursor，不能被调用方当作可复用 slot 的授权。
   function longint unsigned retired_count();
     return retire_seq;
   endfunction
@@ -6115,6 +14159,11 @@ class rdma_cmq_engine extends uvm_object;
 
     status = invalid_state("CMQ shutdown did not complete");
     engine_lock.get(1);
+    status = reset_release_gate_status();
+    if (!status.ok()) begin
+      engine_lock.put(1);
+      return;
+    end
     if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
       clear_configuration();
       status = rdma_status::success();
@@ -6180,3 +14229,18 @@ class rdma_cmq_engine extends uvm_object;
     engine_lock.put(1);
   endtask
 endclass
+
+// 功能：在 doorbell 即将进入 MMIO 时把本 exact observer 交给 owner 认证与 arm。
+// 输入/输出及副作用：无显式输入/返回值；已配置时同步调用
+//   owner.arm_submission_for_mmio(this)，成功副作用由 engine 入口定义。
+// 失败/边界：未配置或 owner=null 仅发布单一稳定 UVM_ERROR 并返回；
+//   不解引用 null owner，不等待、分配、取锁或调用 scheduler/service/adapter。
+function void
+rdma_cmq_mmio_arm_observer::before_mmio_maybe_visible();
+  if (!configured || owner == null) begin
+    `uvm_error("RDMA_CMQ_MMIO_ARM_INVALID",
+               "CMQ MMIO arm capability is invalid")
+    return;
+  end
+  owner.arm_submission_for_mmio(this);
+endfunction

@@ -47,8 +47,8 @@ class rdma_queue_cursor_snapshot extends uvm_object;
   bit wrap;
 
   // 功能：构造默认指向 ring 第 0 项、未回卷的 cursor 值对象。
-  // 输入输出及副作用：name（输入）仅设置 UVM 对象名；初始化 index=0/wrap=0。
-  // 失败边界：构造不知道 ring depth，因此 0/0 只是值默认项，不是已授权 reservation。
+  // 输入/输出及副作用：name（输入）仅设置 UVM 对象名；初始化 index=0/wrap=0。
+  // 失败/边界：构造不知道 ring depth，因此 0/0 只是值默认项，不是已授权 reservation。
   function new(string name = "rdma_queue_cursor_snapshot");
     super.new(name);
     index = 0;
@@ -56,8 +56,8 @@ class rdma_queue_cursor_snapshot extends uvm_object;
   endfunction
 
   // 功能：将 rhs 中 rdma_queue_cursor_snapshot 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入输出及副作用：rhs（输入）；类型正确时覆盖当前 index/wrap，不修改 rhs。
-  // 失败边界：rhs 为 null 或类型不匹配时保留当前 cursor；本函数不验证 index<depth。
+  // 输入/输出及副作用：rhs（输入）；类型正确时覆盖当前 index/wrap，不修改 rhs。
+  // 失败/边界：rhs 为 null 或类型不匹配时保留当前 cursor；本函数不验证 index<depth。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_cursor_snapshot source;
     super.do_copy(rhs);
@@ -84,6 +84,19 @@ class rdma_queue_pending_operation extends uvm_object;
   bit cq_consumer_committed;
   bit completion_released;
   bit consumer_doorbell_succeeded;
+  // CQ shadow publication is a host-memory write, not an MMIO doorbell.  Keep
+  // its immutable target and phase markers separate so NO_SUBMIT remains the
+  // truthful MMIO evidence while recovery can still prove publication.
+  bit consumer_shadow_required;
+  // 0 = ordinary RC/UD CQC CI shadow; 1 = URC packed SQ/RQ consumer cursors.
+  // This authority is frozen with the pending value so recovery never guesses
+  // a layout from the payload's high byte.
+  bit consumer_shadow_urc;
+  bit consumer_shadow_attempted;
+  bit consumer_shadow_published;
+  longint unsigned consumer_shadow_offset;
+  int unsigned consumer_shadow_length;
+  int unsigned consumer_shadow_value;
   longint unsigned entry_offset;
   rdma_queue_cursor_snapshot cursor;
   // 中文设计：next_cursor 是事务成功后的唯一预期位置，防止 recovery
@@ -118,9 +131,9 @@ class rdma_queue_pending_operation extends uvm_object;
   bit epoch_valid;
 
   // 功能：构造一个尚未具备任何可提交 authority 的 pending evidence 外壳。
-  // 输入输出及副作用：name（输入）设置 UVM 名称；所有 handle/快照置 null、
+  // 输入/输出及副作用：name（输入）设置 UVM 名称；所有 handle/快照置 null、
   //   阶段位清零、kind 默认 SQ、MMIO authority 置 RDMA_QUEUE_MMIO_NONE。
-  // 失败边界：默认对象不能直接交给 recovery；缺 queue_h/cursor/image/status/
+  // 失败/边界：默认对象不能直接交给 recovery；缺 queue_h/cursor/image/status/
   //   route/epoch 的 device evidence 必须在 enter_recovery_prepared 被拒绝。
   function new(string name = "rdma_queue_pending_operation");
     super.new(name);
@@ -133,6 +146,13 @@ class rdma_queue_pending_operation extends uvm_object;
     cq_consumer_committed = 0;
     completion_released = 0;
     consumer_doorbell_succeeded = 0;
+    consumer_shadow_required = 0;
+    consumer_shadow_urc = 0;
+    consumer_shadow_attempted = 0;
+    consumer_shadow_published = 0;
+    consumer_shadow_offset = 0;
+    consumer_shadow_length = 0;
+    consumer_shadow_value = 0;
     entry_offset = 0;
     cursor = null;
     next_cursor = null;
@@ -159,9 +179,9 @@ class rdma_queue_pending_operation extends uvm_object;
 
   // 功能：do_copy 为 UVM print/clone 兼容复制 pending 标量，并为 queue/cursor/
   //   image/status 建立局部值对象。
-  // 输入输出及副作用：rhs（输入）；覆盖当前对象。routed_qp_h 和
+  // 输入/输出及副作用：rhs（输入）；覆盖当前对象。routed_qp_h 和
   //   request_snapshot 按兼容契约复制为非拥有别名，因为本 void 入口无法返回深拷贝失败。
-  // 失败边界：rhs 为 null/类型不匹配时保留当前值；需要全局 detached、
+  // 失败/边界：rhs 为 null/类型不匹配时保留当前值；需要全局 detached、
   //   non-fatal 的 recovery 调用方必须使用 runtime.query_pending/clone_pending_value。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_pending_operation source;
@@ -187,6 +207,13 @@ class rdma_queue_pending_operation extends uvm_object;
     cq_consumer_committed = source.cq_consumer_committed;
     completion_released = source.completion_released;
     consumer_doorbell_succeeded = source.consumer_doorbell_succeeded;
+    consumer_shadow_required = source.consumer_shadow_required;
+    consumer_shadow_urc = source.consumer_shadow_urc;
+    consumer_shadow_attempted = source.consumer_shadow_attempted;
+    consumer_shadow_published = source.consumer_shadow_published;
+    consumer_shadow_offset = source.consumer_shadow_offset;
+    consumer_shadow_length = source.consumer_shadow_length;
+    consumer_shadow_value = source.consumer_shadow_value;
     entry_offset = source.entry_offset;
     mmio_maybe_submitted = source.mmio_maybe_submitted;
     known_no_mmio = source.known_no_mmio;
@@ -279,9 +306,9 @@ class rdma_queue_slot_ledger_entry extends uvm_object;
   rdma_status completion_status;
 
   // 功能：构造一个未 post、未 consume 的 host WQE ledger slot。
-  // 输入输出及副作用：name（输入）设置 UVM 名称；清零游标/元数据并置
+  // 输入/输出及副作用：name（输入）设置 UVM 名称；清零游标/元数据并置
   //   request_snapshot、image、completion_status 为 null。
-  // 失败边界：初始 slot 不代表可消费 WQE；只有 commit_producer 可以将 posted 置位。
+  // 失败/边界：初始 slot 不代表可消费 WQE；只有 commit_producer 可以将 posted 置位。
   function new(string name = "rdma_queue_slot_ledger_entry");
     super.new(name);
     posted = 0;
@@ -338,10 +365,10 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：factory_create_object_nonfatal 绕过 registry::create() 的 FCTTYP fatal，
   //   从 UVM factory 获取原始对象，由各值副本边界显式执行类型转换。
-  // 输入输出及副作用：requested_type/name（输入）；返回 factory 创建的
+  // 输入/输出及副作用：requested_type/name（输入）；返回 factory 创建的
   //   uvm_object，不修改 runtime 或转移其它对象的所有权。
-  // 失败边界：requested_type 为 null，factory 返回 null 或错误类型时，本
-  //   helper 均不报 fatal；调用方必须将 null/转换失败归一化为非成功状态。
+  // 失败/边界：requested_type 或全局 factory 为 null、factory 返回 null 时，本
+  //   helper 不报 fatal；动态类型转换由调用方显式检查，失败必须归一化为非成功状态。
   protected function uvm_object factory_create_object_nonfatal(
     uvm_object_wrapper requested_type,
     string name
@@ -356,9 +383,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：acquire_lock 尝试获取 runtime 唯一 semaphore token，保护
   //   PI/CI、occupancy、reservation 和 recovery evidence 的同步访问。
-  // 输入输出及副作用：无显式参数；成功时消耗一个 lock token 并
+  // 输入/输出及副作用：无显式参数；成功时消耗一个 lock token 并
   //   返回 OK，调用方必须在所有分支调用 lock.put(1)。
-  // 失败边界：lock 未构造或 token 正被占用时返回 RESOURCE_BUSY；
+  // 失败/边界：lock 未构造或 token 正被占用时返回 RESOURCE_BUSY；
   //   该失败不读写任何 runtime 业务字段。
   protected function rdma_status acquire_lock();
     if (lock == null || !lock.try_get(1))
@@ -369,9 +396,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：make_runtime_status 统一构造 runtime 对外状态；UVM factory
   //   被注入 null/错误类型时，改用直接构造的非空 fallback。
-  // 输入输出及副作用：code、message（输入）；返回独立 rdma_status 值，
+  // 输入/输出及副作用：code、message（输入）；返回独立 rdma_status 值，
   //   不修改 runtime 账本或外部资源。
-  // 失败边界：factory 创建失败时仍返回同一 code/message；fallback 只初始化
+  // 失败/边界：factory 创建失败时仍返回同一 code/message；fallback 只初始化
   //   诊断字段，不会把错误码伪造成成功。
   protected function rdma_status make_runtime_status(
     rdma_status_code_e code, string message = ""
@@ -449,6 +476,41 @@ class rdma_queue_runtime extends uvm_object;
                          RDMA_QUEUE_RUNTIME_AEQ};
   endfunction
 
+  // 功能：mutable_work_present_locked 统一判断 runtime 在持锁阶段是否仍有未提交的
+  //   pending operation、device reservation 或 used slot，供 quiesce、restore 和 detach
+  //   的冻结屏障共用同一可变证据判据。
+  // 输入/输出及副作用：无显式输入；函数只读取 pending_operation_state、
+  //   device_reservation_valid 和 used，返回 bit，不修改 runtime、锁、cursor、ledger 或外部资源。
+  // 失败/边界：调用方必须已经持有 runtime lock；字段为 null/0 时返回 0，任一字段表示仍有
+  //   可变工作时返回 1；函数不决定错误码、错误文本或调用方的状态迁移。
+  protected function bit mutable_work_present_locked();
+    return pending_operation_state != null || device_reservation_valid || used != 0;
+  endfunction
+
+  // 功能：available_slot_value 依据 ring 几何、已占用 credit、生产方向和
+  //   reservation 标志计算调用方当前可用的 producer 槽位，统一 query 与兼容读取的纯值算术。
+  // 输入/输出及副作用：depth_value、used_value、host_produced_value、
+  //   reservation_valid_value（输入）；返回扣除未提交 device reservation 后的槽位值，
+  //   只读取参数，不修改 runtime、游标、reservation 或 slot ledger。
+  // 失败/边界：used_value 大于 depth_value 时返回 0 作为无 status 兼容入口的保守值；
+  //   depth_value 为 0 时同样返回 0，reservation 仅在尚有槽位且方向为 device-produced 时扣除一次。
+  protected function int unsigned available_slot_value(
+    int unsigned depth_value,
+    int unsigned used_value,
+    bit host_produced_value,
+    bit reservation_valid_value
+  );
+    int unsigned value;
+
+    if (used_value > depth_value) begin
+      return 0;
+    end
+    value = depth_value - used_value;
+    if (!host_produced_value && reservation_valid_value && value > 0)
+      value--;
+    return value;
+  endfunction
+
   // 功能：derive_next_cursor 从给定 ring cursor 计算一个提交后的 detached cursor，
   // 统一处理 index 到 depth 边界的回卷和 wrap 翻转。
   // 输入/输出及副作用：source（输入）、result（输出）；result 先置 null，成功时
@@ -476,31 +538,49 @@ class rdma_queue_runtime extends uvm_object;
                                  "next cursor allocation failed");
     candidate.index = source.index;
     candidate.wrap = source.wrap;
-    if (candidate.index + 1 >= depth) begin
-      candidate.index = 0;
-      candidate.wrap = ~candidate.wrap;
-    end
-    else
-      candidate.index++;
+    cursor_advance(candidate.index, candidate.wrap);
     result = candidate;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：pending_identity_matches_locked 比较 pending 与当前 runtime 的 queue/kind
-  // 身份，并在持锁阶段阻止跨 Function、object 或 generation 的 recovery 操作。
-  // 输入/输出及副作用：pending（输入）；仅读取 pending、queue_h 和 kind，不修改
-  // 任一对象；返回 bit 供调用方决定是否继续提交。
-  // 失败/边界：任一句柄为空、kind 不同或四个 identity 字段任一不等时返回 0。
+  // 功能：pending_identity_matches_locked 在持锁阶段比较 pending 与当前 runtime 的
+  // queue/kind 身份，阻止跨 Function、object 或 generation 的 recovery 操作；句柄四元组
+  // 委托 canonical handle_value_equal，避免与 prepared recovery 使用不同的值比较实现。
+  // 输入/输出及副作用：pending（输入）；仅读取 pending、queue_h 和 kind，不修改任一
+  // 对象、pending 状态或锁；返回 bit 供调用方决定是否继续提交。
+  // 失败/边界：pending、pending.queue_h 或当前 queue_h 为空，pending.kind 不同，或
+  // handle_value_equal 判定 kind/function_uid/object_id/generation 任一不等时返回 0；
+  // helper 不执行 freshness、route/epoch 或 authority 校验，这些仍由 caller 负责。
   protected function bit pending_identity_matches_locked(
     rdma_queue_pending_operation pending
   );
     if (pending == null || pending.queue_h == null || queue_h == null)
       return 1'b0;
-    return pending.kind == kind &&
-           pending.queue_h.kind == queue_h.kind &&
-           pending.queue_h.function_uid == queue_h.function_uid &&
-           pending.queue_h.object_id == queue_h.object_id &&
-           pending.queue_h.generation == queue_h.generation;
+    return pending.kind == kind && handle_value_equal(pending.queue_h, queue_h);
+  endfunction
+
+  // 功能：pending_cursor_geometry_valid 统一验证 pending 的 cursor/next_cursor
+  //   与当前 runtime ring geometry 及 entry offset 是否组成可寻址的值形状。
+  // 输入/输出及副作用：pending（输入）；仅读取 pending 的 cursor、next_cursor、
+  //   entry_size、entry_offset 和 runtime.depth，返回 bit，不修改 pending、runtime、
+  //   游标、ledger 或 status；next_cursor 是否恰为一步后位置由调用方继续判断。
+  // 失败/边界：pending/cursor/next_cursor 为空、depth 为零、任一 index 越界、
+  //   entry_size 为零、index*entry_size 溢出 64 位或 entry_offset 不相等时返回 0。
+  protected function bit pending_cursor_geometry_valid(
+    rdma_queue_pending_operation pending
+  );
+    longint unsigned expected_offset;
+
+    if (pending == null || pending.cursor == null ||
+        pending.next_cursor == null || depth == 0 ||
+        pending.cursor.index >= depth || pending.next_cursor.index >= depth ||
+        pending.entry_size == 0)
+      return 1'b0;
+    if (pending.cursor.index >
+        64'hffff_ffff_ffff_ffff / pending.entry_size)
+      return 1'b0;
+    expected_offset = longint'(pending.cursor.index) * pending.entry_size;
+    return pending.entry_offset == expected_offset;
   endfunction
 
   // 功能：pending_cursor_shape_valid 校验 pending 的消费/生产 cursor 与 entry
@@ -514,29 +594,64 @@ class rdma_queue_runtime extends uvm_object;
   );
     int unsigned expected_next_index;
     bit expected_next_wrap;
-    longint unsigned expected_offset;
 
-    if (pending == null || pending.cursor == null ||
-        pending.next_cursor == null || depth == 0 ||
-        pending.cursor.index >= depth || pending.next_cursor.index >= depth ||
-        pending.entry_size == 0)
-      return 1'b0;
-    if (pending.cursor.index >
-        64'hffff_ffff_ffff_ffff / pending.entry_size)
-      return 1'b0;
-    expected_offset = longint'(pending.cursor.index) * pending.entry_size;
-    if (pending.entry_offset != expected_offset)
+    if (!pending_cursor_geometry_valid(pending))
       return 1'b0;
     expected_next_index = pending.cursor.index;
     expected_next_wrap = pending.cursor.wrap;
-    if (expected_next_index + 1 >= depth) begin
-      expected_next_index = 0;
-      expected_next_wrap = ~expected_next_wrap;
-    end
-    else
-      expected_next_index++;
+    cursor_advance(expected_next_index, expected_next_wrap);
     return cursor_equal(expected_next_index, expected_next_wrap,
                         pending.next_cursor.index, pending.next_cursor.wrap);
+  endfunction
+
+  // 功能：consumer_shadow_phase_valid 判断 pending 是否代表冻结的 CQC shadow
+  //   publication；普通 RC/UD 使用 23-bit CQ CI，URC 使用 15-bit SQ/RQ packed
+  //   cursors，二者都不是 CEQ/AEQ 的 MMIO consumer transaction。
+  // 输入/输出及副作用：pending 为输入；函数只读取 kind、shadow geometry、MMIO
+  //   evidence 和阶段位，不修改 runtime 或 pending，返回是否满足冻结 ABI。
+  // 失败/边界：非 CQ、长度/偏移/layout 宽度错误、shadow 尚未要求或误带 MMIO
+  //   success/doorbell marker 时返回 0；该 helper 不把 shadow 写入伪装成 MMIO。
+  protected function bit consumer_shadow_phase_valid(
+    rdma_queue_pending_operation pending,
+    bit require_published
+  );
+    if (pending == null || pending.kind != RDMA_QUEUE_RUNTIME_CQ ||
+        !pending.consumer_shadow_required ||
+        pending.consumer_shadow_offset != RDMA_CQC_RUNTIME_SHADOW_BYTE_OFFSET ||
+        pending.consumer_shadow_length != RDMA_CQC_RUNTIME_SHADOW_BYTE_LENGTH ||
+        (!pending.consumer_shadow_urc &&
+         pending.consumer_shadow_value[31:24] != 8'h00) ||
+        (!require_published &&
+         !(pending.mmio_evidence inside {RDMA_QUEUE_MMIO_NONE,
+                                         RDMA_QUEUE_MMIO_NO_SUBMIT})) ||
+        (require_published &&
+         pending.mmio_evidence != RDMA_QUEUE_MMIO_NO_SUBMIT) ||
+        pending.consumer_doorbell_succeeded || pending.mmio_maybe_submitted)
+      return 1'b0;
+    if (require_published &&
+        (!pending.consumer_shadow_attempted ||
+         !pending.consumer_shadow_published))
+      return 1'b0;
+    if (!require_published && pending.consumer_shadow_published)
+      return 1'b0;
+    return 1'b1;
+  endfunction
+
+  // 功能：consumer_publication_committed_ready_locked 判断 consumer CI commit
+  //   前已具备的唯一外部发布证明，统一覆盖 MMIO doorbell 与 CQC shadow 两条 ABI。
+  // 输入/输出及副作用：pending 为输入；只读 evidence/phase markers 并返回 bit，
+  //   不修改 runtime 或 caller 状态。
+  // 失败/边界：shadow 路径必须已 attempted+published 且保持 NO_SUBMIT；传统路径
+  //   必须是 MMIO SUCCESS 且 doorbell marker 成功；AMBIGUOUS/NONE 一律拒绝。
+  protected function bit consumer_publication_committed_ready_locked(
+    rdma_queue_pending_operation pending
+  );
+    if (pending == null)
+      return 1'b0;
+    if (pending.consumer_shadow_required)
+      return consumer_shadow_phase_valid(pending, 1'b1);
+    return pending.mmio_evidence == RDMA_QUEUE_MMIO_SUCCESS &&
+           pending.consumer_doorbell_succeeded;
   endfunction
 
   // 功能：consumer_recovery_invariant_locked 在 runtime lock 内统一验证
@@ -560,10 +675,24 @@ class rdma_queue_runtime extends uvm_object;
       return 1'b0;
 
     if (!consumer_committed) begin
+      if (pending.consumer_shadow_required)
+        return consumer_shadow_phase_valid(pending, 1'b0) &&
+               !pending.consumer_shadow_published &&
+               committed_cursor == null &&
+               cursor_equal(consumer_index, consumer_wrap,
+                            pending.cursor.index, pending.cursor.wrap);
       return committed_cursor == null &&
              cursor_equal(consumer_index, consumer_wrap,
                           pending.cursor.index, pending.cursor.wrap);
     end
+
+    if (pending.consumer_shadow_required)
+      return consumer_shadow_phase_valid(pending, 1'b1) &&
+             committed_cursor != null &&
+             cursor_equal(committed_cursor.index, committed_cursor.wrap,
+                          pending.next_cursor.index, pending.next_cursor.wrap) &&
+             cursor_equal(consumer_index, consumer_wrap,
+                          pending.next_cursor.index, pending.next_cursor.wrap);
 
     return evidence == RDMA_QUEUE_MMIO_SUCCESS &&
            committed_cursor != null &&
@@ -966,6 +1095,46 @@ class rdma_queue_runtime extends uvm_object;
            lhs.generation == rhs.generation;
   endfunction
 
+  // 功能：handle_value_matches_snapshot 将 target handle 与 copy_ring_state 在
+  // source lock 内冻结的四元 identity 值比较，复用与普通 handle 比较相同的字段语义。
+  // 输入/输出及副作用：candidate（输入）为当前 target 的非拥有句柄；expected_kind、
+  // expected_function_uid、expected_object_id、expected_generation（输入）是 source
+  // 的 detached scalar snapshot；函数只读参数并返回 bit，不修改任何对象或 runtime。
+  // 失败/边界：candidate 为空时返回 0；调用方必须先拒绝 source 为空并保证 snapshot
+  // 已由 source 的有效 queue_h 填充；kind、Function UID、object ID 或 generation
+  // 任一不等都返回 0，避免在释放 source lock 后重新读取可变对象。
+  protected function bit handle_value_matches_snapshot(
+    rdma_handle candidate,
+    rdma_resource_kind_e expected_kind,
+    longint unsigned expected_function_uid,
+    int unsigned expected_object_id,
+    int unsigned expected_generation
+  );
+    if (candidate == null)
+      return 1'b0;
+    return candidate.kind == expected_kind &&
+           candidate.function_uid == expected_function_uid &&
+           candidate.object_id == expected_object_id &&
+           candidate.generation == expected_generation;
+  endfunction
+
+  // 功能：same_route_epoch_value 比较两个已由调用方取得的 route/epoch 值快照，
+  //   为 ring copy 与 prepared recovery 复用同一组值字段相等语义。
+  // 输入/输出及副作用：lhs_route/lhs_epoch 与 rhs_route/rhs_epoch（输入）是
+  //   两组 packed route key 和 reset epoch；函数只读这些值并返回 bit，不修改
+  //   runtime、valid-bit、锁或任何外部 authority。
+  // 失败/边界：任一路由 key 或 reset epoch 不等即返回 0；本 helper 不检查
+  //   route/epoch valid-bit、route key 格式或 reset freshness，相关拒绝条件仍由
+  //   copy_ring_state 与 enter_recovery_prepared 的调用方先行处理。
+  protected function bit same_route_epoch_value(
+    rdma_route_key_t lhs_route,
+    rdma_reset_epoch_t lhs_epoch,
+    rdma_route_key_t rhs_route,
+    rdma_reset_epoch_t rhs_epoch
+  );
+    return lhs_route == rhs_route && lhs_epoch == rhs_epoch;
+  endfunction
+
   // 功能：image_value_equal 比较 recovery image 的全部 metadata、目标地址、
   //   原始 bytes 与 field_summary，防止不同硬件事务共享同一 cursor 后合并阶段。
   // 输入/输出及副作用：lhs/rhs（输入）；逐值只读并返回 bit，不修改动态队列。
@@ -1166,6 +1335,11 @@ class rdma_queue_runtime extends uvm_object;
            lhs.completion_target_valid == rhs.completion_target_valid &&
            lhs.completion_wq_kind == rhs.completion_wq_kind &&
            handle_value_equal(lhs.routed_qp_h, rhs.routed_qp_h) &&
+           lhs.consumer_shadow_required == rhs.consumer_shadow_required &&
+           lhs.consumer_shadow_urc == rhs.consumer_shadow_urc &&
+           lhs.consumer_shadow_offset == rhs.consumer_shadow_offset &&
+           lhs.consumer_shadow_length == rhs.consumer_shadow_length &&
+           lhs.consumer_shadow_value == rhs.consumer_shadow_value &&
            lhs.route == rhs.route && lhs.route_valid == rhs.route_valid &&
            lhs.reset_epoch == rhs.reset_epoch &&
            lhs.epoch_valid == rhs.epoch_valid;
@@ -1249,6 +1423,13 @@ class rdma_queue_runtime extends uvm_object;
     candidate.cq_consumer_committed = source.cq_consumer_committed;
     candidate.completion_released = source.completion_released;
     candidate.consumer_doorbell_succeeded = source.consumer_doorbell_succeeded;
+    candidate.consumer_shadow_required = source.consumer_shadow_required;
+    candidate.consumer_shadow_urc = source.consumer_shadow_urc;
+    candidate.consumer_shadow_attempted = source.consumer_shadow_attempted;
+    candidate.consumer_shadow_published = source.consumer_shadow_published;
+    candidate.consumer_shadow_offset = source.consumer_shadow_offset;
+    candidate.consumer_shadow_length = source.consumer_shadow_length;
+    candidate.consumer_shadow_value = source.consumer_shadow_value;
     candidate.entry_offset = source.entry_offset;
     candidate.wr_id = source.wr_id;
     candidate.signaled = source.signaled;
@@ -1269,9 +1450,9 @@ class rdma_queue_runtime extends uvm_object;
   endfunction
 
   // 功能：构造 DETACHED、未配置的 runtime，并创建容量为 1 的状态互斥锁。
-  // 输入输出及副作用：name（输入）设置 UVM 名称；清零 geometry/authority/
+  // 输入/输出及副作用：name（输入）设置 UVM 名称；清零 geometry/authority/
   //   occupancy，置空 queue、reservation、pending 和 recovery 授权。
-  // 失败边界：构造后除 configure/query_state 外的事务入口都应拒绝未配置
+  // 失败/边界：构造后除 configure/query_state 外的事务入口都应拒绝未配置
   //   runtime；对象不创建或接管 Host-memory、PCIe 或 lifecycle resource。
   function new(string name = "rdma_queue_runtime");
     super.new(name);
@@ -1513,9 +1694,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：activate 只把已 configure 的 runtime 从 ATTACHED 切换为 ACTIVE；
   //   route/reset epoch authority 由 publish、prepared recovery 和 copy 边界校验。
-  // 输入输出及副作用：无显式参数；成功仅更新 state，queue_h、可选 route/epoch、
+  // 输入/输出及副作用：无显式参数；成功仅更新 state，queue_h、可选 route/epoch、
   //   PI/CI 和 ledger 保持不变，因此直接 runtime fixture 可在 authority 前激活。
-  // 失败边界：非 ATTACHED 或锁忙时返回 INVALID_STATE/RESOURCE_BUSY；本函数不把
+  // 失败/边界：非 ATTACHED 或锁忙时返回 INVALID_STATE/RESOURCE_BUSY；本函数不把
   //   缺失 authority 伪造成有效值，query_route_epoch 仍会 fail-closed。
   function rdma_status activate();
     rdma_status lock_status;
@@ -1533,9 +1714,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：begin_quiesce 为 resize/删除建立冻结屏障，将无 outstanding work 的
   //   ACTIVE runtime 切换为 QUIESCING。
-  // 输入输出及副作用：无显式参数；成功仅更新 state，保留 identity、
+  // 输入/输出及副作用：无显式参数；成功仅更新 state，保留 identity、
   //   route/epoch、PI/CI 与空 ledger，供 copy_ring_state 读取。
-  // 失败边界：非 ACTIVE 返回 INVALID_STATE；pending、device reservation 或 used
+  // 失败/边界：非 ACTIVE 返回 INVALID_STATE；pending、device reservation 或 used
   //   任一存在返回 RESOURCE_BUSY；失败不改变 state/账本。
   virtual function rdma_status begin_quiesce();
     rdma_status lock_status;
@@ -1546,7 +1727,7 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "queue runtime is not active");
     end
-    if (pending_operation_state != null || device_reservation_valid || used != 0) begin
+    if (mutable_work_present_locked()) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_RESOURCE_BUSY,
                                  pending_operation_state != null ?
@@ -1561,9 +1742,9 @@ class rdma_queue_runtime extends uvm_object;
   endfunction
 
   // 功能：restore_active 在 replacement 未提交时撤销 quiesce 屏障，恢复旧 runtime。
-  // 输入输出及副作用：无显式参数；成功把 state 从 QUIESCING 改为 ACTIVE，
+  // 输入/输出及副作用：无显式参数；成功把 state 从 QUIESCING 改为 ACTIVE，
   //   不改变 cursor、authority 或外部 backing 所有权。
-  // 失败边界：非 QUIESCING 返回 INVALID_STATE；冻结期意外出现 pending/
+  // 失败/边界：非 QUIESCING 返回 INVALID_STATE；冻结期意外出现 pending/
   //   reservation/used 返回 RESOURCE_BUSY；失败保持原 state。
   virtual function rdma_status restore_active();
     rdma_status lock_status;
@@ -1574,7 +1755,7 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "queue runtime is not quiescing");
     end
-    if (pending_operation_state != null || device_reservation_valid || used != 0) begin
+    if (mutable_work_present_locked()) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_RESOURCE_BUSY,
                                  "quiesced runtime has mutable work");
@@ -1585,9 +1766,9 @@ class rdma_queue_runtime extends uvm_object;
   endfunction
 
   // 功能：detach_quiesced 在 replacement/backing 切换完成后将旧 runtime 永久隔离。
-  // 输入输出及副作用：无显式参数；成功把 state 从 QUIESCING 改为 DETACHED，
+  // 输入/输出及副作用：无显式参数；成功把 state 从 QUIESCING 改为 DETACHED，
   //   不释放由 data engine/lifecycle owner 持有的 mapping 或 queue resource。
-  // 失败边界：非 QUIESCING 或存在 pending/reservation/used 时拒绝；重复 detach
+  // 失败/边界：非 QUIESCING 或存在 pending/reservation/used 时拒绝；重复 detach
   //   返回 INVALID_STATE，不会重新激活或修改账本。
   virtual function rdma_status detach_quiesced();
     rdma_status lock_status;
@@ -1598,7 +1779,7 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "queue runtime is not quiescing");
     end
-    if (pending_operation_state != null || device_reservation_valid || used != 0) begin
+    if (mutable_work_present_locked()) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_RESOURCE_BUSY,
                                  "quiesced runtime has mutable work");
@@ -1771,10 +1952,10 @@ class rdma_queue_runtime extends uvm_object;
         recovery_retry_confirmed ||
         kind != source_kind ||
         host_produced != source_host_produced || depth == 0 ||
-        queue_h == null || queue_h.kind != source_queue_kind ||
-        queue_h.function_uid != source_function_uid ||
-        queue_h.object_id != source_object_id ||
-        queue_h.generation != source_generation) begin
+        queue_h == null ||
+        !handle_value_matches_snapshot(queue_h, source_queue_kind,
+                                       source_function_uid, source_object_id,
+                                       source_generation)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "target runtime is not an empty compatible attachment");
@@ -1800,7 +1981,8 @@ class rdma_queue_runtime extends uvm_object;
                                  "target route and reset epoch are half valid");
     end
     if (route_valid &&
-        (source_route != route || source_epoch != reset_epoch)) begin
+        !same_route_epoch_value(source_route, source_epoch,
+                                route, reset_epoch)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "route or reset epoch differs between rings");
@@ -1856,9 +2038,9 @@ class rdma_queue_runtime extends uvm_object;
   endfunction
 
   // 功能：query_available 在 runtime lock 内返回可再提交的 producer credit，并扣除尚未 commit 的 device reservation。
-  // 输入输出及副作用：value（输出）先置零，成功时写入 depth-used-1（有
+  // 输入/输出及副作用：value（输出）先置零，成功时写入 depth-used-1（有
   //   device reservation）或 depth-used；不修改游标、reservation 或 slot ledger。
-  // 失败边界：depth=0、used>depth 或锁忙时返回非成功状态；结果不发生
+  // 失败/边界：depth=0、used>depth 或锁忙时返回非成功状态；结果不发生
   //   unsigned 下溢，失败时 value 保持零。
   function rdma_status query_available(output int unsigned value);
     rdma_status lock_status;
@@ -1875,30 +2057,28 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "runtime occupancy exceeds depth");
     end
-    value = depth - used;
-    if (!host_produced && device_reservation_valid && value > 0) value--;
+    value = available_slot_value(depth, used, host_produced,
+                                device_reservation_valid);
     lock.put(1);
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
   // 功能：available_slots 为兼容调用方返回当前 producer credit，并对未提交的
   //   device reservation 预扣一个槽位。
-  // 输入输出及副作用：无显式输入；只读 depth、used、方向和 reservation 位，
+  // 输入/输出及副作用：无显式输入；只读 depth、used、方向和 reservation 位，
   //   返回 int unsigned，不推进 PI/CI 或改变 ledger。
-  // 失败边界：该无 status 兼容入口在 used>depth 或未配置时保守返回 0；
+  // 失败/边界：该无 status 兼容入口在 used>depth 或未配置时保守返回 0；
   //   需要区分损坏与真正 full 的调用方必须使用 query_available。
   function int unsigned available_slots();
-    int unsigned value;
-    value = (used <= depth) ? (depth - used) : 0;
-    if (!host_produced && device_reservation_valid && value > 0) value--;
-    return value;
+    return available_slot_value(depth, used, host_produced,
+                                device_reservation_valid);
   endfunction
 
   // 功能：peek_consumer 返回当前 CI 的 detached cursor；device ring 只有在
   //   used>0 时才允许调用方观察该项。
-  // 输入输出及副作用：snapshot（输出）先置 null；成功时复制 consumer_index/
+  // 输入/输出及副作用：snapshot（输出）先置 null；成功时复制 consumer_index/
   //   consumer_wrap，不推进 CI、不释放 credit，也不泄露内部可变对象。
-  // 失败边界：非 ACTIVE 返回 INVALID_STATE，空 device ring 返回 QUEUE_EMPTY，
+  // 失败/边界：非 ACTIVE 返回 INVALID_STATE，空 device ring 返回 QUEUE_EMPTY，
   //   factory 返回 null/错误类型时返回 RESOURCE_EXHAUSTED 且 output 保持 null。
   function rdma_status peek_consumer(output rdma_queue_cursor_snapshot snapshot);
     rdma_status lock_status;
@@ -2005,8 +2185,8 @@ class rdma_queue_runtime extends uvm_object;
         !pending_identity_matches_locked(pending_operation_state) ||
         pending_operation_state.kind != kind || pending_operation_state.cursor == null ||
         pending_operation_state.next_cursor == null ||
-        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
-        !pending_operation_state.consumer_doorbell_succeeded) begin
+        !consumer_publication_committed_ready_locked(
+          pending_operation_state)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "consumer recovery evidence is invalid");
@@ -2143,8 +2323,8 @@ class rdma_queue_runtime extends uvm_object;
         !recovery_commit_allowed ||
         !pending_identity_matches_locked(pending_operation_state) ||
         pending_operation_state.kind != kind ||
-        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
-        !pending_operation_state.consumer_doorbell_succeeded ||
+        !consumer_publication_committed_ready_locked(
+          pending_operation_state) ||
         pending_operation_state.consumer_committed ||
         !pending_cursor_shape_valid(pending_operation_state) ||
         pending_operation_state.cursor == null ||
@@ -2242,8 +2422,8 @@ class rdma_queue_runtime extends uvm_object;
         pending_operation_state.device_producer ||
         !pending_identity_matches_locked(pending_operation_state) ||
         pending_operation_state.kind != RDMA_QUEUE_RUNTIME_CQ ||
-        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
-        !pending_operation_state.consumer_doorbell_succeeded ||
+        !consumer_publication_committed_ready_locked(
+          pending_operation_state) ||
         !pending_operation_state.consumer_committed ||
         !pending_operation_state.cq_consumer_committed ||
         pending_operation_state.committed_consumer_cursor == null ||
@@ -2671,9 +2851,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：expected_owner_polarity 计算 consumer 当前期待看到的 owner/polarity，
   //   与 device producer 使用的 producer_wrap 版本保持方向隔离。
-  // 输入输出及副作用：无显式输入；返回 initial_polarity XOR consumer_wrap，
+  // 输入/输出及副作用：无显式输入；返回 initial_polarity XOR consumer_wrap，
   //   仅读取值字段，不修改 runtime。
-  // 失败边界：该兼容纯函数不返回 status，也不验证 configure 状态；未配置对象
+  // 失败/边界：该兼容纯函数不返回 status，也不验证 configure 状态；未配置对象
   //   只会得到构造默认值，状态化调用方应使用对应 query 接口。
   function bit expected_owner_polarity();
     return initial_polarity ^ consumer_wrap;
@@ -2681,9 +2861,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：validate_queue_handle 比较 caller handle 与 configure 时冻结的 queue
   //   identity，区分身份错误和 stale generation。
-  // 输入输出及副作用：qh（输入）为非拥有引用；仅读取 kind/function_uid/
+  // 输入/输出及副作用：qh（输入）为非拥有引用；仅读取 kind/function_uid/
   //   object_id/generation 并返回 rdma_status，不修改任一 handle。
-  // 失败边界：任一句柄为空或前三个 identity 字段不等返回 INVALID_ARGUMENT；
+  // 失败/边界：任一句柄为空或前三个 identity 字段不等返回 INVALID_ARGUMENT；
   //   generation 不等返回 STALE_GENERATION；本函数不替代 state/route/epoch 校验。
   function rdma_status validate_queue_handle(rdma_handle qh);
     if (queue_h == null || qh == null)
@@ -2702,9 +2882,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：reserve_producer 为 SQ/RQ/SRQ host producer 返回当前 PI/wrap 的
   //   detached reservation；真正的 ledger/PI 变更留给 commit_producer。
-  // 输入输出及副作用：reservation（输出）先置 null；成功仅发布独立 cursor，
+  // 输入/输出及副作用：reservation（输出）先置 null；成功仅发布独立 cursor，
   //   不增加 used、不占用 slot，也不改变 producer_index/wrap。
-  // 失败边界：device ring、非 ACTIVE、used>=depth 或 factory null/错误类型分别
+  // 失败/边界：device ring、非 ACTIVE、used>=depth 或 factory null/错误类型分别
   //   返回 INVALID_STATE/QUEUE_FULL/RESOURCE_EXHAUSTED，失败 output 保持 null。
   function rdma_status reserve_producer(output rdma_queue_cursor_snapshot reservation);
     rdma_status lock_status;
@@ -2744,9 +2924,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：commit_producer 将匹配当前 PI 的 host WQE 写入 slot ledger，并原子
   //   推进 PI/used；recovery 路径还校验 pending cursor 并消费一次 commit gate。
-  // 输入输出及副作用：reservation/request/wr_id/signaled/image（输入）；成功时
+  // 输入/输出及副作用：reservation/request/wr_id/signaled/image（输入）；成功时
   //   保存 request/image detached 副本、发布 posted slot，并更新 producer cursor。
-  // 失败边界：方向/state/cursor/ledger/occupancy/recovery evidence 不匹配，或
+  // 失败/边界：方向/state/cursor/ledger/occupancy/recovery evidence 不匹配，或
   //   request/image factory 复制失败时返回错误；失败恢复 slot、PI 和 used 原值。
   function rdma_status commit_producer(rdma_queue_cursor_snapshot reservation,
                                        rdma_semantic_request request,
@@ -2946,9 +3126,9 @@ class rdma_queue_runtime extends uvm_object;
   endfunction
 
   // 功能：cursor_equal 将两组 index/wrap 作为完整 ring cursor 比较。
-  // 输入输出及副作用：a/aw 与 b/bw（输入）；两字段均相等时返回 1，纯读取且
+  // 输入/输出及副作用：a/aw 与 b/bw（输入）；两字段均相等时返回 1，纯读取且
   //   不修改 runtime、ledger 或调用方变量。
-  // 失败边界：任一 index 或 wrap 不等即返回 0；本 helper 不验证 index<depth。
+  // 失败/边界：任一 index 或 wrap 不等即返回 0；本 helper 不验证 index<depth。
   function bit cursor_equal(
     int unsigned a,
     bit aw,
@@ -2958,11 +3138,28 @@ class rdma_queue_runtime extends uvm_object;
     return a == b && aw == bw;
   endfunction
 
+  // 功能：release_range_slot_shape_valid 校验释放范围当前位置的 ledger slot 是否符合
+  //       cursor 对应的已发布、未消费条目形状，供四个 range API 共用。
+  // 输入/输出及副作用：slot、expected_index、expected_wrap（输入）；只读 slot 的 posted、
+  //       consumed、index、wrap 字段并返回 bit，不修改 runtime、ledger、cursor 或 status。
+  // 失败/边界：slot 为空、未 posted、已 consumed 或 index/wrap 不匹配时返回 0；helper 不检查
+  //       depth、used、target 可达性，也不改变调用方的错误优先级、锁生命周期或状态副作用。
+  protected function bit release_range_slot_shape_valid(
+    rdma_queue_slot_ledger_entry slot,
+    int unsigned expected_index,
+    bit expected_wrap
+  );
+    if (slot == null)
+      return 1'b0;
+    return slot.posted && !slot.consumed &&
+           slot.index == expected_index && slot.wrap == expected_wrap;
+  endfunction
+
   // 功能：cursor_advance 按当前 depth 将 ring cursor 前进一步，并在末项后
   //   回到 index=0、翻转 wrap。
-  // 输入输出及副作用：i/w（输入输出）被原地更新；只读 runtime.depth，不修改
+  // 输入/输出及副作用：i/w（输入/输出）被原地更新；只读 runtime.depth，不修改
   //   occupancy、reservation 或 slot ledger。
-  // 失败边界：该内部 void helper 假定 depth>0 且 i<depth，不返回错误；所有
+  // 失败/边界：该内部 void helper 假定 depth>0 且 i<depth，不返回错误；所有
   //   对外调用方必须在进入前完成 geometry 校验。
   function void cursor_advance(inout int unsigned i, inout bit w);
     if (i + 1 >= depth) begin
@@ -2973,11 +3170,39 @@ class rdma_queue_runtime extends uvm_object;
       i++;
   endfunction
 
+  // 功能：release_range_target_reachable 从当前 host consumer cursor 沿 ring
+  //   successor 逐步寻找 completion target，统一判断 target 是否仍落在一个
+  //   最多 depth 步的可寻址窗口内。
+  // 输入/输出及副作用：target_index、target_wrap 为待匹配的目标 cursor；函数只
+  //   读 runtime 的 consumer_index、consumer_wrap 和 depth，在局部变量中模拟 cursor
+  //   前进并返回 bit，不修改 CI、used、slot ledger、锁或 status。
+  // 失败/边界：target 在当前 cursor 或恰好 depth 步后到达时返回 1；超过 depth
+  //   仍未命中返回 0。函数不检查 target 越界、slot 内容或 used，调用方必须
+  //   保留自己的 geometry、occupancy、slot-shape、锁和错误文本门禁。
+  protected function bit release_range_target_reachable(
+    int unsigned target_index,
+    bit target_wrap
+  );
+    int unsigned i;
+    bit w;
+    int unsigned count;
+
+    i = consumer_index;
+    w = consumer_wrap;
+    count = 0;
+    while (!cursor_equal(i, w, target_index, target_wrap) && count <= depth) begin
+      cursor_advance(i, w);
+      count++;
+    end
+    return !(count >= depth &&
+             !cursor_equal(i, w, target_index, target_wrap));
+  endfunction
+
   // 功能：match_and_release 从当前 host consumer cursor 连续校验到 completion
   //   target，随后一次性释放这段已 posted WQE，并推进 CI/减少 used。
-  // 输入输出及副作用：target_index/target_wrap（输入）指定完成项；released（输出）
+  // 输入/输出及副作用：target_index/target_wrap（输入）指定完成项；released（输出）
   //   先清空，成功时按消费顺序返回 runtime-owned slot 的非拥有引用队列。
-  // 失败边界：非 ACTIVE/未授权 recovery、target 越界或不在一个 ring 窗口内，
+  // 失败/边界：非 ACTIVE/未授权 recovery、target 越界或不在一个 ring 窗口内，
   //   以及范围内存在 null/unposted/consumed/stale slot 时返回错误且不释放任何项。
   function rdma_status match_and_release(
     int unsigned target_index,
@@ -3007,15 +3232,7 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "completion index is outside depth");
     end
-    i = consumer_index;
-    w = consumer_wrap;
-    count = 0;
-    while (!cursor_equal(i, w, target_index, target_wrap) && count <= depth) begin
-      cursor_advance(i, w);
-      count++;
-    end
-    if (count >= depth &&
-        !cursor_equal(i, w, target_index, target_wrap)) begin
+    if (!release_range_target_reachable(target_index, target_wrap)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "completion cursor is not outstanding");
@@ -3027,8 +3244,7 @@ class rdma_queue_runtime extends uvm_object;
     w = consumer_wrap;
     do begin
       check_slot = slots[i];
-      if (check_slot == null || !check_slot.posted || check_slot.consumed ||
-          check_slot.index != i || check_slot.wrap != w) begin
+      if (!release_range_slot_shape_valid(check_slot, i, w)) begin
         lock.put(1);
         released.delete();
         return make_runtime_status(RDMA_SC_INVALID_STATE,
@@ -3125,8 +3341,7 @@ class rdma_queue_runtime extends uvm_object;
         return 1'b0;
       end
       slot = slots[i];
-      if (slot == null || !slot.posted || slot.consumed ||
-          slot.index != i || slot.wrap != w) begin
+      if (!release_range_slot_shape_valid(slot, i, w)) begin
         lock.put(1);
         void'(set_runtime_status_noalloc(
           status_slot, RDMA_SC_INVALID_STATE,
@@ -3219,8 +3434,7 @@ class rdma_queue_runtime extends uvm_object;
                                    "completion cursor is not outstanding");
       end
       slot = slots[i];
-      if (slot == null || !slot.posted || slot.consumed ||
-          slot.index != i || slot.wrap != w) begin
+      if (!release_range_slot_shape_valid(slot, i, w)) begin
         lock.put(1);
         snapshots.delete();
         return make_runtime_status(RDMA_SC_INVALID_STATE,
@@ -3249,9 +3463,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：validate_release_range 在发送 CQ consumer doorbell 前只读验证从当前
   //   CI 到 completion target 的连续 posted WQE 区间。
-  // 输入输出及副作用：target_index/target_wrap（输入）；只读 cursor 与 slot ledger，
+  // 输入/输出及副作用：target_index/target_wrap（输入）；只读 cursor 与 slot ledger，
   //   返回 rdma_status，不消费 slot、不推进 CI、不释放 credit。
-  // 失败边界：非 ACTIVE、target 越界/不在一个 ring 窗口内，或区间含 null、
+  // 失败/边界：非 ACTIVE、target 越界/不在一个 ring 窗口内，或区间含 null、
   //   unposted、consumed、index/wrap 不一致项时返回错误，ledger 保持不变。
   function rdma_status validate_release_range(
     int unsigned target_index, bit target_wrap
@@ -3274,14 +3488,7 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "completion index is outside depth");
     end
-    i = consumer_index;
-    w = consumer_wrap;
-    count = 0;
-    while (!cursor_equal(i, w, target_index, target_wrap) && count <= depth) begin
-      cursor_advance(i, w);
-      count++;
-    end
-    if (count >= depth && !cursor_equal(i, w, target_index, target_wrap)) begin
+    if (!release_range_target_reachable(target_index, target_wrap)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "completion cursor is not outstanding");
@@ -3291,8 +3498,7 @@ class rdma_queue_runtime extends uvm_object;
     w = consumer_wrap;
     do begin
       slot = slots[i];
-      if (slot == null || !slot.posted || slot.consumed ||
-          slot.index != i || slot.wrap != w) begin
+      if (!release_range_slot_shape_valid(slot, i, w)) begin
         lock.put(1);
         return make_runtime_status(RDMA_SC_INVALID_STATE,
                                    "completion skips an unposted slot");
@@ -3365,10 +3571,7 @@ class rdma_queue_runtime extends uvm_object;
         copy.kind = kind;
     end
     if (copy.queue_h == null || queue_h == null ||
-        copy.queue_h.kind != queue_h.kind ||
-        copy.queue_h.function_uid != queue_h.function_uid ||
-        copy.queue_h.object_id != queue_h.object_id ||
-        copy.queue_h.generation != queue_h.generation || copy.kind != kind) begin
+        !handle_value_equal(copy.queue_h, queue_h) || copy.kind != kind) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "legacy recovery identity mismatch");
@@ -3457,10 +3660,10 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：enter_recovery_prepared 接管调用方已完成 detached 的 pending；首次
   //   admission 安装 recovery evidence，重复 admission 只单调合并同一事务阶段。
-  // 输入输出及副作用：prepared（输入）在首次成功后由 runtime 接管，状态切换为
+  // 输入/输出及副作用：prepared（输入）在首次成功后由 runtime 接管，状态切换为
   //   RECOVERY_REQUIRED；重复成功只合并 MMIO/commit 阶段并重置本轮 commit/retry/
   //   release gate，reservation 保持原快照。
-  // 失败边界：null、非 ACTIVE、identity/direction/geometry/image/status/route/epoch
+  // 失败/边界：null、非 ACTIVE、identity/direction/geometry/image/status/route/epoch
   //   不完整或 reservation 冲突均原子拒绝；重复事务若 immutable evidence、cursor、
   //   MMIO 转换或阶段顺序冲突也拒绝，不发布部分 merge。
   function rdma_status enter_recovery_prepared(rdma_queue_pending_operation prepared);
@@ -3496,6 +3699,16 @@ class rdma_queue_runtime extends uvm_object;
         lock.put(1);
         return make_runtime_status(RDMA_SC_INVALID_STATE,
                                    "prepared recovery immutable evidence conflicts");
+      end
+      if (pending_operation_state.consumer_shadow_required &&
+          (prepared.consumer_shadow_attempted !=
+             pending_operation_state.consumer_shadow_attempted ||
+           prepared.consumer_shadow_published !=
+             pending_operation_state.consumer_shadow_published)) begin
+        lock.put(1);
+        return make_runtime_status(
+          RDMA_SC_INVALID_STATE,
+          "prepared CQC shadow phase conflicts with pending");
       end
       if (!(prepared.mmio_evidence inside {RDMA_QUEUE_MMIO_NONE,
                                            RDMA_QUEUE_MMIO_NOT_APPLICABLE,
@@ -3545,7 +3758,11 @@ class rdma_queue_runtime extends uvm_object;
            (merged_consumer_committed || merged_cq_consumer_committed ||
             merged_completion_released)) ||
           (merged_consumer_committed &&
-           prepared.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS) ||
+           !((pending_operation_state.consumer_shadow_required &&
+              prepared.consumer_shadow_published &&
+              prepared.mmio_evidence == RDMA_QUEUE_MMIO_NO_SUBMIT) ||
+             (!pending_operation_state.consumer_shadow_required &&
+              prepared.mmio_evidence == RDMA_QUEUE_MMIO_SUCCESS))) ||
           (merged_cq_consumer_committed &&
            (!merged_consumer_committed || kind != RDMA_QUEUE_RUNTIME_CQ)) ||
           (merged_completion_released &&
@@ -3609,10 +3826,7 @@ class rdma_queue_runtime extends uvm_object;
                                  "runtime cannot install prepared recovery");
     end
     if (prepared.queue_h == null || queue_h == null ||
-        prepared.queue_h.kind != queue_h.kind ||
-        prepared.queue_h.function_uid != queue_h.function_uid ||
-        prepared.queue_h.object_id != queue_h.object_id ||
-        prepared.queue_h.generation != queue_h.generation) begin
+        !handle_value_equal(prepared.queue_h, queue_h)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "prepared recovery identity mismatch");
@@ -3630,13 +3844,7 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "prepared recovery direction mismatch");
     end
-    if (prepared.cursor == null || prepared.next_cursor == null ||
-        prepared.cursor.index >= depth || prepared.next_cursor.index >= depth ||
-        prepared.entry_size == 0 ||
-        prepared.cursor.index >
-          64'hffff_ffff_ffff_ffff / prepared.entry_size ||
-        prepared.entry_offset !=
-          longint'(prepared.cursor.index) * prepared.entry_size) begin
+    if (!pending_cursor_geometry_valid(prepared)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "prepared recovery geometry is invalid");
@@ -3659,7 +3867,8 @@ class rdma_queue_runtime extends uvm_object;
     end
     if (!route_valid || !epoch_valid || !prepared.route_valid ||
         !prepared.epoch_valid || !rdma_route_key_valid(prepared.route) ||
-        prepared.route != route || prepared.reset_epoch != reset_epoch) begin
+        !same_route_epoch_value(prepared.route, prepared.reset_epoch,
+                                route, reset_epoch)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "prepared recovery route epoch mismatch");
@@ -3693,6 +3902,26 @@ class rdma_queue_runtime extends uvm_object;
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "prepared MMIO evidence direction mismatch");
+    end
+    if (prepared.consumer_shadow_required &&
+        (!consumer_direction || prepared.kind != RDMA_QUEUE_RUNTIME_CQ ||
+         prepared.consumer_shadow_offset != RDMA_CQC_RUNTIME_SHADOW_BYTE_OFFSET ||
+         prepared.consumer_shadow_length != RDMA_CQC_RUNTIME_SHADOW_BYTE_LENGTH ||
+         (!prepared.consumer_shadow_urc &&
+          prepared.consumer_shadow_value[31:24] != 8'h00) ||
+         prepared.consumer_doorbell_succeeded ||
+         prepared.mmio_maybe_submitted ||
+         (prepared.consumer_shadow_published &&
+          (!prepared.consumer_shadow_attempted ||
+           prepared.mmio_evidence != RDMA_QUEUE_MMIO_NO_SUBMIT)) ||
+         (!prepared.consumer_shadow_published &&
+          prepared.consumer_shadow_attempted &&
+          !(prepared.mmio_evidence inside {RDMA_QUEUE_MMIO_NONE,
+                                           RDMA_QUEUE_MMIO_NO_SUBMIT})))) begin
+      lock.put(1);
+      return make_runtime_status(
+        RDMA_SC_INVALID_STATE,
+        "prepared CQC shadow evidence is invalid");
     end
     if ((!consumer_direction && prepared.consumer_committed) ||
         (!consumer_direction && prepared.cq_consumer_committed) ||
@@ -3773,9 +4002,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：query_route_epoch 返回 set_route_epoch 或 copy_ring_state 锁存的
   //   route/reset epoch authority 快照。
-  // 输入输出及副作用：四个 output 先清零；成功时写入 route/epoch 及其有效位，
+  // 输入/输出及副作用：四个 output 先清零；成功时写入 route/epoch 及其有效位，
   //   不改变 runtime authority。
-  // 失败边界：未配置、route/epoch 无效或锁忙时返回非成功状态，四个 output
+  // 失败/边界：未配置、route/epoch 无效或锁忙时返回非成功状态，四个 output
   //   保持安全默认值；configure 本身不建立 authority。
   function rdma_status query_route_epoch(
     output rdma_route_key_t route_snapshot,
@@ -3897,6 +4126,89 @@ class rdma_queue_runtime extends uvm_object;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
+  // 功能：mark_pending_consumer_shadow_attempted_noalloc 在 CQ shadow write 进入
+  //   外部 context adapter 前冻结“已尝试”阶段，保留真实 NO_SUBMIT MMIO 证据。
+  // 输入/输出及副作用：status_slot 为调用方预分配的输出槽；成功只更新 pending
+  //   的 attempted 位，不推进 CI/used、不写 MMIO，也不创建对象。
+  // 失败/边界：非 RECOVERY_REQUIRED、非 CQ shadow pending、重复尝试、已发布、
+  //   CI 已提交或 evidence 不是 NO_SUBMIT 时返回 0，并保持所有阶段位不变。
+  function bit mark_pending_consumer_shadow_attempted_noalloc(
+    rdma_status status_slot
+  );
+    if (status_slot == null) begin
+      return 1'b0;
+    end
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation_state == null ||
+        !consumer_shadow_phase_valid(pending_operation_state, 1'b0) ||
+        pending_operation_state.consumer_shadow_attempted ||
+        pending_operation_state.consumer_committed ||
+        pending_operation_state.committed_consumer_cursor != null ||
+        !consumer_recovery_invariant_locked(
+          pending_operation_state, pending_operation_state.mmio_evidence,
+          pending_operation_state.consumer_committed,
+          pending_operation_state.committed_consumer_cursor)) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "CQ shadow write attempt evidence is invalid"));
+      return 1'b0;
+    end
+    pending_operation_state.consumer_shadow_attempted = 1'b1;
+    pending_operation_state.mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+    pending_operation_state.known_no_mmio = 1'b1;
+    pending_operation_state.mmio_maybe_submitted = 1'b0;
+    pending_operation_state.consumer_doorbell_succeeded = 1'b0;
+    lock.put(1);
+    void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    return 1'b1;
+  endfunction
+
+  // 功能：mark_pending_consumer_shadow_published_noalloc 记录 context adapter 已
+  //   成功写入冻结的 CQC CI/wrap payload，仍保持 MMIO evidence=NO_SUBMIT。
+  // 输入/输出及副作用：status_slot 为预分配状态槽；成功只置 published marker，
+  //   不推进 runtime CI/used、不发 consumer doorbell。
+  // 失败/边界：shadow 未要求/未尝试、写后 pending 已提交、geometry/evidence 不符
+  //   或 runtime identity 无效时返回 0；失败不伪造发布成功。
+  function bit mark_pending_consumer_shadow_published_noalloc(
+    rdma_status status_slot
+  );
+    if (status_slot == null) begin
+      return 1'b0;
+    end
+    if (lock == null || !lock.try_get(1)) begin
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
+      return 1'b0;
+    end
+    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
+        pending_operation_state == null ||
+        !consumer_shadow_phase_valid(pending_operation_state, 1'b0) ||
+        !pending_operation_state.consumer_shadow_attempted ||
+        pending_operation_state.consumer_shadow_published ||
+        pending_operation_state.consumer_committed ||
+        !pending_identity_matches_locked(pending_operation_state) ||
+        !consumer_recovery_invariant_locked(
+          pending_operation_state, pending_operation_state.mmio_evidence,
+          pending_operation_state.consumer_committed,
+          pending_operation_state.committed_consumer_cursor)) begin
+      lock.put(1);
+      void'(set_runtime_status_noalloc(
+        status_slot, RDMA_SC_INVALID_STATE,
+        "CQ shadow publication evidence is invalid"));
+      return 1'b0;
+    end
+    pending_operation_state.consumer_shadow_published = 1'b1;
+    lock.put(1);
+    void'(set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    return 1'b1;
+  endfunction
+
   // 功能：mark_pending_consumer_committed 仅确认由外部路径已经完成的 consumer
   //   CI commit，并把 next_cursor 保存为 committed_consumer_cursor；它不代替提交动作。
   // 输入/输出及副作用：无显式输入；仅当 runtime CI 已等于 next_cursor 时发布
@@ -3913,8 +4225,8 @@ class rdma_queue_runtime extends uvm_object;
     if (pending_operation_state == null || state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
         pending_operation_state.device_producer || pending_operation_state.producer ||
         !is_device_ring_kind(kind) ||
-        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
-        !pending_operation_state.consumer_doorbell_succeeded) begin
+        !consumer_publication_committed_ready_locked(
+          pending_operation_state)) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "consumer commit ordering is invalid");
@@ -4028,10 +4340,10 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：complete_recovery_retry 在 data engine 已完成 replay 的各外部阶段后，
   //   按 producer/consumer 方向验证最终证据并清除 pending、恢复 ACTIVE。
-  // 输入输出及副作用：无显式输入；成功清除 pending/reservation、commit/retry/
+  // 输入/输出及副作用：无显式输入；成功清除 pending/reservation、commit/retry/
   //   release gate 并更新 state，PI/CI/used 必须已由对应 commit API 完成，本函数
   //   不重复推进。
-  // 失败边界：无 pending、identity stale、device PI 未到 next_cursor、host slot
+  // 失败/边界：无 pending、identity stale、device PI 未到 next_cursor、host slot
   //   未 posted，或 consumer doorbell/CI/CQ release 阶段不全时返回错误并保留证据。
   function rdma_status complete_recovery_retry();
     rdma_status lock_status;
@@ -4099,8 +4411,8 @@ class rdma_queue_runtime extends uvm_object;
       // 中文设计：consumer recovery 不拥有 device producer reservation；它必须
       // 有确定 doorbell SUCCESS、一次 CI commit，以及 CQ 有 target 时的 WQE release。
       if (host_produced || !is_device_ring_kind(kind) ||
-          pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
-          !pending_operation_state.consumer_doorbell_succeeded ||
+          !consumer_publication_committed_ready_locked(
+            pending_operation_state) ||
           !pending_operation_state.consumer_committed ||
           pending_operation_state.committed_consumer_cursor == null ||
           !consumer_recovery_invariant_locked(
@@ -4241,9 +4553,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：abort_recovery 放弃当前 pending 并把 attachment 隔离为 DETACHED，
   //   防止不确定 transaction 继续对旧 queue 可见。
-  // 输入输出及副作用：无显式输入；成功清除 pending、device reservation、
+  // 输入/输出及副作用：无显式输入；成功清除 pending、device reservation、
   //   commit/retry/release gate 并更新 state；不回滚已经成功的 CI，也不释放外部 mapping。
-  // 失败边界：仅 RECOVERY_REQUIRED 且 pending 非空时允许；其它状态返回
+  // 失败/边界：仅 RECOVERY_REQUIRED 且 pending 非空时允许；其它状态返回
   //   INVALID_STATE，失败不改变 recovery evidence。
   function rdma_status abort_recovery();
     rdma_status lock_status;
@@ -4282,13 +4594,23 @@ class rdma_queue_runtime extends uvm_object;
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "queue runtime has no pending recovery");
     end
-    if (pending_operation_state.mmio_evidence inside {
+    if (pending_operation_state.consumer_shadow_required &&
+        pending_operation_state.consumer_shadow_published) begin
+      if (!consumer_shadow_phase_valid(pending_operation_state, 1'b1)) begin
+        lock.put(1);
+        return make_runtime_status(RDMA_SC_INVALID_STATE,
+                                   "CQ shadow publication is incomplete");
+      end
+    end
+    else if (pending_operation_state.mmio_evidence inside {
           RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
       lock.put(1);
       return make_runtime_status(RDMA_SC_RECOVERY_REQUIRED,
                                  "recovery commit lacks definitive MMIO evidence");
     end
-    if (pending_operation_state.mmio_evidence inside {
+    if (!(pending_operation_state.consumer_shadow_required &&
+          pending_operation_state.consumer_shadow_published) &&
+        pending_operation_state.mmio_evidence inside {
           RDMA_QUEUE_MMIO_NO_SUBMIT,
           RDMA_QUEUE_MMIO_NOT_APPLICABLE}) begin
       if (!recovery_retry_confirmed) begin
@@ -4324,7 +4646,17 @@ class rdma_queue_runtime extends uvm_object;
         "queue runtime has no pending recovery"));
       return 1'b0;
     end
-    if (pending_operation_state.mmio_evidence inside {
+    if (pending_operation_state.consumer_shadow_required &&
+        pending_operation_state.consumer_shadow_published) begin
+      if (!consumer_shadow_phase_valid(pending_operation_state, 1'b1)) begin
+        lock.put(1);
+        void'(set_runtime_status_noalloc(
+          status_slot, RDMA_SC_INVALID_STATE,
+          "CQ shadow publication is incomplete"));
+        return 1'b0;
+      end
+    end
+    else if (pending_operation_state.mmio_evidence inside {
           RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
       lock.put(1);
       void'(set_runtime_status_noalloc(
@@ -4332,7 +4664,9 @@ class rdma_queue_runtime extends uvm_object;
         "recovery commit lacks definitive MMIO evidence"));
       return 1'b0;
     end
-    if (pending_operation_state.mmio_evidence inside {
+    if (!(pending_operation_state.consumer_shadow_required &&
+          pending_operation_state.consumer_shadow_published) &&
+        pending_operation_state.mmio_evidence inside {
           RDMA_QUEUE_MMIO_NO_SUBMIT,
           RDMA_QUEUE_MMIO_NOT_APPLICABLE}) begin
       if (!recovery_retry_confirmed) begin
@@ -4352,9 +4686,9 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：snapshot_pending 为 legacy caller 返回当前 pending transaction 的
   //   完整 detached 值副本，避免暴露 runtime 内部可变 evidence。
-  // 输入输出及副作用：snapshot（输出）先置 null；成功时深复制 handle、cursor、
+  // 输入/输出及副作用：snapshot（输出）先置 null；成功时深复制 handle、cursor、
   //   image、request、status、route/epoch 与所有阶段位，不修改原 pending。
-  // 失败边界：非 RECOVERY_REQUIRED、无 pending 或任一 non-fatal factory 复制失败
+  // 失败/边界：非 RECOVERY_REQUIRED、无 pending 或任一 non-fatal factory 复制失败
   //   时返回错误且 snapshot 保持 null，runtime 原 evidence 不变。
   function rdma_status snapshot_pending(
     output rdma_queue_pending_operation snapshot
@@ -4680,8 +5014,8 @@ class rdma_queue_runtime extends uvm_object;
         pending_operation_state.device_producer ||
         !pending_identity_matches_locked(pending_operation_state) ||
         pending_operation_state.kind != kind ||
-        pending_operation_state.mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS ||
-        !pending_operation_state.consumer_doorbell_succeeded ||
+        !consumer_publication_committed_ready_locked(
+          pending_operation_state) ||
         !pending_operation_state.consumer_committed ||
         pending_operation_state.committed_consumer_cursor == null ||
         !consumer_recovery_invariant_locked(

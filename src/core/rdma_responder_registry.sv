@@ -25,8 +25,10 @@ class rdma_responder_region extends uvm_object;
   bit active;
 
   // 功能：构造一个尚未登记的 responder region，建立可安全填充的默认快照。
-  // 输入输出及副作用：name 为 UVM 对象名输入；初始化 domain/mode、route/base、size、owner、lease_id 和 active，不取得外部资源。
-  // 失败边界：构造不会验证 route 或区间；未经过 registry.claim 的对象不能作为 release 的有效租约。
+  // 输入/输出及副作用：name 为 UVM 对象名输入；函数把 domain/mode、route/base、size、
+  //   owner、lease_id 和 active 设为默认值并返回 void，不取得外部资源或 registry 租约。
+  // 失败/边界：构造不会验证 route、地址区间或 owner；未经 registry.claim 成功登记的
+  //   对象不能作为 release 的有效句柄。
   function new(string name = "rdma_responder_region");
     super.new(name);
     domain = RDMA_RESPONDER_CONFIG;
@@ -58,8 +60,10 @@ class rdma_responder_registry extends uvm_object;
   protected bit m_sealed;
 
   // 功能：构造空的 responder registry，初始化单调 lease 计数器和 seal 状态。
-  // 输入输出及副作用：name 为 UVM 对象名输入；建立本地账本，不绑定外部环境或转移 region 所有权。
-  // 失败边界：新对象未 seal 且无 active region；任何输入校验失败均由后续 claim 返回状态，不在构造阶段抛出错误。
+  // 输入/输出及副作用：name 为 UVM 对象名输入；初始化 m_regions、lease 计数器和
+  //   seal 状态，账本只属于 registry，不绑定外部环境或转移 region 所有权。
+  // 失败/边界：新对象处于未 seal、无 active region 状态；输入合法性由后续 claim 校验，
+  //   构造函数不返回错误码。
   function new(string name = "rdma_responder_registry");
     super.new(name);
     m_next_lease_id = 1;
@@ -67,8 +71,10 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：创建统一的 resource-engine 错误状态，保留原始 code/message 并标记错误来源。
-  // 输入输出及副作用：code、message 为输入；返回新 rdma_status，其 source_engine 被设置为 RDMA_ENGINE_RESOURCE，不修改 registry 账本。
-  // 失败边界：rdma_status::make 只负责 code/category；本函数始终覆盖 source_engine，避免资源错误伪装成 NONE。
+  // 输入/输出及副作用：code、message 为输入；函数返回新的 rdma_status，并把
+  //   source_engine 固定为 RDMA_ENGINE_RESOURCE，不修改 registry 账本。
+  // 失败/边界：rdma_status::make 的分配/字段语义由 status 类型负责；本 helper 不
+  //   验证 code，也不保留可变 message 引用，始终覆盖 source_engine。
   protected function rdma_status make_status(rdma_status_code_e code, string message);
     rdma_status status;
     status = rdma_status::make(code, message);
@@ -77,8 +83,10 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：判断 domain 是否为四个受支持的 responder 地址域。
-  // 输入输出及副作用：domain 为输入；返回 bit，不写入对象或资源账本。
-  // 失败边界：CONFIG/MMIO/HOST_MEMORY/NETWORK 返回 1；未知枚举值返回 0。
+  // 输入/输出及副作用：domain 为输入；函数只读取枚举并返回 bit，不写入 region、
+  //   ledger 或外部资源。
+  // 失败/边界：CONFIG、MMIO、HOST_MEMORY、NETWORK 返回 1；未知枚举编码返回 0，
+  //   不替调用方修正 domain。
   protected function bit valid_domain(rdma_responder_domain_e domain);
     case (domain)
       RDMA_RESPONDER_CONFIG,
@@ -90,8 +98,10 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：判断 responder mode 是否为 DUT、VIP 或 MONITOR_ONLY 合法模式。
-  // 输入输出及副作用：mode 为输入；返回 bit，不修改 mode 或 registry。
-  // 失败边界：未知编码返回 0；MONITOR_ONLY 是合法登记模式但不参与互斥冲突。
+  // 输入/输出及副作用：mode 为输入；函数只读取枚举并返回 bit，不修改 mode、registry
+  //   或 lease 账本。
+  // 失败/边界：DUT、VIP、MONITOR_ONLY 返回 1；未知编码返回 0，MONITOR_ONLY 的冲突
+  //   例外由 claim 另行处理。
   protected function bit valid_mode(rdma_responder_mode_e mode);
     case (mode)
       RDMA_RESPONDER_DUT,
@@ -102,16 +112,20 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：判断两个路由是否处于同一地址冲突作用域，只比较 Host topology、root 和 segment。
-  // 输入输出及副作用：lhs、rhs 为 route 输入；返回 bit，不修改 route 或 registry。
-  // 失败边界：BDF 差异不扩大冲突域；route 合法性由 claim 单独校验，未知 bit 比较结果按 SV 等值语义处理。
+  // 输入/输出及副作用：lhs、rhs 为 route 输入；函数只比较 host_topology_key、root_id
+  //   和 segment，返回 bit，不修改 route 或 registry。
+  // 失败/边界：BDF 差异不会扩大冲突作用域；route 合法性由 claim 单独校验，未知 bit
+  //   按 SystemVerilog 等值语义参与比较。
   protected function bit same_scope(rdma_route_key_t lhs, rdma_route_key_t rhs);
     return lhs.host_topology_key == rhs.host_topology_key &&
            lhs.root_id == rhs.root_id && lhs.segment == rhs.segment;
   endfunction
 
   // 功能：显式比较 route 的每个字段，避免工具对 packed struct 直接比较产生不一致。
-  // 输入输出及副作用：lhs、rhs 为 route 输入；返回 bit，不修改路由或账本。
-  // 失败边界：任一 host_topology_key、root_id、segment 或 BDF 字段不同即返回 0。
+  // 输入/输出及副作用：lhs、rhs 为 route 输入；函数逐字段比较 topology/root/segment
+  //   和 BDF，返回 bit，不修改路由或账本。
+  // 失败/边界：任一比较字段不同即返回 0；本 helper 不验证 route_valid，也不把 null
+  //   句柄概念引入 packed route。
   protected function bit same_route(rdma_route_key_t lhs, rdma_route_key_t rhs);
     return lhs.host_topology_key == rhs.host_topology_key &&
            lhs.root_id == rhs.root_id && lhs.segment == rhs.segment &&
@@ -121,15 +135,18 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：显式比较两个 BAR 地址值。
-  // 输入输出及副作用：lhs、rhs 为地址输入；返回 bit，不修改地址或账本。
-  // 失败边界：value 任一 bit 不同时返回 0；该纯函数不处理地址溢出。
+  // 输入/输出及副作用：lhs、rhs 为 BAR 地址输入；函数比较 value 并返回 bit，不修改
+  //   地址、region 或 ledger。
+  // 失败/边界：任一 value bit 不同返回 0；该 helper 不检查地址对齐、区间长度或溢出。
   protected function bit same_base(rdma_bar_addr_t lhs, rdma_bar_addr_t rhs);
     return lhs.value == rhs.value;
   endfunction
 
   // 功能：使用 65 位中间值计算区间末地址并检测 base + size - 1 的溢出。
-  // 输入输出及副作用：base、size 为输入；last_ext 为输出 65 位末地址，返回 bit 表示是否溢出，不更新账本。
-  // 失败边界：size=0 返回 0；最高位为 1 表示超出 64 位可寻址范围，调用方必须拒绝该区间。
+  // 输入/输出及副作用：base、size 为输入，last_ext 为输出的 65-bit 闭区间末地址；
+  //   函数只做加法并返回是否落在 64-bit 地址空间内，不更新 ledger。
+  // 失败/边界：size=0 返回 0；base+size-1 的最高扩展位为 1 时返回 0，调用方必须拒绝
+  //   该区间；成功时 last_ext 保存实际末地址。
   protected function bit compute_last(
     rdma_bar_addr_t base,
     longint unsigned size,
@@ -145,8 +162,10 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：判断两个已校验区间是否相交，采用闭区间 [base, base+size-1] 语义。
-  // 输入输出及副作用：lhs、rhs 为 region 输入；返回 bit，不修改 region 或 registry。
-  // 失败边界：调用方必须保证 size 非零且末地址未溢出；若前置条件不满足，结果仅作保守计算而不应提交 claim。
+  // 输入/输出及副作用：lhs/rhs 的 base、size 为输入；函数按闭区间
+  //   [base, base+size-1] 判断是否相交，返回 bit，不修改 region 或 registry。
+  // 失败/边界：调用方必须先保证两段 size 非零且末地址未溢出；前置条件不满足时本
+  //   helper 仍使用 compute_last 的保守值，但结果不得用于提交 claim。
   protected function bit intervals_overlap_values(
     rdma_bar_addr_t lhs_base,
     longint unsigned lhs_size,
@@ -162,8 +181,12 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：登记一个 responder 地址区间，分配单调 lease_id 并保存完整 route/owner 快照。
-  // 输入输出及副作用：domain、mode、route、base、size、owner 为请求输入；region 为成功时返回的 registry-owned 句柄，成功会追加 m_regions。
-  // 失败边界：sealed、非法 domain/mode/route、size=0、65 位末地址溢出、owner 为空或同作用域非监视器区间重叠时拒绝且不改变账本。
+  // 输入/输出及副作用：domain、mode、route、base、size、owner 为请求输入，region 为
+  //   输出；成功时分配单调 lease_id，创建并登记 registry-owned region，同时写入各项
+  //   lease ledger，调用方只获得该句柄的使用权。
+  // 失败/边界：registry 已 sealed、domain/mode/route 非法、size=0、base+size-1 溢出、
+  //   owner 为空或同作用域同 domain 的非监视器区间重叠时返回错误，region 置 null 且账本
+  //   不变；MONITOR_ONLY 不参与互斥冲突。
   function rdma_status claim(
     rdma_responder_domain_e domain,
     rdma_responder_mode_e mode,
@@ -242,8 +265,12 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：释放 registry 返回的 region 租约，逐项验证句柄和身份后移除内部账本项。
-  // 输入输出及副作用：region 为调用方持有的句柄输入；成功时 active 清零并从 m_regions 删除，失败不修改任何条目。
-  // 失败边界：空句柄、非本 registry 对象、lease/owner/domain/mode/route/base/size 任一字段不匹配或 inactive 均返回 INVALID_ARGUMENT；sealed 不阻止 release。
+  // 输入/输出及副作用：region 为调用方持有的候选句柄输入；成功时校验 immutable
+  //   lease identity，将 region.active 清零并从 m_regions 及各 ledger 删除，不释放任何
+  //   外部 responder 资源。
+  // 失败/边界：region 为空、不是本 registry 登记对象、lease/owner/domain/mode/route/
+  //   base/size 不匹配或已 inactive 时返回 INVALID_ARGUMENT 且不改账本；sealed 不阻止
+  //   release，未知句柄也不会被隐式接纳。
   function rdma_status \release (rdma_responder_region region);
     rdma_responder_region current;
     string lease_key;
@@ -280,23 +307,28 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：冻结当前 registry，使后续 claim 失败并允许 release 进行清理。
-  // 输入输出及副作用：无显式输入；首次调用置位 m_sealed，重复调用保持置位并返回成功。
-  // 失败边界：seal 设计为幂等操作，不因已 seal 或仍有 active region 而失败。
+  // 输入/输出及副作用：无显式输入；函数置位 m_sealed，使后续 claim 拒绝新租约并
+  //   返回 success，不改动现有 region 或 ledger。
+  // 失败/边界：seal 是幂等操作，重复调用以及仍有 active region 时都成功；release 仍
+  //   可在 sealed 状态下清理已有租约。
   function rdma_status seal();
     m_sealed = 1'b1;
     return rdma_status::success();
   endfunction
 
   // 功能：查询 registry 是否已进入 seal 状态。
-  // 输入输出及副作用：无显式输入；返回 m_sealed，不修改任何资源状态。
-  // 失败边界：新建 registry 返回 0；seal 成功后始终返回 1，查询无错误码分支。
+  // 输入/输出及副作用：无显式输入；函数只读取并返回 m_sealed，不修改 region、ledger
+  //   或外部资源。
+  // 失败/边界：新建 registry 返回 0，seal 成功后返回 1；该查询没有 status 错误分支。
   function bit is_sealed();
     return m_sealed;
   endfunction
 
   // 功能：统计当前账本中仍 active 的 region 数量，供容量和清理断言使用。
-  // 输入输出及副作用：无显式输入；返回 active 条目计数，不修改队列或租约。
-  // 失败边界：空 registry 返回 0；释放条目已从队列移除，因此不会重复计数。
+  // 输入/输出及副作用：无显式输入；函数扫描 lease-id 与 active ledger 并返回当前
+  //   active region 数量，不修改队列、region 或租约。
+  // 失败/边界：空 registry 返回 0；release 已删除的条目不会重复计数，ledger 缺失的
+  //   lease 也按非 active 处理。
   function int unsigned active_count();
     int unsigned count;
     count = 0;
@@ -308,8 +340,10 @@ class rdma_responder_registry extends uvm_object;
   endfunction
 
   // 功能：按零基索引返回 registry 中的内部 region 句柄，支持诊断和释放。
-  // 输入输出及副作用：index 为输入；返回 registry-owned region handle，不复制或转移所有权。
-  // 失败边界：index 超出当前 m_regions.size 或条目为空时返回 null；该函数不因 sealed 改变可见性。
+  // 输入/输出及副作用：index 为零基索引输入；函数返回 registry 内部 region 句柄的
+  //   非拥有观察引用，不复制对象，也不转移 registry 所有权。
+  // 失败/边界：index 超出当前 m_regions.size 或对应条目为空时返回 null；索引在 release
+  //   后可能重排，sealed 状态不改变该查询的可见性，调用方不得修改返回对象字段。
   function rdma_responder_region region_at(int unsigned index);
     if (index >= m_regions.size())
       return null;

@@ -59,6 +59,24 @@ function automatic bit rdma_control_step_is_hardware(
   };
 endfunction
 
+// 功能：rdma_control_nested_status 规范化控制面模型所调用的 virtual validator
+//       返回值，确保恢复校验不会对 null status 解引用。
+// 输入/输出及副作用：status 和 label 为输入；非空 status 原样返回，null status
+//       转换为 INVALID_STATE；函数不修改模型、快照、句柄或资源账本。
+// 失败/边界：下游 validator 返回 null 时生成带上下文的确定性失败；调用方收到
+//       该状态后必须停止当前恢复分支，不能把 null 当作成功或继续读取字段。
+function automatic rdma_status rdma_control_nested_status(
+  rdma_status status,
+  string label
+);
+  if (status == null)
+    return rdma_status::make(
+      RDMA_SC_INVALID_STATE,
+      {label, " returned null status"}
+    );
+  return status;
+endfunction
+
 class rdma_mr_backing_desc extends uvm_object;
   `uvm_object_utils(rdma_mr_backing_desc)
 
@@ -134,12 +152,14 @@ class rdma_mr_backing_desc extends uvm_object;
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "PBL1 backing does not match its PBAs");
       RDMA_MR_PBL2:
-        if (hmc_refs.size() != 1 || hmc_refs[0].first_pbl_index !=
-            page_layout.first_pbl_index)
+        if (hmc_refs.size() != 1 || !hmc_refs[0].index_valid ||
+            !page_layout.first_pbl_index_valid ||
+            hmc_refs[0].first_pbl_index != page_layout.first_pbl_index)
           return rdma_status::make(
             RDMA_SC_INVALID_ARGUMENT,
             "PBL2 backing does not match its HMC lease"
           );
+      default:;
     endcase
     return rdma_status::success();
   endfunction
@@ -235,7 +255,6 @@ class rdma_control_result extends uvm_object;
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“control result status is incomplete”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、primary_status、rollback_statuses、completed_steps、final_resource_state、final_resource_state_known、recovery_required 并使用字段 rdma_status、primary_status、rollback_statuses、completed_steps、final_resource_state、final_resource_state_known、recovery_required；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“control result status is incomplete”“control result rollback status is null”；失败路径不提交部分状态或转移未声明资源。
-
   virtual function rdma_status validate();
     if (status == null || primary_status == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -312,7 +331,6 @@ typedef enum bit [2:0] { RDMA_QP_AMBIG_NONE, RDMA_QP_AMBIG_CREATE,
 
 // 功能：rdma_qp_recovery_mapping_status 校验 mapping、owner、qp_h、label 与当前对象状态的一致性，并显式处理“mapping is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：mapping（输入）、owner（输入）、qp_h（输入）、label（输入）；rdma_qp_recovery_mapping_status 读取 mapping、owner、qp_h、label 并使用字段 rdma_status、value；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_recovery_mapping_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_recovery_mapping_status(
   rdma_dma_mapping mapping,
@@ -363,6 +381,7 @@ function automatic bit rdma_qp_recovery_context_equivalent(
       lhs.hmc_ref.address.value != rhs.hmc_ref.address.value ||
       lhs.hmc_ref.size != rhs.hmc_ref.size ||
       lhs.hmc_ref.first_pbl_index != rhs.hmc_ref.first_pbl_index ||
+      lhs.hmc_ref.index_valid != rhs.hmc_ref.index_valid ||
       lhs.hmc_ref.ownership != rhs.hmc_ref.ownership ||
       lhs.hmc_ref.release_complete != rhs.hmc_ref.release_complete ||
       !$cast(lhs_token, lhs.slot_token) ||
@@ -376,7 +395,6 @@ endfunction
 
 // 功能：rdma_qp_recovery_ref_status 校验 backing_ref、role_complete、label 与当前对象状态的一致性，并显式处理“backing authority is missing”等拒绝条件，返回 rdma_status 供上层决定是否提交。
 // 输入/输出及副作用：backing_ref（输入）、role_complete（输入）、label（输入）；rdma_qp_recovery_ref_status 读取 backing_ref、role_complete、label 并使用字段 mapping.state；函数返回 rdma_status，不取得调用方资源所有权。
-
 // 失败/边界：rdma_qp_recovery_ref_status 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
 function automatic rdma_status rdma_qp_recovery_ref_status(
   rdma_qp_backing_ref backing_ref,
@@ -580,7 +598,9 @@ class rdma_qp_recovery_state extends uvm_object;
           "partial QP recovery context authority is split"
         );
       if (context_ref != null) begin
-        status = context_ref.validate();
+        status = rdma_control_nested_status(
+          context_ref.validate(), "QP partial recovery context validation"
+        );
         if (!status.ok()) return status;
         if (!rdma_qp_recovery_context_equivalent(context_ref,
                                                   qp_plan.context_ref))
@@ -617,11 +637,31 @@ class rdma_qp_recovery_state extends uvm_object;
           RDMA_SC_INVALID_STATE,
           "partial QP recovery opcode authority is incomplete"
         );
-      status = create_opcode.validate(); if (!status.ok()) return status;
-      status = modify_opcode.validate(); if (!status.ok()) return status;
-      status = delete_opcode.validate(); if (!status.ok()) return status;
-      status = query_opcode.validate(); if (!status.ok()) return status;
-      status = occ_opcode.validate(); if (!status.ok()) return status;
+      status = rdma_control_nested_status(
+        create_opcode.validate(), "QP create opcode validation"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_control_nested_status(
+        modify_opcode.validate(), "QP modify opcode validation"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_control_nested_status(
+        delete_opcode.validate(), "QP delete opcode validation"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_control_nested_status(
+        query_opcode.validate(), "QP query opcode validation"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_control_nested_status(
+        occ_opcode.validate(), "QP OCC opcode validation"
+      );
+      if (!status.ok())
+        return status;
       if (staging_mapping != null) begin
         status = rdma_qp_recovery_mapping_status(
           staging_mapping, recovery_owner, recovery_qp_h,
@@ -639,7 +679,11 @@ class rdma_qp_recovery_state extends uvm_object;
     if (qp_plan == null || context_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery authority is incomplete");
-    status = context_ref.validate(); if (!status.ok()) return status;
+    status = rdma_control_nested_status(
+      context_ref.validate(), "QP recovery context validation"
+    );
+    if (!status.ok())
+      return status;
     if (context_ref.resource_kind != RDMA_RESOURCE_QP)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP recovery context invalid");
     if (!rdma_qp_recovery_context_equivalent(context_ref,
@@ -716,7 +760,9 @@ class rdma_qp_recovery_state extends uvm_object;
       if (!status.ok()) return status;
     end
     // 先验证 plan 的完整几何，再验证每个 mapping/segment 的 Function/QP owner。
-    status = validation_plan.validate();
+    status = rdma_control_nested_status(
+      validation_plan.validate(), "QP recovery plan validation"
+    );
     if (!status.ok()) return status;
     if (qp_plan.sq_ref == null || qp_plan.sq_ref.mapping == null ||
         qp_plan.sq_ref.mapping.owner_h == null ||
@@ -813,7 +859,9 @@ class rdma_qp_recovery_state extends uvm_object;
         "ambiguous create rollback lacks candidate QPC authority"
       );
     if (prior_qpc != null) begin
-      status = prior_qpc.validate();
+      status = rdma_control_nested_status(
+        prior_qpc.validate(), "prior QPC validation"
+      );
       if (!status.ok()) return status;
       if (prior_qpc.qp_h == null ||
           prior_qpc.qp_h.kind != RDMA_RESOURCE_QP)
@@ -830,7 +878,9 @@ class rdma_qp_recovery_state extends uvm_object;
         );
     end
     if (candidate_qpc != null) begin
-      status = candidate_qpc.validate();
+      status = rdma_control_nested_status(
+        candidate_qpc.validate(), "candidate QPC validation"
+      );
       if (!status.ok()) return status;
       if (candidate_qpc.qp_h == null ||
           candidate_qpc.qp_h.kind != RDMA_RESOURCE_QP)
@@ -851,11 +901,31 @@ class rdma_qp_recovery_state extends uvm_object;
         delete_opcode == null || query_opcode == null || occ_opcode == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery opcode authority is incomplete");
-    status = create_opcode.validate(); if (!status.ok()) return status;
-    status = modify_opcode.validate(); if (!status.ok()) return status;
-    status = delete_opcode.validate(); if (!status.ok()) return status;
-    status = query_opcode.validate(); if (!status.ok()) return status;
-    status = occ_opcode.validate(); if (!status.ok()) return status;
+    status = rdma_control_nested_status(
+      create_opcode.validate(), "QP create opcode validation"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_control_nested_status(
+      modify_opcode.validate(), "QP modify opcode validation"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_control_nested_status(
+      delete_opcode.validate(), "QP delete opcode validation"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_control_nested_status(
+      query_opcode.validate(), "QP query opcode validation"
+    );
+    if (!status.ok())
+      return status;
+    status = rdma_control_nested_status(
+      occ_opcode.validate(), "QP OCC opcode validation"
+    );
+    if (!status.ok())
+      return status;
     if (ambiguous_operation != RDMA_QP_AMBIG_NONE &&
         ambiguous_ticket == null && !has_pending_hardware_step)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
@@ -873,8 +943,11 @@ class rdma_qp_recovery_state extends uvm_object;
           RDMA_SC_INVALID_ARGUMENT,
           "ambiguous QP recovery ticket Function does not match"
         );
-      status = ambiguous_ticket.validate();
-      if (!status.ok()) return status;
+      status = rdma_control_nested_status(
+        ambiguous_ticket.validate(), "ambiguous QP recovery ticket validation"
+      );
+      if (!status.ok())
+        return status;
       case (ambiguous_operation)
         RDMA_QP_AMBIG_CREATE:
           if (!rdma_qp_recovery_opcode_equivalent(
@@ -1159,8 +1232,11 @@ class rdma_recovery_record extends uvm_object;
       if (resource_h.kind != RDMA_RESOURCE_QP || qp_recovery == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "QP recovery resource/schema mismatch");
-      status = qp_recovery.validate();
-      if (!status.ok()) return status;
+      status = rdma_control_nested_status(
+        qp_recovery.validate(), "nested QP recovery validation"
+      );
+      if (!status.ok())
+        return status;
       if (qp_recovery.qp_plan == null ||
           qp_recovery.qp_plan.sq_ref == null ||
           qp_recovery.qp_plan.sq_ref.mapping == null ||
@@ -1191,21 +1267,30 @@ class rdma_recovery_record extends uvm_object;
       if (queue_plan == null || queue_plan.resource_kind != resource_h.kind)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "queue recovery plan kind does not match");
-      status = queue_plan.validate();
-      if (status == null || !status.ok())
-        return status == null ? rdma_status::make(
-          RDMA_SC_INVALID_STATE, "queue recovery plan validation returned null"
-        ) : status;
+      status = rdma_control_nested_status(
+        queue_plan.validate(), "queue recovery plan validation"
+      );
+      if (!status.ok())
+        return status;
       if (queue_create_opcode == null || queue_delete_opcode == null ||
           queue_query_opcode == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "queue recovery opcode key is null");
-      status = queue_create_opcode.validate();
-      if (status == null || !status.ok()) return status;
-      status = queue_delete_opcode.validate();
-      if (status == null || !status.ok()) return status;
-      status = queue_query_opcode.validate();
-      if (status == null || !status.ok()) return status;
+      status = rdma_control_nested_status(
+        queue_create_opcode.validate(), "queue create opcode validation"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_control_nested_status(
+        queue_delete_opcode.validate(), "queue delete opcode validation"
+      );
+      if (!status.ok())
+        return status;
+      status = rdma_control_nested_status(
+        queue_query_opcode.validate(), "queue query opcode validation"
+      );
+      if (!status.ok())
+        return status;
       if (ambiguous_queue_operation == RDMA_QUEUE_AMBIG_OCC_FLUSH &&
           (!rdma_queue_role_is_pd(ambiguous_role) || ambiguous_ticket == null))
         return rdma_status::make(

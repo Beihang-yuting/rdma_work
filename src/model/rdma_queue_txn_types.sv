@@ -168,14 +168,21 @@ class rdma_queue_txn_evidence extends uvm_object;
 
   // 功能：记录共享 URC CQ 的 SQ/RQ consumer CI、arm state 和 sequence，形成可重放事务证据。
   // 输入/输出及副作用：shadow 为输入值快照；成功时复制其 authority 游标字段到本 evidence，不修改 shadow 或 queue runtime。
-  // 失败边界：shadow 为空或 validate 失败时返回对应错误，既有 evidence 字段保持不变。
+  // 失败/边界：shadow 为空、validate 返回 null 或 validate 失败时返回确定错误；
+  // 既有 evidence 字段保持不变。
   function rdma_status capture_urc_shadow(rdma_cq_shadow_snapshot shadow);
     rdma_status status;
     if (shadow == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC CQ shadow is null");
     status = shadow.validate();
-    if (!status.ok()) return status;
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "URC CQ shadow validation returned null status"
+      );
+    if (!status.ok())
+      return status;
     urc_sq_ci = shadow.sq_ci;
     urc_rq_ci = shadow.rq_ci;
     urc_arm_state = shadow.arm_state;
@@ -228,13 +235,24 @@ class rdma_queue_txn_evidence extends uvm_object;
   // Capture mutable producer objects as detached value snapshots.
   // 功能：在 rdma_queue_txn_evidence 中，capture_function_identity 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：source（输入）；capture_function_identity 读取 source 并使用字段 cloned、route；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：capture_function_identity 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“Function identity is null”“Function identity snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
+  // 失败/边界：capture_function_identity 返回 RDMA_SC_INVALID_ARGUMENT、
+  //   RDMA_SC_INVALID_STATE、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为
+  //   “Function identity is null”“validator 返回 null”“Function identity snapshot
+  //   clone failed”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status capture_function_identity(rdma_function_identity source);
     uvm_object cloned;
+    rdma_status status;
+
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "Function identity is null");
-    if (!source.validate().ok())
-      return source.validate();
+    status = source.validate();
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function identity validation returned null status"
+      );
+    if (!status.ok())
+      return status;
     cloned = source.clone();
     if (cloned == null || !$cast(function_identity, cloned))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "Function identity snapshot clone failed");
@@ -279,8 +297,12 @@ class rdma_queue_txn_evidence extends uvm_object;
   endfunction
 
   // 功能：在 rdma_queue_txn_evidence 中，capture_request 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）；capture_request 读取 source 并使用字段 status、cloned；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：capture_request 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“semantic request is null”“request snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
+  // 输入/输出及副作用：source（输入）；capture_request 读取 source 并使用字段
+  //   status、cloned；函数返回 rdma_status，不取得调用方资源所有权。
+  // 失败/边界：capture_request 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE、
+  //   RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“semantic request is null”、
+  //   “request validation returned null status”“request snapshot clone failed”；
+  //   失败路径不提交部分状态或转移未声明资源。
   function rdma_status capture_request(rdma_semantic_request source);
     uvm_object cloned;
     rdma_status status;
@@ -288,7 +310,13 @@ class rdma_queue_txn_evidence extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "semantic request is null");
     status = source.validate();
-    if (!status.ok()) return status;
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "semantic request validation returned null status"
+      );
+    if (!status.ok())
+      return status;
     cloned = source.clone();
     if (cloned == null || !$cast(request_snapshot, cloned))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
@@ -398,12 +426,16 @@ class rdma_queue_txn_evidence extends uvm_object;
   // 输入/输出及副作用：无显式参数；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
   // 失败/边界：mark_mmio_maybe_submitted 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function rdma_status mark_mmio_maybe_submitted();
+    rdma_status transition_status;
+
     if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
     if (phase != RDMA_QUEUE_TXN_PAYLOAD_WRITTEN)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "MMIO submission requires payload evidence");
-    if (!transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED).ok())
+    transition_status =
+      transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED);
+    if (transition_status == null || !transition_status.ok())
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "MMIO phase transition failed");
     mmio_maybe_submitted = 1'b1;

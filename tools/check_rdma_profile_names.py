@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the RDMA profile definitions and frozen hardware golden vectors.
-
-The checked-in implementation profile is named ``rdma``.  XTR v1 remains only
-the external hardware-source alias used by the pinned headers and golden-file
-marker.
+"""目录：tools；职责：校验 RDMA profile 命名、冻结驱动 ABI 映射及 golden vectors。
+依赖：ArchiveLock/source manifest、锁定的 C 头文件、SystemVerilog codec/mask 定义和
+仓库内的 reference encoder；本模块只读取契约输入并在失败时抛出 ValidationError。
+所有权与生命周期：解析结果和 NamedTuple 映射由本模块短暂拥有，冻结源码与 golden
+文件由调用方/仓库管理，本校验器不接管或修改它们。实现 profile 固定为 ``rdma``，
+``xtr_v1`` 仅作为硬件来源资料和 golden marker 的外部别名。
 """
 
 from __future__ import annotations
@@ -13,13 +14,28 @@ import fnmatch
 import hashlib
 from pathlib import Path
 import re
-import subprocess
 import sys
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
+try:
+    from .rdma_driver_contract import (
+        ArchiveLock,
+        ContractError,
+        SourceManifestRecord,
+        load_archive_lock,
+        load_source_manifest,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    if str(Path(__file__).resolve().parent) not in sys.path:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from rdma_driver_contract import (
+        ArchiveLock,
+        ContractError,
+        SourceManifestRecord,
+        load_archive_lock,
+        load_source_manifest,
+    )
 
-# 0.1.34 is distributed as a source archive without Git metadata.
-FIXED_COMMIT = "rdma-driver-0.1.34"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "hw" / "rdma" / "source_manifest.txt"
 SV_DEFS_PATH = REPO_ROOT / "src" / "codec" / "rdma" / "rdma_defs.svh"
@@ -39,30 +55,6 @@ PROFILE_FORBIDDEN_PATTERNS = (
     re.compile(r"(?:^|[\"'])xtr_v1\|"),
     re.compile(r"(?:src/codec/|tests/[^\s]*/?)xtr_v1(?:/|[\"'])"),
 )
-
-SOURCE_HASHES = {
-    "cmq.h": "67f685b23af4f1be64322e56e270546d993db95494ecba253d38afd0780b6e06",
-    "qp.h": "6202ca6df10cca9bebdcdf5f766c145cd319e0c765edcfbd8677e6d4afa267bd",
-    "cq.h": "36b6cca236607fd269347ee9bc6e7cfc4410e7ddb920c178931ce11d385e0208",
-    "wr.h": "c75fb5770ef0ea1af404efbaf95cf79356d1096d331d7cdfcc46ea9ad9b3225b",
-    "defs.h": "2715ad7e265c692f34e5decdd34d23ed0cde3b19c8a3de8d89bc60cf71824862",
-    "eth_header/rdma_register.h": "af957673ba0b561cd27d4bd22394cc0bc56a0173bff66c59176a5a829e0acc13",
-    "eth_header/register.h": "061071cab4008cee1fa837b9aa71c068215c98cb5665ef5f4b038a24da09c734",
-    "xtrdma_hw.h": "70aa98a0db8e0c753f11d7bf0347cee774cee01daf7c9593ea1999a2c1ffad68",
-    "map.h": "9b532a140458c3f9592b8a1d7531500e820f8f7b1650bf6fd7f41aa1d214c75d",
-    "qp.c": "c2832eee56ce17128a4c548ed96298912ba0ce6f4ce61401f433c257396f7c3c",
-    "cq.c": "60c502b5d2de6370c6162e9e827439e76003553a913b22cae5979b79e9b7921b",
-    "wr.c": "f9267765b49faff2b5772c28dde862bec7079413b2278540cba3c6f2ea64f7fe",
-    "cmq.c": "0976654707f3ee68a96589121aae22db7a6cefb1eec3454e756ba16e411ab383",
-    "alloc.h": "1e91bb9e92c253c985f2f65684ebbd61d48b512d13aff2b73a8cbae3b25265e9",
-    "mr.h": "db51447212e687556247a19edc76ad13a39e3f4e59e0b68f1cb08c0969eb9dba",
-    "mr.c": "19775d0b99785ab4a372dcebb79aa1560b4158fc04c916a0c144c1f2aa107e5d",
-    "rdma_main.h": "48fd532c4b5987696412f987bbb2e42111d08d9da298745bd91c39effa1128ed",
-    "srq.h": "c0f7edd9bc65a4a574c082167221bdb7644c28e6f4387c1bd2a5db157b2341ae",
-    "srq.c": "c4bfe2cc974b8458e45c7552412e11fad8014acc1da6f0e5c578eb9fd4e8a5d0",
-    "event.h": "9c1185a2279854c95ed00a949c2a8aa3f4a1588386de65bf7fa7662d08dfb99a",
-    "event.c": "6b196af6a6bcdffae099a63df647ed1f565a80fbd9aa0accbb69400ff7fe4c00",
-}
 
 REQUIRED_MANIFEST_ROWS = {
     ("cmq.h", "xtrdma_cmq_opcode"),
@@ -185,6 +177,16 @@ CMQ_BODY_OWNERSHIP = {
     "RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP": (
         0x00000000001FFFFF, 0, 0, 0, 0, 0, 0, 0,
     ),
+    "RDMA_CQC_DELETE_BODY_OWNERSHIP": (
+        0x00000000001FFFFF,
+        0xFF0FFFFFFFFFFFFF,
+        0xFFFFFFFFFFFFF8FF,
+        0xFFFFFFFFFFF8C701,
+        0xF000000000FFFFFF,
+        0x0000000000000FFF,
+        0xFFFFFFFFFFFFFFC0,
+        0x0000000F00FFFFFF,
+    ),
     "RDMA_EQ_OBJECT_ID_BODY_OWNERSHIP": (
         0x0000000000000FFF, 0, 0, 0, 0, 0, 0, 0,
     ),
@@ -200,7 +202,15 @@ class ValidationError(RuntimeError):
 
 
 def find_profile_name_violations() -> list[str]:
-    """扫描当前仓库，返回生产输入中残留的旧 profile token。"""
+    """
+    功能：在 RDMA profile checker 的 find_profile_name_violations 中扫描
+    PROFILE_SCAN_ROOTS 下的文本并收集旧
+    profile token 的路径和行号。
+    输入输出及副作用：无参数；返回包含相对路径、行号和原文的
+    list[str]。只读遍历 PROFILE_SCAN_ROOTS 下的文本，不改写源码或 golden。
+    失败边界：根目录不存在时结果为空；非文本后缀和 UTF-8
+    解码失败文件被跳过，只有 PROFILE_FORBIDDEN_PATTERNS 命中的行才记录。
+    """
 
     violations: list[str] = []
     for root_name in PROFILE_SCAN_ROOTS:
@@ -222,7 +232,14 @@ def find_profile_name_violations() -> list[str]:
 
 
 def validate_profile_names() -> None:
-    """若源码、测试或仿真配置仍引用旧 profile，则抛出可定位错误。"""
+    """
+    功能：在 RDMA profile checker 的 validate_profile_names 中执行内部 rdma
+    命名守卫并报告命名残留。
+    输入输出及副作用：无参数；调用 find_profile_name_violations，
+    违规为空时返回 None，整个检查不产生文件副作用。
+    失败边界：任一旧 rdma_xtr_v1/XTR_V1 token 命中都会抛 ValidationError
+    并列出位置；无命中才通过。
+    """
 
     violations = find_profile_name_violations()
     if violations:
@@ -445,6 +462,14 @@ class GoldenCase(NamedTuple):
 
     @property
     def summary(self) -> str:
+        """
+        功能：在 RDMA profile checker 的 GoldenCase/summary 中把 inputs 序列编码为
+        canonical name=value 摘要。
+        输入输出及副作用：self.inputs 是 GoldenInput 序列；
+        返回按原顺序拼接的 name=value 字符串，不修改 tuple 或 payload。
+        失败边界：inputs 为空时返回空字符串；该属性不重新验证 token，
+        格式错误由 parse_input_summary 在写入前拒绝。
+        """
         return ",".join(f"{item.name}={item.value}" for item in self.inputs)
 
 
@@ -683,6 +708,9 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_KEY", "RDMA_SQ_WQE_RC_REMOTE_KEY", 16),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_VA", "RDMA_SQ_WQE_RC_REMOTE_VA", 24),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_SGB_PA", "RDMA_SQ_WQE_SGB_PA", 32, -0),
+    # wr.h:23,46 and wr.c:243: URC external-SGB RDMA_READ stores the
+    # packet count in qword byte 0x28, bits [63:40].
+    FieldMapping("wr.h", "XTRDMA_SQ_WQE_URC_TOTAL_PKT_NUM", "RDMA_SQ_WQE_URC_TOTAL_PKT_NUM", 40),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_IMMDT_INVLD_RKEY", "RDMA_SQ_WQE_RC_IMMEDIATE", 8),
     FieldMapping("wr.h", "XTRDMA_SQ_WQE_LOCAL_INVLD_STAG", "RDMA_SQ_WQE_LOCAL_INVLD_STAG", 8),
@@ -723,35 +751,82 @@ FIELD_MAPPINGS = (
     FieldMapping("wr.h", "XTRDMA_QP_RQ_WQE_OP", "RDMA_RQE_OPCODE", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_WQE_IDX", "RDMA_RQE_INDEX", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_WQE_IDX_WRAP", "RDMA_RQE_WRAP", 0),
+    # wr.h:179: external/inline RQE signature selector at qword0 bit 56.
+    # xtrdma_post_receive_uk() forces this wire bit for an external SGB.
+    FieldMapping("wr.h", "XTRDMA_QP_RQ_SIGN_EN", "RDMA_RQE_SIGN_EN", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_VALID", "RDMA_RQE_VALID", 0),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_TPL", "RDMA_RQE_PAYLOAD_LEN", 8),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_SIGNATURE", "RDMA_RQE_SIGNATURE", 16),
     FieldMapping("wr.h", "XTRDMA_QP_RQ_SGE_NUM", "RDMA_RQE_SGE_NUM", 16),
+    # wr.h:171-188: XTRDMA_QP_RQ_SGB_PA is GENMASK_ULL(63, 9).
+    # The qword starts at byte 32 and the wire value is PA >> 9.
+    FieldMapping("wr.h", "XTRDMA_QP_RQ_SGB_PA", "RDMA_RQE_SGB_PA", 32),
+    # wr.h:123-149, CQE qword0 contains common owner, transport, receive and
+    # profile flags.  These rows deliberately keep the driver's source names
+    # instead of collapsing the overlay into a synthetic aggregate mask.
     FieldMapping("wr.h", "XTRDMA_CQE_POLARITY", "RDMA_CQE_POLARITY", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_QP_ST", "RDMA_CQE_QP_ST", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_RQ_CQE", "RDMA_CQE_RQ_CQE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQ", "RDMA_CQE_SRFQ", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_SE", "RDMA_CQE_SE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_SIGN_EN", "RDMA_CQE_SIGN_EN", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_QP_WQE_WRAP", "RDMA_CQE_WQE_WRAP", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "RDMA_CQE_WQE_INDEX", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_PKT_OPCODE", "RDMA_CQE_PKT_OPCODE", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_ECODE", "RDMA_CQE_ECODE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_VLAN", "RDMA_CQE_VLAN", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_IPV6", "RDMA_CQE_IPV6", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_CQE_FORMAT", "RDMA_CQE_CQE_FORMAT", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_RESIZE_CQE", "RDMA_CQE_RESIZE_CQE", 0),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_MC", "RDMA_CQE_UD_MC", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_QPN", "RDMA_CQE_QPN", 0),
     FieldMapping("wr.h", "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY", "RDMA_CQE_IMMDT_DATA", 8),
     FieldMapping("wr.h", "XTRDMA_CQE_PAYLOAD_LEN", "RDMA_CQE_PAYLOAD_LEN", 8),
     FieldMapping("wr.h", "XTRDMA_CQE_SIGNATURE", "RDMA_CQE_SIGNATURE", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_RC_REMOTE_SYNDROME", "RDMA_CQE_RC_REMOTE_SYNDROME", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_SRC_QPN", "RDMA_CQE_UD_SRC_QPN", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_RQE_CPL", "RDMA_CQE_RQE_CPL", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQN", "RDMA_CQE_SRFQN", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQE_WRAP", "RDMA_CQE_SRFQE_WRAP", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_SRFQE_INDEX", "RDMA_CQE_SRFQE_INDEX", 16),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_SMAC", "RDMA_CQE_UD_SMAC", 24),
+    FieldMapping("wr.h", "XTRDMA_CQE_UD_VLAN_TAG", "RDMA_CQE_UD_VLAN_TAG", 24),
     # CEQE/AEQE fields (event consumers use qwords at byte 0 and byte 8).
     FieldMapping("defs.h", "XTRDMA_CEQE_WQE_VLD", "RDMA_CEQE_VALID", 0),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_FLAG", "RDMA_CEQE_URC_FLAG", 0),
     FieldMapping("defs.h", "XTRDMA_CEQE_QPN", "RDMA_CEQE_QPN", 0),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_SQ_CEQE_VLD", "RDMA_CEQE_URC_SQ_CQE_VALID", 0),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_RQ_CEQE_VLD", "RDMA_CEQE_URC_RQ_CQE_VALID", 0),
     FieldMapping("defs.h", "XTRDMA_CEQE_CQN", "RDMA_CEQE_CQN", 0),
     FieldMapping("defs.h", "XTRDMA_CEQE_ECODE", "RDMA_CEQE_ECODE", 0),
     FieldMapping("defs.h", "XTRDMA_CEQE_PKT_OPCODE", "RDMA_CEQE_PKT_OPCODE", 0),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_TYPE", "RDMA_CEQE_URC_ABNML_CQE_TYPE", 8),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE", "RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE", 8),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP", "RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP", 8),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_WQE_IDX", "RDMA_CEQE_URC_ABNML_CQE_WQE_IDX", 8),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP", "RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP", 8),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX", "RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX", 8),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP", "RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP", 8),
+    FieldMapping("defs.h", "XTRDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX", "RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX", 8),
     FieldMapping("defs.h", "XTRDMA_CEQE_RC_CQ_PI_WRAP", "RDMA_CEQE_CQ_PI_WRAP", 8),
     FieldMapping("defs.h", "XTRDMA_CEQE_RC_CQ_PI", "RDMA_CEQE_CQ_PI", 8),
     FieldMapping("defs.h", "XTRDMA_AEQE_WQE_VLD", "RDMA_AEQE_VALID", 0),
     FieldMapping("defs.h", "XTRDMA_AEQE_QP_ST", "RDMA_AEQE_QP_ST", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_SRFQ_EN", "RDMA_AEQE_SRFQ_EN", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_AEQ_OVERFLOW_FLAG", "RDMA_AEQE_OVERFLOW_FLAG", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_URC_FLAG", "RDMA_AEQE_URC_FLAG", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_CQ_INVLD_AE_FLAG", "RDMA_AEQE_CQ_INVALID_FLAG", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_URC_ABNML_CQE_TYPE", "RDMA_AEQE_URC_ABNML_CQE_TYPE", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_CQN_EQN_H", "RDMA_AEQE_CQN_EQN_HIGH", 0),
     FieldMapping("defs.h", "XTRDMA_AEQE_PKT_OPCODE", "RDMA_AEQE_PKT_OPCODE", 0),
     FieldMapping("defs.h", "XTRDMA_AEQE_ECODE", "RDMA_AEQE_ECODE", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_CQN_EQN_L", "RDMA_AEQE_CQN_EQN_LOW", 0),
     FieldMapping("defs.h", "XTRDMA_AEQE_QPN", "RDMA_AEQE_QPN", 0),
+    FieldMapping("defs.h", "XTRDMA_AEQE_URC_REMOTE_ECODE", "RDMA_AEQE_URC_REMOTE_ECODE", 8),
     FieldMapping("defs.h", "XTRDMA_AEQE_QUEUE_WQE_IDX_WARP", "RDMA_AEQE_WQE_WRAP", 8),
     FieldMapping("defs.h", "XTRDMA_AEQE_QUEUE_WQE_IDX", "RDMA_AEQE_WQE_INDEX", 8),
+    FieldMapping("defs.h", "XTRDMA_AEQE_SRFQN", "RDMA_AEQE_SRFQN", 8),
+    FieldMapping("defs.h", "XTRDMA_AEQE_SRFQE_IDX", "RDMA_AEQE_SRFQE_IDX", 8),
     # Doorbell payloads.
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_DB_PI", "RDMA_CMQ_DB_PI", 0),
     FieldMapping("cmq.h", "XTRDMA_CMQSQ_DB_POL", "RDMA_CMQ_DB_POLARITY", 0),
@@ -973,10 +1048,29 @@ PROFILE_VALUES = {
     # placement is frozen as independently checked profile metadata.
     "RDMA_QPC_DEST_IP_BYTE_OFFSET": 80,
     "RDMA_QPC_DEST_IP_BYTES": 16,
+    # CEQE/AEQE masks are variant ownership contracts, not permissive decode
+    # hints.  Keep them in the independent checker so a future codec change
+    # cannot silently accept a reserved driver bit.
+    "RDMA_CEQE_QWORD0_UNION_MASK": 0xDFFF_FFDF_FFFF_FFFF,
+    "RDMA_CEQE_QWORD0_RC_MASK": 0x9FFF_FF1F_FFFF_FFFF,
+    "RDMA_CEQE_QWORD1_RC_MASK": 0x0000_0000_0080_FFFF,
+    "RDMA_CEQE_QWORD1_URC_MASK": 0x03FF_FFFF_FFFF_FFFF,
+    "RDMA_AEQE_QWORD0_MASK": 0xFFDF_FFFF_FFFF_FFFF,
+    "RDMA_AEQE_QWORD1_MASK": 0xFFFF_FFFF_0FFF_FFFF,
+    "RDMA_AEQE_CQN_EQN_LSHIFT": 6,
 }
 
 
 def parse_field_expression(expression: str) -> tuple[int, int]:
+    """
+    功能：在 RDMA profile checker 的 parse_field_expression 中将 BIT/GENMASK C
+    表达式转换为 (lsb,width) 坐标。
+    输入输出及副作用：expression 为 C 字段宏文本；返回 (lsb, width)，其中
+    width 覆盖连续位段且 lsb 是最低位。
+    失败边界：只接受 BIT/ BIT_ULL 和 GENMASK/GENMASK_ULL 的 0..63 范围；
+    位点大于 63、high<low 或其它语法抛
+    ValidationError。
+    """
     expr = expression.strip()
     bit_match = re.fullmatch(r"BIT(?:_ULL)?\(\s*(\d+)\s*\)", expr)
     if bit_match:
@@ -996,6 +1090,14 @@ def parse_field_expression(expression: str) -> tuple[int, int]:
 
 
 def parse_value_expression(expression: str) -> int:
+    """
+    功能：在 RDMA profile checker 的 parse_value_expression 中将十六进制或十进制
+    C 常量转换为整数。
+    输入输出及副作用：expression 为 C 数值宏；返回去掉 u/l 后的整数值，
+    不执行 eval，也不改变输入字符串。
+    失败边界：仅接受十六进制/十进制无运算字面量；空串、负数、
+    移位或符号引用抛 unsupported mapped C value expression。
+    """
     expr = expression.strip()
     if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:[uUlL]+)?", expr):
         raise ValidationError(f"unsupported mapped C value expression: {expression}")
@@ -1003,18 +1105,193 @@ def parse_value_expression(expression: str) -> int:
     return int(expr, 0)
 
 
-def parse_sv_value(expression: str) -> int:
-    expr = expression.strip().replace("_", "")
-    match = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", expr)
+def parse_sv_value(
+    expression: str,
+    symbol_resolver: Callable[[str], int] | None = None,
+) -> int:
+    """
+    功能：在 RDMA profile checker 的 parse_sv_value 中解析受限的 SystemVerilog
+    常量表达式，支持 based literal、十进制 literal、已登记符号和整数运算。
+    输入输出及副作用：expression 为 SV localparam 右值；symbol_resolver 可按
+    名称返回同一份 localparam 表中的值；返回精确整数，不执行 Python eval，也不
+    修改调用方的常量表。
+    失败边界：只接受明确的 token、括号和 + - * / % << >> | & ^ 运算；based
+    literal 的尺寸、基数和数字之间允许 SV 语法规定的空白；二进制/八进制
+    literal、未知符号、除零、负结果、残余 token 或空值抛 ValidationError，解析不会
+    截断超宽值。
+    """
+    expr = expression.strip()
+    compact = expr.replace("_", "")
+    match = re.fullmatch(
+        r"(?:\d+)\s*'\s*([hHdD])\s*([0-9a-fA-F]+)", compact
+    )
     if match:
         return int(match.group(2), 16 if match.group(1).lower() == "h" else 10)
-    if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", expr):
-        return int(expr, 0)
-    raise ValidationError(f"unsupported SV constant expression: {expression}")
+    if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", compact):
+        return int(compact, 0)
+
+    token_pattern = re.compile(
+        r"(?:\d+\s*'\s*[hHdD]\s*[0-9a-fA-F_]+|0[xX][0-9a-fA-F_]+|"
+        r"[0-9][0-9_]*|[A-Za-z_][A-Za-z0-9_]*|<<|>>|"
+        r"[()+\-*/%|&^])"
+    )
+    tokens: list[str] = []
+    cursor = 0
+    while cursor < len(expr):
+        if expr[cursor].isspace():
+            cursor += 1
+            continue
+        token = token_pattern.match(expr, cursor)
+        if token is None:
+            raise ValidationError(
+                f"unsupported SV constant expression: {expression}"
+            )
+        tokens.append(token.group(0))
+        cursor = token.end()
+
+    position = 0
+
+    def peek() -> str | None:
+        return tokens[position] if position < len(tokens) else None
+
+    def consume(expected: str | None = None) -> str:
+        nonlocal position
+        token = peek()
+        if token is None or (expected is not None and token != expected):
+            raise ValidationError(
+                f"unsupported SV constant expression: {expression}"
+            )
+        position += 1
+        return token
+
+    def literal(token: str) -> int | None:
+        normalized = re.sub(r"[\s_]", "", token)
+        based = re.fullmatch(r"(?:\d+)'([hHdD])([0-9a-fA-F]+)", normalized)
+        if based:
+            return int(
+                based.group(2),
+                16 if based.group(1).lower() == "h" else 10,
+            )
+        if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", normalized):
+            return int(normalized, 0)
+        return None
+
+    def parse_primary() -> int:
+        token = peek()
+        if token is None:
+            raise ValidationError(
+                f"unsupported SV constant expression: {expression}"
+            )
+        if token == "(":
+            consume("(")
+            value = parse_bit_or()
+            consume(")")
+            return value
+        value = literal(token)
+        if value is not None:
+            consume()
+            return value
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
+            consume()
+            if symbol_resolver is None:
+                raise ValidationError(
+                    f"unknown SV constant symbol: {token}"
+                )
+            try:
+                return symbol_resolver(token)
+            except ValidationError:
+                raise
+            except Exception as error:
+                raise ValidationError(
+                    f"unknown SV constant symbol: {token}"
+                ) from error
+        raise ValidationError(
+            f"unsupported SV constant expression: {expression}"
+        )
+
+    def parse_unary() -> int:
+        token = peek()
+        if token == "+":
+            consume("+")
+            return parse_unary()
+        if token == "-":
+            consume("-")
+            return -parse_unary()
+        return parse_primary()
+
+    def parse_multiplicative() -> int:
+        value = parse_unary()
+        while peek() in {"*", "/", "%"}:
+            operator = consume()
+            rhs = parse_unary()
+            if operator == "*":
+                value *= rhs
+            elif rhs == 0:
+                raise ValidationError(
+                    f"invalid SV constant expression: division by zero: {expression}"
+                )
+            elif operator == "/":
+                value //= rhs
+            else:
+                value %= rhs
+        return value
+
+    def parse_additive() -> int:
+        value = parse_multiplicative()
+        while peek() in {"+", "-"}:
+            operator = consume()
+            rhs = parse_multiplicative()
+            value = value + rhs if operator == "+" else value - rhs
+        return value
+
+    def parse_shift() -> int:
+        value = parse_additive()
+        while peek() in {"<<", ">>"}:
+            operator = consume()
+            rhs = parse_additive()
+            if rhs < 0:
+                raise ValidationError(
+                    f"invalid SV constant expression: negative shift: {expression}"
+                )
+            value = value << rhs if operator == "<<" else value >> rhs
+        return value
+
+    def parse_bit_and() -> int:
+        value = parse_shift()
+        while peek() == "&":
+            consume("&")
+            value &= parse_shift()
+        return value
+
+    def parse_bit_xor() -> int:
+        value = parse_bit_and()
+        while peek() == "^":
+            consume("^")
+            value ^= parse_bit_and()
+        return value
+
+    def parse_bit_or() -> int:
+        value = parse_bit_xor()
+        while peek() == "|":
+            consume("|")
+            value |= parse_bit_xor()
+        return value
+
+    value = parse_bit_or()
+    if position != len(tokens) or value < 0:
+        raise ValidationError(f"unsupported SV constant expression: {expression}")
+    return value
 
 
 def strip_sv_comments(text: str) -> str:
-    """Remove SV comments while preserving strings and source layout."""
+    """
+    功能：在 RDMA profile checker 的 strip_sv_comments 中剥离 SV
+    注释而保留字符串和源码位置。
+    输入输出及副作用：text 为 SV 源码；返回等长的去注释文本，
+    保留字符串字符、换行和索引位置供后续扫描。
+    失败边界：行注释到换行结束、块注释到 */ 结束；
+    未闭合块注释会吞掉余下字符但不抛异常，调用方仍可按位置报错。
+    """
     result: list[str] = []
     index = 0
     state = "code"
@@ -1062,7 +1339,15 @@ def strip_sv_comments(text: str) -> str:
 
 
 def mask_sv_strings(text: str) -> str:
-    """Blank quoted SV strings while preserving source positions and lines."""
+    """
+    功能：在 RDMA profile checker 的 mask_sv_strings
+    中掩盖字符串字面量以隔离结构扫描。
+    输入输出及副作用：text 为已去注释的 SV 源码；返回等长文本，
+    把字符串内容替换为空格并保留换行以隔离结构 token。
+    失败边界：转义引号只结束相应字符串；
+    未闭合字符串会遮蔽至文本末尾，不修改原 text，
+    也不伪造宏或标识符。
+    """
     result: list[str] = []
     index = 0
     in_string = False
@@ -1089,7 +1374,15 @@ def mask_sv_strings(text: str) -> str:
 
 
 def validate_error_codec_preprocessor(codec_code: str) -> None:
-    """Allow only the one required macro invocation in the error codec."""
+    """
+    功能：在 RDMA profile checker 的 validate_error_codec_preprocessor 中锁定错误
+    codec 唯一的
+    uvm_object_utils 宏。
+    输入输出及副作用：codec_code 为错误 codec 源码；成功返回 None，
+    并确认唯一的 uvm_object_utils(rdma_hw_error_codec) 宏。
+    失败边界：反引号数量不是 1、宏名称/
+    行形态不匹配或宏不在唯一反引号范围内时抛 ValidationError。
+    """
     approved = list(
         re.finditer(
             r"^[ \t]*`uvm_object_utils\(rdma_hw_error_codec\)"
@@ -1110,7 +1403,14 @@ def validate_error_codec_preprocessor(codec_code: str) -> None:
 
 
 def tokenize_sv_syntax(text: str) -> list[str]:
-    """Tokenize enough SV syntax to audit hardware-code use sites."""
+    """
+    功能：在 RDMA profile checker 的 tokenize_sv_syntax 中把错误 codec
+    拆成可审计的 SV token。
+    输入输出及副作用：text 为错误 codec 代码；返回按源码顺序排列的
+    token list，并将带宽度的 based literal 压成单 token。
+    失败边界：该词法器不做语义拒绝；空文本可返回空列表，
+    调用者必须由函数区间和 case 校验捕获结构缺失。
+    """
     based_literal = re.compile(
         r"\d+\s*'\s*[sS]?\s*[hHdDbBoO]\s*[0-9a-fA-F_xXzZ?]+"
     )
@@ -1135,7 +1435,15 @@ class SvFunctionRegion(NamedTuple):
 
 
 def parse_sv_function_regions(tokens: list[str]) -> list[SvFunctionRegion]:
-    """Return non-nested function token ranges from a codec source."""
+    """
+    功能：在 RDMA profile checker 的 parse_sv_function_regions 中提取 function
+    的头部和 body token 区间。
+    输入输出及副作用：tokens 为 SV token 序列；返回每个 function 的
+    SvFunctionRegion（名称、头/体起止索引）。
+    失败边界：找不到分号、括号或 endfunction，或 function
+    形态没有参数括号时抛 invalid SV function syntax；无 function
+    时返回空列表。
+    """
     regions: list[SvFunctionRegion] = []
     position = 0
     while position < len(tokens):
@@ -1163,7 +1471,14 @@ def parse_sv_function_regions(tokens: list[str]) -> list[SvFunctionRegion]:
 def matching_token_patterns(
     tokens: list[str], pattern: list[str], start: int, end: int
 ) -> list[int]:
-    """Return starts of an exact token pattern inside one function range."""
+    """
+    功能：在 RDMA profile checker 的 matching_token_patterns 中在指定 token
+    区间定位精确连续 pattern。
+    输入输出及副作用：tokens、pattern 和 [start,end) 定义扫描窗口；
+    返回所有精确连续匹配的起始索引，不复制或改写 token。
+    失败边界：窗口反向或短于 pattern 时自然返回空列表；
+    索引由调用方提供，函数不替调用方裁剪越界数据。
+    """
     return [
         index
         for index in range(start, end - len(pattern) + 1)
@@ -1174,7 +1489,16 @@ def matching_token_patterns(
 def matching_statement_patterns(
     tokens: list[str], pattern: list[str], start: int, end: int
 ) -> list[int]:
-    """Return exact token patterns that also start at a statement boundary."""
+    """
+    功能：在 RDMA profile checker 的 matching_statement_patterns
+    中筛选位于语句边界的精确 pattern。
+    输入输出及副作用：tokens 是待扫描序列，pattern 是连续 token，start/end
+    定义半开区间；函数先调用
+    matching_token_patterns，再检查前一 token 是否为起点、分号、begin 或 else，
+    返回语句起始索引。
+    失败边界：pattern 跨越窗口或仅出现在表达式中会被排除；
+    函数本身不抛异常，错误数量由上层契约判断。
+    """
     return [
         index
         for index in matching_token_patterns(tokens, pattern, start, end)
@@ -1185,7 +1509,15 @@ def matching_statement_patterns(
 def validate_outer_case_default_is_last(
     case_body: str, function_name: str
 ) -> None:
-    """Require one depth-zero default whose statement consumes the case tail."""
+    """
+    功能：在 RDMA profile checker 的 validate_outer_case_default_is_last
+    中验证错误码 case 的唯一最外层 default
+    位于尾部。
+    输入输出及副作用：case_body 与 function_name 描述一个错误码 case；
+    成功返回 None，要求唯一最外层 default 的语句位于末尾。
+    失败边界：嵌套 case 不平衡、default 缺失/重复、default 后仍有 case item
+    或 begin/end 未闭合时抛 ValidationError。
+    """
     tokens = tokenize_sv_syntax(case_body)
     case_depth = 0
     defaults: list[int] = []
@@ -1234,7 +1566,17 @@ def validate_outer_case_default_is_last(
 
 
 def validate_hardware_code_uses(codec_code: str) -> None:
-    """Fail closed unless every hardware_code token has a pinned role."""
+    """
+    功能：在 RDMA profile checker 的 validate_hardware_code_uses 中审计 hardware_code
+    在四个错误 codec
+    function 中的固定角色。
+    输入输出及副作用：codec_code 为四个错误 codec function；成功返回 None，
+    锁定 hardware_code 的 formals、case
+    selector、decode_status 调用和输出赋值。
+    失败边界：classify/inferred_engine/symbolic_name/decode_status 缺失、重复、
+    调用顺序或额外 hardware_code 引用都会抛
+    ValidationError。
+    """
     tokens = tokenize_sv_syntax(codec_code)
     regions = parse_sv_function_regions(tokens)
     regions_by_name: dict[str, list[SvFunctionRegion]] = {}
@@ -1364,10 +1706,27 @@ def validate_hardware_code_uses(codec_code: str) -> None:
 
 
 def parse_sv_constants(text: str) -> dict[str, int]:
+    """
+    功能：在 RDMA profile checker 的 parse_sv_constants 中读取 localparam 和
+    RDMA_FIELD 并生成常量表。
+    输入输出及副作用：text 为 SV 定义；返回名称到整数的 dict，
+    来源包括 localparam 和 RDMA_FIELD 生成的 OFFSET/LSB/WIDTH 常量。
+    失败边界：重复名称、非法 based literal 或越界字段不会覆盖旧值；
+    parse_sv_value 的 ValidationError 原样传播。
+    """
     text = mask_sv_strings(strip_sv_comments(text))
     constants: dict[str, int] = {}
+    raw_constants: dict[str, str] = {}
 
     def add(name: str, value: int) -> None:
+        """
+        功能：在 RDMA profile checker 的 parse_sv_constants/add 中向本次解析的
+        constants 表登记唯一名称。
+        输入输出及副作用：name/value 是当前扫描得到的 SV 常量；把唯一
+        pair 写入闭包 constants，并无返回值或外部写入。
+        失败边界：name 已存在时抛 duplicate SV constant，保证 localparam 与
+        RDMA_FIELD 展开不能静默覆盖。
+        """
         if name in constants:
             raise ValidationError(f"duplicate SV constant: {name}")
         constants[name] = value
@@ -1378,7 +1737,36 @@ def parse_sv_constants(text: str) -> dict[str, int]:
     )
     for match in pattern.finditer(text):
         name = match.group(1)
-        add(name, parse_sv_value(match.group(2)))
+        if name in raw_constants:
+            raise ValidationError(f"duplicate SV constant: {name}")
+        raw_constants[name] = match.group(2)
+
+    resolving: set[str] = set()
+
+    def resolve(name: str) -> int:
+        """
+        功能：按 localparam 名称递归解析原始表达式，并缓存已求值结果。
+        输入输出及副作用：name 为待解析符号；读取 raw_constants，成功时把值
+        写入 constants；不修改 SV 文本或外部文件。
+        失败边界：未知名称、循环引用或表达式非法时抛 ValidationError，禁止用
+        零值或前一个常量替代缺失的驱动坐标。
+        """
+        if name in constants:
+            return constants[name]
+        if name not in raw_constants:
+            raise ValidationError(f"unknown SV constant symbol: {name}")
+        if name in resolving:
+            raise ValidationError(f"cyclic SV constant reference: {name}")
+        resolving.add(name)
+        try:
+            value = parse_sv_value(raw_constants[name], resolve)
+        finally:
+            resolving.remove(name)
+        constants[name] = value
+        return value
+
+    for name in raw_constants:
+        resolve(name)
     field_pattern = re.compile(
         r"`RDMA_FIELD\(\s*(RDMA_[A-Za-z0-9_]+)\s*,\s*(\d+)\s*,"
         r"\s*(\d+)\s*,\s*(\d+)\s*\)"
@@ -1394,7 +1782,16 @@ def parse_sv_constants(text: str) -> dict[str, int]:
 
 
 def parse_sq_field_mappings(text: str) -> dict[str, tuple[str, str, int, int]]:
-    """Parse and validate the SQE field declarations from an SV defs file."""
+    """
+    功能：解析并校验 SV 定义中的 SQE 字段坐标，生成字段到 C
+    来源的映射。
+    输入输出及副作用：text 为包含 RDMA_FIELD 的 SV 文本；返回 sv stem 到 (C
+    path、symbol、lsb、width) 的映射，并补充 16-byte
+    UD IPv6 别名。
+    失败边界：缺少/额外 stem、重复声明、非 64-bit qword 坐标、byte offset
+    或 reference lsb/width 漂移均抛
+    ValidationError。
+    """
     clean = mask_sv_strings(strip_sv_comments(text))
     declared: dict[str, tuple[int, int, int]] = {}
     pattern = re.compile(
@@ -1423,15 +1820,17 @@ def parse_sq_field_mappings(text: str) -> dict[str, tuple[str, str, int, int]]:
             raise ValidationError(f"SQ field byte offset drift: {stem}")
         if reference is None or (lsb, width) != (reference.lsb, reference.width):
             raise ValidationError(f"SQ field coordinate drift: {stem}")
-    return {
+    result = {
         stem: (mappings[stem].path, mappings[stem].c_symbol, lsb, width)
         for stem, (_, lsb, width) in declared.items()
-    } | {
-        # The 16-byte destination-IP memcpy is represented by the two
-        # independently mapped IPv6 qwords; this name is a convenience alias
-        # for callers that treat the raw range as one field.
-        "RDMA_SQ_WQE_UD_DST_IP": ("wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", 0, 64)
     }
+    # The 16-byte destination-IP memcpy is represented by the two independently
+    # mapped IPv6 qwords; this name is a convenience alias for callers that
+    # treat the raw range as one field.
+    result["RDMA_SQ_WQE_UD_DST_IP"] = (
+        "wr.h", "XTRDMA_SQ_WQE_UD_DST_IPV6_L", 0, 64
+    )
+    return result
 
 
 def _sq_header(
@@ -1442,7 +1841,16 @@ def _sq_header(
     se: bool = False,
     index: int = 0x1234,
 ) -> None:
-    """Populate the common SQE header using the pinned logical coordinates."""
+    """
+    功能：在 RDMA profile checker 的 _sq_header 中按 reference 坐标编码共享 SQE
+    header 字段。
+    输入输出及副作用：image 是 64-byte ReferenceImage；按 opcode/inline/se/index
+    写入 QPN、ICOS、QP_SN、header
+    flags 等固定 SQE 字段并更新 occupancy。
+    失败边界：image 必须由 ReferenceImage 管理；任何字段溢出、重叠或 image
+    太短由 put_named/put_field 抛
+    ValidationError，函数不返回新对象。
+    """
     put_named(image, "RDMA_SQ_WQE_QPN", 0x15555)
     put_named(image, "RDMA_SQ_WQE_ICOS", 5)
     put_named(image, "RDMA_SQ_WQE_QP_SN", 0xA6)
@@ -1459,7 +1867,15 @@ def _sq_header(
 
 
 def _sq_sge(sgb: ReferenceImage, slot: int, length: int, lkey: int, iova: int) -> None:
-    """Encode one 16-byte SGE in the driver's two-qword format."""
+    """
+    功能：在 RDMA profile checker 的 _sq_sge 中按 driver 两 qword 格式编码一个
+    SGB SGE。
+    输入输出及副作用：sgb 是 512-byte ReferenceImage；slot、length、lkey、iova
+    决定两个 descriptor qword
+    的长度/key/地址写入并登记 occupancy。
+    失败边界：slot 必须在 0..31 且字段落在 512-byte SGB；越界、
+    重叠或值超宽抛 ValidationError，length==2^31 按驱动约定写零。
+    """
     if slot < 0 or slot >= 32:
         raise ValidationError("SQ SGB slot is outside the 512-byte image")
     base = slot * 16 * 8
@@ -1469,18 +1885,46 @@ def _sq_sge(sgb: ReferenceImage, slot: int, length: int, lkey: int, iova: int) -
 
 
 def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
-    """Build operation-specific SQE/SGB vectors from the pinned coordinates."""
+    """
+    功能：在 RDMA profile checker 的 _build_sq_golden_cases 中构造 RC、atomic、UD 的
+    SQE/SGB golden 集合。
+    输入输出及副作用：无参数；返回 (GoldenCase 列表, detached SGB bytes
+    字典)，分别覆盖 RC inline/direct、atomic
+    CAS/FAA、UD inline/SGB。
+    失败边界：每个 case 使用独立 ReferenceImage；字段坐标冲突、SGB slot
+    越界或摘要无法解析时构造过程抛 ValidationError。
+    """
     cases: list[GoldenCase] = []
     sgb_images: dict[str, bytes] = {"sgb_boundary": bytes(512)}
     sgb_iova = 0x20000  # 512-byte aligned address used by the SGB pointer field.
 
     def add(name: str, summary: str, image: ReferenceImage, sgb: bytes | None = None) -> None:
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/add 中登记一个 SQE
+        case 及可选 detached SGB。
+        输入输出及副作用：name/summary/image 定义一个 SQE case，可选 sgb 定义
+        detached SGB；登记 bytes(image) 快照并在
+        sgb 非空时写入 sgb_images。
+        失败边界：summary token 非法由 parse_input_summary 拒绝；该 helper
+        不检查重复 name，最终一致性由 golden 校验器负责。
+        """
         cases.append(GoldenCase(name, parse_input_summary(summary), bytes(image)))
         if sgb is not None:
             sgb_images[name] = sgb
 
     def rc_payload(name: str, length: int, *, opcode: int = 1, inline: bool = True,
                    immediate: int | None = None, remote: bool = False) -> None:
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/rc_payload 中构造指定
+        RC opcode、长度和
+        inline/remote 组合。
+        输入输出及副作用：按 name、length、opcode、inline、immediate、remote
+        组合编码 RC header、payload、remote
+        key/VA，并为大 inline payload 生成 SGB。
+        失败边界：length 或字段值超出 reference width 时 put_named 抛
+        ValidationError；仅 inline 且长度不超过 32
+        才直接写入 SQE。
+        """
         image = ReferenceImage(64)
         _sq_header(image, opcode, inline=inline, se=opcode in (1, 2, 5), index=length + 0x1200)
         put_named(image, "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", length)
@@ -1506,6 +1950,14 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     rc_payload("rc_inline_512", 512)
 
     def direct_sge(name: str, count: int) -> None:
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/direct_sge 中构造直接
+        SGE 数量对应的 RC case。
+        输入输出及副作用：构造 count 个直接 SGE 的 RC SQE，把每个 slot 的
+        length/lkey/iova 写入 SQE body 后登记 name。
+        失败边界：count 使 descriptor 超出 64-byte image 或字段重叠时由
+        put_field 抛错；正常路径不分配 detached SGB。
+        """
         image = ReferenceImage(64)
         _sq_header(image, 1, inline=False, se=True, index=0x1300 + count)
         put_named(image, "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", count * 8)
@@ -1522,6 +1974,17 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     direct_sge("rc_sge_direct_2", 2)
 
     def sgb_sge(name: str, count: int) -> None:
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/sgb_sge 中构造把 SGE
+        放入 detached SGB 的 RC
+        case。
+        输入输出及副作用：name 标识 case，count 指定 SGE 数量；构造 count
+        个 detached-SGB SGE 的 RC SQE，写入
+        SGB_PA 并用 _sq_sge 生成 512-byte SGB。
+        失败边界：count 大于 32、SGB descriptor 越界或 image occupancy 冲突时抛
+        ValidationError；SQE 与 SGB
+        作为独立快照登记。
+        """
         image = ReferenceImage(64)
         _sq_header(image, 1, inline=False, se=True, index=0x1400 + count)
         put_named(image, "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", count * 8)
@@ -1545,6 +2008,16 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     add("local_invalidate", "case=local_invalidate,opcode=14,mode=none", image)
 
     def atomic(name: str, opcode: int, cas: bool) -> None:
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/atomic 中按 cas
+        分支构造 CAS 或 FAA atomic
+        case。
+        输入输出及副作用：按 cas 选择 opcode 7 的 CAS 或 opcode 8 的 FAA，
+        填充 atomic remote/local SGE 和对应
+        swap/cmp 或 add data。
+        失败边界：cas 分支之外不会写另一组 atomic data；任何 64-bit atomic
+        字段溢出或重复占位由 put_named 拒绝。
+        """
         image = ReferenceImage(64)
         _sq_header(image, opcode, inline=False, index=0x1600 + int(cas))
         put_named(image, "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8)
@@ -1566,6 +2039,16 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
     atomic("atomic_faa", 8, False)
 
     def ud(name: str, with_sgb: bool) -> None:
+        """
+        功能：在 RDMA profile checker 的 _build_sq_golden_cases/ud 中构造 inline 或
+        SGB 模式的 UD case。
+        输入输出及副作用：name 标识 case，with_sgb 选择 inline 或 SGB；编码
+        DMAC、VLAN、routing、IPv6、Q_Key 等字段并
+        固定目的 IPv6 字节序。
+        失败边界：with_sgb 为真时必须能写入 SGB_PA 和一个 SGE；字段范围或
+        16-byte destination IP 长度不符时抛
+        ValidationError。
+        """
         image = ReferenceImage(64)
         _sq_header(image, 1, inline=not with_sgb, se=True, index=0x1700 + int(with_sgb))
         put_named(image, "RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN", 8 if with_sgb else 0)
@@ -1606,7 +2089,15 @@ def _build_sq_golden_cases() -> tuple[list[GoldenCase], dict[str, bytes]]:
 
 
 def sq_reference_image(case_name: str = "sqe_rc_boundary") -> bytes:
-    """Return an operation-specific SQE reference image."""
+    """
+    功能：在 RDMA profile checker 的 sq_reference_image 中从生成集合按名称返回
+    SQE reference bytes。
+    输入输出及副作用：case_name 选择 _build_sq_golden_cases 生成的 SQE；
+    返回对应 immutable payload bytes，不返回可变
+    ReferenceImage。
+    失败边界：case_name 不在生成集合时抛 unknown SQ golden case；命中 case
+    时即使 payload 全零也按名称返回。
+    """
     for case in _build_sq_golden_cases()[0]:
         if case.name == case_name:
             return case.payload
@@ -1614,7 +2105,14 @@ def sq_reference_image(case_name: str = "sqe_rc_boundary") -> bytes:
 
 
 def sq_reference_sgb(case_name: str = "sgb_boundary") -> bytes:
-    """Return the detached 512-byte SGB image for a named SQ case."""
+    """
+    功能：在 RDMA profile checker 的 sq_reference_sgb 中从生成集合按名称返回
+    detached SGB bytes。
+    输入输出及副作用：case_name 选择 detached SGB 字典项；返回对应 512-byte
+    bytes 快照，不暴露内部可变对象。
+    失败边界：缺少 case_name（包括非 SGB 的 SQE 名称）时抛 unknown SQ SGB
+    case，已有字典不会被修改。
+    """
     sgb = _build_sq_golden_cases()[1]
     if case_name not in sgb:
         raise ValidationError(f"unknown SQ SGB case: {case_name}")
@@ -1622,6 +2120,15 @@ def sq_reference_sgb(case_name: str = "sgb_boundary") -> bytes:
 
 
 def validate_sq_golden_vectors() -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_sq_golden_vectors 中逐字节比较仓库
+    sq.hex 与独立 SQE/SGB
+    reference。
+    输入输出及副作用：无参数；读取 GOLDEN_DIR/sq.hex，
+    解析后与独立生成的 SQE 及 detached SGB cases 逐 case、逐 byte 比较。
+    失败边界：文件缺失、末尾换行/marker/摘要/长度格式错误，或实际
+    case 与生成 reference 不完全相等时抛 ValidationError。
+    """
     path = GOLDEN_DIR / "sq.hex"
     if not path.is_file():
         raise ValidationError(f"SQ golden file missing: {path.relative_to(REPO_ROOT)}")
@@ -1644,7 +2151,26 @@ def validate_mapping_uniqueness(
     value_mappings: tuple[ValueMapping, ...],
     reference_fields: tuple[ReferenceField, ...],
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_mapping_uniqueness 中验证 field/value/
+    reference source 与最终
+    SV 名称唯一。
+    输入输出及副作用：field_mappings、value_mappings、reference_fields
+    分别提供字段、值和 reference rows；函数检查
+    三类 mapping 的 SV stem、source identity 与最终常量名唯一，并允许
+    MODIFY_DATA 的四个固定 qword 例外。
+    失败边界：重复 stem/source、例外 offset 不是 32/40/48/56，或不同 producer
+    争用同一最终常量时抛 ValidationError。
+    """
     def unique(items, label: str) -> None:
+        """
+        功能：在 RDMA profile checker 的 validate_mapping_uniqueness/unique 中在局部
+        seen 集合中拒绝重复映射键。
+        输入输出及副作用：遍历 items，在局部 seen 集合中登记 label
+        对应的键；成功无返回且不改变输入迭代器元素。
+        失败边界：同一键第二次出现立即抛 duplicate label；
+        空迭代器合法通过，调用方负责选择键的语义。
+        """
         seen = set()
         for item in items:
             if item in seen:
@@ -1652,6 +2178,16 @@ def validate_mapping_uniqueness(
             seen.add(item)
 
     def unique_sources(items, label: str) -> None:
+        """
+        功能：在 RDMA profile checker 的 validate_mapping_uniqueness/unique_sources
+        中聚合 source offset
+        并执行 MODIFY_DATA 四 offset 例外。
+        输入输出及副作用：items 提供待审计 mapping，label 命名错误类别；
+        按 (item.path,item.c_symbol) 聚合
+        word_byte_offset，仅允许 MODIFY_DATA 恰好占用 32/40/48/56 四个偏移。
+        失败边界：任何其它 source 重复，或 MODIFY_DATA 缺少/
+        多出固定四偏移时抛 duplicate label，避免 source identity 被覆盖。
+        """
         modify_data_source = ("cmq.h", "XTRDMA_CMQSQ_WQE_MODIFY_DATA")
         modify_data_offsets = {32, 40, 48, 56}
         offsets_by_source: dict[tuple[str, str], list[int]] = {}
@@ -1686,6 +2222,16 @@ def validate_mapping_uniqueness(
     final_names: dict[str, str] = {}
 
     def add_final(name: str, producer: str) -> None:
+        """
+        功能：在 RDMA profile checker 的 validate_mapping_uniqueness/add_final
+        中登记最终 SV 常量的唯一
+        producer。
+        输入输出及副作用：name 是最终发出的 SV 常量名，producer 标识其
+        field/value/error/profile 来源；记录到 final_names
+        并返回 None。
+        失败边界：同名常量已有不同 producer 时抛 duplicate global SV constant；
+        同一 producer 重复登记保持幂等。
+        """
         previous = final_names.get(name)
         if previous is not None and previous != producer:
             raise ValidationError(
@@ -1715,6 +2261,15 @@ def validate_profile_constants(
     sv_constants: dict[str, int],
     profile_values: dict[str, int],
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_profile_constants 中比较 profile_values
+    与解析的 SV 常量。
+    输入输出及副作用：逐项比较 sv_constants 与 profile_values 的固定 profile
+    ABI（HW_VERSION、对象字节数、CMQ success、目的
+    IP placement）。
+    失败边界：缺少 required name 或数值不等于 expected 时抛 ValidationError；
+    额外常量不在此函数中删除。
+    """
     for name, expected in profile_values.items():
         actual = sv_constants.get(name)
         if actual is None:
@@ -1729,6 +2284,17 @@ def validate_body_translations(
     translations: tuple[BodyTranslation, ...],
     field_mappings: tuple[FieldMapping, ...],
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_body_translations 中校验 context body 的
+    local 到 final
+    qword 偏移换算。
+    输入输出及副作用：translations 提供 local/final 偏移，field_mappings
+    提供预期字段；核对 context body 的
+    local_word_byte_offset+final_base_offset 是否等于每个 FieldMapping 的最终 qword
+    byte offset。
+    失败边界：translation 重复、source/stem 不在 CQC/SRQC/EQC 期望集合、
+    坐标不等或漏项时抛 ValidationError。
+    """
     expected = {
         mapping.sv_stem: mapping
         for mapping in field_mappings
@@ -1763,6 +2329,16 @@ def validate_body_translations(
 
 
 def validate_sv_mask_api(text: str) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_sv_mask_api 中检查 image mask API
+    签名、selector 和 qword
+    边界保护。
+    输入输出及副作用：text 为 image mask SV 源码；检查 request_envelope_mask/
+    body_mask 的完整签名、五种 image kind
+    selector 和 qword_index 边界守卫。
+    失败边界：任一签名缺失、selector 缺失或 qword_index > 7
+    检查少于两处时抛 ValidationError。
+    """
     envelope_signature = re.compile(
         r"function\s+automatic\s+bit\s*\[63:0\]\s+"
         r"request_envelope_mask\s*\(\s*int\s+unsigned\s+qword_index\s*\)\s*;",
@@ -1790,6 +2366,15 @@ def validate_sv_mask_api(text: str) -> None:
 
 
 def validate_access_projections(text: str) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_access_projections 中从 xtrdma_get_access
+    重建五组 access 投影。
+    输入输出及副作用：text 是 rdma_main.h 的源码；从其中 xtrdma_get_access
+    函数体提取 access 条件，返回 None
+    并核对五组 IB_ACCESS 到 XTRDMA flag 的投影。
+    失败边界：函数缺失、return hw_access 缺失或观察到的条件集合与
+    ACCESS_PROJECTIONS 不完全相等时抛 ValidationError。
+    """
     function = re.search(
         r"\bstatic\s+inline\s+u8\s+xtrdma_get_access\s*\([^)]*\)\s*\{"
         r"(.*?)\breturn\s+hw_access\s*;\s*\}",
@@ -1816,6 +2401,14 @@ def validate_access_projections(text: str) -> None:
 
 
 def parse_sv_masks(text: str) -> dict[str, tuple[int, ...]]:
+    """
+    功能：在 RDMA profile checker 的 parse_sv_masks 中解析八 qword 的 SV field mask
+    数组。
+    输入输出及副作用：text 为 SV mask 定义；返回每个 *_MASK
+    名称对应的恰好八个 qword 整数 tuple。
+    失败边界：重复名称、元素不是可解析 SV literal 或元素数量不是 8
+    时抛 ValidationError；没有 mask 时返回空 dict。
+    """
     masks: dict[str, tuple[int, ...]] = {}
     pattern = re.compile(
         r"localparam\s+bit\s*\[63:0\]\s+"
@@ -1836,6 +2429,14 @@ def parse_sv_masks(text: str) -> dict[str, tuple[int, ...]]:
 
 
 def parse_sv_ownership(text: str) -> dict[str, tuple[int, ...]]:
+    """
+    功能：在 RDMA profile checker 的 parse_sv_ownership 中解析八 qword 的 SV body
+    ownership 数组。
+    输入输出及副作用：text 为 SV body ownership 定义；返回每个 *_OWNERSHIP
+    名称对应的八 qword tuple，独立于 field mask 解析。
+    失败边界：重复名称或 ownership 数组不是八个可解析 literal 时抛
+    ValidationError；缺少声明由上层基线比较发现。
+    """
     ownership: dict[str, tuple[int, ...]] = {}
     pattern = re.compile(
         r"localparam\s+bit\s*\[63:0\]\s+"
@@ -1858,6 +2459,15 @@ def parse_sv_ownership(text: str) -> dict[str, tuple[int, ...]]:
 def validate_cmq_body_ownership(
     ownership: dict[str, tuple[int, ...]],
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_cmq_body_ownership 中比较 CMQ body
+    ownership 基线并确认不侵入
+    envelope。
+    输入输出及副作用：将 ownership 与 CMQ_BODY_OWNERSHIP 八 qword
+    基线逐项比较，并确认任一 body bit 不与 ENVELOPE_MASK 重叠。
+    失败边界：键集合、qword 值或 envelope overlap 任一漂移都抛
+    ValidationError；输入 dict 不会被修正。
+    """
     if ownership != CMQ_BODY_OWNERSHIP:
         raise ValidationError(
             "SV CMQ body ownership differs from independent reference"
@@ -1870,10 +2480,28 @@ def validate_cmq_body_ownership(
 
 
 def strip_c_comments(line: str) -> str:
+    """
+    功能：在 RDMA profile checker 的 strip_c_comments 中从 C 行文本删除块注释供
+    source symbol 扫描。
+    输入输出及副作用：line 为一行 C 源码；返回移除 /*...*/ 后并 strip
+    的文本，供 #define/enum symbol 扫描。
+    失败边界：不处理字符串语义或跨行块注释；
+    未闭合注释按正则删除到行尾，调用方需用 source digest
+    保证输入可信。
+    """
     return re.sub(r"/\*.*?\*/", "", line).strip()
 
 
 def parse_c_symbols(text: str) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """
+    功能：在 RDMA profile checker 的 parse_c_symbols 中提取 C #define 和 enum
+    的全部表达式 occurrence。
+    输入输出及副作用：text 为 C 头文件；返回 (macros,enums)，
+    分别保存每个 symbol 的全部表达式 occurrence，并重建可解析 enum
+    隐式值。
+    失败边界：不支持的显式表达式会让后续隐式项标为占位字符串；
+    重复 occurrence 保留在 list，不能被解析器静默去重。
+    """
     macros: dict[str, list[str]] = {}
     for raw_line in text.splitlines():
         line = strip_c_comments(raw_line)
@@ -1915,6 +2543,15 @@ def parse_c_symbols(text: str) -> tuple[dict[str, list[str]], dict[str, list[str
 def require_unique_expression(
     symbols: dict[str, list[str]], symbol: str, source_path: str
 ) -> str:
+    """
+    功能：在 RDMA profile checker 的 require_unique_expression 中取得一个 source
+    symbol 的唯一可解析表达式。
+    输入输出及副作用：从 symbols 中取 source_path:symbol
+    的唯一表达式并返回原文；wr.h 的 UD_DST_Q_KEY
+    允许相同文本的受控重复。
+    失败边界：symbol 缺失、出现多个不同表达式，
+    或重复不属于该唯一例外时抛 ValidationError。
+    """
     expressions = symbols.get(symbol, [])
     if not expressions:
         raise ValidationError(f"mapped symbol {symbol} missing from {source_path}")
@@ -1932,7 +2569,16 @@ def require_unique_expression(
 def discover_error_code_values(
     source_text: dict[str, str],
 ) -> dict[tuple[str, str], int]:
-    """Discover genuine code values by pinned path and source-name pattern."""
+    """
+    功能：在 RDMA profile checker 的 discover_error_code_values 中发现并解析 defs.h/
+    wr.h 的真实 8-bit error
+    code。
+    输入输出及副作用：source_text 按文件名提供 defs.h/wr.h 源码；读取其中
+    EC_* 与 XTRDMA_CQE_ECODE_*，解析为
+    (path,symbol)->8-bit integer 字典。
+    失败边界：源文件缺失、symbol 重复、表达式不可解析或值超出 0..0xff
+    时抛 ValidationError。
+    """
     values: dict[tuple[str, str], int] = {}
     patterns = {
         "defs.h": re.compile(r"^EC_[A-Za-z0-9_]+$"),
@@ -1969,7 +2615,15 @@ def validate_error_code_mappings(
     source_text: dict[str, str],
     sv_text: str,
 ) -> dict[tuple[str, str], int]:
-    """Check identity completeness and independently derived SV code values."""
+    """
+    功能：在 RDMA profile checker 的 validate_error_code_mappings 中闭合 C error
+    identity、SV 常量和数值映射。
+    输入输出及副作用：mappings 提供 C identity/SV 名称，source_text 提供 defs.h/
+    wr.h 字节，sv_text 提供 SV 声明；
+    闭合三者的 identity 与数值并返回 source_values 供 canonical alias 选择。
+    失败边界：identity/SV 名重复、缺失/额外 mapping、非 bit[7:0] 单一定义或
+    C/SV 数值漂移时抛 ValidationError。
+    """
     sv_text = mask_sv_strings(strip_sv_comments(sv_text))
     identities = [(mapping.path, mapping.c_symbol) for mapping in mappings]
     if len(identities) != len(set(identities)):
@@ -2048,7 +2702,16 @@ def canonical_error_code_mappings(
     source_values: dict[tuple[str, str], int],
     expected_aliases=EXPECTED_ERROR_CODE_ALIASES,
 ) -> dict[int, ErrorCodeMapping]:
-    """Select one lookup identity per value after exact alias validation."""
+    """
+    功能：在 RDMA profile checker 的 canonical_error_code_mappings 中校验 alias
+    集并选择 defs.h 优先的
+    canonical identity。
+    输入输出及副作用：mappings 提供候选 identity，source_values 提供 C 数值，
+    expected_aliases 提供冻结 alias 集；
+    按数值聚合并为每个值选择 defs.h 优先的 ErrorCodeMapping。
+    失败边界：观察到的 alias 集合与预期不等、同值出现多个 defs.h
+    identity 或 source value 缺失时抛 ValidationError。
+    """
     by_value: dict[int, list[ErrorCodeMapping]] = {}
     for mapping in mappings:
         identity = (mapping.path, mapping.c_symbol)
@@ -2086,7 +2749,18 @@ def validate_error_codec(
     codec_text: str,
     canonical: dict[int, ErrorCodeMapping],
 ) -> None:
-    """Bind codec literals and symbolic lookup to validated source identities."""
+    """
+    功能：在 RDMA profile checker 的 validate_error_codec 中闭合错误 codec
+    的常量、case、symbolic_name 和
+    decode_status。
+    输入输出及副作用：codec_text 是错误 codec 源码，canonical 是数值到
+    canonical mapping；审计 preprocessor、
+    classify/inferred_engine case、symbolic_name 文本和 decode_status 的 hardware_code
+    调用闭合。
+    失败边界：known error code 裸 literal、case/default 结构、symbolic 字符串、
+    非 canonical 常量或 hardware_code
+    角色漂移均抛 ValidationError。
+    """
     codec_text = strip_sv_comments(codec_text)
     codec_code = mask_sv_strings(codec_text)
     validate_error_codec_preprocessor(codec_code)
@@ -2254,6 +2928,16 @@ class ReferenceImage(bytearray):
     """Golden payload plus occupancy masks for its logical qwords."""
 
     def __init__(self, byte_count: int):
+        """
+        功能：在 RDMA profile checker 的 ReferenceImage/__init__ 中初始化零填充
+        reference image 及每个 qword 的
+        occupancy。
+        输入输出及副作用：byte_count 指定 reference image 大小；初始化全零
+        bytearray，并建立每个 8-byte qword 的 occupancy
+        位图供重叠检测。
+        失败边界：byte_count 为负数或非整数时由 bytearray 抛 ValueError；
+        后续写入依赖 occupancy 长度与 image 保持一致。
+        """
         super().__init__(byte_count)
         self.occupancy = [0] * ((byte_count + 7) // 8)
 
@@ -2261,6 +2945,16 @@ class ReferenceImage(bytearray):
 def put_field(
     image: ReferenceImage, logical_offset: int, width: int, value: int
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 put_field 中按逻辑 bit 坐标以大端 qword
+    写字段并登记 occupancy。
+    输入输出及副作用：在 image 的 logical_offset qword 中以大端序写 width 位
+    value，并原子更新对应 occupancy mask；返回 None。
+    失败边界：image 必须是 ReferenceImage，width/value
+    必须落在合法范围且字段不可跨 qword/image 边界或与已有 occupancy
+    重叠，否则抛
+    ValidationError。
+    """
     if not isinstance(image, ReferenceImage):
         raise ValidationError("reference image occupancy tracking is required")
     if width < 1 or width > 64 or value < 0 or value >= (1 << width):
@@ -2280,6 +2974,15 @@ def put_field(
 
 
 def put_named(image: ReferenceImage, stem: str, value: int) -> None:
+    """
+    功能：在 RDMA profile checker 的 put_named 中按 REFERENCE_BY_STEM
+    查找坐标并编码命名字段。
+    输入输出及副作用：image 是 ReferenceImage，stem 选择 REFERENCE_BY_STEM
+    坐标，value 是待编码整数；委托
+    put_field 写入 image 并更新 occupancy 记录。
+    失败边界：未知 stem、值超宽、字段越界或与先前命名字段重叠时抛
+    ValidationError，不会创建隐式坐标。
+    """
     reference = REFERENCE_BY_STEM.get(stem)
     if reference is None:
         raise ValidationError(f"reference placement missing for {stem}")
@@ -2372,6 +3075,9 @@ REFERENCE_FIELDS = (
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_REMOTE_VA", "RDMA_SQ_WQE_RC_REMOTE_VA", 24, 0, 64),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_INLINE_LOCAL_QPC_RD", "RDMA_SQ_WQE_INLINE_LOCAL_QPC_RD", 0, 60, 1),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_SGB_PA", "RDMA_SQ_WQE_SGB_PA", 32, 9, 55),
+    # Independent coordinate evidence from wr.h:46.  The driver writes this
+    # only for URC RDMA_READ external-SGB WQEs; qword5 bits [39:0] stay reserved.
+    ReferenceField("wr.h", "XTRDMA_SQ_WQE_URC_TOTAL_PKT_NUM", "RDMA_SQ_WQE_URC_TOTAL_PKT_NUM", 40, 40, 24),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", "RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN", 8, 0, 32),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_IMMDT_INVLD_RKEY", "RDMA_SQ_WQE_RC_IMMEDIATE", 8, 32, 32),
     ReferenceField("wr.h", "XTRDMA_SQ_WQE_LOCAL_INVLD_STAG", "RDMA_SQ_WQE_LOCAL_INVLD_STAG", 8, 32, 32),
@@ -2413,32 +3119,80 @@ REFERENCE_FIELDS = (
     ReferenceField("wr.h", "XTRDMA_QP_RQ_QP_SN", "RDMA_RQE_QP_SN", 0, 24, 8),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_OP", "RDMA_RQE_OPCODE", 0, 32, 4),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_WQE_IDX_WRAP", "RDMA_RQE_WRAP", 0, 55, 1),
+    # Independent raw coordinate evidence from wr.h:179.  Keep this separate
+    # from the codec implementation so a qword0 mask drift cannot self-approve.
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_SIGN_EN", "RDMA_RQE_SIGN_EN", 0, 56, 1),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_VALID", "RDMA_RQE_VALID", 0, 63, 1),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_SIGNATURE", "RDMA_RQE_SIGNATURE", 16, 56, 8),
     ReferenceField("wr.h", "XTRDMA_QP_RQ_SGE_NUM", "RDMA_RQE_SGE_NUM", 16, 48, 8),
-    ReferenceField("wr.h", "XTRDMA_CQE_QPN", "RDMA_CQE_QPN", 0, 0, 18),
-    ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "RDMA_CQE_WQE_INDEX", 0, 40, 15),
-    ReferenceField("wr.h", "XTRDMA_CQE_ECODE", "RDMA_CQE_ECODE", 0, 24, 8),
-    ReferenceField("wr.h", "XTRDMA_CQE_PAYLOAD_LEN", "RDMA_CQE_PAYLOAD_LEN", 8, 0, 32),
+    # Independent raw coordinate evidence from wr.h:188.  This reference is
+    # intentionally separate from FIELD_MAPPINGS so a mapping drift cannot
+    # make the golden placement self-approve.
+    ReferenceField("wr.h", "XTRDMA_QP_RQ_SGB_PA", "RDMA_RQE_SGB_PA", 32, 9, 55),
+    # wr.h:123-149, qword0 common/overlay fields.  Keep every source macro
+    # independently auditable; the codec decides which overlay is active.
     ReferenceField("wr.h", "XTRDMA_CQE_POLARITY", "RDMA_CQE_POLARITY", 0, 63, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_QP_ST", "RDMA_CQE_QP_ST", 0, 60, 3),
     ReferenceField("wr.h", "XTRDMA_CQE_RQ_CQE", "RDMA_CQE_RQ_CQE", 0, 59, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQ", "RDMA_CQE_SRFQ", 0, 58, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SE", "RDMA_CQE_SE", 0, 57, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SIGN_EN", "RDMA_CQE_SIGN_EN", 0, 56, 1),
     ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_WRAP", "RDMA_CQE_WQE_WRAP", 0, 55, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_QP_WQE_INDEX", "RDMA_CQE_WQE_INDEX", 0, 40, 15),
     ReferenceField("wr.h", "XTRDMA_CQE_PKT_OPCODE", "RDMA_CQE_PKT_OPCODE", 0, 32, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_ECODE", "RDMA_CQE_ECODE", 0, 24, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_VLAN", "RDMA_CQE_VLAN", 0, 23, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_IPV6", "RDMA_CQE_IPV6", 0, 22, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_CQE_FORMAT", "RDMA_CQE_CQE_FORMAT", 0, 20, 2),
+    ReferenceField("wr.h", "XTRDMA_CQE_RESIZE_CQE", "RDMA_CQE_RESIZE_CQE", 0, 19, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_MC", "RDMA_CQE_UD_MC", 0, 18, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_QPN", "RDMA_CQE_QPN", 0, 0, 18),
     ReferenceField("wr.h", "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY", "RDMA_CQE_IMMDT_DATA", 8, 32, 32),
+    ReferenceField("wr.h", "XTRDMA_CQE_PAYLOAD_LEN", "RDMA_CQE_PAYLOAD_LEN", 8, 0, 32),
+    ReferenceField("wr.h", "XTRDMA_CQE_SIGNATURE", "RDMA_CQE_SIGNATURE", 16, 56, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_RC_REMOTE_SYNDROME", "RDMA_CQE_RC_REMOTE_SYNDROME", 16, 48, 8),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_SRC_QPN", "RDMA_CQE_UD_SRC_QPN", 16, 32, 24),
+    ReferenceField("wr.h", "XTRDMA_CQE_RQE_CPL", "RDMA_CQE_RQE_CPL", 16, 31, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQN", "RDMA_CQE_SRFQN", 16, 16, 12),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQE_WRAP", "RDMA_CQE_SRFQE_WRAP", 16, 15, 1),
+    ReferenceField("wr.h", "XTRDMA_CQE_SRFQE_INDEX", "RDMA_CQE_SRFQE_INDEX", 16, 0, 15),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_SMAC", "RDMA_CQE_UD_SMAC", 24, 16, 48),
+    ReferenceField("wr.h", "XTRDMA_CQE_UD_VLAN_TAG", "RDMA_CQE_UD_VLAN_TAG", 24, 0, 16),
     ReferenceField("defs.h", "XTRDMA_CEQE_QPN", "RDMA_CEQE_QPN", 0, 40, 21),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_FLAG", "RDMA_CEQE_URC_FLAG", 0, 62, 1),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_SQ_CEQE_VLD", "RDMA_CEQE_URC_SQ_CQE_VALID", 0, 39, 1),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_RQ_CEQE_VLD", "RDMA_CEQE_URC_RQ_CQE_VALID", 0, 38, 1),
     ReferenceField("defs.h", "XTRDMA_CEQE_CQN", "RDMA_CEQE_CQN", 0, 16, 21),
     ReferenceField("defs.h", "XTRDMA_CEQE_ECODE", "RDMA_CEQE_ECODE", 0, 8, 8),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_TYPE", "RDMA_CEQE_URC_ABNML_CQE_TYPE", 8, 56, 2),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE", "RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE", 8, 48, 8),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP", "RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP", 8, 47, 1),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_ABNML_CQE_WQE_IDX", "RDMA_CEQE_URC_ABNML_CQE_WQE_IDX", 8, 32, 15),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP", "RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP", 8, 31, 1),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX", "RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX", 8, 16, 15),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP", "RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP", 8, 15, 1),
+    ReferenceField("defs.h", "XTRDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX", "RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX", 8, 0, 15),
     ReferenceField("defs.h", "XTRDMA_CEQE_RC_CQ_PI", "RDMA_CEQE_CQ_PI", 8, 0, 16),
     ReferenceField("defs.h", "XTRDMA_CEQE_WQE_VLD", "RDMA_CEQE_VALID", 0, 63, 1),
     ReferenceField("defs.h", "XTRDMA_CEQE_PKT_OPCODE", "RDMA_CEQE_PKT_OPCODE", 0, 0, 8),
     ReferenceField("defs.h", "XTRDMA_CEQE_RC_CQ_PI_WRAP", "RDMA_CEQE_CQ_PI_WRAP", 8, 23, 1),
     ReferenceField("defs.h", "XTRDMA_AEQE_QPN", "RDMA_AEQE_QPN", 0, 0, 18),
     ReferenceField("defs.h", "XTRDMA_AEQE_QP_ST", "RDMA_AEQE_QP_ST", 0, 60, 3),
+    ReferenceField("defs.h", "XTRDMA_AEQE_SRFQ_EN", "RDMA_AEQE_SRFQ_EN", 0, 59, 1),
+    ReferenceField("defs.h", "XTRDMA_AEQE_AEQ_OVERFLOW_FLAG", "RDMA_AEQE_OVERFLOW_FLAG", 0, 58, 1),
+    ReferenceField("defs.h", "XTRDMA_AEQE_URC_FLAG", "RDMA_AEQE_URC_FLAG", 0, 57, 1),
+    ReferenceField("defs.h", "XTRDMA_AEQE_CQ_INVLD_AE_FLAG", "RDMA_AEQE_CQ_INVALID_FLAG", 0, 56, 1),
+    ReferenceField("defs.h", "XTRDMA_AEQE_URC_ABNML_CQE_TYPE", "RDMA_AEQE_URC_ABNML_CQE_TYPE", 0, 54, 2),
+    ReferenceField("defs.h", "XTRDMA_AEQE_CQN_EQN_H", "RDMA_AEQE_CQN_EQN_HIGH", 0, 40, 13),
     ReferenceField("defs.h", "XTRDMA_AEQE_ECODE", "RDMA_AEQE_ECODE", 0, 24, 8),
+    ReferenceField("defs.h", "XTRDMA_AEQE_CQN_EQN_L", "RDMA_AEQE_CQN_EQN_LOW", 0, 18, 6),
     ReferenceField("defs.h", "XTRDMA_AEQE_QUEUE_WQE_IDX", "RDMA_AEQE_WQE_INDEX", 8, 32, 23),
     ReferenceField("defs.h", "XTRDMA_AEQE_WQE_VLD", "RDMA_AEQE_VALID", 0, 63, 1),
     ReferenceField("defs.h", "XTRDMA_AEQE_PKT_OPCODE", "RDMA_AEQE_PKT_OPCODE", 0, 32, 8),
+    ReferenceField("defs.h", "XTRDMA_AEQE_URC_REMOTE_ECODE", "RDMA_AEQE_URC_REMOTE_ECODE", 8, 56, 8),
     ReferenceField("defs.h", "XTRDMA_AEQE_QUEUE_WQE_IDX_WARP", "RDMA_AEQE_WQE_WRAP", 8, 55, 1),
+    ReferenceField("defs.h", "XTRDMA_AEQE_SRFQN", "RDMA_AEQE_SRFQN", 8, 16, 12),
+    ReferenceField("defs.h", "XTRDMA_AEQE_SRFQE_IDX", "RDMA_AEQE_SRFQE_IDX", 8, 0, 16),
     ReferenceField("cmq.h", "XTRDMA_CMQSQ_DB_PI", "RDMA_CMQ_DB_PI", 0, 32, 5),
     ReferenceField("cmq.h", "XTRDMA_CMQSQ_DB_POL", "RDMA_CMQ_DB_POLARITY", 0, 37, 1),
     ReferenceField("wr.h", "XTRDMA_NOTIFY_QPN", "RDMA_NOTIFY_RQ_QPN", 0, 0, 21),
@@ -2622,12 +3376,110 @@ REFERENCE_FIELDS = (
 
 REFERENCE_BY_STEM = {reference.sv_stem: reference for reference in REFERENCE_FIELDS}
 
+# wr.h's CQE is a union of common, RC, UD and RQ/SRFQ overlays.  Keep the
+# required source identities independent from the rows below so deleting a
+# row cannot silently make the frozen-source checker less strict.
+WR_CQE_REQUIRED_SYMBOLS = frozenset(
+    {
+        "XTRDMA_CQE_POLARITY",
+        "XTRDMA_CQE_QP_ST",
+        "XTRDMA_CQE_RQ_CQE",
+        "XTRDMA_CQE_SRFQ",
+        "XTRDMA_CQE_SE",
+        "XTRDMA_CQE_SIGN_EN",
+        "XTRDMA_CQE_QP_WQE_WRAP",
+        "XTRDMA_CQE_QP_WQE_INDEX",
+        "XTRDMA_CQE_PKT_OPCODE",
+        "XTRDMA_CQE_ECODE",
+        "XTRDMA_CQE_VLAN",
+        "XTRDMA_CQE_IPV6",
+        "XTRDMA_CQE_CQE_FORMAT",
+        "XTRDMA_CQE_RESIZE_CQE",
+        "XTRDMA_CQE_UD_MC",
+        "XTRDMA_CQE_QPN",
+        "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY",
+        "XTRDMA_CQE_PAYLOAD_LEN",
+        "XTRDMA_CQE_SIGNATURE",
+        "XTRDMA_CQE_RC_REMOTE_SYNDROME",
+        "XTRDMA_CQE_UD_SRC_QPN",
+        "XTRDMA_CQE_RQE_CPL",
+        "XTRDMA_CQE_SRFQN",
+        "XTRDMA_CQE_SRFQE_WRAP",
+        "XTRDMA_CQE_SRFQE_INDEX",
+        "XTRDMA_CQE_UD_SMAC",
+        "XTRDMA_CQE_UD_VLAN_TAG",
+    }
+)
+
+
+def validate_wr_cqe_mappings(
+    field_mappings: tuple[FieldMapping, ...],
+    reference_fields: tuple[ReferenceField, ...],
+) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_wr_cqe_mappings 中锁定 wr.h CQE
+    的完整 source identity 集合，并要求 FIELD_MAPPINGS 与 REFERENCE_FIELDS
+    同时覆盖所有 common/overlay 字段。
+    输入输出及副作用：接收两张只读 mapping 表；比较 `wr.h` 且以
+    `XTRDMA_CQE_` 开头的 source symbol、SV stem 和 qword byte offset，不写入
+    文件；具体 LSB/width 由 validate_reference_fields 再按真实 C 宏解析。
+    失败边界：任一字段被删、增加未知 CQE symbol、路径不是 wr.h、或两张表的
+    stem/offset 不一致时抛 ValidationError；非 CQE 的 CMQ/RQE/SQE rows 不在本
+    守卫的责任范围内。
+    """
+    mappings = {
+        mapping.c_symbol: mapping
+        for mapping in field_mappings
+        if mapping.path == "wr.h"
+        and mapping.c_symbol.startswith("XTRDMA_CQE_")
+    }
+    references = {
+        reference.c_symbol: reference
+        for reference in reference_fields
+        if reference.path == "wr.h"
+        and reference.c_symbol.startswith("XTRDMA_CQE_")
+    }
+
+    if set(mappings) != WR_CQE_REQUIRED_SYMBOLS:
+        missing = sorted(WR_CQE_REQUIRED_SYMBOLS - set(mappings))
+        extra = sorted(set(mappings) - WR_CQE_REQUIRED_SYMBOLS)
+        raise ValidationError(
+            f"CQE mapping contract differs: missing={missing}, extra={extra}"
+        )
+    if set(references) != WR_CQE_REQUIRED_SYMBOLS:
+        missing = sorted(WR_CQE_REQUIRED_SYMBOLS - set(references))
+        extra = sorted(set(references) - WR_CQE_REQUIRED_SYMBOLS)
+        raise ValidationError(
+            f"CQE mapping reference contract differs: missing={missing}, extra={extra}"
+        )
+
+    for symbol in sorted(WR_CQE_REQUIRED_SYMBOLS):
+        mapping = mappings[symbol]
+        reference = references[symbol]
+        if (
+            mapping.sv_stem != reference.sv_stem
+            or mapping.word_byte_offset != reference.word_byte_offset
+        ):
+            raise ValidationError(
+                f"CQE mapping source placement differs: {symbol}"
+            )
+
 
 def validate_reference_fields(
     reference_fields: tuple[ReferenceField, ...],
     field_mappings: tuple[FieldMapping, ...],
     parsed_fields: dict[str, tuple[str, str, int, int]] | None = None,
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_reference_fields 中比较 reference、
+    FIELD_MAPPINGS 与
+    parsed_fields 的来源和坐标。
+    输入输出及副作用：reference_fields 是冻结坐标，field_mappings 是 C/SV
+    映射，parsed_fields 是可选解析结果；比较三者
+    的 source identity、byte offset、lsb/width 与唯一性。
+    失败边界：重复 stem/source、坐标越 qword、mapping 缺失或 parsed_fields 与
+    reference 不等时抛 ValidationError。
+    """
     mappings_by_stem = {}
     for mapping in field_mappings:
         if mapping.sv_stem in mappings_by_stem:
@@ -2677,6 +3529,14 @@ def validate_reference_fields(
 
 
 def parse_input_summary(summary: str) -> tuple[GoldenInput, ...]:
+    """
+    功能：在 RDMA profile checker 的 parse_input_summary 中解析 golden header 的有序
+    name=value 输入摘要。
+    输入输出及副作用：summary 是逗号分隔的 golden header；返回保持顺序的
+    GoldenInput tuple，name/value 只接受小写 token。
+    失败边界：空摘要、格式不符或 name 重复时抛 ValidationError；
+    输入顺序不会被排序或合并。
+    """
     if not summary:
         raise ValidationError("golden input summary must not be empty")
     inputs: list[GoldenInput] = []
@@ -2694,10 +3554,37 @@ def parse_input_summary(summary: str) -> tuple[GoldenInput, ...]:
 
 
 def build_golden_cases() -> dict[str, list[GoldenCase]]:
+    """
+    功能：在 RDMA profile checker 的 build_golden_cases 中构造 context、queue、
+    doorbell 三类 reference
+    cases。
+    输入输出及副作用：无参数；创建 context、cmq、queue、doorbell 四类
+    GoldenCase 列表，所有 payload 由独立 ReferenceImage
+    编码。
+    失败边界：任何字段坐标/语义输入不匹配、目的 IP 长度错误或
+    ReferenceImage 重叠都会在构造时抛 ValidationError。
+    """
     def semantic_input(name: str, value: str | int):
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/semantic_input
+        中包装一个语义输入为摘要三元组。
+        输入输出及副作用：name/value 是 URC/MRT 等语义输入；返回供 make_case
+        消费的 ('',0,'name=value') 三元组，不写入 image。
+        失败边界：name/value 含逗号或不符合 parse_input_summary 的小写 token
+        时，后续摘要解析会抛 ValidationError。
+        """
         return ("", 0, f"{name}={value}")
 
     def make_case(name: str, byte_count: int, inputs) -> GoldenCase:
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_case
+        中根据摘要和字段三元组组装一个 GoldenCase。
+        输入输出及副作用：name 标识 case，byte_count 指定 image 大小，inputs
+        提供 (stem,value,summary_part) 三元组；
+        创建 image、校验可直接对应的摘要值后返回 GoldenCase 快照。
+        失败边界：byte_count 过短、字段重复/越界、摘要 token
+        非法或非派生字段值与输入不一致时抛 ValidationError。
+        """
         summary = ",".join(
             summary_part for _, _, summary_part in inputs if summary_part
         )
@@ -3030,6 +3917,17 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     ))
 
     def make_mrt(name: str, pbl: int, key_alloc: bool) -> GoldenCase:
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_mrt 中构造指定 PBL/
+        key-alloc 分支的 MRT body
+        case。
+        输入输出及副作用：name 标识 case，pbl 选择 0/1/2 分支，key_alloc
+        选择 KEY_ALLOC；据此选择 opcode，填充 STAG、
+        PBL、权限、地址和 self-parent 分支后返回 MRT case。
+        失败边界：pbl 不是 0..2 或 key_alloc 分支字段超宽/重叠时抛
+        ValidationError；只在对应 PBL 写入 PBA 或
+        FIRST_PBL_IDX。
+        """
         opcode = 0x04 if key_alloc else 0x05
         stag = 0xFFFFFF
         state = 2
@@ -3112,6 +4010,15 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     ))
 
     def make_eq(name: str) -> GoldenCase:
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_eq 中构造 EQC/AEQC
+        body boundary case。
+        输入输出及副作用：用 name 生成 64-byte CEQC/AEQC body boundary case，
+        覆盖 EQN、state、PBA、PI/CI、MSI-X
+        等字段。
+        失败边界：name 只影响 case identity；任何固定边界值无法落入
+        reference width 时 put_named 抛 ValidationError。
+        """
         return make_case(name, 64, (
             ("RDMA_EQC_BODY_EQN", 0xFFF, "eqn=0xfff"),
             ("RDMA_EQC_BODY_EQ_ST", 2, "state=2"),
@@ -3170,9 +4077,11 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("RDMA_RQE_QP_SN", 0x5A, "qp_sn=0x5a"),
         ("RDMA_RQE_OPCODE", 9, "opcode=9"),
         ("RDMA_RQE_WRAP", 1, "wrap=1"),
+        ("RDMA_RQE_SIGN_EN", 0, "sign_en=0"),
         ("RDMA_RQE_VALID", 1, "valid=1"),
         ("RDMA_RQE_SIGNATURE", 0x96, "signature=0x96"),
         ("RDMA_RQE_SGE_NUM", 2, "sge_num=2"),
+        ("RDMA_RQE_SGB_PA", 0x123456789ABCDE, "sgb_pa_encoded=0x123456789abcde"),
     ))
 
     cqe = make_case("cqe_error", 64, (
@@ -3195,6 +4104,29 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("RDMA_CEQE_VALID", 1, "valid=1"),
         ("RDMA_CEQE_PKT_OPCODE", 0x9A, "packet_opcode=0x9a"),
         ("RDMA_CEQE_CQ_PI_WRAP", 1, "wrap=1"),
+        ("RDMA_CEQE_URC_FLAG", 0, "urc=0"),
+    ))
+
+    ceqe_urc = make_case("ceqe_urc_error", 16, (
+        ("RDMA_CEQE_QPN", 0x15555, "qpn=0x15555"),
+        ("RDMA_CEQE_CQN", 0x1AAAAA, "cqn=0x1aaaaa"),
+        ("RDMA_CEQE_ECODE", 0xF4, "ecode=0xf4"),
+        ("RDMA_CEQE_VALID", 1, "valid=1"),
+        ("RDMA_CEQE_PKT_OPCODE", 0x9A, "packet_opcode=0x9a"),
+        ("RDMA_CEQE_URC_FLAG", 1, "urc=1"),
+        ("RDMA_CEQE_URC_SQ_CQE_VALID", 1, "sq_valid=1"),
+        ("RDMA_CEQE_URC_RQ_CQE_VALID", 1, "rq_valid=1"),
+        ("RDMA_CEQE_URC_ABNML_CQE_TYPE", 2, "abnormal_type=2"),
+        ("RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE", 0xA5,
+         "remote_ecode=0xa5"),
+        ("RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP", 1, "wqe_wrap=1"),
+        ("RDMA_CEQE_URC_ABNML_CQE_WQE_IDX", 0x4567, "wqe_idx=0x4567"),
+        ("RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP", 1, "sq_cpl_wrap=1"),
+        ("RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX", 0x2345,
+         "sq_cpl_idx=0x2345"),
+        ("RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP", 1, "rq_cpl_wrap=1"),
+        ("RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX", 0x3456,
+         "rq_cpl_idx=0x3456"),
     ))
 
     aeqe = make_case("aeqe_error", 16, (
@@ -3205,6 +4137,16 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
         ("RDMA_AEQE_VALID", 1, "valid=1"),
         ("RDMA_AEQE_PKT_OPCODE", 0x81, "packet_opcode=0x81"),
         ("RDMA_AEQE_WQE_WRAP", 1, "wrap=1"),
+        ("RDMA_AEQE_SRFQ_EN", 1, "srfq=1"),
+        ("RDMA_AEQE_OVERFLOW_FLAG", 1, "overflow=1"),
+        ("RDMA_AEQE_URC_FLAG", 1, "urc=1"),
+        ("RDMA_AEQE_CQ_INVALID_FLAG", 1, "cq_invalid=1"),
+        ("RDMA_AEQE_URC_ABNML_CQE_TYPE", 2, "abnormal_type=2"),
+        ("RDMA_AEQE_CQN_EQN_HIGH", 0x1555, "cqn_eqn_high=0x1555"),
+        ("RDMA_AEQE_CQN_EQN_LOW", 0x2A, "cqn_eqn_low=0x2a"),
+        ("RDMA_AEQE_URC_REMOTE_ECODE", 0xE1, "remote_ecode=0xe1"),
+        ("RDMA_AEQE_SRFQN", 0xABC, "srfqn=0xabc"),
+        ("RDMA_AEQE_SRFQE_IDX", 0x1234, "srfqe_idx=0x1234"),
     ))
 
     cmq_db = make_case("cmq_sq", 8, (
@@ -3278,6 +4220,16 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
     ))
 
     def make_qp_control(name, qpn, dst_port, qp_sn, icos, db_type, offset):
+        """
+        功能：在 RDMA profile checker 的 build_golden_cases/make_qp_control 中构造 QP
+        control doorbell 的
+        8-byte case。
+        输入输出及副作用：name 标识 case，qpn/dst_port/qp_sn/icos/db_type 编码 QP
+        控制字段，offset 写入摘要；返回
+        8-byte QP control doorbell GoldenCase。
+        失败边界：字段超宽或 offset 摘要不是合法数值时构造失败；
+        函数不验证不同 doorbell case 的 offset 唯一性。
+        """
         return make_case(name, 8, (
             ("RDMA_NOTIFY_QP_QPN", qpn, f"qpn={qpn:#x}"),
             ("RDMA_NOTIFY_QP_DST_PORT", dst_port,
@@ -3324,6 +4276,7 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
             rqe,
             cqe,
             ceqe,
+            ceqe_urc,
             aeqe,
         ],
         "doorbell": [
@@ -3345,6 +4298,14 @@ def build_golden_cases() -> dict[str, list[GoldenCase]]:
 
 
 def render_golden(cases: list[GoldenCase]) -> str:
+    """
+    功能：在 RDMA profile checker 的 render_golden 中把 GoldenCase 渲染为 canonical
+    marker、摘要和 hex 文本。
+    输入输出及副作用：按 cases 顺序输出 marker、case 名、canonical inputs、
+    byte count 和两位小写 hex payload 文本。
+    失败边界：case.summary 重新解析后若不等于 case.inputs 抛 ValidationError；
+    空 cases 返回单个换行，是否接受由调用方决定。
+    """
     lines: list[str] = []
     for index, case in enumerate(cases):
         if parse_input_summary(case.summary) != case.inputs:
@@ -3364,6 +4325,15 @@ def render_golden(cases: list[GoldenCase]) -> str:
 
 
 def parse_golden_text(text: str) -> list[GoldenCase]:
+    """
+    功能：在 RDMA profile checker 的 parse_golden_text 中严格解析并重建 canonical
+    golden cases。
+    输入输出及副作用：text 为 golden 文件；严格读取五行 case block，重建
+    GoldenCase 列表并用 render_golden 做 canonical
+    round-trip。
+    失败边界：缺少末尾换行、空行分隔、marker/header、hex、长度、重复
+    name 或 round-trip 任一漂移时抛 ValidationError。
+    """
     if not text.endswith("\n"):
         raise ValidationError("golden file must end with one newline")
     lines = text.splitlines()
@@ -3408,16 +4378,54 @@ def parse_golden_text(text: str) -> list[GoldenCase]:
 
 
 def validate_context_contract(cases: list[GoldenCase]) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_context_contract 中验证 context case
+    顺序、派生字段、mask 和 body
+    translation。
+    输入输出及副作用：检查 context cases 的固定顺序/长度、RC/UD/URC
+    派生字段、MRT/SRQC/EQC body mask 以及 local-to-final
+    translations。
+    失败边界：case 名称、payload 长度、transport/traffic class、split backing、
+    幂次深度、semantic input
+    或任一字段映射不符时抛 ValidationError。
+    """
     def inputs_by_name(case: GoldenCase) -> dict[str, str]:
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/inputs_by_name
+        中建立单个 case
+        的输入名称查找表。
+        输入输出及副作用：case.inputs 为 GoldenInput 序列；返回 name 到 value
+        的字典供同一 context case 的派生校验读取，不修改
+        case。
+        失败边界：重复 name 在 parse_input_summary 阶段已拒绝；此 helper 对空
+        inputs 返回空 dict，缺失键由调用方报告。
+        """
         return {item.name: item.value for item in case.inputs}
 
     def numeric_input(case: GoldenCase, name: str) -> int:
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/numeric_input
+        中读取并解析单个 case 的数值输入。
+        输入输出及副作用：从 case.inputs 读取 name，并把 0x/十进制 value
+        转成 int，供 PSN、backing、depth 等数值比较。
+        失败边界：name 缺失或 value 不是允许的小写十六进制/
+        十进制形式时抛 ValidationError，并带 case.name 定位。
+        """
         value = inputs_by_name(case).get(name)
         if value is None or re.fullmatch(r"(?:0x[0-9a-f]+|[0-9]+)", value) is None:
             raise ValidationError(f"{case.name} missing numeric input {name}")
         return int(value, 0)
 
     def field_value(case: GoldenCase, stem: str) -> int:
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/field_value
+        中按冻结 reference 坐标从
+        payload 解码字段。
+        输入输出及副作用：按 REFERENCE_BY_STEM 取 case.payload 的大端 qword，
+        右移 reference.lsb 并截取 width 位返回字段值。
+        失败边界：stem 不在 reference 表会触发 KeyError；payload 短于
+        word_byte_offset+8 时由切片整数结果暴露，契约层负责拒绝。
+        """
         reference = REFERENCE_BY_STEM[stem]
         word = int.from_bytes(
             case.payload[
@@ -3684,6 +4692,16 @@ def validate_context_contract(cases: list[GoldenCase]) -> None:
         raise ValidationError(f"{urc.name} derived next DSQ address mismatch")
 
     def exact_log2(input_name: str) -> int:
+        """
+        功能：在 RDMA profile checker 的 validate_context_contract/exact_log2 中验证
+        URC 深度/阈值为二次幂并求
+        log2。
+        输入输出及副作用：读取 URC case 的 input_name，确认 entries
+        是非零二次幂并返回 bit_length()-1，供 depth/threshold
+        字段比较。
+        失败边界：输入为 0 或含多个 1 bit 时抛 ValidationError；缺失/
+        非数值先由 numeric_input 拒绝。
+        """
         entries = numeric_input(urc, input_name)
         if entries == 0 or entries & (entries - 1):
             raise ValidationError(
@@ -3829,6 +4847,16 @@ DOORBELL_CASE_OFFSETS = (
 def validate_doorbell_contract(
     cases: list[GoldenCase], queue_cases: list[GoldenCase]
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_doorbell_contract 中验证 doorbell case
+    顺序、offset、SQ header
+    和 payload。
+    输入输出及副作用：cases 提供 doorbell GoldenCase，queue_cases 提供 queue
+    SQE；核对 cases 的固定名称顺序、8-byte
+    长度、offset 序列，并确认 SQ doorbell 等于 queue SQE 的前 8 bytes。
+    失败边界：offset 缺失/格式错误、case 几何或 payload 漂移、SQE case
+    缺失时抛 ValidationError。
+    """
     if tuple(case.name for case in cases) != DOORBELL_CASE_NAMES:
         raise ValidationError("doorbell golden order/name contract drift")
     if any(len(case.payload) != 8 for case in cases):
@@ -3862,69 +4890,90 @@ def validate_doorbell_contract(
             )
 
 
-def validate_source_hash_contract(source_hashes: dict[str, str]) -> None:
-    expected = {
-        "eth_header/register.h":
-            "061071cab4008cee1fa837b9aa71c068215c98cb5665ef5f4b038a24da09c734",
-    }
-    for path, pinned_hash in expected.items():
-        actual = source_hashes.get(path)
-        if actual != pinned_hash:
-            raise ValidationError(f"source hash contract drift for {path}")
-    for path, digest in source_hashes.items():
-        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            raise ValidationError(f"source hash is malformed for {path}")
-
-
-def load_manifest() -> list[tuple[str, str, str, str]]:
-    rows = []
-    for line_number, raw_line in enumerate(MANIFEST_PATH.read_text().splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        columns = line.split()
-        if len(columns) != 4:
-            raise ValidationError(f"manifest line {line_number} does not have four columns")
-        rows.append(tuple(columns))
-    if not rows:
-        raise ValidationError("source manifest has no entries")
-    return rows
-
-
 def selector_matches(text: str, selector: str) -> bool:
-    macros, _ = parse_c_symbols(text)
+    """
+    功能：判断源码文本是否覆盖 manifest selector 的任一替代项；
+    输入输出及副作用：text 为一个锁定源码文件，selector 为 |
+    分隔的符号/glob/文本；返回是否至少命中一个 selector，不修改输入。
+    失败边界：空 selector 返回 False；glob 只匹配 parse_c_symbols 发现的
+    symbol，普通 selector 按标识边界匹配，避免注释子串误命中。
+    """
+    macros, enums = parse_c_symbols(text)
+    enum_tags = re.findall(r"\benum\s+([A-Za-z_]\w*)\s*\{", text)
+    symbols = tuple(macros) + tuple(enums) + tuple(enum_tags)
     for alternative in selector.split("|"):
-        if fnmatch.fnmatchcase(alternative, "xtrdma_*opcode"):
-            if re.search(rf"\benum\s+{re.escape(alternative)}\s*\{{", text):
+        if not alternative:
+            continue
+        if "*" in alternative:
+            if any(fnmatch.fnmatchcase(name, alternative) for name in symbols):
                 return True
-        if any(fnmatch.fnmatchcase(name, alternative) for name in macros):
-            return True
-        if re.search(rf"\benum\s+{re.escape(alternative)}\s*\{{", text):
-            return True
-        if "*" not in alternative and re.search(rf"\b{re.escape(alternative)}\b", text):
+            continue
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(alternative)}(?![A-Za-z0-9_])",
+            text,
+        ):
             return True
     return False
 
 
-def validate_git_head(kernel_root: Path) -> None:
-    probe = subprocess.run(
-        ["git", "-C", str(kernel_root), "rev-parse", "--is-inside-work-tree"],
-        text=True, capture_output=True, check=False,
-    )
-    if probe.returncode != 0:
-        return
-    head = subprocess.run(
-        ["git", "-C", str(kernel_root), "rev-parse", "HEAD"],
-        text=True, capture_output=True, check=False,
-    )
-    if head.returncode != 0 or head.stdout.strip() != FIXED_COMMIT:
-        actual = head.stdout.strip() or "<unreadable>"
-        raise ValidationError(f"kernel HEAD {actual} does not match fixed {FIXED_COMMIT}")
+def validate_source_manifest_sources(
+    kernel_root: Path,
+    archive_lock: ArchiveLock,
+    records: list[SourceManifestRecord],
+) -> dict[str, str]:
+    """
+    功能：依据 ArchiveLock 与 source manifest 验证冻结源码并读取文本；
+    输入输出及副作用：kernel_root 是解档根目录，archive_lock 提供锁定
+    archive_id，records 指向各 UTF-8 文件；校验
+    archive_id、sha256、selector 和 REQUIRED_MANIFEST_ROWS，返回 path->text。
+    失败边界：records 为空、文件缺失/不可读、同路径 digest 不一致、
+    摘要或 selector 漂移、必需 row 缺失时抛 ValidationError。
+    """
+    if not records:
+        raise ValidationError("source manifest has no entries")
+    source_text: dict[str, str] = {}
+    path_digests: dict[str, str] = {}
+    seen_rows: set[tuple[str, str]] = set()
+    for record in records:
+        if record.archive_id != archive_lock.archive_id:
+            raise ValidationError("source manifest archive identifier mismatch")
+        previous_digest = path_digests.setdefault(record.path, record.sha256)
+        if previous_digest != record.sha256:
+            raise ValidationError(f"source manifest digest mismatch: {record.path}")
+        source_path = kernel_root / record.path
+        if not source_path.is_file():
+            raise ValidationError(f"source file missing: {record.path}")
+        actual_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if actual_digest != record.sha256:
+            raise ValidationError(f"source digest mismatch: {record.path}")
+        try:
+            text = source_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise ValidationError(f"source is not UTF-8: {record.path}") from error
+        source_text[record.path] = text
+        if not selector_matches(text, record.selector):
+            raise ValidationError(
+                f"source selector matches no locked symbol/text: {record.path}"
+            )
+        seen_rows.add((record.path, record.selector))
+    missing_rows = REQUIRED_MANIFEST_ROWS - seen_rows
+    if missing_rows:
+        raise ValidationError(f"required manifest rows missing: {sorted(missing_rows)}")
+    return source_text
 
 
 def validate_required_sv_constants(
     sv_constants: dict[str, int], expected_constants: dict[str, int]
 ) -> None:
+    """
+    功能：在 RDMA profile checker 的 validate_required_sv_constants 中比较
+    expected_constants 与实际 SV
+    常量值。
+    输入输出及副作用：逐项核对 expected_constants 与 parse_sv_constants 结果，
+    成功返回 None；不删除额外 SV 常量。
+    失败边界：required name 缺失或实际值不同（包括字段坐标和 profile
+    ABI）时抛 ValidationError，并保留 name/value 诊断。
+    """
     for name, expected in expected_constants.items():
         actual = sv_constants.get(name)
         if actual is None:
@@ -3935,39 +4984,28 @@ def validate_required_sv_constants(
             )
 
 
-def validate(kernel_root: Path) -> None:
-    validate_git_head(kernel_root)
-    validate_source_hash_contract(SOURCE_HASHES)
+def validate(
+    kernel_root: Path,
+    archive_lock_path: Path,
+    source_manifest_path: Path,
+) -> None:
+    """
+    功能：执行冻结 RDMA 定义、映射和 golden 全量契约校验；
+    输入输出及副作用：接收 kernel_root、archive_lock_path、source_manifest_path；
+    按 archive、source、C/SV
+    mapping、mask 和 golden 阶段只读执行全量校验。
+    失败边界：任一 ContractError 转换为 ValidationError；路径/文件缺失、
+    身份或坐标漂移、codec/mask/golden 不一致都会中止且不写回。
+    """
+    try:
+        archive_lock = load_archive_lock(archive_lock_path)
+        records = load_source_manifest(source_manifest_path)
+    except ContractError as error:
+        raise ValidationError(str(error)) from error
     validate_mapping_uniqueness(FIELD_MAPPINGS, VALUE_MAPPINGS, REFERENCE_FIELDS)
+    validate_wr_cqe_mappings(FIELD_MAPPINGS, REFERENCE_FIELDS)
     validate_body_translations(BODY_TRANSLATIONS, FIELD_MAPPINGS)
-    rows = load_manifest()
-    seen_rows = set()
-    source_text: dict[str, str] = {}
-    for commit, relative_path, selector, manifest_hash in rows:
-        if commit != FIXED_COMMIT:
-            raise ValidationError(f"manifest commit for {relative_path} is not fixed commit")
-        expected_hash = SOURCE_HASHES.get(relative_path)
-        if expected_hash is None or manifest_hash != expected_hash:
-            raise ValidationError(f"manifest hash for {relative_path} is not the built-in pinned hash")
-        source_path = kernel_root / relative_path
-        if not source_path.is_file():
-            raise ValidationError(f"source file missing: {relative_path}")
-        actual_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
-        if actual_hash != expected_hash:
-            raise ValidationError(
-                f"source hash mismatch for {relative_path}: {actual_hash} != {expected_hash}"
-            )
-        text = source_path.read_text()
-        source_text[relative_path] = text
-        if not selector_matches(text, selector):
-            raise ValidationError(f"selector {selector} matches nothing in {relative_path}")
-        seen_rows.add((relative_path, selector))
-    missing_rows = REQUIRED_MANIFEST_ROWS - seen_rows
-    if missing_rows:
-        raise ValidationError(f"required manifest rows missing: {sorted(missing_rows)}")
-    for path in SOURCE_HASHES:
-        if path not in source_text:
-            raise ValidationError(f"pinned source {path} has no manifest row")
+    source_text = validate_source_manifest_sources(kernel_root, archive_lock, records)
 
     parsed_sources = {path: parse_c_symbols(text) for path, text in source_text.items()}
     validate_access_projections(source_text["rdma_main.h"])
@@ -4034,12 +5072,12 @@ def validate(kernel_root: Path) -> None:
         "RDMA_AEQC_CREATE_BODY_MASK": BODY_MASKS["aeqc_create"],
         "RDMA_SQ_WQE_HEADER_MASK": (0xEFFFFFFFFFFFFFFF,) + (0,) * 7,
         "RDMA_SQ_WQE_INLINE_HEADER_MASK": (0xFFFFFFFFFFFFFFFF,) + (0,) * 7,
-        "RDMA_SQ_WQE_RC_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFE00, 0, 0, 0),
-        "RDMA_SQ_WQE_RC_INLINE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_RC_DIRECT_SGE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_UD_BODY_MASK": (0, 0xFFFFFFFFFEFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_ATOMIC_BODY_MASK": (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
-        "RDMA_SQ_WQE_ATOMIC_FAA_BODY_MASK": (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0),
+        "RDMA_SQ_WQE_RC_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFE00, 0, 0, 0),
+        "RDMA_SQ_WQE_RC_INLINE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_RC_DIRECT_SGE_BODY_MASK": (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_UD_BODY_MASK": (0, 0xFFFFFFFFFDFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_ATOMIC_BODY_MASK": (0, 0xFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF),
+        "RDMA_SQ_WQE_ATOMIC_FAA_BODY_MASK": (0, 0xFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0),
     }
     if sv_masks != expected_masks:
         raise ValidationError("SV image mask lookup differs from independent reference")
@@ -4065,19 +5103,42 @@ def validate(kernel_root: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """
+    功能：解析 CLI 并选择 profile-only 或冻结源码契约校验；
+    输入输出及副作用：argv 为可选 CLI 参数；返回 0/1，profile-only
+    模式执行命名守卫，冻结模式再执行 validate，并把结果打印到
+    stdout/stderr。
+    失败边界：冻结模式必须同时提供三个路径；argparse、OSError 或
+    ValidationError 均打印 rdma definitions: FAIL 并返回 1。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--kernel-root",
         type=Path,
         help="校验冻结硬件资料；省略时只执行内部 profile 命名守卫",
     )
+    parser.add_argument("--archive-lock", type=Path)
+    parser.add_argument("--source-manifest", type=Path)
     args = parser.parse_args(argv)
     try:
+        frozen_args = (args.kernel_root, args.archive_lock, args.source_manifest)
+        if args.kernel_root is None and any(value is not None for value in frozen_args[1:]):
+            raise ValidationError(
+                "frozen-source mode requires --kernel-root, --archive-lock and --source-manifest"
+            )
         if args.kernel_root is None:
             validate_profile_names()
             print("rdma profile naming: PASS")
             return 0
-        validate(args.kernel_root.resolve())
+        if args.archive_lock is None or args.source_manifest is None:
+            raise ValidationError(
+                "frozen-source mode requires --kernel-root, --archive-lock and --source-manifest"
+            )
+        validate(
+            args.kernel_root.resolve(),
+            args.archive_lock.resolve(),
+            args.source_manifest.resolve(),
+        )
     except (OSError, ValidationError) as error:
         print(f"rdma definitions: FAIL: {error}", file=sys.stderr)
         return 1

@@ -1,0 +1,12 @@
+qpn	0	0	24	a1b2c3
+opcode	0	32	8	0
+index	0	40	5	15
+wrap	0	45	1	0
+use_vfid	0	48	11	0
+vf_id_override	0	59	1	0
+valid	0	63	1	1
+rq_cqn	8	0	21	a3c5d
+signature	8	24	8	9a
+sign_en	8	32	1	1
+sq_cqn	8	43	21	155555
+qpc_buffer_addr_pa	24	9	55	91a2b3c4d5e0

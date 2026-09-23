@@ -18,7 +18,6 @@ class rdma_queue_recovery_test extends rdma_queue_lifecycle_test;
   // command/function identity differs from the ticket being reconciled.
   // 功能：在 rdma_queue_recovery_test 中，query_status 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：ticket（输入）、code（输入）、hardware_ecode（输入）；query_status 读取 ticket、code、hardware_ecode 并使用字段 status、status.source_engine、status.function_uid、status.generation、status.resource_id、status.command_id、status.hardware_code_valid、status.hardware_code；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：query_status 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   function automatic rdma_status query_status(
     rdma_cmq_ticket ticket,

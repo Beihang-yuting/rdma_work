@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Focused tests for the rdma definition checker/reference encoder."""
+"""目录：tests/unit；职责：验证 RDMA profile checker 与 reference encoder 的冻结契约。
+依赖：tools/check_rdma_profile_names.py、仓库 golden vectors 及临时 fixture；测试只读
+生产定义，TemporaryDirectory 负责短生命周期的变异输入，生产文件由被测 checker
+拥有且不得被测试改写。
+"""
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 from pathlib import Path
@@ -22,7 +27,24 @@ SPEC.loader.exec_module(CHECKER)
 
 
 class CExpressionTest(unittest.TestCase):
+    """功能：覆盖 C 字段/常量表达式解析的成功和拒绝边界。
+    输入输出及副作用：通过内存字符串调用 CHECKER 解析器，不写入生产文件。
+    失败边界：任一 BIT、GENMASK、enum 或非法表达式断言漂移都会使本套件失败。"""
+
     def test_bit_and_genmask_forms_are_decoded(self) -> None:
+        """
+        功能：在 CExpressionTest 测试类中验证 BIT、BIT_ULL、GENMASK、GENMASK_ULL
+        均解码为正确 LSB/宽度。
+        输入输出及副作用：无显式参数；在 BIT/GENMASK
+        和数值表达式的内存字符串上调用
+        CHECKER.parse_field_expression、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括 BIT_ULL(63)、
+        BIT(7)、GENMASK_ULL(54, 40)。
+        失败边界：通过 assertEqual 锁定成功路径（BIT_ULL(63)、BIT(7)、
+        GENMASK_ULL(54,
+        40)）；任一实际结果不符都会使该回归测试失败。
+        """
         self.assertEqual(CHECKER.parse_field_expression("BIT_ULL(63)"), (63, 1))
         self.assertEqual(CHECKER.parse_field_expression("BIT(7)"), (7, 1))
         self.assertEqual(
@@ -31,22 +53,72 @@ class CExpressionTest(unittest.TestCase):
         self.assertEqual(CHECKER.parse_field_expression("GENMASK(3, 0)"), (0, 4))
 
     def test_unsupported_expression_is_fatal(self) -> None:
+        """
+        功能：在 CExpressionTest 测试类中确认移位等未支持 C 表达式被
+        ValidationError 拒绝。
+        输入输出及副作用：无显式参数；在 BIT/GENMASK
+        和数值表达式的内存字符串上调用
+        CHECKER.parse_field_expression、self.assertRaisesRegex，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括 unsupported、
+        (1UL << 63)。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        unsupported；未拒绝或错误定位漂移即判失败。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "unsupported"):
             CHECKER.parse_field_expression("(1UL << 63)")
 
     def test_bit_64_is_rejected_fail_closed(self) -> None:
+        """
+        功能：在 CExpressionTest 测试类中确认 64 位以上 BIT 位置 fail-closed。
+        输入输出及副作用：无显式参数；在 BIT/GENMASK
+        和数值表达式的内存字符串上调用
+        CHECKER.parse_field_expression、self.assertRaisesRegex、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        BIT(64)、BIT_ULL(64)、BIT.*64。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 BIT.*64；
+        未拒绝或错误定位漂移即判失败。
+        """
         for expression in ("BIT(64)", "BIT_ULL(64)"):
             with self.subTest(expression=expression):
                 with self.assertRaisesRegex(CHECKER.ValidationError, "BIT.*64"):
                     CHECKER.parse_field_expression(expression)
 
     def test_explicit_values_are_decoded_without_eval(self) -> None:
+        """
+        功能：在 CExpressionTest 测试类中确认十六进制/
+        十进制常量可解析且不执行 eval。
+        输入输出及副作用：无显式参数；在 BIT/GENMASK
+        和数值表达式的内存字符串上调用
+        CHECKER.parse_value_expression、self.assertEqual、self.assertRaisesRegex，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 0x35、
+        12、unsupported。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        unsupported；未拒绝或错误定位漂移即判失败。
+        """
         self.assertEqual(CHECKER.parse_value_expression("0x35"), 0x35)
         self.assertEqual(CHECKER.parse_value_expression("12"), 12)
         with self.assertRaisesRegex(CHECKER.ValidationError, "unsupported"):
             CHECKER.parse_value_expression("PREVIOUS + 1")
 
     def test_implicit_enum_values_are_decoded_without_eval(self) -> None:
+        """
+        功能：在 CExpressionTest 测试类中确认 enum 隐式递增值由 parse_c_symbols
+        正确重建。
+        输入输出及副作用：无显式参数；在 BIT/GENMASK
+        和数值表达式的内存字符串上调用
+        CHECKER.parse_c_symbols、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 enum sample {     SAMPLE_ZERO,     SAMPLE_ONE,     SAMPLE_FIVE = 5,
+        SAMPLE_SIX, };、SAMPLE_ZERO、0。
+        失败边界：通过 assertEqual 锁定成功路径（enum sample {     SAMPLE_ZERO,
+        SAMPLE_ONE,
+        SAMPLE_FIVE = 5,     SAMPLE_SIX, };、SAMPLE_ZERO、0）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         _, enums = CHECKER.parse_c_symbols(
             """
 enum sample {
@@ -64,6 +136,10 @@ enum sample {
 
 
 class ErrorCodeMappingTest(unittest.TestCase):
+    """功能：验证硬件错误码 source identity、SV 常量和 codec case 的闭合映射。
+    输入输出及副作用：构造小型 defs/wr/SV fixture，调用 CHECKER 并断言异常或 canonical 结果；fixture 只在测试期间存活。
+    失败边界：缺失、重复、alias、raw literal 或 hardware_code 角色漂移必须被拒绝。"""
+
     SOURCES = {
         "defs.h": """
 #define EC_FIRST 0x02
@@ -96,12 +172,29 @@ enum xtrdma_cqe_ecode {
     )
 
     def require_checker_attribute(self, name: str):
+        """
+        功能：在 ErrorCodeMappingTest/require_checker_attribute 中确认被测 checker
+        暴露指定 API 并返回该属性。
+        输入输出及副作用：name 是 CHECKER 模块属性名；返回 getattr(CHECKER,
+        name) 的真实对象，供测试调用，不写文件。
+        失败边界：name 不存在时 self.assertTrue 立即失败并报告缺失 API；
+        不会用 bytearray 或默认实现掩盖接口漂移。
+        """
         self.assertTrue(
             hasattr(CHECKER, name), f"checker API missing: {name}"
         )
         return getattr(CHECKER, name)
 
     def mappings(self):
+        """
+        功能：在 ErrorCodeMappingTest/mappings 中用 SOURCE_VALUES 生成 ErrorCodeMapping
+        fixture。
+        输入输出及副作用：无显式参数；按 SOURCE_VALUES 的五个 (path,symbol)
+        生成 ErrorCodeMapping tuple，SV 名保持
+        RDMA_ECODE_ 前缀。
+        失败边界：只在内存中创建 NamedTuple；SOURCE_VALUES 被改动、
+        属性缺失或 mapping 构造失败时断言暴露漂移。
+        """
         mapping_type = self.require_checker_attribute("ErrorCodeMapping")
         return tuple(
             mapping_type(path, symbol, f"RDMA_ECODE_{symbol}")
@@ -109,6 +202,15 @@ enum xtrdma_cqe_ecode {
         )
 
     def sv_text(self, overrides=None, extra: str = "") -> str:
+        """
+        功能：在 ErrorCodeMappingTest/sv_text 中根据 source values 和 overrides
+        渲染最小 SV 常量文本。
+        输入输出及副作用：overrides 可替换指定 source value，extra
+        可追加一段 SV；返回含 bit[7:0] localparam 和 CMQ
+        success 的字符串。
+        失败边界：values 先复制 SOURCE_VALUES，不修改类常量；非法 override
+        仅由后续 checker 校验，extra 为空时不追加文本。
+        """
         values = dict(self.SOURCE_VALUES)
         if overrides is not None:
             values.update(overrides)
@@ -125,6 +227,16 @@ enum xtrdma_cqe_ecode {
         return "\n".join(declarations)
 
     def validate_fixture(self, sources=None, sv_text=None, mappings=None):
+        """
+        功能：在 ErrorCodeMappingTest/validate_fixture 中把 fixture 交给
+        validate_error_code_mappings
+        并返回解析值。
+        输入输出及副作用：sources、sv_text、mappings 可覆盖默认 fixture；
+        调用 validate_error_code_mappings 并返回
+        source identity 到整数的解析结果。
+        失败边界：任一覆盖参数为 None 时回退对应默认值；mapping、
+        源码或 SV 常量不闭合时传播 ValidationError，测试不写仓库。
+        """
         validate = self.require_checker_attribute(
             "validate_error_code_mappings"
         )
@@ -135,6 +247,15 @@ enum xtrdma_cqe_ecode {
         )
 
     def canonical_fixture(self):
+        """
+        功能：在 ErrorCodeMappingTest/canonical_fixture 中验证 fixture 后生成
+        canonical error-code lookup。
+        输入输出及副作用：无显式参数；先用 validate_fixture 得到 source
+        values，再按 EXPECTED_ALIASES 生成 canonical
+        value->ErrorCodeMapping 字典。
+        失败边界：缺少 alias、重复 identity 或 source/SV drift
+        会在任一委托阶段抛 ValidationError，不返回部分 canonical 表。
+        """
         canonicalize = self.require_checker_attribute(
             "canonical_error_code_mappings"
         )
@@ -143,6 +264,15 @@ enum xtrdma_cqe_ecode {
         return canonicalize(mappings, values, self.EXPECTED_ALIASES)
 
     def codec_text(self) -> str:
+        """
+        功能：在 ErrorCodeMappingTest/codec_text 中提供包含四个错误 codec function
+        的最小 SV 文本。
+        输入输出及副作用：无显式参数；返回包含 classify、inferred_engine、
+        symbolic_name、decode_status 和 uvm 宏的最小 SV
+        codec fixture。
+        失败边界：返回的是新建字符串；删改 success case、default 或
+        hardware_code 角色由 validate_error_codec 在测试中拒绝。
+        """
         return """
 `uvm_object_utils(rdma_hw_error_codec)
 local function rdma_status_code_e classify(bit [7:0] hardware_code);
@@ -186,6 +316,20 @@ endfunction
 """
 
     def test_source_discovery_rejects_missing_and_extra_mapping(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认错误码 mapping 缺失和额外
+        identity 都被拒绝。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.mappings、self.require_checker_attribute、
+        self.validate_fixture，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        ErrorCodeMapping、defs.h、EC_GHOST。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 extra error
+        code mapping、missing error code
+        mapping；未拒绝或错误定位漂移即判失败。
+        """
         mappings = self.mappings()
         self.validate_fixture(mappings=mappings)
 
@@ -204,6 +348,20 @@ endfunction
             self.validate_fixture(mappings=mappings + (extra,))
 
     def test_mapping_identity_and_sv_names_must_be_unique(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 source identity 与 SV
+        名称重复会被拒绝。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用 self.assertRaisesRegex、self.mappings、self.validate_fixture，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_ECODE_DUPLICATE_IDENTITY、duplicate error code
+        source identity、duplicate error code SV name。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 duplicate
+        error code SV name、duplicate error
+        code source identity；未拒绝或错误定位漂移即判失败。
+        """
         mappings = self.mappings()
         duplicate_identity = mappings[0]._replace(
             sv_name="RDMA_ECODE_DUPLICATE_IDENTITY"
@@ -225,6 +383,18 @@ endfunction
             )
 
     def test_source_and_sv_constant_value_drift_are_rejected(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 C source 数值漂移不会被 SV
+        fixture 掩盖。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用 self.assertRaisesRegex、self.sv_text、self.validate_fixture，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        defs.h、EC_FIRST 0x02、EC_FIRST 0x03。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 SV error code
+        mismatch.*EC_FIRST；未拒绝或错误定位漂移即判失败。
+        """
         drifted_sources = dict(self.SOURCES)
         drifted_sources["defs.h"] = drifted_sources["defs.h"].replace(
             "EC_FIRST 0x02", "EC_FIRST 0x03"
@@ -244,6 +414,23 @@ endfunction
             )
 
     def test_sv_error_constants_are_exact_and_eight_bits(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 SV
+        错误码常量必须完整且为 bit[7:0]。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.subTest、self.sv_text、self.validate_fixture，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        localparam bit [7:0] RDMA_ECODE_EC_GHOST =
+        8'h03;、localparam bit [7:0] RDMA_ECODE_EC_FIRST = 8'h02;、localparam logic [7:0]
+        RDMA_ECODE_EC_GHOST = 8'h03;。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 extra SV
+        error code constant、missing SV error
+        code constant、must be declared bit \\[7:0\\]；
+        未拒绝或错误定位漂移即判失败。
+        """
         missing = self.sv_text().replace(
             "localparam bit [7:0] RDMA_ECODE_EC_FIRST = 8'h02;", ""
         )
@@ -292,6 +479,20 @@ endfunction
             self.validate_fixture(sv_text=commented)
 
     def test_sv_error_constant_alternate_duplicate_is_rejected(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认通过 enum/alternate
+        声明伪造重复常量会失败。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用 self.assertRaisesRegex、self.sv_text、self.validate_fixture，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 typedef
+        enum bit [7:0] { RDMA_ECODE_EC_FIRST }
+        rdma_ghost_e;、must have one canonical definition。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 must have
+        one canonical
+        definition；未拒绝或错误定位漂移即判失败。
+        """
         duplicate = (
             "typedef enum bit [7:0] { RDMA_ECODE_EC_FIRST } "
             "rdma_ghost_e;"
@@ -302,6 +503,20 @@ endfunction
             self.validate_fixture(sv_text=self.sv_text(extra=duplicate))
 
     def test_alias_set_and_defs_first_policy_are_explicit(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认五组 alias 集合及 defs.h
+        优先 canonical policy。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertEqual、self.assertRaisesRegex、self.canonical_fixture、self.mappings、
+        self.require_checker_attribute、self.validate_fixture，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        defs.h、EC_SHARED、canonical_error_code_mappings。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 error code
+        alias set drift；未拒绝或错误定位漂移即判失败。
+        """
         canonical = self.canonical_fixture()
         self.assertEqual(canonical[0x08].path, "defs.h")
         self.assertEqual(canonical[0x08].c_symbol, "EC_SHARED")
@@ -317,6 +532,20 @@ endfunction
             canonicalize(mappings, values, ())
 
     def test_fixed_mapping_is_complete_and_contains_wr_f0(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认冻结 mapping 数量和 wr.h 0xf0
+        identity 完整。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用 self.assertEqual、self.assertIn、self.require_checker_attribute，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        ERROR_CODE_MAPPINGS、wr.h、XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT。
+        失败边界：通过 assertEqual, assertIn
+        锁定成功路径（ERROR_CODE_MAPPINGS、wr.h、
+        XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         mappings = self.require_checker_attribute("ERROR_CODE_MAPPINGS")
         identities = {(row.path, row.c_symbol) for row in mappings}
         self.assertEqual(len(mappings), 143)
@@ -333,6 +562,21 @@ endfunction
         )
 
     def test_codec_symbolic_constant_and_string_drift_are_rejected(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 symbolic
+        常量或字符串映射漂移被拒绝。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 return
+        "EC_FIRST";、return
+        "EC_BROKEN";、RDMA_ECODE_EC_FIRST: return "EC_FIRST";。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 symbolic
+        error code lookup、symbolic error code
+        lookup function missing；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -376,6 +620,23 @@ endfunction
             validate_codec(commented_function, canonical)
 
     def test_codec_symbolic_unknown_default_is_exact(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 symbolic_name 的未知 default
+        文本保持精确。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        default: return
+        $sformatf("RDMA_UNKNOWN_ECODE_0x%02x", hardware_code);、default: return "BOGUS";、
+        symbolic
+        error code unknown default。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 symbolic
+        error code unknown
+        default；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -391,6 +652,23 @@ endfunction
             validate_codec(drifted_default, canonical)
 
     def test_codec_symbolic_rejects_case_item_after_default(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 default 后追加 case item
+        被拒绝。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertNotEqual、self.assertRaisesRegex、self.canonical_fixture、
+        self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        default: return
+        $sformatf("RDMA_UNKNOWN_ECODE_0x%02x", hardware_code);、(8'hf1 - 1): return
+        "FORGED_F0";、symbolic error code unknown default。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 symbolic
+        error code unknown
+        default；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -409,6 +687,20 @@ endfunction
             validate_codec(drifted, self.canonical_fixture())
 
     def test_codec_symbolic_lookup_rejects_unknown_specific_case(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 symbolic lookup
+        不接受未知硬件码 case。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        default: return
+        $sformatf("RDMA_UNKNOWN_ECODE_0x%02x", hardware_code);、symbolic error code lookup。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 symbolic
+        error code lookup；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -426,6 +718,20 @@ endfunction
             validate_codec(unknown_specific, canonical)
 
     def test_codec_symbolic_rejects_case_external_unknown_return(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 symbolic case
+        返回外部未知标识会失败。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 local
+        function string symbolic_name(bit [7:0]
+        hardware_code);、symbolic error code lookup。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 symbolic
+        error code lookup；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -441,6 +747,20 @@ endfunction
             validate_codec(early_return, canonical)
 
     def test_codec_cannot_use_raw_literal_for_known_source_code(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 known source error code
+        不得使用裸 literal。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 8'hf0、
+        8'd240、8'b11110000。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 raw
+        literal.*known error code；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -461,6 +781,21 @@ endfunction
                     validate_codec(raw_f0, canonical)
 
     def test_codec_classify_rejects_case_external_known_code_returns(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 classify 不得返回外部 known
+        code 表达式。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        hardware_code == 16'h00f0、hardware_code ==
+        240、hardware_code == (8'hf1 - 1)。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 classify|raw
+        literal；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -483,6 +818,22 @@ endfunction
                     validate_codec(early_return, canonical)
 
     def test_codec_classify_rejects_case_item_after_default(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 classify default 后的 case item
+        被拒绝。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertNotEqual、self.assertRaisesRegex、self.canonical_fixture、
+        self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        default: return RDMA_SC_UNKNOWN_HW_ERROR;
+        endcase、default: return RDMA_SC_UNKNOWN_HW_ERROR;     (8'hf1 - 1): return RDMA_SC_OK;
+        endcase、classify|case item|default。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 classify|
+        case item|default；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -501,6 +852,24 @@ endfunction
             validate_codec(drifted, self.canonical_fixture())
 
     def test_codec_inferred_engine_rejects_external_known_code_returns(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 inferred_engine 不得返回外部
+        known code。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 local
+        function rdma_engine_kind_e
+        inferred_engine(bit [7:0] hardware_code);、hardware_code == 240、hardware_code ==
+        (8'hf1 -
+        1)。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        inferred_engine|hardware_code
+        comparison；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -527,6 +896,23 @@ endfunction
                     validate_codec(early_return, canonical)
 
     def test_codec_inferred_engine_rejects_case_item_after_default(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 inferred_engine default
+        尾部规则。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertNotEqual、self.assertRaisesRegex、self.canonical_fixture、
+        self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        default: return RDMA_ENGINE_CMQ;、default: return
+        RDMA_ENGINE_CMQ;     (8'hf1 - 1): return RDMA_ENGINE_CQ;、inferred_engine|case
+        item|default。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        inferred_engine|case
+        item|default；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -543,6 +929,19 @@ endfunction
             validate_codec(drifted, self.canonical_fixture())
 
     def test_codec_other_function_rejects_known_code_expression(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认无关 function 引用 known code
+        会失败。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        hardware_code use。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        hardware_code use；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -561,6 +960,22 @@ endfunction
     def test_codec_decode_status_rejects_unapproved_hardware_code_uses(
         self,
     ) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 decode_status 中未批准
+        hardware_code 用法被拒绝。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertNotEqual、self.assertRaisesRegex、self.canonical_fixture、
+        self.codec_text、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 if
+        (hardware_code == RDMA_CMQ_SUCCESS_ECODE)
+        begin、case equality、inequality else。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        hardware_code use；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -599,6 +1014,25 @@ endfunction
                     validate_codec(bypass, canonical)
 
     def test_codec_accepts_reverse_pinned_success_comparison(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认反向 success comparison
+        仍符合固定 token 契约。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.canonical_fixture、self.codec_text、self.fail、self.require_checker_attribute，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        hardware_code ==
+        RDMA_CMQ_SUCCESS_ECODE、RDMA_CMQ_SUCCESS_ECODE == hardware_code、reverse pinned
+        success
+        comparison was rejected:。
+        失败边界：通过 unittest 断言 锁定成功路径（hardware_code ==
+        RDMA_CMQ_SUCCESS_ECODE、RDMA_CMQ_SUCCESS_ECODE == hardware_code、reverse pinned
+        success
+        comparison was rejected:）；任一实际结果不符都会使该回归测试失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -612,6 +1046,21 @@ endfunction
             self.fail(f"reverse pinned success comparison was rejected: {error}")
 
     def test_codec_rejects_qualified_hardware_code_roles(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认带限定名的 hardware_code
+        角色不能绕过审计。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertNotEqual、self.assertRaisesRegex、self.canonical_fixture、
+        self.codec_text、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        classify callee、inferred callee、symbolic callee。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        hardware_code；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -648,6 +1097,20 @@ endfunction
                     validate_codec(bypass, canonical)
 
     def test_codec_rejects_token_pasting_macro_bypass(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 token-pasting
+        宏不能绕过错误码审计。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 if
+        (hardware_code == RDMA_CMQ_SUCCESS_ECODE)
+        begin、`define REVIEW_HC(a,b) a``b、preprocessor|macro。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 preprocessor|
+        macro；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -669,6 +1132,21 @@ endfunction
             validate_codec(macro_bypass, self.canonical_fixture())
 
     def test_codec_preprocessor_audit_ignores_comments_and_strings(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 preprocessor
+        审计忽略注释和字符串中的伪宏。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.canonical_fixture、self.codec_text、self.fail、self.require_checker_attribute，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 comment/
+        string backtick was parsed as code:。
+        失败边界：通过 unittest 断言 锁定成功路径（comment/string backtick was
+        parsed as
+        code:）；任一实际结果不符都会使该回归测试失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -683,6 +1161,23 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"comment/string backtick was parsed as code: {error}")
 
     def test_codec_raw_scan_ignores_quoted_diagnostic_text(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 raw scan
+        不把诊断字符串当作 code token。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.canonical_fixture、self.codec_text、self.fail、self.require_checker_attribute，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 string
+        diagnostic = "diagnostic 8'hf0
+        only";、quoted raw literal was parsed as code:。
+        失败边界：通过 unittest 断言 锁定成功路径（string diagnostic =
+        "diagnostic 8'hf0 only";、quoted raw
+        literal was parsed as code:）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -697,6 +1192,22 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"quoted raw literal was parsed as code: {error}")
 
     def test_codec_raw_scan_ignores_narrow_non_error_literals(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认窄位非错误 literal
+        不触发误报。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.canonical_fixture、self.codec_text、self.fail、self.require_checker_attribute，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 bit
+        diagnostic_flag = 1'b0;、narrow non-error
+        literal was rejected:。
+        失败边界：通过 unittest 断言 锁定成功路径（bit diagnostic_flag =
+        1'b0;、narrow non-error literal was
+        rejected:）；任一实际结果不符都会使该回归测试失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -708,6 +1219,23 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"narrow non-error literal was rejected: {error}")
 
     def test_codec_raw_scan_ignores_wide_zero_extension_literals(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认宽零扩展 literal
+        不触发误报。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.canonical_fixture、self.codec_text、self.fail、self.require_checker_attribute，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 logic
+        [31:0] diagnostic = {24'h0, 8'h42};、wide
+        zero-extension literal was rejected:。
+        失败边界：通过 unittest 断言 锁定成功路径（logic [31:0] diagnostic =
+        {24'h0, 8'h42};、wide
+        zero-extension literal was rejected:）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -722,6 +1250,20 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.fail(f"wide zero-extension literal was rejected: {error}")
 
     def test_codec_accepts_whitespace_in_based_literal(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 based literal 内部空白按 SV
+        语法接受。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertNotEqual、self.canonical_fixture、self.codec_text、self.fail、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 24
+        'h0、24'h 0、24'h0。
+        失败边界：通过 assertNotEqual 锁定成功路径（24 'h0、24'h 0、24'h0）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -735,6 +1277,20 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
                     self.fail(f"legal based-literal whitespace was rejected: {error}")
 
     def test_error_codec_uvm_test_checks_success_symbols(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 UVM error codec 测试覆盖
+        success symbols。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用 self.assertRegex、self.subTest，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 function automatic void check_error、endfunction、
+        ZERO_RETAINS_ENGINE。
+        失败边界：通过 assertRegex 锁定成功路径（function automatic void
+        check_error、endfunction、ZERO_RETAINS_ENGINE）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         test_text = (
             REPO_ROOT / "tests" / "unit" /
             "rdma_error_codec_test.sv"
@@ -761,6 +1317,19 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
                 )
 
     def test_sv_error_constant_cannot_be_forged_inside_string(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest
+        测试类中确认字符串内伪造常量不被当作声明。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用 self.assertRaisesRegex、self.sv_text、self.validate_fixture，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        localparam bit [7:0] RDMA_ECODE_EC_FIRST =
+        8'h02;、string forged = "、";。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 missing SV
+        error code constant；未拒绝或错误定位漂移即判失败。
+        """
         declaration = (
             "localparam bit [7:0] RDMA_ECODE_EC_FIRST = 8'h02;"
         )
@@ -774,6 +1343,22 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             self.validate_fixture(sv_text=forged)
 
     def test_codec_requires_cmq_profile_symbol_for_zero_cases(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认 zero case 必须使用 CMQ profile
+        success symbol。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        self.assertRaisesRegex、self.canonical_fixture、self.codec_text、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_CMQ_SUCCESS_ECODE: return
+        RDMA_SC_OK;、RDMA_ECODE_XTRDMA_CQE_ECODE_TX_REQ_NML: return RDMA_SC_OK;、hardware
+        error
+        case item。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 hardware
+        error case item；未拒绝或错误定位漂移即判失败。
+        """
         validate_codec = self.require_checker_attribute(
             "validate_error_codec"
         )
@@ -789,6 +1374,23 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             validate_codec(source_zero, canonical)
 
     def test_repo_f0_uses_source_pinned_constant_and_symbol(self) -> None:
+        """
+        功能：在 ErrorCodeMappingTest 测试类中确认仓库 f0 路径使用
+        source-pinned constant/symbol。
+        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
+        codec_text() 生成的 defs.h、wr.h、SV
+        字符串上调用
+        CHECKER.parse_sv_constants、self.assertEqual、self.assertNotRegex、
+        self.assertRegex，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT、\\b8'h[fF]0\\s*:、
+        \\b。
+        失败边界：通过 assertEqual, assertNotRegex, assertRegex
+        锁定成功路径（RDMA_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT、
+        \\b8'h[fF]0\\s*:、
+        \\b）；任一实际结果不符都会使该回归测试失败。
+        """
         constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
         )
@@ -806,6 +1408,10 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
 
 
 class SvDefinitionTest(unittest.TestCase):
+    """功能：验证 SV 定义、mask API、字段映射和 profile 常量的静态契约。
+    输入输出及副作用：读取仓库 SV 文本并构造变异字符串，不修改源文件。
+    失败边界：重复声明、坐标/名称漂移或未声明的 composer 结构均应触发断言失败。"""
+
     NEW_URC_FIELDS = {
         "RDMA_QPC_URC_RSQ_SIZE": (
             "XTRDMA_QPC_URC_RSQ_SIZE", 24, 59, 3, 251
@@ -816,6 +1422,16 @@ class SvDefinitionTest(unittest.TestCase):
     }
 
     def test_duplicate_constant_is_fatal(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认重复 SV constant 定义立即失败。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.parse_sv_constants、self.assertRaisesRegex，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括 duplicate。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 duplicate；
+        未拒绝或错误定位漂移即判失败。
+        """
         text = """
 localparam int unsigned RDMA_FIELD_OFFSET = 32;
 localparam int unsigned RDMA_FIELD_OFFSET = 40;
@@ -824,6 +1440,21 @@ localparam int unsigned RDMA_FIELD_OFFSET = 40;
             CHECKER.parse_sv_constants(text)
 
     def test_sv_comment_stripping_preserves_quoted_markers(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认注释剥离保留 URL
+        等字符串标记。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        self.assertIn、self.assertIsNotNone、self.assertNotIn，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        strip_sv_comments、checker has no
+        strip_sv_comments、"https://example.invalid/a/*literal*/"。
+        失败边界：通过 assertIn, assertIsNotNone, assertNotIn
+        锁定成功路径（strip_sv_comments、checker has
+        no strip_sv_comments、"https://example.invalid/a/*literal*/"）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         strip_comments = getattr(CHECKER, "strip_sv_comments", None)
         self.assertIsNotNone(strip_comments, "checker has no strip_sv_comments")
         stripped = strip_comments(
@@ -836,6 +1467,19 @@ localparam int unsigned RDMA_FIELD_OFFSET = 40;
         self.assertNotIn("RDMA_ECODE_BLOCK", stripped)
 
     def test_width_and_value_literals_are_parsed(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 SV width/value literal
+        解析结果正确。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.parse_sv_constants、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 RDMA_FIELD_WIDTH、RDMA_OP、RDMA_WINDOW。
+        失败边界：通过 assertEqual
+        锁定成功路径（RDMA_FIELD_WIDTH、RDMA_OP、RDMA_WINDOW）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         constants = CHECKER.parse_sv_constants(
             """
 localparam int unsigned RDMA_FIELD_WIDTH = 8;
@@ -847,7 +1491,44 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         self.assertEqual(constants["RDMA_OP"], 0x35)
         self.assertEqual(constants["RDMA_WINDOW"], 0x2000)
 
+    def test_symbolic_constant_expression_is_resolved(self) -> None:
+        """
+        功能：确认 SV localparam 可以由已声明或后声明的 RDMA 常量通过受限
+        加法表达式构成，覆盖 CQC shadow 的绝对偏移来源链。
+        输入输出及副作用：在内存中的 synthetic SV 文本上调用
+        CHECKER.parse_sv_constants，并读取返回的常量字典；不访问或修改仓库文件。
+        失败边界：表达式必须解析为精确整数，符号引用和加法顺序不能被当作
+        字符串或默认零值；未知符号、循环引用仍应由解析器拒绝。
+        """
+        constants = CHECKER.parse_sv_constants(
+            """
+localparam int unsigned RDMA_BASE = 48;
+localparam int unsigned RDMA_DELTA = 4;
+localparam int unsigned RDMA_ABSOLUTE = RDMA_BASE + RDMA_DELTA;
+localparam int unsigned RDMA_FORWARD = RDMA_LATER + 2;
+localparam int unsigned RDMA_LATER = 6;
+"""
+        )
+        self.assertEqual(constants["RDMA_ABSOLUTE"], 52)
+        self.assertEqual(constants["RDMA_FORWARD"], 8)
+        spaced = CHECKER.parse_sv_constants(
+            "localparam bit [63:0] RDMA_WINDOW = 64 'h 2000;\n"
+        )
+        self.assertEqual(spaced["RDMA_WINDOW"], 0x2000)
+
     def test_global_mapping_uniqueness_is_enforced(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认全局 field/value/reference
+        名称唯一。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        self.assertRaisesRegex，只在内存/临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_TEST_REFERENCE_COLLISION、validate_mapping_uniqueness、SV value。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 SV value、
+        field mapping、global SV
+        constant；未拒绝或错误定位漂移即判失败。
+        """
         validate = getattr(CHECKER, "validate_mapping_uniqueness")
         validate(CHECKER.FIELD_MAPPINGS, CHECKER.VALUE_MAPPINGS,
                  CHECKER.REFERENCE_FIELDS)
@@ -897,6 +1578,20 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             )
 
     def test_cmq_composer_does_not_retain_built_artifacts(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 composer
+        不保留被禁止的构建产物。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        self.assertNotRegex，只在内存/临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        \\bminted_(?:bodies|opcodes|snapshots)\\s*\\[\\$\\]、src/codec/rdma/
+        rdma_cmq_codecs.sv。
+        失败边界：通过 assertNotRegex
+        锁定成功路径（\\bminted_(?:bodies|opcodes|snapshots)\\s*\\[\\$\\]、src/codec/
+        rdma/
+        rdma_cmq_codecs.sv）；任一实际结果不符都会使该回归测试失败。
+        """
         source = (
             REPO_ROOT
             / "src/codec/rdma/rdma_cmq_codecs.sv"
@@ -907,6 +1602,17 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         )
 
     def test_duplicate_source_symbol_at_another_offset_is_fatal(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认同一 source symbol 的不同 offset
+        被拒绝。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        self.assertRaisesRegex，只在内存/临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_TEST_DUPLICATE_SOURCE、source、XTRDMA_CMQSQ_WQE_MODIFY_DATA。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 source；
+        未拒绝或错误定位漂移即判失败。
+        """
         validate = CHECKER.validate_mapping_uniqueness
         first = next(
             mapping
@@ -925,6 +1631,18 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             )
 
     def test_unrelated_identical_source_duplicate_is_fatal(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认无关重复 source symbol
+        不能被忽略。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.require_unique_expression、self.assertRaisesRegex，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括 duplicated、
+        XTRDMA_SQ_WQE_QPN、wr.h。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 duplicated；
+        未拒绝或错误定位漂移即判失败。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "duplicated"):
             CHECKER.require_unique_expression(
                 {"XTRDMA_SQ_WQE_QPN": ["GENMASK(20, 0)", "GENMASK(20, 0)"]},
@@ -933,6 +1651,18 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             )
 
     def test_modify_data_source_exception_requires_exact_quartet(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 MODIFY_DATA 只允许四个精确
+        offset。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        self.assertRaisesRegex、self.subTest，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 XTRDMA_CMQSQ_WQE_MODIFY_DATA、field missing、reference missing。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 source；
+        未拒绝或错误定位漂移即判失败。
+        """
         validate = CHECKER.validate_mapping_uniqueness
         symbol = "XTRDMA_CMQSQ_WQE_MODIFY_DATA"
         fields = tuple(
@@ -965,6 +1695,20 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
             validate(fields + (extra_field,), (), references)
 
     def test_field_declaration_expands_to_auditable_coordinates(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 RDMA_FIELD
+        派生常量包含可审计坐标。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.parse_sv_constants、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 `RDMA_FIELD(RDMA_QPC_QPN, 0, 16,
+        21)、RDMA_QPC_QPN_WORD_BYTE_OFFSET、RDMA_QPC_QPN_LSB。
+        失败边界：通过 assertEqual 锁定成功路径（`RDMA_FIELD(RDMA_QPC_QPN, 0, 16,
+        21)、RDMA_QPC_QPN_WORD_BYTE_OFFSET、RDMA_QPC_QPN_LSB）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         constants = CHECKER.parse_sv_constants(
             "`RDMA_FIELD(RDMA_QPC_QPN, 0, 16, 21)\n"
         )
@@ -974,6 +1718,20 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         self.assertEqual(constants["RDMA_QPC_QPN_OFFSET"], 16)
 
     def test_new_urc_rows_match_source_reference_and_sv_coordinates(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 URC rows 的 source/reference/SV
+        坐标一致。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.FieldMapping、CHECKER.ReferenceField、CHECKER.parse_sv_constants、
+        self.assertEqual、
+        self.items、self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        src/codec/rdma/rdma_defs.svh、qp.h、word_byte_offset。
+        失败边界：通过 assertEqual
+        锁定成功路径（src/codec/rdma/rdma_defs.svh、qp.h、word_byte_offset）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
         references = {
             reference.sv_stem: reference
@@ -1014,6 +1772,17 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                 )
 
     def test_new_urc_source_coordinate_drift_is_rejected(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 URC source 坐标漂移被拒绝。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.validate_reference_fields、self.assertRaisesRegex、self.subTest，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        reference mask mismatch。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 reference
+        mask mismatch；未拒绝或错误定位漂移即判失败。
+        """
         parsed_fields = {
             reference.sv_stem: (
                 reference.path,
@@ -1038,6 +1807,17 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                     )
 
     def test_new_urc_reference_coordinate_drift_is_rejected(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 URC reference 坐标漂移被拒绝。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.validate_reference_fields、self.assertRaisesRegex、self.subTest，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        reference mask mismatch。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 reference
+        mask mismatch；未拒绝或错误定位漂移即判失败。
+        """
         parsed_fields = {
             reference.sv_stem: (
                 reference.path,
@@ -1065,6 +1845,18 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                     )
 
     def test_new_urc_sv_constant_drift_is_rejected(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 URC SV 常量漂移被拒绝。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        CHECKER.parse_sv_constants、self.assertRaisesRegex、self.items、self.subTest，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        validate_required_sv_constants、_WORD_BYTE_OFFSET、_LSB。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 SV constant
+        mismatch；未拒绝或错误定位漂移即判失败。
+        """
         validate_required = getattr(CHECKER, "validate_required_sv_constants")
         sv_constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
@@ -1087,6 +1879,18 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
                     validate_required(drifted, expected)
 
     def test_context_object_state_mode_and_right_values_are_mapped(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 context state/mode/right value mapping
+        完整。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
+        self.assertEqual、self.assertTrue，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        alloc.h、XTRDMA_ALLOC_TYPE_DIRECT、RDMA_ALLOC_TYPE_DIRECT。
+        失败边界：通过 assertEqual, assertTrue
+        锁定成功路径（alloc.h、XTRDMA_ALLOC_TYPE_DIRECT、RDMA_ALLOC_TYPE_DIRECT）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         mappings = {
             (mapping.path, mapping.c_symbol, mapping.sv_name)
             for mapping in CHECKER.VALUE_MAPPINGS
@@ -1129,11 +1933,27 @@ localparam bit [63:0] RDMA_WINDOW = 64'h2000;
         )
 
     def test_mask_file_exposes_qword_lookup_api_with_image_kind(self) -> None:
+        """
+        功能：在 SvDefinitionTest 测试类中确认 mask file 暴露 image-kind/qword
+        lookup API。
+        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
+        rdma_image_masks.svh 的只读文本及其内存变异副本上调用 被测
+        API，只在内存/临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        validate_sv_mask_api、src/codec/rdma/rdma_image_masks.svh。
+        失败边界：通过 unittest 断言
+        锁定成功路径（validate_sv_mask_api、src/codec/rdma/rdma_image_masks.svh）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         validate = getattr(CHECKER, "validate_sv_mask_api")
         validate((REPO_ROOT / "src/codec/rdma/rdma_image_masks.svh").read_text())
 
 
 class Task11DefinitionTest(unittest.TestCase):
+    """功能：覆盖 CMQ Task 11 body ownership 与 sparse context 坐标的冻结验证。
+    输入输出及副作用：使用仓库映射和复制后的 tuple 调用 CHECKER，所有变异仅在内存中进行。
+    失败边界：source、reference、SV mask 或 ownership 任一位漂移都必须 fail-closed。"""
+
     TASK11_FIELDS = {
         "RDMA_CMQ_NEXT_QP_STATE":
             ("XTRDMA_CMQSQ_WQE_NXT_QP_ST", 0, 60, 3),
@@ -1236,6 +2056,16 @@ class Task11DefinitionTest(unittest.TestCase):
         "RDMA_CQ_OBJECT_ID_BODY_OWNERSHIP": (
             0x00000000001FFFFF, 0, 0, 0, 0, 0, 0, 0,
         ),
+        "RDMA_CQC_DELETE_BODY_OWNERSHIP": (
+            0x00000000001FFFFF,
+            0xFF0FFFFFFFFFFFFF,
+            0xFFFFFFFFFFFFF8FF,
+            0xFFFFFFFFFFF8C701,
+            0xF000000000FFFFFF,
+            0x0000000000000FFF,
+            0xFFFFFFFFFFFFFFC0,
+            0x0000000F00FFFFFF,
+        ),
         "RDMA_EQ_OBJECT_ID_BODY_OWNERSHIP": (
             0x0000000000000FFF, 0, 0, 0, 0, 0, 0, 0,
         ),
@@ -1247,6 +2077,15 @@ class Task11DefinitionTest(unittest.TestCase):
 
     @staticmethod
     def parsed_reference_fields():
+        """
+        功能：在 Task11DefinitionTest/parsed_reference_fields 中从 TASK11_FIELDS 构造
+        parsed reference
+        坐标字典。
+        输入输出及副作用：无显式参数；从 CHECKER.REFERENCE_FIELDS 生成 Task
+        11 需要的 parsed_fields 坐标快照。
+        失败边界：快照只读且不回写 CHECKER；reference stem 缺失、source 或
+        width 被改动时调用方的断言会失败。
+        """
         return {
             reference.sv_stem: (
                 reference.path,
@@ -1258,6 +2097,20 @@ class Task11DefinitionTest(unittest.TestCase):
         }
 
     def test_task11_rows_match_source_reference_and_sv_coordinates(self) -> None:
+        """
+        功能：在 Task11DefinitionTest 测试类中确认 Task11 rows 同时匹配 source/
+        reference/SV 坐标。
+        输入输出及副作用：无显式参数；在 TASK11_FIELDS、REFERENCE_FIELDS 和
+        rdma_defs.svh 的坐标快照上调用
+        CHECKER.FieldMapping、CHECKER.ReferenceField、CHECKER.parse_sv_constants、
+        self.assertEqual、
+        self.items、self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        src/codec/rdma/rdma_defs.svh、cmq.h、_WORD_BYTE_OFFSET。
+        失败边界：通过 assertEqual
+        锁定成功路径（src/codec/rdma/rdma_defs.svh、cmq.h、_WORD_BYTE_OFFSET）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
         references = {
             reference.sv_stem: reference
@@ -1289,6 +2142,19 @@ class Task11DefinitionTest(unittest.TestCase):
                 )
 
     def test_task11_source_coordinate_drift_is_rejected(self) -> None:
+        """
+        功能：在 Task11DefinitionTest 测试类中确认 Task11 source
+        坐标变异被拒绝。
+        输入输出及副作用：无显式参数；在 TASK11_FIELDS、REFERENCE_FIELDS 和
+        rdma_defs.svh 的坐标快照上调用
+        CHECKER.validate_reference_fields、self.assertRaisesRegex、
+        self.parsed_reference_fields、
+        self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        reference mask mismatch。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 reference
+        mask mismatch；未拒绝或错误定位漂移即判失败。
+        """
         parsed_fields = self.parsed_reference_fields()
         for stem in self.TASK11_FIELDS:
             with self.subTest(stem=stem):
@@ -1305,6 +2171,19 @@ class Task11DefinitionTest(unittest.TestCase):
                     )
 
     def test_task11_reference_coordinate_drift_is_rejected(self) -> None:
+        """
+        功能：在 Task11DefinitionTest 测试类中确认 Task11 reference
+        坐标变异被拒绝。
+        输入输出及副作用：无显式参数；在 TASK11_FIELDS、REFERENCE_FIELDS 和
+        rdma_defs.svh 的坐标快照上调用
+        CHECKER.validate_reference_fields、self.assertRaisesRegex、
+        self.parsed_reference_fields、
+        self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        reference byte offset mismatch。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 reference
+        byte offset mismatch；未拒绝或错误定位漂移即判失败。
+        """
         parsed_fields = self.parsed_reference_fields()
         for stem in self.TASK11_FIELDS:
             with self.subTest(stem=stem):
@@ -1324,6 +2203,18 @@ class Task11DefinitionTest(unittest.TestCase):
                     )
 
     def test_task11_sv_constant_drift_is_rejected(self) -> None:
+        """
+        功能：在 Task11DefinitionTest 测试类中确认 Task11 SV 常量变异被拒绝。
+        输入输出及副作用：无显式参数；在 TASK11_FIELDS、REFERENCE_FIELDS 和
+        rdma_defs.svh 的坐标快照上调用
+        CHECKER.parse_sv_constants、CHECKER.validate_required_sv_constants、
+        self.assertRaisesRegex、
+        self.items、self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        _WORD_BYTE_OFFSET、_LSB、_WIDTH。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 SV constant
+        mismatch；未拒绝或错误定位漂移即判失败。
+        """
         sv_constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
         )
@@ -1344,6 +2235,19 @@ class Task11DefinitionTest(unittest.TestCase):
                     CHECKER.validate_required_sv_constants(drifted, expected)
 
     def test_modify_mode_values_are_pinned_to_driver_enums(self) -> None:
+        """
+        功能：在 Task11DefinitionTest 测试类中确认 modify mode 值绑定 driver
+        enum。
+        输入输出及副作用：无显式参数；在 TASK11_FIELDS、REFERENCE_FIELDS 和
+        rdma_defs.svh 的坐标快照上调用
+        CHECKER.parse_sv_constants、CHECKER.validate_required_sv_constants、
+        self.assertRaisesRegex、
+        self.assertTrue、self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_QPC_MODIFY_STATE_ONLY、RDMA_QPC_MODIFY_FULL、RDMA_QPC_MODIFY_PARTIAL。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 SV constant
+        mismatch；未拒绝或错误定位漂移即判失败。
+        """
         expected = {
             ("qp.h", "XTRDMA_MODIFY_MODE_ONLY_ST",
              "RDMA_QPC_MODIFY_STATE_ONLY"),
@@ -1378,6 +2282,20 @@ class Task11DefinitionTest(unittest.TestCase):
                     )
 
     def test_cmq_ownership_is_parsed_separately_and_exact(self) -> None:
+        """
+        功能：在 Task11DefinitionTest 测试类中确认 CMQ ownership 独立解析且逐
+        qword 精确。
+        输入输出及副作用：无显式参数；在 TASK11_FIELDS、REFERENCE_FIELDS 和
+        rdma_defs.svh 的坐标快照上调用
+        CHECKER.parse_sv_masks、CHECKER.parse_sv_ownership、
+        CHECKER.validate_cmq_body_ownership、
+        self.assertEqual、self.assertTrue，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 src/
+        codec/rdma/rdma_image_masks.svh。
+        失败边界：通过 assertEqual, assertTrue
+        锁定成功路径（src/codec/rdma/rdma_image_masks.svh）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         text = (REPO_ROOT /
                 "src/codec/rdma/rdma_image_masks.svh").read_text()
         self.assertEqual(CHECKER.CMQ_BODY_OWNERSHIP, self.EXPECTED_OWNERSHIP)
@@ -1390,6 +2308,19 @@ class Task11DefinitionTest(unittest.TestCase):
         CHECKER.validate_cmq_body_ownership(self.EXPECTED_OWNERSHIP)
 
     def test_each_cmq_ownership_mask_drift_is_rejected(self) -> None:
+        """
+        功能：在 Task11DefinitionTest 测试类中确认每个 CMQ ownership mask
+        漂移均拒绝。
+        输入输出及副作用：无显式参数；在 TASK11_FIELDS、REFERENCE_FIELDS 和
+        rdma_defs.svh 的坐标快照上调用
+        CHECKER.validate_cmq_body_ownership、self.assertRaisesRegex、self.subTest，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 CMQ
+        body ownership。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 CMQ body
+        ownership；未拒绝或错误定位漂移即判失败。
+        """
         for name in self.EXPECTED_OWNERSHIP:
             with self.subTest(name=name):
                 drifted = dict(self.EXPECTED_OWNERSHIP)
@@ -1403,6 +2334,10 @@ class Task11DefinitionTest(unittest.TestCase):
 
 
 class Task12DoorbellDefinitionTest(unittest.TestCase):
+    """功能：覆盖 CMQ/SQ/RQ/CQ/EQ doorbell 字段、常量和 golden payload 的验证。
+    输入输出及副作用：读取仓库定义并在内存中变异 case，断言固定顺序、offset 和 payload。
+    失败边界：字段坐标、常量、case 名称或 payload 改变时测试必须报告契约错误。"""
+
     DOORBELL_NAMES = [
         "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
         "cq_urc", "ceq", "aeq", "rts2sqd", "sqd2rts", "qp_flush",
@@ -1461,6 +2396,15 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
 
     @staticmethod
     def parsed_reference_fields():
+        """
+        功能：在 Task12DoorbellDefinitionTest/parsed_reference_fields 中从 doorbell
+        reference rows 构造
+        parsed 坐标字典。
+        输入输出及副作用：无显式参数；从 CHECKER.REFERENCE_FIELDS 生成
+        doorbell 校验所需的 source/lsb/width 映射。
+        失败边界：返回独立 dict，不改变 DOORBELL_FIELDS；任一 row
+        漂移由后续 validate_reference_fields 断言捕获。
+        """
         return {
             reference.sv_stem: (
                 reference.path,
@@ -1472,6 +2416,18 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
         }
 
     def test_all_doorbell_fields_are_source_pinned_and_exact(self) -> None:
+        """
+        功能：在 Task12DoorbellDefinitionTest 测试类中确认所有 doorbell 字段均
+        source-pinned 且坐标精确。
+        输入输出及副作用：无显式参数；在 doorbell field/value 表、
+        REFERENCE_FIELDS 和生成的 golden 副本上调用
+        CHECKER.FieldMapping、CHECKER.ReferenceField、self.assertEqual、self.items、
+        self.subTest，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。
+        失败边界：通过 assertEqual 锁定成功路径；
+        任一实际结果不符都会使该回归测试失败。
+        """
         mappings = {mapping.sv_stem: mapping for mapping in CHECKER.FIELD_MAPPINGS}
         references = {
             reference.sv_stem: reference
@@ -1492,6 +2448,19 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
                 )
 
     def test_doorbell_field_coordinate_mutation_is_rejected(self) -> None:
+        """
+        功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell
+        字段坐标变异被拒绝。
+        输入输出及副作用：无显式参数；在 doorbell field/value 表、
+        REFERENCE_FIELDS 和生成的 golden 副本上调用
+        CHECKER.validate_reference_fields、self.assertRaisesRegex、
+        self.parsed_reference_fields，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_NOTIFY_CQ_URC_SQ_CI、reference mask mismatch。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 reference
+        mask mismatch；未拒绝或错误定位漂移即判失败。
+        """
         parsed_fields = self.parsed_reference_fields()
         stem = "RDMA_NOTIFY_CQ_URC_SQ_CI"
         references = list(CHECKER.REFERENCE_FIELDS)
@@ -1508,6 +2477,18 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
             )
 
     def test_all_doorbell_constants_are_source_pinned_and_exact(self) -> None:
+        """
+        功能：在 Task12DoorbellDefinitionTest 测试类中确认所有 doorbell 常量均
+        source-pinned 且数值精确。
+        输入输出及副作用：无显式参数；在 doorbell field/value 表、
+        REFERENCE_FIELDS 和生成的 golden 副本上调用
+        CHECKER.parse_sv_constants、CHECKER.validate_required_sv_constants、self.assertIn、
+        self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 src/
+        codec/rdma/rdma_defs.svh。
+        失败边界：通过 assertIn 锁定成功路径（src/codec/rdma/rdma_defs.svh）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         mappings = {
             (mapping.path, mapping.c_symbol, mapping.sv_name)
             for mapping in CHECKER.VALUE_MAPPINGS
@@ -1523,6 +2504,20 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
                 )
 
     def test_doorbell_constant_mutation_is_rejected(self) -> None:
+        """
+        功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell
+        常量变异被拒绝。
+        输入输出及副作用：无显式参数；在 doorbell field/value 表、
+        REFERENCE_FIELDS 和生成的 golden 副本上调用
+        CHECKER.parse_sv_constants、CHECKER.validate_required_sv_constants、
+        self.assertRaisesRegex，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_DB_TYPE_TX_FLUSH、SV constant
+        mismatch、src/codec/rdma/rdma_defs.svh。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 SV constant
+        mismatch；未拒绝或错误定位漂移即判失败。
+        """
         constants = CHECKER.parse_sv_constants(
             (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
         )
@@ -1536,6 +2531,18 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
             CHECKER.validate_required_sv_constants(drifted, expected)
 
     def test_doorbell_goldens_have_exact_order_size_offsets_and_sq_header(self) -> None:
+        """
+        功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell golden 顺序/
+        大小/offset/SQ header 契约。
+        输入输出及副作用：无显式参数；在 doorbell field/value 表、
+        REFERENCE_FIELDS 和生成的 golden 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 doorbell、offset、queue。
+        失败边界：通过 assertEqual 锁定成功路径（doorbell、offset、queue）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         cases_by_kind = CHECKER.build_golden_cases()
         cases = cases_by_kind["doorbell"]
         self.assertEqual([case.name for case in cases], self.DOORBELL_NAMES)
@@ -1552,6 +2559,18 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
         self.assertEqual(cases[1].payload, sqe.payload[:8])
 
     def test_doorbell_case_name_and_payload_mutations_are_rejected(self) -> None:
+        """
+        功能：在 Task12DoorbellDefinitionTest 测试类中确认 doorbell case 名称或
+        payload 变异被拒绝。
+        输入输出及副作用：无显式参数；在 doorbell field/value 表、
+        REFERENCE_FIELDS 和生成的 golden 副本上调用
+        CHECKER.build_golden_cases、self.assertRaisesRegex，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        validate_doorbell_contract、doorbell、queue。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 order/name、
+        payload；未拒绝或错误定位漂移即判失败。
+        """
         validate = getattr(CHECKER, "validate_doorbell_contract")
         cases_by_kind = CHECKER.build_golden_cases()
         cases = cases_by_kind["doorbell"]
@@ -1569,20 +2588,226 @@ class Task12DoorbellDefinitionTest(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ValidationError, "payload"):
             validate(changed, cases_by_kind["queue"])
 
-    def test_new_pinned_source_hash_mutation_is_rejected(self) -> None:
-        validate = getattr(CHECKER, "validate_source_hash_contract")
-        validate(CHECKER.SOURCE_HASHES)
-        drifted = dict(CHECKER.SOURCE_HASHES)
-        drifted["eth_header/register.h"] = "0" * 64
-        with self.assertRaisesRegex(CHECKER.ValidationError, "source hash"):
-            validate(drifted)
+class SourceIdentityTest(unittest.TestCase):
+    """验证 source manifest 是冻结源码身份的唯一权威。"""
+
+    def _lock(self, archive_id: str = "fixture-archive"):
+        """
+        功能：构造最小 ArchiveLock fixture；
+        输入输出及副作用：archive_id 指定 ArchiveLock 身份；返回固定 sha256、
+        size、prefix、member list 和 count 的最小只读
+        fixture。
+        失败边界：archive_id 仅允许改变身份字段；
+        返回对象不拥有临时目录，调用方若传不同 ID 应触发 manifest
+        mismatch。
+        """
+        return CHECKER.ArchiveLock(
+            archive_id=archive_id,
+            sha256="0" * 64,
+            size_bytes=1,
+            prefix="fixture",
+            member_list_sha256="1" * 64,
+            member_count=1,
+        )
+
+    def _fixture(self, selector: str = "FIXTURE_SYMBOL", digest: str | None = None):
+        """
+        功能：创建临时锁定源码和 manifest；
+        输入输出及副作用：selector/digest 控制 fixture.h 的 SourceManifestRecord；
+        创建
+        TemporaryDirectory、源码文件并返回 temp、root、source、record。
+        失败边界：调用方负责 temp.cleanup；digest 默认按实际 bytes 计算，
+        传入错误 digest 或 selector 只用于拒绝路径测试。
+        """
+        temp = tempfile.TemporaryDirectory(prefix="rdma_source_identity.")
+        root = Path(temp.name)
+        source = root / "fixture.h"
+        source.write_text("#define FIXTURE_SYMBOL 1\n", encoding="utf-8")
+        actual_digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+        record = CHECKER.SourceManifestRecord(
+            archive_id="fixture-archive",
+            path="fixture.h",
+            selector=selector,
+            sha256=actual_digest if digest is None else digest,
+        )
+        return temp, root, source, record
+
+    def test_source_manifest_git_head_does_not_change_locked_source_identity(self) -> None:
+        """
+        功能：确认冻结源码只由 manifest 字节和 selector 决定；
+        输入输出及副作用：无显式参数；在 TemporaryDirectory 内的 fixture.h、
+        ArchiveLock 和 SourceManifestRecord 上调用
+        CHECKER.validate_source_manifest_sources、self._fixture、self._lock、self.assertIn，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        0123456789abcdef0123456789abcdef01234567、fixture.h、utf-8。
+        失败边界：通过 assertIn
+        锁定成功路径（0123456789abcdef0123456789abcdef01234567、fixture.h、utf-8）；
+        任一实际结果不符都会使该回归测试失败。
+        """
+        temp, root, _, record = self._fixture()
+        try:
+            (root / ".git").mkdir()
+            (root / ".git" / "HEAD").write_text(
+                "0123456789abcdef0123456789abcdef01234567\n", encoding="utf-8"
+            )
+            required_rows = CHECKER.REQUIRED_MANIFEST_ROWS
+            CHECKER.REQUIRED_MANIFEST_ROWS = {("fixture.h", "FIXTURE_SYMBOL")}
+            try:
+                sources = CHECKER.validate_source_manifest_sources(
+                    root, self._lock(), [record]
+                )
+            finally:
+                CHECKER.REQUIRED_MANIFEST_ROWS = required_rows
+            self.assertIn("fixture.h", sources)
+        finally:
+            temp.cleanup()
+
+    def test_source_digest_drift_is_rejected(self) -> None:
+        """
+        功能：验证 manifest 摘要漂移被拒绝；
+        输入输出及副作用：无显式参数；在 TemporaryDirectory 内的 fixture.h、
+        ArchiveLock 和 SourceManifestRecord 上调用
+        CHECKER.validate_source_manifest_sources、self._fixture、self._lock、
+        self.assertRaisesRegex，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 f、
+        source digest mismatch: fixture.h。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 source
+        digest mismatch:
+        fixture.h；未拒绝或错误定位漂移即判失败。
+        """
+        temp, root, _, record = self._fixture(digest="f" * 64)
+        try:
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source digest mismatch: fixture.h"):
+                CHECKER.validate_source_manifest_sources(root, self._lock(), [record])
+        finally:
+            temp.cleanup()
+
+    def test_selector_mismatch_is_rejected(self) -> None:
+        """
+        功能：验证 selector 未覆盖源码符号时被拒绝；
+        输入输出及副作用：无显式参数；在 TemporaryDirectory 内的 fixture.h、
+        ArchiveLock 和 SourceManifestRecord 上调用
+        CHECKER.validate_source_manifest_sources、self._fixture、self._lock、
+        self.assertRaisesRegex，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        MISSING_SYMBOL、source selector matches no locked
+        symbol/text: fixture.h。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 source
+        selector matches no locked symbol/text:
+        fixture.h；未拒绝或错误定位漂移即判失败。
+        """
+        temp, root, _, record = self._fixture(selector="MISSING_SYMBOL")
+        try:
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source selector matches no locked symbol/text: fixture.h"):
+                CHECKER.validate_source_manifest_sources(root, self._lock(), [record])
+        finally:
+            temp.cleanup()
+
+    def test_archive_identifier_mismatch_is_rejected(self) -> None:
+        """
+        功能：验证 manifest archive_identifier 必须等于 ArchiveLock；
+        输入输出及副作用：无显式参数；在 TemporaryDirectory 内的 fixture.h、
+        ArchiveLock 和 SourceManifestRecord 上调用
+        CHECKER.validate_source_manifest_sources、self._fixture、self._lock、
+        self.assertRaisesRegex，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 source
+        manifest archive identifier
+        mismatch、other-archive。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 source
+        manifest archive identifier
+        mismatch；未拒绝或错误定位漂移即判失败。
+        """
+        temp, root, _, record = self._fixture()
+        try:
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source manifest archive identifier mismatch"):
+                CHECKER.validate_source_manifest_sources(root, self._lock("other-archive"), [record])
+        finally:
+            temp.cleanup()
+
+    def test_missing_source_is_rejected(self) -> None:
+        """
+        功能：验证 manifest 指向缺失文件时被拒绝；
+        输入输出及副作用：无显式参数；在 TemporaryDirectory 内的 fixture.h、
+        ArchiveLock 和 SourceManifestRecord 上调用
+        CHECKER.validate_source_manifest_sources、self._fixture、self._lock、
+        self.assertRaisesRegex，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 source
+        file missing: fixture.h。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 source file
+        missing: fixture.h；未拒绝或错误定位漂移即判失败。
+        """
+        temp, root, source, record = self._fixture()
+        try:
+            source.unlink()
+            with self.assertRaisesRegex(CHECKER.ValidationError, "source file missing: fixture.h"):
+                CHECKER.validate_source_manifest_sources(root, self._lock(), [record])
+        finally:
+            temp.cleanup()
 
 
 class MakefileCleanupTest(unittest.TestCase):
+    """功能：验证 rdma_defs Make 入口经过 archive verifier 且失败清理保持可诊断。
+    输入输出及副作用：执行 make -n 获取命令文本，不运行解压或删除生产目录。
+    失败边界：缺少 fail-fast、直接解压或错误清理分支时断言失败。"""
+
+    def test_rdma_defs_routes_through_archive_verifier(self) -> None:
+        """
+        功能：确认 rdma_defs 使用统一 verifier；
+        输入输出及副作用：无显式参数；在 sim/Makefile 的 make -n
+        输出及临时 tar/unzip/python3/rm stub 上调用
+        self.assertIn、self.assertNotRegex，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键
+        token/坐标包括 verify_rdma_archive.py、--lock ../hw/rdma/archive_lock.env、
+        --source-manifest
+        ../hw/rdma/source_manifest.txt。
+        失败边界：通过 assertIn, assertNotRegex
+        锁定成功路径（verify_rdma_archive.py、--lock
+        ../hw/rdma/archive_lock.env、--source-manifest
+        ../hw/rdma/source_manifest.txt）；
+        任一实际结果不符都会使该回归测试失败。
+        """
+        rendered = subprocess.run(
+            [
+                "make", "--no-print-directory", "-n",
+                "TEST=rdma_cmq_driver_contract_test", "rdma_defs",
+            ],
+            cwd=REPO_ROOT / "sim", check=True, text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertIn("verify_rdma_archive.py", rendered)
+        self.assertIn("--lock ../hw/rdma/archive_lock.env", rendered)
+        self.assertIn("--source-manifest ../hw/rdma/source_manifest.txt", rendered)
+        self.assertNotRegex(rendered, r"(?:tar -x|unzip -q)")
+        self.assertIn("set -euo pipefail", rendered)
+
     def test_rdma_defs_cleanup_preserves_command_failure_and_reports_delete_failure(self) -> None:
+        """
+        功能：在 MakefileCleanupTest 测试类中确认 Make
+        清理保留命令失败并报告删除失败。
+        输入输出及副作用：无显式参数；在 sim/Makefile 的 make -n
+        输出及临时 tar/unzip/python3/rm stub 上调用
+        self.assertEqual、self.assertIn、self.subTest，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 sim、#!/bin/bash exit 0、#!/bin/bash exit
+        "${XTR_TEST_COMMAND_STATUS:?}"。
+        失败边界：通过 assertEqual, assertIn 锁定成功路径（sim、#!/bin/bash exit
+        0、#!/bin/bash exit
+        "${XTR_TEST_COMMAND_STATUS:?}"）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         sim_dir = REPO_ROOT / "sim"
         rendered = subprocess.run(
-            ["make", "--no-print-directory", "-n", "rdma_defs"],
+            [
+                "make", "--no-print-directory", "-n",
+                "TEST=rdma_cmq_driver_contract_test", "rdma_defs",
+            ],
             cwd=sim_dir,
             check=True,
             text=True,
@@ -1628,15 +2853,45 @@ class MakefileCleanupTest(unittest.TestCase):
 
 
 class ReferenceEncodingTest(unittest.TestCase):
+    """功能：验证独立 reference encoder 的字段占用、端序、golden 派生和语义输入耦合。
+    输入输出及副作用：在 ReferenceImage 与 bytes 副本上编码/变异，不修改仓库 golden。
+    失败边界：越界、重叠、映射漂移、非法语义值或未覆盖输入必须被断言捕获。"""
+
     def make_reference_image(self, byte_count: int):
+        """
+        功能：在 ReferenceEncodingTest/make_reference_image 中创建被测 ReferenceImage
+        或报告构造 API 缺失。
+        输入输出及副作用：byte_count 指定测试 image 大小；返回
+        CHECKER.ReferenceImage，若 API 缺失才回退 bytearray
+        以让断言给出清晰错误。
+        失败边界：负数/非整数大小由构造器拒绝；回退对象没有
+        occupancy，调用 put_field 时必须报告 tracking 缺失。
+        """
         image_type = getattr(CHECKER, "ReferenceImage", bytearray)
         return image_type(byte_count)
 
     def require_checker_attribute(self, name: str):
+        """
+        功能：在 ReferenceEncodingTest/require_checker_attribute 中确认 reference
+        encoder 暴露指定 helper。
+        输入输出及副作用：name 是 reference encoder helper 名；返回 CHECKER
+        上对应对象，供测试动态调用并验证公开契约。
+        失败边界：属性缺失时 self.assertTrue 失败；
+        不会静默取同名本地函数，避免测试绕过生产实现。
+        """
         self.assertTrue(hasattr(CHECKER, name), f"checker has no {name}")
         return getattr(CHECKER, name)
 
     def field_value(self, case, stem: str) -> int:
+        """
+        功能：在 ReferenceEncodingTest/field_value 中按 REFERENCE_BY_STEM 从 case
+        payload 读取字段值。
+        输入输出及副作用：case.payload 与 stem 决定 reference qword；
+        按大端序取 word_byte_offset、右移 lsb 并截取
+        width，返回字段整数。
+        失败边界：未知 stem 触发 KeyError；payload 不足一个 qword 时不补零，
+        调用方必须把异常或错误值视为 fixture 漂移。
+        """
         reference = CHECKER.REFERENCE_BY_STEM[stem]
         word = int.from_bytes(
             case.payload[
@@ -1647,11 +2902,30 @@ class ReferenceEncodingTest(unittest.TestCase):
         return (word >> reference.lsb) & ((1 << reference.width) - 1)
 
     def mutate_field(self, case, stem: str):
+        """
+        功能：在 ReferenceEncodingTest/mutate_field
+        中翻转命名字段最低位并返回变异 GoldenCase。
+        输入输出及副作用：case/stem 指定一个 reference field；
+        读取当前值并异或最低位，委托 set_field 返回只改该字段的
+        GoldenCase。
+        失败边界：stem 必须在 REFERENCE_BY_STEM；
+        字段值为零或边界值仍只翻转 bit0，越界由 set_field 的 bytes
+        转换暴露。
+        """
         reference = CHECKER.REFERENCE_BY_STEM[stem]
         current = self.field_value(case, stem)
         return self.set_field(case, stem, current ^ 1)
 
     def set_field(self, case, stem: str, value: int):
+        """
+        功能：在 ReferenceEncodingTest/set_field 中在 bytes
+        副本中替换命名字段值并返回新 case。
+        输入输出及副作用：在 case.payload 的目标 qword 中清除 stem mask、
+        写入 value 并返回 _replace 产生的新 GoldenCase，原
+        case 保持不变。
+        失败边界：value 未限制在 width 时 to_bytes 或断言会失败；start/width
+        漂移导致的截断不能修改原 payload，必须被测试发现。
+        """
         reference = CHECKER.REFERENCE_BY_STEM[stem]
         start = reference.word_byte_offset
         image = bytearray(case.payload)
@@ -1662,6 +2936,15 @@ class ReferenceEncodingTest(unittest.TestCase):
         return case._replace(payload=bytes(image))
 
     def mutate_input(self, case, name: str):
+        """
+        功能：在 ReferenceEncodingTest/mutate_input 中从 case
+        摘要移除指定语义输入并返回新 case。
+        输入输出及副作用：从 case.inputs 找到 name，按 mr_register/key_alloc/self
+        或数值翻转规则替换 value，返回新的 inputs
+        tuple。
+        失败边界：name 不存在时返回等价 case；未知值按 int(value,0)^1，
+        非数值输入会抛 ValueError，原 tuple 不被修改。
+        """
         inputs = []
         for item in case.inputs:
             if item.name != name:
@@ -1679,21 +2962,69 @@ class ReferenceEncodingTest(unittest.TestCase):
         return case._replace(inputs=tuple(inputs))
 
     def test_absolute_offsets_use_big_endian_driver_qwords(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认逻辑 offset 以 driver 大端
+        qword 编码。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.put_field、self.assertEqual、self.make_reference_image，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        0000000155550000。
+        失败边界：通过 assertEqual 锁定成功路径（0000000155550000）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         image = self.make_reference_image(16)
         CHECKER.put_field(image, 16, 21, 0x15555)
         self.assertEqual(bytes(image[:8]), bytes.fromhex("0000000155550000"))
 
     def test_overflow_is_fatal(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认字段值溢出立即失败。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.put_field、self.assertRaisesRegex、self.make_reference_image，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 does
+        not fit。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 does not
+        fit；未拒绝或错误定位漂移即判失败。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "does not fit"):
             CHECKER.put_field(self.make_reference_image(8), 0, 4, 0x10)
 
     def test_zero_write_reserves_the_full_field_range(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest
+        测试类中确认零值写入仍占用完整字段范围。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.put_field、self.assertRaisesRegex、self.make_reference_image，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        overlap。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 overlap；
+        未拒绝或错误定位漂移即判失败。
+        """
         image = self.make_reference_image(8)
         CHECKER.put_field(image, 0, 8, 0)
         with self.assertRaisesRegex(CHECKER.ValidationError, "overlap"):
             CHECKER.put_field(image, 0, 8, 1)
 
     def test_partial_zero_overlap_is_fatal_and_atomic(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认部分重叠写入失败且 image/
+        occupancy 原子不变。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.put_field、self.assertEqual、self.assertRaisesRegex、
+        self.make_reference_image，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        occupancy、overlap。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 overlap；
+        未拒绝或错误定位漂移即判失败。
+        """
         image = self.make_reference_image(8)
         CHECKER.put_field(image, 0, 8, 0)
         payload_before = bytes(image)
@@ -1706,6 +3037,18 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(tuple(image.occupancy), occupancy_before)
 
     def test_nonoverlap_width64_and_endian_behavior_is_preserved(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认非重叠 64-bit
+        字段保持端序。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.put_field、self.assertEqual、self.make_reference_image，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        00000000000000ba、0123456789abcdef。
+        失败边界：通过 assertEqual 锁定成功路径（00000000000000ba、
+        0123456789abcdef）；任一实际结果不符都会使该回归测试失败。
+        """
         image = self.make_reference_image(16)
         CHECKER.put_field(image, 0, 4, 0xA)
         CHECKER.put_field(image, 4, 4, 0xB)
@@ -1714,10 +3057,36 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(bytes(image[8:]), bytes.fromhex("0123456789abcdef"))
 
     def test_plain_bytearray_cannot_bypass_occupancy_tracking(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认普通 bytearray 不能绕过
+        occupancy tracking。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.put_field、self.assertRaisesRegex，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 occupancy。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 occupancy；
+        未拒绝或错误定位漂移即判失败。
+        """
         with self.assertRaisesRegex(CHECKER.ValidationError, "occupancy"):
             CHECKER.put_field(bytearray(8), 0, 8, 0)
 
     def test_reference_encoder_is_independent_of_sv_mapping_placement(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 reference encoder 不依赖 SV
+        mapping placement。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual、self.fail，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括 FIELD_BY_STEM、
+        golden encoder consulted SV mapping
+        placement:。
+        失败边界：通过 assertEqual 锁定成功路径（FIELD_BY_STEM、golden encoder
+        consulted SV mapping
+        placement:）；任一实际结果不符都会使该回归测试失败。
+        """
         expected = CHECKER.build_golden_cases()
         saved_mappings = CHECKER.FIELD_MAPPINGS
         had_legacy_lookup = hasattr(CHECKER, "FIELD_BY_STEM")
@@ -1737,6 +3106,18 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_reference_validation_rejects_missing_duplicate_and_drift(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 reference 缺失/重复/
+        漂移被拒绝。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        self.assertRaisesRegex、self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        REFERENCE_FIELDS、validate_reference_fields、duplicate。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 byte offset
+        mismatch、duplicate、missing；未拒绝或错误定位漂移即判失败。
+        """
         references = self.require_checker_attribute("REFERENCE_FIELDS")
         validate_references = self.require_checker_attribute(
             "validate_reference_fields"
@@ -1767,6 +3148,19 @@ class ReferenceEncodingTest(unittest.TestCase):
                 )
 
     def test_destination_ip_profile_constants_are_checked_and_drive_placement(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 destination IP profile
+        常量同时校验并驱动 placement。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、CHECKER.parse_sv_constants、self.assertEqual、
+        self.assertRaisesRegex、self.require_checker_attribute，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        validate_profile_constants、RDMA_QPC_DEST_IP_BYTE_OFFSET、RDMA_QPC_DEST_IP_BYTES。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 profile
+        constant；未拒绝或错误定位漂移即判失败。
+        """
         validate_profile = self.require_checker_attribute(
             "validate_profile_constants"
         )
@@ -1794,6 +3188,21 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_every_golden_field_has_explicit_reference_placement(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认每个 golden 字段都有显式
+        reference placement。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual、self.assertGreater、
+        self.assertGreaterEqual、
+        self.assertLessEqual、self.assertNotEqual，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        REFERENCE_FIELDS、RDMA_SQ_。
+        失败边界：通过 assertEqual, assertGreater, assertGreaterEqual, assertLessEqual,
+        assertNotEqual 锁定成功路径（REFERENCE_FIELDS、RDMA_SQ_）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         references = self.require_checker_attribute("REFERENCE_FIELDS")
         reference_stems = [reference.sv_stem for reference in references]
         self.assertEqual(len(set(reference_stems)), len(references))
@@ -1809,6 +3218,18 @@ class ReferenceEncodingTest(unittest.TestCase):
         original_put_named = CHECKER.put_named
 
         def record_put_named(image, stem, value):
+            """
+            功能：在
+            ReferenceEncodingTest/test_every_golden_field_has_explicit_reference_placement/
+            record_put_named
+            中记录 golden 构造期间每次 put_named 的 stem/value 供审计。
+            输入输出及副作用：image、stem、value 是被 monkey-patch 的 put_named
+            调用；把 stem 记录进 used_stems 后委托
+            original_put_named 完成真实写入。
+            失败边界：不得吞掉 original_put_named 的 ValidationError；
+            测试结束由 finally 恢复
+            CHECKER.put_named，避免污染其它 case。
+            """
             used_stems.append(stem)
             original_put_named(image, stem, value)
 
@@ -1825,12 +3246,151 @@ class ReferenceEncodingTest(unittest.TestCase):
             if reference.sv_stem.startswith("RDMA_SQ_")
             and reference.sv_stem not in used_stems
         }
+        # CQE overlay fields are source-mapped here even when the compact
+        # error golden intentionally exercises only its common RC projection.
+        # Their absence from this one golden must not weaken the mapping table.
+        cqe_audit_only = {
+            reference.sv_stem
+            for reference in references
+            if reference.sv_stem.startswith("RDMA_CQE_")
+            and reference.sv_stem not in used_stems
+        }
         self.assertTrue(task11_audit_only <= set(reference_stems))
         self.assertEqual(
-            set(used_stems), set(reference_stems) - task11_audit_only - sq_audit_only
+            set(used_stems),
+            set(reference_stems)
+            - task11_audit_only
+            - sq_audit_only
+            - cqe_audit_only,
         )
 
+    def test_wr_cqe_fields_cover_every_driver_wire_coordinate(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中核对 wr.h CQE 的每个硬件线缆
+        字段都在 FIELD_MAPPINGS 与 REFERENCE_FIELDS 中登记，并固定其 qword
+        byte offset、LSB 和 width。
+        输入输出及副作用：无显式参数；读取 checker 的两张只读映射表，使用
+        unittest 断言 source identity 与坐标，不修改生产源码或 golden 文件。
+        失败边界：缺少字段、错误 source、qword 偏移或位宽都会在对应 subTest
+        失败；该测试不把 wr.h 的辅助常量（shadow/SGE 之外的非 CQE 字段）误算
+        为 CQE wire contract。
+        """
+        expected = {
+            "XTRDMA_CQE_POLARITY": ("RDMA_CQE_POLARITY", 0, 63, 1),
+            "XTRDMA_CQE_QP_ST": ("RDMA_CQE_QP_ST", 0, 60, 3),
+            "XTRDMA_CQE_RQ_CQE": ("RDMA_CQE_RQ_CQE", 0, 59, 1),
+            "XTRDMA_CQE_SRFQ": ("RDMA_CQE_SRFQ", 0, 58, 1),
+            "XTRDMA_CQE_SE": ("RDMA_CQE_SE", 0, 57, 1),
+            "XTRDMA_CQE_SIGN_EN": ("RDMA_CQE_SIGN_EN", 0, 56, 1),
+            "XTRDMA_CQE_QP_WQE_WRAP": ("RDMA_CQE_WQE_WRAP", 0, 55, 1),
+            "XTRDMA_CQE_QP_WQE_INDEX": ("RDMA_CQE_WQE_INDEX", 0, 40, 15),
+            "XTRDMA_CQE_PKT_OPCODE": ("RDMA_CQE_PKT_OPCODE", 0, 32, 8),
+            "XTRDMA_CQE_ECODE": ("RDMA_CQE_ECODE", 0, 24, 8),
+            "XTRDMA_CQE_VLAN": ("RDMA_CQE_VLAN", 0, 23, 1),
+            "XTRDMA_CQE_IPV6": ("RDMA_CQE_IPV6", 0, 22, 1),
+            "XTRDMA_CQE_CQE_FORMAT": ("RDMA_CQE_CQE_FORMAT", 0, 20, 2),
+            "XTRDMA_CQE_RESIZE_CQE": ("RDMA_CQE_RESIZE_CQE", 0, 19, 1),
+            "XTRDMA_CQE_UD_MC": ("RDMA_CQE_UD_MC", 0, 18, 1),
+            "XTRDMA_CQE_QPN": ("RDMA_CQE_QPN", 0, 0, 18),
+            "XTRDMA_CQE_IMMDT_DATA_INVLD_KEY": (
+                "RDMA_CQE_IMMDT_DATA", 8, 32, 32
+            ),
+            "XTRDMA_CQE_PAYLOAD_LEN": ("RDMA_CQE_PAYLOAD_LEN", 8, 0, 32),
+            "XTRDMA_CQE_SIGNATURE": ("RDMA_CQE_SIGNATURE", 16, 56, 8),
+            "XTRDMA_CQE_RC_REMOTE_SYNDROME": (
+                "RDMA_CQE_RC_REMOTE_SYNDROME", 16, 48, 8
+            ),
+            "XTRDMA_CQE_UD_SRC_QPN": ("RDMA_CQE_UD_SRC_QPN", 16, 32, 24),
+            "XTRDMA_CQE_RQE_CPL": ("RDMA_CQE_RQE_CPL", 16, 31, 1),
+            "XTRDMA_CQE_SRFQN": ("RDMA_CQE_SRFQN", 16, 16, 12),
+            "XTRDMA_CQE_SRFQE_WRAP": ("RDMA_CQE_SRFQE_WRAP", 16, 15, 1),
+            "XTRDMA_CQE_SRFQE_INDEX": ("RDMA_CQE_SRFQE_INDEX", 16, 0, 15),
+            "XTRDMA_CQE_UD_SMAC": ("RDMA_CQE_UD_SMAC", 24, 16, 48),
+            "XTRDMA_CQE_UD_VLAN_TAG": ("RDMA_CQE_UD_VLAN_TAG", 24, 0, 16),
+        }
+        mappings = {
+            mapping.c_symbol: mapping
+            for mapping in CHECKER.FIELD_MAPPINGS
+            if mapping.path == "wr.h" and mapping.c_symbol.startswith("XTRDMA_CQE_")
+        }
+        references = {
+            reference.c_symbol: reference
+            for reference in CHECKER.REFERENCE_FIELDS
+            if reference.path == "wr.h" and reference.c_symbol.startswith("XTRDMA_CQE_")
+        }
+
+        self.assertEqual(set(mappings), set(expected))
+        self.assertEqual(set(references), set(expected))
+        for symbol, (stem, byte_offset, lsb, width) in expected.items():
+            with self.subTest(symbol=symbol):
+                mapping = mappings[symbol]
+                reference = references[symbol]
+                self.assertEqual(mapping.sv_stem, stem)
+                self.assertEqual(mapping.word_byte_offset, byte_offset)
+                self.assertEqual(
+                    (reference.sv_stem, reference.word_byte_offset,
+                     reference.lsb, reference.width),
+                    (stem, byte_offset, lsb, width),
+                )
+
+    def test_wr_cqe_mapping_guard_rejects_omission_or_extra_symbol(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中验证 checker 的 CQE 映射完整性
+        守卫拒绝删行、增行或把非 CQE source 混入固定集合。
+        输入输出及副作用：无显式参数；调用 checker 的纯内存映射验证函数，使用
+        NamedTuple 副本构造缺失/额外 source，不写入生产文件或驱动 archive。
+        失败边界：完整表必须通过；缺 mapping、缺 reference 或额外 wr.h CQE
+        symbol 必须抛出 ValidationError，并指出 CQE mapping contract。
+        """
+        validate = self.require_checker_attribute("validate_wr_cqe_mappings")
+        validate(CHECKER.FIELD_MAPPINGS, CHECKER.REFERENCE_FIELDS)
+
+        mapping_index = next(
+            index
+            for index, mapping in enumerate(CHECKER.FIELD_MAPPINGS)
+            if mapping.c_symbol == "XTRDMA_CQE_QP_ST"
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "CQE mapping"):
+            validate(
+                CHECKER.FIELD_MAPPINGS[:mapping_index]
+                + CHECKER.FIELD_MAPPINGS[mapping_index + 1:],
+                CHECKER.REFERENCE_FIELDS,
+            )
+
+        reference_index = next(
+            index
+            for index, reference in enumerate(CHECKER.REFERENCE_FIELDS)
+            if reference.c_symbol == "XTRDMA_CQE_QP_ST"
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "CQE mapping"):
+            validate(
+                CHECKER.FIELD_MAPPINGS,
+                CHECKER.REFERENCE_FIELDS[:reference_index]
+                + CHECKER.REFERENCE_FIELDS[reference_index + 1:],
+            )
+
+        extra = CHECKER.FieldMapping(
+            "wr.h", "XTRDMA_CQE_TEST_EXTRA", "RDMA_CQE_TEST_EXTRA", 0
+        )
+        with self.assertRaisesRegex(CHECKER.ValidationError, "CQE mapping"):
+            validate(
+                CHECKER.FIELD_MAPPINGS + (extra,), CHECKER.REFERENCE_FIELDS
+            )
+
     def test_reference_cases_have_stable_contract(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 reference cases 的名称、
+        长度和 payload 稳定。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 context、qpc_rc_boundary、qpc_ud_boundary。
+        失败边界：通过 assertEqual
+        锁定成功路径（context、qpc_rc_boundary、qpc_ud_boundary）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         cases = CHECKER.build_golden_cases()
         context_cases = cases["context"]
         self.assertEqual(
@@ -1868,6 +3428,19 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_context_case_summaries_are_an_immutable_input_contract(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 context
+        摘要是不可变输入契约。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、CHECKER.parse_input_summary、self.assertEqual、
+        self.assertIsInstance、self.assertRaises、self.assertTrue，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        context、name、inputs。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        AttributeError；未拒绝或错误定位漂移即判失败。
+        """
         context_cases = CHECKER.build_golden_cases()["context"]
         self.assertEqual(CHECKER.GoldenCase._fields, ("name", "inputs", "payload"))
         for case in context_cases:
@@ -1897,6 +3470,20 @@ class ReferenceEncodingTest(unittest.TestCase):
         ])
 
     def test_body_masks_are_independent_exact_and_envelope_disjoint(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 body masks 独立、
+        精确且不侵入 envelope。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        self.assertEqual、self.assertTrue、self.require_checker_attribute、self.subTest，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        BODY_MASKS、cqc_create、mrt_register_pbl0。
+        失败边界：通过 assertEqual, assertTrue
+        锁定成功路径（BODY_MASKS、cqc_create、mrt_register_pbl0）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         masks = self.require_checker_attribute("BODY_MASKS")
         expected = {
             "cqc_create": (0x00000000001fffff, 0xff0fffffffffffff,
@@ -1945,6 +3532,18 @@ class ReferenceEncodingTest(unittest.TestCase):
                 self.assertTrue(all((a & b) == 0 for a, b in zip(envelope, body_mask)))
 
     def test_context_goldens_obey_body_masks_and_coordinate_translations(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 context goldens 遵守 body mask
+        和坐标转换。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual、self.assertRaisesRegex、
+        self.require_checker_attribute，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        BODY_TRANSLATIONS、validate_body_translations、context。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        translation；未拒绝或错误定位漂移即判失败。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         validate(CHECKER.build_golden_cases()["context"])
         translations = self.require_checker_attribute("BODY_TRANSLATIONS")
@@ -1971,6 +3570,20 @@ class ReferenceEncodingTest(unittest.TestCase):
             )
 
     def test_qpc_traffic_class_projection_and_ecn_policy_are_enforced(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 QPC traffic class projection 与
+        ECN policy。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual、self.assertRaisesRegex、
+        self.field_value、
+        self.mutate_field、self.mutate_input，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        context、RDMA_QPC_ICOS、RDMA_QPC_DSCP。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 ECN、
+        traffic class|ECN；未拒绝或错误定位漂移即判失败。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         for case, required_ecn in zip(cases[:3], (2, 0, 2)):
@@ -2004,6 +3617,18 @@ class ReferenceEncodingTest(unittest.TestCase):
                     validate(corrupted)
 
     def test_canonical_urc_semantics_drive_all_derived_fields(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 canonical URC semantics
+        驱动所有派生字段。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual、self.assertTrue、self.field_value、
+        self.subTest，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        remote_qpn、rbsn、dbsn。
+        失败边界：通过 assertEqual, assertTrue 锁定成功路径（remote_qpn、rbsn、
+        dbsn）；任一实际结果不符都会使该回归测试失败。
+        """
         urc = CHECKER.build_golden_cases()["context"][2]
         inputs = {item.name: item.value for item in urc.inputs}
         expected_core = {
@@ -2082,6 +3707,20 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_canonical_urc_common_handle_is_named_qpn(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 URC common handle 使用 qpn
+        名称。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual、self.assertIn、self.assertNotIn，
+        只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括 qpn、
+        0x3ffff、qp_id。
+        失败边界：通过 assertEqual, assertIn, assertNotIn
+        锁定成功路径（qpn、0x3ffff、qp_id）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         urc = CHECKER.build_golden_cases()["context"][2]
         inputs = {item.name: item.value for item in urc.inputs}
 
@@ -2090,6 +3729,20 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertNotIn("qp_id", inputs)
 
     def test_every_urc_semantic_input_is_coupled_to_payload(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认每个 URC semantic input
+        都耦合 payload。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.GoldenInput、CHECKER.build_golden_cases、self.assertRaises、
+        self.mutate_input、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        context、transport、rc。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        CHECKER.ValidationError；未拒绝或错误定位漂移即判失败。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         urc = cases[2]
@@ -2111,6 +3764,19 @@ class ReferenceEncodingTest(unittest.TestCase):
                     validate(corrupted)
 
     def test_urc_accepts_optional_traffic_class_derived_summaries(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 URC 接受可选 traffic-class
+        派生摘要。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.GoldenInput、CHECKER.build_golden_cases、self.fail、
+        self.require_checker_attribute，
+        只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        context、icos、7。
+        失败边界：通过 unittest 断言 锁定成功路径（context、icos、7）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         urc = cases[2]
@@ -2127,6 +3793,20 @@ class ReferenceEncodingTest(unittest.TestCase):
             self.fail(f"valid derived summaries were rejected: {error}")
 
     def test_body_goldens_use_only_driver_supported_semantic_values(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 body goldens 只使用 driver
+        支持的语义值。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertIn、self.assertRaisesRegex、
+        self.field_value、
+        self.mutate_input、self.require_checker_attribute，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        context、cqc_create_body_boundary、mrt_register_pbl0_boundary。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配 unsupported
+        semantic；未拒绝或错误定位漂移即判失败。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         supported = {
@@ -2216,6 +3896,20 @@ class ReferenceEncodingTest(unittest.TestCase):
                         validate(corrupted)
 
     def test_mrt_inputs_and_payload_fields_are_fully_coupled(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 MRT inputs 与 payload fields
+        完全耦合。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertRaises、self.mutate_field、
+        self.mutate_input、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        context、mrt_register_pbl0_boundary、mrt_register_pbl1_boundary。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        CHECKER.ValidationError；未拒绝或错误定位漂移即判失败。
+        """
         validate = self.require_checker_attribute("validate_context_contract")
         cases = CHECKER.build_golden_cases()["context"]
         by_name = {case.name: case for case in cases}
@@ -2269,6 +3963,20 @@ class ReferenceEncodingTest(unittest.TestCase):
                         validate(corrupted)
 
     def test_strict_golden_parser_rejects_all_structural_drift(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 strict golden parser
+        拒绝所有结构漂移。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、CHECKER.render_golden、self.assertEqual、
+        self.assertRaises、
+        self.require_checker_attribute、self.subTest，只在内存/
+        临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        parse_golden_text、duplicate、malformed byte。
+        失败边界：故意变异后必须得到 ValidationError/异常并匹配
+        CHECKER.ValidationError；未拒绝或错误定位漂移即判失败。
+        """
         parser = self.require_checker_attribute("parse_golden_text")
         rendered = CHECKER.render_golden(CHECKER.build_golden_cases()["context"])
         parsed = parser(rendered)
@@ -2292,6 +4000,19 @@ class ReferenceEncodingTest(unittest.TestCase):
                     parser(text)
 
     def test_qpc_sq_fields_use_driver_qword_at_byte_216(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 QPC SQ fields 使用 byte 216
+        driver qword。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual、self.subTest，只在内存/
+        临时目录构造变异输入并用 unittest
+        断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_QPC_SQ_PBA、RDMA_QPC_SQ_SIZE、RDMA_QPC_SQ_OM。
+        失败边界：通过 assertEqual
+        锁定成功路径（RDMA_QPC_SQ_PBA、RDMA_QPC_SQ_SIZE、RDMA_QPC_SQ_OM）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         offsets = {
             mapping.sv_stem: mapping.word_byte_offset
             for mapping in CHECKER.FIELD_MAPPINGS
@@ -2308,6 +4029,19 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual(qpc[216:224], bytes.fromhex("123456789abcdb80"))
 
     def test_sq_fields_and_golden_vectors_are_required(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 SQ fields 和 golden vectors
+        均为必需。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.parse_sq_field_mappings、CHECKER.validate_sq_golden_vectors、self.assertIn、
+        self.assertTrue，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        RDMA_SQ_WQE_QPN、RDMA_SQ_WQE_SIGNATURE、RDMA_SQ_WQE_UD_DST_IP。
+        失败边界：通过 assertIn, assertTrue
+        锁定成功路径（RDMA_SQ_WQE_QPN、RDMA_SQ_WQE_SIGNATURE、
+        RDMA_SQ_WQE_UD_DST_IP）；任一实际结果不符都会使该回归测试失败。
+        """
         fields = CHECKER.parse_sq_field_mappings(CHECKER.SV_DEFS_PATH.read_text())
         self.assertIn("RDMA_SQ_WQE_QPN", fields)
         self.assertIn("RDMA_SQ_WQE_SIGNATURE", fields)
@@ -2315,7 +4049,66 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertTrue((CHECKER.GOLDEN_DIR / "sq.hex").exists())
         CHECKER.validate_sq_golden_vectors()
 
+    def test_sq_field_mapping_has_no_python38_dict_union(self) -> None:
+        """
+        功能：检查 SQ 字段解析器不会执行 Python 3.9 才支持的字典合并。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        self.assertEqual、self.assertIsNotNone，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 parse_sq_field_mappings definition is required、
+        parse_sq_field_mappings must
+        not use dict | dict on Python 3.8、utf-8。
+        失败边界：通过 assertEqual, assertIsNotNone
+        锁定成功路径（parse_sq_field_mappings definition is
+        required、parse_sq_field_mappings must not use dict | dict on Python
+        3.8、utf-8）；任一实际结果不符都会使该回归测试失败。
+        """
+        tree = ast.parse(CHECKER_PATH.read_text(encoding="utf-8"), str(CHECKER_PATH))
+        function = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "parse_sq_field_mappings"
+            ),
+            None,
+        )
+        self.assertIsNotNone(function, "parse_sq_field_mappings definition is required")
+        assert function is not None
+
+        dict_unions = [
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.BitOr)
+            and any(
+                isinstance(operand, (ast.Dict, ast.DictComp))
+                for operand in (node.left, node.right)
+            )
+        ]
+        self.assertEqual(
+            dict_unions,
+            [],
+            "parse_sq_field_mappings must not use dict | dict on Python 3.8",
+        )
+
     def test_sq_opcodes_are_pinned_to_wr_h_enum(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 SQ opcodes 绑定 wr.h enum。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.parse_sv_constants、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括
+        RDMA_SQ_OPCODE_SEND、RDMA_SQ_OPCODE_SEND_WITH_IMM、RDMA_SQ_OPCODE_SEND_WITH_INV。
+        失败边界：通过 assertEqual
+        锁定成功路径（RDMA_SQ_OPCODE_SEND、RDMA_SQ_OPCODE_SEND_WITH_IMM、
+        RDMA_SQ_OPCODE_SEND_WITH_INV）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         constants = CHECKER.parse_sv_constants(CHECKER.SV_DEFS_PATH.read_text())
         expected = {
             "RDMA_SQ_OPCODE_SEND": 1,
@@ -2331,24 +4124,52 @@ class ReferenceEncodingTest(unittest.TestCase):
         self.assertEqual({name: constants.get(name) for name in expected}, expected)
 
     def test_sq_masks_reject_reserved_bits(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 SQ masks 拒绝 reserved bits。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.parse_sv_masks、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括
+        RDMA_SQ_WQE_RC_BODY_MASK、RDMA_SQ_WQE_ATOMIC_BODY_MASK、RDMA_SQ_WQE_HEADER_MASK。
+        失败边界：通过 assertEqual
+        锁定成功路径（RDMA_SQ_WQE_RC_BODY_MASK、RDMA_SQ_WQE_ATOMIC_BODY_MASK、
+        RDMA_SQ_WQE_HEADER_MASK）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         masks = CHECKER.parse_sv_masks(CHECKER.SV_MASKS_PATH.read_text())
         self.assertEqual(masks["RDMA_SQ_WQE_HEADER_MASK"][0], 0xEFFFFFFFFFFFFFFF)
         self.assertEqual(
             masks["RDMA_SQ_WQE_RC_BODY_MASK"],
-            (0, 0xFFFFFFFFFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF,
+            (0, 0xFFFFFFFFFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF,
              0xFFFFFFFFFFFFFE00, 0, 0, 0),
         )
         self.assertEqual(
-            masks["RDMA_SQ_WQE_UD_BODY_MASK"][1], 0xFFFFFFFFFEFFFFFF,
+            masks["RDMA_SQ_WQE_UD_BODY_MASK"][1], 0xFFFFFFFFFDFFFFFF,
         )
         self.assertEqual(
             masks["RDMA_SQ_WQE_ATOMIC_BODY_MASK"],
-            (0, 0xFFFFFFFF, 0xFF00FFFF00000000, 0xFFFFFFFFFFFFFFFF,
+            (0, 0xFFFFFFFF, 0xFFFF0000FFFFFFFF, 0xFFFFFFFFFFFFFFFF,
              0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
              0xFFFFFFFFFFFFFFFF),
         )
 
     def test_sq_golden_cases_have_operation_specific_images(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 SQ golden case 按 operation
+        使用独立 image。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.parse_golden_text、self.assertEqual、self.assertGreater、
+        self.assertGreaterEqual、
+        self.assertNotEqual，只在内存/临时目录构造变异输入并用
+        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
+        rc_inline_1、atomic_cas、ud_inline。
+        失败边界：通过 assertEqual, assertGreater, assertGreaterEqual, assertNotEqual
+        锁定成功路径（rc_inline_1、atomic_cas、ud_inline）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         cases = CHECKER.parse_golden_text((CHECKER.GOLDEN_DIR / "sq.hex").read_text())
         by_name = {case.name: case for case in cases}
         self.assertGreaterEqual(len(cases), 18)
@@ -2365,6 +4186,19 @@ class ReferenceEncodingTest(unittest.TestCase):
         )
 
     def test_golden_summaries_list_every_participating_input(self) -> None:
+        """
+        功能：在 ReferenceEncodingTest 测试类中确认 golden summary
+        列出每个参与输入。
+        输入输出及副作用：无显式参数；在 build_golden_cases() 返回的
+        GoldenCase、ReferenceImage 和 bytes 副本上调用
+        CHECKER.build_golden_cases、self.assertEqual，只在内存/
+        临时目录构造变异输入并用 unittest 断言返回值或异常。
+        本测试关注的关键
+        token/坐标包括 qpc_create、sqe_rc_boundary、rqe_boundary。
+        失败边界：通过 assertEqual
+        锁定成功路径（qpc_create、sqe_rc_boundary、rqe_boundary）；
+        任一实际结果不符都会使该回归测试失败。
+        """
         cases = CHECKER.build_golden_cases()
         summaries = {
             case.name: case.summary
@@ -2386,18 +4220,27 @@ class ReferenceEncodingTest(unittest.TestCase):
                     "remote_va=0x0123456789abcdef",
                 "rqe_boundary":
                     "qpn=0xabcde,index=0x3456,payload=0x10203040,"
-                    "qp_sn=0x5a,opcode=9,wrap=1,valid=1,signature=0x96,"
-                    "sge_num=2",
+                    "qp_sn=0x5a,opcode=9,wrap=1,sign_en=0,valid=1,signature=0x96,"
+                    "sge_num=2,sgb_pa_encoded=0x123456789abcde",
                 "cqe_error":
                     "qpn=0x2aaaa,index=0x4567,ecode=0xf4,"
                     "payload=0x10203040,polarity=1,rq_cqe=1,wrap=1,"
                     "packet_opcode=0x9a,immediate=0x89abcdef",
                 "ceqe_error":
                     "qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,pi=0xbeef,"
-                    "valid=1,packet_opcode=0x9a,wrap=1",
+                    "valid=1,packet_opcode=0x9a,wrap=1,urc=0",
+                "ceqe_urc_error":
+                    "qpn=0x15555,cqn=0x1aaaaa,ecode=0xf4,valid=1,"
+                    "packet_opcode=0x9a,urc=1,sq_valid=1,rq_valid=1,"
+                    "abnormal_type=2,remote_ecode=0xa5,wqe_wrap=1,"
+                    "wqe_idx=0x4567,sq_cpl_wrap=1,sq_cpl_idx=0x2345,"
+                    "rq_cpl_wrap=1,rq_cpl_idx=0x3456",
                 "aeqe_error":
                     "qpn=0x2aaaa,state=5,ecode=0xff,index=0x654321,"
-                    "valid=1,packet_opcode=0x81,wrap=1",
+                    "valid=1,packet_opcode=0x81,wrap=1,srfq=1,overflow=1,"
+                    "urc=1,cq_invalid=1,abnormal_type=2,"
+                    "cqn_eqn_high=0x1555,cqn_eqn_low=0x2a,"
+                    "remote_ecode=0xe1,srfqn=0xabc,srfqe_idx=0x1234",
                 "cmq_sq": "pi=27,polarity=1,offset=0x0",
                 "sq": "offset=0x100",
                 "rq": "qpn=0x15555,icos=5,pi=0x4567,wrap=1,offset=0x10",

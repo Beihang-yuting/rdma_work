@@ -152,17 +152,29 @@ class rdma_cmq_completion_test extends uvm_test;
   endfunction
 
   // Independent driver-derived oracle.  It intentionally does not call any
-  // codec mask/helper: qword 0 owns owner bit 63 and bits 45:24;
-  // returned-object bytes are opened only for admitted query opcodes.
-  // 功能：在 rdma_cmq_completion_test 中，literal_allowed_mask 根据 opcode、对象类型或 profile 选择允许位掩码/有效 payload 范围，供保留位检查使用。
-  // 输入/输出及副作用：opcode（输入）、qword_index（输入）；literal_allowed_mask 读取 opcode、qword_index 并使用字段 ；函数返回 bit [63:0]，不取得调用方资源所有权。
-  // 失败/边界：literal_allowed_mask 按 case(opcode、qword_index) 的固定映射计算 bit [63:0]（h0f→64'hffff_ffff_ffff_ffff；default→64'h0000_0000_0000_0000）；未列出的输入走 default，不修改运行时账本。
+  // codec mask/helper: qword 0 owns the common header, and query opcodes add
+  // only the returned fields documented by cmq.h/cmq.c.
+  // 功能：在 rdma_cmq_completion_test 中，literal_allowed_mask 按驱动 CQE
+  //   公共头和 opcode 专属返回字段计算每个 qword 的允许位掩码，供保留位
+  //   逐位测试使用。
+  // 输入/输出及副作用：opcode、qword_index 为输入；函数只读取固定驱动契约
+  //   并返回 bit [63:0]，不修改 image、codec 或运行时账本。
+  // 失败/边界：qword0 先返回公共头，并按 CEQC/AEQC/SRFQC query opcode 放行
+  //   EQN/SRFQN；其他 qword 只按已声明 payload 范围放行，未列出的输入返回零掩码。
   function automatic bit [63:0] literal_allowed_mask(
     bit [7:0] opcode,
     int unsigned qword_index
   );
-    if (qword_index == 0)
-      return 64'h8000_3fff_ff00_0000;
+    if (qword_index == 0) begin
+      case (opcode)
+        8'h13, 8'h17:
+          return 64'h8000_3fff_ff00_0fff;
+        8'h38:
+          return 64'h8000_3fff_ff00_ffff;
+        default:
+          return 64'h8000_3fff_ff00_0000;
+      endcase
+    end
     case (opcode)
       8'h0f: return 64'hffff_ffff_ffff_ffff; // CQC bytes 8..63
       8'h09:
@@ -532,19 +544,35 @@ class rdma_cmq_completion_test extends uvm_test;
     image = make_image(8'h00, 0, 0, 0, 1'b1);
     expect_decode_success("CQE_ALLOWED_OWNER", image, 1'b1, 0, 0);
 
-    foreach (payload_opcodes[o]) begin
-      literal_payload_bounds(payload_opcodes[o], first_byte, byte_count);
+    foreach (payload_opcodes[query_index]) begin
+      literal_payload_bounds(
+        payload_opcodes[query_index], first_byte, byte_count
+      );
+      // query 返回字段位于 qword0 的低位；只逐位注入这些低位，避免修改
+      // 同一 qword 中的 opcode/header 后把测试输入变成另一条命令。
+      allowed = literal_allowed_mask(payload_opcodes[query_index], 0);
+      for (int unsigned b = 0; b < 16; b++) begin
+        if (!allowed[b]) continue;
+        image = make_image(payload_opcodes[query_index], 0, 0, 0);
+        word = get_qword(image, 0);
+        word[b] = 1'b1;
+        set_qword(image, 0, word);
+        expect_decode_success(
+          $sformatf("CQE_ALLOWED_PAYLOAD_%02x_Q0_B%0d",
+                    payload_opcodes[query_index], b),
+          image, 1'b1, first_byte, byte_count);
+      end
       for (int unsigned q = 1; q < 8; q++) begin
-        allowed = literal_allowed_mask(payload_opcodes[o], q);
+        allowed = literal_allowed_mask(payload_opcodes[query_index], q);
         for (int unsigned b = 0; b < 64; b++) begin
           if (!allowed[b]) continue;
-          image = make_image(payload_opcodes[o], 0, 0, 0);
+          image = make_image(payload_opcodes[query_index], 0, 0, 0);
           word = get_qword(image, q);
           word[b] = 1'b1;
           set_qword(image, q, word);
           expect_decode_success(
             $sformatf("CQE_ALLOWED_PAYLOAD_%02x_Q%0d_B%0d",
-                      payload_opcodes[o], q, b),
+                      payload_opcodes[query_index], q, b),
             image, 1'b1, first_byte, byte_count);
         end
       end

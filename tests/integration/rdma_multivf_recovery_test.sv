@@ -1008,6 +1008,10 @@ class rdma_multivf_recovery_test extends uvm_test;
               cqe.wqe_index = posted.index;
               cqe.wqe_wrap = posted.wrap;
               cqe.rq_cqe = 1'b0;
+              // cqe_fixture 的基础 QP 是 fixture.setup() 建立的 RC route；
+              // 显式冻结 RC overlay，避免依赖 rdma_hw_cqe_model 的兼容默认值。
+              cqe.srfq = 1'b0;
+              cqe.variant = RDMA_CQE_VARIANT_RC;
               status = engine.query_runtime_producer_polarity(
                 cqe_fixture.cq.handle, RDMA_QUEUE_RUNTIME_CQ, cq_polarity);
               cqe.polarity = cq_polarity;

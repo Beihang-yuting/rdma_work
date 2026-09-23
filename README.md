@@ -25,7 +25,7 @@ CMQ/codec 基线来自 `/home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.ta
 | 依赖 | 环境变量 | 固定版本 |
 | --- | --- | --- |
 | dpu_common | `DPU_COMMON_ROOT` | 由仿真环境提供的 snapshot 实现 |
-| host_mem | `HOST_MEM_ROOT` | `365b7553fc7dac6b4ad55886a8e4869153607c28` |
+| host_mem | `HOST_MEM_ROOT` | `3b9e000d5df4d10efbb3029f43605e0362e0caca` |
 | net_packet | `NET_PACKET_ROOT` | `6766c4f042484814548481065328ffbcffab590f` |
 
 外部源码不会同步进本仓库，也不应把访问令牌写入 remote URL、脚本或配置文件。
@@ -46,7 +46,7 @@ git diff --check
 中执行。核心和集成分层如下：
 
 ```bash
-scripts/run_vcs53.sh rdma_defs rdma_defs_test
+scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test
 scripts/run_vcs53.sh core regression
 DPU_COMMON_ROOT=/path/to/dpu_common \
   scripts/run_vcs53.sh integration regression
@@ -70,3 +70,21 @@ scripts/run_host_mem_regression53.sh
 
 更完整的命令、依赖 preflight、测试范围和已验证证据见
 [`docs/rdma-0.1.34-gap-closure-verification.md`](docs/rdma-0.1.34-gap-closure-verification.md)。
+
+## CMQ contract foundation
+
+CMQ 的线上执行入口是 `execute_observed()`；它返回本次调用独占的 ticket、
+completion、`observation_status`、`attempt_effect` 和累计 `submission_effect`，
+不读取或写入共享的 `last_*` 证据。engine 内部 journal 保存 detached command、
+identity、batch digest 与 reset/fence 证明，恢复入口必须重新验证 owner、mapping
+capability、generation 和 reset epoch。`PRE_SUBMIT_REJECTED`、`HOST_VISIBLE`、
+`MMIO_VISIBLE`、`UNOBSERVED` 四态 effect 以及 timeout quarantine/fence 语义见
+[`docs/rdma-cmq-contract-foundation-verification.md`](docs/rdma-cmq-contract-foundation-verification.md)。
+
+CMQ wire gate 以真实的
+`dpu_kernel_rdma-version_0.1.34.tar(1).gz` 归档、source manifest 和 C oracle
+为唯一 ABI 来源；固定清单、执行命令和日志摘要记录在上述验证文档中。未迁移的
+三个 Phase 1B consumer（`rdma_control_plane.sv`、
+`rdma_queue_lifecycle_executor.sv`、`rdma_qp_lifecycle_executor.sv`）暂时只能通过
+legacy `execute()` 读取 `last_execute_no_submit_proven`；三者全部迁移后才会移除该
+兼容 seam。

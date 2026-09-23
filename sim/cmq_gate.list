@@ -1,0 +1,12 @@
+# Dedicated CMQ contract gate; order is part of the contract.
+rdma_cmq_engine_models_test
+rdma_cmq_codec_test
+rdma_cmq_completion_test
+rdma_cmq_profile_test
+rdma_doorbell_codec_test
+rdma_doorbell_scheduler_test
+rdma_queue_data_engine_post_test
+rdma_cmq_engine_test
+rdma_cmq_port_test
+rdma_control_plane_cmq_engine_test
+rdma_cmq_driver_field_mutation_test

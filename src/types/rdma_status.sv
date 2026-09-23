@@ -95,6 +95,36 @@ class rdma_status extends uvm_object;
     return status;
   endfunction
 
+  // 功能：在不经过 UVM factory 的情况下直接构造完整 rdma_status，供
+  //       外部 delegate 返回 null 或 factory 被 hostile override 时的边界降级使用。
+  // 输入/输出及副作用：code、message 为输入；函数直接 new 一个独立 status，
+  //       填充 category、severity、硬件/身份诊断默认值并返回，不修改调用方对象。
+  // 失败/边界：该函数故意绕过 type_id::create，因此始终返回非空对象；未知 code
+  //       由 category_for 保守归类，调用方仍须按 code 处理失败语义。
+  static function automatic rdma_status make_direct(
+    rdma_status_code_e code,
+    string message = ""
+  );
+    rdma_status status;
+
+    status = new("rdma_status_direct");
+    status.category = category_for(code);
+    status.code = code;
+    status.hardware_code = '0;
+    status.hardware_code_valid = 1'b0;
+    status.source_engine = RDMA_ENGINE_NONE;
+    status.function_uid = '0;
+    status.generation = '0;
+    status.resource_id = '0;
+    status.command_id = '0;
+    status.wr_id = '0;
+    status.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO
+                                           : RDMA_SEVERITY_ERROR;
+    status.retryable = 1'b0;
+    status.message = message;
+    return status;
+  endfunction
+
   // 功能：在 rdma_status 中，success 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
   // 输入/输出及副作用：message（输入）；success 读取 message 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：success 的结果直接由 return make(RDMA_SC_OK, message) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。

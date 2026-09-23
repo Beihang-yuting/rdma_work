@@ -144,6 +144,72 @@ class rdma_owner_clone_counting_host_mem extends rdma_host_mem_external_pkg::hos
   endfunction
 endclass
 
+// 中文设计：真实 host_mem 的 free() 是无返回值的 no-fail commit；因此测试在
+// allocation identity 的 completion-seal 边界注入 release 前故障，精确证明 adapter
+// 不会先 seal、free 或退休 allocation ledger。该派生类只服务测试，不改变后端语义。
+class rdma_failure_atomic_release_identity
+  extends rdma_host_mem_allocation_identity;
+  `uvm_object_utils(rdma_failure_atomic_release_identity)
+
+  static int unsigned release_fault_mode = 0;
+
+  // 功能：构造可在 completion seal 前返回 non-null 或 null 故障的 allocation identity。
+  // 输入/输出及副作用：name 为 UVM 对象名；只初始化父类 opaque identity，不访问 backing。
+  // 失败/边界：构造不注入故障；release_fault_mode 只能由对应测试场景显式设置。
+  function new(string name = "rdma_failure_atomic_release_identity");
+    super.new(name);
+  endfunction
+
+  // 功能：在 seal 提交前按 release_fault_mode 注入一次故障，否则委托父类 exactly-once seal。
+  // 输入/输出及副作用：seal 为 adapter 私有权限；故障分支清除模式但不修改父类完成状态。
+  // 失败/边界：模式 1 返回 UNKNOWN_HW_ERROR，模式 2 返回 null；其他值执行真实 seal。
+  virtual function rdma_status mark_release_complete(
+    rdma_host_mem_release_seal seal
+  );
+    case (release_fault_mode)
+      1: begin
+        release_fault_mode = 0;
+        return rdma_status::make(
+          RDMA_SC_UNKNOWN_HW_ERROR,
+          "injected host memory release seal failure"
+        );
+      end
+      2: begin
+        release_fault_mode = 0;
+        return null;
+      end
+      default:
+        return super.mark_release_complete(seal);
+    endcase
+  endfunction
+endclass
+
+// 设计说明：normalize_adapter_status 是 adapter 自己拥有的 fail-closed 边界，
+// 不应通过全局 rdma_status factory 注入来测试。factory override 会在
+// rdma_status::make() 写字段前返回 null，反而把故障点移到状态工厂内部。
+class rdma_host_mem_status_normalization_probe extends rdma_host_mem_adapter;
+  `uvm_object_utils(rdma_host_mem_status_normalization_probe)
+
+  // 功能：构造只暴露 adapter 状态规范化契约的测试 probe，不绑定 host_mem 或
+  //       创建 allocation ledger。
+  // 输入/输出及副作用：name 传给基类构造；只建立本地 UVM 对象，不取得外部资源。
+  // 失败/边界：probe 不能替代真实 adapter 进行释放或 DMA 测试；调用方必须单独
+  //       配置 backend 才能测试其它公开入口。
+  function new(string name = "rdma_host_mem_status_normalization_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：把 null candidate 注入 normalize_adapter_status，验证下游违反非空
+  //       status 契约时 adapter 仍返回确定的 INVALID_STATE。
+  // 输入/输出及副作用：operation 为诊断标签输入；不修改 ledger、mapping 或
+  //       host_mem，只返回 normalize_adapter_status 的新建错误快照。
+  // 失败/边界：返回 null 或 OK 都表示 fail-open；其它错误码表示边界契约漂移，
+  //       测试调用方应报告具体 operation 标签。
+  function rdma_status normalize_null(string operation);
+    return normalize_adapter_status(null, operation);
+  endfunction
+endclass
+
 class rdma_host_mem_adapter_test extends uvm_test;
   `uvm_component_utils(rdma_host_mem_adapter_test)
 
@@ -274,6 +340,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     );
     identity_hm.init_region(64'h0000_0007_0000_0000,
                             64'h0000_0007_00ff_ffff);
+    identity_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     identity_adapter = rdma_host_mem_adapter::type_id::create(
       "manager_identity_adapter"
     );
@@ -478,6 +545,43 @@ class rdma_host_mem_adapter_test extends uvm_test;
                  $sformatf("failed read returned %0d bytes", data.size()))
   endfunction
 
+  // 功能：check_status_normalization_boundary 通过受控 protected probe 注入
+  //       null status，确认 adapter 的公共 fail-closed fallback 非空且不成功。
+  // 输入/输出及副作用：无显式参数；task 只创建本地 probe/status 并产生 UVM
+  //       assertion，不访问 Host-memory、DMA ledger 或原始驱动数据结构。
+  // 失败/边界：null output、RDMA_SC_OK 或缺失 operation 诊断均报告错误；该测试
+  //       不使用全局 factory override，避免在 rdma_status::make() 内部制造 NOA。
+  task automatic check_status_normalization_boundary();
+    rdma_host_mem_status_normalization_probe probe;
+    rdma_status status;
+
+    probe = rdma_host_mem_status_normalization_probe::type_id::create(
+      "status_normalization_probe"
+    );
+    status = probe.normalize_null("explicit null-status injection");
+    if (status == null)
+      `uvm_error(
+        "NULL_STATUS_NORMALIZATION",
+        "adapter normalization returned a null status"
+      )
+    else begin
+      if (status.code != RDMA_SC_INVALID_STATE)
+        `uvm_error(
+          "NULL_STATUS_NORMALIZATION",
+          $sformatf(
+            "expected INVALID_STATE, got %s",
+            status.code.name()
+          )
+        )
+      if (status.message !=
+          "Host-memory adapter explicit null-status injection returned null status")
+        `uvm_error(
+          "NULL_STATUS_NORMALIZATION",
+          $sformatf("unexpected diagnostic: %s", status.message)
+        )
+    end
+  endtask
+
   // 功能：在 rdma_host_mem_adapter_test 中，run_queue_host_mem_fixture 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：无显式参数；run_queue_host_mem_fixture 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：run_queue_host_mem_fixture 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -520,6 +624,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     queue_hm = rdma_host_mem_external_pkg::host_mem_manager::type_id::create("queue_hm");
     queue_hm.init_region(64'h0000_0008_0000_0000,
                          64'h0000_0008_00ff_ffff);
+    queue_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     queue_adapter = rdma_host_mem_adapter::type_id::create(
       "queue_host_mem_adapter"
     );
@@ -713,6 +818,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_host_mem_external_pkg::host_mem_manager equal_hm_b;
     rdma_owner_clone_counting_host_mem owner_clone_hm;
     rdma_owner_clone_counting_host_mem authority_clone_hm;
+    rdma_owner_clone_counting_host_mem atomic_hm;
+    rdma_owner_clone_counting_host_mem foreign_hm;
     rdma_host_mem_adapter adapter;
     rdma_host_mem_adapter offset_adapter;
     rdma_host_mem_adapter overflow_adapter;
@@ -720,6 +827,8 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_host_mem_adapter equal_adapter_b;
     rdma_host_mem_adapter owner_clone_adapter;
     rdma_host_mem_adapter authority_clone_adapter;
+    rdma_host_mem_adapter atomic_adapter;
+    rdma_host_mem_adapter foreign_adapter;
     rdma_function_handle function_h;
     rdma_function_handle invalid_function_h;
     rdma_dma_request_context request_context;
@@ -744,13 +853,20 @@ class rdma_host_mem_adapter_test extends uvm_test;
     rdma_dma_mapping owner_clone_followup_mapping;
     rdma_dma_mapping authority_clone_mapping;
     rdma_dma_mapping authority_clone_followup_mapping;
+    rdma_dma_mapping atomic_mapping;
+    rdma_dma_mapping atomic_authority;
+    rdma_dma_mapping foreign_mapping;
+    rdma_dma_mapping default_mapping;
     rdma_dma_mapping valid_clone;
     rdma_dma_mapping stale_clone;
     rdma_dma_mapping tampered;
     rdma_dma_mapping copy_attack;
     rdma_dma_mapping forged_mapping;
     rdma_status status;
+    rdma_status authority_status;
+    uvm_factory factory;
     bit [63:0] external_addr;
+    bit release_done;
     int unsigned leak_count;
     byte wr[] = '{8'h11, 8'h22, 8'h33, 8'h44};
     byte wr_b[] = '{8'hb1, 8'hb2, 8'hb3, 8'hb4};
@@ -759,8 +875,12 @@ class rdma_host_mem_adapter_test extends uvm_test;
     byte rd[];
     byte external_wr[] = '{8'he1, 8'he2, 8'he3, 8'he4};
     byte external_rd[];
+    byte atomic_wr[] = '{8'h71, 8'h82, 8'h93, 8'ha4};
+    byte atomic_rd[];
 
     phase.raise_objection(this);
+
+    check_status_normalization_boundary();
 
     run_queue_host_mem_fixture();
 
@@ -796,6 +916,9 @@ class rdma_host_mem_adapter_test extends uvm_test;
     hm.init_region(64'h0000_0001_0000_0000,
                    64'h0000_0001_00ff_ffff,
                    host_mem_pkg::MODE_LINEAR);
+    // 这些断言比较首个 backing、rebase 后的 cursor 和两个 manager 的数值地址；
+    // 明确使用 FIRST_FIT 只约束测试 fixture，不改变 host_mem 生产默认的随机策略。
+    hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     adapter = rdma_host_mem_adapter::type_id::create("adapter");
     adapter.mem = hm;
 
@@ -853,6 +976,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     );
     owner_clone_hm.init_region(64'h0000_0005_0000_0000,
                                64'h0000_0005_00ff_ffff);
+    owner_clone_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     owner_clone_adapter = rdma_host_mem_adapter::type_id::create(
       "owner_clone_adapter"
     );
@@ -930,6 +1054,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
       );
     authority_clone_hm.init_region(64'h0000_0006_0000_0000,
                                    64'h0000_0006_00ff_ffff);
+    authority_clone_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     authority_clone_adapter = rdma_host_mem_adapter::type_id::create(
       "authority_clone_adapter"
     );
@@ -1307,6 +1432,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     offset_hm.init_region(64'h0000_0002_0000_0000,
                           64'h0000_0002_00ff_ffff,
                           host_mem_pkg::MODE_LINEAR);
+    offset_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     offset_adapter = rdma_host_mem_adapter::type_id::create("offset_adapter");
     offset_adapter.mem = offset_hm;
     offset_adapter.iova_base = 64'h0000_0000_4000_0000;
@@ -1394,6 +1520,7 @@ class rdma_host_mem_adapter_test extends uvm_test;
     overflow_hm.init_region(64'h0000_0003_0000_0000,
                             64'h0000_0003_00ff_ffff,
                             host_mem_pkg::MODE_LINEAR);
+    overflow_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     overflow_adapter = rdma_host_mem_adapter::type_id::create(
       "overflow_adapter"
     );
@@ -1430,9 +1557,11 @@ class rdma_host_mem_adapter_test extends uvm_test;
     equal_hm_a.init_region(64'h0000_0005_0000_0000,
                            64'h0000_0005_000f_ffff,
                            host_mem_pkg::MODE_LINEAR);
+    equal_hm_a.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     equal_hm_b.init_region(64'h0000_0005_0000_0000,
                            64'h0000_0005_000f_ffff,
                            host_mem_pkg::MODE_LINEAR);
+    equal_hm_b.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
     equal_adapter_a = rdma_host_mem_adapter::type_id::create(
       "equal_adapter_a"
     );
@@ -1465,6 +1594,169 @@ class rdma_host_mem_adapter_test extends uvm_test;
     expect_status("EQUAL_LEAKS_A", status, RDMA_SC_OK);
     status = equal_adapter_b.check_leaks(leak_count);
     expect_status("EQUAL_LEAKS_B", status, RDMA_SC_OK);
+
+    // failure-atomic capability 必须绑定 exact opaque allocation，且 validator
+    // 本身不能 seal、free、改 mapping state 或破坏后续 read/retry authority。
+    factory = uvm_factory::get();
+    factory.set_type_override_by_type(
+      rdma_host_mem_allocation_identity::get_type(),
+      rdma_failure_atomic_release_identity::get_type(),
+      1'b1
+    );
+    rdma_failure_atomic_release_identity::release_fault_mode = 0;
+
+    atomic_hm = rdma_owner_clone_counting_host_mem::type_id::create(
+      "failure_atomic_hm"
+    );
+    atomic_hm.init_region(
+      64'h0000_0006_0000_0000,
+      64'h0000_0006_000f_ffff,
+      host_mem_pkg::MODE_LINEAR
+    );
+    atomic_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
+    atomic_adapter = rdma_host_mem_adapter::type_id::create(
+      "failure_atomic_adapter"
+    );
+    atomic_adapter.mem = atomic_hm;
+    status = atomic_adapter.allocate(
+      request_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, atomic_mapping
+    );
+    expect_status("FAILURE_ATOMIC_ALLOCATE", status, RDMA_SC_OK);
+    status = atomic_adapter.write(atomic_mapping, 0, atomic_wr);
+    expect_status("FAILURE_ATOMIC_SEED", status, RDMA_SC_OK);
+    authority_status = atomic_mapping.snapshot_release_authority(
+      atomic_authority
+    );
+    expect_status(
+      "FAILURE_ATOMIC_AUTHORITY", authority_status, RDMA_SC_OK
+    );
+    if (atomic_authority == null)
+      `uvm_fatal("FAILURE_ATOMIC_AUTHORITY", "authority snapshot is null")
+    atomic_authority.copy(atomic_mapping);
+
+    release_done = 1'b1;
+    status = atomic_mapping.release_completion_status(release_done);
+    expect_status("FAILURE_ATOMIC_INITIAL_SEAL", status, RDMA_SC_OK);
+    if (release_done)
+      `uvm_error("FAILURE_ATOMIC_INITIAL_SEAL", "new mapping is sealed")
+    status = atomic_adapter.validate_failure_atomic_release(
+      atomic_authority
+    );
+    expect_status("FAILURE_ATOMIC_VALIDATE", status, RDMA_SC_OK);
+    if (atomic_hm.free_call_count != 0 ||
+        atomic_mapping.state != RDMA_MAPPING_ACTIVE)
+      `uvm_error(
+        "FAILURE_ATOMIC_VALIDATE",
+        "read-only validator mutated backing or mapping lifecycle"
+      )
+    status = atomic_adapter.read(
+      atomic_mapping, 0, atomic_wr.size(), atomic_rd
+    );
+    expect_status("FAILURE_ATOMIC_VALIDATE_READ", status, RDMA_SC_OK);
+    if (atomic_rd != atomic_wr)
+      `uvm_error("FAILURE_ATOMIC_VALIDATE_READ", "validator changed bytes")
+
+    default_mapping = rdma_dma_mapping::type_id::create(
+      "failure_atomic_default_mapping"
+    );
+    status = atomic_adapter.validate_failure_atomic_release(default_mapping);
+    if (status == null || status.ok())
+      `uvm_error("FAILURE_ATOMIC_DEFAULT", "default mapping was accepted")
+
+    foreign_hm = rdma_owner_clone_counting_host_mem::type_id::create(
+      "failure_atomic_foreign_hm"
+    );
+    foreign_hm.init_region(
+      64'h0000_0007_0000_0000,
+      64'h0000_0007_000f_ffff,
+      host_mem_pkg::MODE_LINEAR
+    );
+    foreign_hm.set_alloc_policy(host_mem_pkg::HOST_MEM_FIRST_FIT);
+    foreign_adapter = rdma_host_mem_adapter::type_id::create(
+      "failure_atomic_foreign_adapter"
+    );
+    foreign_adapter.mem = foreign_hm;
+    status = foreign_adapter.allocate(
+      request_context, 64, 64, RDMA_DMA_BIDIRECTIONAL, foreign_mapping
+    );
+    expect_status("FAILURE_ATOMIC_FOREIGN_ALLOCATE", status, RDMA_SC_OK);
+    status = atomic_adapter.validate_failure_atomic_release(foreign_mapping);
+    if (status == null || status.ok())
+      `uvm_error("FAILURE_ATOMIC_FOREIGN", "wrong adapter mapping was accepted")
+
+    rdma_failure_atomic_release_identity::release_fault_mode = 1;
+    status = atomic_adapter.release_opaque(atomic_authority);
+    expect_status(
+      "FAILURE_ATOMIC_NON_NULL_FAILURE", status, RDMA_SC_UNKNOWN_HW_ERROR
+    );
+    release_done = 1'b1;
+    authority_status = atomic_mapping.release_completion_status(release_done);
+    expect_status(
+      "FAILURE_ATOMIC_NON_NULL_SEAL", authority_status, RDMA_SC_OK
+    );
+    status = atomic_adapter.read(
+      atomic_mapping, 0, atomic_wr.size(), atomic_rd
+    );
+    expect_status("FAILURE_ATOMIC_NON_NULL_READ", status, RDMA_SC_OK);
+    if (release_done || atomic_hm.free_call_count != 0 ||
+        atomic_mapping.state != RDMA_MAPPING_ACTIVE || atomic_rd != atomic_wr)
+      `uvm_error(
+        "FAILURE_ATOMIC_NON_NULL_FAILURE",
+        "non-null release failure changed seal, backing, state or bytes"
+      )
+    authority_status = atomic_mapping.release_authority_status(
+      atomic_authority
+    );
+    expect_status(
+      "FAILURE_ATOMIC_NON_NULL_AUTHORITY", authority_status, RDMA_SC_OK
+    );
+
+    rdma_failure_atomic_release_identity::release_fault_mode = 2;
+    status = atomic_adapter.release_opaque(atomic_authority);
+    expect_status(
+      "FAILURE_ATOMIC_NULL_FAILURE", status, RDMA_SC_INVALID_STATE
+    );
+    release_done = 1'b1;
+    authority_status = atomic_mapping.release_completion_status(release_done);
+    expect_status("FAILURE_ATOMIC_NULL_SEAL", authority_status, RDMA_SC_OK);
+    status = atomic_adapter.read(
+      atomic_mapping, 0, atomic_wr.size(), atomic_rd
+    );
+    expect_status("FAILURE_ATOMIC_NULL_READ", status, RDMA_SC_OK);
+    if (release_done || atomic_hm.free_call_count != 0 ||
+        atomic_mapping.state != RDMA_MAPPING_ACTIVE || atomic_rd != atomic_wr)
+      `uvm_error(
+        "FAILURE_ATOMIC_NULL_FAILURE",
+        "null release failure changed seal, backing, state or bytes"
+      )
+
+    status = atomic_adapter.release_opaque(atomic_authority);
+    expect_status("FAILURE_ATOMIC_RETRY", status, RDMA_SC_OK);
+    release_done = 1'b0;
+    authority_status = atomic_mapping.release_completion_status(release_done);
+    expect_status("FAILURE_ATOMIC_FINAL_SEAL", authority_status, RDMA_SC_OK);
+    if (!release_done || atomic_hm.free_call_count != 1)
+      `uvm_error(
+        "FAILURE_ATOMIC_RETRY",
+        "successful retry did not retire backing exactly once"
+      )
+    status = atomic_adapter.validate_failure_atomic_release(atomic_mapping);
+    if (status == null || status.ok())
+      `uvm_error("FAILURE_ATOMIC_RELEASED", "released mapping was accepted")
+    status = atomic_adapter.read(atomic_mapping, 0, 1, atomic_rd);
+    expect_status(
+      "FAILURE_ATOMIC_USE_AFTER_RELEASE", status, RDMA_SC_INVALID_STATE
+    );
+    status = atomic_adapter.release_opaque(atomic_authority);
+    expect_status(
+      "FAILURE_ATOMIC_DOUBLE_RELEASE", status, RDMA_SC_INVALID_STATE
+    );
+    status = foreign_adapter.release_opaque(foreign_mapping);
+    expect_status("FAILURE_ATOMIC_FOREIGN_CLEANUP", status, RDMA_SC_OK);
+    status = atomic_adapter.check_leaks(leak_count);
+    expect_status("FAILURE_ATOMIC_LEAKS", status, RDMA_SC_OK);
+    status = foreign_adapter.check_leaks(leak_count);
+    expect_status("FAILURE_ATOMIC_FOREIGN_LEAKS", status, RDMA_SC_OK);
 
     phase.drop_objection(this);
   endtask

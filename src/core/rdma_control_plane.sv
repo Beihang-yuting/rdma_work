@@ -88,6 +88,58 @@ class rdma_control_plane extends uvm_object;
     return rdma_cmq_clone_status_value(source);
   endfunction
 
+  // 功能：在 rdma_control_plane 中，execute_control_command_raw_status 收束一次
+  //   legacy CMQ 原始 dispatch，明确保留 backend status identity，供仍依赖原始
+  //   status 引用的特殊控制面阶段调用。
+  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）。任务
+  //   清空本次事务的 ticket/completion，检查 CMQ/command 后恰好调用 cmq.execute 一次，
+  //   将 backend 原始 status 写入 status；不取得 command 或外部 CMQ 资源所有权。
+  // 失败/边界：cmq 为空时返回 RDMA_SC_INVALID_STATE，command 为空时返回
+  //   RDMA_SC_INVALID_ARGUMENT；backend 返回 null status 时保留 null，由调用方按其
+  //   原有诊断和 recovery 优先级归一化。任务不重试、不推断 timeout 或 ambiguity，
+  //   也不推进 generation/资源状态。
+  protected task execute_control_command_raw_status(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    ticket = null;
+    completion = null;
+    status = null;
+    if (cmq == null) begin
+      status = invalid_state("control-plane CMQ is unavailable");
+      return;
+    end
+    if (command == null) begin
+      status = invalid_argument("control-plane CMQ command is null");
+      return;
+    end
+    cmq.execute(command, ticket, completion, status);
+  endtask
+
+  // 功能：在 rdma_control_plane 中，execute_control_command 在原始 CMQ dispatch
+  // 之后生成 detached status，供 MR 回滚、注销和恢复阶段安全读取稳定诊断值。
+  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）；
+  //   null_status_message（输入）。任务复用 raw-status seam 且只调用一次
+  //   cmq.execute；成功或 backend status 均复制为独立 status，不取得 command 或
+  //   外部 CMQ 资源所有权。
+  // 失败/边界：cmq/command guard 的错误沿用 raw seam；backend null status 按
+  //   null_status_message 归一化为 RDMA_SC_INVALID_STATE。任务不重试、不推断
+  //   timeout/ambiguity，也不推进 generation、资源状态或 recovery journal。
+  protected task execute_control_command(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status,
+    input string null_status_message
+  );
+    execute_control_command_raw_status(
+      command, ticket, completion, status
+    );
+    status = checked_status(status, null_status_message);
+  endtask
+
   // 功能：make_result 创建独立的 rdma_control_result；根据 调用方输入 设置字段 result、pending_status、result.status、result.primary_status、result.final_resource_state、result.recovery_required，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：无显式参数；make_result 读取局部计算结果，并使用字段 result、pending_status、result.status、result.primary_status、result.final_resource_state、result.recovery_required；函数返回 rdma_control_result，不取得调用方资源所有权。
   // 失败/边界：make_result 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
@@ -142,7 +194,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：在 rdma_control_plane 中，finalize_mr_recovery 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
   // 输入/输出及副作用：reserved_mr（输入）、recovery（输入）、primary_status（输入）、result（输入）、mr（输出）、result_finalized（输出）、b0（输入）；finalize_mr_recovery 读取 reserved_mr、recovery、primary_status、result、mr、result_finalized、reserved_error 并使用字段 mr、result_finalized、normalized_primary、recovery_status、result.final_resource_state、result.final_resource_state_known、result.recovery_required、result.primary_status，并写入 mr、result_finalized；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：finalize_mr_recovery 返回 RDMA_SC_RECOVERY_REQUIRED；典型拒绝条件为“MR state requires recovery”；失败路径不提交部分状态或转移未声明资源。
   protected function void finalize_mr_recovery(
     rdma_mr reserved_mr,
@@ -223,7 +274,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：执行 retain_mr_rollback_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：reserved_mr（输入）、primary_status（输入）、result（输入）、hardware_presence（输入）、has_pending_step（输入）、pending_step（输入）、ambiguous_ticket（输入）、mr（输出）、result_finalized（输出）；retain_mr_rollback_error 读取 reserved_mr、primary_status、result、hardware_presence、has_pending_step、pending_step、ambiguous_ticket、mr、result_finalized 并使用字段 recovery、recovery.resource_h、recovery.hardware_presence、recovery.completed_steps、recovery.backing_refs、recovery.hmc_refs、recovery.ambiguous_ticket、recovery.primary_status，并写入 mr、result_finalized；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：retain_mr_rollback_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function void retain_mr_rollback_error(
     rdma_mr reserved_mr,
@@ -311,9 +361,9 @@ class rdma_control_plane extends uvm_object;
       command.opcode_key = opcode_key;
       command.body = deregister_body;
       command.timeout = default_timeout;
-      cmq.execute(command, ticket, completion, rollback_status);
-      rollback_status = checked_status(
-        rollback_status, "MR_DEREGISTER rollback returned null"
+      execute_control_command(
+        command, ticket, completion, rollback_status,
+        "MR_DEREGISTER rollback returned null"
       );
       if (!rollback_status.ok()) begin
         result.rollback_statuses.push_back(
@@ -513,7 +563,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：执行 retain_mr_destroy_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：mr_snapshot（输入）、primary_status（输入）、result（输入）、hardware_presence（输入）、has_pending_step（输入）、pending_step（输入）、ambiguous_ticket（输入）、result_finalized（输出）；retain_mr_destroy_error 读取 mr_snapshot、primary_status、result、hardware_presence、has_pending_step、pending_step、ambiguous_ticket、result_finalized 并使用字段 recovery、recovery.resource_h、recovery.hardware_presence、recovery.completed_steps、recovery.backing_refs、recovery.hmc_refs、recovery.ambiguous_ticket、recovery.primary_status，并写入 result_finalized；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：retain_mr_destroy_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function void retain_mr_destroy_error(
     rdma_mr mr_snapshot,
@@ -700,7 +749,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：validate_backing 校验 binding、request、backing、owner、required_ownership 与当前对象状态的一致性，并显式处理“register MR backing authority is incomplete”；“register MR backing descriptor is null”；“register MR backing validation returned null”；“register MR first PBL index exceeds 28 bits”；“register MR backing reference is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：binding（输入）、request（输入）、backing（输入）、owner（输入）、required_ownership（输入）；validate_backing 读取 binding、request、backing、owner、required_ownership 并使用字段 status、required_permissions、required_permissions.device_read、required_permissions.device_write、required_permissions.atomic、required_direction；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
   protected function rdma_status validate_backing(
     rdma_function_binding binding,
@@ -803,7 +851,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：在 rdma_control_plane 中，project_handle 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：software_h（输入）、local_id（输入）、expected_kind（输入）；project_handle 读取 software_h、local_id、expected_kind 并使用字段 projected、projected.kind、projected.function_uid、projected.object_id、projected.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-
   // 失败/边界：project_handle 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
   protected function rdma_handle project_handle(
     rdma_handle software_h,
@@ -2039,10 +2086,10 @@ class rdma_control_plane extends uvm_object;
         command.opcode_key = opcode_key;
         command.body = occ_body;
         command.timeout = default_timeout;
-        ticket = null;
-        completion = null;
-        cmq.execute(command, ticket, completion, status);
-        status = checked_status(status, "OCC_FLUSH execution returned null");
+        execute_control_command(
+          command, ticket, completion, status,
+          "OCC_FLUSH execution returned null"
+        );
         if (!status.ok()) begin
           primary_status = rdma_cmq_clone_status_value(status);
           if (status.code == RDMA_SC_TIMEOUT) begin
@@ -2113,11 +2160,9 @@ class rdma_control_plane extends uvm_object;
       command.opcode_key = opcode_key;
       command.body = deregister_body;
       command.timeout = default_timeout;
-      ticket = null;
-      completion = null;
-      cmq.execute(command, ticket, completion, status);
-      status = checked_status(
-        status, "MR_DEREGISTER execution returned null"
+      execute_control_command(
+        command, ticket, completion, status,
+        "MR_DEREGISTER execution returned null"
       );
       if (!status.ok()) begin
         primary_status = rdma_cmq_clone_status_value(status);
@@ -2186,10 +2231,10 @@ class rdma_control_plane extends uvm_object;
       command.opcode_key = opcode_key;
       command.body = drain_body;
       command.timeout = default_timeout;
-      ticket = null;
-      completion = null;
-      cmq.execute(command, ticket, completion, status);
-      status = checked_status(status, "TQ_FLUSH execution returned null");
+      execute_control_command(
+        command, ticket, completion, status,
+        "TQ_FLUSH execution returned null"
+      );
       if (!status.ok()) begin
         primary_status = rdma_cmq_clone_status_value(status);
         retain_mr_destroy_error(
@@ -2609,7 +2654,7 @@ class rdma_control_plane extends uvm_object;
       mrt.pd_h = project_handle(pd_snapshot.handle,
                                 pd_snapshot.local_pd_id,
                                 RDMA_RESOURCE_PD);
-      mrt.state = RDMA_CONTEXT_VALID;
+      mrt.state = RDMA_MR_STATE_VALID;
       mrt.iova = reserved_mr.iova;
       mrt.length = reserved_mr.length;
       mrt.lkey = reserved_mr.lkey;
@@ -2638,7 +2683,9 @@ class rdma_control_plane extends uvm_object;
       command.body = mrt;
       command.timeout = default_timeout;
 
-      cmq.execute(command, ticket, completion, status);
+      execute_control_command_raw_status(
+        command, ticket, completion, status
+      );
       if (status == null || !status.ok()) begin
         status = checked_status(status,
                                 "KEY_ALLOC execution returned null status");
@@ -2792,7 +2839,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：在 rdma_control_plane 中，alloc_and_register_mr 按容量、身份和生命周期约束预留或分配资源，并返回带 authority 证据的句柄或计划。
   // 输入/输出及副作用：binding（输入）、request（输入）、dma_context（输入）、alignment（输入）、mapping（输出）、mr（输出）、result（输出）；alloc_and_register_mr 驱动下游事务，并写入 mapping、mr、result；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：alloc_and_register_mr 返回 RDMA_SC_UNSUPPORTED_OPCODE、RDMA_SC_DMA_TRANSLATION、RDMA_SC_RECOVERY_REQUIRED；具体拒绝条件包括 “owned MR helper cannot allocate atomic DMA authority”；“owned MR DMA authority does not match Function”；“owned MR snapshot cannot request atomic DMA authority”；“unattached owned MR mapping requires caller recovery”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   task alloc_and_register_mr(
     rdma_function_binding binding,
@@ -3179,6 +3225,88 @@ class rdma_control_plane extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：first_pending_hardware_step 按 recovery.pending_steps 的持久化顺序选择
+  //   本轮应先处理的第一个硬件阶段，供 recover_resource 的硬件恢复循环建立稳定
+  //   的执行候选；该 helper 只抽离扫描职责，不改变后续 CMQ 调用或状态迁移。
+  // 输入/输出及副作用：recovery（输入）只读 pending_steps；step（输出）先置为
+  //   RDMA_CTRL_STEP_RESOURCE_RESERVED，命中时写入首个硬件 step；函数返回 bit 表示
+  //   是否找到硬件阶段，不修改 recovery、result、CMQ、锁、资源账本或外部依赖。
+  // 失败/边界：recovery 为 null 或 pending_steps 为空/仅含本地阶段时返回 0 并保留
+  //   默认 step；helper 不验证 recovery schema、hardware_presence、ticket、owner、
+  //   generation 或 pending 阶段的其它 authority，调用方仍须按原顺序执行这些门禁。
+  protected function bit first_pending_hardware_step(
+    rdma_recovery_record recovery,
+    output rdma_control_step_e step
+  );
+    step = RDMA_CTRL_STEP_RESOURCE_RESERVED;
+    if (recovery == null)
+      return 1'b0;
+    foreach (recovery.pending_steps[i]) begin
+      if (rdma_control_step_is_hardware(recovery.pending_steps[i])) begin
+        step = recovery.pending_steps[i];
+        return 1'b1;
+      end
+    end
+    return 1'b0;
+  endfunction
+
+  // 功能：recovery_has_hardware_step 在恢复账本的 completed_steps 或
+  //   pending_steps 中检查是否存在硬件阶段，统一 reserved-only 判定和末尾
+  //   硬件缺失校验使用的阶段扫描规则。
+  // 输入/输出及副作用：recovery（输入）只读恢复账本；
+  //   inspect_completed（输入）
+  //   为 1 时扫描 completed_steps，为 0 时扫描 pending_steps；函数返回 bit，
+  //   不修改 recovery、result、锁、CMQ 或任何外部资源。
+  // 失败/边界：recovery 为 null、所选阶段数组为空或仅含本地阶段时返回 0；
+  //   helper 不验证阶段顺序、hardware_presence、ticket、owner 或 generation，
+  //   调用方仍须保留原有状态门禁和错误优先级。
+  protected function bit recovery_has_hardware_step(
+    rdma_recovery_record recovery,
+    bit inspect_completed
+  );
+    if (recovery == null)
+      return 1'b0;
+    if (inspect_completed) begin
+      foreach (recovery.completed_steps[i]) begin
+        if (rdma_control_step_is_hardware(recovery.completed_steps[i]))
+          return 1'b1;
+      end
+    end
+    else begin
+      foreach (recovery.pending_steps[i]) begin
+        if (rdma_control_step_is_hardware(recovery.pending_steps[i]))
+          return 1'b1;
+      end
+    end
+    return 1'b0;
+  endfunction
+
+  // 功能：recovery_is_reserved_only 判断 ERROR MR 的恢复账本是否满足“仅本地预留待释放”
+  //   快速路径，并复用 completed_steps 的硬件阶段扫描，集中保留 reserved-only 的 shape 约束。
+  // 输入/输出及副作用：recovery（输入）只读 hardware_presence、ambiguous_ticket、HMC/backing/
+  //   pending 记录和 completed_steps；函数返回 bit，不修改恢复账本、结果、锁、CMQ 或外部资源。
+  // 失败/边界：recovery 为空、硬件存在/未知、有 ambiguous ticket、HMC 引用非空、backing 数量/所有权
+  //   不符、pending 阶段不是 BACKING_RELEASED/RESOURCE_RELEASED，或 completed 含硬件阶段时返回 0；
+  //   函数不检查 primary_status、owner/generation，调用方须先保留现有 ERROR MR 门禁。
+  protected function bit recovery_is_reserved_only(
+    rdma_recovery_record recovery
+  );
+    if (recovery == null ||
+        recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
+        recovery.ambiguous_ticket != null ||
+        recovery.hmc_refs.size() != 0 ||
+        recovery.backing_refs.size() != 1 ||
+        recovery.backing_refs[0] == null ||
+        recovery.backing_refs[0].ownership != RDMA_OWNERSHIP_CONTROL_PLANE ||
+        recovery.pending_steps.size() != 1 ||
+        !(recovery.pending_steps[0] inside {
+          RDMA_CTRL_STEP_BACKING_RELEASED,
+          RDMA_CTRL_STEP_RESOURCE_RELEASED
+        }))
+      return 1'b0;
+    return !recovery_has_hardware_step(recovery, 1'b1);
+  endfunction
+
   // 功能：在 rdma_control_plane 中，remove_recovery_pending_step remove_recovery_pending_step 解除指定资源绑定并隔离 runtime/映射，避免旧句柄在删除后访问后端。
   // 输入/输出及副作用：recovery（输入）、step（输入）；remove_recovery_pending_step 读取 recovery、step 并使用字段 i；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：remove_recovery_pending_step 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
@@ -3309,7 +3437,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：执行 retain_recovery_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：resource_h（输入）、recovery（输入）、failure（输入）、result（输入）、message（输入）；retain_recovery_failure 读取 resource_h、recovery、failure、result、message 并使用字段 persist_status；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：retain_recovery_failure 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function void retain_recovery_failure(
     rdma_handle resource_h,
@@ -3512,7 +3639,6 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：在 rdma_control_plane 中，execute_recovery_hardware_step 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：error_mr（输入）、owner（输入）、step（输入）、ticket（输出）、completion（输出）、status（输出）；execute_recovery_hardware_step 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute_recovery_hardware_step 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   protected task execute_recovery_hardware_step(
     rdma_mr error_mr,
@@ -3593,9 +3719,10 @@ class rdma_control_plane extends uvm_object;
       default: command.body = null;
     endcase
     command.timeout = default_timeout;
-    cmq.execute(command, ticket, completion, status);
-    status = checked_status(status,
-                            "recovery hardware execution returned null");
+    execute_control_command(
+      command, ticket, completion, status,
+      "recovery hardware execution returned null"
+    );
   endtask
 
   // 功能：在 rdma_control_plane 中，recover_resource 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
@@ -3776,25 +3903,7 @@ class rdma_control_plane extends uvm_object;
       creation_origin = recovery_step_completed(
         recovery, RDMA_CTRL_STEP_RESOURCE_RESERVED
       );
-      reserved_only = recovery.hardware_presence ==
-                        RDMA_HW_PRESENCE_ABSENT &&
-                      recovery.ambiguous_ticket == null &&
-                      recovery.hmc_refs.size() == 0 &&
-                      recovery.backing_refs.size() == 1 &&
-                      recovery.backing_refs[0] != null &&
-                      recovery.backing_refs[0].ownership ==
-                        RDMA_OWNERSHIP_CONTROL_PLANE &&
-                      recovery.pending_steps.size() == 1 &&
-                      recovery.pending_steps[0] inside {
-                        RDMA_CTRL_STEP_BACKING_RELEASED,
-                        RDMA_CTRL_STEP_RESOURCE_RELEASED
-                      };
-      if (reserved_only) begin
-        foreach (recovery.completed_steps[i]) begin
-          if (rdma_control_step_is_hardware(recovery.completed_steps[i]))
-            reserved_only = 1'b0;
-        end
-      end
+      reserved_only = recovery_is_reserved_only(recovery);
       if (reserved_only) begin
         recover_reserved_error(resource_h, recovery, result);
         result_finalized = 1'b1;
@@ -4002,15 +4111,9 @@ class rdma_control_plane extends uvm_object;
       end
 
       while (1'b1) begin
-        has_hardware_pending = 1'b0;
-        pending_hardware_step = RDMA_CTRL_STEP_RESOURCE_RESERVED;
-        foreach (recovery.pending_steps[i]) begin
-          if (!has_hardware_pending &&
-              rdma_control_step_is_hardware(recovery.pending_steps[i])) begin
-            has_hardware_pending = 1'b1;
-            pending_hardware_step = recovery.pending_steps[i];
-          end
-        end
+        has_hardware_pending = first_pending_hardware_step(
+          recovery, pending_hardware_step
+        );
         if (!has_hardware_pending)
           break;
         if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
@@ -4100,11 +4203,9 @@ class rdma_control_plane extends uvm_object;
       if (result_finalized)
         break;
 
-      has_hardware_pending = 1'b0;
-      foreach (recovery.pending_steps[i]) begin
-        if (rdma_control_step_is_hardware(recovery.pending_steps[i]))
-          has_hardware_pending = 1'b1;
-      end
+      has_hardware_pending = recovery_has_hardware_step(
+        recovery, 1'b0
+      );
       if (has_hardware_pending ||
           recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
         publish_recovery_required(

@@ -424,6 +424,29 @@ localparam int unsigned RDMA_QPC_DEST_IP_BYTES = 16;
 `RDMA_FIELD(RDMA_QPC_RQ_SIZE, 496, 8, 4)
 `RDMA_FIELD(RDMA_QPC_RQ_OM, 496, 6, 2)
 
+// 功能：固定 QPC runtime shadow 的硬件坐标和 readback ownership 边界。
+// qp.h:20 将硬件 shadow 放在 byte 504；wr.h:35-38 明确声明
+// HW_DROP_DB_CNT[54:48]、SW_RING_DB_CNT[38:32]、SQ_PI_WRAP[15]、
+// SQ_PI[14:0] 四组可观察位。该掩码只供读回校验使用，软件编码器不得写入。
+// 失败边界：未列入掩码的 qword63 位（包括 bit63）必须继续按 reserved 拒绝。
+localparam int unsigned RDMA_QPC_RUNTIME_SHADOW_BYTE_OFFSET = 504;
+localparam int unsigned RDMA_QPC_RUNTIME_SHADOW_QWORD_INDEX = 63;
+localparam bit [63:0] RDMA_QPC_RUNTIME_SHADOW_READBACK_MASK =
+  64'h007f_007f_0000_ffff;
+
+// Driver cq.h: the CQC shadow area occupies bytes 48..55 of the 64-byte
+// context slot.  CI information is the trailing 32-bit big-endian word;
+// this offset is absolute within the context slot, not relative to the
+// shadow-area view exposed by the lifecycle adapter.
+localparam int unsigned RDMA_CQC_SHADOW_AREA_OFFSET = 48;
+localparam int unsigned RDMA_CQC_SHADOW_AREA_SIZE = 8;
+localparam int unsigned RDMA_CQC_SHADOW_CI_INFO_OFFSET = 4;
+localparam int unsigned RDMA_CQC_RUNTIME_SHADOW_BYTE_OFFSET =
+  RDMA_CQC_SHADOW_AREA_OFFSET + RDMA_CQC_SHADOW_CI_INFO_OFFSET;
+localparam int unsigned RDMA_CQC_RUNTIME_SHADOW_BYTE_LENGTH = 4;
+localparam int unsigned RDMA_CQC_RUNTIME_SHADOW_CI_WIDTH = 23;
+localparam int unsigned RDMA_CQC_RUNTIME_SHADOW_WRAP_BIT = 23;
+
 // CQC sparse body in final 64-byte CMQ WQE coordinates (local context +8).
 `RDMA_FIELD(RDMA_CQC_BODY_CQN, 0, 0, 21)
 `RDMA_FIELD(RDMA_CQC_BODY_CQ_SD_PBA, 8, 0, 52)
@@ -569,6 +592,9 @@ localparam int unsigned RDMA_QPC_DEST_IP_BYTES = 16;
 `RDMA_FIELD(RDMA_SQ_WQE_RC_SGE_NUM, 16, 48, 8)
 `RDMA_FIELD(RDMA_SQ_WQE_RC_REMOTE_KEY, 16, 0, 32)
 `RDMA_FIELD(RDMA_SQ_WQE_RC_REMOTE_VA, 24, 0, 64)
+// wr.h:42 and wr.c:xtrdma_fill_sq_sgb() use byte 0x28 only for URC READ
+// external-SGB WQEs.  The low 40 bits of qword5 remain reserved.
+`RDMA_FIELD(RDMA_SQ_WQE_URC_TOTAL_PKT_NUM, 40, 40, 24)
 `RDMA_FIELD(RDMA_SQ_WQE_LOCAL_INVLD_STAG, 8, 32, 32)
 `RDMA_FIELD(RDMA_SQ_WQE_ATOMIC_SGE_NUM, 16, 48, 8)
 `RDMA_FIELD(RDMA_SQ_WQE_ATOMIC_R_KEY, 16, 0, 32)
@@ -607,34 +633,119 @@ localparam int unsigned RDMA_QPC_DEST_IP_BYTES = 16;
 `RDMA_FIELD(RDMA_RQE_OPCODE, 0, 32, 4)
 `RDMA_FIELD(RDMA_RQE_INDEX, 0, 40, 15)
 `RDMA_FIELD(RDMA_RQE_WRAP, 0, 55, 1)
+// wr.h:179, XTRDMA_QP_RQ_SIGN_EN is the receive-WQE signature selector.
+// The driver forces it on for an external SGB, even when rq_sign_en is off.
+`RDMA_FIELD(RDMA_RQE_SIGN_EN, 0, 56, 1)
 `RDMA_FIELD(RDMA_RQE_VALID, 0, 63, 1)
 `RDMA_FIELD(RDMA_RQE_PAYLOAD_LEN, 8, 0, 32)
 `RDMA_FIELD(RDMA_RQE_SIGNATURE, 16, 56, 8)
 `RDMA_FIELD(RDMA_RQE_SGE_NUM, 16, 48, 8)
+// Driver wr.h: XTRDMA_QP_RQ_SGB_PA is the encoded physical address
+// (physical PA >> XTRDMA_RQ_SGB_PA_SHIFT) in qword4 bits[63:9].
+`RDMA_FIELD(RDMA_RQE_SGB_PA, 32, 9, 55)
 `RDMA_FIELD(RDMA_CQE_POLARITY, 0, 63, 1)
+`RDMA_FIELD(RDMA_CQE_QP_ST, 0, 60, 3)
 `RDMA_FIELD(RDMA_CQE_RQ_CQE, 0, 59, 1)
+`RDMA_FIELD(RDMA_CQE_SRFQ, 0, 58, 1)
+`RDMA_FIELD(RDMA_CQE_SE, 0, 57, 1)
+`RDMA_FIELD(RDMA_CQE_SIGN_EN, 0, 56, 1)
 `RDMA_FIELD(RDMA_CQE_WQE_WRAP, 0, 55, 1)
 `RDMA_FIELD(RDMA_CQE_WQE_INDEX, 0, 40, 15)
 `RDMA_FIELD(RDMA_CQE_PKT_OPCODE, 0, 32, 8)
 `RDMA_FIELD(RDMA_CQE_ECODE, 0, 24, 8)
+`RDMA_FIELD(RDMA_CQE_VLAN, 0, 23, 1)
+`RDMA_FIELD(RDMA_CQE_IPV6, 0, 22, 1)
+`RDMA_FIELD(RDMA_CQE_CQE_FORMAT, 0, 20, 2)
+`RDMA_FIELD(RDMA_CQE_RESIZE_CQE, 0, 19, 1)
+`RDMA_FIELD(RDMA_CQE_UD_MC, 0, 18, 1)
 `RDMA_FIELD(RDMA_CQE_QPN, 0, 0, 18)
 `RDMA_FIELD(RDMA_CQE_IMMDT_DATA, 8, 32, 32)
 `RDMA_FIELD(RDMA_CQE_PAYLOAD_LEN, 8, 0, 32)
 `RDMA_FIELD(RDMA_CQE_SIGNATURE, 16, 56, 8)
+`RDMA_FIELD(RDMA_CQE_RC_REMOTE_SYNDROME, 16, 48, 8)
+`RDMA_FIELD(RDMA_CQE_UD_SRC_QPN, 16, 32, 24)
+`RDMA_FIELD(RDMA_CQE_RQE_CPL, 16, 31, 1)
+`RDMA_FIELD(RDMA_CQE_SRFQN, 16, 16, 12)
+`RDMA_FIELD(RDMA_CQE_SRFQE_WRAP, 16, 15, 1)
+`RDMA_FIELD(RDMA_CQE_SRFQE_INDEX, 16, 0, 15)
+`RDMA_FIELD(RDMA_CQE_UD_SMAC, 24, 16, 48)
+`RDMA_FIELD(RDMA_CQE_UD_VLAN_TAG, 24, 0, 16)
+
+// CQE transport/receive variants are an authority gate for overlay fields.
+// The default RC value preserves existing callers; a codec may be switched to
+// UD or RQ/SRFQ explicitly before decoding a raw image.
+typedef enum bit [1:0] {
+  RDMA_CQE_VARIANT_RC = 2'd0,
+  RDMA_CQE_VARIANT_UD = 2'd1,
+  RDMA_CQE_VARIANT_RQ_SRFQ = 2'd2
+} rdma_cqe_variant_e;
+
+localparam bit [63:0] RDMA_CQE_QWORD0_UNION_MASK = 64'hffff_ffff_ffff_ffff;
+localparam bit [63:0] RDMA_CQE_QWORD1_MASK = 64'hffff_ffff_ffff_ffff;
+localparam bit [63:0] RDMA_CQE_QWORD2_RC_MASK = 64'hffff_0000_0000_0000;
+localparam bit [63:0] RDMA_CQE_QWORD2_UD_MASK = 64'hffff_ffff_0000_0000;
+localparam bit [63:0] RDMA_CQE_QWORD2_RQ_SRFQ_MASK = 64'hff00_0000_8fff_ffff;
+// wr.h exposes qword2 as three physical overlay views.  The only wire
+// coordinates absent from all views are bits [30:28]; all other union bits
+// are driver-owned and must survive a raw CQE decode even when the caller has
+// not yet selected a semantic transport variant.
+localparam bit [63:0] RDMA_CQE_QWORD2_UNION_MASK = 64'hffff_ffff_8fff_ffff;
+localparam bit [63:0] RDMA_CQE_QWORD3_UD_MASK = 64'hffff_ffff_ffff_ffff;
+localparam int unsigned RDMA_CQE_64B_PAYLOAD_BYTE_OFFSET = 32;
+localparam int unsigned RDMA_CQE_64B_PAYLOAD_BYTES = 32;
+localparam int unsigned RDMA_CQE_128B_PAYLOAD_BYTE_OFFSET = 0;
+localparam int unsigned RDMA_CQE_128B_PAYLOAD_BYTES = 64;
+
 `RDMA_FIELD(RDMA_CEQE_VALID, 0, 63, 1)
+// defs.h:66-73, CEQE qword0 common and URC selector fields.
+`RDMA_FIELD(RDMA_CEQE_URC_FLAG, 0, 62, 1)
 `RDMA_FIELD(RDMA_CEQE_QPN, 0, 40, 21)
+`RDMA_FIELD(RDMA_CEQE_URC_SQ_CQE_VALID, 0, 39, 1)
+`RDMA_FIELD(RDMA_CEQE_URC_RQ_CQE_VALID, 0, 38, 1)
 `RDMA_FIELD(RDMA_CEQE_CQN, 0, 16, 21)
 `RDMA_FIELD(RDMA_CEQE_ECODE, 0, 8, 8)
 `RDMA_FIELD(RDMA_CEQE_PKT_OPCODE, 0, 0, 8)
+// defs.h:77-85, CEQE URC qword1 abnormal completion fields.
+`RDMA_FIELD(RDMA_CEQE_URC_ABNML_CQE_TYPE, 8, 56, 2)
+`RDMA_FIELD(RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE, 8, 48, 8)
+`RDMA_FIELD(RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP, 8, 47, 1)
+`RDMA_FIELD(RDMA_CEQE_URC_ABNML_CQE_WQE_IDX, 8, 32, 15)
+`RDMA_FIELD(RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP, 8, 31, 1)
+`RDMA_FIELD(RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX, 8, 16, 15)
+`RDMA_FIELD(RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP, 8, 15, 1)
+`RDMA_FIELD(RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX, 8, 0, 15)
 `RDMA_FIELD(RDMA_CEQE_CQ_PI_WRAP, 8, 23, 1)
 `RDMA_FIELD(RDMA_CEQE_CQ_PI, 8, 0, 16)
+// Driver union masks are kept beside the coordinates so codec and checker
+// review the same fail-closed ownership boundary.
+localparam bit [63:0] RDMA_CEQE_QWORD0_UNION_MASK = 64'hdfff_ffdf_ffff_ffff;
+localparam bit [63:0] RDMA_CEQE_QWORD0_RC_MASK = 64'h9fff_ff1f_ffff_ffff;
+localparam bit [63:0] RDMA_CEQE_QWORD1_RC_MASK = 64'h0000_0000_0080_ffff;
+localparam bit [63:0] RDMA_CEQE_QWORD1_URC_MASK = 64'h03ff_ffff_ffff_ffff;
+
 `RDMA_FIELD(RDMA_AEQE_VALID, 0, 63, 1)
 `RDMA_FIELD(RDMA_AEQE_QP_ST, 0, 60, 3)
+// defs.h:100-109, AEQE flags, abnormal type and split CQN/EQN fields.
+`RDMA_FIELD(RDMA_AEQE_SRFQ_EN, 0, 59, 1)
+`RDMA_FIELD(RDMA_AEQE_OVERFLOW_FLAG, 0, 58, 1)
+`RDMA_FIELD(RDMA_AEQE_URC_FLAG, 0, 57, 1)
+`RDMA_FIELD(RDMA_AEQE_CQ_INVALID_FLAG, 0, 56, 1)
+`RDMA_FIELD(RDMA_AEQE_URC_ABNML_CQE_TYPE, 0, 54, 2)
+`RDMA_FIELD(RDMA_AEQE_CQN_EQN_HIGH, 0, 40, 13)
 `RDMA_FIELD(RDMA_AEQE_PKT_OPCODE, 0, 32, 8)
 `RDMA_FIELD(RDMA_AEQE_ECODE, 0, 24, 8)
+`RDMA_FIELD(RDMA_AEQE_CQN_EQN_LOW, 0, 18, 6)
 `RDMA_FIELD(RDMA_AEQE_QPN, 0, 0, 18)
+// defs.h:110-114, AEQE URC/queue fields in qword1.
+`RDMA_FIELD(RDMA_AEQE_URC_REMOTE_ECODE, 8, 56, 8)
+`RDMA_FIELD(RDMA_AEQE_QUEUE_WQE_IDX_WRAP, 8, 55, 1)
 `RDMA_FIELD(RDMA_AEQE_WQE_WRAP, 8, 55, 1)
+`RDMA_FIELD(RDMA_AEQE_SRFQN, 8, 16, 12)
+`RDMA_FIELD(RDMA_AEQE_SRFQE_IDX, 8, 0, 16)
 `RDMA_FIELD(RDMA_AEQE_WQE_INDEX, 8, 32, 23)
+localparam int unsigned RDMA_AEQE_CQN_EQN_LSHIFT = 6;
+localparam bit [63:0] RDMA_AEQE_QWORD0_MASK = 64'hffdf_ffff_ffff_ffff;
+localparam bit [63:0] RDMA_AEQE_QWORD1_MASK = 64'hffff_ffff_0fff_ffff;
 
 // Doorbell payload fields. All payloads are one logical 64-bit word.
 `RDMA_FIELD(RDMA_CMQ_DB_PI, 0, 32, 5)

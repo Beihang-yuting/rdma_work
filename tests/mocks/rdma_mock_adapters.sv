@@ -415,6 +415,9 @@ class rdma_mock_dma_mapping extends rdma_dma_mapping;
     candidate.allocation_token = allocation_token;
     candidate.allocation_token_initialized = 1'b1;
     candidate.release_completion = release_completion;
+    // Detached authority remains an active capability until the adapter
+    // consumes it; public geometry is intentionally left opaque.
+    candidate.state = RDMA_MAPPING_ACTIVE;
     snapshot = candidate;
     return rdma_status::success();
   endfunction
@@ -640,7 +643,6 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
 
   // 功能：request_role 使用 request_context、size、alignment 计算并返回 rdma_queue_backing_role_e 结果；不修改对象字段或外部资源。
   // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）；request_role 读取 request_context、size、alignment 并使用字段 kind、ordinal；函数返回 rdma_queue_backing_role_e，不取得调用方资源所有权。
-
   // 失败/边界：request_role 是只读访问器，返回 rdma_queue_backing_role_e'(request_context.queue_role)；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   function automatic rdma_queue_backing_role_e request_role(
     rdma_dma_request_context request_context,
@@ -1026,6 +1028,73 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
+  // 功能：只读确认 mapping 唯一命中本 mock 的 active opaque token，且 shared release seal 未完成。
+  // 输入/输出及副作用：mapping 为待验证 authority；只读 regions/token/seal，不记录 I/O 或修改 bytes/state。
+  // 失败/边界：空/异型、未知、歧义、已释放或已完成 seal 均返回非 OK，不回退到 public geometry。
+  virtual function rdma_status validate_failure_atomic_release(
+    rdma_dma_mapping mapping
+  );
+    rdma_mock_dma_mapping concrete_mapping;
+    rdma_mock_dma_mapping region_mapping;
+    rdma_status status;
+    int region_index;
+    int unsigned match_count;
+    bit release_complete;
+
+    if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "failure-atomic mock mapping has no allocation token"
+      );
+    if (concrete_mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "failure-atomic mock mapping is not active"
+      );
+
+    region_index = -1;
+    match_count = 0;
+    foreach (regions[i]) begin
+      if (!$cast(region_mapping, regions[i].mapping))
+        continue;
+      if (region_mapping.same_allocation(concrete_mapping)) begin
+        region_index = i;
+        match_count++;
+      end
+    end
+    if (match_count == 0)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "failure-atomic mock mapping is unknown"
+      );
+    if (match_count != 1)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "failure-atomic mock mapping token is ambiguous"
+      );
+    if (regions[region_index].mapping.state != RDMA_MAPPING_ACTIVE)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "failure-atomic mock allocation has been released"
+      );
+
+    release_complete = 1'b0;
+    status = concrete_mapping.release_completion_status(release_complete);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "failure-atomic mock release status is null"
+      );
+    if (!status.ok())
+      return status;
+    if (release_complete)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "failure-atomic mock release is already complete"
+      );
+    return rdma_status::success();
+  endfunction
+
   // 功能：release_opaque 仅依据 mock mapping 的不透明 allocation token 查找
   //       region，模拟真实 adapter 在畸形 public 字段回滚时仍可释放 backing。
   // 输入/输出及副作用：mapping（输入）；成功时更新 region 和 mapping 的释放状态；
@@ -1038,6 +1107,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     rdma_status failure;
     rdma_status status;
     int region_index;
+    int unsigned match_count;
     rdma_queue_backing_role_e role;
 
     record_call("release_opaque", null, mapping);
@@ -1048,29 +1118,28 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     failure = take_failure("release_opaque");
     if (failure != null)
       return failure;
+    status = validate_failure_atomic_release(mapping);
+    if (status == null || !status.ok())
+      return status;
     if (!$cast(concrete_mapping, mapping) || concrete_mapping == null)
       return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "opaque mock mapping has no allocation token"
+        RDMA_SC_INVALID_STATE,
+        "validated opaque mock mapping lost its concrete type"
       );
     region_index = -1;
+    match_count = 0;
     foreach (regions[i]) begin
       if (!$cast(region_mapping, regions[i].mapping))
         continue;
       if (region_mapping.same_allocation(concrete_mapping)) begin
         region_index = i;
-        break;
+        match_count++;
       end
     end
-    if (region_index < 0)
-      return rdma_status::make(
-        RDMA_SC_DMA_TRANSLATION,
-        "opaque mock mapping is unknown"
-      );
-    if (regions[region_index].mapping.state != RDMA_MAPPING_ACTIVE)
+    if (match_count != 1 || region_index < 0)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
-        "opaque mock mapping has already been released"
+        "validated opaque mock mapping token changed"
       );
     status = concrete_mapping.mark_release_complete(release_seal);
     if (status == null)
@@ -1275,7 +1344,6 @@ class rdma_mock_pcie extends rdma_pcie_api;
 
   // 功能：在 rdma_mock_pcie 中，cfg_write32 把 cfg_write32 的配置/编程请求提交到后端适配器，并返回后端确认状态。
   // 输入/输出及副作用：target（输入）、offset（输入）、data（输入）、byte_enable（输入）、status（输出）；cfg_write32 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：cfg_write32 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
   virtual task cfg_write32(
     rdma_bdf_t target,

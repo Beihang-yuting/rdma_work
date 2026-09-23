@@ -6,6 +6,86 @@
 // 中文说明：rdma_sq_payload_writer_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 设计说明：该 mapping 在注册阶段允许正常 clone，在 stage_and_verify 的
+// receipt 快照阶段可切换为 null clone，验证 late clone 失败不会先写 Host-memory。
+class rdma_late_clone_failure_mapping extends rdma_mock_dma_mapping;
+  `uvm_object_utils(rdma_late_clone_failure_mapping)
+
+  static bit fail_clone;
+
+  // 功能：构造 late-clone 故障映射，沿用 mock DMA mapping 的 opaque allocation authority，并把 fail_clone 默认设为关闭。
+  // 输入/输出及副作用：name（输入）；new 只初始化本地故障开关，不复制或接管 Host-memory region、token 或 writer 引用。
+  // 失败/边界：构造本身不注入故障；只有 fail_clone 被置位后，后续 clone 才返回 null。
+  function new(string name = "rdma_late_clone_failure_mapping");
+    super.new(name);
+    fail_clone = 1'b0;
+  endfunction
+
+  // 功能：设置 late-clone 映射的全局 clone 故障开关，供注册前后切换同一 mapping 的行为。
+  // 输入/输出及副作用：value（输入）；只更新本测试夹具的静态 fail_clone，不修改 mapping geometry、token 或后端 region。
+  // 失败/边界：重复设置幂等；打开后所有该类型 mapping 的 clone 都返回 null，关闭后恢复父类 detached clone。
+  static function void set_fail_clone(bit value);
+    fail_clone = value;
+  endfunction
+
+  // 功能：在 receipt mapping 快照阶段注入 null clone，或在故障关闭时返回父类建立的 detached mapping snapshot。
+  // 输入/输出及副作用：无显式输入；fail_clone 打开时返回 null，关闭时调用父类 clone，不改变源 mapping 的字段或 Host-memory 数据。
+  // 失败/边界：null 返回值是刻意测试故障；调用方必须在任何 Host-memory 写入和 refs++ 前拒绝该结果。
+  virtual function uvm_object clone();
+    if (fail_clone)
+      return null;
+    return super.clone();
+  endfunction
+endclass
+
+// 功能：构造可控返回 null rdma_status 的 Host-memory mock，覆盖 payload writer 的外部 API 边界。
+// 输入/输出及副作用：name（输入）；构造函数沿用正常 mock 的区域账本；write/read 在对应开关打开时返回 null，不改写后端数据。
+// 失败/边界：该夹具只用于验证 writer 将外部 null 状态归一化为确定失败；未打开开关时沿用基类的正常分配、写入和读取行为。
+class rdma_null_status_sq_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_null_status_sq_host_mem)
+
+  bit return_null_write;
+  bit return_null_read;
+
+  // 功能：创建 null-status Host-memory 故障夹具并初始化两个注入开关。
+  // 输入/输出及副作用：name（输入）；new 只初始化本地开关，不接管 mapping、region 或 writer 所有权。
+  // 失败/边界：开关默认为关闭，夹具默认行为与 rdma_mock_host_mem 相同。
+  function new(string name = "rdma_null_status_sq_host_mem");
+    super.new(name);
+    return_null_write = 1'b0;
+    return_null_read = 1'b0;
+  endfunction
+
+  // 功能：模拟 Host-memory write 丢失状态，验证 stage_and_verify 在发布 registration 引用后仍能 fail closed 并回滚。
+  // 输入/输出及副作用：mapping、offset、data（输入）；注入开启时返回 null 且不写区域，关闭时调用基类实现。
+  // 失败/边界：null 返回值是刻意故障；调用方不得调用 status.ok()，也不得留下 live receipt 或 registration 引用。
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    byte data[]
+  );
+    if (return_null_write)
+      return null;
+    return super.write(mapping, offset, data);
+  endfunction
+
+  // 功能：模拟 Host-memory read 丢失状态，验证 payload readback 阶段将 null 归一化为确定失败。
+  // 输入/输出及副作用：mapping、offset、size（输入）、data（输出）；注入开启时清空 data 并返回 null，关闭时调用基类实现。
+  // 失败/边界：null 返回值不得被当作成功或继续解引用；关闭注入时保留基类的 detached readback 语义。
+  virtual function rdma_status read(
+    rdma_dma_mapping mapping,
+    longint unsigned offset,
+    int unsigned size,
+    output byte data[]
+  );
+    if (return_null_read) begin
+      data = new[0];
+      return null;
+    end
+    return super.read(mapping, offset, size, data);
+  endfunction
+endclass
+
 class rdma_sq_payload_writer_test extends uvm_test;
   `uvm_component_utils(rdma_sq_payload_writer_test)
 
@@ -112,8 +192,13 @@ class rdma_sq_payload_writer_test extends uvm_test;
     rdma_dma_request_context request_context;
     rdma_host_mem_sq_payload_writer writer;
     rdma_mock_host_mem memory;
+    rdma_null_status_sq_host_mem null_memory;
+    rdma_host_mem_sq_payload_writer null_writer;
     rdma_dma_mapping mapping;
     rdma_dma_mapping second_mapping;
+    rdma_dma_mapping null_mapping;
+    rdma_dma_mapping atomic_mapping;
+    rdma_late_clone_failure_mapping late_clone_mapping;
     rdma_sge sge;
     rdma_sge sges[$];
     rdma_sq_payload_write_receipt receipt;
@@ -122,6 +207,8 @@ class rdma_sq_payload_writer_test extends uvm_test;
     rdma_status status;
     longint unsigned registration_id;
     longint unsigned second_id;
+    longint unsigned null_registration_id;
+    longint unsigned atomic_id;
     longint unsigned rejected_id;
     longint unsigned second_iova;
     int unsigned second_size;
@@ -260,6 +347,86 @@ class rdma_sq_payload_writer_test extends uvm_test;
     expect_code("RELEASE_DETACHED_COPY", writer.release_receipt(detached),
                 RDMA_SC_INVALID_ARGUMENT);
     expect_ok("UNREGISTER3", writer.unregister_mapping(second_id));
+
+    // Receipt snapshot construction is a commit prerequisite.  A mapping
+    // clone that fails after registration must not cause refs++ or Host-memory
+    // writes before the failure is reported.
+    expect_ok("LATE_CLONE_ALLOCATE",
+               memory.allocate(request_context, 16, 16,
+                               RDMA_DMA_DEVICE_READ, atomic_mapping));
+    late_clone_mapping = rdma_late_clone_failure_mapping::type_id::create(
+      "late_clone_mapping"
+    );
+    if (late_clone_mapping == null) begin
+      `uvm_error("LATE_CLONE_SETUP", "late clone mapping allocation failed");
+    end
+    else begin
+      late_clone_mapping.copy(atomic_mapping);
+      expect_ok("LATE_CLONE_REGISTER",
+                 writer.register_mapping(late_clone_mapping, atomic_id));
+      // Keep the registered value's dynamic type explicit even if a factory
+      // clone returns a base-compatible subtype.
+      writer.regs[0].mapping = late_clone_mapping;
+      rdma_late_clone_failure_mapping::set_fail_clone(1'b1);
+      sges.delete();
+      sges.push_back(make_sge("late_clone_sge", atomic_mapping.iova.value, 4));
+      payload = '{8'h61, 8'h62, 8'h63, 8'h64};
+      writes_before = count_calls(memory, "write");
+      reads_before = count_calls(memory, "read");
+      receipt = null;
+      status = writer.stage_and_verify(request_context, sges, payload, receipt);
+      expect_code("LATE_CLONE_FAILURE", status, RDMA_SC_INVALID_STATE);
+      if (receipt != null || writer.regs[0].refs != 0 ||
+          count_calls(memory, "write") != writes_before ||
+          count_calls(memory, "read") != reads_before)
+        `uvm_error("LATE_CLONE_ATOMICITY",
+                   "late clone failure published refs or Host-memory I/O");
+      rdma_late_clone_failure_mapping::set_fail_clone(1'b0);
+      expect_ok("LATE_CLONE_UNREGISTER",
+                 writer.unregister_mapping(atomic_id));
+    end
+
+    // External Host-memory APIs are virtual seams.  A null status from write
+    // or read must be converted to INVALID_STATE and must not leave a live
+    // registration reference or a published receipt.
+    null_memory = rdma_null_status_sq_host_mem::type_id::create(
+      "null_status_memory"
+    );
+    null_writer = rdma_host_mem_sq_payload_writer::type_id::create(
+      "null_status_writer"
+    );
+    request_context = make_context(binding, "null_status_context");
+    expect_ok("NULL_STATUS_CONFIGURE",
+               null_writer.configure(null_memory, binding, 0));
+    expect_ok("NULL_STATUS_ALLOCATE",
+               null_memory.allocate(request_context, 16, 16,
+                                    RDMA_DMA_DEVICE_READ, null_mapping));
+    expect_ok("NULL_STATUS_REGISTER",
+               null_writer.register_mapping(null_mapping,
+                                             null_registration_id));
+    sges.delete();
+    sges.push_back(make_sge("null_status_sge", null_mapping.iova.value, 4));
+    payload = '{8'h31, 8'h32, 8'h33, 8'h34};
+
+    null_memory.return_null_write = 1'b1;
+    receipt = null;
+    status = null_writer.stage_and_verify(request_context, sges, payload,
+                                          receipt);
+    expect_code("NULL_STATUS_WRITE", status, RDMA_SC_INVALID_STATE);
+    if (receipt != null || null_writer.regs[0].refs != 0)
+      `uvm_error("NULL_STATUS_WRITE", "null write left a live receipt/reference");
+
+    null_memory.return_null_write = 1'b0;
+    null_memory.return_null_read = 1'b1;
+    receipt = null;
+    status = null_writer.stage_and_verify(request_context, sges, payload,
+                                          receipt);
+    expect_code("NULL_STATUS_READ", status, RDMA_SC_INVALID_STATE);
+    if (receipt != null || null_writer.regs[0].refs != 0)
+      `uvm_error("NULL_STATUS_READ", "null read left a live receipt/reference");
+
+    expect_ok("NULL_STATUS_UNREGISTER",
+               null_writer.unregister_mapping(null_registration_id));
     phase.drop_objection(this);
   endtask
 endclass

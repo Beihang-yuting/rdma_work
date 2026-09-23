@@ -406,6 +406,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected bit [7:0] gated_opcode;
   protected int unsigned gate_target_count;
   protected int unsigned gate_entered_count;
+  // 中文设计：该 shared seam 仅描述最近一次 legacy execute() 在 mock 内部是否
+  // 可证明地未写入 call ledger；Phase 1A observed fallback 不读取它，避免把
+  // mock 专属证据误提升为通用 lifecycle observation，1B consumer 迁移前保留。
   // Evidence is scoped to the most recent execute() call.  It is asserted
   // only on mock adapter paths that return before recording a CMQ call.
   protected bit last_execute_no_submit_proven;
@@ -548,13 +551,13 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     disable wait_for_mock_cmq_gate;
   endtask
 
-  // 功能：在 rdma_mock_cmq_port 中，release_one 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：无显式参数；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release_one 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
-  task release_one();
+  // 功能：在 rdma_mock_cmq_port 中，release_one 关闭当前 opcode gate 并触发等待者继续执行，完成测试同步屏障的释放。
+  // 输入/输出及副作用：无显式参数；成功时更新 gate_enabled 并触发 release_gate 事件，不修改 CMQ call ledger 或外部资源。
+  // 失败/边界：release_one 仅在 release_gate 已构造时有效；重复调用保持 gate 关闭并重复触发事件，调用者不得把它当作 CMQ 提交结果。
+  function void release_one();
     gate_enabled = 1'b0;
     release_gate.trigger();
-  endtask
+  endfunction
 
   // 功能：在 rdma_mock_cmq_port 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
   // 输入/输出及副作用：message（输入）；invalid_argument 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
@@ -835,7 +838,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   // identity, so unrelated commands cannot consume its terminal evidence.
   // 功能：执行 script_reconcile 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：ticket（输入）、terminal_known（输入）、completion（输入）、status（输入）；script_reconcile 读取 ticket、terminal_known、completion、status 并使用字段 key、script、script.terminal_known、script.status、cloned_object、completion_copy.ticket、script.completion；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：script_reconcile 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   function void script_reconcile(
     rdma_cmq_ticket ticket,
@@ -933,7 +935,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
 
   // 功能：在 rdma_mock_cmq_port 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -954,6 +955,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     string method_name;
 
     last_execute_no_submit_proven = 1'b0;
+    method_ordinals["legacy_execute"]++;
     ticket = null;
     completion = null;
     status = invalid_state("mock CMQ execute did not complete");
@@ -1082,6 +1084,20 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
       completion = null;
       status = invalid_state("mock CMQ final status copy failed");
     end
+  endtask
+
+  // 功能：在 legacy-only mock 中记录 observed fallback 的一次调用并委托基类
+  //   wrapper，验证 base 方向为 observed→legacy 且不会递归回 observed。
+  // 输入/输出及副作用：command 为非拥有输入，result 为 detached 输出；更新
+  //   method_ordinals 计数并调用一次 super.execute_observed。
+  // 失败/边界：基类快照失败仍按其 observation_status 返回；本 mock 不伪造
+  //   ticket/effect，也不写 production adapter 的 shared seam。
+  virtual task execute_observed(
+    input rdma_cmq_command_desc command,
+    output rdma_cmq_execution_result result
+  );
+    method_ordinals["observed_execute"]++;
+    super.execute_observed(command, result);
   endtask
 
   // 功能：在 rdma_mock_cmq_port 中，reconcile 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。

@@ -133,6 +133,60 @@ typedef enum bit [3:0] {
   RDMA_ENGINE_RESET    = 4'd11
 } rdma_engine_kind_e;
 
+// AEQE 的 wire 字段在不同 ecode 下复用相同物理坐标。该枚举只描述驱动
+// event.c 分派后的语义类别，不改变 raw image 中任何字段的拥有权。
+typedef enum bit [2:0] {
+  RDMA_AEQE_EVENT_QP          = 3'd0,
+  RDMA_AEQE_EVENT_SRQ         = 3'd1,
+  RDMA_AEQE_EVENT_CQ          = 3'd2,
+  RDMA_AEQE_EVENT_EQ          = 3'd3,
+  RDMA_AEQE_EVENT_DIAGNOSTIC  = 3'd4,
+  RDMA_AEQE_EVENT_FLUSH       = 3'd5
+} rdma_aeqe_event_class_e;
+
+// 功能：按 0.1.34 驱动 event.c 的 switch 将 AEQE ecode 映射为语义类别，供
+//   publish、poll 和结果物化共享同一份 owner-route 判定。
+// 输入/输出及副作用：ecode 为 AEQE qword0[31:24] 原始值；函数只读取该值并
+//   返回 rdma_aeqe_event_class_e，不修改 raw model、资源账本或路由状态。
+// 失败/边界：驱动显式 SRQ/CQ/EQ/diagnostic/flush case 采用对应类别；0x2e
+//   仍是 QP 专用 SQD 完成；0xfa 以及所有未命名值遵循驱动 default，返回 QP，
+//   不因符号未知而错误地归入 diagnostic 或直接放宽 owner 校验。
+function automatic rdma_aeqe_event_class_e rdma_aeqe_event_class_from_ecode(
+  bit [7:0] ecode
+);
+  case (ecode)
+    8'h07,
+    8'h08: return RDMA_AEQE_EVENT_FLUSH;
+
+    8'h1f,
+    8'hba,
+    8'hf6,
+    8'hff: return RDMA_AEQE_EVENT_DIAGNOSTIC;
+
+    8'h78,
+    8'h79,
+    8'h7a,
+    8'h7b: return RDMA_AEQE_EVENT_SRQ;
+
+    8'hf2,
+    8'hf3,
+    8'hf4,
+    8'hf5: return RDMA_AEQE_EVENT_CQ;
+
+    8'hf7,
+    8'hf8,
+    8'hfb: return RDMA_AEQE_EVENT_EQ;
+
+    default: return RDMA_AEQE_EVENT_QP;
+  endcase
+endfunction
+
+// 0.1.34 驱动 xtrdma_hw.h 的 XTRDMA_MAX_SGE_NUM 固定为 32，表示硬件
+// 接受的原始 send/receive SGE 数量上限。这个常量位于 types 层，使请求
+// 模型、queue codec 和 queue-data engine 共享同一 ABI 边界，而不让 model
+// 反向依赖 codec 层的 .svh 宏。
+localparam int unsigned RDMA_MAX_WQ_SGE = 32;
+
 typedef enum bit [1:0] {
   RDMA_SEVERITY_INFO    = 2'd0,
   RDMA_SEVERITY_WARNING = 2'd1,

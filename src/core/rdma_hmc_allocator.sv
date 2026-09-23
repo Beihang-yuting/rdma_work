@@ -102,7 +102,6 @@ class rdma_hmc_allocator extends uvm_object;
   // 功能：lease_identity_status 校验 lease、owner、object_kind 与当前对象状态的一致性，并显式处理“HMC lease owner is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：lease（输入）、owner（输入）、object_kind（输入）；lease_identity_status 读取 lease、owner、object_kind 并使用字段 rdma_status、function_uid、object_id、kind、generation；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：lease_identity_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE、RDMA_SC_STALE_GENERATION；典型拒绝条件为“HMC lease owner is invalid”“HMC object kind is invalid”；失败路径不提交部分状态或转移未声明资源。
-
   protected function rdma_status lease_identity_status(
     rdma_hmc_lease lease,
     rdma_function_handle owner,

@@ -3,6 +3,85 @@
 // 依赖：依赖 rdma_abi_v5_api、rdma_types_pkg、rdma_model_pkg 和 UVM 测试基类。
 // 所有权与生命周期：测试只拥有 ABI 测试对象；借用映射不得由 ABI 释放外部 host-mem 资源。
 
+// 中文设计：ABI 的 context/host-memory 后端是可替换的 virtual boundary，
+// 因此测试必须能够模拟“后端违反状态返回契约”的最小故障。以下两个 fixture
+// 只返回一次 null，不修改父类的成功路径或其 allocation ledger。
+class rdma_abi_null_context_backing extends rdma_mock_context_backing;
+  `uvm_object_utils(rdma_abi_null_context_backing)
+
+  bit null_next_acquire;
+
+  // 功能：构造一次性 null-acquire fixture，默认不注入故障。
+  // 输入/输出及副作用：name 为 UVM 对象名；初始化本地开关，不创建 context slot。
+  // 失败/边界：只有显式置位 null_next_acquire 时下一次 acquire 返回 null status，随后恢复父类行为。
+  function new(string name = "rdma_abi_null_context_backing");
+    super.new(name);
+    null_next_acquire = 1'b0;
+  endfunction
+
+  // 功能：在 ABI alloc_context 的 acquire 边界注入一次 null status，验证调用方 fail-closed。
+  // 输入/输出及副作用：binding/resource_kind/local_id/context_ref 为输入输出；故障时清空 context_ref，不创建 slot。
+  // 失败/边界：null 注入只消费一次；未注入时委托父类并保留其正常生命周期语义。
+  virtual function rdma_status acquire(
+    rdma_function_binding binding,
+    rdma_resource_kind_e resource_kind,
+    int unsigned local_id,
+    output rdma_context_backing_ref context_ref
+  );
+    if (null_next_acquire) begin
+      null_next_acquire = 1'b0;
+      context_ref = null;
+      return null;
+    end
+    return super.acquire(binding, resource_kind, local_id, context_ref);
+  endfunction
+endclass
+
+class rdma_abi_null_host_mem extends rdma_mock_host_mem;
+  `uvm_object_utils(rdma_abi_null_host_mem)
+
+  bit null_next_allocate;
+  bit null_next_release;
+
+  // 功能：构造一次性 null host-memory fixture，默认委托父类实现。
+  // 输入/输出及副作用：name 为 UVM 对象名；初始化两个故障开关，不预分配 mapping。
+  // 失败/边界：每个开关只影响下一次对应调用，故障消费后恢复父类行为。
+  function new(string name = "rdma_abi_null_host_mem");
+    super.new(name);
+    null_next_allocate = 1'b0;
+    null_next_release = 1'b0;
+  endfunction
+
+  // 功能：在 ABI map_region_with_backing 的 host_mem.allocate 边界注入一次 null status。
+  // 输入/输出及副作用：请求参数和 mapping 为输入输出；故障时清空 mapping，不创建后端 region。
+  // 失败/边界：null 注入只消费一次；未注入时委托父类并保留其 allocation ledger。
+  virtual function rdma_status allocate(
+    rdma_dma_request_context request_context,
+    int unsigned size,
+    int unsigned alignment,
+    rdma_dma_direction_e direction,
+    output rdma_dma_mapping mapping
+  );
+    if (null_next_allocate) begin
+      null_next_allocate = 1'b0;
+      mapping = null;
+      return null;
+    end
+    return super.allocate(request_context, size, alignment, direction, mapping);
+  endfunction
+
+  // 功能：在 ABI unmap_region 的 host_mem.release 边界注入一次 null status。
+  // 输入/输出及副作用：mapping 为待释放输入；故障时不修改父类 region 或 release seal。
+  // 失败/边界：null 注入只消费一次；未注入时委托父类执行 exactly-once release。
+  virtual function rdma_status \release (rdma_dma_mapping mapping);
+    if (null_next_release) begin
+      null_next_release = 1'b0;
+      return null;
+    end
+    return super.\release (mapping);
+  endfunction
+endclass
+
 class rdma_abi_v5_adapter_test extends uvm_test;
   `uvm_component_utils(rdma_abi_v5_adapter_test)
 
@@ -65,6 +144,13 @@ class rdma_abi_v5_adapter_test extends uvm_test;
     rdma_abi_v5_response query_response;
     rdma_abi_v5_response region_response;
     rdma_abi_v5_api region_abi;
+    rdma_abi_v5_api null_context_abi;
+    rdma_abi_v5_api null_host_abi;
+    rdma_abi_v5_response null_response;
+    rdma_abi_v5_response null_map_response;
+    rdma_abi_v5_response null_release_response;
+    rdma_abi_null_context_backing null_context_api;
+    rdma_abi_null_host_mem null_host_api;
     int unsigned host_release_calls;
 
     phase.raise_objection(this);
@@ -212,6 +298,65 @@ class rdma_abi_v5_adapter_test extends uvm_test;
         host_release_calls++;
     if (host_release_calls != 1)
       `uvm_error("ABI_OWNED_RELEASE", "owned mapping was not released once")
+
+    // 后端 status 返回 null 时，ABI 必须在不登记 mapping/不推进 context_id
+    // 的前提下报告 INVALID_STATE；该场景专门覆盖 virtual boundary 的 fail-closed 契约。
+    null_context_api = rdma_abi_null_context_backing::type_id::create(
+      "null_context_api"
+    );
+    null_context_abi = rdma_abi_v5_api::type_id::create("null_context_abi");
+    expect_status("ABI_NULL_CONTEXT_CONFIGURE",
+                  null_context_abi.configure(binding, null_context_api),
+                  RDMA_SC_OK);
+    expect_status("ABI_NULL_CONTEXT_NEGOTIATE",
+                  null_context_abi.negotiate(5, null_response), RDMA_SC_OK);
+    null_context_api.null_next_acquire = 1'b1;
+    expect_status("ABI_NULL_CONTEXT_ACQUIRE",
+                  null_context_abi.alloc_context(null_response),
+                  RDMA_SC_INVALID_STATE);
+    if (null_response == null || null_response.mapping_id != 0 ||
+        null_context_abi.context_id != 1 ||
+        null_context_abi.mappings.size() != 0)
+      `uvm_error("ABI_NULL_CONTEXT_ACQUIRE",
+                 "null context status published a partial mapping")
+
+    null_host_api = rdma_abi_null_host_mem::type_id::create("null_host_api");
+    null_host_abi = rdma_abi_v5_api::type_id::create("null_host_abi");
+    expect_status("ABI_NULL_HOST_CONFIGURE",
+                  null_host_abi.configure(binding, null, null_host_api),
+                  RDMA_SC_OK);
+    expect_status("ABI_NULL_HOST_NEGOTIATE",
+                  null_host_abi.negotiate(5, null_map_response), RDMA_SC_OK);
+    null_host_api.null_next_allocate = 1'b1;
+    expect_status("ABI_NULL_HOST_ALLOCATE",
+                  null_host_abi.map_region(RDMA_ABI_REGION_QP, 512,
+                                            null_map_response),
+                  RDMA_SC_INVALID_STATE);
+    if (null_map_response == null || null_map_response.mapping_id != 0 ||
+        null_host_abi.next_mapping_id != 1 ||
+        null_host_abi.mappings.size() != 0)
+      `uvm_error("ABI_NULL_HOST_ALLOCATE",
+                 "null host status published a partial mapping")
+
+    null_host_api.null_next_release = 1'b1;
+    expect_status("ABI_NULL_HOST_MAP_FOR_RELEASE",
+                  null_host_abi.map_region(RDMA_ABI_REGION_QP, 512,
+                                            null_release_response),
+                  RDMA_SC_OK);
+    expect_status("ABI_NULL_HOST_RELEASE",
+                  null_host_abi.unmap_region(null_release_response.mapping_id),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("ABI_NULL_HOST_RELEASE_QUERY",
+                  null_host_abi.query_mapping(null_release_response.mapping_id,
+                                               query_response),
+                  RDMA_SC_OK);
+    if (query_response == null || query_response.released ||
+        query_response.refcount != 1)
+      `uvm_error("ABI_NULL_HOST_RELEASE",
+                 "null release status retired the mapping prematurely")
+    expect_status("ABI_NULL_HOST_RELEASE_RETRY",
+                  null_host_abi.unmap_region(null_release_response.mapping_id),
+                  RDMA_SC_OK);
 
     phase.drop_objection(this);
   endtask

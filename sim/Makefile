@@ -7,22 +7,38 @@ HOST_MEM_BUILD ?= build/host_mem
 E2E_BUILD ?= build/e2e
 # 53 机上的 /home/ubuntu/workspace/host_mem 是真实 pinned backing 的只读
 # checkout；固定 commit/hash 使 E2E 可复现，同时不把外部源码复制进本仓库。
-override HOST_MEM_PINNED_COMMIT := 3b9e000d5df4d10efbb3029f43605e0362e0caca
-override HOST_MEM_PKG_SHA256 := d2ba57918a3b605525274433008142c80921b6205b0848c76bef8f1fc0d0bba5
-override HOST_MEM_MANAGER_SHA256 := 8dd5ca3ba3abcfae4808c8ea10c34ced279316bebdc04f6f8e0ae5e55e337a9d
 override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
-override RDMA_ARCHIVE_PREFIX := dpu_kernel_rdma-version_0.1.34
 # 6766c4f is the net_packet master snapshot that contains packet.sv and the
 # RoCEv2/iWARP protocol headers consumed by this adapter.
-override NET_PACKET_PINNED_COMMIT := 6766c4f042484814548481065328ffbcffab590f
 TEST ?= rdma_smoke_test
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
 VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_access+class
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
+ENGINE_PROCESS_LIST := rdma_cmq_engine_process.list
+CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
 
-.PHONY: core host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight dpu_common_preflight e2e regression
+# 功能：把一个 logical core test 转交给唯一 controller；普通 test 自映射，
+#   engine 按十八片展开，base 后八项、profile-wide CQE 与 retention 前缀各自独占一片。
+# 输入输出及副作用：参数 1 是 logical UVM test，参数 2 是含 simv 的 build
+#   目录；写每片独立 log 并打印聚合状态。
+# 失败边界：controller 对参数、manifest、simulator 或 summary 任一失败返回
+#   非零；Make 不保留第二份 fan-out 逻辑。
+define RUN_CORE_LOGICAL_TEST
+	"$(CORE_LOGICAL_RUNNER)" \
+		"$(strip $(1))" \
+		"$(strip $(2))" \
+		"$(ENGINE_PROCESS_LIST)" \
+		"../scripts/check_uvm_summary.sh"
+endef
+
+.PHONY: core cmq_gate sv_style host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight dpu_common_preflight e2e regression
+
+# 变更 SV 的注释/单语句门禁与 Git 空白检查共用明确的基线提交，避免隐式读取工作树历史。
+sv_style:
+	python3 ../tools/check_changed_sv_style.py --base "$${STYLE_BASE:?STYLE_BASE is required}"
+	git diff --check "$${STYLE_BASE}"
 
 # 通过统一 run_vcs53.sh 入口逐项执行回归清单；每行必须是 suite/test/tags 三字段。
 regression:
@@ -60,16 +76,40 @@ core:
 		mapfile -t suite_tests < <(sed -n '/^readonly CORE_TESTS=(/,/^)/p' ../scripts/run_queue_lifecycle_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
 		if (( $${#suite_tests[@]} == 0 )); then echo "core regression manifest is empty" >&2; exit 2; fi; \
 		for test_name in "$${suite_tests[@]}"; do \
-			$(BUILD)/simv +UVM_TESTNAME=$$test_name | tee $(BUILD)/$$test_name.log; \
-			../scripts/check_uvm_summary.sh $(BUILD)/$$test_name.log; \
+			$(call RUN_CORE_LOGICAL_TEST,$$test_name,$(BUILD)); \
 		done; \
 	else \
-		$(BUILD)/simv +UVM_TESTNAME=$(TEST) | tee $(BUILD)/$(TEST).log; \
-		../scripts/check_uvm_summary.sh $(BUILD)/$(TEST).log; \
+		$(call RUN_CORE_LOGICAL_TEST,$(TEST),$(BUILD)); \
 	fi
 
+cmq_gate:
+	set -euo pipefail; \
+	manifest=cmq_gate.list; \
+	[[ -r "$$manifest" ]] || { echo "CMQ gate manifest is missing" >&2; exit 2; }; \
+	mapfile -t cmq_tests < <(sed -e 's/[[:space:]]*#.*$$//' -e '/^[[:space:]]*$$/d' "$$manifest"); \
+	(( $${#cmq_tests[@]} == 11 )) || { echo "CMQ gate requires exactly eleven tests" >&2; exit 2; }; \
+	declare -A seen=(); \
+	for test_name in "$${cmq_tests[@]}"; do \
+		[[ "$$test_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]] || { echo "invalid CMQ test name" >&2; exit 2; }; \
+		[[ -z "$${seen[$$test_name]+x}" ]] || { echo "duplicate CMQ test" >&2; exit 2; }; \
+		seen[$$test_name]=1; \
+	done; \
+	$(MAKE) BUILD=$(BUILD) TEST=rdma_smoke_test core >/dev/null; \
+	for test_name in "$${cmq_tests[@]}"; do \
+		$(call RUN_CORE_LOGICAL_TEST,$$test_name,$(BUILD)); \
+	done
+
 rdma_defs:
-	@ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
+	@if [[ "$(TEST)" != "rdma_cmq_driver_contract_test" ]]; then \
+		echo "rdma_defs requires TEST=rdma_cmq_driver_contract_test" >&2; \
+		exit 2; \
+	fi
+	@cd .. && python3 -m unittest \
+		tests.unit.test_verify_rdma_archive \
+		tests.unit.test_check_rdma_profile_names \
+		tests.unit.test_verify_rdma_cmq_oracle \
+		tests.unit.test_check_rdma_field_ownership -v
+	@set -euo pipefail; ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
 	if [[ ! "$$ref_dir" =~ ^/tmp/rdma_profile_ref\.[A-Za-z0-9]{6}$$ ]]; then \
 		echo "Refusing unexpected RDMA reference directory: $$ref_dir" >&2; \
 		exit 2; \
@@ -93,13 +133,35 @@ rdma_defs:
 		exit $$cleanup_status; \
 	}; \
 	trap cleanup EXIT; \
-	case "$(RDMA_ARCHIVE)" in \
-		*.tar.gz|*.tar*.gz|*.tgz) tar -xzf "$(RDMA_ARCHIVE)" -C "$$ref_dir" "$(RDMA_ARCHIVE_PREFIX)" ;; \
-		*.zip) unzip -q "$(RDMA_ARCHIVE)" "$(RDMA_ARCHIVE_PREFIX)/*" -d "$$ref_dir" ;; \
-		*) echo "Unsupported RDMA archive format: $(RDMA_ARCHIVE)" >&2; exit 2 ;; \
-	esac; \
+	kernel_root=$$(python3 ../tools/verify_rdma_archive.py \
+		--archive "$(RDMA_ARCHIVE)" \
+		--lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt \
+		--extract-dir "$$ref_dir" \
+		--print-kernel-root); \
 	python3 ../tools/check_rdma_profile_names.py \
-		--kernel-root "$$ref_dir/$(RDMA_ARCHIVE_PREFIX)"
+		--kernel-root "$$kernel_root" \
+		--archive-lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt; \
+	python3 ../tools/verify_rdma_cmq_oracle.py \
+		--kernel-root "$$kernel_root" \
+		--archive-lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt \
+		--source-anchors ../hw/rdma/c_oracle/cmq_oracle_source_anchors.tsv \
+		--cases ../hw/rdma/c_oracle/cmq_oracle_cases.tsv \
+		--oracle-source ../hw/rdma/c_oracle/rdma_cmq_oracle.c \
+		--artifact-root ../hw/rdma/c_oracle/cases \
+		--cc /usr/bin/gcc; \
+	python3 ../tools/check_rdma_field_ownership.py \
+		--kernel-root "$$kernel_root" \
+		--archive-lock ../hw/rdma/archive_lock.env \
+		--source-manifest ../hw/rdma/source_manifest.txt \
+		--ownership ../hw/rdma/field_ownership.tsv \
+		--exclusions ../hw/rdma/field_exclusions.tsv \
+		--capabilities ../hw/rdma/cmq_capabilities.tsv \
+		--oracle-root ../hw/rdma/c_oracle/cases \
+		--mutation-manifest ../hw/rdma/cmq_field_mutation.tsv \
+		--sv-root ../src
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \
@@ -114,49 +176,7 @@ host_mem_preflight:
 			exit 2; \
 		fi; \
 	done
-	@preflight_failed=0; \
-	git_metadata_available=0; \
-	if git -C "$(HOST_MEM_ROOT)" rev-parse --is-inside-work-tree \
-		>/dev/null 2>&1; then \
-		git_metadata_available=1; \
-		actual_head=$$(git -C "$(HOST_MEM_ROOT)" rev-parse HEAD); \
-		if [[ "$$actual_head" != "$(HOST_MEM_PINNED_COMMIT)" ]]; then \
-			echo "host_mem preflight failed: HEAD $$actual_head does not match pinned commit $(HOST_MEM_PINNED_COMMIT)" >&2; \
-			preflight_failed=1; \
-		else \
-			if ! git -C "$(HOST_MEM_ROOT)" diff --cached \
-				--no-ext-diff --quiet "$(HOST_MEM_PINNED_COMMIT)" -- \
-				src/host_mem_pkg.sv src/host_mem_manager.sv; then \
-				echo "host_mem preflight failed: pinned source index differs from commit $(HOST_MEM_PINNED_COMMIT) (staged change)" >&2; \
-				preflight_failed=1; \
-			fi; \
-			if ! git -C "$(HOST_MEM_ROOT)" diff --no-ext-diff --quiet -- \
-				src/host_mem_pkg.sv src/host_mem_manager.sv; then \
-				echo "host_mem preflight failed: pinned source worktree differs from the index (unstaged change)" >&2; \
-				preflight_failed=1; \
-			fi; \
-		fi; \
-	fi; \
-	pkg_hash=$$(sha256sum "$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"); \
-	pkg_hash=$${pkg_hash%% *}; \
-	manager_hash=$$(sha256sum "$(HOST_MEM_ROOT)/src/host_mem_manager.sv"); \
-	manager_hash=$${manager_hash%% *}; \
-	if [[ "$$pkg_hash" != "$(HOST_MEM_PKG_SHA256)" ]]; then \
-		echo "host_mem preflight failed: host_mem_pkg.sv SHA-256 $$pkg_hash does not match pinned $(HOST_MEM_PKG_SHA256)" >&2; \
-		preflight_failed=1; \
-	fi; \
-	if [[ "$$manager_hash" != "$(HOST_MEM_MANAGER_SHA256)" ]]; then \
-		echo "host_mem preflight failed: host_mem_manager.sv SHA-256 $$manager_hash does not match pinned $(HOST_MEM_MANAGER_SHA256)" >&2; \
-		preflight_failed=1; \
-	fi; \
-	if [[ "$$preflight_failed" != 0 ]]; then \
-		exit 1; \
-	fi; \
-	if [[ "$$git_metadata_available" == 1 ]]; then \
-		echo "host_mem preflight passed: pinned git checkout and source hashes match"; \
-	else \
-		echo "host_mem preflight passed: git metadata unavailable; pinned source hashes match"; \
-	fi
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
 
 host_mem: host_mem_preflight
 	set -euo pipefail; \
@@ -177,7 +197,7 @@ host_mem: host_mem_preflight
 		../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log; \
 	fi
 
-integration:
+integration: dpu_common_preflight
 	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for integration" >&2; exit 2; fi
 	set -euo pipefail; \
 	mkdir -p build/integration; \
@@ -205,12 +225,7 @@ net_packet_preflight:
 		if [[ ! -r "$$dependency" ]]; then echo "Required net_packet dependency is not readable: $$dependency" >&2; preflight_failed=1; fi; \
 	done; \
 	if [[ "$$preflight_failed" != 0 ]]; then exit 2; fi
-	@if git -C "$(NET_PACKET_ROOT)" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
-		actual_head=$$(git -C "$(NET_PACKET_ROOT)" rev-parse HEAD); \
-		if [[ "$$actual_head" != "$(NET_PACKET_PINNED_COMMIT)" ]]; then echo "net_packet preflight failed: HEAD $$actual_head does not match pinned commit $(NET_PACKET_PINNED_COMMIT)" >&2; exit 1; fi; \
-		if ! git -C "$(NET_PACKET_ROOT)" diff --cached --no-ext-diff --quiet "$(NET_PACKET_PINNED_COMMIT)" -- src/core/packet.sv; then echo "net_packet preflight failed: staged source diff detected" >&2; exit 1; fi; \
-		if ! git -C "$(NET_PACKET_ROOT)" diff --no-ext-diff --quiet -- src/core/packet.sv; then echo "net_packet preflight failed: unstaged source diff detected" >&2; exit 1; fi; \
-	else echo "net_packet preflight failed: NET_PACKET_ROOT is not a git checkout" >&2; exit 1; fi
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency net_packet --root "$(NET_PACKET_ROOT)"
 
 net_packet: net_packet_preflight
 	set -euo pipefail; \
@@ -227,12 +242,17 @@ pcie_work_preflight:
 	@if [[ -z "$(PCIE_WORK_ROOT)" ]]; then echo "PCIE_WORK_ROOT is required for pcie_work" >&2; exit 2; fi
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then echo "HOST_MEM_ROOT is required for pcie_work" >&2; exit 2; fi
 	@for dependency in \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_if.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_bdf_utils_pkg.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv" \
+		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/topology/pcie_topology_pkg.sv" \
 		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_func_manager.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_bar_decoder.sv" \
-		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv"; do \
+		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv" \
+		"$(HOST_MEM_ROOT)/src/host_mem_manager.sv"; do \
 		if [[ ! -r "$$dependency" ]]; then echo "Required pcie_work dependency is not readable: $$dependency" >&2; exit 2; fi; \
-	done
+		done
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency pcie_work --root "$(PCIE_WORK_ROOT)"
 
 pcie_work: pcie_work_preflight
 	set -euo pipefail; \
@@ -253,6 +273,7 @@ pcie_work: pcie_work_preflight
 dpu_common_preflight:
 	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for dpu_common integration" >&2; exit 2; fi
 	@if [[ ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then echo "Required dpu_common dependency is not readable: $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" >&2; exit 2; fi
+	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency dpu_common --root "$(DPU_COMMON_ROOT)"
 
 e2e: host_mem_preflight net_packet_preflight dpu_common_preflight
 	set -euo pipefail; \

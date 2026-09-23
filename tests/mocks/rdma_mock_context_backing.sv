@@ -3,7 +3,8 @@
 // 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
 // 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
 
-// 中文说明：rdma_mock_context_backing.sv 属于测试替身，为单元测试提供可控的适配器和控制面行为。
+// 中文说明：rdma_mock_context_backing.sv 属于测试替身，为单元测试提供可控的适配器、
+//   host-visible context read/write 和控制面行为。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_mock_context_slot_token extends rdma_queue_slot_token_contract;
@@ -76,7 +77,7 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
   // 输入/输出及副作用：method_name（输入）、status（输入）；fail_next 读取 method_name、status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：fail_next 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“unknown context backing method”“failure status is null”；失败路径不提交部分状态或转移未声明资源。
   function rdma_status fail_next(string method_name, rdma_status status);
-    if (!(method_name inside {"acquire", "write", "release",
+    if (!(method_name inside {"acquire", "write", "read", "release",
                               "query_release_completion"}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "unknown context backing method");
@@ -287,6 +288,7 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
                           (resource_kind == RDMA_RESOURCE_QP ? 512 : 4096);
     hmc.size = slot.slot_length;
     hmc.first_pbl_index = local_id + 1;
+    hmc.index_valid = 1'b1;
     hmc.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
 
     result = rdma_context_backing_ref::type_id::create("context_ref");
@@ -342,6 +344,52 @@ class rdma_mock_context_backing extends rdma_context_backing_api;
                                "context write exceeds shadow view");
     for (i = 0; i < data.size(); i++)
       slot.data[offset + i] = data[i];
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在 rdma_mock_context_backing 中，read 从指定 context slot 复制一段
+  //   detached bytes，模拟驱动读取 QPC runtime shadow 等 host-visible 回写区域。
+  // 输入/输出及副作用：context_ref、offset、size 为输入，data 为输出；调用只
+  //   增加可审计的 read 调用轨迹，不改变 slot 内容、释放状态或 owner authority。
+  // 失败/边界：故障注入、authority 不匹配、已释放 slot、size=0 或范围越界时返回
+  //   对应错误且 data 为空；成功返回独立数组，调用方修改不会反写 mock slot。
+  virtual function rdma_status read(
+    rdma_context_backing_ref context_ref,
+    longint unsigned offset,
+    int unsigned size,
+    output byte unsigned data[]
+  );
+    rdma_status forced;
+    rdma_mock_context_slot slot;
+
+    data = new[0];
+    call_trace.push_back("read");
+    method_ordinals["read"]++;
+
+    forced = consume_role_failure("read", context_role(
+      context_ref == null ? RDMA_RESOURCE_CQ : context_ref.resource_kind));
+    if (forced != null)
+      return forced;
+
+    forced = consume_failure("read");
+    if (forced != null)
+      return forced;
+
+    slot = find_slot(context_ref);
+    if (slot == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "context authority mismatch");
+    if (slot.released || context_ref.release_complete)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "context slot released");
+    if (size == 0 || offset > slot.slot_length ||
+        size > slot.slot_length - offset)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                               "context read exceeds slot");
+
+    data = new[size];
+    for (int unsigned i = 0; i < size; i++)
+      data[i] = slot.data[offset + i];
     return rdma_status::success();
   endfunction
 

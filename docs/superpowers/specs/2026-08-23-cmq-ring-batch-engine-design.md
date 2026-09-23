@@ -369,6 +369,25 @@ FREE -> PUBLISHED -> COMPLETED -> FREE
 匹配的迟到 CQE 只生成独立 diagnostic，不再次进入 completion 数组；slot 转为
 LATE_COMPLETED 后才允许连续 retirement。
 
+### 9.3 Observed 生命周期决策（Phase 1A）
+
+生产调用方应使用 `execute_observed(command, result)` 取得一次 detached
+`rdma_cmq_execution_result`。该入口恰好执行一次 submit；只有 journal 明确处于
+`PUBLISH_AMBIGUOUS/PUBLISH_CONFIRMED + PENDING` 时才调用一次 `wait_for()`。
+`HOST_VISIBLE_NOT_PUBLISHED + NONE` 立即返回，已保留的 terminal/timeout/late/reset
+行直接从 journal 快照返回。`STAGED`、`PENDING_EFFECT`、缺失/矛盾 identity 或
+快照构造失败均返回 `UNOBSERVED + INVALID_STATE + recovery_required=1`，不得猜测
+提交是否已穿越 MMIO。legacy `execute()` 仅作为 deprecated 单向投影 seam，不能
+反向驱动 observed 或写共享 last-state。
+
+### 9.4 Observed 生命周期决策（Phase 1B）
+
+result envelope 必须同时满足 operation status、submission/attempt effect、completion
+phase、ticket/completion alias 和 Function/CMQ generation/incarnation 一致性。零
+identity 直接返回仅适用于真实 `PRE_SUBMIT_REJECTED + NONE`；任何 delegated malformed
+envelope 都转换为 `UNOBSERVED`。adapter 只校验并传播 detached 图，语义矛盾只能污染
+`observation_status`，不得把 operation status 改写为成功或清除 recovery 证据。
+
 ### 9.2 Malformed 或未知 CQE
 
 owner 已匹配但出现以下任一情况时，engine 进入 `POISONED`：
@@ -402,6 +421,14 @@ binding/generation 重新 `prepare()`、完成 runtime 初始化并 `activate()`
 generation 的迟到 DMA 必须由 PCIe/host-memory 路由拒绝，不能写入新 mapping。
 `shutdown()` 与无后续 prepare 的 reset 共用同一释放路径，并对 allocation leak 返回
 明确 status。
+
+### 10.2 Journal authority 与历史快照
+
+journal row 是 batch、attempt、engine incarnation、Function identity、CMQ identity、
+command/ticket 和 completion phase 的唯一权威。结果重建必须按 row 记录的 profile/
+codec snapshot 解码 payload，不能使用 reconfigure 后的 mutable profile。消费 FIFO 后，
+row 的 terminal/late/reset 快照仍可通过 ticket 查询；未知、重复或跨 reset epoch 的
+ticket 一律 fail-closed 并保持 counters、quarantine 和其他 Function 的 FIFO 不变。
 
 ## 11. 公开 API
 

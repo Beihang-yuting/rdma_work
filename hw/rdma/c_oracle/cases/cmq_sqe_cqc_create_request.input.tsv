@@ -1,0 +1,4 @@
+# 目录：hw/rdma/c_oracle/cases；CQC create oracle fixture 输入。
+wqe_index	0x12
+builder_polarity	1
+cqn	0x15a5a5

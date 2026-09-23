@@ -11,10 +11,10 @@
 | --- | --- | --- | --- |
 | Python 静态 | `python3 tools/check_rdma_profile_names.py` | 无 | profile、0.1.34 manifest 和 golden 约束通过 |
 | Python 单元 | `python3 -m unittest discover -s tests/unit -p 'test_*.py'` | 无 | 所有用例 `OK` |
-| 定义基线 | `scripts/run_vcs53.sh rdma_defs rdma_defs_test` | VCS53 | `rdma definitions: PASS` |
+| 定义基线 | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test` | VCS53 | `rdma definitions: PASS` 与 CMQ oracle/field ownership PASS |
 | core | `scripts/run_vcs53.sh core regression` | VCS53 | 编译并运行所有 core tests，UVM `warning=0 error=0 fatal=0` |
 | dpu_common integration | `DPU_COMMON_ROOT=/path/to/dpu_common scripts/run_vcs53.sh integration regression` | dpu_common snapshot | route、PF/VF、reset 和 context tests 全通过 |
-| host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | host_mem commit `365b7553fc7dac6b4ad55886a8e4869153607c28`，并通过源码 SHA-256 preflight | UMEM/PBL/MW、queue backing 和 release 无泄漏 |
+| host-mem | `HOST_MEM_ROOT=/path/to/host_mem scripts/run_vcs53.sh host_mem regression` | 历史记录：host_mem commit `365b7553fc7dac6b4ad55886a8e4869153607c28`（已被当前锁定记录 superseded） | UMEM/PBL/MW、queue backing 和 release 无泄漏 |
 | net_packet | `NET_PACKET_ROOT=/path/to/net_packet scripts/run_vcs53.sh net_packet regression` | net_packet commit `6766c4f042484814548481065328ffbcffab590f` | RoCEv2/iWARP pack/unpack 和故障策略全通过 |
 | multi-VF E2E | `PCIE_WORK_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=... DPU_COMMON_ROOT=... scripts/run_vcs53.sh e2e rdma_multivf_recovery_test` | dpu_common、pinned host_mem、pinned net_packet | 双 Host/双 PF/四 VF 并发 fault matrix、FLR/generation recovery、CQE/CMQ、真实 mapping release 和 leak seal 全通过 |
 | high-traffic E2E | `PCIE_WORK_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=... DPU_COMMON_ROOT=... scripts/run_vcs53.sh e2e rdma_end_to_end_high_traffic_test` | dpu_common、pinned host_mem、pinned net_packet | 4096×256B、SQ/RQ/CQ window=16、completion batch=4；queue-full、PI/CI、CQE owner/released-slot、真实 mapping 和 Function-qualified event pending 全通过 |
@@ -62,7 +62,7 @@ publish/CEQ 注入点稳定后，应另设独立测试和回归行，避免把�
 | `HOST_MEM_ROOT=/home/ubuntu/host_mem_latest scripts/run_vcs53.sh host_mem regression` | adapter、queue data-engine 和 UMEM 三项均退出码 `0`；每项 UVM `warning=0 error=0 fatal=0`，真实 manager leak check 为 `0 blocks outstanding` |
 | `scripts/run_vcs53.sh core regression`、integration/net_packet 全量回归 | 这些全量回归的最近一次基线证据保留在上一轮记录；本轮针对 fail-closed 改动重新执行了上面列出的 coverage、smoke、host-mem、transport、dual-env 和 multi-VF 入口，不将未重跑的全量结果冒充本轮证据 |
 
-本轮 host-mem preflight 使用 `365b7553fc7dac6b4ad55886a8e4869153607c28`，并校验：
+历史记录中的 host-mem preflight 曾使用 `365b7553fc7dac6b4ad55886a8e4869153607c28`；该记录已被当前锁定基线 superseded。本轮 active 依赖必须通过 `hw/rdma/external_dependencies.tsv` 校验，host-mem commit 为 `3b9e000d5df4d10efbb3029f43605e0362e0caca`。
 
 - `src/host_mem_pkg.sv` SHA-256：`e874491da16334b12d9299355a3148275309a0c5a2c3303cda2fc7c3382ed74f`；
 - `src/host_mem_manager.sv` SHA-256：`6b5eb9bbd94d410b1382a665ddb60347132558fc7882cbed1115f69fa0c1d410`。

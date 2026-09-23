@@ -1,0 +1,5 @@
+case_id	entry	opcode	direction	source_path	source_function	total_bytes	c_type_alignment	image_required_alignment	endian	embed_base
+cmq_sqe_qpc_create_request	CMQ_SQE	QPC_CREATE	REQUEST	cmq.c	xtrdma_sc_qp_create	64	8	64	big	0
+cmq_sqe_cqc_create_request	CMQ_SQE	CQC_CREATE	REQUEST	cmq.c	xtrdma_sc_cq_create	64	8	64	big	8
+cmq_cqe_qpc_create_response	CMQ_CQE	QPC_CREATE	RESPONSE	cmq.c	xtrdma_get_cqe_common_info	64	8	64	big	0
+cmq_sq_doorbell	CMQ_SQ_DOORBELL	CMQ_SQ	REQUEST	cmq.c	xtrdma_sc_cmq_post_sq	8	8	8	big	0

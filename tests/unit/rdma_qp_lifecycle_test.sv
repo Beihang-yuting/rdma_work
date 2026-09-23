@@ -57,7 +57,6 @@ class rdma_qp_completion_ticket_only_cmq extends rdma_mock_cmq_port;
 
   // 功能：在 rdma_qp_completion_ticket_only_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -970,6 +969,35 @@ class rdma_qp_command_fault_executor extends rdma_qp_lifecycle_executor;
   endfunction
 endclass
 
+// 该测试夹具只暴露 QP 生命周期执行器的 borrowed-owner 原子绑定 seam；
+// 不接管 backing 或 QP 句柄，调用方仍负责 fixture 的生命周期。
+class rdma_qp_bind_owner_probe_executor extends rdma_qp_lifecycle_executor;
+  `uvm_object_utils(rdma_qp_bind_owner_probe_executor)
+
+  // 功能：构造 borrowed-owner seam 测试执行器，建立可调用 protected
+  //       绑定逻辑的 UVM 对象；不创建或接管外部 backing。
+  // 输入/输出及副作用：name（输入）；new 只初始化本地 UVM 层级对象并返回
+  //       void，不修改传入资源或 owner。
+  // 失败/边界：构造仅用于测试访问边界；未注入 backing、QP 句柄或配置依赖时，
+  //       probe_bind_borrowed_owner 必须返回对应 INVALID_ARGUMENT/INVALID_STATE。
+  function new(string name = "rdma_qp_bind_owner_probe_executor");
+    super.new(name);
+  endfunction
+
+  // 功能：调用执行器的 borrowed-owner 绑定 seam，验证所有 segment authority
+  //       通过后才发布 QP owner。
+  // 输入/输出及副作用：backing_ref/qp_h（输入）；成功时更新 detached backing
+  //       的 owner_h，失败时不得修改主 mapping 或任一 segment owner。
+  // 失败/边界：输入为空、ownership 非 BORROWED、Function authority 不一致或
+  //       segment 缺失时返回错误；该夹具不释放 backing，也不改变 caller mapping。
+  function rdma_status probe_bind_borrowed_owner(
+    rdma_qp_backing_ref backing_ref,
+    rdma_handle qp_h
+  );
+    return bind_borrowed_owner(backing_ref, qp_h);
+  endfunction
+endclass
+
 class rdma_qp_boundary_context_backing extends rdma_mock_context_backing;
   `uvm_object_utils(rdma_qp_boundary_context_backing)
   rdma_function_binding binding_target;
@@ -1162,7 +1190,6 @@ class rdma_qp_output_fault_cmq extends rdma_mock_cmq_port;
 
   // 功能：在 rdma_qp_output_fault_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -1206,7 +1233,6 @@ class rdma_qp_ticketless_destroy_cmq extends rdma_mock_cmq_port;
 
   // 功能：在 rdma_qp_ticketless_destroy_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -1249,7 +1275,6 @@ class rdma_qp_destroy_rebind_cmq extends rdma_mock_cmq_port;
 
   // 功能：在 rdma_qp_destroy_rebind_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -1451,7 +1476,6 @@ class rdma_qp_lifecycle_test extends uvm_test;
 
   // 功能：setup_qp_environment 更新字段 binding、manager、contexts、cmq、executor，并在提交前保持 Function authority、generation 和资源所有权约束。
   // 输入/输出及副作用：label（输入）、mem（输入）、binding（输出）、manager（输出）、contexts（输出）、cmq（输出）、executor（输出）、pd（输出）、cq（输出）；setup_qp_environment 驱动下游事务，并写入 binding、manager、contexts、cmq、executor、pd、cq；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：setup_qp_environment 失败或超时通过 binding、manager、contexts、cmq、executor、pd、cq 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic setup_qp_environment(
     string label,
@@ -1481,7 +1505,6 @@ class rdma_qp_lifecycle_test extends uvm_test;
 
   // 功能：setup_custom_qp_environment 更新字段 binding，并在提交前保持 Function authority、generation 和资源所有权约束。
   // 输入/输出及副作用：label（输入）、mem（输入）、manager（输入）、contexts（输入）、cmq（输入）、executor（输入）、binding（输出）、pd（输出）、cq（输出）；setup_custom_qp_environment 驱动下游事务，并写入 binding、pd、cq；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：setup_custom_qp_environment 失败或超时通过 binding、pd、cq 明确发布；该路径不隐式重试，也不转移未声明资源。
   task automatic setup_custom_qp_environment(
     string label,
@@ -1962,6 +1985,7 @@ class rdma_qp_lifecycle_test extends uvm_test;
     rdma_create_qp_req request;
     rdma_dma_mapping sq0, sq1, rq0, rq1;
     rdma_qp qp, lookup_qp;
+    rdma_qp_bind_owner_probe_executor bind_probe;
     rdma_resource looked_up;
     rdma_control_result result;
     byte fill[];
@@ -1969,6 +1993,9 @@ class rdma_qp_lifecycle_test extends uvm_test;
     byte rq_pd_expected[16];
     bit borrowed_release;
     longint unsigned stored_segment_iova;
+    rdma_handle prior_primary_owner;
+    rdma_handle prior_segment_owner;
+    rdma_function_handle malformed_function;
     rdma_status status;
 
     mem = rdma_mock_host_mem::type_id::create("BORROWED_MULTI_mem");
@@ -2095,6 +2122,40 @@ class rdma_qp_lifecycle_test extends uvm_test;
           stored_segment_iova)
       `uvm_error("BORROWED_MANAGER_PROJECTION",
         "caller segment mutation reached manager authority")
+
+    // A malformed second-segment Function must fail before the primary owner
+    // is published. This is the focused failure-atomicity seam for the
+    // borrowed-owner rebinding path.
+    bind_probe = rdma_qp_bind_owner_probe_executor::type_id::create(
+      "BORROWED_BIND_ATOMIC_probe"
+    );
+    prior_primary_owner = qp.qp_plan.sq_ref.mapping.owner_h;
+    prior_segment_owner =
+      qp.qp_plan.sq_ref.additional_segments[0].mapping.owner_h;
+    malformed_function = rdma_function_handle::type_id::create(
+      "BORROWED_BIND_ATOMIC_bad_function"
+    );
+    malformed_function.function_uid = binding.function_uid + 1;
+    malformed_function.object_id = binding.owner_h.object_id;
+    malformed_function.generation = binding.generation;
+    qp.qp_plan.sq_ref.additional_segments[0].mapping.function_h =
+      malformed_function;
+    status = bind_probe.probe_bind_borrowed_owner(
+      qp.qp_plan.sq_ref, qp.handle
+    );
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        prior_primary_owner == null ||
+        qp.qp_plan.sq_ref.mapping.owner_h == null ||
+        !qp.qp_plan.sq_ref.mapping.owner_h.same_instance(
+          prior_primary_owner
+        ) ||
+        prior_segment_owner == null ||
+        qp.qp_plan.sq_ref.additional_segments[0].mapping.owner_h == null ||
+        !qp.qp_plan.sq_ref.additional_segments[0].mapping.owner_h.same_instance(
+          prior_segment_owner
+        ))
+      `uvm_error("BORROWED_BIND_ATOMIC",
+        "borrowed owner failure changed a partially validated mapping")
   endtask
 
   // A borrowed SQ-SGB is detached from the caller's mapping authority and

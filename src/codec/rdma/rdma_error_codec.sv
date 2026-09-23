@@ -227,10 +227,14 @@ class rdma_hw_error_codec extends uvm_object;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_error_codec 中，decode_status 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：hardware_code（输入）、observed_engine（输入）、decoded（输出）；decode_status 读取 hardware_code、observed_engine、decoded 并使用字段 decoded、code、source_engine、candidate、candidate.code、candidate.category、candidate.source_engine、candidate.message，并写入 decoded；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：decode_status 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：decode_status 将 8-bit hardware_code 分类为 rdma_status code，选择可信的
+  //   observed_engine 或按错误码推断来源，并组装完整 decoded status。
+  // 输入/输出及副作用：hardware_code、observed_engine（输入），decoded（输出）；先清空
+  //   decoded，再写入 code/category/source/message、硬件码有效位、severity 和 retryable，
+  //   不取得外部资源所有权。
+  // 失败/边界：observed_engine 为 NONE/未知时走 inferred_engine；未知硬件码仍以
+  //   RDMA_UNKNOWN_ECODE 和成功 wrapper 返回，函数没有拒绝分支，调用方不得把成功 wrapper
+  //   当作硬件码合法性的证明。
   function rdma_status decode_status(
     bit [7:0] hardware_code,
     rdma_engine_kind_e observed_engine,

@@ -8,6 +8,23 @@
 
 virtual class rdma_host_mem_api extends uvm_object;
 
+  // 功能：把 UMEM/PBL 下游返回的状态统一规范化为可安全消费的对象。
+  // 输入/输出及副作用：candidate、operation 为输入；非空状态原样返回，null 状态
+  //       转换为带 Host-memory 边界诊断的 INVALID_STATE；不修改 UMEM/PBL 或 mapping。
+  // 失败/边界：null 表示模型对象或扩展实现违反状态返回契约；调用方必须停止读取
+  //       output、清理本地半成品并向上层传播确定失败。
+  protected function automatic rdma_status normalize_status(
+    rdma_status candidate,
+    string operation
+  );
+    if (candidate == null)
+      return rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        {"Host-memory ", operation, " returned null status"}
+      );
+    return candidate;
+  endfunction
+
   // 功能：构造 rdma_host_mem_api，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_host_mem_api 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
@@ -55,6 +72,18 @@ virtual class rdma_host_mem_api extends uvm_object;
   // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   pure virtual function rdma_status \release (rdma_dma_mapping mapping);
 
+  // 功能：只读确认本 manager 对指定 opaque allocation 提供 failure-atomic release 契约。
+  // 输入/输出及副作用：mapping 为待验证 authority；基类不访问 backing、不 release 或改 ledger。
+  // 失败/边界：基类无法证明 concrete release 顺序，始终返回 UNSUPPORTED_OPCODE 以 fail closed。
+  virtual function rdma_status validate_failure_atomic_release(
+    rdma_dma_mapping mapping
+  );
+    return rdma_status::make(
+      RDMA_SC_UNSUPPORTED_OPCODE,
+      "Host-memory manager does not advertise failure-atomic release"
+    );
+  endfunction
+
   // 功能：release_opaque 在调用方发现 public mapping 字段异常时，仍使用
   //       manager 内部的不透明 allocation identity 完成一次回滚释放。
   // 输入/输出及副作用：mapping（输入）；成功时释放 manager 所拥有的 backing，
@@ -66,8 +95,11 @@ virtual class rdma_host_mem_api extends uvm_object;
   endfunction
 
   // 功能：pin_umem 为用户态 VA 范围建立 UMEM 页描述和 pin 引用。
-  // 输入/输出及副作用：function_h、user_va、length 为输入，umem 为输出；默认实现只建立模型页，不触碰外部 host-mem。
-  // 失败/边界：空 Function、零/非页对齐范围和 generation 不匹配返回错误；成功返回的 UMEM 必须已 pin。
+  // 输入/输出及副作用：function_h、user_va、length 为输入，umem 为输出；
+  //       默认实现只建立模型页，不触碰外部 host-mem。
+  // 失败/边界：空 Function、零长度、地址溢出和 generation 不匹配返回错误；
+  //       非页对齐范围按 Linux ib_umem 语义保留首页 offset，成功返回的
+  //       UMEM 必须已 pin。
   virtual function rdma_status pin_umem(
     rdma_function_handle function_h,
     longint unsigned user_va,
@@ -91,7 +123,9 @@ virtual class rdma_host_mem_api extends uvm_object;
     umem.generation = function_h.generation;
     umem.permissions = '{device_read:1'b1, device_write:1'b1, atomic:1'b0};
     status = umem.pin_pages();
-    if (!status.ok()) umem = null;
+    status = normalize_status(status, "UMEM pin");
+    if (!status.ok())
+      umem = null;
     return status;
   endfunction
 
@@ -99,10 +133,13 @@ virtual class rdma_host_mem_api extends uvm_object;
   // 输入/输出及副作用：umem 为输入；默认实现调用 UMEM exactly-once unpin，不释放 borrowed 外部页。
   // 失败/边界：空 UMEM 返回 INVALID_ARGUMENT；重复调用保持幂等成功。
   virtual function rdma_status unpin_umem(rdma_umem umem);
+    rdma_status status;
+
     if (umem == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UMEM to unpin is null");
-    return umem.unpin_pages();
+    status = umem.unpin_pages();
+    return normalize_status(status, "UMEM unpin");
   endfunction
 
   // 功能：build_umem_pbl 组合 PBL 构建并把非拥有引用写入 DMA mapping。
@@ -120,14 +157,34 @@ virtual class rdma_host_mem_api extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "UMEM mapping source is null");
     status = rdma_pbl_builder::build_multilevel(umem, pbl);
-    if (!status.ok()) return status;
+    status = normalize_status(status, "PBL build");
+    if (!status.ok()) begin
+      pbl = null;
+      return status;
+    end
+    if (pbl == null || umem.pages.size() == 0 || umem.pages[0] == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "PBL build returned no usable page mapping"
+      );
     mapping = rdma_dma_mapping::type_id::create("umem_dma_mapping");
     if (mapping == null)
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "UMEM DMA mapping allocation failed");
     mapping.function_h = umem.function_h;
-    mapping.iova = umem.pages[0].iova;
-    mapping.backing_addr = umem.pages[0].backing_addr;
+    if (umem.pages[0].iova.value >
+        64'hffff_ffff_ffff_ffff - umem.first_page_offset ||
+        umem.pages[0].backing_addr.value >
+        64'hffff_ffff_ffff_ffff - umem.first_page_offset)
+      begin
+        mapping = null;
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
+                                 "UMEM mapping offset overflows");
+      end
+    mapping.iova.value = umem.pages[0].iova.value +
+                         umem.first_page_offset;
+    mapping.backing_addr.value = umem.pages[0].backing_addr.value +
+                                 umem.first_page_offset;
     mapping.size = umem.length;
     mapping.state = RDMA_MAPPING_ACTIVE;
     mapping.umem_ref = umem;

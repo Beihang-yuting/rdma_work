@@ -557,6 +557,102 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     end
   endfunction
 
+  // 功能：detach_queue_recovery_context 将指定 ERROR queue 的 detached
+  // recovery context_ref 清空，注入 recovery/authoritative presence 不对称
+  // 故障，供 context progress 原子性测试使用。
+  // 输入/输出及副作用：handle（输入）定位 queue recovery 记录；函数只写入
+  // recovery_records[key].queue_plan.context_ref=null，不修改 registry、其他
+  // progress 位或外部 backing，也不转移资源所有权。
+  // 失败/边界：recovery 记录、queue_plan 或 handle key 缺失时通过 UVM fatal
+  // 暴露 fixture 构造错误；成功后下一次 context progress 必须拒绝且不提交单侧位。
+  function void detach_queue_recovery_context(rdma_handle handle);
+    string key;
+
+    key = resource_key(handle);
+    if (!recovery_records.exists(key) || recovery_records[key] == null ||
+        recovery_records[key].queue_plan == null)
+      `uvm_fatal("QUEUE_CONTEXT_FIXTURE", "recovery queue plan is unavailable")
+    recovery_records[key].queue_plan.context_ref = null;
+  endfunction
+
+  // 功能：restore_queue_recovery_context 从 authoritative registry queue 的
+  // context_ref 建立新的 detached recovery context 快照，恢复 presence parity
+  // 并保留 opaque completion authority 的共享身份。
+  // 输入/输出及副作用：handle（输入）定位 registry/recovery；函数 clone 并写入
+  // recovery_records[key].queue_plan.context_ref，仅读取并不修改 registry context
+  // 或外部 HMC/backing，也不取得其生命周期所有权。
+  // 失败/边界：registry/recovery plan 缺失、authoritative context 为空、clone 为空
+  // 或类型转换失败时通过 UVM fatal 停止 fixture；成功后 recovery progress 位保持原值。
+  function void restore_queue_recovery_context(rdma_handle handle);
+    rdma_queue_resource queue_resource;
+    rdma_context_backing_ref cloned_context;
+    uvm_object cloned_object;
+    string key;
+
+    key = resource_key(handle);
+    if (!recovery_records.exists(key) || recovery_records[key] == null ||
+        recovery_records[key].queue_plan == null ||
+        !$cast(queue_resource, registry[key]) ||
+        queue_resource.queue_plan == null ||
+        queue_resource.queue_plan.context_ref == null)
+      `uvm_fatal("QUEUE_CONTEXT_FIXTURE", "authoritative queue context is unavailable")
+    cloned_object = queue_resource.queue_plan.context_ref.clone();
+    if (cloned_object == null || !$cast(cloned_context, cloned_object))
+      `uvm_fatal("QUEUE_CONTEXT_FIXTURE", "queue context clone failed")
+    recovery_records[key].queue_plan.context_ref = cloned_context;
+  endfunction
+
+  // 功能：diverge_queue_recovery_context_authority 替换 recovery context 的
+  // completion_authority，注入两侧 token authority 不一致而不触碰 registry 快照。
+  // 输入/输出及副作用：handle（输入）定位 recovery；函数只写 recovery context
+  // token 的 completion_authority，保留 owner、resource_kind、local_id、shadow
+  // geometry 与 HMC 字段，不取得新 authority 之外的资源所有权。
+  // 失败/边界：recovery plan/context、slot_token 缺失或 token 类型不符时通过
+  // UVM fatal 报告 fixture 错误；成功后 context progress 应返回 INVALID_STATE。
+  function void diverge_queue_recovery_context_authority(rdma_handle handle);
+    rdma_context_backing_ref context_ref;
+    rdma_queue_slot_token_contract token;
+    string key;
+
+    key = resource_key(handle);
+    if (!recovery_records.exists(key) || recovery_records[key] == null ||
+        recovery_records[key].queue_plan == null)
+      `uvm_fatal("QUEUE_CONTEXT_FIXTURE", "recovery context token is unavailable")
+    context_ref = recovery_records[key].queue_plan.context_ref;
+    if (context_ref == null || !$cast(token, context_ref.slot_token))
+      `uvm_fatal("QUEUE_CONTEXT_FIXTURE", "recovery context token is unavailable")
+    token.completion_authority =
+      rdma_queue_completion_authority::type_id::create(
+        "queue_context_diverged_authority"
+      );
+  endfunction
+
+  // 功能：observed_queue_context_release_complete 读取 registry 或 recovery
+  // queue 的 context release_complete 位，供失败原子性和成功提交断言使用。
+  // 输入/输出及副作用：handle、recovery_side（输入）；函数只读取对应 queue
+  // plan/context_ref，不写 registry、recovery_records、progress 或外部 backing；
+  // 返回 bit 表示当前快照的 release_complete。
+  // 失败/边界：目标 queue、plan 或 context_ref 缺失时通过 UVM fatal 暴露 fixture
+  // 错误；调用方必须先确保 context 存在，函数不把缺失解释为已完成。
+  function bit observed_queue_context_release_complete(
+    rdma_handle handle,
+    bit recovery_side
+  );
+    rdma_queue_backing_plan plan;
+    rdma_queue_resource queue_resource;
+    string key;
+
+    key = resource_key(handle);
+    plan = null;
+    if (recovery_side)
+      plan = recovery_records[key].queue_plan;
+    else if ($cast(queue_resource, registry[key]))
+      plan = queue_resource.queue_plan;
+    if (plan == null || plan.context_ref == null)
+      `uvm_fatal("QUEUE_CONTEXT_FIXTURE", "queue context is unavailable")
+    return plan.context_ref.release_complete;
+  endfunction
+
   // 功能：在 rdma_queue_recovery_probe_manager 中，clear_queue_ambiguity 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
   // 输入/输出及副作用：handle（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
   // 失败/边界：clear_queue_ambiguity 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
@@ -2923,6 +3019,7 @@ class rdma_resource_manager_test extends uvm_test;
         64'h0000_6000_0000_0000 + longint'(kind) * 64'h1000;
       hmc_ref.size = 4096;
       hmc_ref.first_pbl_index = local_id + 1;
+      hmc_ref.index_valid = 1'b1;
       hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
       context_ref.hmc_ref = hmc_ref;
       context_ref.shadow_pointer_base.value =
@@ -3134,6 +3231,7 @@ class rdma_resource_manager_test extends uvm_test;
       64'h0000_8500_0000_0000 + longint'(qp.local_qp_id) * 512;
     context_ref.hmc_ref.size = 512;
     context_ref.hmc_ref.first_pbl_index = qp.local_qp_id + 1;
+    context_ref.hmc_ref.index_valid = 1'b1;
     context_ref.hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     context_ref.shadow_pointer_base.value =
       64'h0000_8600_0000_0000 + longint'(qp.local_qp_id) * 512;
@@ -4127,6 +4225,7 @@ class rdma_resource_manager_test extends uvm_test;
     hmc_ref.address.value = address_value;
     hmc_ref.size = 64'h3000;
     hmc_ref.first_pbl_index = 28'he2251;
+    hmc_ref.index_valid = 1'b1;
     hmc_ref.ownership = RDMA_OWNERSHIP_BORROWED;
     hmc_ref.release_complete = 1'b0;
     return hmc_ref;
@@ -4270,6 +4369,7 @@ class rdma_resource_manager_test extends uvm_test;
     hmc_ref.address.value = 64'he225_2000_0000_0000;
     hmc_ref.size = 64'h1000;
     hmc_ref.first_pbl_index = 28'h1;
+    hmc_ref.index_valid = 1'b1;
     hmc_ref.ownership = RDMA_OWNERSHIP_CONTROL_PLANE;
     hmc_ref.release_complete = 1'b1;
     recovery.hmc_refs.push_back(hmc_ref);
@@ -5457,6 +5557,73 @@ class rdma_resource_manager_test extends uvm_test;
       expect_status("QUEUE_RECOVERY_ERROR",
                     queue_recovery_manager.mark_error(srq.handle, queue_recovery),
                     RDMA_SC_OK);
+      // context progress 是双快照事务：detached recovery context 必须在任一
+      // candidate 收到完成位之前被拒绝，随后再从 authoritative snapshot 重建 fixture。
+      queue_recovery_manager.detach_queue_recovery_context(srq.handle);
+      expect_status("DETACHED_CONTEXT_PROGRESS_REJECT",
+        queue_recovery_manager.record_queue_context_cleanup_complete(
+          srq.handle
+        ), RDMA_SC_INVALID_STATE);
+      expect_status("DETACHED_CONTEXT_LOOKUP",
+        queue_recovery_manager.lookup_recovery(srq.handle,
+                                               queue_recovery_lookup),
+        RDMA_SC_OK);
+      if (queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b0) ||
+          queue_recovery_lookup == null ||
+          queue_recovery_lookup.queue_plan == null ||
+          queue_recovery_lookup.queue_plan.context_ref != null)
+        `uvm_error("DETACHED_CONTEXT_PROGRESS_ATOMIC",
+                   "detached recovery context changed registry progress")
+      queue_recovery_manager.restore_queue_recovery_context(srq.handle);
+      if (queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b0) ||
+          queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b1))
+        `uvm_error("DETACHED_CONTEXT_RESTORE_ATOMIC",
+                   "context restore did not preserve pending progress")
+
+      // 携带不同 opaque completion authority 的 recovery token 同样必须在 commit
+      // 前拒绝；即使可见 owner、geometry 和 HMC 值都相同，也要捕获 authority 漂移。
+      queue_recovery_manager.diverge_queue_recovery_context_authority(
+        srq.handle
+      );
+      expect_status("MISMATCHED_CONTEXT_AUTHORITY_REJECT",
+        queue_recovery_manager.record_queue_context_cleanup_complete(
+          srq.handle
+        ), RDMA_SC_INVALID_STATE);
+      expect_status("MISMATCHED_CONTEXT_AUTHORITY_LOOKUP",
+        queue_recovery_manager.lookup_recovery(srq.handle,
+                                               queue_recovery_lookup),
+        RDMA_SC_OK);
+      if (queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b0) ||
+          queue_recovery_lookup == null ||
+          queue_recovery_lookup.queue_plan == null ||
+          queue_recovery_lookup.queue_plan.context_ref == null ||
+          queue_recovery_lookup.queue_plan.context_ref.release_complete)
+        `uvm_error("MISMATCHED_CONTEXT_AUTHORITY_ATOMIC",
+                   "mismatched context authority published progress")
+      queue_recovery_manager.restore_queue_recovery_context(srq.handle);
+      if (queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b0) ||
+          queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b1))
+        `uvm_error("MISMATCHED_CONTEXT_RESTORE_ATOMIC",
+                   "authority restore did not preserve pending progress")
+      // A queue in ERROR always carries a detached recovery snapshot.  A
+      // caller may nevertheless name a role that is absent from both plans;
+      // cardinality must be rejected from the authoritative copy first, so
+      // the recovery comparison cannot use an uninitialized array index or
+      // change the public error class to a recovery-authority failure.
+      expect_status("RECOVERY_MISSING_FLUSH_ROLE",
+        queue_recovery_manager.record_queue_flush_complete(
+          srq.handle, RDMA_QUEUE_ROLE_SRQ_SGB
+        ), RDMA_SC_INVALID_ARGUMENT);
+      expect_status("RECOVERY_MISSING_CLEANUP_ROLE",
+        queue_recovery_manager.record_queue_cleanup_complete(
+          srq.handle, RDMA_QUEUE_ROLE_CQ_PD
+        ), RDMA_SC_INVALID_ARGUMENT);
       // Each detached plan must independently prove the predecessor before a
       // later SRQ flush can be recorded.  Rejection cannot publish either
       // target's progress bit.
@@ -5544,6 +5711,10 @@ class rdma_resource_manager_test extends uvm_test;
           !queue_recovery_lookup.queue_plan.flush_targets[0].flush_complete ||
           !queue_recovery_lookup.queue_plan.refs[0].cleanup_complete ||
           !queue_recovery_lookup.queue_plan.context_ref.release_complete ||
+          !queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b0) ||
+          !queue_recovery_manager.observed_queue_context_release_complete(
+            srq.handle, 1'b1) ||
           queue_recovery_lookup.queue_plan == queue_recovery.queue_plan ||
           queue_recovery_lookup.queue_create_opcode ==
             queue_recovery.queue_create_opcode ||
@@ -7166,6 +7337,7 @@ class rdma_resource_manager_test extends uvm_test;
         64'hc0a2_5000_0000_0000 + (i * 64'h4000);
       composite_hmc_refs[i].size = 64'h5000 + (i * 64'h1000);
       composite_hmc_refs[i].first_pbl_index = 32'hc0a2_1000 + i;
+      composite_hmc_refs[i].index_valid = 1'b1;
       composite_hmc_refs[i].ownership =
         (i == 0) ? RDMA_OWNERSHIP_BORROWED :
                    RDMA_OWNERSHIP_CONTROL_PLANE;

@@ -162,6 +162,15 @@ class rdma_dpu_integration_test extends uvm_test;
       `uvm_error("DPU_INT", "notify aperture was not projected from mailbox BAR")
     if (binding.queue_dma.dma_domain_id != 3)
       `uvm_error("DPU_INT", "DMA domain did not use the PCIe segment")
+
+    // 设计说明：SGE 上限来自冻结的 xtrdma ABI，不能由 integration adapter
+    // 使用较小占位值重新解释；本断言只观察投影，不修改 binding 或快照。
+    // 驱动常量变化时，manifest、共享常量与该投影必须在同一 ABI 变更中更新。
+    if (binding.queue_caps.max_wq_sge != RDMA_MAX_WQ_SGE)
+      `uvm_error("DPU_INT", $sformatf(
+        "max_wq_sge=%0d, expected xtrdma driver limit %0d",
+        binding.queue_caps.max_wq_sge, RDMA_MAX_WQ_SGE))
+
     phase.drop_objection(this);
   endtask
 endclass

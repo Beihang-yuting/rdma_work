@@ -1,0 +1,5 @@
+# 目录：hw/rdma/c_oracle/cases；CMQ SQ doorbell second-cycle fixture 输入。
+head_before	0x36
+pi_before	0x16
+ring_size	32
+sq_polarity_before	0

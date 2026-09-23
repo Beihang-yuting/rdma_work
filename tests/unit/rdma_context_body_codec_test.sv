@@ -129,7 +129,7 @@ class rdma_context_body_codec_test extends uvm_test;
     mrt = rdma_mrt_model::type_id::create(name);
     mrt.mr_h = make_handle({name, "_mr"}, RDMA_RESOURCE_MR, 24'hff_ffff);
     mrt.pd_h = make_handle({name, "_pd"}, RDMA_RESOURCE_PD, 16'hffff);
-    mrt.state = RDMA_CONTEXT_VALID;
+    mrt.state = RDMA_MR_STATE_VALID;
     mrt.iova.value = 64'hffff_ffff_ffff_ffff;
     mrt.length = 64'h0000_3fff_ffff_ffff;
     mrt.lkey = 32'hffff_ffff;
@@ -153,8 +153,13 @@ class rdma_context_body_codec_test extends uvm_test;
         mrt.page_layout.pba0.value = 64'hffff_ffff_ffff_f000;
         mrt.page_layout.pba1.value = 64'hffff_ffff_ffff_f000;
       end
-      RDMA_MR_PBL2:
+      RDMA_MR_PBL2: begin
         mrt.page_layout.first_pbl_index = 28'hfff_ffff;
+        mrt.page_layout.first_pbl_index_valid = 1'b1;
+      end
+      default: begin
+        // Keep the fixture total for an invalid or future PBL mode.
+      end
     endcase
     return mrt;
   endfunction
@@ -217,7 +222,6 @@ class rdma_context_body_codec_test extends uvm_test;
 
   // 功能：在 rdma_context_body_codec_test 中，body_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
   // 输入/输出及副作用：image_kind（输入）、object_type（输入）、variant（输入）、opcode（输入）；body_key 读取 image_kind、object_type、variant、opcode 并使用字段 key.hw_version、key.image_kind、key.object_type、key.variant、key.opcode；函数返回 rdma_codec_key，不取得调用方资源所有权。
-
 // 失败/边界：body_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
   function automatic rdma_codec_key body_key(
     rdma_image_kind_e image_kind,
@@ -320,7 +324,6 @@ class rdma_context_body_codec_test extends uvm_test;
 
   // 功能：在 rdma_context_body_codec_test 中，image_field 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
   // 输入/输出及副作用：image（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）；image_field 读取 image、word_byte_offset、lsb、width 并使用字段 mask；函数返回 bit [63:0]，不取得调用方资源所有权。
-
   // 失败/边界：image_field 的结果直接由 return (image_word(image, word_byte_offset >> 3) >> lsb) & mask 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function automatic bit [63:0] image_field(
     rdma_hw_image image,
@@ -701,7 +704,7 @@ class rdma_context_body_codec_test extends uvm_test;
     mrt = make_mrt("mrt_pbl1_coordinates", RDMA_MR_PBL1);
     mrt.mr_h.object_id = 24'h12_3456;
     mrt.pd_h.object_id = 16'h3456;
-    mrt.state = RDMA_CONTEXT_INVALID;
+    mrt.state = RDMA_MR_STATE_INVALID;
     mrt.iova.value = 64'h0123_4567_89ab_cdef;
     mrt.length = 64'h0000_1234_5678_9abc;
     mrt.lkey = {24'h12_3456, 8'ha5};
@@ -1184,7 +1187,7 @@ class rdma_context_body_codec_test extends uvm_test;
     changed.page_layout.host_page_size = RDMA_MR_PAGE_64K;
     expect_encode_failure("MRT_PAGE_64K", register_codec, changed);
     if (!$cast(changed, clone_model(pbl0, "MRT_ERROR_STATE"))) return;
-    changed.state = RDMA_CONTEXT_ERROR;
+    changed.state = rdma_mr_state_e'(2'd3);
     expect_encode_failure("MRT_ERROR_STATE", register_codec, changed);
 
     corrupt = clone_image(pbl0_image, "MRT_STATE_MIRROR");
@@ -1229,6 +1232,54 @@ class rdma_context_body_codec_test extends uvm_test;
     expect_ok("MRT_NORMALIZED_RIGHTS", status);
     if (!equal)
       `uvm_error("MRT_NORMALIZED_RIGHTS", mismatch)
+  endfunction
+
+  // 功能：验证 KEY_ALLOC 使用驱动 mr.h 中独立的 FREE 状态，并检查非法状态码不会被解码为有效 MRT。
+  // 输入/输出及副作用：codec 为 KEY_ALLOC 编解码器；任务创建本地 MRT/image，执行一次编码、解码和状态字段破坏，不修改外部资源。
+  // 失败/边界：FREE 必须编码为 XTRDMA_MR_ST_FREE=1 并往返保持；编码或解码 3（驱动未定义）必须 fail closed 且不发布模型。
+  function automatic void check_mrt_free_state(
+    rdma_codec_base codec
+  );
+    rdma_mrt_model source;
+    rdma_hw_model decoded_model_base;
+    rdma_mrt_model decoded;
+    rdma_hw_image image;
+    rdma_hw_image corrupt;
+    rdma_hw_model invalid_model_base;
+    rdma_status status;
+
+    source = make_mrt("mrt_free_state", RDMA_MR_PBL0);
+    source.state = rdma_mr_state_e'(RDMA_MR_STATE_FREE);
+    status = codec.encode(source, image);
+    expect_ok("MRT_FREE_ENCODE", status);
+    if (image == null) begin
+      `uvm_error("MRT_FREE_ENCODE", "FREE state encode published null image")
+      return;
+    end
+    expect_image_field("MRT_FREE_CODE", image,
+                       RDMA_MRT_BODY_ST_WORD_BYTE_OFFSET,
+                       RDMA_MRT_BODY_ST_LSB,
+                       RDMA_MRT_BODY_ST_WIDTH,
+                       RDMA_MR_ST_FREE);
+
+    decoded_model_base = null;
+    status = codec.decode(image, decoded_model_base);
+    expect_ok("MRT_FREE_DECODE", status);
+    if (!$cast(decoded, decoded_model_base) ||
+        decoded.state != RDMA_MR_STATE_FREE)
+      `uvm_error("MRT_FREE_ROUNDTRIP",
+                 "KEY_ALLOC FREE state was not preserved by decode")
+
+    corrupt = clone_image(image, "mrt_invalid_state_code");
+    set_image_field(corrupt, RDMA_MRT_BODY_ST_WORD_BYTE_OFFSET,
+                    RDMA_MRT_BODY_ST_LSB,
+                    RDMA_MRT_BODY_ST_WIDTH, 2'd3);
+    invalid_model_base = null;
+    status = codec.decode(corrupt, invalid_model_base);
+    expect_status("MRT_INVALID_STATE_CODE", status, RDMA_SC_CODEC_ERROR);
+    if (invalid_model_base != null)
+      `uvm_error("MRT_INVALID_STATE_CODE",
+                 "invalid MR state code published a decoded model")
   endfunction
 
   // 功能：在测试辅助 rdma_context_body_codec_test.check_srqc_negatives 中构造或驱动“srqc negatives”场景，并断言 DUT
@@ -1586,6 +1637,7 @@ class rdma_context_body_codec_test extends uvm_test;
     check_cqc_negatives(cqc_codec, cqc, cqc_image);
     check_mrt_negatives(mrt_key_codec, mrt_register_codec, mrt0, mrt1, mrt2,
                         mrt_key0_image, mrt0_image, mrt1_image, mrt2_image);
+    check_mrt_free_state(mrt_key_codec);
     check_srqc_negatives(srqc_codec, srqc, srqc_image);
     check_eq_negatives(ceqc_codec, aeqc_codec, ceqc, aeqc,
                        ceqc_image, aeqc_image);

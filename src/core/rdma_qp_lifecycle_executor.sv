@@ -6,29 +6,6 @@
 // 中文说明：rdma_qp_lifecycle_executor.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-class rdma_qp_occ_flush_body extends rdma_hw_occ_flush_body;
-  // QP 回滚使用 QPN=0 的精确 OCC flush 图像，避免误刷其他资源。
-  `uvm_object_utils(rdma_qp_occ_flush_body)
-
-  // 功能：构造 rdma_qp_occ_flush_body，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qp_occ_flush_body 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name = "rdma_qp_occ_flush_body");
-    super.new(name);
-  endfunction
-
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、vf_flush、mr_serial_flush、qpc、cqc、mrt、pble、sqrqe 并使用字段 rdma_status、vf_flush、mr_serial_flush、qpc、cqc、mrt、pble、sqrqe；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 的结果直接由 return rdma_status::success() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-  virtual function rdma_status validate();
-    if (!vf_flush && !mr_serial_flush && !qpc && !cqc && !mrt &&
-        !pble && !sqrqe && !sgb_irqe && eirqe && orqe && uaqe &&
-        !pd && qpn == 0 && mr_serial == 0 && pd_backing.value == 0)
-      return rdma_status::success();
-    return super.validate();
-  endfunction
-endclass
-
 class rdma_qp_lifecycle_executor extends uvm_object;
   // 生命周期执行器统一负责 QP backing 的分配、发布、恢复和最终清理。
   `uvm_object_utils(rdma_qp_lifecycle_executor)
@@ -179,7 +156,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：执行 retain_failed_allocation 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：mapping（输入）、role（输入）、length（输入）、backing_ref（输出）；retain_failed_allocation 读取 mapping、role、length、backing_ref 并使用字段 backing_ref、backing_ref.role、backing_ref.mapping、backing_ref.ownership、backing_ref.mapping_offset、backing_ref.length、backing_ref.recovery_only，并写入 backing_ref；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：retain_failed_allocation 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected function rdma_status retain_failed_allocation(
     rdma_dma_mapping mapping,
@@ -403,30 +379,83 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return backing_ref.validate();
   endfunction
 
-  // 功能：在 rdma_qp_lifecycle_executor 中，bind_borrowed_owner 把 bind_borrowed_owner 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：backing_ref（输入）、qp_h（输入）；bind_borrowed_owner 先依据 backing_ref == null || backing_ref.mapping == null || qp_h == null || backing_ref.ownership != RDMA_OWNERSHIP_BORROWED；backing_ref.additional_segments[i] == null || backing_ref.additional_segments[i].mapping == null 校验 backing_ref、qp_h；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 功能：bind_borrowed_owner 校验 detached borrowed backing 的 Function authority，
+  //       为主 mapping 与全部 additional_segments 生成同一 QP 的 owner 快照，
+  //       并在所有检查通过后一次性发布 owner_h。
+  // 输入/输出及副作用：backing_ref、qp_h（输入）；读取 backing_ref.mapping.function_h
+  //       与 additional_segments[i].mapping，成功时只写入 detached backing 的
+  //       owner_h，不接管或修改 caller 持有的原始 mapping。
+  // 失败/边界：backing_ref/qp_h 为空、ownership 非 BORROWED、Function authority
+  //       缺失或 segment 不属于同一 Function、owner clone 不完整时返回错误；
+  //       任何失败都必须保持主 mapping 和全部 segment 的原 owner_h 不变。
   protected function rdma_status bind_borrowed_owner(
     rdma_qp_backing_ref backing_ref,
     rdma_handle qp_h
   );
-    // 发布前把 detached mapping 的 owner 绑定到新 QP，且不取得释放所有权。
+    rdma_handle primary_owner;
+    rdma_handle segment_owners[$];
+    rdma_handle prior_primary_owner;
+    rdma_handle prior_segment_owners[$];
+    rdma_function_handle mapping_owner;
+    rdma_status status;
+
+    // 借用 backing 的 owner 绑定跨越主 mapping 与全部 segment。先把所有
+    // 新 owner 快照和 Function authority 条件准备完，再一次性写入 owner_h；
+    // 这样任一 segment 失败都不会留下“主 mapping 已换 owner、后续 segment
+    // 仍是旧 owner”的半发布状态。
     if (backing_ref == null || backing_ref.mapping == null || qp_h == null ||
         backing_ref.ownership != RDMA_OWNERSHIP_BORROWED)
       return invalid_argument("QP borrowed owner binding is invalid");
-    backing_ref.mapping.owner_h = rdma_clone_handle_value(
-      qp_h, "QP borrowed owner"
-    );
+
+    mapping_owner = backing_ref.mapping.function_h;
+    if (mapping_owner == null || mapping_owner.kind != RDMA_RESOURCE_FUNCTION)
+      return invalid_argument("QP borrowed mapping Function authority is invalid");
+    prior_primary_owner = backing_ref.mapping.owner_h;
+    primary_owner = rdma_clone_handle_value(qp_h, "QP borrowed owner");
+    if (primary_owner == null || !primary_owner.same_instance(qp_h))
+      return invalid_state("QP borrowed owner clone is null");
+
     foreach (backing_ref.additional_segments[i]) begin
       if (backing_ref.additional_segments[i] == null ||
           backing_ref.additional_segments[i].mapping == null)
         return invalid_state("QP borrowed segment authority is missing");
-      backing_ref.additional_segments[i].mapping.owner_h =
-        rdma_clone_handle_value(qp_h, "QP borrowed segment owner");
+      if (backing_ref.additional_segments[i].mapping.function_h == null ||
+          !backing_ref.additional_segments[i].mapping.function_h.same_instance(
+            mapping_owner
+          ))
+        return invalid_state("QP borrowed segment Function authority is invalid");
+      prior_segment_owners.push_back(
+        backing_ref.additional_segments[i].mapping.owner_h
+      );
+      segment_owners.push_back(rdma_clone_handle_value(
+        qp_h, "QP borrowed segment owner"
+      ));
+      if (segment_owners.size() == 0 ||
+          segment_owners[segment_owners.size() - 1] == null ||
+          !segment_owners[segment_owners.size() - 1].same_instance(qp_h))
+        return invalid_state("QP borrowed segment owner clone is null");
     end
-    return rdma_qp_mapping_authority_status(
-      backing_ref, backing_ref.mapping.function_h, qp_h, "QP borrowed"
+
+    // Above checks cover every condition that the final authority predicate
+    // can reject after these assignments. Commit only after the complete
+    // candidate owner set is available, then retain the canonical predicate
+    // as a defensive postcondition check.
+    backing_ref.mapping.owner_h = primary_owner;
+    foreach (backing_ref.additional_segments[i])
+      backing_ref.additional_segments[i].mapping.owner_h = segment_owners[i];
+    status = rdma_qp_mapping_authority_status(
+      backing_ref, mapping_owner, qp_h, "QP borrowed"
     );
+    if (status == null || !status.ok()) begin
+      // Canonical postcheck is intentionally retained after the publish point;
+      // if a future predicate gains a condition not covered by the staging
+      // checks above, restore every owner field before returning the failure.
+      backing_ref.mapping.owner_h = prior_primary_owner;
+      foreach (backing_ref.additional_segments[i])
+        backing_ref.additional_segments[i].mapping.owner_h =
+          prior_segment_owners[i];
+    end
+    return status;
   endfunction
 
   // 功能：make_ring 创建独立的 rdma_status；根据 role、depth、ring 设置字段 ring、logical_bytes、ring.role、ring.depth、ring.entry_size_bytes、ring.logical_bytes、ring.storage_bytes、ring.object_mode，返回对象仅由调用方持有，不转移外部资源所有权。
@@ -487,7 +516,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，zero_sq_sgb_ref 清空 SQ SGB backing 引用，模拟缺失/已释放映射并验证后续清理路径。
   // 输入/输出及副作用：request_context（输入）、backing_ref（输入）、length（输入）；zero_sq_sgb_ref 读取 request_context、backing_ref、length 并使用字段 status、zeros、slot、m、off；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：zero_sq_sgb_ref 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“SQ SGB zero input is invalid”“SQ SGB segment boundary splits a slot”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status zero_sq_sgb_ref(
     rdma_dma_request_context request_context,
@@ -534,7 +562,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，zero_and_encode_pd 按 profile 的字段布局和端序把语义模型编码为硬件镜像，并在发布前检查长度与对齐。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）、payload_ref（输入）、pd_ref（输入）；zero_and_encode_pd 读取 binding、expected_owner、payload_ref、pd_ref 并使用字段 payload_bytes、zeros、status、fence_status、offset、page_mapping、page_mapping_offset、page；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：zero_and_encode_pd 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_STATE；典型拒绝条件为“QP payload page coverage is incomplete”“QP page-directory page allocation failed”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status zero_and_encode_pd(
     rdma_function_binding binding,
@@ -651,7 +678,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，materialize_plan 把已验证的 backing 规格落实为 Host-memory 映射/队列计划，并登记释放责任。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）、qp_snapshot（输入）、request（输入）、plan（输出）；materialize_plan 读取 binding、expected_owner、qp_snapshot、request、plan 并使用字段 plan、status、plan.transport、plan.sq_depth、plan.rq_depth、plan.rq_source_h，并写入 plan；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：materialize_plan 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP plan materialization input is null”“QP local QPN exceeds 21 bits”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status materialize_plan(
     rdma_function_binding binding,
@@ -786,7 +812,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，local_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
   // 输入/输出及副作用：source（输入）、kind（输入）、local_id（输入）、label（输入）、projected（输出）；local_handle 读取 source、kind、local_id、label、projected 并使用字段 projected、projected.object_id，并写入 projected；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：local_handle 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status local_handle(
     rdma_handle source, rdma_resource_kind_e kind, int unsigned local_id,
@@ -801,7 +826,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，capture_qpc_authority 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：binding（输入）、qp_snapshot（输入）、plan（输入）、pd（输出）、send_cq（输出）、recv_cq（输出）、srq（输出）、qp_sequence_value（输出）；capture_qpc_authority 读取 binding、qp_snapshot、plan、pd、send_cq、recv_cq、srq、qp_sequence_value 并使用字段 pd、send_cq、recv_cq、srq、qp_sequence_value、status，并写入 pd、send_cq、recv_cq、srq、qp_sequence_value；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：capture_qpc_authority 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QPC authority capture input is null”；失败路径不提交部分状态或转移未声明资源。
   protected function rdma_status capture_qpc_authority(
     rdma_function_binding binding,
@@ -1092,6 +1116,36 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return 1'b0;
   endfunction
 
+  // 功能：在 rdma_qp_lifecycle_executor 中，execute_qp_legacy_command 收束 QP
+  //   创建、修改、查询和回滚阶段共用的 legacy CMQ 原始 dispatch，避免各阶段
+  //   重复维护输出初始化与一次 execute 调用。
+  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）。任务
+  //   清空本次调用的 ticket/completion/status，调用 cmq.execute 一次并保留后端原始
+  //   status；不执行 generation fence、ambiguity 分类、completion 校验或资源状态
+  //   提交，也不取得 command/CMQ 资源所有权。
+  // 失败/边界：cmq 为空时返回 RDMA_SC_INVALID_STATE，command 为空时返回
+  //   RDMA_SC_INVALID_ARGUMENT；后端返回 null status 时保留 null，由调用方按各阶段
+  //   原有诊断和 recovery 优先级归一化。任务不重试、不代替调用方的 pre/post fence。
+  protected task execute_qp_legacy_command(
+    rdma_cmq_command_desc command,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output rdma_status status
+  );
+    ticket = null;
+    completion = null;
+    status = null;
+    if (cmq == null) begin
+      status = invalid_state("QP CMQ is unavailable");
+      return;
+    end
+    if (command == null) begin
+      status = invalid_argument("QP CMQ command is null");
+      return;
+    end
+    cmq.execute(command, ticket, completion, status);
+  endtask
+
   // 功能：在 rdma_qp_lifecycle_executor 中由 same_qpc_snapshot 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
   // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
   // 失败/边界：same_qpc_snapshot 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
@@ -1316,7 +1370,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       completion = null;
       status = live_binding_fence(binding, expected_owner);
       if (status.ok())
-        cmq.execute(query_command, ticket, completion, status);
+        execute_qp_legacy_command(
+          query_command, ticket, completion, status
+        );
       else begin
         ticket = null;
         completion = null;
@@ -1480,21 +1536,26 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                             "QP command validation returned null");
   endfunction
 
-  // 功能：build_occ_command 创建独立的 rdma_status；根据 owner、local_qpn、pd_ref、command 设置字段 command、body、body.qpn、body.eirqe、body.orqe、body.uaqe、body.pd、pd_backing.value、command.function_h、command.opcode_key，返回对象仅由调用方持有，不转移外部资源所有权。
+  // 功能：build_occ_command 为 QP 回滚或销毁构造 canonical OCC_FLUSH
+  //   命令；QPN 路径选择 EIRQE/ORQE/UAQE，PD 路径只选择 PD backing。
   // 输入/输出及副作用：owner（输入）、local_qpn（输入）、pd_ref（输入）、command（输出）；build_occ_command 读取 owner、local_qpn、pd_ref、command 并使用字段 command、body、body.qpn、body.eirqe、body.orqe、body.uaqe、body.pd、pd_backing.value，并写入 command；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：build_occ_command 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP OCC authority is invalid”“QP OCC PD mapping is null”；失败路径不提交部分状态或转移未声明资源。
+  // 失败/边界：owner 为空、local_qpn 超过 21 bit、PD mapping 为空或
+  //   canonical body/command 校验失败时返回错误；QPN 0 是驱动保留的合法
+  //   SMI QP 标识，不能借 subtype 绕过 profile exact-type 门禁。
   protected function rdma_status build_occ_command(
     rdma_function_handle owner,
     int unsigned local_qpn,
     rdma_qp_backing_ref pd_ref,
     output rdma_cmq_command_desc command
   );
-    rdma_qp_occ_flush_body body;
+    rdma_hw_occ_flush_body body;
 
     command = null;
     if (owner == null || local_qpn > 21'h1f_ffff)
       return invalid_argument("QP OCC authority is invalid");
-    body = rdma_qp_occ_flush_body::type_id::create("qp_occ_body");
+    // profile 只快照 exact canonical body；QP 层不得再创建带自定义
+    // validate() 的派生类型，否则 mock/production 共用的快照边界会拒绝命令。
+    body = rdma_hw_occ_flush_body::type_id::create("qp_occ_body");
     body.qpn = local_qpn;
     if (pd_ref == null) begin
       body.eirqe = 1'b1;
@@ -1684,10 +1745,17 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     result.status = rdma_cmq_clone_status_value(normalized);
   endfunction
 
-  // 功能：make_create_recovery 创建独立的 rdma_status；根据 plan、candidate_qpc、staging、ambiguous_operation、ambiguous_role、ticket、recovery 设置字段 recovery、recovery.intent、recovery.ambiguous_operation、recovery.ambiguous_role、recovery.candidate_qpc、recovery.qp_plan、recovery.context_ref、recovery.staging_mapping、recovery.create_opcode、recovery.modify_opcode，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：plan（输入）、candidate_qpc（输入）、staging（输入）、ambiguous_operation（输入）、ambiguous_role（输入）、ticket（输入）、recovery（输出）；输入字段被复制到返回值或
-  //   output；生成结果与输入隔离，不隐式修改调用方对象。
-  // 失败/边界：make_create_recovery 无返回值，仅执行 recovery=rdma_qp_recovery_state::type_id::create("qp_create_recovery")、recovery.intent=RDMA_QP_RECOVER_CREATE_ROLLBACK、recovery.ambiguous_operation=ambiguous_operation、recovery.ambiguous_role=ambiguous_role；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：make_create_recovery 组装 QP CREATE 的临时恢复证据，并设置 intent、
+  //       ambiguity、QPC/staging、opcode key 和 ticket；qp_plan、context_ref 与
+  //       candidate_qpc 在此阶段仍是输入对象的借用句柄，最终独立快照由
+  //       manager.mark_qp_error 的 authority-aware projector 建立。
+  // 输入/输出及副作用：plan、candidate_qpc、staging、ambiguous_operation、
+  //       ambiguous_role、ticket（输入），recovery（输出）；函数只创建本地
+  //       recovery shell，不释放或接管 backing/mapping/context/QPC，且在交给
+  //       manager 前禁止调用方修改这些借用对象。
+  // 失败/边界：恢复 shell 创建、opcode/ticket clone 或 recovery.validate 失败时
+  //       返回相应 status；通用 plan.clone 不能替代 authority-aware projection，
+  //       否则可能丢失 opaque mapping release authority。
   protected function rdma_status make_create_recovery(
     rdma_qp_backing_plan plan,
     rdma_qpc_model candidate_qpc,
@@ -1716,10 +1784,16 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                             "QP create recovery validation returned null");
   endfunction
 
-  // 功能：make_modify_recovery 创建独立的 rdma_status；根据 authoritative、prior_qpc、candidate_qpc、staging、query_mapping、query_mapping_recovery_only、ticket、recovery 设置字段 recovery、recovery.intent、recovery.ambiguous_operation、recovery.ambiguous_role、recovery.prior_qpc、recovery.candidate_qpc、recovery.qp_plan、recovery.context_ref、recovery.staging_mapping、recovery.query_mapping，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：authoritative（输入）、prior_qpc（输入）、candidate_qpc（输入）、staging（输入）、query_mapping（输入）、query_mapping_recovery_only（输入）、ticket（输入）、recovery（输出）；输入字段被复制到返回值或
-  //   output；生成结果与输入隔离，不隐式修改调用方对象。
-  // 失败/边界：make_modify_recovery 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP modify recovery authority is incomplete”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：make_modify_recovery 组合 QP MODIFY 的临时恢复 shell，记录 prior/
+  //       candidate QPC、authoritative plan/context、staging/query mapping、
+  //       query-only 标志和重放 opcode；shell 仅供随后 mark_qp_error 投影。
+  // 输入/输出及副作用：authoritative、prior_qpc、candidate_qpc、staging、
+  //       query_mapping、query_mapping_recovery_only、ticket（输入），recovery
+  //       （输出）；qp_plan/context_ref/QPC/mapping 均暂借输入句柄，不取得外部
+  //       资源所有权，也不在此阶段修改 authoritative resource。
+  // 失败/边界：authoritative、plan/context、prior/candidate QPC 缺失时返回
+  //       RDMA_SC_INVALID_ARGUMENT；ticket/clone/validate 失败时返回对应错误；
+  //       在 manager authority-aware projection 完成前不得保留或并发修改 shell。
   protected function rdma_status make_modify_recovery(
     rdma_qp authoritative,
     rdma_qpc_model prior_qpc,
@@ -1761,7 +1835,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：执行 retain_modify_recovery 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：authoritative（输入）、prior_qpc（输入）、candidate_qpc（输入）、staging（输入）、query_mapping（输入）、query_mapping_recovery_only（输入）、ticket（输入）、primary（输入）、result（输出）；retain_modify_recovery 驱动下游事务，并写入 result；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：retain_modify_recovery 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected task retain_modify_recovery(
     rdma_qp authoritative,
@@ -1811,7 +1884,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，execute_terminal_command 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）、command（输入）、status（输出）、ambiguous（输出）、recovery_ticket（输出）；execute_terminal_command 驱动下游事务，并写入 status、ambiguous、recovery_ticket；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute_terminal_command 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   protected task execute_terminal_command(
     rdma_function_binding binding,
@@ -1833,7 +1905,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (!status.ok())
       return;
     status = null;
-    cmq.execute(command, ticket, completion, status);
+    execute_qp_legacy_command(command, ticket, completion, status);
     ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
     recovery_ticket = ticket;
     if (recovery_ticket == null && completion != null)
@@ -1852,7 +1924,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，cleanup_attached_qp 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）、candidate（输入）、plan（输入）、model（输入）、hardware_present（输入）、primary（输入）、result（输入）、released（输出）；cleanup_attached_qp 驱动下游事务，并写入 released；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：cleanup_attached_qp 返回 RDMA_SC_RECOVERY_REQUIRED；典型拒绝条件为“QP OCC rollback requires recovery”“QP delete rollback requires recovery”；失败路径不提交部分状态或转移未声明资源。
   protected task cleanup_attached_qp(
     rdma_function_binding binding,
@@ -2083,7 +2154,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：执行 retain_create_recovery 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
   // 输入/输出及副作用：candidate（输入）、plan（输入）、model（输入）、staging（输入）、ambiguous_operation（输入）、ambiguous_role（输入）、ticket（输入）、primary（输入）、result（输入）；retain_create_recovery 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：retain_create_recovery 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
   protected task retain_create_recovery(
     rdma_qp candidate,
@@ -2432,7 +2502,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     ticket = null;
     completion = null;
     status = null;
-    cmq.execute(command, ticket, completion, status);
+    execute_qp_legacy_command(command, ticket, completion, status);
     ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
     recovery_ticket = ticket;
     if (recovery_ticket == null && completion != null)
@@ -2565,7 +2635,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   // 功能：在 rdma_qp_lifecycle_executor 中，modify_locked 在代际和状态机保护下修改 QP 上下文，提交硬件命令后才发布新的软件状态。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）、request（输入）、transaction_id（输入）、qp（输出）、result（输出）；modify_locked 驱动下游事务，并写入 qp、result；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：modify_locked 返回 RDMA_SC_RESOURCE_BUSY、RDMA_SC_UNSUPPORTED_OPCODE；典型拒绝条件为“QP has outstanding operations”“QP SQD/SQE modify is unsupported”；失败路径不提交部分状态或转移未声明资源。
   task modify_locked(rdma_function_binding binding,
                      rdma_function_handle expected_owner,
@@ -2716,7 +2785,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                  RDMA_OP_QPC_MODIFY, command);
     if (status.ok()) begin
       ticket = null; completion = null; ambiguous = 1'b0; status = null;
-      cmq.execute(command, ticket, completion, status);
+      execute_qp_legacy_command(command, ticket, completion, status);
       // Some CMQ adapters expose the authoritative ticket only through the
       // completion.  Recover it before classifying the outcome so a
       // definitive completion remains definitive and an ambiguous one keeps
@@ -2889,10 +2958,16 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     publish_primary(result, rdma_status::success());
   endtask
 
-  // 功能：在 rdma_qp_lifecycle_executor 中，destroy_locked 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、expected_owner（输入）、request（输入）、transaction_id（输入）、result（输出）；输入 handle/mapping/token
-  //   指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_locked 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：destroy_locked 按 owner、generation 和幂等规则执行 QP ERROR/flush/
+  //       delete/cleanup；失败时组装借用 qp_plan 的 transient recovery shell，
+  //       再交给 manager.mark_qp_error 建立持久 authority。
+  // 输入/输出及副作用：binding、expected_owner、request、transaction_id（输入），
+  //       result（输出）；成功路径更新硬件/账本生命周期，失败路径只把
+  //       qp.qp_plan/context_ref 作为非拥有引用传入恢复投影，不转移 mapping、
+  //       HMC 或 QPC 所有权。
+  // 失败/边界：owner/generation 不匹配、资源不存在、CMQ/flush/delete/cleanup
+  //       失败或 manager authority projection 失败时返回错误并保留 recovery 证据；
+  //       transient shell 在交给 manager 前不得被调用方修改，不能重新激活旧句柄。
   task destroy_locked(rdma_function_binding binding,
                       rdma_function_handle expected_owner,
                       rdma_destroy_resource_req request,
@@ -4023,7 +4098,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
           ticket = null; completion = null;
           status = live_binding_fence(binding, expected_owner);
           if (status.ok())
-            cmq.execute(query_command, ticket, completion, status);
+            execute_qp_legacy_command(
+              query_command, ticket, completion, status
+            );
           else begin
             ticket = null;
             completion = null;

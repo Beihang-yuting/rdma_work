@@ -42,6 +42,33 @@ class rdma_queue_planner_nth_fail_mem extends rdma_mock_host_mem;
   endfunction
 endclass
 
+// 功能：构造一个 CQ 请求校验器故障夹具，模拟可覆写 semantic request 在
+//       policy preflight 边界丢失 rdma_status。
+// 输入/输出及副作用：name（输入）；构造函数沿用 CQ 请求的默认字段，
+//       validate() 不修改请求或资源账本而返回 null。
+// 失败/边界：该夹具只用于验证 policy 的 fail-closed 契约；null 结果不得被
+//       当成成功，也不得继续读取请求的 backing 或发布 preflight。
+class rdma_null_cq_request_status extends rdma_create_cq_req;
+  `uvm_object_utils(rdma_null_cq_request_status)
+
+  // 功能：创建返回空状态的 CQ 请求 fixture，并保留基类默认初始化语义。
+  // 输入/输出及副作用：name（输入）；new 只初始化本地 UVM 对象，不取得
+  //       manager、binding 或 queue backing 的所有权。
+  // 失败/边界：构造成功不代表请求有效；validate() 始终注入 null 状态。
+  function new(string name = "rdma_null_cq_request_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 semantic request validator 丢失状态，覆盖
+  //       rdma_queue_lifecycle_policy::common_preflight_status 的 virtual seam。
+  // 输入/输出及副作用：无显式输入；不修改 request 字段，返回 null 状态句柄。
+  // 失败/边界：null 是刻意注入的 contract violation；调用方必须将其转换为
+  //       RDMA_SC_INVALID_STATE，而不能调用 status.ok()。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
 // 功能：模拟 Host-memory manager 返回 public route 被篡改、但内部 allocation
 //       token 仍然有效的故障，验证 planner 必须使用 opaque rollback。
 // 输入/输出及副作用：allocate（输入/输出 mapping）；成功分配后只篡改返回
@@ -54,11 +81,20 @@ class rdma_queue_planner_malformed_mapping_mem extends rdma_mock_host_mem;
 
   int unsigned opaque_release_calls;
 
+  // 功能：构造 malformed-mapping Host-memory mock，初始化 opaque 释放调用计数并建立基类 fixture。
+  // 输入/输出及副作用：name 为 UVM 对象名称输入；构造函数只初始化本地计数，不分配或接管真实 Host-memory 资源。
+  // 失败/边界：构造不会注入 route 故障；未调用 allocate 前 opaque_release_calls 必须为零，后续测试负责清理 mock 状态。
   function new(string name = "rdma_queue_planner_malformed_mapping_mem");
     super.new(name);
     opaque_release_calls = 0;
   endfunction
 
+  // 功能：先执行基类 DMA allocation，再篡改返回 mapping.route.root_id，模拟
+  //       public route 与 opaque lease 不一致的故障。
+  // 输入/输出及副作用：request_context、size、alignment、direction 为输入，mapping
+  //       为输出；成功时只修改本测试返回值并保留基类 allocation 记录。
+  // 失败/边界：基类返回 null/失败 status 或 mapping 为 null 时不注入篡改；malformed
+  //       mapping 只能由 planner 的 authority-aware rollback 接口释放。
   virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -75,6 +111,10 @@ class rdma_queue_planner_malformed_mapping_mem extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：记录 planner 对 opaque mapping 回滚入口的调用，再委托基类释放内部
+  //       lease。
+  // 输入/输出及副作用：mapping 为待释放的 opaque 引用；opaque_release_calls 单调递增，基类可能更新 mock allocation ledger。
+  // 失败/边界：mapping 无效或重复释放时沿用基类错误；本辅助函数不接受 public route 修复，也不替代真实 owner 的生命周期。
   virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
     opaque_release_calls++;
     return super.release_opaque(mapping);
@@ -509,7 +549,6 @@ class rdma_queue_destroy_trace_cmq extends rdma_mock_cmq_port;
 
   // 功能：在 rdma_queue_destroy_trace_cmq 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
   // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
   virtual task execute(
     rdma_cmq_command_desc command,
@@ -604,6 +643,69 @@ class rdma_queue_executor_generation_fail extends
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "injected post-create generation change");
     return super.generation_status(binding, expected_owner);
+  endfunction
+endclass
+
+class rdma_queue_cq_build_failure_policy extends rdma_cq_lifecycle_policy;
+  `uvm_object_utils(rdma_queue_cq_build_failure_policy)
+
+  bit snapshot_seen_at_build;
+  rdma_status injected_failure;
+
+  // 功能：构造 CQ build-failure policy，初始化观察标志和可选注入状态，不改变默认 CQ policy 的所有权边界。
+  // 输入/输出及副作用：name（输入）；构造函数建立本地
+  //   snapshot_seen_at_build 与 injected_failure 状态，不取得 manager、CMQ 或
+  //   backing 所有权。
+  // 失败/边界：构造只建立测试 fixture；未注入 failure 时沿用基类命令构造，注入空 status 时不伪造失败结果。
+  function new(string name = "rdma_queue_cq_build_failure_policy");
+    super.new(name);
+    snapshot_seen_at_build = 1'b0;
+    injected_failure = null;
+  endfunction
+
+  // 功能：build_create_command 观察 CQ create descriptor 构造时是否已经发布 programmed CQC，并可注入确定性构造失败。
+  // 输入/输出及副作用：owner、resource、context_model、timeout、command
+  //   （输入/输出）；函数只更新观察标志和 command 输出，不提交 CMQ 或修改
+  //   manager。
+  // 失败/边界：resource 不是 CQ 时交由基类返回类型错误；injected_failure 非空时返回 detached failure，避免产生可发送 command。
+  virtual function rdma_status build_create_command(
+    rdma_function_handle owner,
+    rdma_queue_resource resource,
+    rdma_hw_model context_model,
+    time timeout,
+    output rdma_cmq_command_desc command
+  );
+    rdma_cq cq;
+
+    snapshot_seen_at_build = 1'b0;
+    if ($cast(cq, resource))
+      snapshot_seen_at_build = cq.programmed_cqc != null;
+    if (injected_failure != null) begin
+      command = null;
+      return rdma_cmq_clone_status_value(injected_failure);
+    end
+    return super.build_create_command(owner, resource, context_model,
+                                      timeout, command);
+  endfunction
+endclass
+
+class rdma_queue_lifecycle_executor_policy_probe extends
+  rdma_queue_lifecycle_executor;
+  `uvm_object_utils(rdma_queue_lifecycle_executor_policy_probe)
+
+  // 功能：构造可替换 CQ policy 的 executor probe，保留生产 executor 的锁、账本和生命周期实现。
+  // 输入/输出及副作用：name（输入）；构造函数只调用基类并建立测试对象，不接管外部资源。
+  // 失败/边界：probe 不改变生产路径；未安装 policy 时继续使用基类默认 CQ policy。
+  function new(string name = "rdma_queue_lifecycle_executor_policy_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：install_cq_policy 将测试专用 CQ policy 注入 executor 的 protected seam，供构造失败时序断言使用。
+  // 输入/输出及副作用：policy（输入）；成功时替换本 probe 的非拥有 policy 引用，不修改 manager、CMQ 或 backing。
+  // 失败/边界：policy 为空时保持既有 policy，调用方不得据此推断生产配置发生变化。
+  function void install_cq_policy(rdma_cq_lifecycle_policy policy);
+    if (policy != null)
+      cq_policy = policy;
   endfunction
 endclass
 
@@ -881,7 +983,6 @@ class rdma_queue_lifecycle_test extends uvm_test;
 
   // 功能：在 rdma_queue_lifecycle_test 中，add_borrowed_slice 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
   // 输入/输出及副作用：preflight（输入）、name（输入）、role（输入）、mapping（输入）、mapping_offset（输入）、length（输入）、logical_offset（输入）；add_borrowed_slice 可能更新本对象明确拥有的状态；函数返回 void，不取得调用方资源所有权。
-
   // 失败/边界：add_borrowed_slice 无返回值，仅执行 slice=make_slice(name, role, mapping, mapping_offset, length)、slice.logical_queue_offset=logical_offset；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
   function automatic void add_borrowed_slice(
     rdma_queue_preflight preflight,
@@ -1102,6 +1203,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_ceq other_ceq;
     rdma_pd pd_dependency;
     rdma_create_cq_req cq_req;
+    rdma_null_cq_request_status null_cq_req;
     rdma_create_srq_req srq_req;
     rdma_create_ceq_req ceq_req;
     rdma_create_aeq_req aeq_req;
@@ -1124,6 +1226,25 @@ class rdma_queue_lifecycle_test extends uvm_test;
     cq_req.owner = binding.make_handle();
     cq_req.depth = 64;
     cq_req.ceq_h = ceq_dependency.handle;
+
+    // RED：policy 必须把 virtual request.validate() 的 null 返回归一化为
+    // INVALID_STATE；否则 common_preflight_status 会在 status.ok() 处触发
+    // 空句柄解引用，并且可能留下已准备的 preflight 输出。
+    null_cq_req = rdma_null_cq_request_status::type_id::create(
+      "null_cq_request_status"
+    );
+    null_cq_req.owner = binding.make_handle();
+    null_cq_req.depth = 64;
+    null_cq_req.cqe_size_bytes = 64;
+    null_cq_req.ceq_h = ceq_dependency.handle;
+    preflight = null;
+    expect_status("CQ_NULL_REQUEST_STATUS",
+      cq_policy.preflight(binding, null_cq_req, manager, preflight),
+      RDMA_SC_INVALID_STATE);
+    if (preflight != null)
+      `uvm_error("CQ_NULL_REQUEST_STATUS",
+                 "null request status published a preflight result")
+
     for (int unsigned cqe_size = 32; cqe_size <= 128; cqe_size *= 2) begin
       cq_req.cqe_size_bytes = cqe_size;
       preflight = null;
@@ -2279,7 +2400,9 @@ class rdma_queue_lifecycle_test extends uvm_test;
     byte unsigned slot_image[];
     byte unsigned shadow_image[];
     rdma_cmq_command_desc command;
-    rdma_hw_object_id_command_body object_body;
+    rdma_hw_cqc_delete_body delete_body;
+    uvm_object cloned_object;
+    rdma_cqc_model detached_cqc;
     rdma_hw_occ_flush_body occ_body;
     rdma_queue_flush_target target;
     rdma_queue_resource wrong_resource;
@@ -2379,12 +2502,22 @@ class rdma_queue_lifecycle_test extends uvm_test;
     if (command != null)
       `uvm_error("CQC_REJECTS_FOREIGN_COMMAND_OWNER",
                  "failed foreign-owner command leaked caller output")
+
+    // A programmed CQ retains the canonical CQC image that the driver copies
+    // into qword1..qword7 of CQC_DELETE.  The lifecycle policy must not fall
+    // back to an object-ID-only body after create succeeds.
+    cloned_object = cqc.clone();
+    if (cloned_object == null || !$cast(detached_cqc, cloned_object))
+      `uvm_error("CQC_DELETE_COMMAND", "CQC context clone failed")
+    cq.programmed_cqc = detached_cqc;
     expect_status("CQC_DELETE_COMMAND",
       cq_policy.build_object_command(8'h0e, owner, cq, 100ns, command),
       RDMA_SC_OK);
     if (command == null || command.opcode_key.opcode != 8'h0e ||
-        !$cast(object_body, command.body) ||
-        object_body.object_h.object_id != cq.local_cq_id)
+        !$cast(delete_body, command.body) || delete_body.cqc_context == null ||
+        delete_body.cqc_context.cq_h == null ||
+        delete_body.cqc_context.cq_h.object_id != cq.local_cq_id ||
+        delete_body.cqc_context == cqc)
       `uvm_error("CQC_DELETE_COMMAND", "CQC delete descriptor is incorrect")
     expect_status("CQC_QUERY_COMMAND",
       cq_policy.build_object_command(8'h0f, owner, cq, 100ns, command),
@@ -2886,7 +3019,6 @@ class rdma_queue_lifecycle_test extends uvm_test;
 
   // 功能：在 rdma_queue_lifecycle_test 中，retry_executor_local_cleanup 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
   // 输入/输出及副作用：label（输入）、manager（输入）、mem（输入）、context_backing（输入）、resource_h（输入）；retry_executor_local_cleanup 驱动下游事务；函数返回 无直接返回值，不取得调用方资源所有权。
-
   // 失败/边界：retry_executor_local_cleanup 异常完成由下游接口或 UVM 报告机制发布；该路径不隐式重试，也不转移未声明资源。
   task automatic retry_executor_local_cleanup(
     string label,
@@ -2990,6 +3122,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_queue_lifecycle_executor executor;
     rdma_semantic_request request;
     rdma_queue_resource queue;
+    rdma_cq active_cq;
     rdma_control_result result;
     rdma_resource looked_up;
     rdma_status status;
@@ -3045,6 +3178,17 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status({label, "_LOOKUP"}, status, RDMA_SC_OK);
     if (looked_up == null || looked_up.state != RDMA_RESOURCE_ACTIVE)
       `uvm_error(label, "registry did not retain the ACTIVE queue")
+    if (kind == RDMA_RESOURCE_CQ) begin
+      if (!$cast(active_cq, queue) || active_cq.programmed_cqc == null ||
+          active_cq.programmed_cqc.cq_h == null ||
+          active_cq.programmed_cqc.cq_h.object_id != active_cq.local_cq_id ||
+          active_cq.programmed_cqc.cq_h.function_uid !=
+            active_cq.handle.function_uid ||
+          active_cq.programmed_cqc.cq_h.generation !=
+            active_cq.handle.generation)
+        `uvm_error(label,
+                   "successful CQ omitted a valid programmed CQC snapshot")
+    end
     if (manager.release_reserved_calls != 0 ||
         count_executor_host_calls(mem, "release") != 0 ||
         context_backing.release_call_count != 0)
@@ -3092,6 +3236,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_queue_lifecycle_executor executor;
     rdma_semantic_request request;
     rdma_queue_resource queue;
+    rdma_cq ambiguous_cq;
     rdma_control_result result;
     rdma_resource looked_up;
     rdma_recovery_record recovery;
@@ -3166,6 +3311,16 @@ class rdma_queue_lifecycle_test extends uvm_test;
           recovery.queue_query_opcode == null ||
           recovery.queue_query_opcode.opcode != 8'h0f)
         `uvm_error(label, "timeout recovery lost queue plan/ticket/opcodes")
+      if (!$cast(ambiguous_cq, queue) || ambiguous_cq.programmed_cqc == null ||
+          ambiguous_cq.programmed_cqc.cq_h == null ||
+          ambiguous_cq.programmed_cqc.cq_h.object_id !=
+            ambiguous_cq.local_cq_id ||
+          ambiguous_cq.programmed_cqc.cq_h.function_uid !=
+            ambiguous_cq.handle.function_uid ||
+          ambiguous_cq.programmed_cqc.cq_h.generation !=
+            ambiguous_cq.handle.generation)
+        `uvm_error(label,
+                   "ambiguous CQ create lost programmed CQC recovery authority")
       if (count_executor_host_calls(mem, "release") != 0 ||
           context_backing.release_call_count != 0 ||
           manager.release_reserved_calls != 0)
@@ -3335,6 +3490,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
     rdma_queue_resource queue;
     rdma_control_result result;
     rdma_recovery_record recovery;
+    rdma_cq recovered_cq;
     rdma_status primary;
     rdma_status cleanup_failure;
     rdma_status status;
@@ -3383,6 +3539,8 @@ class rdma_queue_lifecycle_test extends uvm_test;
     if (recovery == null || recovery.queue_plan == null ||
         recovery.queue_plan.context_ref == null ||
         recovery.queue_plan.context_ref.release_complete ||
+        !$cast(recovered_cq, queue) ||
+        recovered_cq.programmed_cqc != null ||
         recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT ||
         recovery.ambiguous_queue_operation != RDMA_QUEUE_AMBIG_NONE ||
         recovery.ambiguous_ticket != null ||
@@ -3402,10 +3560,75 @@ class rdma_queue_lifecycle_test extends uvm_test;
     expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
   endtask
 
+  // 功能：在测试辅助
+  //   rdma_queue_lifecycle_test.check_executor_cq_build_failure_snapshot_timing
+  //   中注入 CQ create descriptor 构造失败，验证 CQC snapshot 只在 descriptor
+  //   可用后发布。
+  // 输入/输出及副作用：无显式参数；fixture、policy、manager、backing 和 CMQ
+  //   由 task 创建并在结束前释放，执行时产生 UVM assertion/report。
+  // 失败/边界：若 build_create_command 已看到 programmed_cqc、CMQ 被错误触发或
+  //   reservation 未回收，则报告 UVM_ERROR；该 task 不接受失败后继续提交。
+  task automatic check_executor_cq_build_failure_snapshot_timing();
+    string label;
+    rdma_function_binding binding;
+    rdma_fault_inject_resource_manager manager;
+    rdma_ceq dependency;
+    rdma_queue_executor_trace_mem mem;
+    rdma_queue_executor_trace_context context_backing;
+    rdma_mock_cmq_port cmq;
+    rdma_queue_cq_build_failure_policy policy;
+    rdma_queue_lifecycle_executor_policy_probe executor;
+    rdma_semantic_request request;
+    rdma_queue_resource queue;
+    rdma_control_result result;
+    rdma_status status;
+
+    label = "EXEC_CQ_BUILD_FAILURE_SNAPSHOT";
+    binding = make_binding({label, "_binding"});
+    manager = rdma_fault_inject_resource_manager::type_id::create(
+      {label, "_manager"}
+    );
+    expect_status({label, "_DEPENDENCY"},
+                  manager.create_ceq(binding, dependency), RDMA_SC_OK);
+    mem = rdma_queue_executor_trace_mem::type_id::create({label, "_mem"});
+    context_backing = rdma_queue_executor_trace_context::type_id::create(
+      {label, "_context"}
+    );
+    cmq = rdma_mock_cmq_port::type_id::create({label, "_cmq"});
+    policy = rdma_queue_cq_build_failure_policy::type_id::create(
+      {label, "_policy"}
+    );
+    policy.injected_failure = rdma_status::make(
+      RDMA_SC_INVALID_ARGUMENT, "injected CQ descriptor build failure"
+    );
+    executor = rdma_queue_lifecycle_executor_policy_probe::type_id::create(
+      {label, "_executor"}
+    );
+    expect_status({label, "_CONFIGURE"}, executor.configure(
+      manager, cmq, mem, context_backing, 100ns
+    ), RDMA_SC_OK);
+    executor.install_cq_policy(policy);
+    request = make_executor_request({label, "_request"}, RDMA_RESOURCE_CQ,
+                                    binding, dependency, 1'b0);
+    executor.create_locked(binding, binding.make_handle(), request, 64'd411,
+                           queue, result);
+    if (result == null || result.status == null ||
+        result.status.code != RDMA_SC_INVALID_ARGUMENT ||
+        result.recovery_required || queue != null ||
+        policy.snapshot_seen_at_build || cmq.calls.size() != 0 ||
+        manager.release_reserved_calls != 1)
+      `uvm_error(label,
+                 "CQ build failure published a premature snapshot or leaked reservation")
+    status = manager.release_reserved(dependency.handle);
+    expect_status({label, "_DEPENDENCY_RELEASED"}, status, RDMA_SC_OK);
+  endtask
+
   // 功能：在测试辅助 rdma_queue_lifecycle_test.check_executor_prestage_cleanup_recovery 中构造或驱动“executor prestage cleanup
   //   recovery”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
+  // 失败/边界：fixture 未初始化、故障注入未生效、CQ pre-context recovery
+  //       未发布 ERROR/typed-key authority，或观测值与预期不一致时报告
+  //       UVM_ERROR/断言失败；测试不会吞掉失败。
   task automatic check_executor_prestage_cleanup_recovery();
     for (int unsigned mode = 0; mode < 3; mode++) begin
       string label;
@@ -3421,6 +3644,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
       rdma_queue_resource queue;
       rdma_control_result result;
       rdma_recovery_record recovery;
+      rdma_cq recovered_cq;
       rdma_status primary;
       rdma_status cleanup_failure;
       rdma_status status;
@@ -3482,7 +3706,13 @@ class rdma_queue_lifecycle_test extends uvm_test;
           ) != 1 ||
           count_executor_recovery_step(
             recovery.pending_steps, RDMA_CTRL_STEP_BACKING_RELEASED
-          ) != 1 || manager.release_reserved_calls != 0)
+          ) != 1 || manager.release_reserved_calls != 0 ||
+          (kind == RDMA_RESOURCE_CQ &&
+           (!$cast(recovered_cq, queue) ||
+            recovered_cq.programmed_cqc != null)) ||
+          (kind == RDMA_RESOURCE_CQ &&
+           (recovery.queue_delete_opcode == null ||
+            recovery.queue_delete_opcode.opcode != RDMA_OP_CQC_DELETE)))
         `uvm_error(label,
                    "pre-stage cleanup failure lost transaction authority")
       retry_executor_local_cleanup(label, manager, mem, context_backing,
@@ -4125,6 +4355,7 @@ class rdma_queue_lifecycle_test extends uvm_test;
       check_executor_failure_case(mode);
     check_executor_cq_reset_cancelled();
     check_executor_local_cleanup_recovery();
+    check_executor_cq_build_failure_snapshot_timing();
     check_executor_prestage_cleanup_recovery();
     check_executor_reservation_release_recovery();
     check_executor_eq_rollback_recovery();

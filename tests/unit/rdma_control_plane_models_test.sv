@@ -131,6 +131,7 @@ class rdma_control_plane_models_test extends uvm_test;
     hmc_ref.address.value = 64'h0000_0000_8000_0000;
     hmc_ref.size = 64'h1000;
     hmc_ref.first_pbl_index = first_pbl_index;
+    hmc_ref.index_valid = 1'b1;
     hmc_ref.ownership = RDMA_OWNERSHIP_BORROWED;
     hmc_ref.release_complete = 1'b0;
     return hmc_ref;
@@ -326,9 +327,11 @@ class rdma_control_plane_models_test extends uvm_test;
                   RDMA_SC_INVALID_ARGUMENT);
     hmc_ref.size = 64'h1000;
     hmc_ref.first_pbl_index = 0;
+    hmc_ref.index_valid = 1'b0;
     expect_status("HMC_REF_INDEX", hmc_ref.validate(),
                   RDMA_SC_INVALID_ARGUMENT);
     hmc_ref.first_pbl_index = 32'h80;
+    hmc_ref.index_valid = 1'b1;
     hmc_ref.release_complete = 1'b1;
     expect_status("HMC_REF_BORROWED_RELEASED", hmc_ref.validate(),
                   RDMA_SC_INVALID_STATE);
@@ -404,6 +407,7 @@ class rdma_control_plane_models_test extends uvm_test;
     descriptor.page_layout.pba0 = '0;
     descriptor.page_layout.pba1 = '0;
     descriptor.page_layout.first_pbl_index = hmc_ref.first_pbl_index;
+    descriptor.page_layout.first_pbl_index_valid = 1'b1;
     descriptor.hmc_refs.push_back(hmc_ref);
     expect_status("MR_BACKING_PBL2", descriptor.validate(), RDMA_SC_OK);
     cloned_object = descriptor.clone();

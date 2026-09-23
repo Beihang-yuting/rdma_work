@@ -6,6 +6,119 @@
 // 中文说明：rdma_context_model_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 功能：构造返回 null 状态的 QPC behavior 校验夹具，覆盖 context model 的
+//       第一个可覆写嵌套 validator 边界。
+// 输入/输出及副作用：name（输入）；new 只初始化本地 UVM 对象；validate()
+//       不修改行为字段而返回 null。
+// 失败/边界：该 fixture 仅用于验证 QPC fail-closed 语义；null 结果不得被当作
+//       成功，也不得继续生成 QPC wire image。
+class rdma_null_context_behavior_status extends rdma_qpc_behavior;
+  `uvm_object_utils(rdma_null_context_behavior_status)
+
+  // 功能：创建空状态 QPC behavior fixture，并沿用基类字段默认值。
+  // 输入/输出及副作用：name（输入）；new 不接管 QP、CMQ 或 context backing
+  //       所有权。
+  // 失败/边界：构造成功不代表 behavior 有效；本夹具的 validate() 始终返回 null。
+  function new(string name = "rdma_null_context_behavior_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 behavior validator 丢失 rdma_status，验证 QPC 不解引用空句柄。
+  // 输入/输出及副作用：无显式输入；不修改字段，返回 null 状态句柄。
+  // 失败/边界：null 是刻意注入的 contract violation；调用方必须转换为确定失败。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 QPC address-vector 校验夹具，覆盖 QPC 路由扩展边界。
+// 输入/输出及副作用：name（输入）；new 只初始化本地 address-vector 值；validate()
+//       不访问外部路由资源而返回 null。
+// 失败/边界：该 fixture 不可作为真实 address-vector authority 发布。
+class rdma_null_context_address_vector_status extends rdma_address_vector;
+  `uvm_object_utils(rdma_null_context_address_vector_status)
+
+  // 功能：创建空状态 address-vector fixture。
+  // 输入/输出及副作用：name（输入）；new 不修改外部对象或资源所有权。
+  // 失败/边界：构造成功不代表 address-vector 已通过驱动字段约束。
+  function new(string name = "rdma_null_context_address_vector_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 address-vector validator 丢失状态，验证 QPC 将异常归一化。
+  // 输入/输出及副作用：无显式输入；不修改向量字段，返回 null。
+  // 失败/边界：null 返回值不可被调用方继续调用 ok()。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 QPC transport-extension 校验夹具，保持 RC 类型身份。
+// 输入/输出及副作用：name（输入）；new 建立 RC extension 默认字段；validate()
+//       不修改 transport 参数而返回 null。
+// 失败/边界：该 fixture 只覆盖状态契约，不改变任何 RC 位域定义。
+class rdma_null_context_transport_status extends rdma_qpc_rc_ext;
+  `uvm_object_utils(rdma_null_context_transport_status)
+
+  // 功能：创建空状态 RC transport extension fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管 QPC 或 CMQ 生命周期。
+  // 失败/边界：构造成功不代表 RC extension 可编码。
+  function new(string name = "rdma_null_context_transport_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 RC transport validator 丢失状态，验证 QPC fail-closed。
+  // 输入/输出及副作用：无显式输入；不修改 RC 字段，返回 null 状态句柄。
+  // 失败/边界：null 是故障注入结果，不能继续解引用。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 page-layout 校验夹具，覆盖 CQC/CEQC/AEQC 嵌套布局边界。
+// 输入/输出及副作用：name（输入）；new 沿用 page-layout 默认值；validate()
+//       不修改布局而返回 null。
+// 失败/边界：该 fixture 不改变 page-table 几何或原始驱动布局。
+class rdma_null_context_page_layout_status extends rdma_page_table_layout;
+  `uvm_object_utils(rdma_null_context_page_layout_status)
+
+  // 功能：创建空状态 page-layout fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管 context backing 所有权。
+  // 失败/边界：构造成功不代表布局可发布。
+  function new(string name = "rdma_null_context_page_layout_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 page-layout validator 丢失状态，验证各 EQ context model 不解引用空句柄。
+  // 输入/输出及副作用：无显式输入；不修改布局字段，返回 null。
+  // 失败/边界：null 返回值必须转换为 INVALID_STATE。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
+// 功能：构造返回 null 状态的 ring-position 校验夹具，覆盖 CQC/CEQC/AEQC 的环游标边界。
+// 输入/输出及副作用：name（输入）；new 沿用 ring position 默认值；validate()
+//       不修改游标而返回 null。
+// 失败/边界：该 fixture 仅验证 status 契约，不改变 PI/CI/wrap 语义。
+class rdma_null_context_ring_status extends rdma_ring_position;
+  `uvm_object_utils(rdma_null_context_ring_status)
+
+  // 功能：创建空状态 ring-position fixture。
+  // 输入/输出及副作用：name（输入）；new 不接管队列环或门铃所有权。
+  // 失败/边界：构造成功不代表游标可用于硬件上下文。
+  function new(string name = "rdma_null_context_ring_status");
+    super.new(name);
+  endfunction
+
+  // 功能：模拟 ring-position validator 丢失状态，验证 EQ context fail-closed。
+  // 输入/输出及副作用：无显式输入；不修改 index/wrap，返回 null。
+  // 失败/边界：null 返回值不得继续调用 ok()。
+  virtual function rdma_status validate();
+    return null;
+  endfunction
+endclass
+
 class rdma_context_model_test extends uvm_test;
   `uvm_component_utils(rdma_context_model_test)
 
@@ -66,6 +179,25 @@ class rdma_context_model_test extends uvm_test;
     else if (status.code != RDMA_SC_INVALID_ARGUMENT)
       `uvm_error(label,
                  $sformatf("expected INVALID_ARGUMENT, got %s (%s)",
+                           status.code.name(), status.convert2string()))
+  endfunction
+
+  // 功能：expect_code 比较 context model 返回的精确状态码，覆盖 null-status
+  //       归一化和其他边界分支的可观察契约。
+  // 输入/输出及副作用：label、status、expected（输入）；函数只产生 UVM
+  //       error 报告，不修改模型或资源账本。
+  // 失败/边界：status 为空或 code 与 expected 不同都报告错误，并保留实际
+  //       status 文本，避免把模拟器异常误判为业务拒绝。
+  function void expect_code(
+    string label,
+    rdma_status status,
+    rdma_status_code_e expected
+  );
+    if (status == null)
+      `uvm_error(label, "context model returned null status")
+    else if (status.code != expected)
+      `uvm_error(label,
+                 $sformatf("expected %s, got %s (%s)", expected.name(),
                            status.code.name(), status.convert2string()))
   endfunction
 
@@ -238,7 +370,7 @@ class rdma_context_model_test extends uvm_test;
     mrt = rdma_mrt_model::type_id::create(name);
     mrt.mr_h = make_handle({name, "_mr"}, RDMA_RESOURCE_MR, 32'h000123);
     mrt.pd_h = make_handle({name, "_pd"}, RDMA_RESOURCE_PD, 32'h000202);
-    mrt.state = RDMA_CONTEXT_VALID;
+    mrt.state = RDMA_MR_STATE_VALID;
     mrt.iova.value = 64'h0000_0000_8000_0000;
     mrt.length = 64'h2000;
     mrt.lkey = 32'h0001_235a;
@@ -339,6 +471,16 @@ class rdma_context_model_test extends uvm_test;
     rdma_aeqc_model aeqc_clone;
     rdma_qpc_urc_ext urc_ext;
     rdma_qpc_urc_ext urc_ext_clone;
+    rdma_qpc_behavior saved_qpc_behavior;
+    rdma_address_vector saved_qpc_address_vector;
+    rdma_qpc_transport_ext saved_qpc_transport_ext;
+    rdma_null_context_behavior_status null_qpc_behavior;
+    rdma_null_context_address_vector_status null_qpc_address_vector;
+    rdma_null_context_transport_status null_qpc_transport;
+    rdma_page_table_layout saved_page_layout;
+    rdma_ring_position saved_ring_position;
+    rdma_null_context_page_layout_status null_page_layout;
+    rdma_null_context_ring_status null_ring_position;
     rdma_qp qp;
     rdma_srq srq;
     rdma_status status;
@@ -434,6 +576,38 @@ class rdma_context_model_test extends uvm_test;
 
     qpc = make_qpc("qpc");
     expect_ok("QPC_VALID", qpc.validate());
+
+    // RED：QPC 的三个嵌套 virtual validator 若返回 null，context model
+    //       必须返回 INVALID_STATE，而不能在 .ok() 处触发 NOA。
+    saved_qpc_behavior = qpc.behavior;
+    null_qpc_behavior = rdma_null_context_behavior_status::type_id::create(
+      "null_qpc_behavior"
+    );
+    qpc.behavior = null_qpc_behavior;
+    expect_code("QPC_NULL_BEHAVIOR_STATUS", qpc.validate(),
+                RDMA_SC_INVALID_STATE);
+    qpc.behavior = saved_qpc_behavior;
+
+    saved_qpc_address_vector = qpc.address_vector;
+    null_qpc_address_vector =
+      rdma_null_context_address_vector_status::type_id::create(
+        "null_qpc_address_vector"
+      );
+    qpc.address_vector = null_qpc_address_vector;
+    expect_code("QPC_NULL_ADDRESS_VECTOR_STATUS", qpc.validate(),
+                RDMA_SC_INVALID_STATE);
+    qpc.address_vector = saved_qpc_address_vector;
+
+    saved_qpc_transport_ext = qpc.transport_ext;
+    null_qpc_transport = rdma_null_context_transport_status::type_id::create(
+      "null_qpc_transport"
+    );
+    null_qpc_transport.remote_qpn = 24'h654321;
+    qpc.transport_ext = null_qpc_transport;
+    expect_code("QPC_NULL_TRANSPORT_STATUS", qpc.validate(),
+                RDMA_SC_INVALID_STATE);
+    qpc.transport_ext = saved_qpc_transport_ext;
+
     if (qpc.path_mtu_bytes != 1024 ||
         !uvm_is_match("*mtu=1024*", qpc.describe()))
       `uvm_error("QPC_PATH_MTU",
@@ -463,6 +637,26 @@ class rdma_context_model_test extends uvm_test;
 
     cqc = make_cqc("cqc");
     expect_ok("CQC_VALID", cqc.validate());
+
+    // CQC page layout and ring positions are independently virtual seams; a
+    // null status from either must not be mistaken for a valid context.
+    saved_page_layout = cqc.page_layout;
+    null_page_layout = rdma_null_context_page_layout_status::type_id::create(
+      "null_cqc_page_layout"
+    );
+    cqc.page_layout = null_page_layout;
+    expect_code("CQC_NULL_PAGE_LAYOUT_STATUS", cqc.validate(),
+                RDMA_SC_INVALID_STATE);
+    cqc.page_layout = saved_page_layout;
+
+    saved_ring_position = cqc.producer;
+    null_ring_position = rdma_null_context_ring_status::type_id::create(
+      "null_cqc_producer"
+    );
+    cqc.producer = null_ring_position;
+    expect_code("CQC_NULL_RING_STATUS", cqc.validate(), RDMA_SC_INVALID_STATE);
+    cqc.producer = saved_ring_position;
+
     cloned_object = cqc.clone();
     if (!$cast(cqc_clone, cloned_object))
       `uvm_error("CQC_CLONE", "CQC clone lost dynamic type")
@@ -506,6 +700,14 @@ class rdma_context_model_test extends uvm_test;
 
     ceqc = make_ceqc("ceqc");
     expect_ok("CEQC_VALID", ceqc.validate());
+    saved_page_layout = ceqc.page_layout;
+    null_page_layout = rdma_null_context_page_layout_status::type_id::create(
+      "null_ceqc_page_layout"
+    );
+    ceqc.page_layout = null_page_layout;
+    expect_code("CEQC_NULL_PAGE_LAYOUT_STATUS", ceqc.validate(),
+                RDMA_SC_INVALID_STATE);
+    ceqc.page_layout = saved_page_layout;
     cloned_object = ceqc.clone();
     if (!$cast(ceqc_clone, cloned_object))
       `uvm_error("CEQC_CLONE", "CEQC clone lost dynamic type")
@@ -521,6 +723,14 @@ class rdma_context_model_test extends uvm_test;
 
     aeqc = make_aeqc("aeqc");
     expect_ok("AEQC_VALID", aeqc.validate());
+    saved_page_layout = aeqc.page_layout;
+    null_page_layout = rdma_null_context_page_layout_status::type_id::create(
+      "null_aeqc_page_layout"
+    );
+    aeqc.page_layout = null_page_layout;
+    expect_code("AEQC_NULL_PAGE_LAYOUT_STATUS", aeqc.validate(),
+                RDMA_SC_INVALID_STATE);
+    aeqc.page_layout = saved_page_layout;
     cloned_object = aeqc.clone();
     if (!$cast(aeqc_clone, cloned_object))
       `uvm_error("AEQC_CLONE", "AEQC clone lost dynamic type")
@@ -823,6 +1033,7 @@ class rdma_context_model_test extends uvm_test;
     mr_page_layout.pba0 = '0;
     mr_page_layout.pba1 = '0;
     mr_page_layout.first_pbl_index = 1;
+    mr_page_layout.first_pbl_index_valid = 1'b1;
     expect_ok("PBL2_VALID", mr_page_layout.validate());
     mr_page_layout.pbl_mode = rdma_mr_pbl_mode_e'(2'b11);
     expect_invalid("ILLEGAL_MODE", mr_page_layout.validate());
@@ -838,6 +1049,7 @@ class rdma_context_model_test extends uvm_test;
     mr_page_layout.pba0.value = 64'h4000_0000;
     mr_page_layout.pba1 = '0;
     mr_page_layout.first_pbl_index = 1;
+    mr_page_layout.first_pbl_index_valid = 1'b1;
     expect_invalid("CONTRADICTORY_PBL2", mr_page_layout.validate());
 
     mrt.length = 0;

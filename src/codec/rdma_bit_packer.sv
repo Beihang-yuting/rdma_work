@@ -45,10 +45,12 @@ class rdma_bit_packer extends uvm_object;
     return initialize(image_byte_count);
   endfunction
 
-  // 功能：validate_access 校验 bytes、bit_offset、width、end_exclusive 与当前对象状态的一致性，并显式处理“bit packer is not initialized”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：bytes（输入）、bit_offset（输入）、width（输入）、end_exclusive（输出）；validate_access 读取 bytes、bit_offset、width、end_exclusive 并使用字段 end_exclusive、extended_end、capacity_bits，并写入 end_exclusive；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：validate_access 返回 RDMA_SC_INVALID_STATE、RDMA_SC_CODEC_ERROR；典型拒绝条件为“bit packer is not initialized”“field width must be in the range 1..64”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：validate_access 验证 bit packer 已初始化、bytes 长度匹配，并计算
+  //   [bit_offset, end_exclusive) 是否落在 image 容量内。
+  // 输入/输出及副作用：bytes、bit_offset、width（输入），end_exclusive（输出）；先清零输出，
+  //   只读 expected_byte_count/initialized，不修改 bytes 或 occupancy。
+  // 失败/边界：packer 未初始化、image 长度不符、width 不在 1..64、位区间发生 64-bit 溢出
+  //   或超出 image 时返回 INVALID_STATE/CODEC_ERROR，失败不得让调用方写入。
   protected function rdma_status validate_access(
     byte unsigned bytes[],
     longint unsigned bit_offset,
@@ -85,10 +87,12 @@ class rdma_bit_packer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_bit_packer 中，put_u64 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：bytes（引用）、bit_offset（输入）、width（输入）、value（输入）；put_u64 读取 bytes、bit_offset、width、value 并使用字段 status、bit_index、byte_index、bit_in_byte，并写入 bytes；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：put_u64 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：put_u64 把 value 的低 width 位按 bit_offset 写入 ref image，并同步标记 occupancy，
+  //   供后续字段重叠检查。
+  // 输入/输出及副作用：bytes（ref 输入/输出）、bit_offset、width、value（输入）；成功时修改
+  //   bytes 和本对象 occupancy，不拥有调用方 image 的生命周期。
+  // 失败/边界：几何校验失败、value 超出 width 或目标 occupancy 已占用时返回 CODEC_ERROR；
+  //   所有检查先于写入，失败保持 bytes/occupancy 不变。
   function rdma_status put_u64(
     ref byte unsigned bytes[],
     input longint unsigned bit_offset,

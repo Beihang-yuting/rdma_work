@@ -1,0 +1,7 @@
+Host: ubuntu@10.11.10.53 (login bash via scripts/run_vcs53.sh)
+Command: scripts/run_vcs53.sh core rdma_cmq_codec_test
+UVM Report Summary: warning=0 error=0 fatal=0
+PROCESS PASS logical=rdma_cmq_codec_test physical=rdma_cmq_codec_test
+LOGICAL PASS logical=rdma_cmq_codec_test processes=1
+Note: the baseline's expected-fatal catcher reports caught=1 while the final
+UVM severity summary remains pristine.

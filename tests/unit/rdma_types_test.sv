@@ -18,7 +18,6 @@ class rdma_types_test extends uvm_test;
 
   // 功能：status_has_defaults 按函数体读取当前字段并生成 bit 结果，供调用方进行诊断或分支决策；不修改外部资源。
   // 输入/输出及副作用：status（输入）、expected_category（输入）、expected_code（输入）、expected_severity（输入）、expected_message（输入）；status_has_defaults 读取 status、expected_category、expected_code、expected_severity、expected_message 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-
   // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
   function automatic bit status_has_defaults(
     rdma_status status,

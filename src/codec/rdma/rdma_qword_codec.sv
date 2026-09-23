@@ -6,6 +6,23 @@
 // 中文说明：rdma_qword_codec.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
+// 功能：rdma_raw_qword_mask_is_valid 在所有原始 qword ownership/reserved 检查前，
+//       以四态语义确认 raw word 和允许掩码均为确定值，再判断 raw word 是否只包含
+//       驱动声明的位。
+// 输入/输出及副作用：raw_word、allowed_mask（输入）均按 logic[63:0] 接收；函数只读
+//       两个输入，不修改 builder、image 或模型，返回 1 表示检查通过、0 表示拒绝。
+// 失败/边界：raw_word 或 allowed_mask 任一包含 X/Z 时 fail-closed；二态输入仅在
+//       (raw_word & ~allowed_mask) 精确等于零时通过，因此不会扩大任何原始驱动 mask。
+function automatic bit rdma_raw_qword_mask_is_valid(
+  input logic [63:0] raw_word,
+  input logic [63:0] allowed_mask
+);
+  if ($isunknown(raw_word) || $isunknown(allowed_mask))
+    return 1'b0;
+
+  return (raw_word & ~allowed_mask) === 64'b0;
+endfunction
+
 class rdma_hw_qword_builder extends uvm_object;
   `uvm_object_utils(rdma_hw_qword_builder)
 
@@ -57,10 +74,12 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：validate_field_access 校验 word_byte_offset、lsb、width、qword_index 与当前对象状态的一致性，并显式处理“field word byte offset is not qword aligned”；“field word byte offset is outside the image”；“field width must be in the range 1..64”；“field lsb is outside a logical qword”；“field extends beyond its logical qword”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：word_byte_offset（输入）、lsb（输入）、width（输入）、qword_index（输出）；validate_field_access 读取 word_byte_offset、lsb、width、qword_index 并使用字段 qword_index，并写入 qword_index；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：validate_field_access 返回 函数体规定的失败状态；具体拒绝条件包括 “field word byte offset is not qword aligned”；“field word byte offset is outside the image”；“field width must be in the range 1..64”；“field lsb is outside a logical qword”；“field extends beyond its logical qword”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：validate_field_access 将 byte offset/bit slice 映射到已初始化 qword builder 的合法
+  //   索引，并在任何字段读写前完成范围检查。
+  // 输入/输出及副作用：word_byte_offset、lsb、width（输入），qword_index（输出）；先把
+  //   qword_index 清零，只读 words/initialized，不修改 words 或 occupancy。
+  // 失败/边界：builder 未初始化、offset 未按 8 字节对齐、qword 超出 image、width 不在
+  //   1..64、lsb 超出 63 或字段跨 qword 时返回 INVALID_STATE/CODEC_ERROR。
   protected function rdma_status validate_field_access(
     int unsigned word_byte_offset,
     int unsigned lsb,
@@ -116,10 +135,12 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，put_field 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：word_byte_offset（输入）、lsb（输入）、width（输入）、value（输入）；put_field 读取 word_byte_offset、lsb、width、value 并使用字段 status、width_mask、field_mask；函数返回 rdma_status，不取得调用方资源所有权。
-
-  // 失败/边界：put_field 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：put_field 在通过 validate_field_access 后，把 value 按 qword 位布局写入 words，并
+  //   登记对应 occupancy 以阻止后续字段重叠。
+  // 输入/输出及副作用：word_byte_offset、lsb、width、value（输入）；成功时更新当前 builder
+  //   的 words/occupancy，函数不修改外部 image 或取得资源所有权。
+  // 失败/边界：builder 未初始化、字段几何非法、value 超出 width 或 occupancy 已占用该位时
+  //   返回错误；所有检查先于写入，失败保持 words/occupancy 不变。
   function rdma_status put_field(
     int unsigned word_byte_offset,
     int unsigned lsb,
@@ -281,7 +302,6 @@ class rdma_hw_qword_builder extends uvm_object;
 
   // 功能：validate_allowed_mask 校验 image_kind、opcode、pbl_mode 与当前对象状态的一致性，并显式处理“body mask validation requires exactly eight qwords”；“body mask overlaps request envelope ownership”；“body image contains a bit outside its allowed mask”；“image kind, opcode, and PBL mode have no rdma body mask”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：image_kind（输入）、opcode（输入）、pbl_mode（输入）；validate_allowed_mask 读取 image_kind、opcode、pbl_mode 并使用字段 rdma_status、initialized、qword_index、words；函数返回 rdma_status，不取得调用方资源所有权。
-
   // 失败/边界：validate_allowed_mask 返回 RDMA_SC_UNSUPPORTED_OPCODE；具体拒绝条件包括 “body mask validation requires exactly eight qwords”；“body mask overlaps request envelope ownership”；“body image contains a bit outside its allowed mask”；“image kind, opcode, and PBL mode have no rdma body mask”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
   function rdma_status validate_allowed_mask(
     rdma_image_kind_e image_kind,
@@ -300,9 +320,9 @@ class rdma_hw_qword_builder extends uvm_object;
         return rdma_status::make(
             RDMA_SC_UNSUPPORTED_OPCODE,
             "image kind, opcode, and PBL mode have no rdma body mask");
-      if ((mask & request_envelope_mask(qword_index)) != 0)
+      if ((mask & request_envelope_mask(qword_index)) !== 64'b0)
         return codec_error("body mask overlaps request envelope ownership");
-      if ((words[qword_index] & ~mask) != 0)
+      if (!rdma_raw_qword_mask_is_valid(words[qword_index], mask))
         return codec_error("body image contains a bit outside its allowed mask");
     end
     return rdma_status::success();
