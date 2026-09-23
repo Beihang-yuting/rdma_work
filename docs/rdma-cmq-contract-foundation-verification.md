@@ -95,10 +95,12 @@ logical gate 失败。mutation gate 还必须保持 `CQC_CREATE` request unsuppo
 | queue/control-plane/QP execution seams | `SSHPASS=<runtime-only> ./scripts/run_vcs53.sh core rdma_queue_lifecycle_test`, `rdma_queue_recovery_test`, `rdma_control_plane_cmq_engine_test`, `rdma_control_plane_test`, `rdma_qp_lifecycle_test`, and `rdma_qp_recovery_test` | PASS at the recorded source boundary; each compile/elab/link and PROCESS/LOGICAL PASS with `UVM_INFO=3`, `UVM_WARNING/ERROR/FATAL=0/0/0`; Batch136–140 deduplicate rollback/create/destroy/control-plane/QP/KEY_ALLOC raw dispatch while retaining legacy compatibility |
 | Batch157 focused CQ shadow/replay | `scripts/run_vcs53.sh core rdma_cq_engine_test`; `rdma_cq_engine_resize_test`; `rdma_cq_shadow_flush_test` | Current source boundary: all wrapper rc=0, PROCESS/LOGICAL PASS, UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`, pristine; complete wrapper hashes are recorded in the Batch157 section below |
 | Batch158 focused device publish/admission | `scripts/run_vcs53.sh core rdma_queue_data_engine_device_publish_test`; `rdma_queue_data_engine_poll_test`; `rdma_aeqe_route_test`; `rdma_aeqe_f5_e2e_test` | Current source boundary: all four wrapper rc=0, PROCESS/LOGICAL PASS, UVM `INFO=220/3/3/115`, `UVM_WARNING/ERROR/FATAL=0/0/0`, pristine; reservation/polarity helper preserves AEQE post-reservation route/epoch recheck |
+| Batch159 focused shared transport envelope decode | `scripts/run_vcs53.sh core rdma_cmq_engine_test` | Current source boundary: wrapper rc=0, 18/18 PROCESS PASS、1/1 LOGICAL PASS；18 个 UVM process report 均 pristine，`UVM_WARNING/ERROR/FATAL=0/0/0`；observed/recovery decoder 的 status/effect shape 与文案契约已覆盖 |
 | local static gates | `git diff --check`; `python3 tools/check_changed_sv_style.py --base 8b8ad4e`; queue/profile/Phase-1A checks; manifest/keyword/ownership tests; Python discover | Batch157 current boundary PASS; combined log `/tmp/batch157-static-fix.log`, SHA-256 `73e0e60ee02883bcdda68f52e72e54f07760844a1e5db3c501376e782997d13a`; full-tree scanner is recorded below |
 | Batch158 local static gates | `git diff --check`; `python3 tools/check_changed_sv_style.py --base 33be6c7`; queue/profile/Phase-1A checks; Python discover; full-tree contract scanner | Current source boundary PASS; Python 292/292, scanner 189 files/5,485 methods/0 diagnostics; final log/hash is intentionally frozen with the Batch158 commit rather than this uncommitted worktree |
-| final CMQ gate | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test`; `scripts/run_vcs53.sh cmq_gate regression` | Historical source-boundary evidence: CMQ 28/28 process, 11/11 logical, UVM 0/0/0; Batch158 后尚未刷新全量 gate |
-| compatibility/full core | host_mem, integration, focused consumers and `scripts/run_vcs53.sh core regression` | Historical source-boundary evidence: core 95/95 process, 78/78 logical, UVM 0/0/0；Batch158 仅刷新四项 device-publish/AEQE focused，完整 core 与更广 PCIe ordering/error 组合仍开放 |
+| Batch159 local static gates | `git diff --check`; `python3 tools/check_changed_sv_style.py --base 9be3470`; queue/profile/Phase-1A checks; Python discover; full-tree contract scanner | Current source boundary PASS; Python 292/292, scanner 189 files/5,488 methods/0 diagnostics; complete log/source hash is intentionally frozen with the Batch159 commit |
+| final CMQ gate | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test`; `scripts/run_vcs53.sh cmq_gate regression` | Historical source-boundary evidence: CMQ 28/28 process, 11/11 logical, UVM 0/0/0; Batch159 后尚未刷新全量 gate |
+| compatibility/full core | host_mem, integration, focused consumers and `scripts/run_vcs53.sh core regression` | Historical source-boundary evidence: core 95/95 process, 78/78 logical, UVM 0/0/0；Batch159 仅刷新一个 18-process CMQ engine focused，完整 core 与更广 PCIe ordering/error 组合仍开放 |
 
 ### Batch138 current source boundary
 
@@ -630,6 +632,44 @@ Batch158 不关闭 `configure_shared()`-only live reset 认证、跨队列/跨�
 全生命周期、legacy descriptor、外部 PCIe ordering/error、engine-level 全局锁、完整
 CMQ/core gate、全目录最终 ownership 审计或广义 Phase 1C F2；计划继续保持 `active`。
 详见 `task-cmq-batch158-device-publish-admission-report.md`。
+
+### Batch159：shared transport envelope decode
+
+Batch159 将 `rdma_cmq_engine.sv` 中 observed submit 与 recovery submit 重复的
+transport envelope 解码提取为受保护的 `decode_transport_envelope()`。helper 先清空
+四个 output，检查 envelope、status shape 与 submission-effect enum，再返回 detached
+operation status、observation code/message 和 raw effect。null envelope 按 observed/
+recovery context 保留不同的稳定文案；malformed status 不会擦除合法 effect，malformed
+effect 统一降级为 `RDMA_SUBMIT_EFFECT_UNOBSERVED`，并保持 recovery effect 文案覆盖与
+observed status/effect combined 文案规则。
+
+decoder 不执行 observer arm、effect fold、分类、retry/journal/CAS mutation，不取得
+engine lock，也不调用外部 transport。observed caller 仍负责 PRE rollback 与
+classification；recovery caller 仍负责 MMIO visibility、cumulative fold、recovery
+required 和 record/results 提交，因此 shared seam 只承担 shape/diagnostic 解码。
+
+`tests/unit/rdma_cmq_engine_test.sv` 新增 probe 与四行 recovery contract，覆盖 null、
+malformed status、malformed effect 和双 malformed；每行断言 operation/observation 文案、
+状态码、raw effect、caller-owned envelope 不变及 detached status 不 alias。该表在 recovery
+mutation fixture 前执行，既有 observed decision matrix 继续覆盖 arm/fold/retry 语义。
+
+最终源码边界的 VCS53 结果（通过 53 主机登录 bash）为：
+
+| Entry | Result |
+| --- | --- |
+| `rdma_cmq_engine_test` | wrapper rc=0；18/18 PROCESS PASS、1/1 LOGICAL PASS；18 个 process 的 UVM report 均 pristine，`UVM_WARNING/ERROR/FATAL=0/0/0` |
+
+`git diff --check`、changed-SV style（base=`9be3470`）、queue/profile/Phase-1A 及相关
+静态 gates、Python 292/292 均通过。全目录 scanner 复用
+`sanitize_source`/`method_ranges`/`check_method_comments`/`check_file_header`，覆盖
+189 个文件（187 `.sv`、2 `.svh`），5,488 methods（`.sv` 5,486、`.svh` 2），0
+diagnostics。完整 wrapper/source/log hash 在提交后冻结，避免把未提交 worktree 指纹当作
+主线证据。
+
+Batch159 不关闭 malformed recovery 的更广泛组合矩阵、跨队列/跨线程并发、engine-level
+全局锁、SRQ 全生命周期、legacy descriptor、外部 PCIe ordering/error、完整 CMQ/core
+regression、typed URC factory、最终 ownership 审计或广义 Phase 1C F2；计划继续保持
+`active`。详见 `task-cmq-batch159-transport-envelope-decode-report.md`。
 
 ## Explicit follow-up boundaries
 

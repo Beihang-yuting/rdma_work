@@ -3733,6 +3733,27 @@ class rdma_cmq_engine_probe extends rdma_cmq_engine;
     );
   endfunction
 
+  // 功能：直接观测 shared transport envelope decoder 的 recovery context，锁定
+  //   null/status/effect 三类降级文案与 raw effect 输出，不进入 journal/CAS。
+  // 输入/输出及副作用：transport_result、recovery_context 为非拥有输入；四个
+  //   output 返回 detached operation status、observation code/message 与 raw effect，
+  //   wrapper 不修改 engine、envelope、observer 或外部 scheduler。
+  // 失败/边界：调用方必须显式提供完整 output；底层 decoder 对 null、X/Z/spare
+  //   status/effect 仍按 recovery/observed context 选择稳定的非空失败证据。
+  function void decode_transport_envelope_probe(
+    input rdma_doorbell_submission_result transport_result,
+    input bit recovery_context,
+    output rdma_status operation_status,
+    output rdma_status_code_e observation_code,
+    output string observation_message,
+    output rdma_submission_effect_e raw_effect
+  );
+    decode_transport_envelope(
+      transport_result, recovery_context, operation_status,
+      observation_code, observation_message, raw_effect
+    );
+  endfunction
+
   // 功能：把解码后的 call-local 证据分类为提交结果，不触发 journal rollback、
   //   预分配消费、fence 变更或 Host-memory/MMIO 调用。
   // 输入/输出及副作用：observer_armed 是真实 retained arm bit，retry_safe 是
@@ -6722,6 +6743,121 @@ class rdma_cmq_engine_test extends uvm_test;
              source_status.code !== source_code ||
              source_status.message != source_message))))
         `uvm_error(label, "classifier changed caller-owned envelope")
+    end
+  endfunction
+
+  // 功能：用四行 recovery envelope 表锁定 shared decoder 的历史诊断优先级，覆盖
+  //   null、malformed status、malformed effect 与 status/effect 同时 malformed。
+  // 输入/输出及副作用：无显式参数；每行创建独立 probe/envelope，只读取 decoder
+  //   输出并比较 code/message/effect 与 caller-owned alias，绝不安装 journal 或 I/O。
+  // 失败/边界：recovery context 的 null/status 文案必须保持旧值；effect malformed
+  //   覆盖 recovery status 文案而不得改变 operation status；合法 effect 即使 status
+  //   malformed 也必须原样保留，任何漂移通过 UVM_ERROR 暴露。
+  function automatic void check_recovery_transport_envelope_contract();
+    rdma_cmq_engine_probe engine;
+    rdma_doorbell_submission_result envelope;
+    rdma_status operation_status;
+    rdma_status source_status;
+    rdma_status_code_e observation_code;
+    rdma_status_code_e expected_observation_code;
+    rdma_submission_effect_e raw_effect;
+    rdma_submission_effect_e expected_effect;
+    rdma_submission_effect_e source_effect;
+    rdma_status_category_e source_category;
+    rdma_status_code_e source_code;
+    string observation_message;
+    string expected_operation_message;
+    string expected_observation_message;
+    string source_message;
+    string label;
+
+    engine = rdma_cmq_engine_probe::type_id::create(
+      "recovery_transport_envelope_probe"
+    );
+    for (int unsigned case_id = 0; case_id < 4; case_id++) begin
+      label = $sformatf("RECOVERY_ENVELOPE_DECODE_%0d", case_id);
+      envelope = new($sformatf("recovery_envelope_%0d", case_id));
+      envelope.status = rdma_cmq_direct_status(
+        RDMA_SC_TIMEOUT, "recovery operation"
+      );
+      envelope.submission_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN;
+      expected_operation_message = "recovery operation";
+      expected_observation_code = RDMA_SC_OK;
+      expected_observation_message = "";
+      expected_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN;
+
+      case (case_id)
+        0: begin
+          envelope = null;
+          expected_operation_message =
+            "CMQ recovery transport returned a null envelope";
+          expected_observation_code = RDMA_SC_INVALID_STATE;
+          expected_observation_message =
+            "CMQ recovery transport envelope is missing";
+          expected_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        end
+        1: begin
+          envelope.status.code = rdma_status_code_e'(5'b1_1111);
+          expected_operation_message =
+            "CMQ recovery transport operation status is malformed";
+          expected_observation_code = RDMA_SC_INVALID_STATE;
+          expected_observation_message = expected_operation_message;
+        end
+        2: begin
+          envelope.submission_effect = rdma_submission_effect_e'(3'bx01);
+          expected_observation_code = RDMA_SC_INVALID_STATE;
+          expected_observation_message =
+            "CMQ recovery transport effect is malformed";
+          expected_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        end
+        3: begin
+          envelope.status.category = rdma_status_category_e'(4'b1111);
+          envelope.submission_effect = rdma_submission_effect_e'(3'bz00);
+          expected_operation_message =
+            "CMQ recovery transport operation status is malformed";
+          expected_observation_code = RDMA_SC_INVALID_STATE;
+          expected_observation_message =
+            "CMQ recovery transport effect is malformed";
+          expected_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        end
+        default: begin
+          `uvm_error(label, "unexpected recovery decoder table row")
+          continue;
+        end
+      endcase
+
+      source_status = (envelope == null) ? null : envelope.status;
+      source_category = (source_status == null) ?
+        RDMA_STATUS_STATE : source_status.category;
+      source_code = (source_status == null) ? RDMA_SC_OK : source_status.code;
+      source_message = (source_status == null) ? "" : source_status.message;
+      source_effect = (envelope == null) ?
+        RDMA_SUBMIT_EFFECT_UNOBSERVED : envelope.submission_effect;
+      engine.decode_transport_envelope_probe(
+        envelope, 1'b1, operation_status, observation_code,
+        observation_message, raw_effect
+      );
+      if (operation_status == null ||
+          operation_status.code !=
+            ((case_id == 0 || case_id == 1 || case_id == 3) ?
+             RDMA_SC_INVALID_STATE : RDMA_SC_TIMEOUT) ||
+          operation_status.message != expected_operation_message ||
+          observation_code != expected_observation_code ||
+          observation_message != expected_observation_message ||
+          raw_effect !== expected_effect)
+        `uvm_error(label, "recovery envelope decode contract drifted")
+      if (envelope != null &&
+          (envelope.status != source_status ||
+           envelope.submission_effect !== source_effect ||
+           (source_status != null &&
+            (source_status.category !== source_category ||
+             source_status.code !== source_code ||
+             source_status.message != source_message))))
+        `uvm_error(label, "recovery decoder changed caller-owned envelope")
+      if (source_status != null &&
+          rdma_cmq_status_shape_valid(source_status) &&
+          operation_status == source_status)
+        `uvm_error(label, "recovery decoder aliased operation status")
     end
   endfunction
 
@@ -11751,8 +11887,9 @@ class rdma_cmq_engine_test extends uvm_test;
 
   // 功能：覆盖 null envelope+unarmed 的 UNOBSERVED 下界，再由下一次 authentic
   //   arm 在仍无 envelope 时把 cumulative 推进到 MMIO_MAYBE_VISIBLE，同时保留 raw UNOBSERVED。
-  // 输入/输出及副作用：无外部输入；自建 fenced fixture，连续两次更新 expected attempt，
-  //   第二次要求 scheduler 在返回前同步调用 observer，并检查 fence/preallocation 消费。
+  // 输入/输出及副作用：无外部输入；先运行无 mutation 的 recovery envelope 表，再
+  //   自建 fenced fixture，连续两次更新 expected attempt；第二次要求 scheduler 在
+  //   返回前同步调用 observer，并检查 fence/preallocation 消费。
   // 失败/边界：未 arm 的 null envelope 不得清 journal/fence 或遗留 observer；真实 arm 后即使
   //   envelope degraded 也不得把累计存在性退回 UNOBSERVED，且旧 attempt 无再 arm 能力。
   task automatic run_task16_recovery_unobserved_effect_chain();
@@ -11776,6 +11913,7 @@ class rdma_cmq_engine_test extends uvm_test;
     string fence_key;
     string fence_reason;
 
+    check_recovery_transport_envelope_contract();
     prepare_recovery_fixture(
       "recovery_unobserved", 2, RDMA_SUBMIT_EFFECT_UNOBSERVED,
       engine, mem, scheduler, profile_service, active_binding, source_cmq,

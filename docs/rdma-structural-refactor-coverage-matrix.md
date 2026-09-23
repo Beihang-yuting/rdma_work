@@ -34,11 +34,13 @@
 
 | queue-data device-producer publish admission | Batch158 将 `publish_cqe()`、`publish_ceqe()` 与 `publish_aeqe_common()` 重复的 `reserve_device_producer()`/expected-polarity 检查提取为 `reserve_device_publish_checked()` 与 `check_device_publish_polarity()`；CQE/CEQE 继续 reservation→polarity→codec，AEQE 继续 image staging→reservation→route/epoch recheck→polarity→commit | `rdma_queue_data_engine_device_publish_test`、`rdma_queue_data_engine_poll_test`、`rdma_aeqe_route_test`、`rdma_aeqe_f5_e2e_test` | Batch158 四项 VCS53 最终源码边界均 wrapper rc=0、PROCESS/LOGICAL PASS，UVM `INFO=220/3/3/115`、WARNING/ERROR/FATAL 全为 0；`git diff --check`、changed-SV style、queue/profile/Phase-1A/Python 292 与全目录 scanner 5,485 methods/0 diagnostics GREEN | authority/codec 顺序、AEQE reservation 后 route/epoch 窗口、write/commit recovery、跨队列并发、SRQ lifecycle、legacy descriptor、外部 PCIe ordering/error、engine-level 全局锁和最终 ownership 审计仍 OPEN |
 
+| CMQ shared transport envelope decode | Batch159 将 observed submit 与 recovery submit 重复的 transport envelope 解码提取为 `decode_transport_envelope()`；统一输出 detached operation status、observation code/message 与 raw submission effect，保留 observed/recovery context 的文案差异和 malformed effect 覆盖规则；observer arm、effect fold、分类、journal/CAS mutation 仍留在 caller | `rdma_cmq_engine_test`（18-process logical runner） | Batch159 VCS53 wrapper rc=0，18/18 PROCESS PASS、1/1 LOGICAL PASS，18 个 UVM report 均 pristine（WARNING/ERROR/FATAL 全为 0）；静态 gates、Python 292/292 与全目录 scanner 5,488 methods/0 diagnostics GREEN | malformed observed/recovery 组合的更广泛矩阵、跨队列/跨线程并发、engine-level 全局锁、SRQ lifecycle、legacy descriptor、外部 ordering/error、完整 CMQ/core regression、typed URC factory 与最终 ownership/Phase-1C F2 审计仍 OPEN |
+
 > 当前口径更新（2026-09-23）：上表“外部环境与门禁”行末的 5,431 methods 是
-> Batch133 历史边界，不是当前总数。Batch158 当前 scanner 为 189 文件（187 `.sv`、
-> 2 `.svh`）、5,485 methods（`.sv` 5,483、`.svh` 2）、0 diagnostics；当前刷新了
-> 四项 device-publish/AEQE focused 与相关静态门禁，完整 CMQ/core gate 仍未重跑。表中
-> 早期行使用的“当前 worktree”均指对应批次当时的源码边界，不指 Batch158 当前源码边界。
+> Batch133 历史边界，不是当前总数。Batch159 当前 scanner 为 189 文件（187 `.sv`、
+> 2 `.svh`）、5,488 methods（`.sv` 5,486、`.svh` 2）、0 diagnostics；当前刷新了
+> CMQ engine 的 18-process shared-decoder focused 与相关静态门禁，完整 CMQ/core gate 仍未重跑。表中
+> 早期行使用的“当前 worktree”均指对应批次当时的源码边界，不指 Batch159 当前源码边界。
 
 ### pcie_work 当前接入证据（2026-09-22）
 
@@ -468,7 +470,9 @@
   0-diagnostic 结果、VCS wrapper hash 和 factory atomicity 证据见
   `task-cmq-batch157-cq-shadow-replay-atomicity-report.md`；Batch158 当前 5,485-method/
   0-diagnostic 结果与 device-publish focused 证据见
-  `task-cmq-batch158-device-publish-admission-report.md`。
+  `task-cmq-batch158-device-publish-admission-report.md`；Batch159 当前 5,488-method/
+  0-diagnostic 结果与 shared transport envelope decode 证据见
+  `task-cmq-batch159-transport-envelope-decode-report.md`。
 - `pcie_work` 的正确 suite 阻断证据是
   `evidence/post-batch87-rdma_sriov_pcie_work-correct-blocked.log`；`rc=2` 只表示
   `external dependency is not approved: pcie_work`，不是 UVM 业务失败。
@@ -793,6 +797,25 @@
   gate 和最终 ownership 审计仍 OPEN，计划继续保持 `active`。详见
   `task-cmq-batch158-device-publish-admission-report.md`。
 
+### Batch159 当前更新（2026-09-23）
+
+- `src/core/rdma_cmq_engine.sv` 新增 `decode_transport_envelope()`，统一 observed
+  submit 与 recovery submit 对 transport envelope 的 status shape、observation 文案
+  和 submission effect 解码；合法 status 仍复制为 detached status，合法 effect 保留，
+  malformed status/effect 各自 fail-closed，recovery 的 effect 文案覆盖和 observed 的
+  combined 文案均保持。decoder 不执行 observer arm、effect fold、分类、journal/CAS
+  mutation 或外部 transport 调用。
+- `tests/unit/rdma_cmq_engine_test.sv` 新增 probe 与四行 recovery envelope contract
+  （null、malformed status、malformed effect、双 malformed），并在 recovery mutation
+  fixture 前运行；caller-owned envelope、status alias、operation/observation 文案和
+  raw effect 降级均有断言。`rdma_cmq_engine_test` 在 53 机 wrapper rc=0、18/18
+  PROCESS PASS、1/1 LOGICAL PASS，18 个 UVM report 均 WARNING/ERROR/FATAL 为 0。
+- 静态 gates 与 Python 292/292 通过；全目录 scanner 为 189 文件（187 `.sv`、2 `.svh`）、
+  5,488 methods（`.sv` 5,486、`.svh` 2）、0 diagnostics。更广 malformed recovery
+  组合、并发/global lock、SRQ lifecycle、legacy descriptor、外部 ordering/error、完整
+  CMQ/core gate、typed URC factory 与最终 ownership/Phase-1C F2 审计仍 OPEN，计划继续
+  保持 `active`。详见 `task-cmq-batch159-transport-envelope-decode-report.md`。
+
 ## 尚未关闭的验收项
 
 1. Phase 1C F2 仍暂停于更广泛的 `sge_num` canonical-authority/whole-plan 收口；Batch100
@@ -832,7 +855,8 @@
    5,464 methods（`.sv` 5,462、`.svh` 2），Batch154 边界为 5,465 methods；Batch155
    边界为 5,467 methods，Batch156 最新边界为 5,469 methods（`.sv` 5,467、`.svh`
    2），Batch157 当前边界为 5,483 methods（`.sv` 5,481、`.svh` 2），Batch158 当前边界为
-   5,485 methods（`.sv` 5,483、`.svh` 2），0 diagnostics。
+   5,485 methods（`.sv` 5,483、`.svh` 2），Batch159 当前边界为 5,488 methods（`.sv`
+   5,486、`.svh` 2），0 diagnostics。
 4. Batch114 已关闭 UD codec 与通用 model/writer 对非零 inline/1–2 SGE 的 effective
    mode 对齐缺口；Batch115 已用临时 focused probe 补充公开 `post_send()`/
    `replay_pending()` 的 UD 1B inline/1–2 SGE 与 SGB failure recovery 证据；Batch116
@@ -847,7 +871,7 @@
    Batch148 当前边界为 5,460 methods/0 diagnostics；Batch152 边界为 5,464 methods/0
    diagnostics；Batch154 边界为 5,465 methods，Batch155 边界为 5,467 methods，
    Batch156 边界为 5,469 methods，Batch157 当前边界为 5,483 methods，Batch158 当前边界为
-   5,485 methods/0 diagnostics；
+   5,485 methods，Batch159 当前边界为 5,488 methods/0 diagnostics；
    不把 Batch111/Batch122 的旧计数冒充当前源码结果。
 5. 旧批次条目中的 `pcie_work` OPEN/UNAPPROVED 文案是批准前的历史记录；当前锁已按用户
    指定上游快照更新为 75 个 `APPROVED` 闭包行，`tools/check_external_dependency_lock.py`

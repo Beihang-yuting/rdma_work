@@ -8606,6 +8606,95 @@ class rdma_cmq_engine extends uvm_object;
     return snapshot;
   endfunction
 
+  // 设计说明：observed submit 与 recovery submit 都先把 transport envelope
+  //   降级为四项 detached evidence；context 只选择诊断文案和 status 名称，
+  //   不把 observer arm、effect fold、分类或 journal mutation 拉进 decoder。
+  // 功能：decode_transport_envelope 从一次 transport 返回值提取独立的 operation
+  //   status、observation 状态/文本和原始 submission effect，供 observed submit
+  //   与 recovery submit 复用同一套 shape 校验和 null/malformed 降级规则。
+  // 输入/输出及副作用：transport_result 为非拥有只读 envelope，recovery_context
+  //   只选择 observed/recovery 的稳定诊断上下文；四个 output 入口先清空，成功时
+  //   operation_status 是 detached status，raw_effect 只复制合法 effect，不修改
+  //   envelope、observer、engine lock、journal 或外部 transport。
+  // 失败/边界：null envelope、非法 status 或 X/Z/spare effect 均返回非空保守证据；
+  //   observed 在 status/effect 同时非法时保留 combined 文案，recovery 保留其
+  //   历史 effect 文案覆盖规则；非法 effect 统一降级为 UNOBSERVED，context 不会
+  //   把 envelope 自报 callback 或 effect 解释成真实 MMIO authority。
+  protected function void decode_transport_envelope(
+    input rdma_doorbell_submission_result transport_result,
+    input bit recovery_context,
+    output rdma_status operation_status,
+    output rdma_status_code_e observation_code,
+    output string observation_message,
+    output rdma_submission_effect_e raw_effect
+  );
+    bit status_valid;
+
+    operation_status = null;
+    observation_code = RDMA_SC_OK;
+    observation_message = "";
+    raw_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+    if (transport_result == null) begin
+      if (recovery_context) begin
+        operation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ recovery transport returned a null envelope"
+        );
+        observation_message = "CMQ recovery transport envelope is missing";
+      end
+      else begin
+        operation_status = rdma_cmq_direct_status(
+          RDMA_SC_INVALID_STATE,
+          "CMQ observed transport returned a null envelope"
+        );
+        observation_message = "CMQ observed transport envelope is missing";
+      end
+      observation_code = RDMA_SC_INVALID_STATE;
+      return;
+    end
+
+    status_valid = rdma_cmq_status_shape_valid(transport_result.status);
+    if (status_valid) begin
+      operation_status = copy_submit_status_direct(
+        transport_result.status,
+        recovery_context ? "cmq_recovery_operation_status" :
+                           "cmq_transport_operation_status"
+      );
+    end
+    else begin
+      operation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        recovery_context ?
+          "CMQ recovery transport operation status is malformed" :
+          "CMQ observed transport returned a malformed operation status"
+      );
+      observation_code = RDMA_SC_INVALID_STATE;
+      if (recovery_context)
+        observation_message =
+          "CMQ recovery transport operation status is malformed";
+      else
+        observation_message =
+          "CMQ observed transport operation status is malformed";
+    end
+
+    if (rdma_cmq_submission_effect_valid(
+          transport_result.submission_effect
+        )) begin
+      raw_effect = transport_result.submission_effect;
+    end
+    else begin
+      raw_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      observation_code = RDMA_SC_INVALID_STATE;
+      if (recovery_context)
+        observation_message = "CMQ recovery transport effect is malformed";
+      else if (status_valid)
+        observation_message = "CMQ observed transport effect is malformed";
+      else
+        observation_message =
+          "CMQ observed transport status and effect are malformed";
+    end
+  endfunction
+
   // 设计说明：transport 的 operation status 与 attempted effect 是独立证据；
   //   malformed 字段仅降级自身，不能擦除另一字段的有效 PRE/MMIO 事实。
   // 功能：将 observed envelope 解码为本次 submit 的直接复制 operation status、
@@ -8630,44 +8719,11 @@ class rdma_cmq_engine extends uvm_object;
     decision.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
     decision.publication_retry_safe = 1'b0;
 
-    if (transport_result == null) begin
-      decision.operation_status = rdma_cmq_direct_status(
-        RDMA_SC_INVALID_STATE,
-        "CMQ observed transport returned a null envelope"
-      );
-      decision.observation_code = RDMA_SC_INVALID_STATE;
-      decision.observation_message =
-        "CMQ observed transport envelope is missing";
-    end
-    else begin
-      if (rdma_cmq_status_shape_valid(transport_result.status)) begin
-        decision.operation_status = copy_submit_status_direct(
-          transport_result.status, "cmq_transport_operation_status"
-        );
-      end
-      else begin
-        decision.operation_status = rdma_cmq_direct_status(
-          RDMA_SC_INVALID_STATE,
-          "CMQ observed transport returned a malformed operation status"
-        );
-        decision.observation_code = RDMA_SC_INVALID_STATE;
-        decision.observation_message =
-          "CMQ observed transport operation status is malformed";
-      end
-
-      if (rdma_cmq_submission_effect_valid(
-            transport_result.submission_effect
-          )) begin
-        decision.raw_effect = transport_result.submission_effect;
-      end
-      else begin
-        decision.observation_code = RDMA_SC_INVALID_STATE;
-        decision.observation_message =
-          (decision.observation_message.len() == 0) ?
-            "CMQ observed transport effect is malformed" :
-            "CMQ observed transport status and effect are malformed";
-      end
-    end
+    decode_transport_envelope(
+      transport_result, 1'b0, decision.operation_status,
+      decision.observation_code, decision.observation_message,
+      decision.raw_effect
+    );
 
     decision.rollback_pre = !observer_armed &&
       decision.raw_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
@@ -11456,42 +11512,10 @@ class rdma_cmq_engine extends uvm_object;
     if (!observer_armed)
       arm_observers.delete(recovery_stage.capability_key);
 
-    observation_code = RDMA_SC_OK;
-    observation_message = "";
-    current_attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
-    if (transport_result == null) begin
-      operation_status = rdma_cmq_direct_status(
-        RDMA_SC_INVALID_STATE,
-        "CMQ recovery transport returned a null envelope"
-      );
-      observation_code = RDMA_SC_INVALID_STATE;
-      observation_message = "CMQ recovery transport envelope is missing";
-    end
-    else begin
-      if (rdma_cmq_status_shape_valid(transport_result.status))
-        operation_status = copy_submit_status_direct(
-          transport_result.status, "cmq_recovery_operation_status"
-        );
-      else begin
-        operation_status = rdma_cmq_direct_status(
-          RDMA_SC_INVALID_STATE,
-          "CMQ recovery transport operation status is malformed"
-        );
-        observation_code = RDMA_SC_INVALID_STATE;
-        observation_message =
-          "CMQ recovery transport operation status is malformed";
-      end
-      if (rdma_cmq_submission_effect_valid(
-            transport_result.submission_effect
-          ))
-        current_attempt_effect = transport_result.submission_effect;
-      else begin
-        current_attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
-        observation_code = RDMA_SC_INVALID_STATE;
-        observation_message =
-          "CMQ recovery transport effect is malformed";
-      end
-    end
+    decode_transport_envelope(
+      transport_result, 1'b1, operation_status, observation_code,
+      observation_message, current_attempt_effect
+    );
 
     retry_safe = 1'b1;
     if (observer_armed) begin

@@ -17,8 +17,8 @@
 ## 当前执行状态（2026-09-23）
 
 当前工作树为
-`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-structural-refactor-batch158`，分支为
-`feature/rdma-structural-refactor-batch158`，HEAD/基线为 `33be6c7`。Batch158 的源码、
+`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-structural-refactor-batch159`，分支为
+`feature/rdma-structural-refactor-batch159`，HEAD/基线为 `9be3470`。Batch159 的源码、
 测试和文档尚未提交；计划保持 `active`，不得把 focused GREEN 解释为整份重构完成。
 
 ## 批次进展记录（更新至 2026-09-23）
@@ -591,6 +591,17 @@
   legacy descriptor、外部 ordering/error、engine-level 全局锁、完整 parent/core gate
   与最终 ownership 审计仍开放。详见
   `task-cmq-batch158-device-publish-admission-report.md`。
+- Batch159 在 `src/core/rdma_cmq_engine.sv` 新增共享的
+  `decode_transport_envelope()`，把 observed/recovery transport 返回值统一降级为
+  detached operation status、observation code/message 与 raw submission effect；合法
+  status/effect 保留，malformed status/effect 分别 fail-closed，recovery effect 文案
+  覆盖与 observed combined 文案保持。observer arm、effect fold、分类、journal/CAS
+  mutation 仍由 caller 执行。`rdma_cmq_engine_test` 在 53 机 18/18 PROCESS、1/1
+  LOGICAL PASS，18 个 UVM report 的 WARNING/ERROR/FATAL 均为 0；Python 292/292 与
+  全目录 5,488 methods/0 diagnostics scanner 通过。计划继续保持 `active`；malformed
+  recovery 组合矩阵、并发/global lock、SRQ lifecycle、legacy descriptor、外部
+  ordering/error、完整 CMQ/core gate、typed URC factory、ownership 与 Phase-1C F2
+  仍开放。详见 `task-cmq-batch159-transport-envelope-decode-report.md`。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
   `git diff --check`、changed-SV style，以及覆盖 5,286 个 function/task 的历史全目录中文契约/文件头
   scanner 均 GREEN；Batch110 按当时工作树边界重新扫描 185 个 `.sv`、2 个 `.svh`，共 5,382
@@ -608,8 +619,9 @@
   Batch155 EQ facade operation envelope helper 后为 5,467 methods，Batch156 CQ facade
   operation envelope helper 后为 5,469 methods（`.sv` 5,467、`.svh` 2）；Batch157
   CQ shadow replay/factory atomicity helper 与测试后为 5,483 methods（`.sv`
-  5,481、`.svh` 2）；Batch158 device-publish admission helper 后当前边界为 5,485
-  methods（`.sv` 5,483、`.svh` 2）、0 diagnostics；扫描继续复用
+  5,481、`.svh` 2）；Batch158 device-publish admission helper 后为 5,485 methods
+  （`.sv` 5,483、`.svh` 2）；Batch159 transport envelope decoder 与 recovery probe 后
+  当前边界为 5,488 methods（`.sv` 5,486、`.svh` 2）、0 diagnostics；扫描继续复用
   `sanitize_source`、`method_ranges`、`check_method_comments` 和 `check_file_header`，覆盖
   `src/`、`tests/`、`sim/`，不把历史计数冒充当前证据。
 
@@ -641,8 +653,8 @@ rollback legacy execution 去重 seam、Batch137 的 create/destroy legacy execu
   Batch151/152/153 的 facade authority/configuration admission 收缩、Batch154 的 CEQ/AEQ
   timeout wrapper 收缩、Batch155 的 EQ facade operation envelope 收缩、Batch156 的 CQ
   facade operation envelope 收缩、Batch157 的 CQ shadow canonical replay/factory
-  atomicity 收口和 Batch158 的 device-publish reservation/polarity admission 收缩；
-  完整公开
+  atomicity 收口、Batch158 的 device-publish reservation/polarity admission 收缩和
+  Batch159 的 shared transport envelope decode 收缩；完整公开
   post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。
