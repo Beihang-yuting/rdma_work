@@ -95,102 +95,106 @@ class rdma_eq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 设计说明：五个 EQ facade 入口的 delegate 签名和业务副作用不同，但共享同一
+  // 配置/Function authority 拒绝顺序以及 null-status 边界。这里仅提取两个无 I/O
+  // helper；public task 仍显式调用各自 delegate，使 CEQ/AEQ consumer、legacy
+  // producer 和 secondary-authority producer 的差异在入口处直接可见。
+
+  // 功能：validate_operation_authority 按 EQ facade 原有顺序执行配置门禁和 live
+  //   Function authority 校验，并保证调用方总能获得非 null status。
+  // 输入/输出及副作用：label 为当前 poll/publish 入口的诊断前缀；函数只读
+  //   configured、delegate 与冻结 authority，不修改 runtime、backing、cursor 或结果。
+  // 失败/边界：未配置或 delegate 缺失返回固定 INVALID_STATE；binding 缺失/非 ACTIVE
+  //   返回 INVALID_STATE，UID、generation 或 reset epoch 漂移返回 STALE_GENERATION，
+  //   binding.validate() 的非空失败原样返回；authority 校验异常返回 null 时按 label
+  //   归一化为 INVALID_STATE，其他非空成功/失败 status 对象原样返回。
+  protected function rdma_status validate_operation_authority(string label);
+    rdma_status status;
+
+    if (!configured || delegate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "EQ facade is not configured");
+
+    status = validate_live_authority(label);
+    if (status == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {label, " authority validation returned null"});
+    return status;
+  endfunction
+
+  // 功能：normalize_delegate_status 将 EQ delegate 的 null status 转换为带入口名的
+  //   INVALID_STATE，同时保留所有非 null 成功或失败对象。
+  // 输入/输出及副作用：candidate 是 delegate 输出 status，operation_name 是固定的
+  //   delegate task 名；函数返回归一化 status，不修改 result、delegate 或队列状态。
+  // 失败/边界：candidate 为 null 时新建 INVALID_STATE；非 null 时保持对象、code 和
+  //   message 不变。result 是否清空由 typed public wrapper 根据返回状态显式决定。
+  protected function rdma_status normalize_delegate_status(
+    rdma_status candidate,
+    string operation_name
+  );
+    if (candidate == null)
+      return rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {"EQ delegate ", operation_name, " returned null status"});
+    return candidate;
+  endfunction
+
   // 功能：轮询 CEQ，将事件解码、CQ route 和 CI commit 交给共享 engine，并按
   //   超时策略等待条目出现。
-  // 输入/输出及副作用：ceq_h（输入）、result/status（输出）；poll_ceqe 驱动
-  //   下游事务，并写入 result/status；函数无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：CEQ 未登记、owner 不匹配、CI doorbell 失败或代际过期时不发布
-  //   事件；delegate 返回 null status 时统一返回 INVALID_STATE，非空失败状态保留
-  //   原 code/message；任一失败都清空 result。
+  // 输入/输出及副作用：ceq_h（输入）、result/status（output）；task 把 handle 和
+  //   operation_timeout 交给 delegate 驱动下游事务，不取得调用方资源所有权。
+  // 失败/边界：未配置、Function authority 失活/漂移、CEQ 未登记、owner 不匹配、
+  //   timeout 或 CI doorbell 失败时不发布事件；合法 CQ route miss 可成功消费并返回
+  //   result=null；delegate null status 归一化为 INVALID_STATE，其他失败原样保留。
   task poll_ceqe(
     rdma_handle ceq_h,
     output rdma_queue_event_result result,
     output rdma_status status
   );
     result = null;
-    status = null;
-    if (!configured || delegate == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "EQ facade is not configured");
-      return;
-    end
-    status = validate_live_authority("EQ CEQ poll");
-
-    if (status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "EQ CEQ poll authority validation returned null");
-      return;
-    end
-
+    status = validate_operation_authority("EQ CEQ poll");
     if (!status.ok())
       return;
 
     delegate.poll_ceqe(ceq_h, operation_timeout, result, status);
-
-    if (status == null) begin
+    status = normalize_delegate_status(status, "poll_ceqe");
+    if (!status.ok())
       result = null;
-      status = rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "EQ delegate poll_ceqe returned null status");
-    end
-    else if (!status.ok()) begin
-      result = null;
-    end
   endtask
 
   // 功能：轮询 AEQ，将异常事件解码、按 ecode class 解析 QP/SRQ/CQ/EQ/Function
   //   owner route 及 CI commit 交给共享 engine，并按超时策略等待条目出现。
-  // 输入/输出及副作用：aeq_h（输入）、result/status（输出）；poll_aeqe 驱动
-  //   下游事务，并写入 result/status；函数无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：AEQ 未登记、错误 handle kind、owner/identity 失配或 CI 提交失败
-  //   时不发布结果；CQ-flush 的 CQ/QP 任一路命中可返回 partial result，
-  //   零路由事件仍可被消费但 result 为 null；delegate 返回 null status 时统一返回
-  //   INVALID_STATE，非空失败状态保留原 code/message，任一失败都清空 result。
+  // 输入/输出及副作用：aeq_h（输入）、result/status（output）；task 把 handle 和
+  //   operation_timeout 交给 delegate 驱动下游事务，不取得调用方资源所有权。
+  // 失败/边界：未配置、Function authority 失活/漂移、AEQ 未登记、错误 handle kind、
+  //   owner/identity 失配、timeout 或 CI 提交失败时不发布结果；CQ-flush 任一路命中
+  //   可返回 partial result，零路由事件可成功消费且 result=null；delegate null status
+  //   归一化为 INVALID_STATE，其他失败原样保留。
   task poll_aeqe(
     rdma_handle aeq_h,
     output rdma_queue_event_result result,
     output rdma_status status
   );
     result = null;
-    status = null;
-    if (!configured || delegate == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "EQ facade is not configured");
-      return;
-    end
-    status = validate_live_authority("EQ AEQ poll");
-
-    if (status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "EQ AEQ poll authority validation returned null");
-      return;
-    end
-
+    status = validate_operation_authority("EQ AEQ poll");
     if (!status.ok())
       return;
 
     delegate.poll_aeqe(aeq_h, operation_timeout, result, status);
-
-    if (status == null) begin
+    status = normalize_delegate_status(status, "poll_aeqe");
+    if (!status.ok())
       result = null;
-      status = rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "EQ delegate poll_aeqe returned null status");
-    end
-    else if (!status.ok()) begin
-      result = null;
-    end
   endtask
 
   // 功能：publish_ceqe 将已经通过 CQ authority 校验的 CEQE 发布请求透明转交
   //   给共享 queue-data engine，保持 CEQ backing 与 producer runtime 单一所有者。
   // 输入/输出及副作用：ceq_h、model 为输入，result/status 为输出；facade 既不
   //   clone result/image，也不修改 CEQ/CQ runtime 或 backing，只传播 delegate 输出。
-  // 失败/边界：未 configure 或 delegate 缺失返回 INVALID_STATE 且 result 为 null；
-  //   CQ route、PI、polarity、full、codec/recovery 的非空失败状态原样保留；
-  //   delegate 返回 null status 时统一返回 INVALID_STATE；任一失败都清空 result。
+  // 失败/边界：未配置、binding 缺失/非 ACTIVE 返回 INVALID_STATE；Function UID、
+  //   generation 或 reset epoch 漂移返回 STALE_GENERATION；CQ route、PI、polarity、
+  //   full、codec/recovery 的非空失败原样保留；delegate 返回 null status 时统一返回
+  //   INVALID_STATE，任一失败都清空 result。
   task publish_ceqe(
     rdma_handle ceq_h,
     rdma_hw_ceqe_model model,
@@ -198,35 +202,14 @@ class rdma_eq_engine extends uvm_object;
     output rdma_status status
   );
     result = null;
-    status = null;
-    if (!configured || delegate == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "EQ facade is not configured");
-      return;
-    end
-    status = validate_live_authority("EQ CEQE publish");
-
-    if (status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "EQ CEQE publish authority validation returned null");
-      return;
-    end
-
+    status = validate_operation_authority("EQ CEQE publish");
     if (!status.ok())
       return;
 
     delegate.publish_ceqe(ceq_h, model, result, status);
-
-    if (status == null) begin
+    status = normalize_delegate_status(status, "publish_ceqe");
+    if (!status.ok())
       result = null;
-      status = rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "EQ delegate publish_ceqe returned null status");
-    end
-    else if (!status.ok()) begin
-      result = null;
-    end
   endtask
 
   // 功能：publish_aeqe 保留无 secondary caller authority 的 legacy AEQE 入口，将按
@@ -235,10 +218,11 @@ class rdma_eq_engine extends uvm_object;
   //   target route。
   // 输入/输出及副作用：aeq_h、model 为输入，result/status 为输出；成功 result
   //   的 queue_h/image 仍归 delegate 创建，facade 只借用并返回同一 detached 对象。
-  // 失败/边界：未 configure/delegate 空返回 INVALID_STATE；CQ-flush 因 legacy 入口
+  // 失败/边界：未配置、binding 缺失/非 ACTIVE 返回 INVALID_STATE；Function UID、
+  //   generation 或 reset epoch 漂移返回 STALE_GENERATION；CQ-flush 因 legacy 入口
   //   缺少显式 QP secondary authority 而由 delegate 拒绝；primary owner route、
-  //   generation、polarity、满环和编码的非空失败状态保留原 code/message；delegate
-  //   返回 null status 时统一返回 INVALID_STATE，任一失败都清空 result。
+  //   polarity、满环和编码的非空失败原样保留；delegate null status 归一化为
+  //   INVALID_STATE，任一失败都清空 result。
   task publish_aeqe(
     rdma_handle aeq_h,
     rdma_hw_aeqe_model model,
@@ -246,35 +230,14 @@ class rdma_eq_engine extends uvm_object;
     output rdma_status status
   );
     result = null;
-    status = null;
-    if (!configured || delegate == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "EQ facade is not configured");
-      return;
-    end
-    status = validate_live_authority("EQ AEQE publish");
-
-    if (status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "EQ AEQE publish authority validation returned null");
-      return;
-    end
-
+    status = validate_operation_authority("EQ AEQE publish");
     if (!status.ok())
       return;
 
     delegate.publish_aeqe(aeq_h, model, result, status);
-
-    if (status == null) begin
+    status = normalize_delegate_status(status, "publish_aeqe");
+    if (!status.ok())
       result = null;
-      status = rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "EQ delegate publish_aeqe returned null status");
-    end
-    else if (!status.ok()) begin
-      result = null;
-    end
   endtask
 
   // 功能：publish_aeqe_with_secondary 将 CQ-flush 的 CQ primary owner 与显式 QP
@@ -283,8 +246,10 @@ class rdma_eq_engine extends uvm_object;
   //   route。
   // 输入/输出及副作用：aeq_h、model、secondary_target_h 为输入，result/status
   //   为输出；成功结果及 16B image 由 delegate 创建，facade 不预留槽位或写 backing。
-  // 失败/边界：未配置、Function authority 失活/漂移或 delegate 返回 null status
-  //   时返回 INVALID_STATE/STALE_GENERATION 并清空 result；显式非成功状态原样保留。
+  // 失败/边界：未配置、binding 缺失/非 ACTIVE 返回 INVALID_STATE；Function UID、
+  //   generation 或 reset epoch 漂移返回 STALE_GENERATION；primary/secondary authority
+  //   不完整及其他 delegate 非空失败原样保留，delegate null status 归一化为
+  //   INVALID_STATE；任一失败都清空 result。
   task publish_aeqe_with_secondary(
     rdma_handle aeq_h,
     rdma_hw_aeqe_model model,
@@ -293,35 +258,15 @@ class rdma_eq_engine extends uvm_object;
     output rdma_status status
   );
     result = null;
-    status = null;
-    if (!configured || delegate == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "EQ facade is not configured");
-      return;
-    end
-    status = validate_live_authority("EQ AEQE secondary publish");
-
-    if (status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "EQ AEQE secondary publish authority validation returned null");
-      return;
-    end
-
+    status = validate_operation_authority("EQ AEQE secondary publish");
     if (!status.ok())
       return;
 
     delegate.publish_aeqe_with_secondary(
       aeq_h, model, secondary_target_h, result, status);
-
-    if (status == null) begin
+    status = normalize_delegate_status(
+      status, "publish_aeqe_with_secondary");
+    if (!status.ok())
       result = null;
-      status = rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "EQ delegate publish_aeqe_with_secondary returned null status");
-    end
-    else if (!status.ok()) begin
-      result = null;
-    end
   endtask
 endclass

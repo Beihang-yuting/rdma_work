@@ -1,8 +1,13 @@
 // 目录：核心执行层 core/rdma_cq_engine.sv，位于队列数据路径的 CQ facade。
-// 职责：提供 CQE 消费入口，把解码、route、CI 提交和 WQE release 委托给共享 queue-data engine。
-// 依赖：rdma_queue_data_engine、rdma_queue_completion_result 及 CQ codec/adapter 契约。
-// 所有权与生命周期：facade 不拥有 CQ runtime、backing mapping 或 doorbell；这些由上层管理。
+// 职责：提供 CQE poll/publish、CQ resize 与 shared-CQ shadow flush，把 queue-data
+//   mutation 委托给共享 engine，并在 facade 边界统一 Function authority。
+// 依赖：rdma_queue_data_engine、CQ completion/publish result、Function binding、
+//   CQ shadow snapshot 及 CQ codec/adapter 契约。
+// 所有权与生命周期：facade 借用 delegate/binding，不拥有 runtime、backing 或 doorbell；
+//   自身拥有 configure 时冻结的标量、cloned shared handle 与 flush 缓存快照。
 
+// 设计说明：独立 CQ facade 提供稳定 typed API，唯一 queue-data engine 保持 mutation
+// 权威；单一非拥有 delegate 和冻结 Function 坐标阻断 reset/rebind 后的旧 facade。
 class rdma_cq_engine extends uvm_object;
   `uvm_object_utils(rdma_cq_engine)
 
@@ -26,15 +31,13 @@ class rdma_cq_engine extends uvm_object;
   protected longint unsigned shadow_sequence;
   protected bit shadow_flushed;
   protected rdma_cq_shadow_snapshot flushed_shadow;
-  protected rdma_status shadow_flush_result;
   int unsigned shadow_flush_count;
 
-  // 功能：把 CQ poll 调用转交给当前唯一 delegate，作为 facade 与共享 engine
-  //   之间可替换的窄测试边界。
-  // 输入/输出及副作用：cq_h、timeout 为输入，result/status 为输出；默认实现
-  //   直接调用 delegate.poll_cqe，所有 backing/cursor/recovery 副作用仍归 delegate。
-  // 失败/边界：调用方必须先确认 delegate 非空和 authority 有效；该边界允许
-  //   hostile 子类返回 null/failure status，公开 poll_cqe 负责 fail-closed。
+  // 功能：把 CQ poll 调用转交给唯一 delegate，形成 facade 与共享 engine 的窄测试边界。
+  // 输入/输出及副作用：cq_h、timeout 为输入，result/status 为输出；完成、TIMEOUT、
+  //   recovery evidence 和所有 backing/cursor 副作用均来自 delegate.poll_cqe。
+  // 失败/边界：调用方必须先确认 delegate 非空和 authority 有效；该 seam 没有独立
+  //   cancel/resume 接口，hostile 子类可返回 null/failure，公开 poll_cqe 负责 fail-closed。
   protected virtual task call_delegate_poll_cqe(
     rdma_handle cq_h,
     time timeout,
@@ -44,12 +47,12 @@ class rdma_cq_engine extends uvm_object;
     delegate.poll_cqe(cq_h, timeout, result, status);
   endtask
 
-  // 功能：把 CQE publish 调用转交给当前唯一 delegate，保持 facade 不拥有
-  //   producer runtime 或 CQ backing。
-  // 输入/输出及副作用：cq_h/model 为输入，result/status 为输出；默认实现调用
-  //   delegate.publish_cqe，可能由 delegate 预留槽位、写 backing 并提交 PI。
-  // 失败/边界：调用方必须先完成配置/authority 门禁；hostile 子类可返回
-  //   null/failure status，公开 publish_cqe 必须丢弃失败结果。
+  // 功能：把 CQE publish 转交给唯一 delegate，保持 facade 不拥有 runtime/CQ backing。
+  // 输入/输出及副作用：cq_h/model 为输入，result/status 为输出；delegate.publish_cqe
+  //   可预留槽位、写 backing、提交 PI 或保存 recovery evidence。
+  // 失败/边界：调用方必须先完成配置/authority 门禁；reservation 后的确定失败由
+  //   delegate cancel，写入后的不确定失败进入 recovery；hostile null/failure status
+  //   由公开 publish_cqe 归一化并丢弃不可信 result，facade 不提供额外取消入口。
   protected virtual task call_delegate_publish_cqe(
     rdma_handle cq_h,
     rdma_hw_cqe_model model,
@@ -73,11 +76,11 @@ class rdma_cq_engine extends uvm_object;
     return delegate.resize_cq(cq_h, new_depth, new_cqe_bytes);
   endfunction
 
-  // 功能：创建未配置的 CQ facade，不读取或修改任何 CQ backing。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回
-  //   void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：未 configure 的 facade 调用 poll_cqe 必须返回 INVALID_STATE，
-  //   且 result 为空。
+  // 功能：创建普通入口和 shared-shadow 均未配置的 CQ facade，不分配 CQ backing。
+  // 输入/输出及副作用：name 为输入；new 清空 delegate/authority、shared handle、shadow
+  //   与 flush 缓存，将两个 configured flag 清零并把 transport 置为 RC；不接管外部资源。
+  // 失败/边界：configure 前 poll/publish/resize 均返回 INVALID_STATE；configure_shared
+  //   可独立启用 flush_shadow，但不能授权三个普通入口。
   function new(string name = "rdma_cq_engine");
     super.new(name);
     delegate = null;
@@ -100,15 +103,16 @@ class rdma_cq_engine extends uvm_object;
     shadow_sequence = 0;
     shadow_flushed = 1'b0;
     flushed_shadow = null;
-    shadow_flush_result = null;
     shadow_flush_count = 0;
   endfunction
 
-  // 功能：校验 CQ facade 保存的 Function binding 仍处于原 generation/reset epoch。
-  // 输入/输出及副作用：label 仅用于诊断；读取 binding 快照并返回状态，不修改
-  //   delegate 或队列游标。
-  // 失败/边界：未配置、delegate 缺失、binding 校验失败或 UID/generation/reset epoch
-  //   漂移时返回错误，调用方不得继续访问 CQ。
+  // 功能：校验 CQ facade 冻结的 Function UID/generation/reset epoch 与借用 binding
+  //   仍一致，且 binding 仍为 ACTIVE 并通过自身 validate()。
+  // 输入/输出及副作用：label 仅用于诊断；函数只读配置、binding 和快照并返回
+  //   rdma_status，不修改 delegate、shadow、runtime 或队列游标。
+  // 失败/边界：未配置、delegate/binding 缺失或 binding 非 ACTIVE 返回 INVALID_STATE；
+  //   UID/generation/reset epoch 漂移返回 STALE_GENERATION；validate() 的 null/失败
+  //   分别归一化为 INVALID_STATE 或原样返回。
   protected function rdma_status validate_live_authority(string label);
     return rdma_validate_live_authority(
       configured,
@@ -120,15 +124,69 @@ class rdma_cq_engine extends uvm_object;
       label);
   endfunction
 
-  // 功能：配置共享 CQ 的 Function authority、URC completion QP 和可恢复
-  //   shadow 游标。
-  // 输入/输出及副作用：cq_h/completion_qp_h/transport/identity、SQ/RQ CI、
-  //   arm、sequence 和 URC evidence_engine 为输入；成功时保存句柄快照与
-  //   authority 标量，不接管外部资源。
-  // 失败/边界：CQ/QP 句柄为空或类型错误、URC 缺少 completion QP/evidence_engine、
-  // Function UID/generation/reset epoch 为零或句柄代际不匹配时返回错误且保留旧
-  // 配置；configure 已绑定另一 delegate 时返回 INVALID_ARGUMENT；shared 配置本身
-  // 已完成时返回 INVALID_STATE。两个入口始终共享唯一 delegate authority。
+  // 功能：绕过 typed registry cast，按 requested_type 从 UVM raw factory 创建对象，
+  //   供 CQ facade 把 null/错误动态类型 override 转换为普通 status。
+  // 输入/输出及副作用：requested_type/name 为输入；返回 raw uvm_object，只读取全局
+  //   factory override，不修改 CQ 配置、shadow、delegate 或外部资源。
+  // 失败/边界：requested_type、factory 或 factory 返回值为空时返回 null；本 helper
+  //   不判断动态类型，调用方必须显式 cast 后才能发布对象。
+  protected function uvm_object factory_create_object_nonfatal(
+    uvm_object_wrapper requested_type,
+    string name
+  );
+    uvm_factory factory;
+
+    if (requested_type == null)
+      return null;
+    factory = uvm_factory::get();
+    if (factory == null)
+      return null;
+    return factory.create_object_by_type(requested_type, "", name);
+  endfunction
+
+  // 功能：把 source 的 kind/Function UID/object ID/generation 复制到独立 handle，
+  //   供 shared 配置和 shadow 快照在 hostile factory 下保持非致命失败。
+  // 输入/输出及副作用：source/name 为输入，snapshot 为输出且入口先清空；成功只发布
+  //   手工复制的值对象，不调用 source.clone/do_copy，也不修改 source 或 facade 状态。
+  // 失败/边界：source=null 表示合法的可选句柄并返回 OK/null；raw factory 返回 null
+  //   或不可 cast 类型时返回 RESOURCE_EXHAUSTED，snapshot 保持 null。
+  protected function rdma_status clone_handle_value_nonfatal(
+    rdma_handle source,
+    string name,
+    output rdma_handle snapshot
+  );
+    rdma_handle candidate;
+    uvm_object raw_candidate;
+
+    snapshot = null;
+    if (source == null)
+      return rdma_status::make_direct(RDMA_SC_OK);
+
+    raw_candidate = factory_create_object_nonfatal(rdma_handle::get_type(), name);
+    if (raw_candidate == null || !$cast(candidate, raw_candidate))
+      return rdma_status::make_direct(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        {name, " allocation returned null or an incompatible type"}
+      );
+
+    candidate.kind = source.kind;
+    candidate.function_uid = source.function_uid;
+    candidate.object_id = source.object_id;
+    candidate.generation = source.generation;
+    snapshot = candidate;
+    return rdma_status::make_direct(RDMA_SC_OK);
+  endfunction
+
+  // 功能：配置 shared CQ 的冻结 Function authority、可选 completion QP、transport
+  //   和可恢复 shadow；URC 额外绑定 evidence engine。
+  // 输入/输出及副作用：cq_h/completion_qp_h/transport/identity、SQ/RQ CI、arm、
+  //   sequence 和 evidence_engine 为输入；成功保存 cloned handle、authority 标量、
+  //   shadow 值与非拥有 delegate 引用，并清空旧 flush 缓存。
+  // 失败/边界：CQ/非空 QP 的 kind 或 21-bit object ID 非法返回 INVALID_ARGUMENT，
+  //   handle validator 为 null 返回 INVALID_STATE；非法 transport、URC 缺少 QP/evidence、
+  //   Function authority 不完整/失配和重复 shared 配置均拒绝。普通 configure 已完成时，
+  //   evidence_engine 为空或不同、live binding 失活/漂移或 UID/generation 不一致也拒绝；
+  //   handle clone 失败返回 RESOURCE_EXHAUSTED 且保留旧配置。RC/UD 允许 completion_qp_h=null。
   function rdma_status configure_shared(
     rdma_handle cq_h,
     rdma_handle completion_qp_h,
@@ -143,6 +201,7 @@ class rdma_cq_engine extends uvm_object;
     rdma_handle cq_snapshot;
     rdma_handle qp_snapshot;
     rdma_status handle_status;
+    rdma_status authority_status;
     if (cq_h == null || cq_h.kind != RDMA_RESOURCE_CQ)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "shared CQ handle is invalid");
@@ -209,12 +268,41 @@ class rdma_cq_engine extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "shared CQ evidence engine differs from configured delegate");
 
-    cq_snapshot = rdma_clone_handle_value(cq_h, "shared CQ handle");
-    qp_snapshot = rdma_clone_handle_value(completion_qp_h,
-                                          "shared CQ completion QP");
-    if (cq_snapshot == null || (completion_qp_h != null && qp_snapshot == null))
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "shared CQ authority snapshot failed");
+    // 中文设计：普通 configure 已经把 delegate 绑定到一个 Function incarnation；
+    // shared shadow 只能补齐同一 UID/generation 的 CQ，不能借用旧 engine 发布另一
+    // Function 的 authority。reset epoch 仍允许由 shared snapshot 独立携带，后续
+    // flush 的 live-authority gate 会决定该 epoch 是否已经过期。
+    if (configured &&
+        (identity.function_uid != authority_function_uid ||
+         identity.generation != authority_generation))
+      return rdma_status::make(
+        RDMA_SC_STALE_GENERATION,
+        "shared CQ Function authority differs from configured binding");
+
+    if (configured) begin
+      authority_status = validate_live_authority("CQ shared configure");
+      if (authority_status == null)
+        return rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "CQ shared configure authority validation returned null");
+      if (!authority_status.ok())
+        return authority_status;
+    end
+
+    handle_status = clone_handle_value_nonfatal(
+      cq_h, "shared_cq_handle", cq_snapshot);
+    if (handle_status == null || !handle_status.ok())
+      return handle_status == null ? rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "shared CQ handle clone returned null status"
+      ) : handle_status;
+    handle_status = clone_handle_value_nonfatal(
+      completion_qp_h, "shared_completion_qp_handle", qp_snapshot);
+    if (handle_status == null || !handle_status.ok())
+      return handle_status == null ? rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "shared CQ completion QP clone returned null status"
+      ) : handle_status;
     shared_cq_h = cq_snapshot;
     shared_completion_qp_h = qp_snapshot;
     if (evidence_engine != null)
@@ -231,23 +319,83 @@ class rdma_cq_engine extends uvm_object;
     // 后续配置由上方 one-shot 门禁拒绝，不能重置已发布的 flush 结果。
     shadow_flushed = 1'b0;
     flushed_shadow = null;
-    shadow_flush_result = null;
     shadow_flush_count = 0;
     shared_configured = 1'b1;
     return rdma_status::success();
   endfunction
 
-  // 功能：在当前 active Function/reset epoch 捕获并清除共享 CQ shadow；重复
-  //   调用返回首个结果而不重复清除。
-  // 输入/输出及副作用：shadow 为 inout 快照；首次成功调用写入 CQ authority、
-  //   SQ/RQ CI、arm、sequence 并清零内部 shadow，后续调用保持原快照。
-  // 失败/边界：未配置 shared CQ、快照 authority 与当前 Function/generation/
-  // reset epoch/CQ kind/object 不匹配时返回 STALE_GENERATION；URC evidence
-  // capture 失败时原子拒绝且不清除内部 shadow。
+  // 设计说明：首次 flush 和后续 replay 都必须发布 detached value；不能把
+  // flushed_shadow 直接交给 caller，否则 caller 修改 handle/游标会污染唯一缓存。
+
+  // 功能：把 source CQ shadow 复制成独立值快照，供首次 cache 和 replay 共用。
+  // 输入/输出及副作用：source/name 为输入，snapshot 为输出；成功时分配新 snapshot、
+  //   单独 clone cq_h 并复制 Function authority、SQ/RQ CI、arm 和 sequence。
+  // 失败/边界：source/cq_h 缺失返回 INVALID_STATE；snapshot 或 handle clone 失败返回
+  //   RESOURCE_EXHAUSTED，snapshot 保持 null，source 与 facade 状态均不修改。
+  protected function rdma_status clone_shadow_snapshot_value(
+    rdma_cq_shadow_snapshot source,
+    string name,
+    output rdma_cq_shadow_snapshot snapshot
+  );
+    rdma_cq_shadow_snapshot candidate;
+    rdma_handle cq_snapshot;
+    rdma_status handle_status;
+    uvm_object raw_candidate;
+
+    snapshot = null;
+    if (source == null || source.cq_h == null)
+      return rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "CQ shadow snapshot source is incomplete"
+      );
+
+    raw_candidate = factory_create_object_nonfatal(
+      rdma_cq_shadow_snapshot::get_type(), name);
+    if (raw_candidate == null || !$cast(candidate, raw_candidate))
+      return rdma_status::make_direct(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        {name, " allocation returned null or an incompatible type"}
+      );
+    handle_status = clone_handle_value_nonfatal(
+      source.cq_h, {name, "_handle"}, cq_snapshot);
+    if (handle_status == null || !handle_status.ok())
+      return handle_status == null ? rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "CQ shadow handle clone returned null status"
+      ) : handle_status;
+
+    candidate.cq_h = cq_snapshot;
+    candidate.function_uid = source.function_uid;
+    candidate.generation = source.generation;
+    candidate.reset_epoch = source.reset_epoch;
+    candidate.sq_ci = source.sq_ci;
+    candidate.rq_ci = source.rq_ci;
+    candidate.arm_state = source.arm_state;
+    candidate.\sequence = source.\sequence ;
+    snapshot = candidate;
+    return rdma_status::make_direct(RDMA_SC_OK);
+  endfunction
+
+  // 功能：在当前 active Function/reset epoch 捕获并清除共享 CQ shadow；首次完成后，
+  //   携带匹配非空 authority 的重复调用收到首个结果的 detached 缓存副本。
+  // 输入/输出及副作用：shadow 为 inout authority/结果快照；首次允许 null 并写入 CQ
+  //   authority、SQ/RQ CI、arm、sequence，缓存 detached value，把公开 count 置 1 并
+  //   清零内部 active shadow；每次返回独立 success status，replay 不重复 evidence/mutation。
+  // 失败/边界：未配置 shared CQ 返回 INVALID_STATE；普通 configure 已提供 binding 时，
+  //   live authority 失活/漂移会先拒绝；shared-only 路径只能匹配冻结字段，不等同于
+  //   live binding 认证。调用方 authority/kind/object 不匹配或 replay 缺少 authority
+  //   返回 STALE_GENERATION；缓存 authority 或 URC evidence status 异常返回
+  //   INVALID_STATE；snapshot/handle clone 失败返回 RESOURCE_EXHAUSTED 且不改
+  //   caller/cache/count，URC evidence 非空失败在清除内部 shadow 前原样返回。
   function rdma_status flush_shadow(inout rdma_cq_shadow_snapshot shadow);
+    rdma_cq_shadow_snapshot active_source;
     rdma_cq_shadow_snapshot captured;
+    rdma_cq_shadow_snapshot cached;
+    rdma_cq_shadow_snapshot replayed;
     rdma_status evidence_status;
     rdma_status authority_status;
+    rdma_status prepared_success;
+    rdma_status snapshot_status;
     if (!shared_configured)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "shared CQ is not configured");
@@ -280,25 +428,63 @@ class rdma_cq_engine extends uvm_object;
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "CQ shadow replay authority is missing");
 
-      if (shadow_flush_result == null)
+      if (flushed_shadow == null || flushed_shadow.cq_h == null ||
+          flushed_shadow.cq_h.kind != RDMA_RESOURCE_CQ ||
+          flushed_shadow.function_uid != shared_function_uid ||
+          flushed_shadow.generation != shared_generation ||
+          flushed_shadow.reset_epoch != shared_reset_epoch ||
+          flushed_shadow.cq_h.function_uid != shared_function_uid ||
+          flushed_shadow.cq_h.generation != shared_generation ||
+          flushed_shadow.cq_h.object_id != shared_cq_h.object_id)
+        return rdma_status::make_direct(
+          RDMA_SC_INVALID_STATE,
+          "CQ shadow replay cache authority is invalid"
+        );
+      snapshot_status = clone_shadow_snapshot_value(
+        flushed_shadow, "replayed_cq_shadow", replayed);
+      if (snapshot_status == null)
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
-          "CQ shadow replay cached a null status");
+          "CQ shadow replay snapshot returned null status");
+      if (!snapshot_status.ok())
+        return snapshot_status;
 
-      return shadow_flush_result;
+      shadow = replayed;
+      return rdma_status::make_direct(RDMA_SC_OK);
     end
-    captured = rdma_cq_shadow_snapshot::type_id::create("flushed_cq_shadow");
-    captured.cq_h = rdma_clone_handle_value(shared_cq_h, "flushed CQ handle");
-    captured.function_uid = shared_function_uid;
-    captured.generation = shared_generation;
-    captured.reset_epoch = shared_reset_epoch;
-    captured.sq_ci = shadow_sq_ci;
-    captured.rq_ci = shadow_rq_ci;
-    captured.arm_state = shadow_arm_state;
-    captured.\sequence = shadow_sequence;
-    if (captured.cq_h == null)
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "flushed CQ handle snapshot failed");
+
+    // 中文设计：active_source 只是 direct-new 的局部字段视图，不会发布给 caller；
+    // 两个可见快照都经 raw factory 独立物化。所有本地分配先于 URC evidence，
+    // 因而第二份 cache 失败也不会留下外部 evidence 或消费 active shadow。
+    active_source = new("active_cq_shadow_source");
+    active_source.cq_h = shared_cq_h;
+    active_source.function_uid = shared_function_uid;
+    active_source.generation = shared_generation;
+    active_source.reset_epoch = shared_reset_epoch;
+    active_source.sq_ci = shadow_sq_ci;
+    active_source.rq_ci = shadow_rq_ci;
+    active_source.arm_state = shadow_arm_state;
+    active_source.\sequence = shadow_sequence;
+    snapshot_status = clone_shadow_snapshot_value(
+      active_source, "flushed_cq_shadow", captured);
+    if (snapshot_status == null)
+      return rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "CQ shadow output snapshot returned null status"
+      );
+    if (!snapshot_status.ok())
+      return snapshot_status;
+    snapshot_status = clone_shadow_snapshot_value(
+      active_source, "cached_cq_shadow", cached);
+    if (snapshot_status == null)
+      return rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "CQ shadow cache snapshot returned null status"
+      );
+    if (!snapshot_status.ok())
+      return snapshot_status;
+    prepared_success = rdma_status::make_direct(RDMA_SC_OK);
+
     if (shared_transport == RDMA_TRANSPORT_URC) begin
       evidence_status = delegate.capture_urc_shadow_evidence(captured);
 
@@ -310,28 +496,28 @@ class rdma_cq_engine extends uvm_object;
       if (!evidence_status.ok())
         return evidence_status;
     end
+
     shadow = captured;
-    flushed_shadow = rdma_cq_shadow_snapshot::type_id::create("cached_cq_shadow");
-    flushed_shadow.copy(captured);
+    flushed_shadow = cached;
     shadow_sq_ci = 0;
     shadow_rq_ci = 0;
     shadow_arm_state = '0;
     shadow_sequence = 0;
     shadow_flushed = 1'b1;
     shadow_flush_count = 1;
-    shadow_flush_result = rdma_status::success();
-    return shadow_flush_result;
+    return prepared_success;
   endfunction
 
-  // 功能：绑定共享 queue-data engine，校验 CQ 使用的资源、binding、Host-memory、
+  // 功能：绑定共享 queue-data engine，校验 CQ 的 manager、binding、Host-memory、
   //   doorbell 和 codec 引用一致。
-  // 输入/输出及副作用：resource_manager、function_binding、memory、scheduler、
-  //   codecs、timeout 和 shared_engine 为输入；函数先通过共用 admission helper
-  //   完成依赖、authority 和 ACTIVE 校验，成功时更新本对象配置/状态并保存非拥有引用，
-  //   返回 rdma_status。
-  // 失败/边界：空依赖、重复登记、状态或 generation/authority 校验失败时返回
-  //   错误；configure_shared 已绑定另一 delegate 时返回 INVALID_ARGUMENT；本入口
-  //   已配置时返回 INVALID_STATE。失败发生在任何 delegate/authority 写入之前。
+  // 输入/输出及副作用：resource_manager、function_binding、memory、scheduler、codecs、
+  //   timeout/shared_engine 为输入；成功保存非拥有 delegate/binding、冻结 authority、
+  //   timeout 和 configured 状态，并返回 rdma_status。
+  // 失败/边界：任一依赖/shared_engine 为空、timeout 为零、engine 的 manager/binding/
+  //   memory/scheduler/codecs 不一致返回 INVALID_ARGUMENT；binding validate 为 null、
+  //   非 ACTIVE 或重复 configure 返回 INVALID_STATE，非空 validation 失败原样返回；
+  //   configure_shared 已绑定另一 delegate 时返回 INVALID_ARGUMENT；admission 先于
+  //   one-shot 门禁，所有失败均发生在 delegate/authority 写入前。
   function rdma_status configure(
     rdma_resource_manager resource_manager,
     rdma_function_binding function_binding,
@@ -375,57 +561,80 @@ class rdma_cq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 设计说明：CQ poll、publish 与 resize 的 typed delegate seam 不同，但进入 seam
+  // 之前共享同一配置/Function authority 顺序，返回后也共享 null-status 边界。
+  // 这里仅提取无 I/O helper；flush_shadow 的 shared-config/replay 契约保持独立。
+
+  // 功能：validate_operation_authority 按 CQ facade 原有顺序执行配置门禁和 live
+  //   Function authority 校验，并保证三个普通业务入口获得非 null status。
+  // 输入/输出及副作用：label 为 poll/publish/resize 的诊断前缀；函数只读
+  //   configured、delegate 与冻结 authority，不修改 runtime、backing、cursor 或 shadow。
+  // 失败/边界：未配置或 delegate 缺失返回固定 INVALID_STATE；binding 缺失/非 ACTIVE
+  //   返回 INVALID_STATE，UID、generation 或 reset epoch 漂移返回 STALE_GENERATION，
+  //   binding.validate() 的非空失败原样返回；authority 返回 null 时按 label 归一化。
+  protected function rdma_status validate_operation_authority(string label);
+    rdma_status status;
+
+    if (!configured || delegate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "CQ facade is not configured");
+
+    status = validate_live_authority(label);
+    if (status == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               {label, " authority validation returned null"});
+    return status;
+  endfunction
+
+  // 功能：normalize_delegate_status 将 CQ delegate 的 null status 转换为带 seam 名的
+  //   INVALID_STATE，同时保留任意非 null 成功或失败对象。
+  // 输入/输出及副作用：candidate 为 delegate 输出，operation_name 为固定 seam 名；
+  //   函数返回归一化 status，不修改 result、delegate、ring geometry 或 shadow 状态。
+  // 失败/边界：candidate 为 null 时新建 INVALID_STATE；非 null 时保持同一对象、code
+  //   和 message。poll/publish 的 result 清理由各 typed wrapper 显式负责。
+  protected function rdma_status normalize_delegate_status(
+    rdma_status candidate,
+    string operation_name
+  );
+    if (candidate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+        {"CQ delegate ", operation_name, " returned null status"});
+    return candidate;
+  endfunction
+
   // 功能：轮询一个 CQE，并由共享 engine 完成读/解码/route、CI doorbell、
   //   consumer commit 和 WQE release。
-  // 输入/输出及副作用：cq_h（输入）、result/status（输出）；poll_cqe 驱动
-  //   下游事务，并写入 result/status；函数无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：未配置、CQ 未登记、owner/identity 错误或 CI 提交失败时不发布
-  //   completion；空环返回 QUEUE_EMPTY；delegate 返回 null status 时统一返回
-  //   INVALID_STATE，非空失败状态保留原 code/message；任一失败都清空 result。
+  // 输入/输出及副作用：cq_h 为输入，result/status 为 output；task 把 handle/timeout
+  //   交给 poll seam，成功发布 detached completion，不取得资源所有权。
+  // 失败/边界：未配置、Function authority 失活/漂移、CQ 未登记、owner/identity
+  //   错误或 CI 提交失败时不发布 completion；配置的非零 operation_timeout 到期返回
+  //   TIMEOUT；delegate null status 归一化为 INVALID_STATE，其他失败原样保留，任一
+  //   失败都清空 result。facade 不提供取消/恢复入口，delegate 留下的 recovery evidence
+  //   由显式 queue recovery 流程处理。
   task poll_cqe(
     rdma_handle cq_h,
     output rdma_queue_completion_result result,
     output rdma_status status
   );
     result = null;
-    status = null;
-    if (!configured || delegate == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "CQ facade is not configured");
-      return;
-    end
-    status = validate_live_authority("CQ poll");
-
-    if (status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ poll authority validation returned null");
-      return;
-    end
-
+    status = validate_operation_authority("CQ poll");
     if (!status.ok())
       return;
 
     call_delegate_poll_cqe(cq_h, operation_timeout, result, status);
-
-    if (status == null) begin
+    status = normalize_delegate_status(status, "poll_cqe");
+    if (!status.ok())
       result = null;
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ delegate poll_cqe returned null status");
-    end
-    else if (!status.ok()) begin
-      result = null;
-    end
   endtask
 
-  // 功能：publish_cqe 将设备生成的 CQE 透明委托给共享 queue-data engine，
-  //   使 facade 与直接 delegate 保持同一 authority、backing 和 recovery 语义。
+  // 功能：publish_cqe 委托设备 CQE，使 facade 与直接 delegate 保持同一 authority、
+  //   backing 和 recovery 语义。
   // 输入/输出及副作用：cq_h、model 为输入，result/status 为输出；facade 不 clone
-  //   result/image、不写 backing、不保存 runtime，仅转发 delegate 的输出对象。
-  // 失败/边界：未 configure 或 delegate 为空返回 INVALID_STATE 且 result 为 null；
-  //   route、polarity、full、编码和 recovery 的非空失败状态原样传播；delegate
-  //   返回 null status 时统一返回 INVALID_STATE；任一失败都清空 result。
+  //   result/image、不写 backing、不保存 runtime，仅转发 delegate 的完成对象或错误。
+  // 失败/边界：未配置、binding 缺失/非 ACTIVE 返回 INVALID_STATE；Function UID、
+  //   generation 或 reset epoch 漂移返回 STALE_GENERATION；route、polarity、full、
+  //   编码和 recovery 的非空失败原样保留；reservation 后确定失败由 delegate cancel，
+  //   backing 写入后失败留下 recovery evidence；delegate null status 归一化为
+  //   INVALID_STATE，任一失败都清空 result，facade 不另设 timeout/cancel/resume。
   task publish_cqe(
     rdma_handle cq_h,
     rdma_hw_cqe_model model,
@@ -433,68 +642,32 @@ class rdma_cq_engine extends uvm_object;
     output rdma_status status
   );
     result = null;
-    status = null;
-    if (!configured || delegate == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "CQ facade is not configured");
-      return;
-    end
-    status = validate_live_authority("CQ publish");
-
-    if (status == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ publish authority validation returned null");
-      return;
-    end
-
+    status = validate_operation_authority("CQ publish");
     if (!status.ok())
       return;
 
     call_delegate_publish_cqe(cq_h, model, result, status);
-
-    if (status == null) begin
+    status = normalize_delegate_status(status, "publish_cqe");
+    if (!status.ok())
       result = null;
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ delegate publish_cqe returned null status");
-    end
-    else if (!status.ok()) begin
-      result = null;
-    end
   endtask
 
   // 功能：请求共享 queue-data engine 对 CQ ring 做 quiesce、重建和原子切换。
-  // 输入/输出及副作用：cq_h/new_depth/new_cqe_bytes 为输入；成功时更新共享
-  //   attachment geometry。
-  // 失败/边界：facade 未完成 configure 或 authority 已漂移时不调用 delegate；
-  // configure_shared-only facade 不能 resize；delegate 拒绝 quiesce/分配/激活时
-  // 返回错误且旧 ring 保持有效，null status 统一为 INVALID_STATE。
+  // 输入/输出及副作用：cq_h/new_depth/new_cqe_bytes 为输入，返回 rdma_status；成功时
+  //   delegate 更新共享 attachment geometry，facade 不取得新旧 backing 所有权。
+  // 失败/边界：未配置、binding 缺失/非 ACTIVE 返回 INVALID_STATE；Function 坐标漂移
+  //   返回 STALE_GENERATION，configure_shared-only facade 不能 resize。非法 depth/
+  //   entry size、并发 busy、pending cleanup recovery、
+  //   quiesce/分配/发布前激活失败均由 delegate 拒绝并保留旧 ring；发布后的旧资源
+  //   清理失败返回 RECOVERY_REQUIRED，此时新 attachment 保持有效。null status 归一化
+  //   为 INVALID_STATE，其他非空失败对象原样保留。
   function rdma_status resize(rdma_handle cq_h, int unsigned new_depth,
                               int unsigned new_cqe_bytes);
-    rdma_status authority_status;
-    rdma_status resize_status;
+    rdma_status status = validate_operation_authority("CQ resize");
+    if (!status.ok())
+      return status;
 
-    if (!configured || delegate == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "CQ facade is not configured");
-
-    // configured 只能由 configure() 置位，因此其成功态必然带 authority_binding；
-    // configure_shared-only 仍停在上方 INVALID_STATE 门禁，不存在 legacy 直通分支。
-    authority_status = validate_live_authority("CQ resize");
-    if (authority_status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "CQ resize authority validation returned null");
-    if (!authority_status.ok())
-      return authority_status;
-
-    resize_status = call_delegate_resize_cq(
-      cq_h, new_depth, new_cqe_bytes);
-
-    if (resize_status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ delegate resize_cq returned null status");
-
-    return resize_status;
+    return normalize_delegate_status(call_delegate_resize_cq(
+      cq_h, new_depth, new_cqe_bytes), "resize_cq");
   endfunction
 endclass

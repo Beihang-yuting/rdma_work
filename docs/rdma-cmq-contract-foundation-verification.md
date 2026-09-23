@@ -77,11 +77,12 @@ process 的 simulator、summary 或日志检查失败都会使
 logical gate 失败。mutation gate 还必须保持 `CQC_CREATE` request unsupported，并报告
 其固定的 static/dynamic closed-evidence 计数。
 
-## Fresh acceptance evidence
+## 记录的验收证据与刷新规则
 
-所有 VCS 命令只通过 53 主机的 login-shell `scripts/run_vcs53.sh` 执行。以下表格在
-每次 fresh run 后填写完整命令、exit code、日志路径和 `UVM_WARNING/ERROR/FATAL`；
-缺少摘要、出现 warning 或 VCS crash 都是 blocker，不能用旧日志替代。
+所有 VCS 命令只通过 53 主机的 login-shell `scripts/run_vcs53.sh` 执行。以下表格按
+各自记录的源码边界保留命令、exit code、日志路径和 `UVM_WARNING/ERROR/FATAL`；除非
+条目明确标为当前批次，否则都属于历史证据。缺少摘要、出现 warning 或 VCS crash
+都是 blocker，源码变化后不能用旧日志替代当前验收。
 
 | Scope | Command / log | Result |
 | --- | --- | --- |
@@ -92,9 +93,10 @@ logical gate 失败。mutation gate 还必须保持 `CQC_CREATE` request unsuppo
 | pcie_work SR-IOV config-proxy | same approved roots, `make pcie_work TEST=rdma_sriov_enumeration_test` on `ubuntu@10.11.10.53` login bash | PASS; exit `0`, `UVM_INFO=260`, `UVM_WARNING/ERROR/FATAL=0/0/0` |
 | host_mem candidate regression | `make host_mem TEST=regression` on `ubuntu@10.11.10.53` login bash | PASS; adapter/queue-data/UMEM `UVM_INFO=17/17/4`, warning/error/fatal all zero, leak checks zero |
 | queue/control-plane/QP execution seams | `SSHPASS=<runtime-only> ./scripts/run_vcs53.sh core rdma_queue_lifecycle_test`, `rdma_queue_recovery_test`, `rdma_control_plane_cmq_engine_test`, `rdma_control_plane_test`, `rdma_qp_lifecycle_test`, and `rdma_qp_recovery_test` | PASS at the recorded source boundary; each compile/elab/link and PROCESS/LOGICAL PASS with `UVM_INFO=3`, `UVM_WARNING/ERROR/FATAL=0/0/0`; Batch136–140 deduplicate rollback/create/destroy/control-plane/QP/KEY_ALLOC raw dispatch while retaining legacy compatibility |
-| local static gates | `python3 -m unittest ...`; `python3 tools/check_queue_lifecycle.py`; `python3 tools/check_changed_sv_style.py --base HEAD`; `git diff --check` | PASS at last recorded run; rerun before acceptance |
-| final CMQ gate | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test`; `scripts/run_vcs53.sh cmq_gate regression` | Existing current-worktree evidence: CMQ 28/28 process, 11/11 logical, UVM 0/0/0; rerun after any further source change |
-| compatibility/full core | host_mem, integration, focused consumers and `scripts/run_vcs53.sh core regression` | Existing current-worktree evidence: core 95/95 process, 78/78 logical, UVM 0/0/0; broader pcie ordering/error and combined suite remain open |
+| Batch157 focused CQ shadow/replay | `scripts/run_vcs53.sh core rdma_cq_engine_test`; `rdma_cq_engine_resize_test`; `rdma_cq_shadow_flush_test` | Current source boundary: all wrapper rc=0, PROCESS/LOGICAL PASS, UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`, pristine; complete wrapper hashes are recorded in the Batch157 section below |
+| local static gates | `git diff --check`; `python3 tools/check_changed_sv_style.py --base 8b8ad4e`; queue/profile/Phase-1A checks; manifest/keyword/ownership tests; Python discover | Batch157 current boundary PASS; combined log `/tmp/batch157-static-fix.log`, SHA-256 `73e0e60ee02883bcdda68f52e72e54f07760844a1e5db3c501376e782997d13a`; full-tree scanner is recorded below |
+| final CMQ gate | `scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test`; `scripts/run_vcs53.sh cmq_gate regression` | Historical source-boundary evidence: CMQ 28/28 process, 11/11 logical, UVM 0/0/0; Batch157 后尚未刷新全量 gate |
+| compatibility/full core | host_mem, integration, focused consumers and `scripts/run_vcs53.sh core regression` | Historical source-boundary evidence: core 95/95 process, 78/78 logical, UVM 0/0/0; Batch157 仅刷新三项 CQ focused，完整 core 与更广 PCIe ordering/error 组合仍开放 |
 
 ### Batch138 current source boundary
 
@@ -483,6 +485,111 @@ methods（`.sv` 5,463、`.svh` 2）、0 diagnostics。Batch154 只关闭 event p
 timeout 外壳的重复 seam，不覆盖 CEQ/AEQ malformed retry、跨队列并发、SRQ 全生命周期、
 legacy descriptor、外部 PCIe error/ordering、engine-level 全局锁或最终 ownership 审计；
 计划继续保持 `active`。详见 `task-cmq-batch154-event-poll-timeout-shrink-report.md`。
+
+### Batch155：EQ facade operation envelope 收缩
+
+Batch155 在 `src/core/rdma_eq_engine.sv` 新增受保护、非 virtual 的
+`validate_operation_authority()` 与 `normalize_delegate_status()`，统一五个 public
+task 的配置/Function authority 拒绝顺序和 delegate null-status 归一化。五条 typed
+delegate 调用仍分别保留，CEQ/AEQ route、timeout retry、producer/consumer 副作用、
+runtime/backing/cursor、MMIO、recovery 与 CQ-flush secondary authority 均未合并。
+
+`rdma_eq_engine_test` 新增/加强五个未配置入口的 sentinel 清理与固定消息、五条
+null-status 精确消息，以及五条非空失败 status 对象身份和夹带 result 清理。生产源码
+由 327 行降至 272 行。EQ facade、queue-data poll、event-route consume 与 AEQE route
+四项最终源码边界 VCS53 均 wrapper rc=0、PROCESS/LOGICAL PASS、UVM
+`INFO=3/WARNING=0/ERROR=0/FATAL=0` 且 pristine；日志 SHA-256 分别为：
+
+- `97e0fa12529ac91ed5eaaed9781684788b89a98e4d3eb2a0cb34dd12f43ed342`
+- `dd6ec3926973da702823ccdd9059882aaf2cc5591ee8374b02f4b9aa2413539e`
+- `418b230e399ef41c83138803a2066cffc9f7ae74e31866e00f03875751e81a03`
+- `4c0225f48f77789414f741b9be9a15fa8f7eaec8eb87e98dcd1483f335567a08`
+
+`git diff --check`、changed-SV style、queue/profile/Phase-1A gates 与 Python 292/292
+均通过；全目录 scanner 更新为 189 个文件（187 `.sv`、2 `.svh`）、5,467 methods
+（`.sv` 5,465、`.svh` 2）、0 diagnostics。Batch155 只关闭 EQ facade operation
+envelope 的重复 seam，不覆盖 CEQ/AEQ malformed retry、SRQ 全生命周期、legacy
+descriptor、跨队列并发、外部 PCIe error/ordering、engine-level 全局锁或最终
+ownership 审计；计划继续保持 `active`。详见
+`task-cmq-batch155-eq-facade-operation-envelope-report.md`。
+
+### Batch156：CQ facade operation envelope 收缩
+
+Batch156 在 `src/core/rdma_cq_engine.sv` 新增受保护、非 virtual 的
+`validate_operation_authority()` 与 `normalize_delegate_status()`，统一 `poll_cqe()`、
+`publish_cqe()`、`resize()` 的配置/Function authority 拒绝顺序和 delegate null-status
+归一化。三条 typed virtual seam 保持独立；`flush_shadow()` 因 shared-only 配置、
+conditional live-authority、inout caller shadow 和 replay 顺序不同而明确排除。
+
+`rdma_cq_engine_test` 新增/加强三个未配置入口的固定消息、poll/publish sentinel 清理、
+三条 null-status 精确消息、三条非空失败 status 对象身份，以及 reset epoch 漂移后的三组
+delegate counter 不变断言。`configure()` 禁止 zero timeout，所以空 CQ 的 facade 结果是
+`TIMEOUT`，不把 delegate 单次 `QUEUE_EMPTY` 写成可达外部契约。生产源码由 500 行降至
+498 行，剥离注释/空行后的生产语句行由 373 降至 344。
+
+三项最终源码边界 VCS53 均 wrapper rc=0、PROCESS/LOGICAL PASS、UVM
+`INFO=3/WARNING=0/ERROR=0/FATAL=0` 且 pristine；日志 SHA-256 分别为：
+
+- `rdma_cq_engine_test`：
+  `6bbb677a7d6ab116e36318154fc15c613b08318070073db51939ed0c3944bbcb`
+- `rdma_cq_engine_resize_test`：
+  `6253e6c9a27b35b8cf634a7e72f25963f075e74f1b88c0fd179087ab2b583e77`
+- `rdma_cq_shadow_flush_test`：
+  `0843be3677d04d3ae33ae1bceea5ca29b58af5f22d5350c9355a1fa43a7c0877`
+
+`git diff --check`、changed-SV style、queue/profile/Phase-1A gates 与 Python 292/292
+均通过；全目录 scanner 更新为 189 文件（187 `.sv`、2 `.svh`）、5,469 methods
+（`.sv` 5,467、`.svh` 2）、0 diagnostics。`flushed_shadow` 只写不读、replay 不回填缓存
+快照的问题保留为独立后续；本批不声称关闭跨队列并发、SRQ 全生命周期、legacy
+descriptor、外部 PCIe error/ordering、engine-level 全局锁或最终 ownership 审计。
+计划继续保持 `active`。详见
+`task-cmq-batch156-cq-facade-operation-envelope-report.md`。
+
+### Batch157：CQ shadow canonical replay 与 factory 原子性
+
+Batch157 删除 `src/core/rdma_cq_engine.sv` 的可变 `shadow_flush_result`，并新增 raw UVM
+factory 创建、手工 handle clone 和 detached shadow snapshot clone。普通
+`configure()+configure_shared()` 组合拒绝跨 Function UID/generation，并在补齐 shared
+shadow 前复用 live binding admission；首次
+`flush_shadow()` 在 URC evidence capture 前分别 staging caller 输出与内部 cache；
+replay 先验证冻结 authority，再从 cache 重建新的 snapshot/status，因此 caller 篡改不
+会污染 cache，replay 不重复 evidence 或 `shadow_flush_count`。`configure_shared()` 的
+两次 handle clone、首次 snapshot/cache 分配和 replay 分配均失败原子地返回
+`RDMA_SC_RESOURCE_EXHAUSTED`，不发布部分配置、caller、cache、count 或 evidence。
+queue-data engine 的 URC evidence candidate 也通过 raw factory/cast 创建，null/错误
+动态类型和 null capture status 在发布 `last_urc_evidence` 前失败。
+
+`rdma_cq_shadow_flush_test` 新增 null/错误动态类型 override，覆盖 shared 配置、首刷
+(含 URC evidence candidate)、replay 的失败/重试；`rdma_cq_engine_test` 覆盖 ordinary
+`configure()+configure_shared()` 的跨 UID/generation 拒绝与 live reset-epoch gate。
+注意 `configure_shared()`-only facade 没有 live binding，只能验证冻结字段，不能独立
+认证外部 reset，这项能力仍为 OPEN。
+
+最终源码边界的 VCS53 证据（均通过登录 bash 的 `scripts/run_vcs53.sh` 执行）为：
+
+| Entry | Result | Complete wrapper SHA-256 |
+| --- | --- | --- |
+| `rdma_cq_engine_test` | rc=0；PROCESS/LOGICAL PASS；UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；pristine | `2b3ed52478718459184ac64ed03b75a52b4a8d443624a4469517c50f26e700ca` |
+| `rdma_cq_engine_resize_test` | rc=0；PROCESS/LOGICAL PASS；UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；pristine | `7110ebc081a9ca2e41c2242d13ed6b554eddda586b3d8c9fae19e16bc353d4af` |
+| `rdma_cq_shadow_flush_test` | rc=0；PROCESS/LOGICAL PASS；UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`；pristine | `36581453cab2e5d2284146de8b515c1c582820f53b3ee47029ae99bc0057e8c8` |
+
+保留的前置 RED 日志 `/tmp/batch157-red-rdma_cq_shadow_flush_test.log`（旧 alias 断言，
+不是当前契约）wrapper rc=2，UVM `INFO=3/WARNING=0/ERROR=2/FATAL=0`，SHA-256 为
+`ee2286c3dc692d752f0b36c6ab8126a633f012ba7beb0f616798134e42dbf4c8`。
+
+当前静态门禁合并日志 `/tmp/batch157-static-fix.log` 的 SHA-256 为
+`73e0e60ee02883bcdda68f52e72e54f07760844a1e5db3c501376e782997d13a`；`git diff --check`、
+changed-SV style、queue/profile/Phase-1A、CMQ manifest 22/22、SV keyword 3/3、multivf
+manifest 4/4、field ownership 61/61 和 Python 292/292 均通过。全目录
+`sanitize_source`/`method_ranges`/`check_method_comments`/`check_file_header` 扫描覆盖
+189 个文件（187 `.sv`、2 `.svh`），5,483 methods（`.sv` 5,481、`.svh` 2），0
+diagnostics；摘要 `/tmp/batch157-contract-scan-final.log` 的 SHA-256 为
+`30f48cc7d65cb1f2be3b8a8c3da4bee093f9487655e48f0d31c5eae9f9bf46c3`。
+
+Batch157 仍不关闭 shared-only live reset 认证、跨队列并发、SRQ 生命周期、legacy
+descriptor、外部 PCIe ordering/error、engine-level 全局锁、完整 CMQ/core regression、
+全目录最终 ownership 审计或广义 Phase 1C F2；计划继续保持 `active`。详见
+`task-cmq-batch157-cq-shadow-replay-atomicity-report.md`。
 
 ## Explicit follow-up boundaries
 

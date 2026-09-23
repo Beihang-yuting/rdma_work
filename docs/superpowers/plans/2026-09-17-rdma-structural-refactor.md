@@ -1,6 +1,6 @@
 # RDMA 结构重构执行交接
 
-## 用户最新指令与当前状态
+## 初始交接快照（历史）
 
 用户要求立即将主线优先级切换为结构优化：停止当前修复任务，先优化代码结构，
 然后运行测试并修复发现的问题。此前“等待 F2 收口再开始”的顺序已被此指令替代。
@@ -9,11 +9,19 @@
 也没有调用或干预其子代理；因此本文件不代表暂停完成、任务已调度或代码重构已启动。
 交接时只读检查发现主线仍在运行 `rdma_queue_codec_test` 的 VCS53 wrapper。
 
-工作树：`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-cmq-contract-foundation`。
-当前继续执行工作树 HEAD：`00b8ff6`（feature/rdma-cmq-contract-foundation）；
-有大量已存在的未提交改动。所有改动和已有验证证据必须保留。
+以下路径和提交只记录 2026-09-17 初始交接现场，不再代表当前执行位置：工作树为
+`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-cmq-contract-foundation`，HEAD 为
+`00b8ff6`（`feature/rdma-cmq-contract-foundation`），当时存在大量未提交改动。该历史
+现场及已有验证证据仍须保留。
 
-## 当前批次状态（2026-09-22）
+## 当前执行状态（2026-09-23）
+
+当前工作树为
+`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-structural-refactor-batch155`，分支为
+`feature/rdma-structural-refactor-batch155`，HEAD/基线为 `8b8ad4e`。Batch157 的源码、
+测试和文档尚未提交；计划保持 `active`，不得把 focused GREEN 解释为整份重构完成。
+
+## 批次进展记录（更新至 2026-09-23）
 
 - Batch100 已关闭本项目 RC raw `INLINE_SGB` 的固定 512B/32-chunk 容量拒绝 guard；这不等于
   广义 Phase 1C F2 收口，`sge_num` canonical-authority/whole-plan 工作仍暂停。
@@ -535,9 +543,44 @@
   `INFO=3/WARNING=0/ERROR=0/FATAL=0`；全目录 scanner 更新为 189 文件（187 `.sv`、
   2 `.svh`）、5,465 methods（`.sv` 5,463、`.svh` 2）、0 diagnostics。计划继续保持
   `active`。详见 `task-cmq-batch154-event-poll-timeout-shrink-report.md`。
+- Batch155 在 `src/core/rdma_eq_engine.sv` 新增受保护、非 virtual 的
+  `validate_operation_authority()` 与 `normalize_delegate_status()`，只收束五个 EQ
+  facade public task 重复的配置/Function authority admission 和 delegate null-status
+  envelope；CEQ/AEQ consumer、legacy producer 与 secondary-authority producer 仍显式
+  调用各自 typed delegate，route、timeout、runtime/backing/cursor、MMIO、recovery 和
+  CQ-flush secondary authority 均未合并。生产源码由 327 行降至 272 行；EQ facade、
+  queue-data poll、event-route consume 与 AEQE route 四项 53 机 focused 均 PROCESS/
+  LOGICAL PASS，UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0`。全目录 scanner 更新为 189
+  文件（187 `.sv`、2 `.svh`）、5,467 methods（`.sv` 5,465、`.svh` 2）、0
+  diagnostics；计划继续保持 `active`。详见
+  `task-cmq-batch155-eq-facade-operation-envelope-report.md`。
+- Batch156 在 `src/core/rdma_cq_engine.sv` 新增受保护、非 virtual 的
+  `validate_operation_authority()` 与 `normalize_delegate_status()`，收束
+  `poll_cqe()`、`publish_cqe()`、`resize()` 的配置/Function authority 与 delegate
+  null-status 外壳；三条 typed virtual seam 仍显式独立，shared-only/inout/replay 契约
+  不同的 `flush_shadow()` 未并入。生产源码 500→498 行，非注释非空行 373→344；三项
+  CQ VCS53 均 wrapper rc=0、PROCESS/LOGICAL PASS、UVM
+  `INFO=3/WARNING=0/ERROR=0/FATAL=0` 且 pristine。全目录 scanner 为 189 文件（187
+  `.sv`、2 `.svh`）、5,469 methods（`.sv` 5,467、`.svh` 2）、0 diagnostics；计划继续
+  保持 `active`。详见 `task-cmq-batch156-cq-facade-operation-envelope-report.md`。
+- Batch157 在 `src/core/rdma_cq_engine.sv` 删除可变 `shadow_flush_result`，以 raw UVM
+  factory helper 和手工 value clone 收束 shared handle、首次 shadow snapshot 与 replay
+  的非致命失败路径；普通 `configure()+configure_shared()` 拒绝跨 Function
+  UID/generation，并在补齐 shared shadow 前复用 live binding admission。queue-data
+  engine 的 URC evidence candidate 同样改用 raw factory/cast，避免错误动态类型触发
+  typed-factory fatal。首次 flush 在 URC evidence 前分别 staging caller/cache detached
+  snapshot；replay 从 cache 重建独立 snapshot/status，不重复 evidence 或计数，并在
+  factory 失败时保持 caller/cache/count/evidence 原子不变。`rdma_cq_shadow_flush_test`
+  新增 null/错误类型 override、配置/首刷（含 evidence candidate）/replay 重试及
+  projected 21-bit local CQ ID fixture；`rdma_cq_engine_test` 覆盖跨 UID/generation
+  拒绝与 ordinary live reset gate。CQ engine、resize、shadow-flush 三项 VCS53 均 wrapper rc=0、PROCESS/
+  LOGICAL PASS、UVM `INFO=3/WARNING=0/ERROR=0/FATAL=0` 且 pristine；全目录 scanner
+  实测为 189 文件（187 `.sv`、2 `.svh`）、5,483 methods（`.sv` 5,481、`.svh` 2）、
+  0 diagnostics。`configure_shared()`-only 没有 live reset binding 的限制仍 OPEN，计划
+  继续保持 `active`。详见 `task-cmq-batch157-cq-shadow-replay-atomicity-report.md`。
 - Batch104 之前的静态复审已通过：Python 292、CMQ manifest 22、SV keyword guard 3、
   `git diff --check`、changed-SV style，以及覆盖 5,286 个 function/task 的历史全目录中文契约/文件头
-  scanner 均 GREEN；Batch110 按当前工作树重新扫描 185 个 `.sv`、2 个 `.svh`，共 5,382
+  scanner 均 GREEN；Batch110 按当时工作树边界重新扫描 185 个 `.sv`、2 个 `.svh`，共 5,382
   个 function/task、0 diagnostics，且 Python/manifest/keyword/queue/profile/Phase-1A
   辅助门禁均通过；Batch111 在 capability 改动后重扫为 5,387 个 function/task、0 diagnostics，
   摘要见 `evidence/batch111.*`，历史完整摘要仍位于 `evidence/final-static.meta`。
@@ -548,8 +591,11 @@
   reservation-only recovery helper 后重扫为 5,461 methods（`.sv` 5,459、`.svh` 2）；Batch150
   context helper 收缩与 dead fixture 删除后重扫为 5,462 methods（`.sv` 5,460、`.svh` 2）、
   Batch151 authority helper 与 Batch152 facade configuration helper 后重扫为 5,464 methods
-  （`.sv` 5,462、`.svh` 2）；Batch154 event poll timeout helper 后当前边界为 5,465
-  methods（`.sv` 5,463、`.svh` 2）、0 diagnostics；扫描继续复用
+  （`.sv` 5,462、`.svh` 2）；Batch154 event poll timeout helper 后为 5,465 methods，
+  Batch155 EQ facade operation envelope helper 后为 5,467 methods，Batch156 CQ facade
+  operation envelope helper 后为 5,469 methods（`.sv` 5,467、`.svh` 2）；Batch157
+  CQ shadow replay/factory atomicity helper 与测试后当前边界为 5,483 methods（`.sv`
+  5,481、`.svh` 2）、0 diagnostics；扫描继续复用
   `sanitize_source`、`method_ranges`、`check_method_comments` 和 `check_file_header`，覆盖
   `src/`、`tests/`、`sim/`，不把历史计数冒充当前证据。
 
@@ -579,7 +625,10 @@ rollback legacy execution 去重 seam、Batch137 的 create/destroy legacy execu
   host-producer route/epoch admission、Batch148 的 host-producer commit/recovery route
   和 Batch149 的 reservation-only recovery seam、Batch150 的 CMQ context helper 重复收缩、
   Batch151/152/153 的 facade authority/configuration admission 收缩、Batch154 的 CEQ/AEQ
-  timeout wrapper 收缩；完整公开 post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
+  timeout wrapper 收缩、Batch155 的 EQ facade operation envelope 收缩、Batch156 的 CQ
+  facade operation envelope 收缩和 Batch157 的 CQ shadow canonical replay/factory
+  atomicity 收口；完整公开
+  post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
 不得标记为 `complete`。
 

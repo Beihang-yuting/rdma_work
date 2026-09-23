@@ -332,25 +332,34 @@ class rdma_queue_data_engine extends uvm_object;
     configured = 1'b0;
   endfunction
 
-  // 功能：把 CQ flush 产生的 URC shadow 捕获为 queue-data engine 的可恢复事务证据。
-  // 输入/输出及副作用：shadow 为输入；成功时新建并保存 last_urc_evidence 的 detached 快照，不释放或修改外部 runtime。
-  // 失败/边界：shadow 为空、authority 无效或 evidence 分配失败时返回错误，既有
-  //   evidence 保持不变。
+  // 功能：把 CQ flush 产生的 URC shadow 捕获为 queue-data engine 的可恢复事务证据，
+  //   通过 raw factory 把 evidence 的 null/错误动态类型降级为普通状态。
+  // 输入/输出及副作用：shadow 为输入；成功时新建并保存 last_urc_evidence 的 detached
+  //   快照，不释放或修改外部 runtime；candidate 在发布前始终只存在于局部变量。
+  // 失败/边界：shadow 为空、evidence factory 返回 null/不可 cast、capture 返回 null
+  //   或失败时返回确定错误，既有 last_urc_evidence 保持不变且不触发 typed-factory fatal。
   function rdma_status capture_urc_shadow_evidence(rdma_cq_shadow_snapshot shadow);
     rdma_queue_txn_evidence candidate;
+    uvm_object raw_candidate;
     rdma_status status;
     if (shadow == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC CQ shadow evidence is null");
-    candidate = rdma_queue_txn_evidence::type_id::create("urc_shadow_evidence");
-    if (candidate == null)
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "URC CQ shadow evidence allocation failed");
+    raw_candidate = factory_create_object_nonfatal(
+      rdma_queue_txn_evidence::get_type(), "urc_shadow_evidence");
+    if (raw_candidate == null || !$cast(candidate, raw_candidate))
+      return rdma_status::make_direct(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "URC CQ shadow evidence allocation returned null or an incompatible type");
     status = candidate.capture_urc_shadow(shadow);
+    if (status == null)
+      return rdma_status::make_direct(
+        RDMA_SC_INVALID_STATE,
+        "URC CQ shadow evidence capture returned null status");
     if (!status.ok())
       return status;
     last_urc_evidence = candidate;
-    return rdma_status::success();
+    return rdma_status::make_direct(RDMA_SC_OK);
   endfunction
 
   // 功能：bad 把调用方指定的错误码与诊断文本封装为新的 rdma_status。

@@ -8,14 +8,16 @@
 
 // 功能：提供只用于边界测试的 queue-data delegate，让 EQ 五个入口返回 null 或
 //   显式失败状态并夹带未认证 result。
-// 输入/输出及副作用：模式与调用计数由测试读写；各入口不读取 event backing、
-//   不推进 cursor，也不发送 producer/consumer doorbell。
+// 输入/输出及副作用：模式、最后返回的 status 句柄与调用计数由测试读写；各入口
+//   不读取 event backing、不推进 cursor，也不发送 producer/consumer doorbell。
 // 失败/边界：该对象不代表可用 EQ runtime；facade 必须按模式归一化/保留 status，
 //   并在所有失败路径丢弃未认证 result。
 class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
   `uvm_object_utils(rdma_eq_null_status_delegate)
 
   bit inject_failure_status;
+  // hostile delegate 每次返回的非空 status 句柄，用于证明 facade 不克隆或替换错误对象。
+  rdma_status last_returned_status;
   int unsigned poll_ceqe_calls;
   int unsigned poll_aeqe_calls;
   int unsigned publish_ceqe_calls;
@@ -23,11 +25,13 @@ class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
   int unsigned publish_aeqe_with_secondary_calls;
 
   // 功能：构造 null-status EQ delegate 并初始化父类本地状态。
-  // 输入/输出及副作用：name 为输入；new 不分配 event ring、router 或外部资源。
+  // 输入/输出及副作用：name 为输入；new 清空模式、最后返回的 status 与调用计数，
+  //   不分配 event ring、router 或外部资源。
   // 失败/边界：delegate 仅用于注入边界故障，不能用于真实 CEQ/AEQ 事务。
   function new(string name = "rdma_eq_null_status_delegate");
     super.new(name);
     inject_failure_status = 1'b0;
+    last_returned_status = null;
     poll_ceqe_calls = 0;
     poll_aeqe_calls = 0;
     publish_ceqe_calls = 0;
@@ -37,7 +41,7 @@ class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
 
   // 功能：模拟 EQ delegate 在 CEQ poll 入口返回 null 或显式失败状态。
   // 输入/输出及副作用：ceq_h、timeout 为输入；result 被设置为未认证测试对象，
-  //   status 清空为 null，不修改 queue-data engine、runtime、backing 或 scheduler。
+  //   status 按模式输出并同步到 last_returned_status；不修改 runtime/backing/scheduler。
   // 失败/边界：模式为 0 时返回 null，模式为 1 时返回 UNKNOWN_HW_ERROR；
   //   facade 必须分别归一化/原样保留 status，且始终清空 result。
   virtual task poll_ceqe(
@@ -52,11 +56,12 @@ class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
     status = inject_failure_status ?
       rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                         "injected EQ CEQ poll failure") : null;
+    last_returned_status = status;
   endtask
 
   // 功能：模拟 EQ delegate 在 AEQ poll 入口返回未认证结果与 null/失败状态。
   // 输入/输出及副作用：aeq_h、timeout 为输入；result 被设置为测试对象，status
-  //   清空为 null，不读取 AEQ backing、不推进 CI、不发送 doorbell。
+  //   按模式输出并同步到 last_returned_status；不读取 backing、不推进 CI/doorbell。
   // 失败/边界：null 必须归一化为 INVALID_STATE，显式失败必须原样保留，且
   //   两种模式都要求 result=null；测试不依赖 handle kind/注册状态。
   virtual task poll_aeqe(
@@ -71,11 +76,12 @@ class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
     status = inject_failure_status ?
       rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                         "injected EQ AEQ poll failure") : null;
+    last_returned_status = status;
   endtask
 
   // 功能：模拟 EQ delegate 在 CEQE publish 入口发布未认证结果并返回 null/失败状态。
   // 输入/输出及副作用：ceq_h、model 为输入；result 被设置为测试对象，status
-  //   清空为 null，不预留 event 槽位、不写 backing、不提交 producer cursor。
+  //   按模式输出并同步到 last_returned_status；不预留槽位、不写 backing/cursor。
   // 失败/边界：null 必须归一化为 INVALID_STATE，显式失败必须原样保留；两种
   //   模式都要求 result=null，null model 仅用于到达 hostile delegate。
   virtual task publish_ceqe(
@@ -90,11 +96,12 @@ class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
     status = inject_failure_status ?
       rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                         "injected EQ CEQE publish failure") : null;
+    last_returned_status = status;
   endtask
 
   // 功能：模拟 EQ delegate 在 AEQE publish 入口发布未认证结果并返回 null/失败状态。
   // 输入/输出及副作用：aeq_h、model 为输入；result 被设置为测试对象，status
-  //   清空为 null，不预留 event 槽位、不写 backing、不提交 producer cursor。
+  //   按模式输出并同步到 last_returned_status；不预留槽位、不写 backing/cursor。
   // 失败/边界：null 必须归一化为 INVALID_STATE，显式失败必须原样保留；两种
   //   模式都要求 result=null，null model 仅用于到达 hostile delegate。
   virtual task publish_aeqe(
@@ -109,12 +116,13 @@ class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
     status = inject_failure_status ?
       rdma_status::make(RDMA_SC_UNKNOWN_HW_ERROR,
                         "injected EQ AEQE publish failure") : null;
+    last_returned_status = status;
   endtask
 
   // 功能：模拟 EQ delegate 在带 secondary authority 的 AEQE publish sibling
   //   返回未认证结果与 null/显式失败状态。
   // 输入/输出及副作用：aeq_h、model、secondary_target_h 为输入；result/status
-  //   为输出，并递增 publish_aeqe_with_secondary_calls；不访问 backing 或 cursor。
+  //   为输出，记录 last_returned_status 并递增调用计数；不访问 backing 或 cursor。
   // 失败/边界：模式为 0 时返回 null，模式为 1 时返回 UNKNOWN_HW_ERROR；facade
   //   必须归一化 null、保留显式失败，并在两条失败路径清空 result。
   virtual task publish_aeqe_with_secondary(
@@ -131,6 +139,7 @@ class rdma_eq_null_status_delegate extends rdma_queue_data_engine;
       rdma_status::make(
         RDMA_SC_UNKNOWN_HW_ERROR,
         "injected EQ AEQE secondary publish failure") : null;
+    last_returned_status = status;
   endtask
 endclass
 
@@ -760,11 +769,12 @@ class rdma_eq_engine_test extends uvm_test;
       facade_qp_created, facade_qp_attached);
   endtask
 
-  // 功能：配置 EQ facade，验证 one-shot 生命周期、空 CEQ、错误 AEQ kind，并执行
-  //   CEQE、legacy AEQE 与 CQ-flush sibling 的 direct/facade 等价及 hostile 矩阵。
-  // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
-  // 失败/边界：第二次 configure 必须返回 INVALID_STATE 且保留首个 delegate；未登记
-  //   的 AEQ、错误 Function 或 stale handle 必须返回错误且不发布 event。
+  // 功能：配置 EQ facade，验证五个入口的统一 operation envelope、one-shot 生命周期、
+  //   空 CEQ、错误 AEQ kind，并执行 producer direct/facade 等价及 hostile 矩阵。
+  // 输入/输出及副作用：phase 为输入；task 管理 objection，创建 lifecycle event ring、
+  //   驱动 poll/publish，并通过 UVM 断言暴露 status/result 与 delegate 调用结果。
+  // 失败/边界：未配置的五个入口都必须返回同一 INVALID_STATE 并清空 sentinel；第二次
+  //   configure 不得替换首个 delegate；错误 Function/stale authority 不得发布 event。
   task run_phase(uvm_phase phase);
     rdma_queue_data_engine_fixture fixture;
     rdma_eq_engine facade;
@@ -801,20 +811,48 @@ class rdma_eq_engine_test extends uvm_test;
       return;
     end
     facade = rdma_eq_engine::type_id::create("eq_facade");
-    // 功能：验证三个 producer facade 入口在未配置时均不取得 event backing。
-    // 输入/输出及副作用：使用 fixture 句柄和 null model 调用，published/status
-    // 为输出；只观察配置门禁，不创建 reservation、不修改 runtime 或 Host-memory。
-    // 失败/边界：三个入口都必须返回 INVALID_STATE 且 published 为 null；若任一路径
-    // 成功，说明 facade 绕过了 delegate 的生命周期 authority。
+    // 功能：验证两个 consumer 与三个 producer facade 入口在未配置时都由同一
+    // operation envelope 拒绝，且不会把调用方 sentinel 误留为可信结果。
+    // 输入/输出及副作用：使用 fixture 句柄和 null model 调用；只观察 result/status，
+    // 不创建 reservation、不修改 event runtime、Host-memory 或 doorbell。
+    // 失败/边界：五个入口都必须返回固定 INVALID_STATE/message 并清空 result；
+    // 任一路径成功或保留 sentinel 都表示 facade 绕过配置 authority。
+    event_result = rdma_queue_event_result::type_id::create(
+      "eq_unconfigured_ceq_result_sentinel");
+    facade.poll_ceqe(fixture.ceq.handle, event_result, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        status.message != "EQ facade is not configured" ||
+        event_result != null)
+      `uvm_error("EQ_CEQ_UNCONFIGURED",
+                 "unconfigured EQ facade polled CEQ")
+
+    event_result = rdma_queue_event_result::type_id::create(
+      "eq_unconfigured_aeq_result_sentinel");
+    facade.poll_aeqe(fixture.ceq.handle, event_result, status);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        status.message != "EQ facade is not configured" ||
+        event_result != null)
+      `uvm_error("EQ_AEQ_UNCONFIGURED",
+                 "unconfigured EQ facade polled AEQ")
+
+    published = rdma_queue_device_publish_result::type_id::create(
+      "eq_unconfigured_ceqe_result_sentinel");
     facade.publish_ceqe(fixture.ceq.handle, null, published, status);
-    if (status == null || status.code != RDMA_SC_INVALID_STATE || published != null)
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        status.message != "EQ facade is not configured" || published != null)
       `uvm_error("EQ_CEQE_UNCONFIGURED", "unconfigured EQ facade published CEQE")
+    published = rdma_queue_device_publish_result::type_id::create(
+      "eq_unconfigured_aeqe_result_sentinel");
     facade.publish_aeqe(fixture.ceq.handle, null, published, status);
-    if (status == null || status.code != RDMA_SC_INVALID_STATE || published != null)
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        status.message != "EQ facade is not configured" || published != null)
       `uvm_error("EQ_AEQE_UNCONFIGURED", "unconfigured EQ facade published AEQE")
+    published = rdma_queue_device_publish_result::type_id::create(
+      "eq_unconfigured_aeqe_secondary_result_sentinel");
     facade.publish_aeqe_with_secondary(
       fixture.ceq.handle, null, null, published, status);
-    if (status == null || status.code != RDMA_SC_INVALID_STATE || published != null)
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        status.message != "EQ facade is not configured" || published != null)
       `uvm_error("EQ_AEQE_SECONDARY_UNCONFIGURED",
                  "unconfigured EQ facade published AEQE with secondary authority")
     // fixture.ceq 是 CQ 创建前登记的 dependency-only 资源，没有 queue plan；
@@ -950,6 +988,7 @@ class rdma_eq_engine_test extends uvm_test;
       event_result = null;
       facade.poll_ceqe(runtime_ceq.handle, event_result, status);
       if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+          status.message != "EQ delegate poll_ceqe returned null status" ||
           event_result != null)
         `uvm_error("EQ_NULL_DELEGATE",
                    "EQ facade propagated CEQ poll null delegate status")
@@ -957,6 +996,7 @@ class rdma_eq_engine_test extends uvm_test;
       event_result = null;
       facade.poll_aeqe(runtime_ceq.handle, event_result, status);
       if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+          status.message != "EQ delegate poll_aeqe returned null status" ||
           event_result != null)
         `uvm_error("EQ_NULL_AEQ_POLL_DELEGATE",
                    "EQ facade propagated AEQ poll null delegate status")
@@ -964,6 +1004,7 @@ class rdma_eq_engine_test extends uvm_test;
       published = null;
       facade.publish_ceqe(runtime_ceq.handle, null, published, status);
       if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+          status.message != "EQ delegate publish_ceqe returned null status" ||
           published != null)
         `uvm_error("EQ_NULL_CEQE_PUBLISH_DELEGATE",
                    "EQ facade propagated CEQE publish null delegate status")
@@ -971,6 +1012,7 @@ class rdma_eq_engine_test extends uvm_test;
       published = null;
       facade.publish_aeqe(runtime_ceq.handle, null, published, status);
       if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+          status.message != "EQ delegate publish_aeqe returned null status" ||
           published != null)
         `uvm_error("EQ_NULL_AEQE_PUBLISH_DELEGATE",
                    "EQ facade propagated AEQE publish null delegate status")
@@ -979,17 +1021,21 @@ class rdma_eq_engine_test extends uvm_test;
       facade.publish_aeqe_with_secondary(
         runtime_ceq.handle, null, null, published, status);
       if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+          status.message !=
+            "EQ delegate publish_aeqe_with_secondary returned null status" ||
           published != null)
         `uvm_error("EQ_NULL_AEQE_SECONDARY_PUBLISH_DELEGATE",
                    "EQ facade propagated AEQE secondary publish null status")
 
-      // RED：五个入口对非 null 失败状态均须原样保留 code/message，同时清空
-      // delegate 夹带的未认证结果。
+      // RED：五个入口对非 null 失败状态均须保留同一对象及其 code/message，同时
+      // 清空 delegate 夹带的未认证结果。
       null_status_delegate.inject_failure_status = 1'b1;
 
       event_result = null;
       facade.poll_ceqe(runtime_ceq.handle, event_result, status);
-      if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+      if (status == null ||
+          status != null_status_delegate.last_returned_status ||
+          status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
           status.message != "injected EQ CEQ poll failure" ||
           event_result != null)
         `uvm_error("EQ_FAILURE_CEQ_POLL_DELEGATE",
@@ -997,7 +1043,9 @@ class rdma_eq_engine_test extends uvm_test;
 
       event_result = null;
       facade.poll_aeqe(runtime_ceq.handle, event_result, status);
-      if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+      if (status == null ||
+          status != null_status_delegate.last_returned_status ||
+          status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
           status.message != "injected EQ AEQ poll failure" ||
           event_result != null)
         `uvm_error("EQ_FAILURE_AEQ_POLL_DELEGATE",
@@ -1005,7 +1053,9 @@ class rdma_eq_engine_test extends uvm_test;
 
       published = null;
       facade.publish_ceqe(runtime_ceq.handle, null, published, status);
-      if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+      if (status == null ||
+          status != null_status_delegate.last_returned_status ||
+          status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
           status.message != "injected EQ CEQE publish failure" ||
           published != null)
         `uvm_error("EQ_FAILURE_CEQE_PUBLISH_DELEGATE",
@@ -1013,7 +1063,9 @@ class rdma_eq_engine_test extends uvm_test;
 
       published = null;
       facade.publish_aeqe(runtime_ceq.handle, null, published, status);
-      if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+      if (status == null ||
+          status != null_status_delegate.last_returned_status ||
+          status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
           status.message != "injected EQ AEQE publish failure" ||
           published != null)
         `uvm_error("EQ_FAILURE_AEQE_PUBLISH_DELEGATE",
@@ -1022,7 +1074,9 @@ class rdma_eq_engine_test extends uvm_test;
       published = null;
       facade.publish_aeqe_with_secondary(
         runtime_ceq.handle, null, null, published, status);
-      if (status == null || status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
+      if (status == null ||
+          status != null_status_delegate.last_returned_status ||
+          status.code != RDMA_SC_UNKNOWN_HW_ERROR ||
           status.message != "injected EQ AEQE secondary publish failure" ||
           published != null)
         `uvm_error("EQ_FAILURE_AEQE_SECONDARY_PUBLISH_DELEGATE",
