@@ -43,6 +43,7 @@ readonly CORE_TESTS=(
   rdma_queue_data_engine_poll_test
   rdma_queue_data_engine_recovery_test
   rdma_cq_engine_resize_test
+  rdma_cq_resize_exit_test
   rdma_cqe_size_codec_test
   rdma_sq_models_test
   # SQ/RQ/CQ/EQ engine 共享 queue lifecycle 编译，必须纳入同一 VCS53 回归，

@@ -16,6 +16,16 @@
 
 ## 当前执行状态（2026-09-28）
 
+Batch225 在 `aa2518f` 基线上将 CQ resize 的 20 个发布前失败续接收束到唯一回滚
+出口，发布后仍直接返回并保留新 authority/旧资源 cleanup evidence。不新增生产
+组件、方法或状态，engine 9,977→9,934 行；138 声明/类壳不变、137 正文 token 不变，
+resize 展开尾段后与基线 token 一致。新增 16-case 故障矩阵及六项 Python 门禁；
+排除命名块 disable 跨 engine 嵌套退出风险后，最终使用单次循环 break。最终
+core 99/82、CMQ 28/11（PROCESS/LOGICAL）、integration 10、E2E 3、Host-memory 3、
+PCIe 1、focused 16-case、Python 317/317、驱动契约及静态门禁均通过；E2E 保留基线
+编译警告。仍不合并/推送，详见
+`task-rdma-batch225-cq-resize-exit-report.md`，项目仍 active。
+
 Batch224 在 `bbbdc4f` 基线上统一 CQ/event/replay 的 consumer doorbell evidence 和
 CI commit 步骤，不改变 caller 的 admission、shadow/WQE 或恢复幂等选择，不新增生产
 文件/对象/账本。engine 10,000→9,977 行，原 136 个方法声明不变；133 个正文 token
