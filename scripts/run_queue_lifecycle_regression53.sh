@@ -25,6 +25,7 @@ readonly CORE_TESTS=(
   rdma_queue_backing_access_test
   rdma_queue_data_engine_post_test
   rdma_queue_detached_snapshot_test
+  rdma_queue_consumer_steps_test
   # device publish、route-consume 与真实 AEQE E2E 共享 lifecycle fixture，
   # 必须在定义共享 fixture 的 post 测试之后执行。
   rdma_queue_data_engine_device_publish_test

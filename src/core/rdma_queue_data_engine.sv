@@ -10,6 +10,8 @@
 // 其生命周期由 lifecycle/resource manager 或外部环境管理，detach/abort 不越权释放 mapping。
 // 值边界：身份比较与 consumer 结果物化集中到 rdma_queue_data_projector；字段 helper 无分配，
 //   业务 wrapper 自己决定返回 status 分配；scheduler 后仍禁止新建对象或虚拟 clone/copy。
+// 消费提交：live CQ、event 与 replay 共享 doorbell evidence/CI commit 步骤；各 caller
+//   仍决定 admission、shadow、幂等跳步、WQE release 和最终交付，runtime 是唯一账本 owner。
 
 // 设计说明：本层是 host 侧 queue-data facade。queue 的生命周期仍归 lifecycle
 // resource 所有；engine 仅在 attachment 存活期间保存 detached runtime cursor 和
@@ -26,6 +28,11 @@ class rdma_queue_data_engine extends uvm_object;
 
   // 值操作集中到无状态 projector；别名只缩短调用限定，不创建对象或改变任何 owner。
   typedef rdma_queue_data_projector value_ops;
+
+  // 仅选择既有固定诊断文本，不推导 queue kind、route、shadow 模式或 replay authority。
+  typedef enum bit [1:0] {
+    CONSUMER_DIAG_CQ, CONSUMER_DIAG_EVENT, CONSUMER_DIAG_REPLAY
+  } consumer_diagnostic_e;
 
   rdma_resource_manager manager;
   rdma_function_binding binding;
@@ -6407,6 +6414,129 @@ class rdma_queue_data_engine extends uvm_object;
     return cq_attachment.runtime.commit_consumer(cursor);
   endfunction
 
+  // 设计说明：三条 consumer 流程共享通知和本地提交机制，但不共享业务准入和幂等策略。
+  //   本 task 只执行一次 prepared doorbell 并保存 evidence；caller 负责证明当前阶段需要
+  //   MMIO。不能用它代替 CQ shadow，也不能让 SUCCESS/AMBIGUOUS replay 再发一次通知。
+  // 功能：submit_consumer_doorbell_recorded 统一调用 consumer doorbell seam，拒绝 null
+  //   status 或缺少 result/SUCCESS evidence 的假成功，并把本次结果写入既有 recovery。
+  // 输入/输出及副作用：attachment/next/link/descriptor/noalloc_status 为已准入且非空的
+  //   caller-owned continuation（event 的 link 可空）；diagnostic 仅选择固定文本；status
+  //   原样保留真实错误或指向预建错误槽，completed 仅在成功通知证据保存后为 1。可能执行
+  //   一次 MMIO 并更新 runtime pending；seam 返回后不分配对象、不拼接字符串，不推进 CI/WQE。
+  // 失败/边界：caller 必须已校验 runtime、next、descriptor/status 并安装 pending；本层不
+  //   重做 admission。null/不完整成功归一化 INVALID_STATE，证据保存失败升级 RECOVERY_REQUIRED；
+  //   任一失败 completed=0，不重发、不继续 commit，也不改变原始 NO_SUBMIT/AMBIGUOUS 语义。
+  protected task submit_consumer_doorbell_recorded(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot next,
+    rdma_queue_data_qp_link link,
+    rdma_doorbell_desc descriptor,
+    rdma_status noalloc_status,
+    consumer_diagnostic_e diagnostic,
+    output bit completed,
+    output rdma_status status
+  );
+    rdma_doorbell_result db_result;
+    rdma_queue_mmio_evidence_e evidence;
+
+    completed = 1'b0;
+    db_result = null;
+    evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
+    submit_consumer_doorbell(
+      attachment, next, db_result, status, evidence, link, descriptor,
+      noalloc_status);
+    if (status == null) begin
+      void'(value_ops::set_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        diagnostic == CONSUMER_DIAG_CQ ? "CQ consumer doorbell returned null status" :
+        diagnostic == CONSUMER_DIAG_EVENT ? "event consumer doorbell returned null status" :
+        "consumer recovery doorbell returned null status"));
+      status = noalloc_status;
+    end
+    else if (status.ok() &&
+             (db_result == null || evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
+      void'(value_ops::set_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        diagnostic == CONSUMER_DIAG_CQ ?
+          "CQ consumer doorbell returned incomplete success evidence" :
+        diagnostic == CONSUMER_DIAG_EVENT ?
+          "event consumer doorbell returned incomplete success evidence" :
+        "consumer recovery doorbell returned incomplete success evidence"));
+      status = noalloc_status;
+    end
+    if (!status.ok()) begin
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            evidence, status, noalloc_status)) begin
+        void'(value_ops::set_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          diagnostic == CONSUMER_DIAG_CQ ? "CQ doorbell failure evidence could not be retained" :
+          diagnostic == CONSUMER_DIAG_EVENT ?
+            "event doorbell failure evidence could not be retained" :
+          "consumer recovery doorbell failure could not be retained"));
+        status = noalloc_status;
+      end
+      return;
+    end
+    if (!attachment.runtime.record_recovery_failure_noalloc(
+          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
+      void'(value_ops::set_status_noalloc(
+        noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+        diagnostic == CONSUMER_DIAG_CQ ? "CQ doorbell success evidence could not be retained" :
+        diagnostic == CONSUMER_DIAG_EVENT ?
+          "event doorbell success evidence could not be retained" :
+        "consumer recovery doorbell success could not be retained"));
+      status = noalloc_status;
+      return;
+    end
+    completed = 1'b1;
+  endtask
+
+  // 功能：commit_consumer_cursor_recorded 打开 runtime recovery commit gate，调用唯一
+  //   可覆写 CI seam，并在拒绝时保存当前通知方式对应的失败证据，供 live/replay 共用。
+  // 输入/输出及副作用：attachment/cursor/noalloc_status 为 caller 已校验的 continuation，
+  //   failure_evidence 由 caller 按 shadow/MMIO 选择，diagnostic 仅选固定文本；status 返回
+  //   seam 状态或预建错误槽，返回 1 表示 CI 提交成功。可能推进 CI/used/pending marker，
+  //   不分配对象、不执行 MMIO/shadow、WQE release 或 recovery completion。
+  // 失败/边界：caller 保证 runtime/cursor/status 非空，replay 仅在尚未 committed 时调用；
+  //   gate 拒绝返回 0 并保留其错误；null seam 归一化 INVALID_STATE；commit 失败保存原错误，
+  //   证据保存失败升级 RECOVERY_REQUIRED。失败不自动补做、重试或回滚已发生的外部通知。
+  protected function bit commit_consumer_cursor_recorded(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot cursor,
+    rdma_status noalloc_status,
+    rdma_queue_mmio_evidence_e failure_evidence,
+    consumer_diagnostic_e diagnostic,
+    output rdma_status status
+  );
+    if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
+      status = noalloc_status;
+      return 1'b0;
+    end
+    status = commit_cq_consumer(attachment, cursor, noalloc_status);
+    if (status == null) begin
+      void'(value_ops::set_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        diagnostic == CONSUMER_DIAG_CQ ? "CQ consumer commit returned null status" :
+        diagnostic == CONSUMER_DIAG_EVENT ? "event consumer commit returned null status" :
+        "consumer recovery commit returned null status"));
+      status = noalloc_status;
+    end
+    if (!status.ok()) begin
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            failure_evidence, status, noalloc_status)) begin
+        void'(value_ops::set_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          diagnostic == CONSUMER_DIAG_CQ ? "CQ consumer commit failure could not be retained" :
+          diagnostic == CONSUMER_DIAG_EVENT ?
+            "event consumer commit failure could not be retained" :
+          "consumer recovery commit failure could not be retained"));
+        status = noalloc_status;
+      end
+      return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
   // 设计说明：CEQ 与 AEQ 在 decode、route 和 result 物化之后都必须先准备完整的
   //   consumer pending/doorbell evidence，才能进入 commit_event_poll_candidate 的
   //   首个 runtime mutation。两条入口的 prepared continuation 过去各自维护同一段
@@ -6477,6 +6607,7 @@ class rdma_queue_data_engine extends uvm_object;
   // consumer-only 副作用链。将这段链路集中到一个 task，能够让两种事件队列
   // 使用相同的 MMIO evidence、失败续接和 CI 提交顺序，同时明确它不拥有 CQ
   // completion target，也不会触碰 CQ→WQ release gate。
+  // doorbell evidence 与 CI gate/commit 通过共用步骤执行；result 交付仍由本 event 流程决定。
   // 功能：commit_event_poll_candidate 接管已完成准备的 CEQ/AEQ candidate，进入
   // prepared recovery，提交 consumer doorbell，记录 MMIO evidence，推进事件队列
   // consumer cursor，并在 recovery 完成后按 route 命中与否发布 detached result。
@@ -6504,8 +6635,7 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_queue_event_result result,
     output rdma_status status
   );
-    rdma_doorbell_result db_result;
-    rdma_queue_mmio_evidence_e db_mmio_evidence;
+    bit doorbell_completed;
     rdma_queue_data_qp_link no_route;
     rdma_status noalloc_status;
 
@@ -6539,67 +6669,15 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    db_result = null;
-    db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-    submit_consumer_doorbell(
-      attachment, next, db_result, status, db_mmio_evidence,
-      no_route, prepared_db_desc, noalloc_status);
-    // 中文设计：doorbells.submit 返回后属于严格 no-allocation continuation；错误
-    // 诊断只允许写入 caller-owned slot，不能再拼接 event_name 等动态字符串。
-    if (status == null) begin
-      void'(value_ops::set_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "event consumer doorbell returned null status"));
-      status = noalloc_status;
-    end
-    else if (status.ok() &&
-             (db_result == null ||
-              db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
-      void'(value_ops::set_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "event consumer doorbell returned incomplete success evidence"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            db_mmio_evidence, status, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "event doorbell failure evidence could not be retained"));
-        status = noalloc_status;
-      end
+    submit_consumer_doorbell_recorded(
+      attachment, next, no_route, prepared_db_desc, noalloc_status,
+      CONSUMER_DIAG_EVENT, doorbell_completed, status);
+    if (!doorbell_completed)
       return;
-    end
-    if (!attachment.runtime.record_recovery_failure_noalloc(
-          RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
-      void'(value_ops::set_status_noalloc(
-        noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-        "event doorbell success evidence could not be retained"));
-      status = noalloc_status;
+    if (!commit_consumer_cursor_recorded(
+          attachment, cursor, noalloc_status, RDMA_QUEUE_MMIO_SUCCESS,
+          CONSUMER_DIAG_EVENT, status))
       return;
-    end
-
-    if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    status = commit_cq_consumer(attachment, cursor, noalloc_status);
-    if (status == null) begin
-      void'(value_ops::set_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "event consumer commit returned null status"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            RDMA_QUEUE_MMIO_SUCCESS, status, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "event consumer commit failure could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
     if (!attachment.runtime.complete_consumer_recovery_noalloc(
           1'b0, noalloc_status)) begin
       status = noalloc_status;
@@ -6909,6 +6987,7 @@ class rdma_queue_data_engine extends uvm_object;
   //   该阶段集中在独立 task 可让 caller 保持 read/decode/route/staging 的纯准备边界，
   //   也避免 recovery retry 重新解析可变 CQE 或 route。该 task 不与 frozen recovery
   //   的 release_consumer_pending_wqe 合并，因为这里仍拥有本次 live poll 的 CQE。
+  //   doorbell evidence/CI commit 复用公共步骤；shadow 与 WQE release 的选择和顺序留在这里。
   // 功能：commit_cq_poll_candidate 接管已通过 staging 和 WQ identity relookup 的
   //   CQ candidate，先进入 prepared recovery，再按 shadow 或 doorbell 发布、开启并
   //   提交 CQ consumer，最后按 CQ→WQ 顺序释放 completion target 并完成 runtime recovery；
@@ -6940,8 +7019,7 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_queue_completion_result result,
     output rdma_status status
   );
-    rdma_doorbell_result db_result;
-    rdma_queue_mmio_evidence_e db_mmio_evidence;
+    bit doorbell_completed;
     rdma_status noalloc_status;
 
     result = null;
@@ -6985,69 +7063,18 @@ class rdma_queue_data_engine extends uvm_object;
       end
     end
     else begin
-      db_result = null;
-      db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-      submit_consumer_doorbell(cq_attachment, next, db_result, status,
-                               db_mmio_evidence, link, prepared_db_desc,
-                               noalloc_status);
-      if (status == null) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ consumer doorbell returned null status"));
-        status = noalloc_status;
-      end
-      else if (status.ok() &&
-               (db_result == null ||
-                db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ consumer doorbell returned incomplete success evidence"));
-        status = noalloc_status;
-      end
-      if (!status.ok()) begin
-        if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-              db_mmio_evidence, status, noalloc_status)) begin
-          void'(value_ops::set_status_noalloc(
-            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-            "CQ doorbell failure evidence could not be retained"));
-          status = noalloc_status;
-        end
+      submit_consumer_doorbell_recorded(
+        cq_attachment, next, link, prepared_db_desc, noalloc_status,
+        CONSUMER_DIAG_CQ, doorbell_completed, status);
+      if (!doorbell_completed)
         return;
-      end
-      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-            RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status,
-          RDMA_SC_RECOVERY_REQUIRED,
-          "CQ doorbell success evidence could not be retained"));
-        status = noalloc_status;
-        return;
-      end
     end
 
-    if (!cq_attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
-      status = noalloc_status;
+    if (!commit_consumer_cursor_recorded(
+          cq_attachment, cursor, noalloc_status,
+          cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT : RDMA_QUEUE_MMIO_SUCCESS,
+          CONSUMER_DIAG_CQ, status))
       return;
-    end
-    status = commit_cq_consumer(cq_attachment, cursor, noalloc_status);
-    if (status == null) begin
-      void'(value_ops::set_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CQ consumer commit returned null status"));
-      status = noalloc_status;
-    end
-    if (!status.ok()) begin
-      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-            cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
-                                 RDMA_QUEUE_MMIO_SUCCESS,
-            status, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "CQ consumer commit failure could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
 
     // 中文设计：CQ runtime 持有 marker 后才允许进入 routed WQ；统一 helper
     // 覆盖 live poll 和 recovery retry 的 begin/release/finish 及失败证据，避免
@@ -9466,6 +9493,7 @@ class rdma_queue_data_engine extends uvm_object;
   // CQ consumer commit 和可选 WQE release；这些阶段共享 completion authority 与锁序，
   // 不能与 producer DMA recovery 混用。helper 保留 caller 冻结的 next cursor 和
   // pending evidence，集中维护 CQ→WQ 的副作用顺序。
+  // doorbell evidence/CI commit 复用 live 的公共步骤，但是否跳过已完成阶段仍只在这里判断。
   // 功能：replay_consumer_pending 校验 consumer pending 的 queue/route/epoch/completion
   //   authority，按 MMIO evidence 续做 shadow 或 consumer doorbell，提交 CQ cursor，
   //   释放 CQ 对应 WQE，并完成 consumer recovery。
@@ -9482,8 +9510,7 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_cursor_snapshot next,
     output rdma_status status
   );
-    rdma_doorbell_result db_result;
-    rdma_queue_mmio_evidence_e db_mmio_evidence;
+    bit doorbell_completed;
     rdma_queue_data_qp_link link;
     rdma_queue_data_attachment wqe_attachment;
     rdma_doorbell_desc prepared_db_desc;
@@ -9542,43 +9569,11 @@ class rdma_queue_data_engine extends uvm_object;
             "consumer recovery doorbell preparation is incomplete");
         return;
       end
-      db_result = null;
-      db_mmio_evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
-      submit_consumer_doorbell(
-        attachment, next, db_result, status, db_mmio_evidence, link,
-        prepared_db_desc, noalloc_status);
-      if (status == null) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "consumer recovery doorbell returned null status"));
-        status = noalloc_status;
-      end
-      else if (status.ok() &&
-               (db_result == null ||
-                db_mmio_evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "consumer recovery doorbell returned incomplete success evidence"));
-        status = noalloc_status;
-      end
-      if (!status.ok()) begin
-        if (!attachment.runtime.record_recovery_failure_noalloc(
-              db_mmio_evidence, status, noalloc_status)) begin
-          void'(value_ops::set_status_noalloc(
-            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-            "consumer recovery doorbell failure could not be retained"));
-          status = noalloc_status;
-        end
+      submit_consumer_doorbell_recorded(
+        attachment, next, link, prepared_db_desc, noalloc_status,
+        CONSUMER_DIAG_REPLAY, doorbell_completed, status);
+      if (!doorbell_completed)
         return;
-      end
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "consumer recovery doorbell success could not be retained"));
-        status = noalloc_status;
-        return;
-      end
       status = noalloc_status;
     end
     else if (pending.mmio_evidence == RDMA_QUEUE_MMIO_SUCCESS) begin
@@ -9599,30 +9594,12 @@ class rdma_queue_data_engine extends uvm_object;
     end
 
     if (!pending.consumer_committed) begin
-      if (!attachment.runtime.enable_recovery_commit_noalloc(noalloc_status)) begin
-        status = noalloc_status;
+      if (!commit_consumer_cursor_recorded(
+            attachment, pending.cursor, noalloc_status,
+            pending.consumer_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
+                                               RDMA_QUEUE_MMIO_SUCCESS,
+            CONSUMER_DIAG_REPLAY, status))
         return;
-      end
-      status = commit_cq_consumer(
-        attachment, pending.cursor, noalloc_status);
-      if (status == null) begin
-        void'(value_ops::set_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "consumer recovery commit returned null status"));
-        status = noalloc_status;
-      end
-      if (!status.ok()) begin
-        if (!attachment.runtime.record_recovery_failure_noalloc(
-              pending.consumer_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
-                                                   RDMA_QUEUE_MMIO_SUCCESS,
-              status, noalloc_status)) begin
-          void'(value_ops::set_status_noalloc(
-            noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-            "consumer recovery commit failure could not be retained"));
-          status = noalloc_status;
-        end
-        return;
-      end
     end
 
     if (attachment.kind == RDMA_QUEUE_RUNTIME_CQ &&

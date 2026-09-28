@@ -16,6 +16,15 @@
 
 ## 当前执行状态（2026-09-28）
 
+Batch224 在 `bbbdc4f` 基线上统一 CQ/event/replay 的 consumer doorbell evidence 和
+CI commit 步骤，不改变 caller 的 admission、shadow/WQE 或恢复幂等选择，不新增生产
+文件/对象/账本。engine 10,000→9,977 行，原 136 个方法声明不变；133 个正文 token
+不变，三个 caller 展开公共步骤后与基线 token 一致。新增 45-case 故障矩阵及六项
+Python 门禁；最终 core 98/81、CMQ 28/11（PROCESS/LOGICAL）、integration 10、E2E 3、
+Host-memory 3、PCIe 1、focused 45-case、Python 311/311、驱动契约及静态门禁均通过，
+E2E 保留已记录的基线编译警告。仍不合并/推送，main 保持
+`5f8dfe9`；详见 `task-rdma-batch224-consumer-commit-steps-report.md`，项目仍 active。
+
 Batch223 在 `1a1322c` 基线上继续：25 个 queue-data 值投影/身份谓词集中迁入
 `rdma_queue_data_projector`，engine 从 10,872 行/161 methods 降到 10,000 行/136 methods。
 新组件 889 行，两生产文件合计 +17 行，属于职责收缩而非总代码净减。全部 161 方法

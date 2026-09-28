@@ -19,7 +19,16 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch223：从 queue-data engine 集中迁出 25 个值投影/身份谓词，形成无状态
+当前 Batch224：CQ/event live poll 与 consumer replay 共用 doorbell evidence/CI commit
+两个步骤；原业务 admission、shadow/WQE 分支与恢复跳步仍由 caller 决定。不新增生产
+文件或 mutable owner，engine 10,000→9,977 行、136→138 methods，生产净减 23 行。
+全部原声明不变，133 个方法 token 不变，三个 caller 展开公共步骤后与基线 token 一致。
+新增 45-case 独立故障矩阵与六项 Python 门禁；最终 core 98/81、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、E2E 3、Host-memory 3、PCIe 1、focused 45-case、
+Python 311/311、驱动契约及静态门禁均通过，E2E 保留已记录的基线编译警告。
+详见 `task-rdma-batch224-consumer-commit-steps-report.md`，项目计划仍 active。
+
+前批 Batch223：从 queue-data engine 集中迁出 25 个值投影/身份谓词，形成无状态
 `rdma_queue_data_projector`；engine 10,872→10,000 行、161→136 methods，两个生产
 文件合计 +17 行，不冒充总代码净减。全部原方法 token 与 27 个公开业务声明核对
 一致，owner/I/O/commit 顺序保留；最终 core 97/80、CMQ 28/11（PROCESS/LOGICAL）、
@@ -70,7 +79,7 @@ L6 只协调外部生命周期并在边界验证完整 route、authority 和 res
 
 | 优先级 | 组件 | 当前规模 | 目标 | 首个可迁移职责 |
 | --- | --- | ---: | --- | --- |
-| P0 | `rdma_queue_data_engine.sv` | 10,000 行/136 methods | 继续收束统一 transaction seam | 值 projector 已分离；下一步 producer/consumer/resize 编排骨架 |
+| P0 | `rdma_queue_data_engine.sv` | 9,977 行/138 methods | 继续收束统一 transaction seam | 值 projector 和 consumer 提交步骤已统一；继续 producer/resize 与业务组合边界 |
 | P1 | `rdma_resource_manager.sv` | 7,936 行/139 methods | 继续收束 allocator、registry、rollback transaction | projector 已分离；继续检查 publication 后更新，不改变 resource owner |
 | P1 | `rdma_queue_runtime.sv` | 4,646 行/94 methods | 纯 runtime snapshot/predicate 与 mutation owner 分界 | cursor/occupancy/attachment snapshot |
 | P2 | `rdma_queue_lifecycle_policy.sv` + queue/QP executors | 2,118 / 2,819 / 4,338 行 | policy、执行副作用、状态迁移表分离 | operation envelope 与 transition candidate |
@@ -81,7 +90,7 @@ SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 
 公共复杂度回收到 queue-data/runtime transaction 层。Host-memory、PCIe、网络和
 dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 adapter/router。
 
-上表 queue-data/manager 已分别按 Batch223/221 源码重测，其余维持 Batch218；独立 queue-data
+上表 queue-data/manager 已分别按 Batch224/221 源码重测，其余维持 Batch218；独立 queue-data
 projector 为 889 行/25 methods，resource projector 为 2,217 行/47 methods。
 后续在统一 owner/提交契约稳定后仍须收敛重复校验，
 不以删注释、压缩行或新增大量单函数文件代替可读性改进。
