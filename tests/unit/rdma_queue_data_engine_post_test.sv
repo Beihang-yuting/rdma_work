@@ -3134,6 +3134,113 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_cursor_policy 验证 detached cursor policy 的普通递增、ring 末项回零
+  //   与 wrap 翻转，并锁定 depth=0/越界 index 的兼容算术结果仍由 caller 负责拒绝。
+  // 输入/输出及副作用：task 只调用 rdma_queue_cursor_policy::advance() 并比较输出值，
+  //   不创建或修改 fixture、runtime、pending、ledger、Host-memory、doorbell 或外部资源。
+  // 失败/边界：若普通项未递增、末项未回零/翻转，或 depth=0/越界输入的确定性输出漂移，
+  //   分别报告 CURSOR_POLICY_* 错误；本断言不把 policy 输出解释为已完成 reservation。
+  task automatic check_cursor_policy();
+    int unsigned next_index;
+    bit next_wrap;
+
+    rdma_queue_cursor_policy::advance(4, 1, 1'b0, next_index, next_wrap);
+    if (next_index != 2 || next_wrap != 1'b0)
+      `uvm_error("CURSOR_POLICY_INCREMENT",
+                 $sformatf("expected 1/0 -> 2/0, got %0d/%0b",
+                           next_index, next_wrap))
+
+    rdma_queue_cursor_policy::advance(4, 3, 1'b0, next_index, next_wrap);
+    if (next_index != 0 || next_wrap != 1'b1)
+      `uvm_error("CURSOR_POLICY_WRAP",
+                 $sformatf("expected 3/0 -> 0/1, got %0d/%0b",
+                           next_index, next_wrap))
+
+    rdma_queue_cursor_policy::advance(4, 3, 1'b1, next_index, next_wrap);
+    if (next_index != 0 || next_wrap != 1'b0)
+      `uvm_error("CURSOR_POLICY_WRAP_BACK",
+                 $sformatf("expected 3/1 -> 0/0, got %0d/%0b",
+                           next_index, next_wrap))
+
+    rdma_queue_cursor_policy::advance(0, 0, 1'b0, next_index, next_wrap);
+    if (next_index != 0 || next_wrap != 1'b1)
+      `uvm_error("CURSOR_POLICY_ZERO_DEPTH",
+                 $sformatf("expected 0/0 -> 0/1, got %0d/%0b",
+                           next_index, next_wrap))
+
+    rdma_queue_cursor_policy::advance(4, 7, 1'b1, next_index, next_wrap);
+    if (next_index != 0 || next_wrap != 1'b0)
+      `uvm_error("CURSOR_POLICY_OUT_OF_RANGE",
+                 $sformatf("expected 7/1 -> 0/0, got %0d/%0b",
+                           next_index, next_wrap))
+  endtask
+
+  // 功能：check_wq_target_policy 验证 CQE route 到 SQ、私有 RQ、共享 SRQ 的 detached
+  //   target contract 映射，并确认未知 wire flag 在首次 attachment lookup 前被拒绝。
+  // 输入/输出及副作用：task 只调用 rdma_queue_wq_target_policy::for_cqe() 并比较输出
+  //   kind/role，不创建或修改 fixture、runtime、pending、ledger、Host-memory、doorbell
+  //   或外部资源；send 分支还验证未选中的 SRQ presence 不改变 SQ contract。
+  // 失败/边界：若 send/receive-private/receive-shared 的 kind 或 role 漂移，或 rq_cqe/
+  //   srq_present 含 X/Z 仍被接受，则分别报告 WQ_TARGET_POLICY_* 错误；policy 输出
+  //   仅是目标候选，不代表 attachment、route/epoch 或 WQE ledger 已获授权。
+  task automatic check_wq_target_policy();
+    rdma_queue_wq_target_contract_t contract;
+    bit accepted;
+
+    accepted = rdma_queue_wq_target_policy::for_cqe(
+      1'b0, 1'b1, contract);
+    if (!accepted || contract.runtime_kind != RDMA_QUEUE_RUNTIME_SQ ||
+        contract.backing_role != RDMA_QUEUE_ROLE_QP_SQ_RING)
+      `uvm_error("WQ_TARGET_POLICY_SEND",
+                 "send CQE did not map to QP SQ contract")
+
+    accepted = rdma_queue_wq_target_policy::for_cqe(
+      1'b1, 1'b0, contract);
+    if (!accepted || contract.runtime_kind != RDMA_QUEUE_RUNTIME_RQ ||
+        contract.backing_role != RDMA_QUEUE_ROLE_QP_RQ_RING)
+      `uvm_error("WQ_TARGET_POLICY_RQ",
+                 "private receive CQE did not map to QP RQ contract")
+
+    accepted = rdma_queue_wq_target_policy::for_cqe(
+      1'b1, 1'b1, contract);
+    if (!accepted || contract.runtime_kind != RDMA_QUEUE_RUNTIME_SRQ ||
+        contract.backing_role != RDMA_QUEUE_ROLE_SRQ_RING)
+      `uvm_error("WQ_TARGET_POLICY_SRQ",
+                 "shared receive CQE did not map to SRQ contract")
+
+    accepted = rdma_queue_wq_target_policy::for_cqe(
+      1'bx, 1'b0, contract);
+    if (accepted)
+      `uvm_error("WQ_TARGET_POLICY_UNKNOWN_RQ",
+                 "unknown CQE receive flag was accepted")
+
+    accepted = rdma_queue_wq_target_policy::for_cqe(
+      1'b1, 1'bx, contract);
+    if (accepted)
+      `uvm_error("WQ_TARGET_POLICY_UNKNOWN_SRQ",
+                 "unknown SRQ presence was accepted")
+
+    accepted = rdma_queue_wq_target_policy::for_receive_target(
+      RDMA_RESOURCE_QP, contract);
+    if (!accepted || contract.runtime_kind != RDMA_QUEUE_RUNTIME_RQ ||
+        contract.backing_role != RDMA_QUEUE_ROLE_QP_RQ_RING)
+      `uvm_error("WQ_TARGET_POLICY_RECV_QP",
+                 "QP receive target did not map to private RQ contract")
+
+    accepted = rdma_queue_wq_target_policy::for_receive_target(
+      RDMA_RESOURCE_SRQ, contract);
+    if (!accepted || contract.runtime_kind != RDMA_QUEUE_RUNTIME_SRQ ||
+        contract.backing_role != RDMA_QUEUE_ROLE_SRQ_RING)
+      `uvm_error("WQ_TARGET_POLICY_RECV_SRQ",
+                 "SRQ receive target did not map to shared SRQ contract")
+
+    accepted = rdma_queue_wq_target_policy::for_receive_target(
+      RDMA_RESOURCE_PD, contract);
+    if (accepted)
+      `uvm_error("WQ_TARGET_POLICY_RECV_PD",
+                 "non-WQ receive target resource kind was accepted")
+  endtask
+
   // 功能：run_phase 验证未配置门禁与真实 SQ/RQ post/readback；direct mixed-zero
   //   SEND 锁定 filtered SGE count 与跨零项压紧布局，17-byte inline SEND 锁定
   //   canonical 两个 chunk 及 actual-slot 持久化，并覆盖 513B UD inline admission。
@@ -3385,6 +3492,8 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       check_send_route_epoch_authority();
       check_send_reservation_route_epoch_window();
       check_empty_receive_rqe();
+      check_cursor_policy();
+      check_wq_target_policy();
     end
 
     if (fixture != null && fixture.needs_cleanup()) begin

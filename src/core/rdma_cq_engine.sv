@@ -411,15 +411,11 @@ class rdma_cq_engine extends uvm_object;
         return authority_status;
     end
     if (shadow != null) begin
-      if (shadow.cq_h == null || shadow.cq_h.kind != RDMA_RESOURCE_CQ ||
-          shadow.function_uid != shared_function_uid ||
-          shadow.generation != shared_generation ||
-          shadow.reset_epoch != shared_reset_epoch ||
-          shadow.cq_h.function_uid != shared_function_uid ||
-          shadow.cq_h.generation != shared_generation ||
-          shadow.cq_h.object_id != shared_cq_h.object_id)
-        return rdma_status::make(RDMA_SC_STALE_GENERATION,
-                                 "CQ shadow authority is stale");
+      authority_status = rdma_cq_shadow_replay_policy::validate(
+        shadow, shared_cq_h, shared_function_uid, shared_generation,
+        shared_reset_epoch, "CQ shadow authority is stale");
+      if (!authority_status.ok())
+        return authority_status;
     end
     if (shadow_flushed) begin
       // 没有调用方携带的当前 authority 快照时，不能把旧 epoch 的缓存
@@ -428,18 +424,12 @@ class rdma_cq_engine extends uvm_object;
         return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                  "CQ shadow replay authority is missing");
 
-      if (flushed_shadow == null || flushed_shadow.cq_h == null ||
-          flushed_shadow.cq_h.kind != RDMA_RESOURCE_CQ ||
-          flushed_shadow.function_uid != shared_function_uid ||
-          flushed_shadow.generation != shared_generation ||
-          flushed_shadow.reset_epoch != shared_reset_epoch ||
-          flushed_shadow.cq_h.function_uid != shared_function_uid ||
-          flushed_shadow.cq_h.generation != shared_generation ||
-          flushed_shadow.cq_h.object_id != shared_cq_h.object_id)
-        return rdma_status::make_direct(
-          RDMA_SC_INVALID_STATE,
-          "CQ shadow replay cache authority is invalid"
-        );
+      authority_status = rdma_cq_shadow_replay_policy::validate(
+        flushed_shadow, shared_cq_h, shared_function_uid, shared_generation,
+        shared_reset_epoch, "CQ shadow replay cache authority is invalid",
+        RDMA_SC_INVALID_STATE);
+      if (!authority_status.ok())
+        return authority_status;
       snapshot_status = clone_shadow_snapshot_value(
         flushed_shadow, "replayed_cq_shadow", replayed);
       if (snapshot_status == null)

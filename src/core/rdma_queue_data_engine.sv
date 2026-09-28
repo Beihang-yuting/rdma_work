@@ -13,258 +13,8 @@
 // resource 所有；engine 仅在 attachment 存活期间保存 detached runtime cursor 和
 // 借用的 backing-access capability，不能反向接管外部 mapping 或队列资源。
 
-// 设计说明：host producer post 的返回对象必须与 runtime ledger 解耦，只向调用方
-// 发布 queue identity、WR 标识、已提交 producer cursor、编码镜像和最终状态的值快照。
-class rdma_queue_post_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_post_result)
-  rdma_handle queue_h;
-  longint unsigned wr_id;
-  int unsigned index;
-  bit wrap;
-  rdma_hw_image image;
-  rdma_status status;
-
-  // 功能：构造尚未代表成功 post 的空结果，清零 WR/cursor 并移除所有快照
-  //   引用。
-  // 输入/输出及副作用：name 为 UVM 对象名；只初始化 queue_h、wr_id、index、wrap、
-  //   image 和 status，不访问 runtime、backing 或 scheduler。
-  // 失败/边界：status/queue_h/image 任一为空时对象都不是可发布结果；构造不取得
-  //   manager、Host-memory 或 PCIe 资源所有权，只有 post 成功路径可以填充并返回它。
-  function new(string name = "rdma_queue_post_result");
-    super.new(name);
-    queue_h = null;
-    wr_id = 0;
-    index = 0;
-    wrap = 1'b0;
-    image = null;
-    status = null;
-  endfunction
-endclass
-
-// 功能：保存一次 CQ/CEQ/AEQ 共用的 device-producer 发布 detached 结果，供
-//   调用方观察已提交槽位、镜像与 occupancy，而不暴露 runtime 的可变内部状态。
-// 输入/输出及副作用：字段由各类型 publish 成功路径写入；对象不拥有 queue、
-//   mapping 或 runtime，只拥有自身指向的 detached queue/image/status 快照。
-// 失败/边界：失败路径不得发布半成品对象；occupancy_valid=0 表示提交后的查询失败，
-//   不是对已提交 cursor 的回滚，也不得被调用方当作 occupancy=0。
-class rdma_queue_device_publish_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_device_publish_result)
-  rdma_handle queue_h;
-  int unsigned index;
-  bit wrap;
-  int unsigned occupancy;
-  bit occupancy_valid;
-  rdma_hw_image image;
-  rdma_status status;
-
-  // 功能：构造设备发布结果并建立安全默认状态。
-  // 输入/输出及副作用：name 为输入；仅初始化本地字段，不接管外部资源。
-  // 失败/边界：构造阶段不执行校验，调用方必须依据 status 判断结果是否可用。
-  function new(string name = "rdma_queue_device_publish_result");
-    super.new(name);
-    queue_h = null;
-    index = 0;
-    wrap = 1'b0;
-    occupancy = 0;
-    occupancy_valid = 1'b0;
-    image = null;
-    status = null;
-  endfunction
-endclass
-
-// 设计说明：CQ poll 返回对象保存预物化的 CQE 语义和 WQE release 值快照；它不
-// 暴露 runtime-owned ledger entry，调用方修改结果不能反向改变 SQ/RQ/SRQ credit。
-class rdma_queue_completion_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_completion_result)
-  rdma_handle queue_h;
-  rdma_hw_cqe_model cqe;
-  rdma_status completion_status;
-  rdma_queue_slot_ledger_entry released_slots[$];
-
-  // 功能：构造空的 CQ completion 结果，清除 queue/CQE/status 与 released slot
-  //   队列。
-  // 输入/输出及副作用：name 为 UVM 对象名；仅写本对象字段，不读取 CQ backing、
-  //   不提交 consumer cursor，也不释放 WQE ledger。
-  // 失败/边界：queue_h、cqe 或 completion_status 为空时不得发布给成功调用方；
-  //   released_slots 只有 prepared candidate 完整构造后才拥有 detached slot 值。
-  function new(string name = "rdma_queue_completion_result");
-    super.new(name);
-    queue_h = null;
-    cqe = null;
-    completion_status = null;
-    released_slots.delete();
-  endfunction
-endclass
-
-// 设计说明：CEQ/AEQ poll 只发布 event queue、路由目标模型与状态的 detached 值，
-// 不把 CQ/QP attachment 或 event runtime 的可变引用交给调用方。
-class rdma_queue_event_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_event_result)
-  rdma_handle queue_h;
-  rdma_hw_model event_model;
-  rdma_status event_status;
-  // CQ flush 同时携带 CQ error 与 QP flush 语义；secondary_target_h 保存
-  // 第二个已认证 owner 的值快照，其余事件保持为空。
-  rdma_handle secondary_target_h;
-
-  // 功能：构造尚未绑定 CEQE/AEQE 的空 event 结果并清除全部对象引用。
-  // 输入/输出及副作用：name 为 UVM 对象名；只初始化 queue_h、event_model、
-  //   event_status，不读取 route、backing 或 consumer cursor。
-  // 失败/边界：三个字段未由 prepared event candidate 全部填充时不得作为成功结果；
-  //   本对象不拥有 lifecycle queue/QP，只拥有成功路径写入的 detached 快照。
-  function new(string name = "rdma_queue_event_result");
-    super.new(name);
-    queue_h = null;
-    event_model = null;
-    event_status = null;
-    secondary_target_h = null;
-  endfunction
-endclass
-
-// 设计说明：每个 ring 必须拥有独立 attachment。尤其同一 QP 的 SQ/RQ 逻辑
-// offset 都从零开始，若共享 backing-access lookup namespace 会把不同 ring 的
-// slot 误解析到同一 mapping；因此只借用各自的 access/runtime，不共享索引。CQ
-// attachment 还冻结其 authoritative CEQ handle 值，阻止通知被改投同 Function 其他 CEQ。
-class rdma_queue_data_attachment extends uvm_object;
-  `uvm_object_utils(rdma_queue_data_attachment)
-  rdma_handle queue_h;
-  rdma_handle ceq_h;
-  rdma_queue_runtime_kind_e kind;
-  rdma_queue_runtime runtime;
-  rdma_queue_backing_access access;
-  rdma_queue_backing_role_e role;
-  // CQ context authority is borrowed from the lifecycle-owned queue plan.  It
-  // is retained only when a context adapter is configured for shadow writes;
-  // the engine never releases or mutates this authority object itself.
-  rdma_context_backing_ref context_ref;
-  int unsigned entry_size;
-  int unsigned local_id;
-  rdma_transport_e transport;
-
-  // 功能：构造 queue attachment 的安全默认状态；CQ 的 ceq_h 依赖必须在发布
-  //   attachment 前另行冻结，其他 runtime 保持该字段为空。
-  // 输入/输出及副作用：name 为对象名；new 只初始化本地 queue_h/ceq_h、runtime、
-  //   backing role、geometry 与 transport，不访问 manager 或 Host-memory。
-  // 失败/边界：构造不分配 dependency handle；ceq_h 为空的 CQ attachment 不完整，
-  //   attach/publish 必须返回错误，不能回退到同 Function 任意 CEQ。
-  function new(string name = "rdma_queue_data_attachment");
-    super.new(name);
-    queue_h = null;
-    ceq_h = null;
-    kind = RDMA_QUEUE_RUNTIME_SQ;
-    runtime = null;
-    access = null;
-    role = RDMA_QUEUE_ROLE_CQ_RING;
-    context_ref = null;
-    entry_size = 64;
-    local_id = 0;
-    transport = RDMA_TRANSPORT_RC;
-  endfunction
-endclass
-
-// 设计说明：QP link 是 engine 内 SQ/RQ/SRQ 与 send/recv CQ 的冻结路由索引；handle
-// 为值快照，backing access/ref 是非拥有 capability，生命周期仍归 QP plan/manager。
-class rdma_queue_data_qp_link extends uvm_object;
-  `uvm_object_utils(rdma_queue_data_qp_link)
-  rdma_handle qp_h;
-  rdma_handle srq_h;
-  rdma_handle send_cq_h;
-  rdma_handle recv_cq_h;
-  int unsigned local_qp_id;
-  rdma_transport_e transport;
-  rdma_queue_backing_access sq_sgb_access;
-  rdma_qp_backing_ref sq_sgb_ref;
-  // QPC context authority is borrowed from the lifecycle-owned QP plan.  It is
-  // retained here so the SQ doorbell path can observe the hardware-owned
-  // runtime shadow without reconstructing a context from a semantic model.
-  rdma_context_backing_ref context_ref;
-  // Frozen PMTU copied from the authoritative programmed QPC.  The link does
-  // not own the QPC; zero means no authenticated PMTU is available and makes
-  // URC READ external-SGB encoding fail closed.
-  int unsigned path_mtu_bytes;
-  bit [6:0] sw_ring_db_count;
-  bit sw_ring_db_count_valid;
-
-  // 功能：构造未绑定 QP/CQ/SRQ 的空路由记录，并默认采用 RC transport。
-  // 输入/输出及副作用：name 为 UVM 对象名；清空四个 handle、local_id、SGB
-  //   access/ref、QPC context ref 和 software doorbell count，仅修改本地记录。
-  // 失败/边界：qp_h 或 send/recv CQ authority 缺失时不能用于 post/publish/poll；
-  //   构造不会取得 sq_sgb_ref/context_ref 或 access 的所有权，失败清理由
-  //   attachment owner 负责；count_valid=0 时不能据此宣称硬件已发通知。
-  function new(string name = "rdma_queue_data_qp_link");
-    super.new(name);
-    qp_h = null;
-    srq_h = null;
-    send_cq_h = null;
-    recv_cq_h = null;
-    local_qp_id = 0;
-    transport = RDMA_TRANSPORT_RC;
-    sq_sgb_access = null;
-    sq_sgb_ref = null;
-    context_ref = null;
-    path_mtu_bytes = 0;
-    sw_ring_db_count = '0;
-    sw_ring_db_count_valid = 1'b0;
-  endfunction
-endclass
-
-// CQ resize 在 authority 已发布后，旧 runtime/backing 仍可能因为后端故障
-// 无法立即 detach/release。该记录由 engine 持有，直到所有清理动作完成。
-class rdma_cq_resize_recovery extends uvm_object;
-  `uvm_object_utils(rdma_cq_resize_recovery)
-
-  rdma_handle cq_h;
-  // 保存 Function route/UID 的不可变快照，防止 UID/object-id 重用到另一
-  // Host/root 后误释放旧 backing；generation/reset epoch 变化本身允许恢复。
-  rdma_function_identity function_identity;
-  rdma_queue_runtime old_runtime;
-  rdma_queue_backing_ref old_ref;
-  // 发布前候选 backing 的清理失败也必须保留 opaque authority；published=0
-  // 时 retry 只处理 pending_ref，不触碰当前仍在使用的旧 attachment。
-  rdma_queue_backing_ref pending_ref;
-  bit published;
-  // prepublish_restore_pending 表示 manager/CQ 屏障或 dependent runtime
-  // 尚未恢复；该状态与 pending_ref 正交，允许一次记录同时保存两类失败。
-  bit prepublish_restore_pending;
-  bit manager_restore_pending;
-  bit cq_restore_pending;
-  // 保存旧/候选 CQ ring 的不可变几何，retry 时防止 recovery ref 被替换成
-  // 另一 role 或另一 logical slice 后误清理。
-  rdma_queue_backing_role_e backing_role;
-  longint unsigned backing_mapping_offset;
-  longint unsigned backing_length;
-  longint unsigned backing_logical_queue_offset;
-  bit backing_geometry_valid;
-  rdma_reset_epoch_t backing_reset_epoch;
-  bit backing_epoch_valid;
-  rdma_queue_runtime dependents[$];
-  rdma_status last_status;
-
-  // 功能：构造 CQ resize recovery record，初始化旧 authority、依赖 runtime 和最近一次失败状态。
-  // 输入/输出及副作用：name 为 UVM 对象名称；只建立本地记录，不访问 Host-memory 或 manager。
-  // 失败/边界：记录为空或字段不完整时，重试入口必须拒绝执行并返回 RECOVERY_REQUIRED。
-  function new(string name = "rdma_cq_resize_recovery");
-    super.new(name);
-    cq_h = null;
-    function_identity = null;
-    old_runtime = null;
-    old_ref = null;
-    pending_ref = null;
-    published = 1'b0;
-    prepublish_restore_pending = 1'b0;
-    manager_restore_pending = 1'b0;
-    cq_restore_pending = 1'b0;
-    backing_role = RDMA_QUEUE_ROLE_CQ_RING;
-    backing_mapping_offset = 0;
-    backing_length = 0;
-    backing_logical_queue_offset = 0;
-    backing_geometry_valid = 1'b0;
-    backing_reset_epoch = 0;
-    backing_epoch_valid = 1'b0;
-    dependents.delete();
-    last_status = null;
-  endfunction
-endclass
+// queue-data result models are defined in rdma_queue_data_transaction_models.sv so that
+// SQ/RQ/CQ/EQ facades share detached result types without pulling runtime implementation here.
 
 // 设计说明：queue-data engine 是 lifecycle 资源与 runtime/backing/scheduler 之间的
 // 编排层。它拥有 attachment/link/recovery 索引和 detached 结果，不拥有 manager、
@@ -605,14 +355,12 @@ class rdma_queue_data_engine extends uvm_object;
     return make_engine_status_nonfatal(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：advance_queue_cursor_value 计算 queue-data 各类 producer/consumer
-  //   transaction 的下一槽位值，统一处理 ring 末项回到零号槽和 wrap 翻转。
-  // 输入/输出及副作用：depth、source_index、source_wrap 为输入；next_index、
-  //   next_wrap 为输出；函数只写输出标量，不分配 cursor、不访问 runtime、pending、
-  //   backing、ledger 或 scheduler，也不改变调用方保存的 source 值。
-  // 失败/边界：本纯值 helper 不返回 status；调用方须在需要拒绝时自行完成 depth/
-  //   index geometry 校验。对 depth=0 或越界 index 仍按原有算术规则给出确定输出，
-  //   以保留各入口原错误路径和失败优先级，不能把该结果当作已授权 cursor。
+  // 功能：advance_queue_cursor_value 为 queue-data engine 保留兼容 wrapper，把
+  //   producer/consumer 下一槽位计算转发给 detached cursor policy。
+  // 输入/输出及副作用：depth/source_index/source_wrap 为输入；next_index/next_wrap
+  //   为输出；wrapper 不读取或修改 runtime、pending、backing、ledger 和 scheduler。
+  // 失败/边界：depth=0 或 source_index 越界仍由 policy 给出原算术结果，geometry
+  //   拒绝必须由 caller 自己完成；该输出不代表已授权 reservation 或 commit。
   protected function void advance_queue_cursor_value(
     int unsigned depth,
     int unsigned source_index,
@@ -620,14 +368,8 @@ class rdma_queue_data_engine extends uvm_object;
     output int unsigned next_index,
     output bit next_wrap
   );
-    next_index = source_index;
-    next_wrap = source_wrap;
-    if (next_index + 1 >= depth) begin
-      next_index = 0;
-      next_wrap = ~source_wrap;
-    end
-    else
-      next_index++;
+    rdma_queue_cursor_policy::advance(
+      depth, source_index, source_wrap, next_index, next_wrap);
   endfunction
 
   // 功能：make_next_poll_cursor_nonfatal 根据 runtime 的 ring depth 和已冻结的
@@ -5498,6 +5240,7 @@ class rdma_queue_data_engine extends uvm_object;
     bit [31:0] key;
     bit [63:0] va;
     longint unsigned sgb_offset;
+    longint unsigned canonical_sge_payload_len;
     int unsigned descriptor_index;
     if (link == null || model == null || cursor == null || image == null ||
         link.sq_sgb_access == null)
@@ -5590,10 +5333,19 @@ class rdma_queue_data_engine extends uvm_object;
       if (model.sges.size() > RDMA_MAX_WQ_SGE)
         return bad("SQE SGB descriptor count exceeds 32");
 
+      status = rdma_sge_authority::derive_send(
+          model.sges, valid_sge_count, canonical_sge_payload_len);
+      if (status == null || !status.ok())
+        return status == null ?
+          bad("SQE SGB SGE authority returned null status",
+              RDMA_SC_INVALID_STATE) :
+          status;
+      if (valid_sge_count != canonical_sge_num)
+        return bad("SQE SGB descriptor count is not canonical",
+                   RDMA_SC_INVALID_STATE);
+
       descriptor_index = 0;
       foreach (model.sges[i]) begin
-        if (model.sges[i] == null)
-          return bad("SQE SGB descriptor is invalid");
         if (model.sges[i].length == 0)
           continue;
 
@@ -7262,6 +7014,8 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_queue_runtime_kind_e expected_wq_kind,
     output rdma_queue_backing_role_e expected_role
   );
+    rdma_queue_wq_target_contract_t target_contract;
+
     target_h = null;
     expected_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
     expected_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
@@ -7271,24 +7025,30 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("CQ poll completion target input is incomplete",
                  RDMA_SC_INVALID_ARGUMENT);
 
+    // 中文设计：wire route 到 runtime kind/role 的映射只由 detached policy 计算；
+    // handle kind、SRQ incarnation 和 attachment geometry 仍在本 caller 后续阶段
+    // 校验，避免 policy 取得或复制 queue ownership。
+    if (link.srq_h != null && link.srq_h.kind != RDMA_RESOURCE_SRQ)
+      return bad("CQ poll completion SRQ handle kind is invalid",
+                 RDMA_SC_INVALID_ARGUMENT);
+    if (!rdma_queue_wq_target_policy::for_cqe(
+          cqe.rq_cqe, cqe.rq_cqe ? (link.srq_h != null) : 1'b0,
+          target_contract))
+      return bad("CQ poll completion target policy input is unknown",
+                 RDMA_SC_INVALID_ARGUMENT);
+
+    expected_wq_kind = target_contract.runtime_kind;
+    expected_role = target_contract.backing_role;
+
     if (cqe.rq_cqe) begin
       if (link.srq_h != null) begin
-        if (link.srq_h.kind != RDMA_RESOURCE_SRQ)
-          return bad("CQ poll completion SRQ handle kind is invalid",
-                     RDMA_SC_INVALID_ARGUMENT);
-        expected_wq_kind = RDMA_QUEUE_RUNTIME_SRQ;
-        expected_role = RDMA_QUEUE_ROLE_SRQ_RING;
         target_h = link.srq_h;
       end
       else begin
-        expected_wq_kind = RDMA_QUEUE_RUNTIME_RQ;
-        expected_role = RDMA_QUEUE_ROLE_QP_RQ_RING;
         target_h = link.qp_h;
       end
     end
     else begin
-      expected_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
-      expected_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
       target_h = link.qp_h;
     end
 
@@ -7793,6 +7553,92 @@ class rdma_queue_data_engine extends uvm_object;
       cqe.wqe_index, cqe.wqe_wrap, released);
   endfunction
 
+  // 功能：execute_consumer_wqe_release 统一 live CQ poll 与 consumer recovery 的
+  //   CQ→WQ release 事务：取得 CQ release gate、按 CQE 或冻结坐标释放 routed WQ，
+  //   完成 gate，并在失败时把 MMIO evidence/status 留回 CQ runtime。
+  // 输入/输出及副作用：attachment、pending、wqe_attachment、cqe、冻结 target 和
+  //   failure_evidence 为 caller 已冻结输入；context 只用于保持既有诊断前缀；status
+  //   为输出。函数可能推进 WQ runtime ledger 或记录 recovery evidence，但不取得
+  //   queue、handle、WQ attachment 或 Host-memory backing 的生命周期所有权。
+  // 失败/边界：任一 runtime/attachment/pending/failure_status 缺失、begin gate 拒绝、
+  //   release target 不完整、finish 失败或 release 失败证据无法保存时返回非 OK；
+  //   recovery 模式必须提供 frozen_target_valid 和 pending completion 坐标，live
+  //   模式必须提供非空 cqe；失败不会调用 complete_consumer_recovery。
+  protected task execute_consumer_wqe_release(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_pending_operation pending,
+    rdma_queue_data_attachment wqe_attachment,
+    rdma_hw_cqe_model cqe,
+    input bit frozen_target_valid,
+    input int unsigned frozen_target_index,
+    input bit frozen_target_wrap,
+    input rdma_queue_mmio_evidence_e failure_evidence,
+    input string diagnostic_context,
+    output rdma_status status
+  );
+    rdma_queue_slot_ledger_entry released[$];
+    rdma_status noalloc_status;
+    bit release_succeeded;
+
+    status = null;
+    if (attachment == null || pending == null || wqe_attachment == null ||
+        attachment.runtime == null || wqe_attachment.runtime == null ||
+        pending.failure_status == null ||
+        (cqe == null && !frozen_target_valid) ||
+        (cqe != null && frozen_target_valid)) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        {diagnostic_context, " consumer WQE release input is incomplete"});
+      return;
+    end
+    if (frozen_target_valid &&
+        (pending.completion_index != frozen_target_index ||
+         pending.completion_wrap != frozen_target_wrap)) begin
+      status = make_engine_status_nonfatal(
+        RDMA_SC_INVALID_STATE,
+        {diagnostic_context, " consumer WQE release target is inconsistent"});
+      return;
+    end
+
+    noalloc_status = pending.failure_status;
+    if (!attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
+      status = noalloc_status;
+      return;
+    end
+    released.delete();
+    status = release_cq_wqe(
+      wqe_attachment, cqe, released, noalloc_status,
+      frozen_target_valid, frozen_target_index, frozen_target_wrap);
+    if (status == null) begin
+      void'(set_engine_status_noalloc(
+        noalloc_status, RDMA_SC_INVALID_STATE,
+        {diagnostic_context, " WQE release returned null status"}));
+      status = noalloc_status;
+    end
+    release_succeeded = status.ok();
+    if (!attachment.runtime.finish_consumer_release_noalloc(
+          release_succeeded, status)) begin
+      if (status == null || status.ok()) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_INVALID_STATE,
+          {diagnostic_context, " release gate finalization failed"}));
+        status = noalloc_status;
+      end
+      return;
+    end
+    if (!release_succeeded) begin
+      if (!attachment.runtime.record_recovery_failure_noalloc(
+            failure_evidence, status, noalloc_status)) begin
+        void'(set_engine_status_noalloc(
+          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
+          {diagnostic_context, " WQE release failure could not be retained"}));
+        status = noalloc_status;
+      end
+      return;
+    end
+    status = noalloc_status;
+  endtask
+
   // 功能：stage_cq_poll_candidate 在 CQ poll 首次 runtime mutation 之前冻结
   //   routed WQ、release range、下一 CQ cursor、detached completion/pending，以及
   //   CQC shadow 或 legacy doorbell 的 caller-local payload；它把 poll 的复杂准备
@@ -7993,13 +7839,10 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_doorbell_result db_result;
     rdma_queue_mmio_evidence_e db_mmio_evidence;
     rdma_status noalloc_status;
-    rdma_queue_slot_ledger_entry released[$];
-    bit release_succeeded;
 
     result = null;
     status = null;
     noalloc_status = prepared_noalloc_status;
-    released.delete();
 
     if (cq_attachment == null || cq_attachment.runtime == null ||
         cursor == null || next == null || link == null || cqe == null ||
@@ -8102,42 +7945,17 @@ class rdma_queue_data_engine extends uvm_object;
       return;
     end
 
-    // 中文设计：CQ runtime 持有 marker 后才允许进入 routed WQ；finish 必须覆盖
-    // release 的成功和失败路径，避免跨 runtime 锁序反转或残留活动 gate。
-    if (!cq_attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    released.delete();
-    status = release_cq_wqe(
-      wqe_attachment, cqe, released, noalloc_status);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CQ WQE release returned null status"));
-      status = noalloc_status;
-    end
-    release_succeeded = status.ok();
-    if (!cq_attachment.runtime.finish_consumer_release_noalloc(
-          release_succeeded, status)) begin
-      if (status == null || status.ok()) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ release gate finalization failed"));
+    // 中文设计：CQ runtime 持有 marker 后才允许进入 routed WQ；统一 helper
+    // 覆盖 live poll 和 recovery retry 的 begin/release/finish 及失败证据，避免
+    // 两条 caller 路径在跨 runtime 锁序或 gate 清理上再次分叉。
+    execute_consumer_wqe_release(
+      cq_attachment, pending, wqe_attachment, cqe, 1'b0, 0, 1'b0,
+      cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
+                           RDMA_QUEUE_MMIO_SUCCESS,
+      "CQ", status);
+    if (status == null || !status.ok()) begin
+      if (status == null)
         status = noalloc_status;
-      end
-      return;
-    end
-    if (!release_succeeded) begin
-      if (!cq_attachment.runtime.record_recovery_failure_noalloc(
-            cq_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
-                                 RDMA_QUEUE_MMIO_SUCCESS,
-            status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "CQ WQE release failure could not be retained"));
-        status = noalloc_status;
-      end
       return;
     end
     if (!cq_attachment.runtime.complete_consumer_recovery_noalloc(
@@ -8998,6 +8816,65 @@ class rdma_queue_data_engine extends uvm_object;
     return finish_resize(rdma_status::success());
   endfunction
 
+  // 功能：decode_event_image 按事件 image kind 查找对应 codec 并完成一次 detached
+  //   image 解码，把 CEQE/AEQE 共用的 metadata、registry 和 null-status 处理收束到
+  //   一个只读阶段，供两个 event poll caller 继续执行各自 route policy。
+  // 输入/输出及副作用：entry_image、image_kind 和 label 为输入；decoded_model/status
+  //   为输出。函数只读取 codec registry 并创建 detached model，不推进 event cursor、
+  //   不写 Host-memory/MMIO，也不建立 recovery pending。
+  // 失败/边界：空 image、未知 image kind、registry 缺失、codec 类型/解码失败或返回
+  //   null status 均返回非成功状态；失败发生在任何 consumer mutation 之前，caller
+  //   必须保留 ring entry 供显式修复后重试，不能把 malformed image 当作 route miss ack。
+  protected task decode_event_image(
+    rdma_hw_image entry_image,
+    rdma_image_kind_e image_kind,
+    string label,
+    output rdma_hw_model decoded_model,
+    output rdma_status status
+  );
+    rdma_codec_key codec_key;
+    rdma_codec_base codec;
+    string object_type;
+
+    decoded_model = null;
+    status = null;
+    if (entry_image == null) begin
+      status = bad({label, " image is null"}, RDMA_SC_CODEC_ERROR);
+      return;
+    end
+    case (image_kind)
+      RDMA_IMAGE_CEQE: object_type = "ceqe";
+      RDMA_IMAGE_AEQE: object_type = "aeqe";
+      default: begin
+        status = bad({label, " image kind is unsupported"},
+                     RDMA_SC_CODEC_ERROR);
+        return;
+      end
+    endcase
+    codec_key = '{hw_version:"rdma", image_kind:image_kind,
+      object_type:object_type, variant:"default", opcode:8'h00};
+    status = lookup_codec_checked(codec_key, {label, " poll"}, codec);
+    if (status == null || !status.ok()) begin
+      if (status == null)
+        status = bad({label, " codec lookup normalization failed"},
+                     RDMA_SC_CODEC_ERROR);
+      return;
+    end
+    status = codec.decode(entry_image, decoded_model);
+    if (status == null) begin
+      status = bad({label, " decode returned null status"},
+                   RDMA_SC_CODEC_ERROR);
+      return;
+    end
+    if (!status.ok())
+      return;
+    if (decoded_model == null) begin
+      status = bad({label, " codec returned a null model"},
+                   RDMA_SC_CODEC_ERROR);
+      return;
+    end
+  endtask
+
   // 功能：poll_ceqe_once 在 scheduler 前冻结 CEQE、可选 CQ route 与 prepared
   //   pending，再按 doorbell→consumer commit→result 消费一条 CEQ event。
   // 输入/输出及副作用：ceq_h 为输入，result/status 为输出；合法 image 命中 CQ
@@ -9014,8 +8891,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment attachment;
     rdma_queue_cursor_snapshot cursor;
     rdma_queue_cursor_snapshot next;
-    rdma_codec_key codec_key;
-    rdma_codec_base codec;
     rdma_hw_image entry_image;
     rdma_hw_model decoded_model;
     rdma_hw_ceqe_model ceqe;
@@ -9042,21 +8917,9 @@ class rdma_queue_data_engine extends uvm_object;
     status = make_entry_image(data, RDMA_IMAGE_CEQE, attachment.entry_size,
                               entry_image);
     if (!status.ok()) return;
-    codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_CEQE,
-      object_type:"ceqe", variant:"default", opcode:8'h00};
-    status = lookup_codec_checked(codec_key, "CEQE poll", codec);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("CEQE codec lookup normalization failed",
-                     RDMA_SC_CODEC_ERROR);
-      return;
-    end
-    status = codec.decode(entry_image, decoded_model);
-    if (status == null) begin
-      status = bad("CEQE decode returned null status", RDMA_SC_CODEC_ERROR);
-      return;
-    end
-    if (!status.ok()) return;
+    decode_event_image(entry_image, RDMA_IMAGE_CEQE, "CEQE",
+                       decoded_model, status);
+    if (status == null || !status.ok()) return;
     if (!$cast(ceqe, decoded_model) || ceqe == null) begin
       status = bad("CEQE codec returned the wrong model type", RDMA_SC_CODEC_ERROR);
       return;
@@ -9204,8 +9067,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment attachment;
     rdma_queue_cursor_snapshot cursor;
     rdma_queue_cursor_snapshot next;
-    rdma_codec_key codec_key;
-    rdma_codec_base codec;
     rdma_hw_image entry_image;
     rdma_hw_model decoded_model;
     rdma_hw_aeqe_model aeqe;
@@ -9243,21 +9104,9 @@ class rdma_queue_data_engine extends uvm_object;
     status = make_entry_image(data, RDMA_IMAGE_AEQE, attachment.entry_size,
                               entry_image);
     if (!status.ok()) return;
-    codec_key = '{hw_version:"rdma", image_kind:RDMA_IMAGE_AEQE,
-      object_type:"aeqe", variant:"default", opcode:8'h00};
-    status = lookup_codec_checked(codec_key, "AEQE poll", codec);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("AEQE codec lookup normalization failed",
-                     RDMA_SC_CODEC_ERROR);
-      return;
-    end
-    status = codec.decode(entry_image, decoded_model);
-    if (status == null) begin
-      status = bad("AEQE decode returned null status", RDMA_SC_CODEC_ERROR);
-      return;
-    end
-    if (!status.ok()) return;
+    decode_event_image(entry_image, RDMA_IMAGE_AEQE, "AEQE",
+                       decoded_model, status);
+    if (status == null || !status.ok()) return;
     if (!$cast(aeqe, decoded_model) || aeqe == null) begin
       status = bad("AEQE codec returned the wrong model type", RDMA_SC_CODEC_ERROR);
       return;
@@ -9751,6 +9600,7 @@ class rdma_queue_data_engine extends uvm_object;
     output rdma_queue_runtime_kind_e runtime_kind
   );
     rdma_handle completion_qp_h;
+    rdma_queue_wq_target_contract_t target_contract;
     rdma_status status;
 
     link = null;
@@ -9760,8 +9610,11 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("receive target snapshot is incomplete",
                  RDMA_SC_INVALID_ARGUMENT);
 
-    runtime_kind = snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
-                   RDMA_QUEUE_RUNTIME_SRQ : RDMA_QUEUE_RUNTIME_RQ;
+    if (!rdma_queue_wq_target_policy::for_receive_target(
+          snapshot.target_h.kind, target_contract))
+      return bad("receive target resource kind is unsupported",
+                 RDMA_SC_INVALID_ARGUMENT);
+    runtime_kind = target_contract.runtime_kind;
     completion_qp_h = snapshot.target_h.kind == RDMA_RESOURCE_SRQ ?
                       snapshot.completion_qp_h : snapshot.target_h;
     if (completion_qp_h == null ||
@@ -10496,60 +10349,13 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_attachment wqe_attachment,
     output rdma_status status
   );
-    rdma_queue_slot_ledger_entry released[$];
-    rdma_status noalloc_status;
-    bit release_succeeded;
-
-    status = null;
-    if (attachment == null || pending == null || wqe_attachment == null ||
-        attachment.runtime == null || wqe_attachment.runtime == null ||
-        pending.failure_status == null)
-      begin
-        status = make_engine_status_nonfatal(
-          RDMA_SC_INVALID_STATE,
-          "consumer recovery WQE release input is incomplete");
-        return;
-      end
-
-    noalloc_status = pending.failure_status;
-    if (!attachment.runtime.begin_consumer_release_noalloc(noalloc_status)) begin
-      status = noalloc_status;
-      return;
-    end
-    released.delete();
-    status = release_cq_wqe(
-      wqe_attachment, null, released, noalloc_status, 1'b1,
-      pending.completion_index, pending.completion_wrap);
-    if (status == null) begin
-      void'(set_engine_status_noalloc(
-        noalloc_status, RDMA_SC_INVALID_STATE,
-        "CQ recovery WQE release returned null status"));
-      status = noalloc_status;
-    end
-    release_succeeded = status.ok();
-    if (!attachment.runtime.finish_consumer_release_noalloc(
-          release_succeeded, status)) begin
-      if (status == null || status.ok()) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_INVALID_STATE,
-          "CQ recovery release gate finalization failed"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    if (!release_succeeded) begin
-      if (!attachment.runtime.record_recovery_failure_noalloc(
-            pending.consumer_shadow_required ? RDMA_QUEUE_MMIO_NO_SUBMIT :
-                                                 RDMA_QUEUE_MMIO_SUCCESS,
-            status, noalloc_status)) begin
-        void'(set_engine_status_noalloc(
-          noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
-          "CQ recovery release failure could not be retained"));
-        status = noalloc_status;
-      end
-      return;
-    end
-    status = noalloc_status;
+    execute_consumer_wqe_release(
+      attachment, pending, wqe_attachment, null, 1'b1,
+      pending == null ? 0 : pending.completion_index,
+      pending == null ? 1'b0 : pending.completion_wrap,
+      pending != null && pending.consumer_shadow_required ?
+        RDMA_QUEUE_MMIO_NO_SUBMIT : RDMA_QUEUE_MMIO_SUCCESS,
+      "CQ recovery", status);
   endtask
 
   // 设计说明：consumer recovery 同时包含 CQ route 解析、CQC shadow/doorbell 续做、
