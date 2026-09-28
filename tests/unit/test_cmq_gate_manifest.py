@@ -2264,14 +2264,17 @@ class CmqGateManifestTest(unittest.TestCase):
     #   移至无候选快速返回之后时失败；不会改写被测文件。
     def test_observed_submit_candidate_stage_order(self):
         source = (ROOT / "src" / "core" / "rdma_cmq_engine.sv").read_text()
+        transaction_models = (
+            ROOT / "src" / "core" / "rdma_cmq_engine_transaction_models.sv"
+        ).read_text()
         engine = self._class_body("rdma_cmq_engine", source)
         self.assertIsNotNone(
             re.search(
                 r"\btypedef\s+struct\s*\{[^}]*\}\s*"
                 r"rdma_cmq_submit_candidate_stage_t\s*;",
-                source,
+                transaction_models,
             ),
-            "missing call-local candidate-stage context",
+            "missing transaction-model candidate-stage context",
         )
         helper = re.findall(
             r"\bprotected\s+function\s+(?:automatic\s+)?void\s+"
@@ -2297,9 +2300,9 @@ class CmqGateManifestTest(unittest.TestCase):
         ):
             self.assertRegex(helper_body, pattern)
         self.assertEqual(len(re.findall(r"\bcontinue\s*;", helper_body)), 11)
-        self.assertEqual(len(re.findall(r"\bbreak\s*;", helper_body)), 20)
+        self.assertEqual(len(re.findall(r"\bbreak\s*;", helper_body)), 21)
         self.assertEqual(
-            len(re.findall(r"\bpoison_status\s*\(", helper_body)), 2
+            len(re.findall(r"\bpoison_status\s*\(", helper_body)), 3
         )
         self.assertNotRegex(
             helper_body,
@@ -2549,14 +2552,12 @@ class CmqGateManifestTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(
             len(re.findall(r"\bif\s*\(\s*!transaction_failed\s*\)\s*begin", helper)),
-            5,
+            6,
             "each doorbell stage must retain its original failure guard",
         )
         self.assertEqual(len(re.findall(r"\bdoorbell_metadata_status\s*\(", helper)), 2)
         for pattern in (
-            r"\bfinal_pi\s*=\s*final_sequence\s*%\s*CMQ_DEPTH\s*;",
-            r"\bfinal_polarity\s*=\s*\(\s*final_sequence\s*/\s*CMQ_DEPTH\s*\)"
-            r"\s*&\s*1'b1\s*;",
+            r"\brdma_cmq_ring_position_for_sequence\s*\(",
             r"\bprofile\.encode_doorbell\s*\(\s*doorbell_encode_target\s*,"
             r"\s*final_pi\s*,\s*final_polarity\s*,\s*doorbell_image\s*\)",
         ):
@@ -2968,6 +2969,125 @@ fi
             )
             self.assertEqual(malformed_manifest.returncode, 2)
             self.assertIn("exactly eighteen", malformed_manifest.stderr)
+
+    # 功能：冻结 Phase 2 transaction kernel 的 ring geometry、terminal-transition
+    #   staging 与 polled journal commit 共享边界，防止 engine 恢复本地重复 helper
+    #   或重新分叉同一 lifecycle transition 的多套实现。
+    # 输入/输出及副作用：读取 kernel、transaction-model 和 engine 源文并执行静态断言；
+    #   不启动 simulator，不修改任何源码或运行时状态。
+    # 失败边界：kernel helper 缺失、engine 重新声明 protected 几何实现、旧的 expiry/
+    #   generation-cancel 类型残留、两条 policy 未使用统一 staging 类型，或正常/late
+    #   CQE 分支绕过共享 journal commit seam 时失败。
+    def test_transaction_kernel_and_terminal_stage_are_shared(self):
+        kernel = (ROOT / "src" / "core" / "rdma_cmq_transaction_kernel.sv").read_text(
+            encoding="utf-8"
+        )
+        models = (
+            ROOT / "src" / "core" / "rdma_cmq_engine_transaction_models.sv"
+        ).read_text(encoding="utf-8")
+        engine = (ROOT / "src" / "core" / "rdma_cmq_engine.sv").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            len(re.findall(r"\bfunction\s+automatic\s+bit\s+"
+                           r"rdma_cmq_slot_ring_geometry_matches\s*\(", kernel)),
+            1,
+        )
+        self.assertEqual(
+            len(re.findall(r"\brdma_cmq_slot_ring_geometry_matches\s*\(", engine)),
+            2,
+        )
+        self.assertNotRegex(
+            engine,
+            r"\bprotected\s+function\s+(?:automatic\s+)?bit\s+"
+            r"slot_ring_geometry_matches\s*\(",
+        )
+        self.assertNotIn("rdma_cmq_expiry_candidate_stage_t", models + engine)
+        self.assertNotIn(
+            "rdma_cmq_generation_cancel_candidate_stage_t", models + engine
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\brdma_cmq_terminal_transition_candidate_stage_t\b", models + engine
+            )),
+            5,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\bprotected\s+function\s+rdma_status\s+"
+                r"commit_polled_journal_transition_locked\s*\(", engine
+            )),
+            1,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\bcommit_polled_journal_transition_locked\s*\(", engine
+            )),
+            3,
+        )
+        polled_body = engine.split(
+            "protected function rdma_status commit_polled_completion_locked(",
+            1,
+        )[1].split("endfunction", 1)[0]
+        self.assertNotIn("stage_runtime_journal_transition_locked(", polled_body)
+        self.assertEqual(
+            len(re.findall(
+                r"\bfunction\s+automatic\s+bit\s+"
+                r"rdma_cmq_find_unique_ticket_item\s*\(", kernel
+            )),
+            1,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\bfunction\s+automatic\s+bit\s+"
+                r"rdma_cmq_transition_predecessor_valid\s*\(", kernel
+            )),
+            1,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\brdma_cmq_transition_predecessor_valid\s*\(", engine
+            )),
+            1,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\bfunction\s+automatic\s+bit\s+"
+                r"rdma_cmq_terminal_state_phase_valid\s*\(", kernel
+            )),
+            1,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\brdma_cmq_terminal_state_phase_valid\s*\(", engine
+            )),
+            5,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\bfunction\s+automatic\s+bit\s+"
+                r"rdma_cmq_completion_phase_has_terminal_evidence\s*\(",
+                kernel,
+            )),
+            1,
+        )
+        self.assertEqual(
+            len(re.findall(
+                r"\brdma_cmq_completion_phase_has_terminal_evidence\s*\(",
+                engine,
+            )),
+            4,
+        )
+        self.assertEqual(
+            len(re.findall(r"\brdma_cmq_find_unique_ticket_item\s*\(", engine)),
+            1,
+        )
+        locator_body = engine.split(
+            "protected function rdma_status locate_journal_item_by_ticket_locked(",
+            1,
+        )[1].split("endfunction", 1)[0]
+        self.assertNotIn("foreach (batch_record.items[i])", locator_body)
 
 
 if __name__ == "__main__":
