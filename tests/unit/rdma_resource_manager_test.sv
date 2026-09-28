@@ -1,6 +1,7 @@
 // 目录：测试层 unit/rdma_resource_manager_test.sv。
 // 职责：验证资源分配/发布/恢复/释放、QP/CQ 业务状态与 generation/authority 拒绝契约。
-// 依赖：rdma_core/model package、UVM 和本文件的 mapping/CQC/probe fixture。
+// 依赖：rdma_core/model package、resource projector、UVM 和本文件的 mapping/CQC/probe fixture。
+//   probe 直接使用集中投影组件构造冲突快照，不依赖 manager 已移出的 protected helper。
 // 所有权与生命周期：测试拥有本地 manager/值对象；opaque backing 仍遵守 adapter 完成证明。
 //   static callback target 只借用 manager，逐场景清空；held mutation guard 由测试显式归还。
 // 设计：通过真实 clone/completion 窗口注入重入，不为生产 manager 增加专用测试 observer。
@@ -57,7 +58,7 @@ class rdma_resource_manager_probe extends rdma_resource_manager;
           `uvm_fatal("REGISTRY_WINDOW_GUARD", "could not hold mutation guard")
       end
       3: begin
-        status = project_resource_value(
+        status = rdma_resource_projector::project_resource_value(
           registry[key], "registry source conflict", projected
         );
         if (!status.ok())
@@ -495,7 +496,7 @@ class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
     rdma_status status;
     string key;
 
-    status = project_public_resource_value(
+    status = rdma_resource_projector::project_public_resource_value(
       candidate, "force QP staged precondition", projected
     );
     if (!status.ok() || !$cast(replacement, projected))
@@ -527,7 +528,7 @@ class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
     rdma_status status;
     string key;
 
-    status = project_public_resource_value(
+    status = rdma_resource_projector::project_public_resource_value(
       candidate, "force QP ACTIVE precondition", projected
     );
     if (!status.ok() || !$cast(replacement, projected))
@@ -1346,7 +1347,7 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager_probe;
         if (!hold_mutation_guard_probe())
           `uvm_fatal("QUEUE_RESTORE_OBSERVER", "could not inject busy guard")
       3: begin
-        status = project_resource_value(registry[key], "restore source fault", replacement);
+        status = rdma_resource_projector::project_resource_value(registry[key], "restore source fault", replacement);
         if (!status.ok())
           `uvm_fatal("QUEUE_RESTORE_OBSERVER", status.convert2string())
         registry[key] = replacement;
@@ -3124,7 +3125,7 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     rdma_resource source,
     output rdma_resource result
   );
-    return project_public_resource_value(source, "projection gate probe",
+    return rdma_resource_projector::project_public_resource_value(source, "projection gate probe",
                                          result);
   endfunction
 
@@ -3137,7 +3138,7 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     rdma_status status;
 
     key = resource_key(replacement.handle);
-    status = project_resource_value(replacement, "error probe reset",
+    status = rdma_resource_projector::project_resource_value(replacement, "error probe reset",
                                     replacement_copy);
     if (!status.ok())
       `uvm_fatal("RM_TEST_SCHEMA", status.convert2string())

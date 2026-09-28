@@ -1,7 +1,8 @@
 // 目录：核心执行层 core/rdma_resource_manager.sv。
 // 职责：唯一拥有 resource registry、recovery、allocator、incarnation/generation 账本；
 //   对外提供 detached 查询与资源生命周期提交，不执行 CMQ、DMA 或队列数据传输。
-// 依赖：types/model 值契约、resource transaction candidate 和 allocator/dependency policy。
+// 依赖：types/model 值契约、resource projector、transaction candidate 和 allocator/dependency policy。
+//   projector 负责快照对象图与身份比较；本类仍唯一负责 admission、ledger 和 commit。
 // 所有权与生命周期：manager 拥有账本快照，incarnation tombstone 在释放后保留；
 //   外部 mapping/backing 仅借用 adapter 的不透明 authority，不接管其生命周期。
 // 设计：外部投影/完成证明位于锁外，最终 mutation 在短 guard 内按冻结 epoch/source 提交。
@@ -202,128 +203,6 @@ class rdma_resource_manager extends uvm_object;
                      owner.object_id, owner.generation, local_qpn);
   endfunction
 
-  // Public carriers may be compatible subclasses, but only fields declared by
-  // the built-in model are authoritative.  Borrowed carrier graphs are
-  // structurally projected into direct-new built-in storage without invoking
-  // their virtual clone/copy hooks.  An owned DMA mapping is the explicit
-  // exception: its concrete clone carries opaque adapter release authority and
-  // is accepted only through the checked contract below.  Future extension
-  // support requires another explicit trusted adapter here.
-  // 功能：在 rdma_resource_manager 中，project_handle_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_handle_value 读取 source、copy_label、result 并使用字段 result、result_function、result.kind、result.function_uid、result.object_id、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_handle_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_handle_value(
-    rdma_handle source,
-    string copy_label,
-    output rdma_handle result
-  );
-    rdma_function_handle source_function;
-    rdma_function_handle result_function;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    if (source.kind == RDMA_RESOURCE_FUNCTION) begin
-      if (!$cast(source_function, source))
-        return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          {copy_label, " Function handle is structurally incompatible"}
-        );
-      result_function = new({copy_label, "_function_handle"});
-      result = result_function;
-    end
-    else begin
-      result = new({copy_label, "_handle"});
-    end
-    result.kind = source.kind;
-    result.function_uid = source.function_uid;
-    result.object_id = source.object_id;
-    result.generation = source.generation;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_function_handle_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_function_handle_value 读取 source、copy_label、result 并使用字段 result、result.kind、result.function_uid、result.object_id、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_function_handle_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
-  protected function rdma_status project_function_handle_value(
-    rdma_function_handle source,
-    string copy_label,
-    output rdma_function_handle result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_function_handle"});
-    result.kind = source.kind;
-    result.function_uid = source.function_uid;
-    result.object_id = source.object_id;
-    result.generation = source.generation;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_mapping_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_mapping_value 读取 source、copy_label、result 并使用字段 result、status、result.requester_bdf、result.pasid_valid、result.pasid、result.dma_domain_valid、result.dma_domain_id、result.backing_addr，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_mapping_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_mapping_value(
-    rdma_dma_mapping source,
-    string copy_label,
-    output rdma_dma_mapping result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_mapping"});
-    status = project_function_handle_value(
-      source.function_h, {copy_label, "_function"}, result.function_h
-    );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_handle_value(source.owner_h, {copy_label, "_owner"},
-                                  result.owner_h);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.requester_bdf = source.requester_bdf;
-    result.pasid_valid = source.pasid_valid;
-    result.pasid = source.pasid;
-    result.dma_domain_valid = source.dma_domain_valid;
-    result.dma_domain_id = source.dma_domain_id;
-    // Route 与 reset epoch 是 mapping authority 的一部分。若 detached
-    // projection 丢失这两个字段，CQ resize recovery 无法证明旧 backing
-    // 仍属于原 Host/Function，也不能安全执行 opaque cleanup。
-    result.route = source.route;
-    result.route_valid = source.route_valid;
-    result.reset_epoch = source.reset_epoch;
-    result.epoch_valid = source.epoch_valid;
-    result.backing_addr = source.backing_addr;
-    result.iova = source.iova;
-    result.size = source.size;
-    result.direction = source.direction;
-    result.permissions = source.permissions;
-    result.state = source.state;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：same_mapping_handle_value 为 mapping/HMC 值比较提供 nullable handle
-  //       identity seam，并转发到 resource manager 的 canonical handle 比较。
-  // 输入/输出及副作用：lhs、rhs（输入）是非拥有 handle 引用；只读取 kind、
-  //       function_uid、object_id、generation，返回 bit，不修改 handle、mapping、
-  //       runtime、账本或外部 adapter，也不取得任何资源所有权。
-  // 失败/边界：lhs 与 rhs 同为 null 返回 1；仅一侧为 null 返回 0；两侧非空时
-  //       四个字段任一 `==` 不等返回 0。该 seam 不执行 $isunknown，也不判断
-  //       authority、对象 alias 或 generation 新鲜度，调用方须保留自己的门禁。
-  protected function bit same_mapping_handle_value(
-    rdma_handle lhs,
-    rdma_handle rhs
-  );
-    return same_handle_instance(lhs, rhs);
-  endfunction
-
   // 功能：same_hmc_ref_value 比较两个 HMC reference 的 owner、对象类型、地址、大小、
   //       PBLE index 元数据、所有权和释放完成标志，形成跨 queue/context 比较共用的值契约。
   // 输入/输出及副作用：lhs、rhs（输入 HMC reference）；函数只读 owner、object_kind、address、
@@ -338,7 +217,7 @@ class rdma_resource_manager extends uvm_object;
   );
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    return same_mapping_handle_value(lhs.owner, rhs.owner) &&
+    return rdma_resource_projector::same_mapping_handle_value(lhs.owner, rhs.owner) &&
            lhs.object_kind == rhs.object_kind &&
            lhs.address.value == rhs.address.value &&
            lhs.size == rhs.size &&
@@ -346,56 +225,6 @@ class rdma_resource_manager extends uvm_object;
            lhs.index_valid == rhs.index_valid &&
            lhs.ownership == rhs.ownership &&
            lhs.release_complete == rhs.release_complete;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中比较释放 authority 的全部值字段，包括
-  //       Function/owner、DMA 参数、完整 Host/root/segment/BDF route 和 reset epoch。
-  // 输入/输出及副作用：lhs/rhs（输入 mapping）；只读比较对象并返回 bit，不更新
-  //       runtime、账本或外部 adapter。
-  // 失败/边界：任一对象为空、route/epoch 有缺失或任一 authority 字段不一致时返回
-  //       0；即使 mapping.state 不同也由调用方决定是否使用该值比较。
-  protected function bit same_mapping_release_fields(
-    rdma_dma_mapping lhs,
-    rdma_dma_mapping rhs
-  );
-    if (lhs == null || rhs == null)
-      return lhs == null && rhs == null;
-    return same_mapping_handle_value(lhs.function_h, rhs.function_h) &&
-           lhs.requester_bdf == rhs.requester_bdf &&
-           lhs.pasid_valid == rhs.pasid_valid &&
-           lhs.pasid == rhs.pasid &&
-           lhs.dma_domain_valid == rhs.dma_domain_valid &&
-           lhs.dma_domain_id == rhs.dma_domain_id &&
-           lhs.route_valid == rhs.route_valid &&
-           lhs.route.host_topology_key == rhs.route.host_topology_key &&
-           lhs.route.root_id == rhs.route.root_id &&
-           lhs.route.segment == rhs.route.segment &&
-           rdma_bdf_same(lhs.route.bdf, rhs.route.bdf) &&
-           lhs.epoch_valid == rhs.epoch_valid &&
-           lhs.reset_epoch == rhs.reset_epoch &&
-           lhs.backing_addr.value == rhs.backing_addr.value &&
-           lhs.iova.value == rhs.iova.value &&
-           lhs.size == rhs.size &&
-           lhs.direction == rhs.direction &&
-           lhs.permissions == rhs.permissions &&
-           same_mapping_handle_value(lhs.owner_h, rhs.owner_h);
-  endfunction
-
-  // 功能：same_mapping_value 在完整 release-authority 值相等的基础上继续比较
-  //   mapping.state，供需要精确区分 ACTIVE/RELEASED 的 registry 快照校验使用。
-  // 输入/输出及副作用：lhs、rhs（输入）为只读 mapping 引用；函数比较 Function/owner、
-  //   requester/DMA、route/epoch、address/IOVA/size/direction/permissions 和 state，返回 bit，
-  //   不更新 manager 账本、mapping 或外部 adapter。
-  // 失败/边界：两侧同时为 null 时返回 1，只有一侧为 null 或任一 authority/state 字段
-  //   不一致时返回 0；动态 subtype 不参与相等判定，也不会触发隐式投影或完成查询。
-  protected function bit same_mapping_value(
-    rdma_dma_mapping lhs,
-    rdma_dma_mapping rhs
-  );
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    return same_mapping_release_fields(lhs, rhs) &&
-           lhs.state == rhs.state;
   endfunction
 
   // Recovery-only mappings expose a public state field that the adapter may
@@ -416,174 +245,7 @@ class rdma_resource_manager extends uvm_object;
   );
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    return same_mapping_release_fields(lhs, rhs);
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，mapping_handles_detached 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；mapping_handles_detached 读取 lhs、rhs 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：mapping_handles_detached 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
-  protected function bit mapping_handles_detached(
-    rdma_dma_mapping lhs,
-    rdma_dma_mapping rhs
-  );
-    if (lhs == null || rhs == null)
-      return 1'b0;
-    return (lhs.function_h == null || rhs.function_h == null ||
-            lhs.function_h != rhs.function_h) &&
-           (lhs.owner_h == null || rhs.owner_h == null ||
-            lhs.owner_h != rhs.owner_h);
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，mapping_hook_value_intact 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
-  // 输入/输出及副作用：current（输入）、saved（输入）、expected_type（输入）；mapping_hook_value_intact 读取 current、saved、expected_type 并使用字段 current_type；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：mapping_hook_value_intact 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
-  protected function bit mapping_hook_value_intact(
-    rdma_dma_mapping current,
-    rdma_dma_mapping saved,
-    uvm_object_wrapper expected_type
-  );
-    uvm_object_wrapper current_type;
-
-    if (current == null || saved == null || current == saved ||
-        expected_type == null)
-      return 1'b0;
-    current_type = current.get_object_type();
-    return current_type != null && current_type == expected_type &&
-           same_mapping_value(current, saved) &&
-           mapping_handles_detached(current, saved);
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，owned_mapping_hook_graph_intact 逐字段核对快照、嵌套引用和 authority 值，确认复制结果既等值又无可变别名。
-  // 输入/输出及副作用：source（输入）、result（输入）、saved_value（输入）、source_type（输入）、authority_snapshot（输入）、saved_authority（输入）、authority_type（输入）；owned_mapping_hook_graph_intact 读取 source、result、saved_value、source_type、authority_snapshot、saved_authority、authority_type 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：owned_mapping_hook_graph_intact 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
-  protected function bit owned_mapping_hook_graph_intact(
-    rdma_dma_mapping source,
-    rdma_dma_mapping result,
-    rdma_dma_mapping saved_value,
-    uvm_object_wrapper source_type,
-    rdma_dma_mapping authority_snapshot,
-    rdma_dma_mapping saved_authority,
-    uvm_object_wrapper authority_type
-  );
-    return source != result && source != authority_snapshot &&
-           result != authority_snapshot &&
-           mapping_hook_value_intact(source, saved_value, source_type) &&
-           mapping_hook_value_intact(result, saved_value, source_type) &&
-           mapping_hook_value_intact(authority_snapshot, saved_authority,
-                                     authority_type) &&
-           mapping_handles_detached(source, result) &&
-           mapping_handles_detached(source, authority_snapshot) &&
-           mapping_handles_detached(result, authority_snapshot);
-  endfunction
-
-  // An owned mapping is also the adapter's release capability.  Preserve its
-  // concrete value type while treating clone() as an untrusted boundary: the
-  // clone must be registered, exact-type, detached, and value preserving.
-  // 功能：在 rdma_resource_manager 中，clone_owned_mapping_value 将 rhs 中 rdma_resource_manager 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；clone_owned_mapping_value 读取 source、copy_label、result 并使用字段 result、status、source_type、authority_type、cloned_object、result_type，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：clone_owned_mapping_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status clone_owned_mapping_value(
-    rdma_dma_mapping source,
-    string copy_label,
-    output rdma_dma_mapping result
-  );
-    rdma_dma_mapping saved_value;
-    rdma_dma_mapping authority_snapshot;
-    rdma_dma_mapping saved_authority;
-    rdma_status status;
-    uvm_object cloned_object;
-    uvm_object_wrapper source_type;
-    uvm_object_wrapper result_type;
-    uvm_object_wrapper authority_type;
-
-    result = null;
-    if (source == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping is null"}
-      );
-    status = project_mapping_value(source, {copy_label, "_saved"},
-                                   saved_value);
-    if (!status.ok())
-      return status;
-    source_type = source.get_object_type();
-    if (source_type == null ||
-        source_type == rdma_dma_mapping::get_type())
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping type is not a registered subtype"}
-      );
-    status = source.snapshot_release_authority(authority_snapshot);
-    if (status == null || !status.ok() || authority_snapshot == null ||
-        authority_snapshot == source ||
-        !same_mapping_value(source, saved_value)) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping authority snapshot is unsupported or invalid"}
-      );
-    end
-    authority_type = authority_snapshot.get_object_type();
-    status = project_mapping_value(
-      authority_snapshot, {copy_label, "_saved_authority"}, saved_authority
-    );
-    if (status == null || !status.ok() || authority_type == null ||
-        authority_type != source_type ||
-        !mapping_hook_value_intact(authority_snapshot, saved_authority,
-                                   authority_type) ||
-        !mapping_handles_detached(source, authority_snapshot)) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping authority snapshot changed value, type, or aliases"}
-      );
-    end
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(result, cloned_object) ||
-        result == source) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping clone contract failed"}
-      );
-    end
-    result_type = result.get_object_type();
-    if (result_type == null || result_type != source_type ||
-        !owned_mapping_hook_graph_intact(
-          source, result, saved_value, source_type,
-          authority_snapshot, saved_authority, authority_type
-        )) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping clone changed type, value, or aliases"}
-      );
-    end
-    status = source.release_authority_status(authority_snapshot);
-    if (status == null || !status.ok() ||
-        !owned_mapping_hook_graph_intact(
-          source, result, saved_value, source_type,
-          authority_snapshot, saved_authority, authority_type
-        )) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping source authority hook changed value, authority, or aliases"}
-      );
-    end
-    status = result.release_authority_status(authority_snapshot);
-    if (status == null || !status.ok() ||
-        !owned_mapping_hook_graph_intact(
-          source, result, saved_value, source_type,
-          authority_snapshot, saved_authority, authority_type
-        )) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " owned mapping result authority hook changed value, authority, or aliases"}
-      );
-    end
-    return rdma_status::success();
+    return rdma_resource_projector::same_mapping_release_fields(lhs, rhs);
   endfunction
 
   // Recovery may carry a detached copy of an owned mapping, but matching
@@ -608,7 +270,7 @@ class rdma_resource_manager extends uvm_object;
     if (authoritative == null || recovery == null)
       return 1'b0;
     mapping_type = authoritative.get_object_type();
-    status = project_mapping_value(
+    status = rdma_resource_projector::project_mapping_value(
       authoritative, "owned authority correspondence value", saved_value
     );
     if (status == null || !status.ok() || mapping_type == null)
@@ -617,27 +279,27 @@ class rdma_resource_manager extends uvm_object;
     if (status == null || !status.ok() || authority_snapshot == null)
       return 1'b0;
     authority_type = authority_snapshot.get_object_type();
-    status = project_mapping_value(
+    status = rdma_resource_projector::project_mapping_value(
       authority_snapshot, "owned authority correspondence snapshot",
       saved_authority
     );
     if (status == null || !status.ok() || authority_type == null ||
         authority_type != mapping_type ||
-        !owned_mapping_hook_graph_intact(
+        !rdma_resource_projector::owned_mapping_hook_graph_intact(
           authoritative, recovery, saved_value, mapping_type,
           authority_snapshot, saved_authority, authority_type
         ))
       return 1'b0;
     status = authoritative.release_authority_status(authority_snapshot);
     if (status == null || !status.ok() ||
-        !owned_mapping_hook_graph_intact(
+        !rdma_resource_projector::owned_mapping_hook_graph_intact(
           authoritative, recovery, saved_value, mapping_type,
           authority_snapshot, saved_authority, authority_type
         ))
       return 1'b0;
     status = recovery.release_authority_status(authority_snapshot);
     return status != null && status.ok() &&
-           owned_mapping_hook_graph_intact(
+           rdma_resource_projector::owned_mapping_hook_graph_intact(
              authoritative, recovery, saved_value, mapping_type,
              authority_snapshot, saved_authority, authority_type
            );
@@ -660,7 +322,7 @@ class rdma_resource_manager extends uvm_object;
            lhs.mapping_offset == rhs.mapping_offset &&
            lhs.length == rhs.length &&
            lhs.logical_queue_offset == rhs.logical_queue_offset &&
-           same_mapping_value(lhs.mapping, rhs.mapping);
+           rdma_resource_projector::same_mapping_value(lhs.mapping, rhs.mapping);
   endfunction
 
   // 功能：在 rdma_resource_manager 中由 same_queue_backing_ref_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
@@ -677,7 +339,7 @@ class rdma_resource_manager extends uvm_object;
         lhs.length != rhs.length ||
         lhs.logical_queue_offset != rhs.logical_queue_offset ||
         lhs.additional_segments.size() != rhs.additional_segments.size() ||
-        !same_mapping_value(lhs.mapping, rhs.mapping))
+        !rdma_resource_projector::same_mapping_value(lhs.mapping, rhs.mapping))
       return 1'b0;
     foreach (lhs.additional_segments[i]) begin
       if (!same_backing_segment_value(lhs.additional_segments[i],
@@ -742,7 +404,7 @@ class rdma_resource_manager extends uvm_object;
           lhs.pages[i].logical_page_offset !=
             rhs.pages[i].logical_page_offset ||
           lhs.pages[i].page_iova.value != rhs.pages[i].page_iova.value ||
-          !same_mapping_value(lhs.pages[i].mapping, rhs.pages[i].mapping))
+          !rdma_resource_projector::same_mapping_value(lhs.pages[i].mapping, rhs.pages[i].mapping))
         return 1'b0;
     end
     return 1'b1;
@@ -772,7 +434,7 @@ class rdma_resource_manager extends uvm_object;
         lhs_token.completion_authority == null ||
         rhs_token.completion_authority == null ||
         lhs_token.completion_authority !== rhs_token.completion_authority ||
-        !same_handle_instance(lhs.owner, rhs.owner) ||
+        !rdma_resource_projector::same_handle_instance(lhs.owner, rhs.owner) ||
         lhs.resource_kind != rhs.resource_kind ||
         lhs.local_id != rhs.local_id ||
         lhs.shadow_pointer_base.value != rhs.shadow_pointer_base.value ||
@@ -1297,16 +959,16 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT, "release completion mapping is null"
       );
     mapping_type = mapping.get_object_type();
-    status = project_mapping_value(
+    status = rdma_resource_projector::project_mapping_value(
       mapping, "release completion input guard", saved_mapping
     );
     if (status == null || !status.ok() || mapping_type == null ||
-        !mapping_hook_value_intact(mapping, saved_mapping, mapping_type))
+        !rdma_resource_projector::mapping_hook_value_intact(mapping, saved_mapping, mapping_type))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "release completion input guard is invalid"
       );
-    status = clone_owned_mapping_value(
+    status = rdma_resource_projector::clone_owned_mapping_value(
       mapping, "release completion query", completion_query
     );
     if (status == null || !status.ok() || completion_query == null)
@@ -1315,24 +977,24 @@ class rdma_resource_manager extends uvm_object;
         "release completion query clone is invalid"
       );
     query_type = completion_query.get_object_type();
-    status = project_mapping_value(
+    status = rdma_resource_projector::project_mapping_value(
       completion_query, "release completion query guard", saved_query
     );
     if (status == null || !status.ok() || query_type == null ||
         query_type != mapping_type ||
-        !mapping_hook_value_intact(completion_query, saved_query,
+        !rdma_resource_projector::mapping_hook_value_intact(completion_query, saved_query,
                                    query_type) ||
-        !mapping_handles_detached(mapping, completion_query))
+        !rdma_resource_projector::mapping_handles_detached(mapping, completion_query))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "release completion query guard is invalid"
       );
     status = completion_query.release_completion_status(release_complete);
     if (status == null ||
-        !mapping_hook_value_intact(mapping, saved_mapping, mapping_type) ||
-        !mapping_hook_value_intact(completion_query, saved_query,
+        !rdma_resource_projector::mapping_hook_value_intact(mapping, saved_mapping, mapping_type) ||
+        !rdma_resource_projector::mapping_hook_value_intact(completion_query, saved_query,
                                    query_type) ||
-        !mapping_handles_detached(mapping, completion_query)) begin
+        !rdma_resource_projector::mapping_handles_detached(mapping, completion_query)) begin
       release_complete = 1'b0;
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
@@ -1367,7 +1029,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "QP recovery completion mapping is null"
       );
-    status = clone_recovery_mapping_value(
+    status = rdma_resource_projector::clone_recovery_mapping_value(
       mapping, "QP recovery completion query", completion_query
     );
     if (status == null || !status.ok() || completion_query == null)
@@ -1383,1196 +1045,14 @@ class rdma_resource_manager extends uvm_object;
       );
     if (!status.ok())
       return status;
-    if (!same_mapping_value(mapping, completion_query) ||
-        !mapping_handles_detached(mapping, completion_query))
+    if (!rdma_resource_projector::same_mapping_value(mapping, completion_query) ||
+        !rdma_resource_projector::mapping_handles_detached(mapping, completion_query))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "QP recovery completion query changed mapping value or aliases"
       );
     release_complete = after_complete;
     return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_backing_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_backing_ref_value 读取 source、copy_label、result 并使用字段 result、result.mapping、status、result.ownership、result.release_complete，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_backing_ref_value 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_backing_ref_value(
-    rdma_backing_ref source,
-    string copy_label,
-    output rdma_backing_ref result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_backing_ref"});
-    result.mapping = null;
-    if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
-      status = clone_owned_mapping_value(
-        source.mapping, {copy_label, "_mapping"}, result.mapping
-      );
-    else
-      status = project_mapping_value(
-        source.mapping, {copy_label, "_mapping"}, result.mapping
-      );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.ownership = source.ownership;
-    result.release_complete = source.release_complete;
-    status = result.validate();
-    if (status == null) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        {copy_label, " backing validation returned null"}
-      );
-    end
-    if (!status.ok())
-      result = null;
-    return status;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_hmc_ref_value 从输入对象提取
-  //       受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source、copy_label 为输入，result 为输出；函数读取
-  //       source 和 copy_label，并复制 owner、kind、address、size、PBL index、
-  //       validity、ownership 与 release_complete；不取得调用方资源所有权。
-  // 失败/边界：project_hmc_ref_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_hmc_ref_value(
-    rdma_hmc_ref source,
-    string copy_label,
-    output rdma_hmc_ref result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_hmc_ref"});
-    status = project_function_handle_value(
-      source.owner, {copy_label, "_owner"}, result.owner
-    );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.object_kind = source.object_kind;
-    result.address = source.address;
-    result.size = source.size;
-    result.first_pbl_index = source.first_pbl_index;
-    result.index_valid = source.index_valid;
-    result.ownership = source.ownership;
-    result.release_complete = source.release_complete;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_bar_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_bar_value 读取 source、copy_label、result 并使用字段 result、result.bar_id、result.base、result.size、result.enabled，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_bar_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_bar_value(
-    rdma_bar_info source,
-    string copy_label,
-    output rdma_bar_info result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " BAR metadata is null"}
-      );
-    result = new({copy_label, "_bar"});
-    result.bar_id = source.bar_id;
-    result.base = source.base;
-    result.size = source.size;
-    result.enabled = source.enabled;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_pcie_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_pcie_value 读取 source、copy_label、result 并使用字段 result、result.bdf、result.parent_pf_bdf、result.vf_index、result.mse、result.bme、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_pcie_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_pcie_value(
-    rdma_pcie_identity source,
-    string copy_label,
-    output rdma_pcie_identity result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " PCIe identity is null"}
-      );
-    result = new({copy_label, "_pcie"});
-    foreach (result.bar[i])
-      result.bar[i] = null;
-    result.bdf = source.bdf;
-    result.parent_pf_bdf = source.parent_pf_bdf;
-    result.vf_index = source.vf_index;
-    result.mse = source.mse;
-    result.bme = source.bme;
-    foreach (source.bar[i]) begin
-      status = project_bar_value(
-        source.bar[i], $sformatf("%s_bar_%0d", copy_label, i),
-        result.bar[i]
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_binding_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_binding_value 读取 source、copy_label、result 并使用字段 result、result.pcie、result.owner_h、status、result.queue_dma、result.queue_caps、result.interrupt_vectors、result.function_uid，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_binding_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_binding_value(
-    rdma_function_binding source,
-    string copy_label,
-    output rdma_function_binding result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " Function binding is null"}
-      );
-    result = new({copy_label, "_binding"});
-    result.pcie = null;
-    result.owner_h = null;
-    status = project_pcie_value(source.pcie, {copy_label, "_pcie"},
-                                result.pcie);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    // Preserve the protected identity authority across value projection;
-    // copying only legacy mirrors leaves the projected binding unusable.
-    status = result.configure_identity(source.function_identity_snapshot());
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.queue_dma = source.queue_dma;
-    result.queue_caps = source.queue_caps;
-    result.interrupt_vectors = source.interrupt_vectors;
-    status = project_handle_value(source.owner_h, {copy_label, "_owner"},
-                                  result.owner_h);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.function_uid = source.function_uid;
-    result.notify_bar_id = source.notify_bar_id;
-    result.notify_base = source.notify_base;
-    result.notify_size = source.notify_size;
-    result.notify_table_sel = source.notify_table_sel;
-    result.notify_table_index = source.notify_table_index;
-    result.host_id = source.host_id;
-    result.pfvf_id = source.pfvf_id;
-    result.rdma_vf_id = source.rdma_vf_id;
-    result.global_function_id = source.global_function_id;
-    result.vsi_id = source.vsi_id;
-    result.state = source.state;
-    result.generation = source.generation;
-    result.notify_valid = source.notify_valid;
-    result.notify_ready = source.notify_ready;
-    result.dmi_valid = source.dmi_valid;
-    result.dmi_ready = source.dmi_ready;
-    result.vft_valid = source.vft_valid;
-    result.vft_ready = source.vft_ready;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_opcode_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_opcode_value 读取 source、copy_label、result 并使用字段 result、result.profile_name、result.opcode、result.variant，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_opcode_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
-  protected function rdma_status project_opcode_value(
-    rdma_cmq_opcode_key source,
-    string copy_label,
-    output rdma_cmq_opcode_key result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_opcode"});
-    result.profile_name = source.profile_name;
-    result.opcode = source.opcode;
-    result.variant = source.variant;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_status_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_status_value 读取 source、copy_label、result 并使用字段 result、result.category、result.code、result.hardware_code、result.hardware_code_valid、result.source_engine、result.function_uid、result.generation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_status_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
-  protected function rdma_status project_status_value(
-    rdma_status source,
-    string copy_label,
-    output rdma_status result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_status"});
-    result.category = source.category;
-    result.code = source.code;
-    result.hardware_code = source.hardware_code;
-    result.hardware_code_valid = source.hardware_code_valid;
-    result.source_engine = source.source_engine;
-    result.function_uid = source.function_uid;
-    result.generation = source.generation;
-    result.resource_id = source.resource_id;
-    result.command_id = source.command_id;
-    result.wr_id = source.wr_id;
-    result.severity = source.severity;
-    result.retryable = source.retryable;
-    result.message = source.message;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_ticket_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_ticket_value 读取 source、copy_label、result 并使用字段 result、status、result.command_id、result.slot_sequence、result.sq_index、result.sq_wrap、result.absolute_deadline，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_ticket_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_ticket_value(
-    rdma_cmq_ticket source,
-    string copy_label,
-    output rdma_cmq_ticket result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_ticket"});
-    status = project_function_handle_value(
-      source.function_h, {copy_label, "_function"}, result.function_h
-    );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_handle_value(source.cmq_h, {copy_label, "_cmq"},
-                                  result.cmq_h);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_opcode_value(source.opcode_key, {copy_label, "_opcode"},
-                                  result.opcode_key);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.command_id = source.command_id;
-    result.slot_sequence = source.slot_sequence;
-    result.sq_index = source.sq_index;
-    result.sq_wrap = source.sq_wrap;
-    result.absolute_deadline = source.absolute_deadline;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_recovery_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_recovery_value 读取 source、copy_label、result 并使用字段 result、status、result.hardware_presence、result.completed_steps、result.pending_steps、result.queue_recovery_valid、result.queue_intent、result.ambiguous_queue_operation，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_recovery_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_recovery_value(
-    rdma_recovery_record source,
-    string copy_label,
-    output rdma_recovery_record result
-  );
-    rdma_backing_ref backing_copy;
-    rdma_hmc_ref hmc_copy;
-    rdma_status status_copy;
-    rdma_status status;
-    rdma_cmq_opcode_key opcode_copy;
-    rdma_queue_backing_plan plan_copy;
-    rdma_qp_recovery_state qp_recovery_copy;
-
-    result = null;
-    if (source == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery record is null"}
-      );
-    result = new({copy_label, "_recovery"});
-    status = project_handle_value(source.resource_h,
-                                  {copy_label, "_resource"},
-                                  result.resource_h);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.hardware_presence = source.hardware_presence;
-    result.completed_steps = source.completed_steps;
-    result.pending_steps = source.pending_steps;
-    result.backing_refs.delete();
-    foreach (source.backing_refs[i]) begin
-      status = project_backing_ref_value(
-        source.backing_refs[i], $sformatf("%s_backing_%0d", copy_label, i),
-        backing_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.backing_refs.push_back(backing_copy);
-    end
-    result.hmc_refs.delete();
-    foreach (source.hmc_refs[i]) begin
-      status = project_hmc_ref_value(
-        source.hmc_refs[i], $sformatf("%s_hmc_%0d", copy_label, i), hmc_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.hmc_refs.push_back(hmc_copy);
-    end
-    status = project_ticket_value(source.ambiguous_ticket,
-                                  {copy_label, "_ticket"},
-                                  result.ambiguous_ticket);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_status_value(source.primary_status,
-                                  {copy_label, "_primary"},
-                                  result.primary_status);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.rollback_statuses.delete();
-    foreach (source.rollback_statuses[i]) begin
-      status = project_status_value(
-        source.rollback_statuses[i],
-        $sformatf("%s_rollback_%0d", copy_label, i), status_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.rollback_statuses.push_back(status_copy);
-    end
-    result.queue_recovery_valid = source.queue_recovery_valid;
-    result.queue_intent = source.queue_intent;
-    result.ambiguous_queue_operation = source.ambiguous_queue_operation;
-    result.ambiguous_role = source.ambiguous_role;
-    status = project_opcode_value(source.queue_create_opcode,
-                                  {copy_label, "_queue_create"},
-                                  opcode_copy);
-    if (!status.ok()) begin result = null; return status; end
-    result.queue_create_opcode = opcode_copy;
-    status = project_opcode_value(source.queue_delete_opcode,
-                                  {copy_label, "_queue_delete"},
-                                  opcode_copy);
-    if (!status.ok()) begin result = null; return status; end
-    result.queue_delete_opcode = opcode_copy;
-    status = project_opcode_value(source.queue_query_opcode,
-                                  {copy_label, "_queue_query"},
-                                  opcode_copy);
-    if (!status.ok()) begin result = null; return status; end
-    result.queue_query_opcode = opcode_copy;
-    status = project_queue_plan_value(source.queue_plan,
-                                      {copy_label, "_queue_plan"}, plan_copy);
-    if (!status.ok()) begin result = null; return status; end
-    result.queue_plan = plan_copy;
-    result.qp_recovery_valid = source.qp_recovery_valid;
-    status = project_qp_recovery_value(
-      source.qp_recovery, {copy_label, "_qp_recovery"}, qp_recovery_copy
-    );
-    if (!status.ok()) begin result = null; return status; end
-    result.qp_recovery = qp_recovery_copy;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_resource_base_fields 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输入）；project_resource_base_fields 读取 source、copy_label、result 并使用字段 status、result.state、result.hmc_fvm_addr、result.hmc_fvm_addr_valid、result.outstanding_ids；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_resource_base_fields 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_resource_base_fields(
-    rdma_resource source,
-    string copy_label,
-    rdma_resource result
-  );
-    rdma_backing_ref backing_copy;
-    rdma_hmc_ref hmc_copy;
-    rdma_handle dependency_copy;
-    rdma_status status;
-
-    status = project_handle_value(source.handle, {copy_label, "_handle"},
-                                  result.handle);
-    if (!status.ok())
-      return status;
-    status = project_function_handle_value(
-      source.owner, {copy_label, "_owner"}, result.owner
-    );
-    if (!status.ok())
-      return status;
-    result.state = source.state;
-    result.hmc_fvm_addr = source.hmc_fvm_addr;
-    result.hmc_fvm_addr_valid = source.hmc_fvm_addr_valid;
-    result.backing_refs.delete();
-    foreach (source.backing_refs[i]) begin
-      status = project_backing_ref_value(
-        source.backing_refs[i], $sformatf("%s_backing_%0d", copy_label, i),
-        backing_copy
-      );
-      if (!status.ok())
-        return status;
-      result.backing_refs.push_back(backing_copy);
-    end
-    result.hmc_refs.delete();
-    foreach (source.hmc_refs[i]) begin
-      status = project_hmc_ref_value(
-        source.hmc_refs[i], $sformatf("%s_hmc_%0d", copy_label, i), hmc_copy
-      );
-      if (!status.ok())
-        return status;
-      result.hmc_refs.push_back(hmc_copy);
-    end
-    result.dependencies.delete();
-    foreach (source.dependencies[i]) begin
-      status = project_handle_value(
-        source.dependencies[i],
-        $sformatf("%s_dependency_%0d", copy_label, i), dependency_copy
-      );
-      if (!status.ok())
-        return status;
-      result.dependencies.push_back(dependency_copy);
-    end
-    result.outstanding_ids = source.outstanding_ids;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_page_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_page_value 读取 source、copy_label、result 并使用字段 result、result.role、result.mapping_offset、result.logical_page_offset、result.page_iova、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_page_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_queue_page_value(
-    rdma_queue_dma_page_ref source,
-    string copy_label,
-    output rdma_queue_dma_page_ref result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_page"});
-    result.role = source.role;
-    result.mapping_offset = source.mapping_offset;
-    result.logical_page_offset = source.logical_page_offset;
-    result.page_iova = source.page_iova;
-    status = project_mapping_value(source.mapping,
-                                   {copy_label, "_mapping"},
-                                   result.mapping);
-    if (!status.ok())
-      result = null;
-    return status;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_ring_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_ring_value 读取 source、copy_label、result 并使用字段 result、result.role、result.entry_size_bytes、result.depth、result.logical_bytes、result.storage_bytes、result.page_count、result.initial_polarity，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_ring_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_queue_ring_value(
-    rdma_queue_ring_layout source,
-    string copy_label,
-    output rdma_queue_ring_layout result
-  );
-    rdma_queue_dma_page_ref page_copy;
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_ring"});
-    result.role = source.role;
-    result.entry_size_bytes = source.entry_size_bytes;
-    result.depth = source.depth;
-    result.logical_bytes = source.logical_bytes;
-    result.storage_bytes = source.storage_bytes;
-    result.page_count = source.page_count;
-    result.initial_polarity = source.initial_polarity;
-    foreach (source.pages[i]) begin
-      status = project_queue_page_value(
-        source.pages[i], $sformatf("%s_page_%0d", copy_label, i), page_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.pages.push_back(page_copy);
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：project_backing_segment_value 将 queue/QP backing 的一个附加 segment 投影为
-  //   detached 对象，复制 source.role、source.ownership、source.mapping_offset、
-  //   source.length 和 source.logical_queue_offset，并按 ownership 选择 mapping clone
-  //   或值投影，供两类 backing-ref 快照共用。
-  // 输入/输出及副作用：source、segment_label、null_error、owned_mapping_label 和
-  //   borrowed_mapping_label（输入）；result（输出）。函数读取 source.mapping，写入
-  //   新的 result，不取得 source 或 mapping 的业务所有权。
-  // 失败/边界：source 为空时按 null_error 返回 RDMA_SC_INVALID_ARGUMENT；映射投影失败
-  //   时原样传播 status 并清空 result；函数不额外执行几何、role 或 ownership 校验，
-  //   borrowed 的 null mapping 继续遵循 project_mapping_value 的既有语义。
-  protected function rdma_status project_backing_segment_value(
-    rdma_queue_backing_segment source,
-    string segment_label,
-    string null_error,
-    string owned_mapping_label,
-    string borrowed_mapping_label,
-    output rdma_queue_backing_segment result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, null_error);
-    result = new(segment_label);
-    result.role = source.role;
-    result.ownership = source.ownership;
-    result.mapping_offset = source.mapping_offset;
-    result.length = source.length;
-    result.logical_queue_offset = source.logical_queue_offset;
-    if (result.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
-      status = clone_owned_mapping_value(
-        source.mapping, owned_mapping_label, result.mapping
-      );
-    else
-      status = project_mapping_value(
-        source.mapping, borrowed_mapping_label, result.mapping
-      );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_backing_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_backing_ref_value 读取 source、copy_label、result 并使用字段 result、result.role、result.ownership、result.mapping_offset、result.length、result.logical_queue_offset、result.cleanup_complete、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_backing_ref_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_queue_backing_ref_value(
-    rdma_queue_backing_ref source,
-    string copy_label,
-    output rdma_queue_backing_ref result
-  );
-    rdma_queue_backing_segment segment_copy;
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_ref"});
-    result.role = source.role;
-    result.ownership = source.ownership;
-    result.mapping_offset = source.mapping_offset;
-    result.length = source.length;
-    result.logical_queue_offset = source.logical_queue_offset;
-    result.cleanup_complete = source.cleanup_complete;
-    if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
-      status = clone_owned_mapping_value(source.mapping,
-                                         {copy_label, "_owned_mapping"},
-                                         result.mapping);
-    else
-      status = project_mapping_value(source.mapping,
-                                     {copy_label, "_borrowed_mapping"},
-                                     result.mapping);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    foreach (source.additional_segments[i]) begin
-      status = project_backing_segment_value(
-        source.additional_segments[i],
-        $sformatf("%s_segment_%0d", copy_label, i),
-        {copy_label, " additional backing segment is null"},
-        $sformatf("%s_segment_%0d_owned_mapping", copy_label, i),
-        $sformatf("%s_segment_%0d_borrowed_mapping", copy_label, i),
-        segment_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.additional_segments.push_back(segment_copy);
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_slot_token_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_slot_token_value 读取 source、copy_label、result 并使用字段 result、cloned_object，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_slot_token_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_queue_slot_token_value(
-    uvm_object source,
-    string copy_label,
-    output uvm_object result
-  );
-    rdma_queue_slot_token_contract source_token;
-    rdma_queue_slot_token_contract result_token;
-    uvm_object cloned_object;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    if (!$cast(source_token, source) ||
-        source_token.completion_authority == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " slot token contract is invalid"}
-      );
-    cloned_object = source_token.clone();
-    if (cloned_object == null || cloned_object == source ||
-        !$cast(result_token, cloned_object) ||
-        result_token.completion_authority == null ||
-        result_token.completion_authority !==
-          source_token.completion_authority)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " slot token clone lost opaque authority"}
-      );
-    result = result_token;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_context_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_context_value 读取 source、copy_label、result 并使用字段 result、status、result.resource_kind、result.local_id、result.shadow_pointer_base、result.slot_length、result.shadow_view_offset、result.shadow_view_length，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_context_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_queue_context_value(
-    rdma_context_backing_ref source,
-    string copy_label,
-    output rdma_context_backing_ref result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_context"});
-    status = project_function_handle_value(
-      source.owner, {copy_label, "_owner"}, result.owner
-    );
-    if (status.ok())
-      status = project_queue_slot_token_value(
-        source.slot_token, {copy_label, "_token"}, result.slot_token
-      );
-    if (status.ok())
-      status = project_hmc_ref_value(
-        source.hmc_ref, {copy_label, "_hmc"}, result.hmc_ref
-      );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.resource_kind = source.resource_kind;
-    result.local_id = source.local_id;
-    result.shadow_pointer_base = source.shadow_pointer_base;
-    result.slot_length = source.slot_length;
-    result.shadow_view_offset = source.shadow_view_offset;
-    result.shadow_view_length = source.shadow_view_length;
-    result.release_complete = source.release_complete;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_flush_target_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_flush_target_value 读取 source、copy_label、result 并使用字段 result、result.role、result.phase、result.flush_complete、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_flush_target_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_queue_flush_target_value(
-    rdma_queue_flush_target source,
-    string copy_label,
-    output rdma_queue_flush_target result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_flush"});
-    result.role = source.role;
-    result.phase = source.phase;
-    result.flush_complete = source.flush_complete;
-    status = project_queue_backing_ref_value(
-      source.pd_ref, {copy_label, "_pd_ref"}, result.pd_ref
-    );
-    if (!status.ok())
-      result = null;
-    return status;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_plan_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_queue_plan_value 读取 source、copy_label、result 并使用字段 result、result.resource_kind、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_plan_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_queue_plan_value(
-    rdma_queue_backing_plan source,
-    string copy_label,
-    output rdma_queue_backing_plan result
-  );
-    rdma_queue_ring_layout ring_copy;
-    rdma_queue_backing_ref ref_copy;
-    rdma_queue_flush_target flush_copy;
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_plan"});
-    result.resource_kind = source.resource_kind;
-    foreach (source.rings[i]) begin
-      status = project_queue_ring_value(
-        source.rings[i], $sformatf("%s_ring_%0d", copy_label, i), ring_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.rings.push_back(ring_copy);
-    end
-    foreach (source.refs[i]) begin
-      status = project_queue_backing_ref_value(
-        source.refs[i], $sformatf("%s_ref_%0d", copy_label, i), ref_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.refs.push_back(ref_copy);
-    end
-    status = project_queue_context_value(
-      source.context_ref, {copy_label, "_context"}, result.context_ref
-    );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    foreach (source.flush_targets[i]) begin
-      status = project_queue_flush_target_value(
-        source.flush_targets[i],
-        $sformatf("%s_flush_%0d", copy_label, i), flush_copy
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.flush_targets.push_back(flush_copy);
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_qp_ring_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_ring_value 读取 source、copy_label、result 并使用字段 result、result.role、result.entry_size_bytes、result.depth、result.logical_bytes、result.storage_bytes、result.object_mode，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_qp_ring_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
-  protected function rdma_status project_qp_ring_value(
-    rdma_qp_ring_layout source,
-    string copy_label,
-    output rdma_qp_ring_layout result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_ring"});
-    result.role = source.role;
-    result.entry_size_bytes = source.entry_size_bytes;
-    result.depth = source.depth;
-    result.logical_bytes = source.logical_bytes;
-    result.storage_bytes = source.storage_bytes;
-    result.object_mode = source.object_mode;
-    return rdma_status::success();
-  endfunction
-
-  // Recovery-only QP references deliberately bypass the normal owned-mapping
-  // snapshot/equivalence hooks: those hooks are the operation that failed
-  // while the allocation was being validated.  Preserve the concrete clone
-  // (and therefore its opaque adapter release token) and require only value,
-  // detached-handle, and completion-query authority here.  The reference
-  // validator separately enforces the exact Function/QP owner and role.
-  // 功能：在 rdma_resource_manager 中，clone_recovery_mapping_value 将 rhs 中 rdma_resource_manager 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；clone_recovery_mapping_value 读取 source、copy_label、result 并使用字段 result、source_type、status、cloned_object、result_type，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：clone_recovery_mapping_value 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status clone_recovery_mapping_value(
-    rdma_dma_mapping source,
-    string copy_label,
-    output rdma_dma_mapping result
-  );
-    uvm_object cloned_object;
-    uvm_object_wrapper source_type;
-    uvm_object_wrapper result_type;
-    rdma_status status;
-    bit source_complete;
-    bit result_complete;
-
-    result = null;
-    if (source == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery mapping is null"}
-      );
-    source_type = source.get_object_type();
-    if (source_type == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery mapping type is not registered"}
-      );
-    status = source.release_completion_status(source_complete);
-    if (status == null || !status.ok())
-      return status == null ? rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        {copy_label, " recovery completion authority query returned null"}
-      ) : status;
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(result, cloned_object) ||
-        result == source)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery mapping clone contract failed"}
-      );
-    result_type = result.get_object_type();
-    if (result_type == null || result_type != source_type ||
-        !same_mapping_value(source, result) ||
-        !mapping_handles_detached(source, result)) begin
-      result = null;
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery mapping clone changed value, type, or aliases"}
-      );
-    end
-    status = result.release_completion_status(result_complete);
-    if (status == null || !status.ok() || source_complete != result_complete) begin
-      result = null;
-      return status == null ? rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        {copy_label, " recovery clone completion authority changed"}
-      ) : status.ok() ? rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " recovery clone completion state changed"}
-      ) : status;
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_qp_backing_ref_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_backing_ref_value 读取 source、copy_label、result 并使用字段 result、status、result.role、result.ownership、result.mapping_offset、result.length、result.cleanup_complete、result.recovery_only，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_qp_backing_ref_value 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP backing segment is null”；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_qp_backing_ref_value(
-    rdma_qp_backing_ref source,
-    string copy_label,
-    output rdma_qp_backing_ref result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_ref"});
-    if (source.recovery_only)
-      status = clone_recovery_mapping_value(
-        source.mapping, {copy_label, "_recovery_mapping"}, result.mapping
-      );
-    else if (source.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
-      status = clone_owned_mapping_value(
-        source.mapping, {copy_label, "_owned_mapping"}, result.mapping
-      );
-    else
-      status = project_mapping_value(
-        source.mapping, {copy_label, "_borrowed_mapping"}, result.mapping
-      );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.role = source.role;
-    result.ownership = source.ownership;
-    result.mapping_offset = source.mapping_offset;
-    result.length = source.length;
-    result.cleanup_complete = source.cleanup_complete;
-    result.recovery_only = source.recovery_only;
-    result.additional_segments.delete();
-    foreach (source.additional_segments[i]) begin
-      rdma_queue_backing_segment segment;
-
-      status = project_backing_segment_value(
-        source.additional_segments[i],
-        {copy_label, "_segment"},
-        "QP backing segment is null",
-        {copy_label, "_segment_mapping"},
-        {copy_label, "_segment_mapping"},
-        segment
-      );
-      if (!status.ok()) begin
-        result = null;
-        return status;
-      end
-      result.additional_segments.push_back(segment);
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_qp_plan_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_plan_value 读取 source、copy_label、result 并使用字段 result、result.transport、result.sq_depth、result.rq_depth、result.sq_pd_flush_complete、result.rq_pd_flush_complete、result.cleanup_complete、status，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_qp_plan_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_qp_plan_value(
-    rdma_qp_backing_plan source,
-    string copy_label,
-    output rdma_qp_backing_plan result
-  );
-    rdma_qp_backing_ref ref_copy;
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_plan"});
-    result.transport = source.transport;
-    result.sq_depth = source.sq_depth;
-    result.rq_depth = source.rq_depth;
-    result.sq_pd_flush_complete = source.sq_pd_flush_complete;
-    result.rq_pd_flush_complete = source.rq_pd_flush_complete;
-    result.cleanup_complete = source.cleanup_complete;
-    status = project_qp_ring_value(source.sq_ring, {copy_label, "_sq"},
-                                   result.sq_ring);
-    if (status.ok())
-      status = project_qp_ring_value(source.rq_ring, {copy_label, "_rq"},
-                                     result.rq_ring);
-    if (status.ok())
-      status = project_qp_backing_ref_value(
-        source.sq_ref, {copy_label, "_sq"}, result.sq_ref
-      );
-    if (status.ok())
-      status = project_qp_backing_ref_value(
-        source.sq_sgb_ref, {copy_label, "_sq_sgb"}, result.sq_sgb_ref
-      );
-    if (status.ok())
-      status = project_qp_backing_ref_value(
-        source.rq_ref, {copy_label, "_rq"}, result.rq_ref
-      );
-    if (status.ok())
-      status = project_qp_backing_ref_value(
-        source.sq_pd_ref, {copy_label, "_sq_pd"}, result.sq_pd_ref
-      );
-    if (status.ok())
-      status = project_qp_backing_ref_value(
-        source.rq_pd_ref, {copy_label, "_rq_pd"}, result.rq_pd_ref
-      );
-    if (status.ok())
-      status = project_handle_value(source.rq_source_h,
-                                    {copy_label, "_rq_source"},
-                                    result.rq_source_h);
-    if (status.ok()) begin
-      result.urc_refs.delete();
-      foreach (source.urc_refs[i]) begin
-        status = project_qp_backing_ref_value(
-          source.urc_refs[i], $sformatf("%s_urc_%0d", copy_label, i),
-          ref_copy
-        );
-        if (!status.ok()) break;
-        result.urc_refs.push_back(ref_copy);
-      end
-    end
-    if (status.ok())
-      status = project_queue_context_value(
-        source.context_ref, {copy_label, "_context"}, result.context_ref
-      );
-    if (!status.ok())
-      result = null;
-    return status;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_address_vector_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_address_vector_value 读取 source、copy_label、result 并使用字段 result、result.source_address_index、result.source_vport、result.destination_vport、result.destination_port、result.destination_mac、result.ipv6、result.vlan_enable，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_address_vector_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
-  protected function rdma_status project_address_vector_value(
-    rdma_address_vector source,
-    string copy_label,
-    output rdma_address_vector result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_address_vector"});
-    result.source_address_index = source.source_address_index;
-    result.source_vport = source.source_vport;
-    result.destination_vport = source.destination_vport;
-    result.destination_port = source.destination_port;
-    result.destination_mac = source.destination_mac;
-    foreach (result.destination_ip[i])
-      result.destination_ip[i] = source.destination_ip[i];
-    result.ipv6 = source.ipv6;
-    result.vlan_enable = source.vlan_enable;
-    result.cfi = source.cfi;
-    result.lag_enable = source.lag_enable;
-    result.tunnel_enable = source.tunnel_enable;
-    result.forwarding_enable = source.forwarding_enable;
-    result.vlan_id = source.vlan_id;
-    result.traffic_class = source.traffic_class;
-    result.flow_label = source.flow_label;
-    result.hop_limit = source.hop_limit;
-    result.udp_source_port = source.udp_source_port;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_qpc_behavior_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qpc_behavior_value 读取 source、copy_label、result 并使用字段 result、result.transport_version、result.migration_enable、result.tx_endian_swap、result.rx_endian_swap、result.read_after_write_fence、result.atomic_after_atomic_fence、priority，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_qpc_behavior_value 先检查 source == null，再返回 rdma_status::success()；拒绝分支不提交部分状态，也不隐式重试。
-  protected function rdma_status project_qpc_behavior_value(
-    rdma_qpc_behavior source,
-    string copy_label,
-    output rdma_qpc_behavior result
-  );
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_behavior"});
-    result.transport_version = source.transport_version;
-    result.migration_enable = source.migration_enable;
-    result.tx_endian_swap = source.tx_endian_swap;
-    result.rx_endian_swap = source.rx_endian_swap;
-    result.read_after_write_fence = source.read_after_write_fence;
-    result.atomic_after_atomic_fence = source.atomic_after_atomic_fence;
-    result.\priority = source.\priority ;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_qpc_extension_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qpc_extension_value 读取 source、copy_label、result 并使用字段 result、result_rc、result_rc.remote_qpn、result_rc.send_psn、result_rc.recv_psn、result_rc.retry_count、result_rc.rnr_retry_count、result_ud，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_qpc_extension_value 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_qpc_extension_value(
-    rdma_qpc_transport_ext source,
-    string copy_label,
-    output rdma_qpc_transport_ext result
-  );
-    rdma_qpc_rc_ext source_rc;
-    rdma_qpc_rc_ext result_rc;
-    rdma_qpc_ud_ext source_ud;
-    rdma_qpc_ud_ext result_ud;
-    rdma_qpc_urc_ext source_urc;
-    rdma_qpc_urc_ext result_urc;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    if ($cast(source_rc, source)) begin
-      result_rc = new({copy_label, "_rc"});
-      result_rc.remote_qpn = source_rc.remote_qpn;
-      result_rc.send_psn = source_rc.send_psn;
-      result_rc.recv_psn = source_rc.recv_psn;
-      result_rc.retry_count = source_rc.retry_count;
-      result_rc.rnr_retry_count = source_rc.rnr_retry_count;
-      result = result_rc;
-    end
-    else if ($cast(source_ud, source)) begin
-      result_ud = new({copy_label, "_ud"});
-      result_ud.qkey = source_ud.qkey;
-      result_ud.destination_qpn = source_ud.destination_qpn;
-      result = result_ud;
-    end
-    else if ($cast(source_urc, source)) begin
-      result_urc = new({copy_label, "_urc"});
-      result_urc.remote_qpn = source_urc.remote_qpn;
-      result_urc.rbsn = source_urc.rbsn;
-      result_urc.dbsn = source_urc.dbsn;
-      result_urc.rpsn = source_urc.rpsn;
-      result_urc.dpsn = source_urc.dpsn;
-      if (source_urc.queues == null)
-        result_urc.queues = null;
-      else begin
-        result_urc.queues = new({copy_label, "_urc_queues"});
-        result_urc.queues.rsq_backing = source_urc.queues.rsq_backing;
-        result_urc.queues.rdsq_backing = source_urc.queues.rdsq_backing;
-        result_urc.queues.dsq_backing = source_urc.queues.dsq_backing;
-        result_urc.queues.rsq_depth = source_urc.queues.rsq_depth;
-        result_urc.queues.rdsq_depth = source_urc.queues.rdsq_depth;
-        result_urc.queues.rdsq_fetch_count =
-          source_urc.queues.rdsq_fetch_count;
-        result_urc.queues.dsq_fetch_count =
-          source_urc.queues.dsq_fetch_count;
-        result_urc.queues.rq_sequence_threshold_entries =
-          source_urc.queues.rq_sequence_threshold_entries;
-        result_urc.queues.sq_completion_threshold_entries =
-          source_urc.queues.sq_completion_threshold_entries;
-      end
-      result = result_urc;
-    end
-    else
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " QPC transport extension is incompatible"}
-      );
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_qpc_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qpc_value 读取 source、copy_label、result 并使用字段 result、status、result.transport、result.state、result.host_id、result.vf_id、result.stat_index、result.pkey，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_qpc_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_qpc_value(
-    rdma_qpc_model source,
-    string copy_label,
-    output rdma_qpc_model result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_qpc"});
-    status = project_handle_value(source.qp_h, {copy_label, "_qp"},
-                                  result.qp_h);
-    if (status.ok())
-      status = project_handle_value(source.pd_h, {copy_label, "_pd"},
-                                    result.pd_h);
-    if (status.ok())
-      status = project_handle_value(source.send_cq_h,
-                                    {copy_label, "_send_cq"},
-                                    result.send_cq_h);
-    if (status.ok())
-      status = project_handle_value(source.recv_cq_h,
-                                    {copy_label, "_recv_cq"},
-                                    result.recv_cq_h);
-    if (status.ok())
-      status = project_handle_value(source.srq_h, {copy_label, "_srq"},
-                                    result.srq_h);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    result.transport = source.transport;
-    result.state = source.state;
-    result.host_id = source.host_id;
-    result.vf_id = source.vf_id;
-    result.stat_index = source.stat_index;
-    result.pkey = source.pkey;
-    result.qp_sequence = source.qp_sequence;
-    result.access = source.access;
-    result.path_mtu_bytes = source.path_mtu_bytes;
-    result.sq_depth = source.sq_depth;
-    result.rq_depth = source.rq_depth;
-    result.sq_backing = source.sq_backing;
-    result.rq_backing = source.rq_backing;
-    result.context_backing = source.context_backing;
-    result.sq_mode = source.sq_mode;
-    result.rq_mode = source.rq_mode;
-    result.signature_enable = source.signature_enable;
-    result.tx_flow_control = source.tx_flow_control;
-    result.rx_flow_control = source.rx_flow_control;
-    status = project_address_vector_value(
-      source.address_vector, {copy_label, "_av"}, result.address_vector
-    );
-    if (status.ok())
-      status = project_qpc_behavior_value(
-        source.behavior, {copy_label, "_behavior"}, result.behavior
-      );
-    if (status.ok())
-      status = project_qpc_extension_value(
-        source.transport_ext, {copy_label, "_extension"},
-        result.transport_ext
-      );
-    if (!status.ok())
-      result = null;
-    return status;
   endfunction
 
   // 功能：在 rdma_resource_manager 中由 same_qp_backing_ref_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
@@ -2598,9 +1078,9 @@ class rdma_resource_manager extends uvm_object;
     if (lhs.recovery_only)
       return same_recovery_mapping_value(lhs.mapping, rhs.mapping);
     if (lhs.ownership == RDMA_OWNERSHIP_CONTROL_PLANE)
-      return same_mapping_value(lhs.mapping, rhs.mapping) &&
+      return rdma_resource_projector::same_mapping_value(lhs.mapping, rhs.mapping) &&
              same_owned_mapping_authority(lhs.mapping, rhs.mapping);
-    return same_mapping_value(lhs.mapping, rhs.mapping);
+    return rdma_resource_projector::same_mapping_value(lhs.mapping, rhs.mapping);
   endfunction
 
   // 功能：在 rdma_resource_manager 中由 same_qp_ring_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
@@ -2657,7 +1137,7 @@ class rdma_resource_manager extends uvm_object;
         !same_qp_backing_ref_value(lhs.rq_ref, rhs.rq_ref) ||
         !same_qp_backing_ref_value(lhs.sq_pd_ref, rhs.sq_pd_ref) ||
         !same_qp_backing_ref_value(lhs.rq_pd_ref, rhs.rq_pd_ref) ||
-        !same_handle_instance(lhs.rq_source_h, rhs.rq_source_h) ||
+        !rdma_resource_projector::same_handle_instance(lhs.rq_source_h, rhs.rq_source_h) ||
         lhs.urc_refs.size() != rhs.urc_refs.size() ||
         !same_context_value(lhs.context_ref, rhs.context_ref))
       return 1'b0;
@@ -2774,11 +1254,11 @@ class rdma_resource_manager extends uvm_object;
   );
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    return same_handle_instance(lhs.qp_h, rhs.qp_h) &&
-           same_handle_instance(lhs.pd_h, rhs.pd_h) &&
-           same_handle_instance(lhs.send_cq_h, rhs.send_cq_h) &&
-           same_handle_instance(lhs.recv_cq_h, rhs.recv_cq_h) &&
-           same_handle_instance(lhs.srq_h, rhs.srq_h) &&
+    return rdma_resource_projector::same_handle_instance(lhs.qp_h, rhs.qp_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.pd_h, rhs.pd_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.send_cq_h, rhs.send_cq_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.recv_cq_h, rhs.recv_cq_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.srq_h, rhs.srq_h) &&
            lhs.transport == rhs.transport && lhs.state == rhs.state &&
            lhs.host_id == rhs.host_id && lhs.vf_id == rhs.vf_id &&
            lhs.stat_index == rhs.stat_index && lhs.pkey == rhs.pkey &&
@@ -2807,13 +1287,13 @@ class rdma_resource_manager extends uvm_object;
   );
     if (lhs == null || rhs == null)
       return lhs == rhs;
-    return same_handle_instance(lhs.handle, rhs.handle) &&
-           same_handle_instance(lhs.owner, rhs.owner) &&
+    return rdma_resource_projector::same_handle_instance(lhs.handle, rhs.handle) &&
+           rdma_resource_projector::same_handle_instance(lhs.owner, rhs.owner) &&
            lhs.state == rhs.state &&
            lhs.backing_refs.size() == rhs.backing_refs.size() &&
            lhs.hmc_refs.size() == rhs.hmc_refs.size() &&
-           same_dependency_topology(lhs, rhs) &&
-           same_outstanding_ids(lhs, rhs) &&
+           rdma_resource_projector::same_dependency_topology(lhs, rhs) &&
+           rdma_resource_projector::same_outstanding_ids(lhs, rhs) &&
            lhs.hmc_fvm_addr == rhs.hmc_fvm_addr &&
            lhs.hmc_fvm_addr_valid == rhs.hmc_fvm_addr_valid &&
            lhs.local_qp_id == rhs.local_qp_id &&
@@ -2830,405 +1310,12 @@ class rdma_resource_manager extends uvm_object;
            lhs.rq_consumer_wrap == rhs.rq_consumer_wrap &&
            lhs.sq_iova.value == rhs.sq_iova.value &&
            lhs.rq_iova.value == rhs.rq_iova.value &&
-           same_handle_instance(lhs.pd_h, rhs.pd_h) &&
-           same_handle_instance(lhs.send_cq_h, rhs.send_cq_h) &&
-           same_handle_instance(lhs.recv_cq_h, rhs.recv_cq_h) &&
-           same_handle_instance(lhs.srq_h, rhs.srq_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.pd_h, rhs.pd_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.send_cq_h, rhs.send_cq_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.recv_cq_h, rhs.recv_cq_h) &&
+           rdma_resource_projector::same_handle_instance(lhs.srq_h, rhs.srq_h) &&
            same_qp_plan_value(lhs.qp_plan, rhs.qp_plan) &&
            same_qpc_value(lhs.programmed_qpc, rhs.programmed_qpc);
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_qp_recovery_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_qp_recovery_value 读取 source、copy_label、result 并使用字段 result、result.intent、result.ambiguous_operation、result.ambiguous_role、result.role_complete、result.has_pending_hardware_step、result.query_mapping_recovery_only、result.query_presence_known，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_qp_recovery_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_qp_recovery_value(
-    rdma_qp_recovery_state source,
-    string copy_label,
-    output rdma_qp_recovery_state result
-  );
-    rdma_status status;
-
-    result = null;
-    if (source == null)
-      return rdma_status::success();
-    result = new({copy_label, "_qp_recovery"});
-    result.intent = source.intent;
-    result.ambiguous_operation = source.ambiguous_operation;
-    result.ambiguous_role = source.ambiguous_role;
-    result.role_complete = source.role_complete;
-    result.has_pending_hardware_step = source.has_pending_hardware_step;
-    result.query_mapping_recovery_only = source.query_mapping_recovery_only;
-    result.query_presence_known = source.query_presence_known;
-    result.query_presence = source.query_presence;
-    result.error_modify_complete = source.error_modify_complete;
-    result.delete_complete = source.delete_complete;
-    status = project_qpc_value(source.prior_qpc, {copy_label, "_prior"},
-                               result.prior_qpc);
-    if (status.ok())
-      status = project_qpc_value(source.candidate_qpc,
-                                 {copy_label, "_candidate"},
-                                 result.candidate_qpc);
-    if (status.ok())
-      status = project_qp_plan_value(source.qp_plan, {copy_label, "_plan"},
-                                     result.qp_plan);
-    if (status.ok())
-      status = project_queue_context_value(
-        source.context_ref, {copy_label, "_context"}, result.context_ref
-      );
-    if (status.ok() && source.staging_mapping != null)
-      status = clone_owned_mapping_value(
-        source.staging_mapping, {copy_label, "_staging"},
-        result.staging_mapping
-      );
-    if (status.ok() && source.query_mapping != null)
-      status = source.query_mapping_recovery_only ?
-        clone_recovery_mapping_value(
-          source.query_mapping, {copy_label, "_query_recovery"},
-          result.query_mapping
-        ) :
-        clone_owned_mapping_value(
-          source.query_mapping, {copy_label, "_query"}, result.query_mapping
-        );
-    if (status.ok())
-      status = project_opcode_value(source.create_opcode,
-                                    {copy_label, "_create"},
-                                    result.create_opcode);
-    if (status.ok())
-      status = project_opcode_value(source.modify_opcode,
-                                    {copy_label, "_modify"},
-                                    result.modify_opcode);
-    if (status.ok())
-      status = project_opcode_value(source.delete_opcode,
-                                    {copy_label, "_delete"},
-                                    result.delete_opcode);
-    if (status.ok())
-      status = project_opcode_value(source.query_opcode,
-                                    {copy_label, "_query_opcode"},
-                                    result.query_opcode);
-    if (status.ok())
-      status = project_opcode_value(source.occ_opcode,
-                                    {copy_label, "_occ_opcode"},
-                                    result.occ_opcode);
-    if (status.ok())
-      status = project_ticket_value(source.ambiguous_ticket,
-                                    {copy_label, "_ticket"},
-                                    result.ambiguous_ticket);
-    if (!status.ok())
-      result = null;
-    return status;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_queue_fields 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、result（输入）、copy_label（输入）；project_queue_fields 读取 source、result、copy_label 并使用字段 result.depth、result.producer_index、result.consumer_index、result.producer_wrap、result.consumer_wrap、result.queue_iova、status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_queue_fields 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_queue_fields(
-    rdma_queue_resource source,
-    rdma_queue_resource result,
-    string copy_label
-  );
-    rdma_status status;
-
-    result.depth = source.depth;
-    result.producer_index = source.producer_index;
-    result.consumer_index = source.consumer_index;
-    result.producer_wrap = source.producer_wrap;
-    result.consumer_wrap = source.consumer_wrap;
-    result.queue_iova = source.queue_iova;
-    status = project_queue_plan_value(source.queue_plan,
-                                      {copy_label, "_queue_plan"},
-                                      result.queue_plan);
-    return status;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_resource_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_resource_value 读取 source、copy_label、result 并使用字段 result、result_function、result_function.binding、result_pd、result_mr、result_cq、result_qp、result_srq，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_resource_value 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status project_resource_value(
-    rdma_resource source,
-    string copy_label,
-    output rdma_resource result
-  );
-    rdma_function source_function;
-    rdma_function result_function;
-    rdma_pd source_pd;
-    rdma_pd result_pd;
-    rdma_mr source_mr;
-    rdma_mr result_mr;
-    rdma_cq source_cq;
-    rdma_cq result_cq;
-    uvm_object cloned_object;
-    rdma_cqc_model cloned_cqc;
-    rdma_qp source_qp;
-    rdma_qp result_qp;
-    rdma_srq source_srq;
-    rdma_srq result_srq;
-    rdma_cmq source_cmq;
-    rdma_cmq result_cmq;
-    rdma_ceq source_ceq;
-    rdma_ceq result_ceq;
-    rdma_aeq source_aeq;
-    rdma_aeq result_aeq;
-    rdma_status status;
-
-    result = null;
-    if (source == null || source.handle == null ||
-        !valid_kind(source.handle.kind))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        {copy_label, " resource carrier is structurally incompatible"}
-      );
-
-    case (source.handle.kind)
-      RDMA_RESOURCE_FUNCTION: begin
-        if (!$cast(source_function, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " Function carrier does not match handle kind"}
-          );
-        result_function = new({copy_label, "_function"});
-        result_function.binding = null;
-        result = result_function;
-      end
-      RDMA_RESOURCE_PD: begin
-        if (!$cast(source_pd, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " PD carrier does not match handle kind"}
-          );
-        result_pd = new({copy_label, "_pd"});
-        result = result_pd;
-      end
-      RDMA_RESOURCE_MR: begin
-        if (!$cast(source_mr, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " MR carrier does not match handle kind"}
-          );
-        result_mr = new({copy_label, "_mr"});
-        result = result_mr;
-      end
-      RDMA_RESOURCE_CQ: begin
-        if (!$cast(source_cq, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " CQ carrier does not match handle kind"}
-          );
-        result_cq = new({copy_label, "_cq"});
-        result = result_cq;
-      end
-      RDMA_RESOURCE_QP: begin
-        if (!$cast(source_qp, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " QP carrier does not match handle kind"}
-          );
-        result_qp = new({copy_label, "_qp"});
-        result = result_qp;
-      end
-      RDMA_RESOURCE_SRQ: begin
-        if (!$cast(source_srq, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " SRQ carrier does not match handle kind"}
-          );
-        result_srq = new({copy_label, "_srq"});
-        result = result_srq;
-      end
-      RDMA_RESOURCE_CMQ: begin
-        if (!$cast(source_cmq, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " CMQ carrier does not match handle kind"}
-          );
-        result_cmq = new({copy_label, "_cmq"});
-        result = result_cmq;
-      end
-      RDMA_RESOURCE_CEQ: begin
-        if (!$cast(source_ceq, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " CEQ carrier does not match handle kind"}
-          );
-        result_ceq = new({copy_label, "_ceq"});
-        result = result_ceq;
-      end
-      RDMA_RESOURCE_AEQ: begin
-        if (!$cast(source_aeq, source))
-          return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            {copy_label, " AEQ carrier does not match handle kind"}
-          );
-        result_aeq = new({copy_label, "_aeq"});
-        result = result_aeq;
-      end
-      default:
-        return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          {copy_label, " resource kind is invalid"}
-        );
-    endcase
-
-    status = project_resource_base_fields(source, copy_label, result);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-
-    case (source.handle.kind)
-      RDMA_RESOURCE_FUNCTION: begin
-        result_function.local_function_id = source_function.local_function_id;
-        result_function.global_function_id =
-          source_function.global_function_id;
-        result_function.rdma_vf_id = source_function.rdma_vf_id;
-        result_function.vsi_id = source_function.vsi_id;
-        result_function.pfvf_id = source_function.pfvf_id;
-        status = project_binding_value(
-          source_function.binding, {copy_label, "_binding"},
-          result_function.binding
-        );
-      end
-      RDMA_RESOURCE_PD: begin
-        result_pd.local_pd_id = source_pd.local_pd_id;
-        result_pd.global_pd_id = source_pd.global_pd_id;
-      end
-      RDMA_RESOURCE_MR: begin
-        result_mr.local_mr_id = source_mr.local_mr_id;
-        result_mr.global_mr_id = source_mr.global_mr_id;
-        status = project_handle_value(
-          source_mr.pd_h, {copy_label, "_pd"}, result_mr.pd_h
-        );
-        result_mr.iova = source_mr.iova;
-        result_mr.length = source_mr.length;
-        result_mr.lkey = source_mr.lkey;
-        result_mr.rkey = source_mr.rkey;
-        result_mr.access = source_mr.access;
-        result_mr.mr_serial = source_mr.mr_serial;
-      end
-      RDMA_RESOURCE_CQ: begin
-        status = project_queue_fields(source_cq, result_cq, copy_label);
-        result_cq.local_cq_id = source_cq.local_cq_id;
-        result_cq.global_cq_id = source_cq.global_cq_id;
-        result_cq.cqe_size_bytes = source_cq.cqe_size_bytes;
-        if (status.ok())
-          status = project_handle_value(
-            source_cq.ceq_h, {copy_label, "_ceq"}, result_cq.ceq_h
-          );
-        if (status.ok() && source_cq.programmed_cqc != null) begin
-          cloned_object = source_cq.programmed_cqc.clone();
-          if (cloned_object == null || !$cast(cloned_cqc, cloned_object) ||
-              cloned_cqc == source_cq.programmed_cqc) begin
-            status = rdma_status::make(
-              RDMA_SC_INVALID_STATE,
-              {copy_label, " programmed CQC clone failed"}
-            );
-          end
-          else begin
-            result_cq.programmed_cqc = cloned_cqc;
-          end
-        end
-      end
-      RDMA_RESOURCE_QP: begin
-        result_qp.local_qp_id = source_qp.local_qp_id;
-        result_qp.global_qp_id = source_qp.global_qp_id;
-        result_qp.transport = source_qp.transport;
-        result_qp.qp_state = source_qp.qp_state;
-        result_qp.sq_depth = source_qp.sq_depth;
-        result_qp.rq_depth = source_qp.rq_depth;
-        result_qp.sq_producer_index = source_qp.sq_producer_index;
-        result_qp.sq_consumer_index = source_qp.sq_consumer_index;
-        result_qp.sq_wrap = source_qp.sq_wrap;
-        result_qp.sq_consumer_wrap = source_qp.sq_consumer_wrap;
-        result_qp.rq_producer_index = source_qp.rq_producer_index;
-        result_qp.rq_consumer_index = source_qp.rq_consumer_index;
-        result_qp.rq_wrap = source_qp.rq_wrap;
-        result_qp.rq_consumer_wrap = source_qp.rq_consumer_wrap;
-        result_qp.sq_iova = source_qp.sq_iova;
-        result_qp.rq_iova = source_qp.rq_iova;
-        status = project_handle_value(
-          source_qp.pd_h, {copy_label, "_pd"}, result_qp.pd_h
-        );
-        if (status.ok())
-          status = project_handle_value(
-            source_qp.send_cq_h, {copy_label, "_send_cq"},
-            result_qp.send_cq_h
-          );
-        if (status.ok())
-          status = project_handle_value(
-            source_qp.recv_cq_h, {copy_label, "_recv_cq"},
-            result_qp.recv_cq_h
-          );
-        if (status.ok())
-          status = project_handle_value(
-            source_qp.srq_h, {copy_label, "_srq"}, result_qp.srq_h
-          );
-        if (status.ok())
-          status = project_qp_plan_value(
-            source_qp.qp_plan, {copy_label, "_qp_plan"}, result_qp.qp_plan
-          );
-        if (status.ok())
-          status = project_qpc_value(
-            source_qp.programmed_qpc, {copy_label, "_programmed_qpc"},
-            result_qp.programmed_qpc
-          );
-      end
-      RDMA_RESOURCE_SRQ: begin
-        status = project_queue_fields(source_srq, result_srq, copy_label);
-        result_srq.local_srq_id = source_srq.local_srq_id;
-        result_srq.global_srq_id = source_srq.global_srq_id;
-        result_srq.max_sge = source_srq.max_sge;
-        result_srq.limit_threshold = source_srq.limit_threshold;
-        if (status.ok())
-          status = project_handle_value(
-            source_srq.pd_h, {copy_label, "_pd"}, result_srq.pd_h
-          );
-      end
-      RDMA_RESOURCE_CMQ: begin
-        status = project_queue_fields(source_cmq, result_cmq, copy_label);
-        result_cmq.local_cmq_id = source_cmq.local_cmq_id;
-        result_cmq.global_cmq_id = source_cmq.global_cmq_id;
-        result_cmq.completion_producer_index =
-          source_cmq.completion_producer_index;
-        result_cmq.completion_consumer_index =
-          source_cmq.completion_consumer_index;
-        result_cmq.completion_wrap = source_cmq.completion_wrap;
-        result_cmq.completion_consumer_wrap =
-          source_cmq.completion_consumer_wrap;
-        result_cmq.completion_iova = source_cmq.completion_iova;
-      end
-      RDMA_RESOURCE_CEQ: begin
-        status = project_queue_fields(source_ceq, result_ceq, copy_label);
-        result_ceq.local_ceq_id = source_ceq.local_ceq_id;
-        result_ceq.global_ceq_id = source_ceq.global_ceq_id;
-        result_ceq.function_local_vector = source_ceq.function_local_vector;
-        result_ceq.hardware_vector = source_ceq.hardware_vector;
-        result_ceq.msix_table_index = source_ceq.msix_table_index;
-      end
-      RDMA_RESOURCE_AEQ: begin
-        status = project_queue_fields(source_aeq, result_aeq, copy_label);
-        result_aeq.local_aeq_id = source_aeq.local_aeq_id;
-        result_aeq.global_aeq_id = source_aeq.global_aeq_id;
-        result_aeq.function_local_vector = source_aeq.function_local_vector;
-        result_aeq.hardware_vector = source_aeq.hardware_vector;
-        result_aeq.msix_table_index = source_aeq.msix_table_index;
-      end
-      default: begin
-        status = rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          {copy_label, " resource kind changed during projection"}
-        );
-      end
-    endcase
-
-    if (status == null || !status.ok()) begin
-      result = null;
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          {copy_label, " projection returned null status"}
-        );
-      return status;
-    end
-    return rdma_status::success();
   endfunction
 
   // 功能：registry_schema_status 先为 registry 的每一项建立 detached schema 投影，再
@@ -3250,7 +1337,7 @@ class rdma_resource_manager extends uvm_object;
     epoch_snapshot = publication_epoch;
     foreach (registry[key]) begin
       source_registry[key] = registry[key];
-      status = project_resource_value(
+      status = rdma_resource_projector::project_resource_value(
         registry[key], {operation, "_registry_entry"}, projected
       );
       if (!status.ok())
@@ -3305,7 +1392,7 @@ class rdma_resource_manager extends uvm_object;
     epoch_snapshot = publication_epoch;
     foreach (recovery_records[key]) begin
       source_records[key] = recovery_records[key];
-      status = project_recovery_value(
+      status = rdma_resource_projector::project_recovery_value(
         recovery_records[key], {operation, "_recovery_entry"}, projected
       );
       if (!status.ok())
@@ -3369,7 +1456,7 @@ class rdma_resource_manager extends uvm_object;
         {operation, " recovery entry is null"}
       );
     epoch_snapshot = publication_epoch;
-    status = project_recovery_value(
+    status = rdma_resource_projector::project_recovery_value(
       source_record, {operation, "_recovery_entry"}, projected
     );
     if (!status.ok())
@@ -3444,7 +1531,7 @@ class rdma_resource_manager extends uvm_object;
       return status;
     if (!registry.exists(key) || registry[key] == null ||
         registry[key].handle == null ||
-        !same_handle_instance(registry[key].handle, replacement.handle))
+        !rdma_resource_projector::same_handle_instance(registry[key].handle, replacement.handle))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         {operation, " registry replacement authority changed"}
@@ -3477,307 +1564,6 @@ class rdma_resource_manager extends uvm_object;
     advance_publication_epoch();
     mutation_guard.put(1);
     return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中由 same_outstanding_ids 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_outstanding_ids 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
-  protected function bit same_outstanding_ids(
-    rdma_resource lhs,
-    rdma_resource rhs
-  );
-    if (lhs == null || rhs == null ||
-        lhs.outstanding_ids.size() != rhs.outstanding_ids.size())
-      return 1'b0;
-    foreach (lhs.outstanding_ids[i]) begin
-      if (lhs.outstanding_ids[i] != rhs.outstanding_ids[i])
-        return 1'b0;
-    end
-    return 1'b1;
-  endfunction
-
-  // 功能：same_handle_instance 是 resource manager 内部 canonical handle identity
-  //       比较器，按四个公开身份字段判断两个 handle 是否表示同一值。
-  // 输入/输出及副作用：lhs、rhs（输入）是非拥有 handle 引用；只读取 kind、
-  //       function_uid、object_id、generation，返回 bit，不修改 handle、registry、
-  //       runtime 或外部 adapter，也不取得任何资源所有权。
-  // 失败/边界：lhs 与 rhs 同为 null 返回 1；仅一侧为 null 返回 0；两侧非空时
-  //       四个字段任一 `==` 不等返回 0。函数不执行 $isunknown，不验证
-  //       authority/alias 或 generation 新鲜度；状态、路由和生命周期门禁由
-  //       caller 负责。
-  protected function bit same_handle_instance(rdma_handle lhs,
-                                               rdma_handle rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    return lhs.kind == rhs.kind &&
-           lhs.function_uid == rhs.function_uid &&
-           lhs.object_id == rhs.object_id &&
-           lhs.generation == rhs.generation;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中由 same_handle_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_handle_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
-  protected function bit same_handle_value(rdma_handle lhs,
-                                            rdma_handle rhs);
-    return same_handle_instance(lhs, rhs);
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中由 same_dependency_topology 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_dependency_topology 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
-  protected function bit same_dependency_topology(rdma_resource lhs,
-                                                  rdma_resource rhs);
-    if (lhs == null || rhs == null ||
-        lhs.dependencies.size() != rhs.dependencies.size())
-      return 1'b0;
-    foreach (lhs.dependencies[i]) begin
-      if (!same_handle_instance(lhs.dependencies[i], rhs.dependencies[i]))
-        return 1'b0;
-    end
-    return 1'b1;
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中由 same_binding_identity 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_binding_identity 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
-  protected function bit same_binding_identity(rdma_function_binding lhs,
-                                               rdma_function_binding rhs);
-    if (lhs == null || rhs == null)
-      return lhs == rhs;
-    if (lhs.function_uid != rhs.function_uid ||
-        lhs.notify_bar_id != rhs.notify_bar_id ||
-        lhs.notify_base != rhs.notify_base ||
-        lhs.notify_size != rhs.notify_size ||
-        lhs.notify_table_sel != rhs.notify_table_sel ||
-        lhs.notify_table_index != rhs.notify_table_index ||
-        lhs.host_id != rhs.host_id || lhs.pfvf_id != rhs.pfvf_id ||
-        lhs.rdma_vf_id != rhs.rdma_vf_id ||
-        lhs.global_function_id != rhs.global_function_id ||
-        lhs.vsi_id != rhs.vsi_id ||
-        lhs.state != rhs.state || lhs.generation != rhs.generation ||
-        lhs.notify_valid != rhs.notify_valid ||
-        lhs.notify_ready != rhs.notify_ready ||
-        lhs.dmi_valid != rhs.dmi_valid || lhs.dmi_ready != rhs.dmi_ready ||
-        lhs.vft_valid != rhs.vft_valid || lhs.vft_ready != rhs.vft_ready ||
-        !same_handle_value(lhs.owner_h, rhs.owner_h))
-      return 1'b0;
-    if (lhs.queue_dma.requester_bdf != rhs.queue_dma.requester_bdf ||
-        lhs.queue_dma.pasid_valid != rhs.queue_dma.pasid_valid ||
-        lhs.queue_dma.pasid != rhs.queue_dma.pasid ||
-        lhs.queue_dma.dma_domain_valid != rhs.queue_dma.dma_domain_valid ||
-        lhs.queue_dma.dma_domain_id != rhs.queue_dma.dma_domain_id)
-      return 1'b0;
-    if (lhs.queue_caps.min_cq_depth != rhs.queue_caps.min_cq_depth ||
-        lhs.queue_caps.max_cq_depth != rhs.queue_caps.max_cq_depth ||
-        lhs.queue_caps.min_srq_depth != rhs.queue_caps.min_srq_depth ||
-        lhs.queue_caps.max_srq_depth != rhs.queue_caps.max_srq_depth ||
-        lhs.queue_caps.max_ceq_depth != rhs.queue_caps.max_ceq_depth ||
-        lhs.queue_caps.max_aeq_depth != rhs.queue_caps.max_aeq_depth ||
-        lhs.queue_caps.max_wq_sge != rhs.queue_caps.max_wq_sge ||
-        lhs.queue_caps.max_queue_ring_bytes !=
-          rhs.queue_caps.max_queue_ring_bytes ||
-        lhs.queue_caps.max_sgb_bytes != rhs.queue_caps.max_sgb_bytes)
-      return 1'b0;
-    if (lhs.interrupt_vectors.size() != rhs.interrupt_vectors.size())
-      return 1'b0;
-    foreach (lhs.interrupt_vectors[i]) begin
-      if (lhs.interrupt_vectors[i].function_local_vector !=
-            rhs.interrupt_vectors[i].function_local_vector ||
-          lhs.interrupt_vectors[i].hardware_eq_vector !=
-            rhs.interrupt_vectors[i].hardware_eq_vector ||
-          lhs.interrupt_vectors[i].msix_table_index !=
-            rhs.interrupt_vectors[i].msix_table_index ||
-          lhs.interrupt_vectors[i].enabled !=
-            rhs.interrupt_vectors[i].enabled)
-        return 1'b0;
-    end
-    if (lhs.pcie == null || rhs.pcie == null)
-      return lhs.pcie == rhs.pcie;
-    if (lhs.pcie.bdf != rhs.pcie.bdf ||
-        lhs.pcie.parent_pf_bdf != rhs.pcie.parent_pf_bdf ||
-        lhs.pcie.vf_index != rhs.pcie.vf_index ||
-        lhs.pcie.mse != rhs.pcie.mse || lhs.pcie.bme != rhs.pcie.bme)
-      return 1'b0;
-    foreach (lhs.pcie.bar[i]) begin
-      if (lhs.pcie.bar[i] == null || rhs.pcie.bar[i] == null) begin
-        if (lhs.pcie.bar[i] != rhs.pcie.bar[i])
-          return 1'b0;
-      end
-      else if (lhs.pcie.bar[i].bar_id != rhs.pcie.bar[i].bar_id ||
-               lhs.pcie.bar[i].base != rhs.pcie.bar[i].base ||
-               lhs.pcie.bar[i].size != rhs.pcie.bar[i].size ||
-               lhs.pcie.bar[i].enabled != rhs.pcie.bar[i].enabled)
-        return 1'b0;
-    end
-    return 1'b1;
-  endfunction
-
-  // 功能：publication_identity_status 校验 candidate、authoritative 与当前对象状态的一致性，并显式处理“published resource identity or topology changed”；“published resource manager-owned fields changed”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：candidate（输入）、authoritative（输入）；publication_identity_status 读取 candidate、authoritative 并使用字段 fields_match；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：publication_identity_status 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “published resource identity or topology changed”；“published resource manager-owned fields changed”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
-  protected function rdma_status publication_identity_status(
-    rdma_resource candidate,
-    rdma_resource authoritative
-  );
-    rdma_function candidate_function;
-    rdma_function authoritative_function;
-    rdma_pd candidate_pd;
-    rdma_pd authoritative_pd;
-    rdma_mr candidate_mr;
-    rdma_mr authoritative_mr;
-    rdma_cq candidate_cq;
-    rdma_cq authoritative_cq;
-    rdma_qp candidate_qp;
-    rdma_qp authoritative_qp;
-    rdma_srq candidate_srq;
-    rdma_srq authoritative_srq;
-    rdma_cmq candidate_cmq;
-    rdma_cmq authoritative_cmq;
-    rdma_ceq candidate_ceq;
-    rdma_ceq authoritative_ceq;
-    rdma_aeq candidate_aeq;
-    rdma_aeq authoritative_aeq;
-    bit fields_match;
-
-    if (candidate == null || authoritative == null ||
-        candidate.handle == null || authoritative.handle == null ||
-        candidate.handle.kind != authoritative.handle.kind ||
-        !same_handle_instance(candidate.handle, authoritative.handle) ||
-        !same_handle_instance(candidate.owner, authoritative.owner) ||
-        !same_dependency_topology(candidate, authoritative) ||
-        !same_outstanding_ids(candidate, authoritative))
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "published resource identity or topology changed"
-      );
-
-    fields_match = 1'b0;
-    case (authoritative.handle.kind)
-      RDMA_RESOURCE_FUNCTION: begin
-        if ($cast(candidate_function, candidate) &&
-            $cast(authoritative_function, authoritative))
-          fields_match = candidate_function.local_function_id ==
-                      authoritative_function.local_function_id &&
-                    candidate_function.global_function_id ==
-                      authoritative_function.global_function_id &&
-                    candidate_function.rdma_vf_id ==
-                      authoritative_function.rdma_vf_id &&
-                    candidate_function.vsi_id == authoritative_function.vsi_id &&
-                    candidate_function.pfvf_id ==
-                      authoritative_function.pfvf_id &&
-                    same_binding_identity(candidate_function.binding,
-                                          authoritative_function.binding);
-      end
-      RDMA_RESOURCE_PD: begin
-        if ($cast(candidate_pd, candidate) &&
-            $cast(authoritative_pd, authoritative))
-          fields_match = candidate_pd.local_pd_id == authoritative_pd.local_pd_id &&
-                    candidate_pd.global_pd_id == authoritative_pd.global_pd_id;
-      end
-      RDMA_RESOURCE_MR: begin
-        if ($cast(candidate_mr, candidate) &&
-            $cast(authoritative_mr, authoritative))
-          fields_match = candidate_mr.local_mr_id == authoritative_mr.local_mr_id &&
-                    candidate_mr.global_mr_id == authoritative_mr.global_mr_id &&
-                    same_handle_instance(candidate_mr.pd_h,
-                                         authoritative_mr.pd_h);
-      end
-      RDMA_RESOURCE_CQ: begin
-        if ($cast(candidate_cq, candidate) &&
-            $cast(authoritative_cq, authoritative))
-          fields_match = candidate_cq.local_cq_id == authoritative_cq.local_cq_id &&
-                    candidate_cq.global_cq_id == authoritative_cq.global_cq_id &&
-                    same_handle_instance(candidate_cq.ceq_h,
-                                         authoritative_cq.ceq_h);
-      end
-      RDMA_RESOURCE_QP: begin
-        if ($cast(candidate_qp, candidate) &&
-            $cast(authoritative_qp, authoritative))
-          fields_match = candidate_qp.local_qp_id == authoritative_qp.local_qp_id &&
-                    candidate_qp.global_qp_id == authoritative_qp.global_qp_id &&
-                    same_handle_instance(candidate_qp.pd_h,
-                                         authoritative_qp.pd_h) &&
-                    same_handle_instance(candidate_qp.send_cq_h,
-                                         authoritative_qp.send_cq_h) &&
-                    same_handle_instance(candidate_qp.recv_cq_h,
-                                         authoritative_qp.recv_cq_h) &&
-                    same_handle_instance(candidate_qp.srq_h,
-                                         authoritative_qp.srq_h);
-      end
-      RDMA_RESOURCE_SRQ: begin
-        if ($cast(candidate_srq, candidate) &&
-            $cast(authoritative_srq, authoritative))
-          fields_match = candidate_srq.local_srq_id ==
-                      authoritative_srq.local_srq_id &&
-                    candidate_srq.global_srq_id ==
-                      authoritative_srq.global_srq_id &&
-                    same_handle_instance(candidate_srq.pd_h,
-                                         authoritative_srq.pd_h);
-      end
-      RDMA_RESOURCE_CMQ: begin
-        if ($cast(candidate_cmq, candidate) &&
-            $cast(authoritative_cmq, authoritative))
-          fields_match = candidate_cmq.local_cmq_id ==
-                      authoritative_cmq.local_cmq_id &&
-                    candidate_cmq.global_cmq_id ==
-                      authoritative_cmq.global_cmq_id;
-      end
-      RDMA_RESOURCE_CEQ: begin
-        if ($cast(candidate_ceq, candidate) &&
-            $cast(authoritative_ceq, authoritative))
-          fields_match = candidate_ceq.local_ceq_id ==
-                      authoritative_ceq.local_ceq_id &&
-                    candidate_ceq.global_ceq_id ==
-                      authoritative_ceq.global_ceq_id;
-      end
-      RDMA_RESOURCE_AEQ: begin
-        if ($cast(candidate_aeq, candidate) &&
-            $cast(authoritative_aeq, authoritative))
-          fields_match = candidate_aeq.local_aeq_id ==
-                      authoritative_aeq.local_aeq_id &&
-                    candidate_aeq.global_aeq_id ==
-                      authoritative_aeq.global_aeq_id;
-      end
-    endcase
-    if (!fields_match)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "published resource manager-owned fields changed"
-      );
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_public_resource_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_public_resource_value 读取 source、copy_label、result 并使用字段 status、result，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_public_resource_value 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
-  protected function rdma_status project_public_resource_value(
-    rdma_resource source,
-    string copy_label,
-    output rdma_resource result
-  );
-    rdma_status status;
-
-    status = project_resource_value(source, copy_label, result);
-    if (!status.ok())
-      return status;
-    status = publication_identity_status(result, source);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_resource_manager 中，project_public_recovery_value 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）、copy_label（输入）、result（输出）；project_public_recovery_value 读取 source、copy_label、result 并使用输入参数和固定枚举/常量，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：project_public_recovery_value 的结果直接由 return project_recovery_value(source, copy_label, result) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-  protected function rdma_status project_public_recovery_value(
-    rdma_recovery_record source,
-    string copy_label,
-    output rdma_recovery_record result
-  );
-    return project_recovery_value(source, copy_label, result);
   endfunction
 
   // 功能：recovery_ready 比较 recovery 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
@@ -3881,7 +1667,7 @@ class rdma_resource_manager extends uvm_object;
     if (binding == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "function binding is null");
-    status = project_binding_value(binding, "binding input",
+    status = rdma_resource_projector::project_binding_value(binding, "binding input",
                                    projected_binding);
     if (!status.ok())
       return status;
@@ -3917,7 +1703,7 @@ class rdma_resource_manager extends uvm_object;
       registration_needed = 1'b1;
     end
     else begin
-      status = project_binding_value(binding_snapshots[key],
+      status = rdma_resource_projector::project_binding_value(binding_snapshots[key],
                                    "trusted binding", trusted_binding);
       if (!status.ok())
         return status;
@@ -4004,7 +1790,7 @@ class rdma_resource_manager extends uvm_object;
     prior_serial = '0;
     reservation_epoch = '0;
     if (registration_needed) begin
-      status = project_binding_value(trusted_binding, "binding registry", binding_copy);
+      status = rdma_resource_projector::project_binding_value(trusted_binding, "binding registry", binding_copy);
       if (!status.ok())
         return status;
     end
@@ -4434,7 +2220,7 @@ class rdma_resource_manager extends uvm_object;
       candidate = null;
       return status;
     end
-    status = project_function_handle_value(
+    status = rdma_resource_projector::project_function_handle_value(
       candidate.owner, "Function identity handle", candidate.handle
     );
     if (!status.ok()) begin
@@ -4578,7 +2364,7 @@ class rdma_resource_manager extends uvm_object;
     // projection 可能触发外部 clone/factory 或 completion 查询；先锁存
     // manager epoch，返回后再确认这些非拥有调用没有重入修改 registry/allocator。
     candidate.manager_epoch = publication_epoch;
-    status = project_resource_value(
+    status = rdma_resource_projector::project_resource_value(
       resource, {copy_label, " registry"}, candidate.registry_copy
     );
     if (status == null || !status.ok()) begin
@@ -4589,7 +2375,7 @@ class rdma_resource_manager extends uvm_object;
         {copy_label, " registry projection returned null status"}
       ) : status;
     end
-    status = project_resource_value(
+    status = rdma_resource_projector::project_resource_value(
       candidate.registry_copy, copy_label, candidate.published
     );
     if (status == null || !status.ok()) begin
@@ -4600,7 +2386,7 @@ class rdma_resource_manager extends uvm_object;
         {copy_label, " published projection returned null status"}
       ) : status;
     end
-    status = project_function_handle_value(
+    status = rdma_resource_projector::project_function_handle_value(
       resource.owner, "resource_incarnation_owner", candidate.owner_copy
     );
     if (status == null || !status.ok()) begin
@@ -4611,7 +2397,7 @@ class rdma_resource_manager extends uvm_object;
         {copy_label, " owner projection returned null status"}
       ) : status;
     end
-    status = project_handle_value(
+    status = rdma_resource_projector::project_handle_value(
       resource.handle, "resource_incarnation", candidate.handle_copy
     );
     if (status == null || !status.ok()) begin
@@ -4792,7 +2578,7 @@ class rdma_resource_manager extends uvm_object;
         "closing or failed dependency cannot admit new resources"
       );
     if (dependency_resource.owner == null ||
-        !same_handle_instance(dependency_resource.owner, owner))
+        !rdma_resource_projector::same_handle_instance(dependency_resource.owner, owner))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "resource dependency has another owner");
     return rdma_status::success();
@@ -4874,7 +2660,7 @@ class rdma_resource_manager extends uvm_object;
       return 1'b0;
     foreach (candidate.dependencies[i]) begin
       if (candidate.dependencies[i] != null &&
-          same_handle_instance(candidate.dependencies[i], dependency))
+          rdma_resource_projector::same_handle_instance(candidate.dependencies[i], dependency))
         return 1'b1;
     end
     return 1'b0;
@@ -4891,7 +2677,7 @@ class rdma_resource_manager extends uvm_object;
         return 1'b1;
       if (resource.handle.kind == RDMA_RESOURCE_FUNCTION &&
           registry[key].owner != null &&
-          same_handle_instance(registry[key].owner, resource.handle))
+          rdma_resource_projector::same_handle_instance(registry[key].owner, resource.handle))
         return 1'b1;
     end
     return 1'b0;
@@ -4927,7 +2713,7 @@ class rdma_resource_manager extends uvm_object;
       if (resource.handle != null &&
           resource.handle.kind == RDMA_RESOURCE_FUNCTION &&
           registry[key].owner != null &&
-          same_handle_instance(registry[key].owner, resource.handle))
+          rdma_resource_projector::same_handle_instance(registry[key].owner, resource.handle))
         is_dependent = 1'b1;
       if (is_dependent)
         snapshot.dependent_count++;
@@ -5098,7 +2884,7 @@ class rdma_resource_manager extends uvm_object;
       return status;
     authoritative = new("function_resource");
     authoritative.handle = identity.handle;
-    status = project_function_handle_value(identity.owner, "Function owner",
+    status = rdma_resource_projector::project_function_handle_value(identity.owner, "Function owner",
                                            authoritative.owner);
     if (!status.ok()) begin
       rollback_function_identity_candidate(identity);
@@ -5113,7 +2899,7 @@ class rdma_resource_manager extends uvm_object;
     // rdma_function::new creates its default binding through the factory.
     // Replace it explicitly before any manager clone or validation dispatch.
     authoritative.binding = null;
-    status = project_binding_value(identity.trusted_binding, "Function resource",
+    status = rdma_resource_projector::project_binding_value(identity.trusted_binding, "Function resource",
                                    authoritative.binding);
     if (!status.ok()) begin
       rollback_function_identity_candidate(identity);
@@ -5200,9 +2986,9 @@ class rdma_resource_manager extends uvm_object;
     // 将低 8 位 key 置零，使未 staged 的非零 ID MR 也能发布本地 ERROR cleanup。
     // 该值不是可用 MPT key：ALLOCATED/ERROR 均不能承载数据面访问，stage 仍须提供正式 key。
     authoritative.lkey = {identity.local_id[23:0], 8'h00};
-    status = project_handle_value(pd_h, "MR PD", authoritative.pd_h);
+    status = rdma_resource_projector::project_handle_value(pd_h, "MR PD", authoritative.pd_h);
     if (status.ok())
-      status = project_handle_value(pd_h, "MR dependency", dependency_copy);
+      status = rdma_resource_projector::project_handle_value(pd_h, "MR dependency", dependency_copy);
     if (!status.ok()) begin
       rollback_identity_candidate(identity);
       return status;
@@ -5249,9 +3035,9 @@ class rdma_resource_manager extends uvm_object;
     authoritative.local_cq_id = identity.local_id;
     authoritative.global_cq_id = identity.handle.object_id;
     if (ceq_h != null) begin
-      status = project_handle_value(ceq_h, "CQ CEQ", authoritative.ceq_h);
+      status = rdma_resource_projector::project_handle_value(ceq_h, "CQ CEQ", authoritative.ceq_h);
       if (status.ok())
-        status = project_handle_value(ceq_h, "CQ dependency",
+        status = rdma_resource_projector::project_handle_value(ceq_h, "CQ dependency",
                                    dependency_copy);
       if (!status.ok()) begin
         rollback_identity_candidate(identity);
@@ -5313,23 +3099,23 @@ class rdma_resource_manager extends uvm_object;
     authoritative.state = RDMA_RESOURCE_ALLOCATED;
     authoritative.local_qp_id = identity.local_id;
     authoritative.global_qp_id = identity.handle.object_id;
-    status = project_handle_value(pd_h, "QP PD", authoritative.pd_h);
+    status = rdma_resource_projector::project_handle_value(pd_h, "QP PD", authoritative.pd_h);
     if (status.ok())
-      status = project_handle_value(send_cq_h, "QP send CQ",
+      status = rdma_resource_projector::project_handle_value(send_cq_h, "QP send CQ",
                                  authoritative.send_cq_h);
     if (status.ok())
-      status = project_handle_value(recv_cq_h, "QP receive CQ",
+      status = rdma_resource_projector::project_handle_value(recv_cq_h, "QP receive CQ",
                                  authoritative.recv_cq_h);
     if (status.ok())
-      status = project_handle_value(pd_h, "QP PD dependency", dependency_copy);
+      status = rdma_resource_projector::project_handle_value(pd_h, "QP PD dependency", dependency_copy);
     if (status.ok()) begin
       authoritative.dependencies.push_back(dependency_copy);
-      status = project_handle_value(send_cq_h, "QP send CQ dependency",
+      status = rdma_resource_projector::project_handle_value(send_cq_h, "QP send CQ dependency",
                                  dependency_copy);
     end
     if (status.ok()) begin
       authoritative.dependencies.push_back(dependency_copy);
-      status = project_handle_value(recv_cq_h, "QP receive CQ dependency",
+      status = rdma_resource_projector::project_handle_value(recv_cq_h, "QP receive CQ dependency",
                                  dependency_copy);
     end
     if (status.ok())
@@ -5339,9 +3125,9 @@ class rdma_resource_manager extends uvm_object;
       return status;
     end
     if (srq_h != null) begin
-      status = project_handle_value(srq_h, "QP SRQ", authoritative.srq_h);
+      status = rdma_resource_projector::project_handle_value(srq_h, "QP SRQ", authoritative.srq_h);
       if (status.ok())
-        status = project_handle_value(srq_h, "QP SRQ dependency",
+        status = rdma_resource_projector::project_handle_value(srq_h, "QP SRQ dependency",
                                    dependency_copy);
       if (!status.ok()) begin
         rollback_identity_candidate(identity);
@@ -5376,7 +3162,7 @@ class rdma_resource_manager extends uvm_object;
     string key;
 
     sequence_value = '0;
-    status = project_function_handle_value(owner, "QP sequence owner",
+    status = rdma_resource_projector::project_function_handle_value(owner, "QP sequence owner",
                                            trusted_owner);
     if (!status.ok())
       return status;
@@ -5427,9 +3213,9 @@ class rdma_resource_manager extends uvm_object;
     authoritative.state = RDMA_RESOURCE_ALLOCATED;
     authoritative.local_srq_id = identity.local_id;
     authoritative.global_srq_id = identity.handle.object_id;
-    status = project_handle_value(pd_h, "SRQ PD", authoritative.pd_h);
+    status = rdma_resource_projector::project_handle_value(pd_h, "SRQ PD", authoritative.pd_h);
     if (status.ok())
-      status = project_handle_value(pd_h, "SRQ dependency", dependency_copy);
+      status = rdma_resource_projector::project_handle_value(pd_h, "SRQ dependency", dependency_copy);
     if (!status.ok()) begin
       rollback_identity_candidate(identity);
       return status;
@@ -5558,7 +3344,7 @@ class rdma_resource_manager extends uvm_object;
     longint unsigned epoch_snapshot;
 
     resource = null;
-    status = project_handle_value(handle, "lookup", trusted_handle);
+    status = rdma_resource_projector::project_handle_value(handle, "lookup", trusted_handle);
     if (!status.ok())
       return status;
     if (trusted_handle == null)
@@ -5576,18 +3362,18 @@ class rdma_resource_manager extends uvm_object;
     if (registry.exists(key)) begin
       source_resource = registry[key];
       epoch_snapshot = publication_epoch;
-      status = project_resource_value(source_resource, "lookup registry entry",
+      status = rdma_resource_projector::project_resource_value(source_resource, "lookup registry entry",
                                       authoritative);
       if (!status.ok())
         return status;
       if (authoritative.handle == null ||
-          !same_handle_instance(authoritative.handle, trusted_handle))
+          !rdma_resource_projector::same_handle_instance(authoritative.handle, trusted_handle))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "registry identity is inconsistent");
       status = owner_binding_status(authoritative.owner);
       if (!status.ok())
         return status;
-      status = project_resource_value(authoritative, "lookup", detached);
+      status = rdma_resource_projector::project_resource_value(authoritative, "lookup", detached);
       if (!status.ok())
         return status;
       if (epoch_snapshot != publication_epoch || !registry.exists(key) ||
@@ -5710,7 +3496,7 @@ class rdma_resource_manager extends uvm_object;
 
     resource = null;
 
-    status = project_function_handle_value(
+    status = rdma_resource_projector::project_function_handle_value(
       owner, "lookup local resource owner", trusted_owner
     );
     if (status == null || !status.ok() || trusted_owner == null)
@@ -5749,7 +3535,7 @@ class rdma_resource_manager extends uvm_object;
       );
 
     if (found_live) begin
-      status = project_resource_value(
+      status = rdma_resource_projector::project_resource_value(
         live_candidate, "lookup local resource", projected
       );
       if (status == null || !status.ok() || projected == null)
@@ -5793,7 +3579,7 @@ class rdma_resource_manager extends uvm_object;
     string key;
 
     epoch_snapshot = publication_epoch;
-    status = project_public_resource_value(candidate, "stage allocated",
+    status = rdma_resource_projector::project_public_resource_value(candidate, "stage allocated",
                                            replacement);
     if (!status.ok())
       return status;
@@ -5813,11 +3599,11 @@ class rdma_resource_manager extends uvm_object;
     if (registry[key].state != RDMA_RESOURCE_ALLOCATED)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "registry resource is not ALLOCATED");
-    status = publication_identity_status(replacement, authoritative);
+    status = rdma_resource_projector::publication_identity_status(replacement, authoritative);
     if (!status.ok())
       return status;
     if (replacement.handle.kind != RDMA_RESOURCE_PD) begin
-      status = project_public_resource_value(replacement, "stage prepared",
+      status = rdma_resource_projector::project_public_resource_value(replacement, "stage prepared",
                                            prepared);
       if (!status.ok())
         return status;
@@ -5876,7 +3662,7 @@ class rdma_resource_manager extends uvm_object;
         "CQ programming requires an ALLOCATED candidate with CQC"
       );
 
-    status = project_public_resource_value(
+    status = rdma_resource_projector::project_public_resource_value(
       candidate, "attach CQ programming", projected
     );
     if (!status.ok() || !$cast(replacement, projected))
@@ -5930,7 +3716,7 @@ class rdma_resource_manager extends uvm_object;
         "CQ programming target already has a CQC"
       );
 
-    status = publication_identity_status(replacement, authoritative);
+    status = rdma_resource_projector::publication_identity_status(replacement, authoritative);
     if (!status.ok())
       return status;
     status = replacement.validate();
@@ -5959,7 +3745,7 @@ class rdma_resource_manager extends uvm_object;
     string key;
 
     epoch_snapshot = publication_epoch;
-    status = project_public_resource_value(candidate, "commit programmed",
+    status = rdma_resource_projector::project_public_resource_value(candidate, "commit programmed",
                                            replacement);
     if (!status.ok())
       return status;
@@ -5987,7 +3773,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "only a staged ALLOCATED resource can be programmed"
       );
-    status = publication_identity_status(replacement, authoritative);
+    status = rdma_resource_projector::publication_identity_status(replacement, authoritative);
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_PROGRAMMED;
@@ -6037,7 +3823,7 @@ class rdma_resource_manager extends uvm_object;
         "non-PD activation requires PROGRAMMED state"
       );
     end
-    status = project_resource_value(registry[key], "activate", replacement);
+    status = rdma_resource_projector::project_resource_value(registry[key], "activate", replacement);
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_ACTIVE;
@@ -6089,7 +3875,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_RESOURCE_BUSY,
         "resource still has outstanding operations"
       );
-    status = project_resource_value(registry[key], "begin quiesce",
+    status = rdma_resource_projector::project_resource_value(registry[key], "begin quiesce",
                                     replacement);
     if (!status.ok())
       return status;
@@ -6141,7 +3927,7 @@ class rdma_resource_manager extends uvm_object;
           blockers, RDMA_RESOURCE_RELEASE_CQ_RESIZE))
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                "CQ has an active dependent resource");
-    status = project_resource_value(registry[key], "begin CQ resize",
+    status = rdma_resource_projector::project_resource_value(registry[key], "begin CQ resize",
                                     replacement);
     if (!status.ok()) return status;
     replacement.state = RDMA_RESOURCE_QUIESCING;
@@ -6227,9 +4013,9 @@ class rdma_resource_manager extends uvm_object;
     if (status == null || !status.ok())
       return status == null ? rdma_status::make(
         RDMA_SC_INVALID_STATE, "CQ replacement validation returned null") : status;
-    status = publication_identity_status(candidate, authoritative);
+    status = rdma_resource_projector::publication_identity_status(candidate, authoritative);
     if (!status.ok()) return status;
-    status = project_public_resource_value(candidate, "replace active CQ",
+    status = rdma_resource_projector::project_public_resource_value(candidate, "replace active CQ",
                                            replacement_resource);
     if (!status.ok()) return status;
     if (!$cast(replacement_cq, replacement_resource))
@@ -6265,7 +4051,7 @@ class rdma_resource_manager extends uvm_object;
     string key;
 
     epoch_snapshot = publication_epoch;
-    status = project_public_resource_value(candidate, "attach QP programming",
+    status = rdma_resource_projector::project_public_resource_value(candidate, "attach QP programming",
                                            projected);
     if (!status.ok() || !$cast(replacement, projected))
       return status.ok() ? rdma_status::make(
@@ -6284,11 +4070,11 @@ class rdma_resource_manager extends uvm_object;
       key = resource_key(replacement.handle);
       if (registry.exists(key) && registry[key] != null &&
           registry[key].handle != null &&
-          same_handle_instance(registry[key].handle, replacement.handle)) begin
+          rdma_resource_projector::same_handle_instance(registry[key].handle, replacement.handle)) begin
         // 旧代际 lookup 不返回资源；必须在 fallback 的外部 projection 前冻结引用，
         // 不能在 projection 返回后重取而把等值 source 替换当作本次校验结果。
         source_resource = registry[key];
-        status = project_resource_value(
+        status = rdma_resource_projector::project_resource_value(
           source_resource, "attach exact-old QP recovery programming",
           authoritative
         );
@@ -6305,7 +4091,7 @@ class rdma_resource_manager extends uvm_object;
       return rdma_status::make(
         RDMA_SC_INVALID_STATE, "QP programming target is not a clean reservation"
       );
-    status = publication_identity_status(replacement, authoritative);
+    status = rdma_resource_projector::publication_identity_status(replacement, authoritative);
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_PROGRAMMED;
@@ -6353,7 +4139,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP semantic-only commit requires ACTIVE RESET to INIT"
       );
-    status = project_resource_value(registry[key], "commit QP semantic state",
+    status = rdma_resource_projector::project_resource_value(registry[key], "commit QP semantic state",
                                     projected);
     if (!status.ok() || !$cast(replacement, projected))
       return status.ok() ? rdma_status::make(
@@ -6398,7 +4184,7 @@ class rdma_resource_manager extends uvm_object;
     bit source_recovery_exists;
     longint unsigned epoch_snapshot;
 
-    status = project_public_resource_value(candidate, "commit QP programmed",
+    status = rdma_resource_projector::project_public_resource_value(candidate, "commit QP programmed",
                                            projected);
     if (!status.ok() || !$cast(replacement, projected))
       return status.ok() ? rdma_status::make(
@@ -6410,7 +4196,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT, "programmed target is not a QP"
       ) : status;
     key = resource_key(authoritative.handle);
-    status = publication_identity_status(replacement, authoritative);
+    status = rdma_resource_projector::publication_identity_status(replacement, authoritative);
     if (!status.ok())
       return status;
     if (!same_qp_plan_value(replacement.qp_plan,
@@ -6427,7 +4213,7 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_STATE, "programmed QP commit requires ACTIVE state"
         );
       requested_qp_state = replacement.qp_state;
-      status = project_qpc_value(
+      status = rdma_resource_projector::project_qpc_value(
         replacement.programmed_qpc, "commit QP requested QPC",
         requested_qpc
       );
@@ -6436,7 +4222,7 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_STATE,
           "requested QP programmed QPC projection failed"
         ) : status;
-      status = project_resource_value(
+      status = rdma_resource_projector::project_resource_value(
         registry[key], "commit QP authoritative resource", projected
       );
       if (!status.ok() || !$cast(replacement, projected))
@@ -6470,7 +4256,7 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_ARGUMENT,
           "programmed QP does not match a reconciliation candidate"
         );
-      status = project_resource_value(
+      status = rdma_resource_projector::project_resource_value(
         registry[key], "commit QP expected reconciliation", projected
       );
       if (!status.ok() || !$cast(expected_replacement, projected))
@@ -6478,7 +4264,7 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_STATE,
           "expected QP reconciliation projection failed"
         ) : status;
-      status = project_qpc_value(
+      status = rdma_resource_projector::project_qpc_value(
         restore_prior ? recovery.qp_recovery.prior_qpc :
                         recovery.qp_recovery.candidate_qpc,
         "commit QP expected reconciliation QPC",
@@ -6611,7 +4397,7 @@ class rdma_resource_manager extends uvm_object;
       stale_recovery_allowed = 1'b0;
       if (registry.exists(key) && registry[key] != null &&
           registry[key].handle != null &&
-          same_handle_instance(registry[key].handle, qp_h) &&
+          rdma_resource_projector::same_handle_instance(registry[key].handle, qp_h) &&
           $cast(retained_qp, registry[key])) begin
         if ((recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE ||
              recovery.has_pending_hardware_step) &&
@@ -6623,7 +4409,7 @@ class rdma_resource_manager extends uvm_object;
         else if (preprogram_shape &&
                  registry[key].state == RDMA_RESOURCE_ALLOCATED &&
                  !recovery_records.exists(key)) begin
-          status = project_qp_recovery_value(
+          status = rdma_resource_projector::project_qp_recovery_value(
             recovery, "mark stale pre-program QP ERROR", recovery_copy
           );
           if (status.ok() && recovery_copy != null)
@@ -6637,9 +4423,9 @@ class rdma_resource_manager extends uvm_object;
           // incarnation 才能放宽 stale-generation recovery gate。
           stale_recovery_allowed = status != null && status.ok() &&
             recovery_qp_h != null && recovery_owner != null &&
-            same_handle_instance(recovery_qp_h, registry[key].handle) &&
+            rdma_resource_projector::same_handle_instance(recovery_qp_h, registry[key].handle) &&
             registry[key].owner != null &&
-            same_handle_instance(recovery_owner, registry[key].owner);
+            rdma_resource_projector::same_handle_instance(recovery_owner, registry[key].owner);
         end
         else if (recovery.intent == RDMA_QP_RECOVER_CREATE_ROLLBACK &&
                  recovery.ambiguous_operation == RDMA_QP_AMBIG_NONE &&
@@ -6655,7 +4441,7 @@ class rdma_resource_manager extends uvm_object;
           stale_recovery_allowed = status != null && status.ok();
         end
         if (stale_recovery_allowed)
-          status = project_resource_value(
+          status = rdma_resource_projector::project_resource_value(
             registry[key], "mark stale in-flight QP ERROR", authoritative
           );
         else
@@ -6673,7 +4459,7 @@ class rdma_resource_manager extends uvm_object;
     preprogram_publication = preprogram_shape &&
       registry[key].state == RDMA_RESOURCE_ALLOCATED;
     if (preprogram_publication) begin
-      status = project_qp_recovery_value(
+      status = rdma_resource_projector::project_qp_recovery_value(
         recovery, "mark pre-program QP ERROR", recovery_copy
       );
       if (!status.ok() || recovery_copy == null)
@@ -6745,7 +4531,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE, "QP ERROR source ledger is incomplete"
       );
     if (!preprogram_publication) begin
-      status = project_qp_recovery_value(recovery, "mark QP ERROR",
+      status = rdma_resource_projector::project_qp_recovery_value(recovery, "mark QP ERROR",
                                          recovery_copy);
       if (!status.ok() || recovery_copy == null)
         return status.ok() ? rdma_status::make(
@@ -6765,13 +4551,13 @@ class rdma_resource_manager extends uvm_object;
       // 失配继续走 INVALID_ARGUMENT authority-changed，后续 SRQ 检查与发布顺序不变。
       if (authoritative_qp.qp_plan != null ||
           authoritative_qp.programmed_qpc != null ||
-          !same_handle_instance(recovery_qp_h, authoritative_qp.handle) ||
+          !rdma_resource_projector::same_handle_instance(recovery_qp_h, authoritative_qp.handle) ||
           recovery_owner == null || authoritative_qp.owner == null ||
-          !same_handle_instance(recovery_owner, authoritative_qp.owner) ||
+          !rdma_resource_projector::same_handle_instance(recovery_owner, authoritative_qp.owner) ||
           (authoritative_qp.srq_h == null) !=
             (recovery_copy.qp_plan.rq_source_h == null) ||
           (authoritative_qp.srq_h != null &&
-           !same_handle_instance(authoritative_qp.srq_h,
+           !rdma_resource_projector::same_handle_instance(authoritative_qp.srq_h,
              recovery_copy.qp_plan.rq_source_h)))
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT,
@@ -6884,14 +4670,14 @@ class rdma_resource_manager extends uvm_object;
                               existing_recovery.qp_plan) ||
           !same_context_value(recovery_copy.context_ref,
                               existing_recovery.context_ref) ||
-          !same_mapping_value(recovery_copy.staging_mapping,
+          !rdma_resource_projector::same_mapping_value(recovery_copy.staging_mapping,
                               existing_recovery.staging_mapping) ||
           recovery_copy.staging_mapping != null &&
             !same_owned_mapping_authority(
               recovery_copy.staging_mapping,
               existing_recovery.staging_mapping
             ) ||
-          !same_mapping_value(recovery_copy.query_mapping,
+          !rdma_resource_projector::same_mapping_value(recovery_copy.query_mapping,
                               existing_recovery.query_mapping) ||
           recovery_copy.query_mapping_recovery_only !=
             existing_recovery.query_mapping_recovery_only ||
@@ -6931,7 +4717,7 @@ class rdma_resource_manager extends uvm_object;
           "QP ERROR replacement changed retained authority or progress"
         );
     end
-    status = project_resource_value(registry[key], "mark QP ERROR resource",
+    status = rdma_resource_projector::project_resource_value(registry[key], "mark QP ERROR resource",
                                     projected);
     if (!status.ok() || !$cast(replacement, projected))
       return status.ok() ? rdma_status::make(
@@ -6939,7 +4725,7 @@ class rdma_resource_manager extends uvm_object;
       ) : status;
     replacement.state = RDMA_RESOURCE_ERROR;
     if (preprogram_publication) begin
-      status = project_qp_plan_value(
+      status = rdma_resource_projector::project_qp_plan_value(
         recovery_copy.qp_plan, "mark pre-program QP ERROR plan",
         replacement.qp_plan
       );
@@ -6970,7 +4756,7 @@ class rdma_resource_manager extends uvm_object;
       return status;
 
     if (error_replacement) begin
-      status = project_recovery_value(
+      status = rdma_resource_projector::project_recovery_value(
         recovery_records[key], "replace QP ERROR record", record_copy
       );
       if (!status.ok())
@@ -6986,7 +4772,7 @@ class rdma_resource_manager extends uvm_object;
     end
     else begin
       record_copy = new("qp_recovery_record");
-      status = project_handle_value(authoritative.handle, "QP recovery handle",
+      status = rdma_resource_projector::project_handle_value(authoritative.handle, "QP recovery handle",
                                     record_copy.resource_h);
       if (!status.ok())
         return status;
@@ -7069,7 +4855,7 @@ class rdma_resource_manager extends uvm_object;
         existing_recovery == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery progress record is incomplete");
-    status = project_qp_recovery_value(recovery,
+    status = rdma_resource_projector::project_qp_recovery_value(recovery,
                                        "QP recovery progress", recovery_copy);
     if (!status.ok() || recovery_copy == null)
       return status.ok() ? rdma_status::make(
@@ -7084,9 +4870,9 @@ class rdma_resource_manager extends uvm_object;
                         existing_recovery.candidate_qpc) ||
         !same_context_value(recovery_copy.context_ref,
                             existing_recovery.context_ref) ||
-        !same_mapping_value(recovery_copy.staging_mapping,
+        !rdma_resource_projector::same_mapping_value(recovery_copy.staging_mapping,
                             existing_recovery.staging_mapping) ||
-        !same_mapping_value(recovery_copy.query_mapping,
+        !rdma_resource_projector::same_mapping_value(recovery_copy.query_mapping,
                             existing_recovery.query_mapping) ||
         recovery_copy.query_mapping_recovery_only !=
           existing_recovery.query_mapping_recovery_only ||
@@ -7107,7 +4893,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "QP recovery progress changed retained authority"
       );
-    status = project_recovery_value(existing_record,
+    status = rdma_resource_projector::project_recovery_value(existing_record,
                                     "QP recovery progress record",
                                     replacement_record);
     if (!status.ok())
@@ -7179,15 +4965,15 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP query mapping authority is already retained");
     if (query_mapping_recovery_only)
-      status = clone_recovery_mapping_value(
+      status = rdma_resource_projector::clone_recovery_mapping_value(
         query_mapping, "QP retained query recovery", projected_mapping);
     else
-      status = clone_owned_mapping_value(
+      status = rdma_resource_projector::clone_owned_mapping_value(
         query_mapping, "QP retained query", projected_mapping);
     if (!status.ok() || projected_mapping == null)
       return status.ok() ? rdma_status::make(
         RDMA_SC_INVALID_STATE, "QP retained query mapping projection failed") : status;
-    status = project_recovery_value(existing_record,
+    status = rdma_resource_projector::project_recovery_value(existing_record,
                                     "QP retained query record",
                                     replacement_record);
     if (!status.ok() || replacement_record == null ||
@@ -7479,7 +5265,7 @@ class rdma_resource_manager extends uvm_object;
       );
     else if (!registry.exists(key) || registry[key] != source_resource ||
              registry[key] == null || registry[key].handle == null ||
-             !same_handle_instance(registry[key].handle, replacement.handle))
+             !rdma_resource_projector::same_handle_instance(registry[key].handle, replacement.handle))
       status = rdma_status::make(
         RDMA_SC_INVALID_STATE,
         {operation, " registry authority changed during projection"}
@@ -7551,7 +5337,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         {operation, " requires QUIESCING or ERROR QP"}
       );
-    status = project_resource_value(registry[key], {operation, " resource"},
+    status = rdma_resource_projector::project_resource_value(registry[key], {operation, " resource"},
                                     projected);
     if (!status.ok() || !$cast(resource_copy, projected) ||
         resource_copy.qp_plan == null)
@@ -7573,7 +5359,7 @@ class rdma_resource_manager extends uvm_object;
         return rdma_status::make(
           RDMA_SC_INVALID_STATE, {operation, " QP recovery source is missing"}
         );
-      status = project_recovery_value(recovery_records[key],
+      status = rdma_resource_projector::project_recovery_value(recovery_records[key],
                                       {operation, " recovery"}, recovery_copy);
       if (!status.ok())
         return status;
@@ -8178,7 +5964,7 @@ class rdma_resource_manager extends uvm_object;
           "queue progress requires QUIESCING or ERROR queue"
         );
       end
-    status = project_resource_value(
+    status = rdma_resource_projector::project_resource_value(
       registry[candidate.key], {operation, " resource"},
       candidate.resource_copy
     );
@@ -8218,7 +6004,7 @@ class rdma_resource_manager extends uvm_object;
           "queue progress recovery source is missing"
         );
       end
-      status = project_recovery_value(
+      status = rdma_resource_projector::project_recovery_value(
         recovery_records[candidate.key], {operation, " recovery"},
         candidate.recovery_copy
       );
@@ -8429,7 +6215,7 @@ class rdma_resource_manager extends uvm_object;
           progress.recovery_copy.queue_plan.flush_targets[recovery_target_index].flush_complete ||
           progress.recovery_copy.queue_plan.flush_targets[recovery_target_index].pd_ref == null ||
           resource_queue.queue_plan.flush_targets[target_index].pd_ref == null ||
-          !same_mapping_value(
+          !rdma_resource_projector::same_mapping_value(
             progress.recovery_copy.queue_plan.flush_targets[recovery_target_index].pd_ref.mapping,
             resource_queue.queue_plan.flush_targets[target_index].pd_ref.mapping
           ))
@@ -8710,7 +6496,7 @@ class rdma_resource_manager extends uvm_object;
             recovery.backing_refs[i].ownership ||
           authoritative.backing_refs[i].release_complete ||
           recovery.backing_refs[i].release_complete ||
-          !same_mapping_value(
+          !rdma_resource_projector::same_mapping_value(
             authoritative.backing_refs[i].mapping,
             recovery.backing_refs[i].mapping
           ) ||
@@ -8752,7 +6538,7 @@ class rdma_resource_manager extends uvm_object;
     foreach (authoritative.hmc_refs[i]) begin
       if (authoritative.hmc_refs[i] == null ||
           recovery.hmc_refs[i] == null ||
-          !same_mapping_handle_value(
+          !rdma_resource_projector::same_mapping_handle_value(
             authoritative.hmc_refs[i].owner,
             recovery.hmc_refs[i].owner
           ) ||
@@ -9018,7 +6804,7 @@ class rdma_resource_manager extends uvm_object;
         status = queue_restore_authority_status(registry[key], recovery);
         if (!status.ok())
           return status;
-        status = project_recovery_value(recovery, "restore queue recovery",
+        status = rdma_resource_projector::project_recovery_value(recovery, "restore queue recovery",
                                         recovery_replacement);
         if (!status.ok() || recovery_replacement == null)
           return status.ok() ? rdma_status::make(
@@ -9047,7 +6833,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "only QUIESCING or safe ERROR MR can be restored ACTIVE"
       );
-    status = project_resource_value(registry[key], "restore active",
+    status = rdma_resource_projector::project_resource_value(registry[key], "restore active",
                                   replacement);
     if (!status.ok())
       return status;
@@ -9059,7 +6845,7 @@ class rdma_resource_manager extends uvm_object;
       if (!$cast(queue_replacement, replacement))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "restored queue resource type mismatch");
-      status = project_queue_plan_value(recovery_replacement.queue_plan,
+      status = rdma_resource_projector::project_queue_plan_value(recovery_replacement.queue_plan,
                                         "restore active queue plan",
                                         restored_plan);
       if (!status.ok() || restored_plan == null)
@@ -9188,7 +6974,7 @@ class rdma_resource_manager extends uvm_object;
     longint unsigned epoch_snapshot;
     string key;
 
-    status = project_handle_value(handle, "mark error", trusted_handle);
+    status = rdma_resource_projector::project_handle_value(handle, "mark error", trusted_handle);
     if (!status.ok())
       return status;
     if (trusted_handle != null &&
@@ -9197,7 +6983,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP resources require QP-specific ERROR publication"
       );
-    status = project_public_recovery_value(recovery, "mark error",
+    status = rdma_resource_projector::project_public_recovery_value(recovery, "mark error",
                                            recovery_copy);
     if (!status.ok())
       return status;
@@ -9224,16 +7010,16 @@ class rdma_resource_manager extends uvm_object;
     source_recovery_exists = recovery_records.exists(key);
     source_recovery = source_recovery_exists ? recovery_records[key] : null;
     epoch_snapshot = publication_epoch;
-    status = project_resource_value(registry[key], "mark error registry",
+    status = rdma_resource_projector::project_resource_value(registry[key], "mark error registry",
                                     replacement);
     if (!status.ok())
       return status;
     if (replacement.handle == null ||
-        !same_handle_instance(replacement.handle, trusted_handle))
+        !rdma_resource_projector::same_handle_instance(replacement.handle, trusted_handle))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "error registry identity is inconsistent");
     if (recovery_copy.resource_h == null ||
-        !same_handle_instance(recovery_copy.resource_h, trusted_handle))
+        !rdma_resource_projector::same_handle_instance(recovery_copy.resource_h, trusted_handle))
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "recovery record does not match the resource incarnation"
@@ -9373,13 +7159,13 @@ class rdma_resource_manager extends uvm_object;
         foreach (recovery_copy.queue_plan.refs[i]) begin
           if (recovery_copy.queue_plan.refs[i] == null ||
               recovery_copy.queue_plan.refs[i].mapping == null ||
-              !same_handle_instance(
+              !rdma_resource_projector::same_handle_instance(
                 recovery_copy.queue_plan.refs[i].mapping.function_h,
                 queue_replacement.owner
               ) ||
               (recovery_copy.queue_plan.refs[i].ownership ==
                  RDMA_OWNERSHIP_CONTROL_PLANE &&
-               !same_handle_instance(
+               !rdma_resource_projector::same_handle_instance(
                  recovery_copy.queue_plan.refs[i].mapping.owner_h,
                  trusted_handle
                )))
@@ -9391,14 +7177,14 @@ class rdma_resource_manager extends uvm_object;
             if (recovery_copy.queue_plan.refs[i].additional_segments[j] == null ||
                 recovery_copy.queue_plan.refs[i].additional_segments[j].mapping ==
                   null ||
-                !same_handle_instance(
+                !rdma_resource_projector::same_handle_instance(
                   recovery_copy.queue_plan.refs[i].additional_segments[j].
                     mapping.function_h,
                   queue_replacement.owner
                 ) ||
                 (recovery_copy.queue_plan.refs[i].additional_segments[j].
                    ownership == RDMA_OWNERSHIP_CONTROL_PLANE &&
-                 !same_handle_instance(
+                 !rdma_resource_projector::same_handle_instance(
                    recovery_copy.queue_plan.refs[i].additional_segments[j].
                      mapping.owner_h,
                    trusted_handle
@@ -9410,7 +7196,7 @@ class rdma_resource_manager extends uvm_object;
           end
         end
         if (recovery_copy.queue_plan.context_ref != null &&
-            !same_handle_instance(
+            !rdma_resource_projector::same_handle_instance(
               recovery_copy.queue_plan.context_ref.owner,
               queue_replacement.owner
             ))
@@ -9422,7 +7208,7 @@ class rdma_resource_manager extends uvm_object;
           status = queue_local_release_plan_status(recovery_copy.queue_plan);
           if (!status.ok()) return status;
         end
-        status = project_queue_plan_value(
+        status = rdma_resource_projector::project_queue_plan_value(
           recovery_copy.queue_plan, "mark error transaction resource plan",
           authoritative_plan
         );
@@ -9432,7 +7218,7 @@ class rdma_resource_manager extends uvm_object;
             "transaction resource plan projection returned null"
           );
         if (!status.ok()) return status;
-        status = project_queue_plan_value(
+        status = rdma_resource_projector::project_queue_plan_value(
           recovery_copy.queue_plan, "mark error transaction recovery plan",
           recovery_plan
         );
@@ -9465,7 +7251,7 @@ class rdma_resource_manager extends uvm_object;
           queue_replacement.queue_plan, recovery_copy.queue_plan
         );
         if (!status.ok()) return status;
-        status = project_queue_plan_value(
+        status = rdma_resource_projector::project_queue_plan_value(
           recovery_copy.queue_plan,
           "mark error reservation resource plan", authoritative_plan
         );
@@ -9475,7 +7261,7 @@ class rdma_resource_manager extends uvm_object;
             "reservation resource plan projection returned null"
           );
         if (!status.ok()) return status;
-        status = project_queue_plan_value(
+        status = rdma_resource_projector::project_queue_plan_value(
           recovery_copy.queue_plan,
           "mark error reservation recovery plan", recovery_plan
         );
@@ -9494,7 +7280,7 @@ class rdma_resource_manager extends uvm_object;
         // A QUIESCING progress record lives only in the registry.  Make that
         // snapshot authoritative when ERROR recovery begins so callers cannot
         // erase already-proven cleanup by supplying an older plan.
-        status = project_queue_plan_value(
+        status = rdma_resource_projector::project_queue_plan_value(
           queue_replacement.queue_plan,
           "mark error authoritative queue plan", authoritative_plan
         );
@@ -9681,7 +7467,7 @@ class rdma_resource_manager extends uvm_object;
     if (!recovery_records.exists(key))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "resource has no recovery record");
-    return project_recovery_value(recovery_records[key], "lookup recovery",
+    return rdma_resource_projector::project_recovery_value(recovery_records[key], "lookup recovery",
                                 recovery);
   endfunction
 
@@ -9904,7 +7690,7 @@ class rdma_resource_manager extends uvm_object;
           "outstanding operation ID is already tracked"
         );
     end
-    status = project_resource_value(registry[key], "track outstanding",
+    status = rdma_resource_projector::project_resource_value(registry[key], "track outstanding",
                                   replacement);
     if (!status.ok())
       return status;
@@ -9951,7 +7737,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "outstanding operation ID is not tracked"
       );
-    status = project_resource_value(registry[key], "retire outstanding",
+    status = rdma_resource_projector::project_resource_value(registry[key], "retire outstanding",
                                   replacement);
     if (!status.ok())
       return status;
@@ -10040,7 +7826,7 @@ class rdma_resource_manager extends uvm_object;
     longint unsigned epoch_snapshot;
 
     epoch_snapshot = publication_epoch;
-    status = project_function_handle_value(owner, "Function teardown",
+    status = rdma_resource_projector::project_function_handle_value(owner, "Function teardown",
                                            trusted_owner);
     if (!status.ok())
       return status;
@@ -10070,7 +7856,7 @@ class rdma_resource_manager extends uvm_object;
     target_count = 0;
     foreach (registry[key]) begin
       if (registry[key].owner != null &&
-          same_handle_instance(registry[key].owner, trusted_owner))
+          rdma_resource_projector::same_handle_instance(registry[key].owner, trusted_owner))
         target_count++;
     end
 
@@ -10078,13 +7864,13 @@ class rdma_resource_manager extends uvm_object;
       progress = 1'b0;
       foreach (registry[key]) begin
         if (selected.exists(key) || registry[key].owner == null ||
-            !same_handle_instance(registry[key].owner, trusted_owner))
+            !rdma_resource_projector::same_handle_instance(registry[key].owner, trusted_owner))
           continue;
         blocked = 1'b0;
         foreach (registry[other_key]) begin
           if (key == other_key || selected.exists(other_key) ||
               registry[other_key].owner == null ||
-              !same_handle_instance(registry[other_key].owner,
+              !rdma_resource_projector::same_handle_instance(registry[other_key].owner,
                                     trusted_owner))
             continue;
           if (resource_depends_on(registry[other_key],
@@ -10124,7 +7910,7 @@ class rdma_resource_manager extends uvm_object;
     leak_count = 0;
     trusted_owner = null;
     if (owner != null) begin
-      status = project_function_handle_value(owner, "leak filter",
+      status = rdma_resource_projector::project_function_handle_value(owner, "leak filter",
                                              trusted_owner);
       if (!status.ok())
         return status;
@@ -10138,7 +7924,7 @@ class rdma_resource_manager extends uvm_object;
     foreach (registry[key]) begin
       if (trusted_owner == null ||
           (registry[key].owner != null &&
-           same_handle_instance(registry[key].owner, trusted_owner)))
+           rdma_resource_projector::same_handle_instance(registry[key].owner, trusted_owner)))
         leak_count++;
     end
     if (leak_count != 0)

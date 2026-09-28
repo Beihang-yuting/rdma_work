@@ -25,6 +25,7 @@ package rdma_core_pkg;
   `include "rdma_resource_transaction_models.sv"
   `include "rdma_resource_dependency_policy.sv"
   `include "rdma_queue_role_cardinality_policy.sv"
+  `include "rdma_resource_projector.sv"
   `include "rdma_resource_manager.sv"
   `include "rdma_responder_registry.sv"
   `include "rdma_srq_preflight_value_policy.sv"
