@@ -62,6 +62,54 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return status == null ? invalid_state(message) : status;
   endfunction
 
+  // 功能：make_result 使用公共 lifecycle result seed 建立 QP 操作的 detached 初始
+  //   结果，统一 transaction id、未完成 status 和默认资源状态，供 create/modify/
+  //   destroy/recover 四类入口继续追加各自业务字段。
+  // 输入/输出及副作用：transaction_id、result_name、pending_message（输入）；返回
+  //   新建的 rdma_control_result，写入 status、primary_status 和默认状态字段；不
+  //   取得 manager、CMQ、QP backing 或 recovery ledger 所有权。
+  // 失败/边界：seed 或 result 分配/初始化失败时返回带 INVALID_STATE 的结果对象；
+  //   transaction_id 为 0 仍由各入口按原有顺序拒绝，本 helper 不提前改变错误优先级。
+  protected function rdma_control_result make_result(
+    longint unsigned transaction_id,
+    string result_name,
+    string pending_message
+  );
+    rdma_control_result result;
+    rdma_lifecycle_result_seed seed;
+    rdma_status seed_status;
+
+    result = rdma_control_result::type_id::create(result_name);
+    seed = rdma_lifecycle_result_seed::type_id::create(
+      {result_name, "_seed"}
+    );
+    if (result == null || seed == null) begin
+      if (result == null)
+        return null;
+      result.transaction_id = transaction_id;
+      result.primary_status = invalid_state(
+        "QP lifecycle result seed allocation failed"
+      );
+      result.status = rdma_cmq_clone_status_value(result.primary_status);
+      return result;
+    end
+    seed.transaction_id = transaction_id;
+    seed.domain = RDMA_LIFECYCLE_DOMAIN_QP;
+    seed.pending_message = pending_message;
+    seed_status = seed.initialize_result(result);
+    if (seed_status == null || !seed_status.ok()) begin
+      result.transaction_id = transaction_id;
+      result.primary_status = invalid_state(
+        "QP lifecycle result seed initialization failed"
+      );
+      result.status = rdma_cmq_clone_status_value(result.primary_status);
+      result.final_resource_state = RDMA_RESOURCE_NEW;
+      result.final_resource_state_known = 1'b0;
+      result.recovery_required = 1'b0;
+    end
+    return result;
+  endfunction
+
   // 功能：在 rdma_qp_lifecycle_executor 中，live_binding_fence 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）；live_binding_fence 读取 binding、expected_owner 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：live_binding_fence 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP binding fence input is null”“QP binding generation is stale”；失败路径不提交部分状态或转移未声明资源。
@@ -676,9 +724,17 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return null;
   endfunction
 
-  // 功能：在 rdma_qp_lifecycle_executor 中，materialize_plan 把已验证的 backing 规格落实为 Host-memory 映射/队列计划，并登记释放责任。
-  // 输入/输出及副作用：binding（输入）、expected_owner（输入）、qp_snapshot（输入）、request（输入）、plan（输出）；materialize_plan 读取 binding、expected_owner、qp_snapshot、request、plan 并使用字段 plan、status、plan.transport、plan.sq_depth、plan.rq_depth、plan.rq_source_h，并写入 plan；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：materialize_plan 返回 RDMA_SC_RESOURCE_EXHAUSTED、RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QP plan materialization input is null”“QP local QPN exceeds 21 bits”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：materialize_plan 把已验证的 SQ/RQ/SGB/URC backing 规格落实为 Host-memory
+  //   映射和 detached QP backing plan，并登记后续释放责任；URC 内部 backing 的
+  //   role/length/order 由 typed factory 提供，避免执行器重复维护几何常量。
+  // 输入/输出及副作用：binding、expected_owner、qp_snapshot、request（输入）定义
+  //   Function/QP authority 和 transport；plan（输出）接收新建 ring、mapping、PD、
+  //   SRQ link 与 URC refs。函数通过现有 adapter 分配非拥有映射，但不发布 manager
+  //   resource 或修改 caller request。
+  // 失败/边界：输入为空、QPN 超过 21 bit、queue capability/geometry 校验失败、任一
+  //   owned/borrowed backing 或 URC allocation 失败时返回对应 status；失败只保留已
+  //   追加到 plan 的 detached refs，交由上层 partial-plan rollback，不得留下半提交
+  //   的 QP authority 或把非 URC transport 当作 URC backing。
   protected function rdma_status materialize_plan(
     rdma_function_binding binding,
     rdma_function_handle expected_owner,
@@ -688,6 +744,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
   );
     rdma_status status;
     rdma_qp_backing_ref ref_value;
+    rdma_qp_urc_backing_spec_t urc_specs[$];
 
     plan = null;
     if (binding == null || qp_snapshot == null || request == null ||
@@ -784,28 +841,20 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         if (!status.ok()) return status;
       end
     end
-    if (request.transport == RDMA_TRANSPORT_URC) begin
+    // 设计说明：URC 内部 backing 的 geometry/order 属于 detached policy 值；本循环
+    //   只负责调用现有 allocate_ref，并在每次失败时把可能已产生的引用追加到 plan，
+    //   让上层既有 partial-plan rollback 继续释放同一顺序中的所有成功分配。
+    rdma_qp_urc_backing_policy::specs_for_transport(
+      request.transport, urc_specs
+    );
+    foreach (urc_specs[i]) begin
       status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
-        RDMA_QUEUE_ROLE_QP_URC_RSQ, 4096, RDMA_DMA_BIDIRECTIONAL, ref_value);
-      if (!status.ok()) begin
-        if (ref_value != null) plan.urc_refs.push_back(ref_value);
+                            urc_specs[i].role, urc_specs[i].length,
+                            RDMA_DMA_BIDIRECTIONAL, ref_value);
+      if (ref_value != null)
+        plan.urc_refs.push_back(ref_value);
+      if (!status.ok())
         return status;
-      end
-      plan.urc_refs.push_back(ref_value);
-      status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
-        RDMA_QUEUE_ROLE_QP_URC_RDSQ, 4096, RDMA_DMA_BIDIRECTIONAL, ref_value);
-      if (!status.ok()) begin
-        if (ref_value != null) plan.urc_refs.push_back(ref_value);
-        return status;
-      end
-      plan.urc_refs.push_back(ref_value);
-      status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
-        RDMA_QUEUE_ROLE_QP_URC_DSQ, 8192, RDMA_DMA_BIDIRECTIONAL, ref_value);
-      if (!status.ok()) begin
-        if (ref_value != null) plan.urc_refs.push_back(ref_value);
-        return status;
-      end
-      plan.urc_refs.push_back(ref_value);
     end
     return rdma_status::success();
   endfunction
@@ -1093,27 +1142,15 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     rdma_cmq_ticket ticket,
     rdma_cmq_completion completion
   );
-    if (status == null)
-      return 1'b1;
-    if (status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED})
-      return 1'b1;
-    if (completion != null && completion.status != null &&
-        completion.status.code inside {RDMA_SC_TIMEOUT,
-                                       RDMA_SC_RESET_CANCELLED})
-      return 1'b1;
-    if (ticket == null || completion == null || completion.status == null) begin
-      // A CMQ adapter may return a terminal success status without exposing
-      // either a ticket or completion object.  The status itself is then the
-      // definitive outcome; only non-OK null outcomes require an explicit
-      // adapter proof that submission never crossed the hardware boundary.
-      if (status.ok() && ticket == null && completion == null)
-        return 1'b0;
-      if (!status.ok() && ticket == null && completion == null &&
-          cmq != null && cmq.last_execute_definitive_no_submit())
-        return 1'b0;
-      return 1'b1;
-    end
-    return 1'b0;
+    return rdma_cmq_ambiguity_policy::is_ambiguous(
+      status,
+      ticket,
+      completion,
+      cmq != null && cmq.last_execute_definitive_no_submit(),
+      1'b1,
+      1'b0,
+      1'b1
+    );
   endfunction
 
   // 功能：在 rdma_qp_lifecycle_executor 中，execute_qp_legacy_command 收束 QP
@@ -1132,18 +1169,15 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     output rdma_cmq_completion completion,
     output rdma_status status
   );
-    ticket = null;
-    completion = null;
-    status = null;
-    if (cmq == null) begin
-      status = invalid_state("QP CMQ is unavailable");
-      return;
-    end
-    if (command == null) begin
-      status = invalid_argument("QP CMQ command is null");
-      return;
-    end
-    cmq.execute(command, ticket, completion, status);
+    rdma_cmq_dispatch_legacy_raw(
+      cmq,
+      command,
+      ticket,
+      completion,
+      status,
+      "QP CMQ is unavailable",
+      "QP CMQ command is null"
+    );
   endtask
 
   // 功能：在 rdma_qp_lifecycle_executor 中由 same_qpc_snapshot 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
@@ -2228,13 +2262,11 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     bit [7:0] qpc_sequence_value;
 
     qp = null;
-    result = rdma_control_result::type_id::create("qp_create_result");
-    result.transaction_id = transaction_id;
-    result.primary_status = invalid_state("QP create did not complete");
-    result.status = invalid_state("QP create did not complete");
-    result.final_resource_state = RDMA_RESOURCE_NEW;
-    result.final_resource_state_known = 1'b0;
-    result.recovery_required = 1'b0;
+    result = make_result(
+      transaction_id,
+      "qp_create_result",
+      "QP create did not complete"
+    );
     candidate = null;
     plan = null;
     staging = null;
@@ -2633,7 +2665,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     result.recovery_required = 1'b0;
   endtask
 
-  // 功能：在 rdma_qp_lifecycle_executor 中，modify_locked 在代际和状态机保护下修改 QP 上下文，提交硬件命令后才发布新的软件状态。
+  // 功能：modify_locked 在代际和状态机保护下修改 QP 上下文，先消费统一 transition
+  //   policy 的 capability/迁移 decision，再提交硬件命令并发布新的软件状态。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）、request（输入）、transaction_id（输入）、qp（输出）、result（输出）；modify_locked 驱动下游事务，并写入 qp、result；函数返回 无直接返回值，不取得调用方资源所有权。
   // 失败/边界：modify_locked 返回 RDMA_SC_RESOURCE_BUSY、RDMA_SC_UNSUPPORTED_OPCODE；典型拒绝条件为“QP has outstanding operations”“QP SQD/SQE modify is unsupported”；失败路径不提交部分状态或转移未声明资源。
   task modify_locked(rdma_function_binding binding,
@@ -2663,11 +2696,13 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     bit query_mapping_valid;
     bit query_mapping_recovery_only;
     rdma_dma_request_context query_context;
+    rdma_qp_transition_decision_t transition_decision;
     qp = null;
-    result = rdma_control_result::type_id::create("qp_modify_result");
-    result.transaction_id = transaction_id;
-    result.primary_status = invalid_state("QP modify did not complete");
-    result.status = result.primary_status;
+    result = make_result(
+      transaction_id,
+      "qp_modify_result",
+      "QP modify did not complete"
+    );
     if (transaction_id == 0) begin
       publish_primary(result, invalid_argument("QP transaction ID is zero")); return;
     end
@@ -2688,36 +2723,36 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       status = rdma_status::make(RDMA_SC_RESOURCE_BUSY, "QP has outstanding operations");
     if (status.ok() && (request.owner == null || !request.owner.same_instance(expected_owner)))
       status = invalid_argument("QP modify owner does not match binding");
-    if (status.ok() && (authoritative.qp_state inside {RDMA_QPS_SQD, RDMA_QPS_SQE} ||
-                        request.new_state inside {RDMA_QPS_SQD, RDMA_QPS_SQE}))
-      status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                  "QP SQD/SQE modify is unsupported");
+    // 设计说明：transition policy 同时是 capability gate 和完整迁移矩阵的唯一值
+    //   authority。这里先缓存 decision，只在 transport-specific request 校验前消费
+    //   SQD/SQE unsupported 结果，以保持原错误优先级；后面不再复制同一状态条件。
+    if (status.ok()) begin
+      transition_decision = rdma_qp_transition_decide(
+        authoritative.qp_state, request.new_state
+      );
+      if (transition_decision.reject_code == RDMA_SC_UNSUPPORTED_OPCODE)
+        status = rdma_status::make(
+          transition_decision.reject_code,
+          transition_decision.reject_reason
+        );
+    end
     if (status.ok()) status = request.validate_for_transport(authoritative.transport);
     if (status.ok() && request.new_state == authoritative.qp_state)
       status = invalid_state("QP state transition is unchanged");
     full_modify = 1'b0;
     state_only = 1'b0;
     if (status.ok()) begin
-      case (authoritative.qp_state)
-        RDMA_QPS_RESET:
-          if (request.new_state == RDMA_QPS_INIT) state_only = 1'b1;
-          else status = invalid_state("QP RESET transition is invalid");
-        RDMA_QPS_INIT:
-          if (request.new_state == RDMA_QPS_RTR) full_modify = 1'b1;
-          else if (request.new_state inside {RDMA_QPS_ERROR, RDMA_QPS_RESET}) state_only = 1'b1;
-          else status = invalid_state("QP INIT transition is invalid");
-        RDMA_QPS_RTR:
-          if (request.new_state == RDMA_QPS_RTS) full_modify = 1'b1;
-          else if (request.new_state inside {RDMA_QPS_ERROR, RDMA_QPS_RESET}) state_only = 1'b1;
-          else status = invalid_state("QP RTR transition is invalid");
-        RDMA_QPS_RTS:
-          if (request.new_state inside {RDMA_QPS_ERROR, RDMA_QPS_RESET}) state_only = 1'b1;
-          else status = invalid_state("QP RTS transition is invalid");
-        RDMA_QPS_ERROR:
-          if (request.new_state == RDMA_QPS_RESET) state_only = 1'b1;
-          else status = invalid_state("QP ERROR transition is invalid");
-        default: status = invalid_state("QP state transition is invalid");
-      endcase
+      if (transition_decision.action == RDMA_QP_TRANSITION_INVALID)
+        status = rdma_status::make(
+          transition_decision.reject_code,
+          transition_decision.reject_reason
+        );
+      else begin
+        full_modify = transition_decision.action ==
+                      RDMA_QP_TRANSITION_FULL_MODIFY;
+        state_only = transition_decision.action ==
+                     RDMA_QP_TRANSITION_SEMANTIC_ONLY;
+      end
     end
     if (status.ok() && state_only &&
         authoritative.qp_state == RDMA_QPS_RESET && request.new_state == RDMA_QPS_INIT) begin
@@ -2988,8 +3023,11 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     bit ambiguous, hardware_absent, release_complete, error_modify_complete;
     bit side_effect_attempted;
 
-    result = rdma_control_result::type_id::create("qp_destroy_result");
-    result.transaction_id = transaction_id;
+    result = make_result(
+      transaction_id,
+      "qp_destroy_result",
+      "QP destroy did not complete"
+    );
     result.resource_h = request == null ? null :
       rdma_clone_handle_value(request.target_h, "QP destroy handle");
     status = (transaction_id == 0 || binding == null || expected_owner == null ||
@@ -3915,12 +3953,13 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     fresh_query_mapping = 1'b0;
     query_unresolved = 1'b0;
 
-    result = rdma_control_result::type_id::create("qp_recover_result");
-    result.transaction_id = transaction_id;
+    result = make_result(
+      transaction_id,
+      "qp_recover_result",
+      "QP recovery did not complete"
+    );
     result.resource_h = rdma_clone_handle_value(resource_h,
                                                 "QP recovery handle");
-    result.primary_status = invalid_state("QP recovery did not complete");
-    result.status = result.primary_status;
     if (transaction_id == 0 || binding == null || expected_owner == null ||
         resource_h == null || manager == null || cmq == null) begin
       publish_primary(result, invalid_argument("QP recovery input is invalid"));

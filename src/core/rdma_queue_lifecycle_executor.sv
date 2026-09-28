@@ -72,26 +72,15 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_cmq_ticket ticket,
     rdma_cmq_completion completion
   );
-    // A null status means the adapter did not provide an outcome at all.  A
-    // timeout/reset is inherently ambiguous even when the adapter did return
-    // a status.  A missing ticket/completion is ambiguous by default: status
-    // code alone cannot prove that a destructive command was rejected before
-    // submission.  Only an explicit adapter proof may make that a definitive
-    // no-submit outcome and permit ACTIVE restoration.
-    if (status == null)
-      return 1'b1;
-    if (status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED})
-      return 1'b1;
-    if (completion != null && completion.status != null &&
-        completion.status.code inside {RDMA_SC_TIMEOUT,
-                                       RDMA_SC_RESET_CANCELLED})
-      return 1'b1;
-    if (completion == null || completion.status == null) begin
-      if (status.ok() || ticket != null)
-        return 1'b1;
-      return cmq == null || !cmq.last_execute_definitive_no_submit();
-    end
-    return 1'b0;
+    return rdma_cmq_ambiguity_policy::is_ambiguous(
+      status,
+      ticket,
+      completion,
+      cmq != null && cmq.last_execute_definitive_no_submit(),
+      1'b0,
+      1'b1,
+      1'b0
+    );
   endfunction
 
   // 功能：在 rdma_queue_lifecycle_executor 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
@@ -126,15 +115,41 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_result 创建独立的 rdma_control_result；根据 transaction_id 设置字段 result、result.transaction_id，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：transaction_id（输入）；make_result 读取 transaction_id 并使用字段 result、result.transaction_id；函数返回 rdma_control_result，不取得调用方资源所有权。
-  // 失败/边界：make_result 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：make_result 通过 queue 域 lifecycle result seed 建立 detached 的未完成
+  //   rdma_control_result，统一 transaction_id、初始资源状态和失败诊断，再交给
+  //   queue create/destroy/recovery 逻辑追加各自阶段结果。
+  // 输入/输出及副作用：transaction_id（输入）；返回写入 transaction_id、status、
+  //   primary_status 和默认资源状态的 result，不读取 manager、CMQ 或 queue ledger，
+  //   也不取得调用方资源所有权。
+  // 失败/边界：result/seed 分配失败时返回空或不完整结果，调用入口必须沿既有 guard
+  //   拒绝继续；seed 初始化失败不改变原错误优先级、不隐式重试、不发布半事务状态。
   protected function rdma_control_result make_result(
     longint unsigned transaction_id
   );
     rdma_control_result result;
+    rdma_lifecycle_result_seed seed;
+    rdma_status seed_status;
+
     result = rdma_control_result::type_id::create("queue_create_result");
-    result.transaction_id = transaction_id;
+    seed = rdma_lifecycle_result_seed::type_id::create(
+      "queue_create_result_seed"
+    );
+    if (result == null || seed == null)
+      return result;
+    seed.transaction_id = transaction_id;
+    seed.domain = RDMA_LIFECYCLE_DOMAIN_QUEUE;
+    seed.pending_message = "queue create did not complete";
+    seed_status = seed.initialize_result(result);
+    if (seed_status == null || !seed_status.ok()) begin
+      result.transaction_id = transaction_id;
+      result.primary_status = invalid_state(
+        "queue lifecycle result seed initialization failed"
+      );
+      result.status = rdma_cmq_clone_status_value(result.primary_status);
+      result.final_resource_state = RDMA_RESOURCE_NEW;
+      result.final_resource_state_known = 1'b0;
+      result.recovery_required = 1'b0;
+    end
     return result;
   endfunction
 
@@ -417,39 +432,21 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   // 输入/输出及副作用：kind（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
   // 失败/边界：delete_opcode 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
   protected function bit [7:0] delete_opcode(rdma_resource_kind_e kind);
-    case (kind)
-      RDMA_RESOURCE_CQ:  return RDMA_OP_CQC_DELETE;
-      RDMA_RESOURCE_SRQ: return RDMA_OP_SRFQC_DELETE;
-      RDMA_RESOURCE_CEQ: return RDMA_OP_CEQC_DELETE;
-      RDMA_RESOURCE_AEQ: return RDMA_OP_AEQC_DELETE;
-      default:           return 8'h00;
-    endcase
+    return rdma_queue_lifecycle_opcode_policy::delete_opcode(kind);
   endfunction
 
   // 功能：create_opcode 按资源 kind 返回对应的 CQC/SRFQC/CEQC/AEQC create opcode，未知 kind 返回 8'h00。
   // 输入/输出及副作用：kind（输入）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
   // 失败/边界：create_opcode 按 case(kind) 的固定映射计算 bit [7:0]（RDMA_RESOURCE_CQ→RDMA_OP_CQC_CREATE；RDMA_RESOURCE_SRQ→RDMA_OP_SRFQC_CREATE；RDMA_RESOURCE_CEQ→RDMA_OP_CEQC_CREATE；RDMA_RESOURCE_AEQ→RDMA_OP_AEQC_CREATE；default→8'h00）；未列出的输入走 default，不修改运行时账本。
   protected function bit [7:0] create_opcode(rdma_resource_kind_e kind);
-    case (kind)
-      RDMA_RESOURCE_CQ:  return RDMA_OP_CQC_CREATE;
-      RDMA_RESOURCE_SRQ: return RDMA_OP_SRFQC_CREATE;
-      RDMA_RESOURCE_CEQ: return RDMA_OP_CEQC_CREATE;
-      RDMA_RESOURCE_AEQ: return RDMA_OP_AEQC_CREATE;
-      default:           return 8'h00;
-    endcase
+    return rdma_queue_lifecycle_opcode_policy::create_opcode(kind);
   endfunction
 
   // 功能：在 rdma_queue_lifecycle_executor 中，query_opcode 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：kind（输入）；query_opcode 读取 kind 并使用输入参数和固定枚举/常量；函数返回 bit [7:0]，不取得调用方资源所有权。
   // 失败/边界：query_opcode 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
   protected function bit [7:0] query_opcode(rdma_resource_kind_e kind);
-    case (kind)
-      RDMA_RESOURCE_CQ:  return RDMA_OP_CQC_QUERY;
-      RDMA_RESOURCE_SRQ: return RDMA_OP_SRFQC_QUERY;
-      RDMA_RESOURCE_CEQ: return RDMA_OP_CEQC_QUERY;
-      RDMA_RESOURCE_AEQ: return RDMA_OP_AEQC_QUERY;
-      default:           return 8'h00;
-    endcase
+    return rdma_queue_lifecycle_opcode_policy::query_opcode(kind);
   endfunction
 
   // 功能：在 rdma_queue_lifecycle_executor 中，append_rollback 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
@@ -1089,16 +1086,23 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   );
     rdma_status execute_status;
 
-    ticket = null;
-    completion = null;
-    ambiguous = 1'b0;
-    status = invalid_state("queue CMQ command was not executed");
     if (cmq == null || command == null) begin
+      ticket = null;
+      completion = null;
+      ambiguous = 1'b0;
       status = invalid_argument("queue CMQ command is incomplete");
       return;
     end
-    execute_status = null;
-    cmq.execute(command, ticket, completion, execute_status);
+    ambiguous = 1'b0;
+    rdma_cmq_dispatch_legacy_raw(
+      cmq,
+      command,
+      ticket,
+      completion,
+      execute_status,
+      "queue CMQ is unavailable",
+      "queue CMQ command is incomplete"
+    );
     if (binding != null && expected_owner != null) begin
       rdma_status fence_status;
       fence_status = live_binding_fence(binding, expected_owner);
@@ -1346,6 +1350,76 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       resource != null, !status.ok());
   endfunction
 
+  // 设计说明：ERROR queue recovery 的 pre-delete 与 post-delete OCC 重试都必须在
+  // 同一个 detached target 上执行一次 CMQ、完成 generation fence，再由 manager 记录
+  // role progress；两条 caller 仍分别决定 barrier、ambiguity、持久化和下一状态。
+  // 该 task 不读取 recovery ledger，也不修改 queue_plan.flush_complete，避免把恢复账本
+  // 的提交权从 recover_locked 转移到公共 helper。
+  // 功能：execute_recovery_flush_step 构造并执行一个 recovery OCC flush，返回 CMQ 证据
+  //   和 manager progress 状态，供 recover_locked 选择重试、持久化或终止恢复。
+  // 输入/输出及副作用：binding、expected_owner、policy、target、resource_h 和两条诊断
+  //   文案为输入；status、ticket、completion、ambiguous 为输出。成功时写入指定 resource
+  //   的 target.role progress，但不修改 target 的 flush_complete 标志；execute_failed 与
+  //   progress_failed 额外指出 CMQ/fence 或 manager 阶段失败，供 caller 保留原诊断分支。
+  // 失败/边界：authority/target/manager/CMQ 缺失、descriptor 构造失败、CMQ/fence 失败或
+  //   manager 返回 null/失败时不写 role progress；timeout/reset、缺失 completion 或
+  //   no-submit 证明保留 execute_queue_command 的 ambiguous 结果，由 caller 建立持久
+  //   recovery evidence。descriptor/progress 文案只影响诊断，不改变错误码或重试顺序。
+  protected task execute_recovery_flush_step(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner,
+    rdma_queue_lifecycle_policy policy,
+    rdma_queue_flush_target target,
+    rdma_handle resource_h,
+    input string descriptor_null_message,
+    input string progress_null_message,
+    output rdma_status status,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output bit ambiguous,
+    output bit execute_failed,
+    output bit progress_failed
+  );
+    rdma_cmq_command_desc command;
+    rdma_status fence_status;
+
+    status = rdma_status::success();
+    ticket = null;
+    completion = null;
+    ambiguous = 1'b0;
+    execute_failed = 1'b0;
+    progress_failed = 1'b0;
+    if (binding == null || expected_owner == null || policy == null ||
+        target == null || resource_h == null || manager == null || cmq == null) begin
+      status = invalid_argument("queue recovery flush authority is incomplete");
+      return;
+    end
+    command = null;
+    status = normalize_status(policy.build_flush_command(
+      expected_owner, target, command_timeout, command
+    ), descriptor_null_message);
+    if (!status.ok())
+      return;
+    execute_queue_command(command, ticket, completion, status, ambiguous,
+                          binding, expected_owner);
+    if (!status.ok()) begin
+      execute_failed = 1'b1;
+      return;
+    end
+    fence_status = live_binding_fence(binding, expected_owner);
+    if (!fence_status.ok()) begin
+      status = fence_status;
+      execute_failed = 1'b1;
+      return;
+    end
+    status = normalize_status(
+      manager.record_queue_flush_complete(resource_h, target.role),
+      progress_null_message
+    );
+    if (!status.ok())
+      progress_failed = 1'b1;
+  endtask
+
   // Recover an ERROR queue while the caller owns the per-Function lifecycle
   // semaphore.  Transaction-ID allocation and locking deliberately remain in
   // the control-plane facade; this task only advances the durable queue
@@ -1382,6 +1456,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     bit creation_origin;
     bit local_done;
     bit predelete_target;
+    bit execute_failed;
+    bit progress_failed;
     int target_index;
     int unsigned i;
     rdma_queue_backing_role_e target_role;
@@ -1842,11 +1918,15 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT)
           continue;
         target_role = recovery.queue_plan.flush_targets[i].role;
-        status = normalize_status(policy.build_flush_command(
-          expected_owner, recovery.queue_plan.flush_targets[i],
-          command_timeout, command),
-          "queue recovery OCC descriptor returned null");
-        if (!status.ok()) begin
+        execute_recovery_flush_step(
+          binding, expected_owner, policy,
+          recovery.queue_plan.flush_targets[i], resource_h,
+          "queue recovery OCC descriptor returned null",
+          "queue OCC progress returned null",
+          status, ticket, completion, ambiguous, execute_failed,
+          progress_failed
+        );
+        if (!status.ok() && !execute_failed && !progress_failed) begin
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
@@ -1855,8 +1935,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           done = 1'b1;
           break;
         end
-        execute_queue_command(command, ticket, completion, status, ambiguous,
-                              binding, expected_owner);
         if (ambiguous) begin
           recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
             ticket, "queue OCC recovery");
@@ -1876,22 +1954,12 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             rdma_cmq_clone_status_value(status));
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
           publish_queue_recovery_required(recovery, result,
-            "queue OCC target failed");
+            progress_failed ?
+              "queue OCC progress could not be persisted" :
+              "queue OCC target failed");
           if (!persist_status.ok())
             result.rollback_statuses.push_back(
               rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        status = live_binding_fence(binding, expected_owner);
-        if (status.ok()) status = normalize_status(manager.record_queue_flush_complete(
-          resource_h, target_role), "queue OCC progress returned null");
-        if (!status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
-            "queue OCC progress could not be persisted");
           done = 1'b1;
           break;
         end
@@ -1995,11 +2063,15 @@ class rdma_queue_lifecycle_executor extends uvm_object;
               RDMA_QUEUE_FLUSH_POST_DELETE)
           continue;
         target_role = recovery.queue_plan.flush_targets[i].role;
-        status = normalize_status(policy.build_flush_command(
-          expected_owner, recovery.queue_plan.flush_targets[i],
-          command_timeout, command),
-          "queue post-delete OCC descriptor returned null");
-        if (!status.ok()) begin
+        execute_recovery_flush_step(
+          binding, expected_owner, policy,
+          recovery.queue_plan.flush_targets[i], resource_h,
+          "queue post-delete OCC descriptor returned null",
+          "queue post-delete OCC progress returned null",
+          status, ticket, completion, ambiguous, execute_failed,
+          progress_failed
+        );
+        if (!status.ok() && !execute_failed && !progress_failed) begin
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
@@ -2008,8 +2080,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           done = 1'b1;
           break;
         end
-        execute_queue_command(command, ticket, completion, status, ambiguous,
-                              binding, expected_owner);
         if (ambiguous) begin
           recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
             ticket, "queue post-delete OCC recovery");
@@ -2029,22 +2099,12 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             rdma_cmq_clone_status_value(status));
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
           publish_queue_recovery_required(recovery, result,
-            "queue post-delete OCC failed");
+            progress_failed ?
+              "queue post-delete OCC progress failed" :
+              "queue post-delete OCC failed");
           if (!persist_status.ok())
             result.rollback_statuses.push_back(
               rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        status = live_binding_fence(binding, expected_owner);
-        if (status.ok()) status = normalize_status(manager.record_queue_flush_complete(
-          resource_h, target_role), "queue post-delete OCC progress returned null");
-        if (!status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
-            "queue post-delete OCC progress failed");
           done = 1'b1;
           break;
         end
@@ -2485,6 +2545,72 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     publish_failure(status, result, RDMA_RESOURCE_NEW, 1'b0, 1'b0);
   endtask
 
+  // 设计说明：destroy_locked 的 SRQ 前置 flush 与 CQ/CEQ/AEQ 删除后的 flush
+  //   共享同一条“构造 descriptor→一次 CMQ execute→generation fence→记录 role
+  //   progress”事务边界。该 task 只消费已经通过 recipe/cardinality 校验的 detached
+  //   flush target 和 queue handle，不持有 plan、registry、recovery ledger 或 backing。
+  // 功能：execute_destroy_flush_step 执行一个 queue backing role 的 OCC flush，并把
+  //   ticket、completion、AMBIGUOUS 证据和 manager progress 返回给 destroy caller。
+  // 输入/输出及副作用：binding、expected_owner、policy、target、queue_h 为输入；status、
+  //   ticket、completion、ambiguous、completed 为输出。成功且 completion.status 为 OK 时
+  //   调用 manager.record_queue_flush_complete(queue_h,target.role)，completed 置 1。
+  // 失败/边界：输入缺失、descriptor/CMQ/fence/manager 返回 null 或失败时不提交 role
+  //   progress；legacy execute 缺失 ticket/completion 或 timeout/reset 会保留原有
+  //   ambiguous 标记供 destroy_locked 建立不可判定恢复记录。completion.status 非空且失败
+  //   时保持既有语义：execute status 仍可为 OK，但 completed 保持 0，调用方继续按原顺序判断。
+  protected task execute_destroy_flush_step(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner,
+    rdma_queue_lifecycle_policy policy,
+    rdma_queue_flush_target target,
+    rdma_handle queue_h,
+    output rdma_status status,
+    output rdma_cmq_ticket ticket,
+    output rdma_cmq_completion completion,
+    output bit ambiguous,
+    output bit completed
+  );
+    rdma_cmq_command_desc command;
+    rdma_status step_status;
+    rdma_status fence_status;
+
+    status = rdma_status::success();
+    ticket = null;
+    completion = null;
+    ambiguous = 1'b0;
+    completed = 1'b0;
+    if (binding == null || expected_owner == null || policy == null ||
+        target == null || queue_h == null || manager == null || cmq == null) begin
+      status = invalid_argument("queue destroy flush authority is incomplete");
+      return;
+    end
+    command = null;
+    status = normalize_status(policy.build_flush_command(
+      expected_owner, target, command_timeout, command
+    ), "flush descriptor returned null");
+    if (status.ok()) begin
+      execute_queue_command(
+        command, ticket, completion, step_status, ambiguous,
+        null, null, "flush result was lost", "flush completion was lost"
+      );
+      fence_status = live_binding_fence(binding, expected_owner);
+      if (!fence_status.ok())
+        status = fence_status;
+      else
+        status = step_status;
+    end
+    if (status.ok() && completion != null && completion.status != null &&
+        completion.status.ok()) begin
+      status = live_binding_fence(binding, expected_owner);
+      if (status.ok())
+        status = normalize_status(
+          manager.record_queue_flush_complete(queue_h, target.role),
+          "flush progress returned null");
+      if (status.ok())
+        completed = 1'b1;
+    end
+  endtask
+
   // 功能：在 rdma_queue_lifecycle_executor 中，destroy_locked 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
   // 输入/输出及副作用：binding（输入）、expected_owner（输入）、request（输入）、transaction_id（输入）、result（输出）；输入 handle/mapping/token
   //   指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
@@ -2507,8 +2633,9 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_cmq_ticket ticket;
     rdma_cmq_completion completion;
     bit delete_before_flush, release_context_first, ambiguous, hardware_absent;
+    bit flush_completed;
     rdma_queue_ambiguous_operation_e ambiguous_op;
-    int unsigned i, j, k, count, ref_cursor, ref_role_count;
+    int unsigned i, j;
 
     result = make_result(transaction_id);
     status = rdma_status::success();
@@ -2559,57 +2686,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     if (status.ok()) begin
       policy.hardware_cleanup_roles(flush_roles, flush_phases, delete_before_flush);
       policy.local_cleanup_roles(local_roles, release_context_first);
-      if (flush_roles.size() != flush_phases.size())
-        status = invalid_state("cleanup recipe phase mismatch");
-      foreach (flush_roles[k]) begin
-        count = 0;
-        foreach (plan.flush_targets[j]) begin
-          if (plan.flush_targets[j] != null &&
-              plan.flush_targets[j].role == flush_roles[k] &&
-              plan.flush_targets[j].phase == flush_phases[k])
-            count++;
-        end
-        if (count != 1)
-          status = invalid_state("cleanup recipe role missing or duplicated");
-      end
-      foreach (local_roles[k]) begin
-        count = 0;
-        foreach (plan.refs[j]) begin
-          if (plan.refs[j] != null && plan.refs[j].role == local_roles[k])
-            count++;
-        end
-        if (count != 1 &&
-            !(queue.resource_kind() == RDMA_RESOURCE_SRQ &&
-              local_roles[k] == RDMA_QUEUE_ROLE_SRQ_SGB && count == 0))
-          status = invalid_state("local cleanup role missing or duplicated");
-      end
-      if (release_context_first != (plan.context_ref != null))
-        status = invalid_state("local cleanup context recipe mismatch");
-      // cleanup_local() walks refs in reverse planner order; enforce that
-      // planner order exactly projects the policy recipe.  SRQ_SGB is an
-      // optional role for max_sge <= 2, so skip that recipe entry when the
-      // canonical plan intentionally omits it.
-      ref_cursor = plan.refs.size();
-      for (k = 0; k < local_roles.size(); k++) begin
-        ref_role_count = 0;
-        foreach (plan.refs[j]) begin
-          if (plan.refs[j] != null && plan.refs[j].role == local_roles[k])
-            ref_role_count++;
-        end
-        if (ref_role_count == 0 && queue.resource_kind() == RDMA_RESOURCE_SRQ &&
-            local_roles[k] == RDMA_QUEUE_ROLE_SRQ_SGB)
-          continue;
-        if (ref_cursor == 0) begin
-          status = invalid_state("planner local cleanup order diverges from recipe");
-          continue;
-        end
-        ref_cursor--;
-        if (plan.refs[ref_cursor] == null ||
-            plan.refs[ref_cursor].role != local_roles[k])
-          status = invalid_state("planner local cleanup order diverges from recipe");
-      end
-      if (ref_cursor != 0)
-        status = invalid_state("planner local cleanup has unlisted roles");
+      status = rdma_queue_cleanup_recipe_policy::validate(
+        queue.resource_kind(), plan, flush_roles, flush_phases,
+        release_context_first, local_roles
+      );
     end
     if (status.ok()) status = live_binding_fence(binding, expected_owner);
     if (status.ok()) status = normalize_status(manager.begin_quiesce(queue.handle), "queue begin quiesce returned null");
@@ -2620,43 +2700,15 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         for (i = 0; i < flush_roles.size(); i++) begin
           foreach (plan.flush_targets[j]) begin
             if (plan.flush_targets[j].role == flush_roles[i]) begin
-              ticket = null;
-              completion = null;
-              command = null;
-              ambiguous = 1'b0;
-              status = normalize_status(policy.build_flush_command(
-                expected_owner, plan.flush_targets[j], command_timeout, command
-              ), "flush descriptor returned null");
-              if (status.ok()) begin
-                ticket = null;
-                completion = null;
-                step_status = null;
-                execute_queue_command(
-                  command, ticket, completion, step_status, ambiguous,
-                  null, null, "flush result was lost",
-                  "flush completion was lost"
-                );
-                fence_status = live_binding_fence(binding, expected_owner);
-                if (!fence_status.ok()) begin
-                  status = fence_status;
-                  break;
-                end
-                status = step_status;
-              end
+              execute_destroy_flush_step(
+                binding, expected_owner, policy, plan.flush_targets[j],
+                queue.handle, status, ticket, completion, ambiguous,
+                flush_completed
+              );
               if (ambiguous)
                 ambiguous_op = RDMA_QUEUE_AMBIG_OCC_FLUSH;
-              if (status.ok() && completion != null &&
-                  completion.status != null && completion.status.ok()) begin
-                status = live_binding_fence(binding, expected_owner);
-                if (status.ok())
-                  status = normalize_status(
-                    manager.record_queue_flush_complete(
-                      queue.handle, flush_roles[i]),
-                    "flush progress returned null");
-                if (status.ok())
-                  result.completed_steps.push_back(
-                    RDMA_CTRL_STEP_HW_OCC_FLUSHED);
-              end
+              if (flush_completed)
+                result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
               if (!status.ok())
                 break;
             end
@@ -2700,43 +2752,15 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         for (i = 0; i < flush_roles.size(); i++) begin
           foreach (plan.flush_targets[j]) begin
             if (plan.flush_targets[j].role == flush_roles[i]) begin
-              ticket = null;
-              completion = null;
-              command = null;
-              ambiguous = 1'b0;
-              status = normalize_status(policy.build_flush_command(
-                expected_owner, plan.flush_targets[j], command_timeout, command
-              ), "flush descriptor returned null");
-              if (status.ok()) begin
-                ticket = null;
-                completion = null;
-                step_status = null;
-                execute_queue_command(
-                  command, ticket, completion, step_status, ambiguous,
-                  null, null, "flush result was lost",
-                  "flush completion was lost"
-                );
-                fence_status = live_binding_fence(binding, expected_owner);
-                if (!fence_status.ok()) begin
-                  status = fence_status;
-                  break;
-                end
-                status = step_status;
-              end
+              execute_destroy_flush_step(
+                binding, expected_owner, policy, plan.flush_targets[j],
+                queue.handle, status, ticket, completion, ambiguous,
+                flush_completed
+              );
               if (ambiguous)
                 ambiguous_op = RDMA_QUEUE_AMBIG_OCC_FLUSH;
-              if (status.ok() && completion != null &&
-                  completion.status != null && completion.status.ok()) begin
-                status = live_binding_fence(binding, expected_owner);
-                if (status.ok())
-                  status = normalize_status(
-                    manager.record_queue_flush_complete(
-                      queue.handle, flush_roles[i]),
-                    "flush progress returned null");
-                if (status.ok())
-                  result.completed_steps.push_back(
-                    RDMA_CTRL_STEP_HW_OCC_FLUSHED);
-              end
+              if (flush_completed)
+                result.completed_steps.push_back(RDMA_CTRL_STEP_HW_OCC_FLUSHED);
               if (!status.ok())
                 break;
             end

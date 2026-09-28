@@ -278,24 +278,6 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：backing_role_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
-  // 输入/输出及副作用：spec（输入）、role（输入）；backing_role_count 读取 spec、role 并使用字段 count；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：backing_role_count 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
-  protected function int unsigned backing_role_count(
-    rdma_queue_backing_spec spec,
-    rdma_queue_backing_role_e role
-  );
-    int unsigned count;
-    count = 0;
-    if (spec == null)
-      return 0;
-    foreach (spec.slices[i]) begin
-      if (spec.slices[i] != null && spec.slices[i].role == role)
-        count++;
-    end
-    return count;
-  endfunction
-
   // 功能：在 rdma_queue_lifecycle_policy 中，clone_backing_spec 将 rhs 中 rdma_queue_lifecycle_policy 的值字段复制到当前对象，建立与源对象隔离的快照。
   // 输入/输出及副作用：source（输入）、result（输出）；clone_backing_spec 读取 source、result 并使用字段 result、cloned_object，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：source 为空或 clone 类型不是 rdma_queue_backing_spec 时返回错误，不产生部分有效快照。
@@ -1089,15 +1071,12 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     if (!status.ok())
       return status;
     if (cq_request.ring_backing.mode == RDMA_QUEUE_BACKING_BORROWED) begin
-      foreach (cq_request.ring_backing.slices[i]) begin
-        if (cq_request.ring_backing.slices[i] == null ||
-            cq_request.ring_backing.slices[i].role !=
-              RDMA_QUEUE_ROLE_CQ_RING)
-          return invalid_argument("CQ borrowed backing has an invalid role");
-      end
-      if (backing_role_count(cq_request.ring_backing,
-                             RDMA_QUEUE_ROLE_CQ_RING) == 0)
-        return invalid_argument("CQ borrowed backing omits CQ_RING");
+      status = rdma_queue_borrowed_role_policy::validate_single_role(
+        cq_request.ring_backing, RDMA_QUEUE_ROLE_CQ_RING,
+        "CQ borrowed backing has an invalid role",
+        "CQ borrowed backing omits CQ_RING"
+      );
+      if (!status.ok()) return status;
     end
     status = checked_ring_layout("cq_preflight_ring",
       RDMA_QUEUE_ROLE_CQ_RING, cq_request.depth, cq_request.cqe_size_bytes,
@@ -1388,37 +1367,26 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       return invalid_argument("SRQ policy requires rdma_create_srq_req");
     status = common_preflight_status(binding, srq_request, manager, owner);
     if (!status.ok()) return status;
-    if (srq_request.depth < binding.queue_caps.min_srq_depth ||
-        srq_request.depth > binding.queue_caps.max_srq_depth)
-      return invalid_argument("SRQ depth exceeds Function capability");
-    if (srq_request.max_sge == 0 ||
-        srq_request.max_sge > binding.queue_caps.max_wq_sge)
-      return invalid_argument("SRQ maximum SGE exceeds Function capability");
-    if (srq_request.limit_threshold / 4 > 14'h3fff)
-      return invalid_argument("SRQ encoded limit exceeds 14 bits");
+    status = rdma_srq_preflight_value_policy::validate_limits(
+      srq_request.depth,
+      srq_request.max_sge,
+      srq_request.limit_threshold,
+      binding.queue_caps.min_srq_depth,
+      binding.queue_caps.max_srq_depth,
+      binding.queue_caps.max_wq_sge
+    );
+    if (!status.ok()) return status;
     status = dependency_status(manager, owner, srq_request.pd_h,
                                RDMA_RESOURCE_PD, 1'b0);
     if (!status.ok()) return status;
-    need_sgb = srq_request.max_sge > 2;
+    need_sgb = rdma_srq_preflight_value_policy::requires_sgb(
+      srq_request.max_sge
+    );
     if (srq_request.payload_backing.mode == RDMA_QUEUE_BACKING_BORROWED) begin
-      foreach (srq_request.payload_backing.slices[i]) begin
-        if (srq_request.payload_backing.slices[i] == null ||
-            !(srq_request.payload_backing.slices[i].role inside {
-              RDMA_QUEUE_ROLE_SRQ_RING, RDMA_QUEUE_ROLE_SRFQ_RING,
-              RDMA_QUEUE_ROLE_SRQ_SGB}))
-          return invalid_argument("SRQ borrowed backing has an invalid role");
-        if (!need_sgb && srq_request.payload_backing.slices[i].role ==
-                         RDMA_QUEUE_ROLE_SRQ_SGB)
-          return invalid_argument("SRQ borrowed backing has an extra SGB");
-      end
-      if (backing_role_count(srq_request.payload_backing,
-                             RDMA_QUEUE_ROLE_SRQ_RING) == 0 ||
-          backing_role_count(srq_request.payload_backing,
-                             RDMA_QUEUE_ROLE_SRFQ_RING) == 0 ||
-          (need_sgb &&
-           backing_role_count(srq_request.payload_backing,
-                              RDMA_QUEUE_ROLE_SRQ_SGB) == 0))
-        return invalid_argument("SRQ borrowed backing omits a required role");
+      status = rdma_srq_preflight_value_policy::validate_borrowed_backing(
+        srq_request.payload_backing, need_sgb
+      );
+      if (!status.ok()) return status;
     end
     candidate = rdma_queue_preflight::type_id::create("srq_preflight");
     candidate.resource_kind = RDMA_RESOURCE_SRQ;
@@ -1605,36 +1573,43 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
   endfunction
 
   // 功能：在 rdma_srq_lifecycle_policy 中，hardware_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
-  // 输入/输出及副作用：flush_roles（输出）、flush_phases（输出）、delete_before_flush（输出）；hardware_cleanup_roles 读取 flush_roles、flush_phases、delete_before_flush 并使用字段 delete_before_flush，并写入 flush_roles、flush_phases、delete_before_flush；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：hardware_cleanup_roles 无返回值，仅执行 delete_before_flush=1'b0；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 输入/输出及副作用：flush_roles、flush_phases、delete_before_flush（输出）；
+  //   hardware_cleanup_roles 从 detached SRQ value policy 复制 SRFQ_PD→SRQ_PD 的
+  //   PRE_DELETE recipe，不修改 queue、QP dependency 或 manager 账本。
+  // 失败/边界：hardware_cleanup_roles 无返回值且当前 policy 固定
+  //   delete_before_flush=1'b0；调用方仍须在 CMQ completion 后记录 flush 进度，
+  //   不能把 recipe 当作成功证据。
   virtual function void hardware_cleanup_roles(
     output rdma_queue_backing_role_e flush_roles[$],
     output rdma_queue_flush_phase_e flush_phases[$],
     output bit delete_before_flush
   );
-    flush_roles.delete();
-    flush_phases.delete();
-    delete_before_flush = 1'b0;
-    flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
-    flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
-    flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
-    flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
+    rdma_queue_backing_role_e local_roles[$];
+    bit release_context_first;
+
+    rdma_srq_destroy_value_policy(
+      1'b1, flush_roles, flush_phases, delete_before_flush,
+      local_roles, release_context_first);
   endfunction
 
   // 功能：在 rdma_srq_lifecycle_policy 中，local_cleanup_roles 返回该资源策略要求的硬件 flush 与本地释放角色及其执行顺序。
-  // 输入/输出及副作用：roles（输出）、release_context_first（输出）；local_cleanup_roles 读取 roles、release_context_first 并使用字段 release_context_first，并写入 roles、release_context_first；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：local_cleanup_roles 无返回值，仅执行 release_context_first=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 输入/输出及副作用：roles、release_context_first（输出）；local_cleanup_roles
+  //   从 detached SRQ value policy 复制 SRFQ_PD→SRQ_PD→可选 SRQ_SGB→SRFQ_RING
+  //   →SRQ_RING 的逆向释放 recipe，不修改 queue、QP dependency 或 manager 账本。
+  // 失败/边界：local_cleanup_roles 无返回值且 canonical policy 保留 SRQ_SGB
+  //   作为可选 recipe entry；destroy executor 会按实际 plan.refs 豁免缺失的
+  //   max_sge<=2 SGB，不能提前释放 borrowed backing。
   virtual function void local_cleanup_roles(
     output rdma_queue_backing_role_e roles[$],
     output bit release_context_first
   );
-    roles.delete();
-    release_context_first = 1'b1;
-    roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
-    roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
-    roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB);
-    roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING);
-    roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING);
+    rdma_queue_backing_role_e flush_roles[$];
+    rdma_queue_flush_phase_e flush_phases[$];
+    bit delete_before_flush;
+
+    rdma_srq_destroy_value_policy(
+      1'b1, flush_roles, flush_phases, delete_before_flush,
+      roles, release_context_first);
   endfunction
 endclass
 
@@ -1713,15 +1688,12 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     if (vector.hardware_eq_vector > 16'hffff)
       return invalid_argument("CEQ hardware vector exceeds 16 bits");
     if (ceq_request.ring_backing.mode == RDMA_QUEUE_BACKING_BORROWED) begin
-      foreach (ceq_request.ring_backing.slices[i]) begin
-        if (ceq_request.ring_backing.slices[i] == null ||
-            ceq_request.ring_backing.slices[i].role !=
-              RDMA_QUEUE_ROLE_CEQ_RING)
-          return invalid_argument("CEQ borrowed backing has an invalid role");
-      end
-      if (backing_role_count(ceq_request.ring_backing,
-                             RDMA_QUEUE_ROLE_CEQ_RING) == 0)
-        return invalid_argument("CEQ borrowed backing omits CEQ_RING");
+      status = rdma_queue_borrowed_role_policy::validate_single_role(
+        ceq_request.ring_backing, RDMA_QUEUE_ROLE_CEQ_RING,
+        "CEQ borrowed backing has an invalid role",
+        "CEQ borrowed backing omits CEQ_RING"
+      );
+      if (!status.ok()) return status;
     end
     status = checked_ring_layout("ceq_preflight_ring",
       RDMA_QUEUE_ROLE_CEQ_RING, ceq_request.depth, 16, 1'b1,
@@ -1968,15 +1940,12 @@ class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     if (vector.hardware_eq_vector > 16'hffff)
       return invalid_argument("AEQ hardware vector exceeds 16 bits");
     if (aeq_request.ring_backing.mode == RDMA_QUEUE_BACKING_BORROWED) begin
-      foreach (aeq_request.ring_backing.slices[i]) begin
-        if (aeq_request.ring_backing.slices[i] == null ||
-            aeq_request.ring_backing.slices[i].role !=
-              RDMA_QUEUE_ROLE_AEQ_RING)
-          return invalid_argument("AEQ borrowed backing has an invalid role");
-      end
-      if (backing_role_count(aeq_request.ring_backing,
-                             RDMA_QUEUE_ROLE_AEQ_RING) == 0)
-        return invalid_argument("AEQ borrowed backing omits AEQ_RING");
+      status = rdma_queue_borrowed_role_policy::validate_single_role(
+        aeq_request.ring_backing, RDMA_QUEUE_ROLE_AEQ_RING,
+        "AEQ borrowed backing has an invalid role",
+        "AEQ borrowed backing omits AEQ_RING"
+      );
+      if (!status.ok()) return status;
     end
     status = checked_ring_layout("aeq_preflight_ring",
       RDMA_QUEUE_ROLE_AEQ_RING, aeq_request.depth, 16, 1'b1,

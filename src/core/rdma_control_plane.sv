@@ -104,18 +104,15 @@ class rdma_control_plane extends uvm_object;
     output rdma_cmq_completion completion,
     output rdma_status status
   );
-    ticket = null;
-    completion = null;
-    status = null;
-    if (cmq == null) begin
-      status = invalid_state("control-plane CMQ is unavailable");
-      return;
-    end
-    if (command == null) begin
-      status = invalid_argument("control-plane CMQ command is null");
-      return;
-    end
-    cmq.execute(command, ticket, completion, status);
+    rdma_cmq_dispatch_legacy_raw(
+      cmq,
+      command,
+      ticket,
+      completion,
+      status,
+      "control-plane CMQ is unavailable",
+      "control-plane CMQ command is null"
+    );
   endtask
 
   // 功能：在 rdma_control_plane 中，execute_control_command 在原始 CMQ dispatch
@@ -140,19 +137,41 @@ class rdma_control_plane extends uvm_object;
     status = checked_status(status, null_status_message);
   endtask
 
-  // 功能：make_result 创建独立的 rdma_control_result；根据 调用方输入 设置字段 result、pending_status、result.status、result.primary_status、result.final_resource_state、result.recovery_required，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：无显式参数；make_result 读取局部计算结果，并使用字段 result、pending_status、result.status、result.primary_status、result.final_resource_state、result.recovery_required；函数返回 rdma_control_result，不取得调用方资源所有权。
-  // 失败/边界：make_result 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：make_result 通过 control 域 lifecycle result seed 建立 detached 的未完成
+  //   rdma_control_result，供 PD/MR/CQ/QP 等控制面入口在同一结果契约上追加业务阶段。
+  // 输入/输出及副作用：无显式参数；返回写入 status、primary_status、初始资源状态
+  //   和 recovery 标志的 result，只访问本地 seed，不取得 manager、CMQ 或外部 adapter
+  //   所有权。
+  // 失败/边界：seed 分配或初始化失败时返回带 INVALID_STATE 的结果；transaction_id
+  //   仍由调用入口在原有分配窗口写入，函数不提前改变 exhaustion、错误优先级或提交顺序。
   protected function rdma_control_result make_result();
     rdma_control_result result;
-    rdma_status pending_status;
+    rdma_lifecycle_result_seed seed;
+    rdma_status seed_status;
 
     result = new("control_result");
-    pending_status = invalid_state("control-plane operation did not complete");
-    result.status = rdma_cmq_clone_status_value(pending_status);
-    result.primary_status = rdma_cmq_clone_status_value(pending_status);
-    result.final_resource_state = RDMA_RESOURCE_NEW;
-    result.recovery_required = 1'b0;
+    seed = rdma_lifecycle_result_seed::type_id::create(
+      "control_result_seed"
+    );
+    if (seed == null) begin
+      result.status = invalid_state(
+        "control-plane result seed allocation failed"
+      );
+      result.primary_status = rdma_cmq_clone_status_value(result.status);
+      return result;
+    end
+    seed.domain = RDMA_LIFECYCLE_DOMAIN_CONTROL;
+    seed.pending_message = "control-plane operation did not complete";
+    seed_status = seed.initialize_result(result);
+    if (seed_status == null || !seed_status.ok()) begin
+      result.status = invalid_state(
+        "control-plane result seed initialization failed"
+      );
+      result.primary_status = rdma_cmq_clone_status_value(result.status);
+      result.final_resource_state = RDMA_RESOURCE_NEW;
+      result.final_resource_state_known = 1'b0;
+      result.recovery_required = 1'b0;
+    end
     return result;
   endfunction
 
