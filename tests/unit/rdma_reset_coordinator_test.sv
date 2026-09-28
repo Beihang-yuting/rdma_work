@@ -255,11 +255,71 @@ class rdma_reset_coordinator_test extends uvm_test;
     rdma_function_handle authority_handle;
     rdma_route_key_t authority_route;
     rdma_reset_epoch_t authority_epoch;
+    rdma_reset_epoch_t source_epochs[string];
+    rdma_reset_epoch_candidate epoch_candidate;
     rdma_status foreign_status;
     longint unsigned foreign_token;
 
     phase.raise_objection(this);
+    source_epochs.delete();
+    source_epochs["pf0"] = 64'd3;
+    source_epochs["vf0"] = 64'd7;
+    epoch_candidate = rdma_reset_epoch_candidate::type_id::create(
+      "epoch_candidate_fixture"
+    );
+    status = epoch_candidate.capture_function_epochs(source_epochs);
+    if (status == null || !status.ok() ||
+        epoch_candidate.function_epochs["pf0"] != 64'd3 ||
+        epoch_candidate.function_epochs["vf0"] != 64'd7)
+      `uvm_error("RESET_CANDIDATE", "epoch candidate capture failed")
+    source_epochs["pf0"] = 64'd99;
+    if (epoch_candidate.function_epochs["pf0"] != 64'd3)
+      `uvm_error("RESET_CANDIDATE", "epoch candidate aliases source map")
+    status = epoch_candidate.validate();
+    if (status == null || !status.ok())
+      `uvm_error("RESET_CANDIDATE", "valid reset snapshot was rejected")
+    epoch_candidate.clear();
+    if (epoch_candidate.function_epochs.size() != 0 || epoch_candidate.valid)
+      `uvm_error("RESET_CANDIDATE", "epoch candidate clear left staged state")
+    status = epoch_candidate.validate();
+    if (status == null || status.ok() || status.code != RDMA_SC_INVALID_STATE)
+      `uvm_error("RESET_CANDIDATE", "cleared reset candidate was accepted")
+
     coordinator = rdma_reset_coordinator::type_id::create("coordinator");
+
+    // Batch185 detached admission policy matrix：先验证 tokenless 数据面在 publication、
+    // transaction 和 cleanup 组合下的纯值结果，再由 coordinator/router 场景证明 wrapper
+    // 仍沿用同一判定。policy 不持有 coordinator 状态，不会把同步 guard 误报成全局锁。
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b0, 1'b0, 1'b0, "idle read"
+    );
+    if (status == null || !status.ok())
+      `uvm_error("RESET_ADMISSION_POLICY", "idle dataplane was rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b1, 1'b0, 1'b0, "publication write"
+    );
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "publication-active dataplane was not rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b0, 1'b1, 1'b0, "transaction allocate"
+    );
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "transaction-active dataplane was not rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b1, 1'b1, 1'b0, "nested reset read"
+    );
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "combined reset-active dataplane was not rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b1, 1'b1, 1'b1, "rollback release"
+    );
+    if (status == null || !status.ok())
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "cleanup dataplane was blocked during reset")
+
     pf0 = make_identity(0, 0, RDMA_FUNCTION_PF, 0, 16'h0100, 0, 10);
     vf0 = make_identity(0, 0, RDMA_FUNCTION_VF, 1, 16'h0101, 16'h0100, 11);
     pf1 = make_identity(1, 1, RDMA_FUNCTION_PF, 0, 16'h0100, 0, 20);

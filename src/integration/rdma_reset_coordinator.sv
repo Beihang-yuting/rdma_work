@@ -61,6 +61,36 @@ class rdma_reset_router_epoch_capability extends uvm_object;
   endfunction
 endclass
 
+// 设计说明：tokenless Host-router 数据面需要在访问外部 manager 前完成同一份 reset
+// admission 判定，但该判定不能读取或改变 coordinator 的 owner、epoch 或 router ledger。
+// 将两个 active 标志和 cleanup 意图冻结为 detached policy，让 allocate/write/read 与
+// release/release_opaque 共用明确的同步边界，也便于测试完整覆盖组合而不伪造并发锁。
+class rdma_reset_tokenless_admission_policy;
+
+  // 功能：根据同步 publication guard、leased reset transaction 和 cleanup 意图，决定
+  //       tokenless Host-router 数据面操作是否可以继续访问外部 manager。
+  // 输入/输出及副作用：publication_active、transaction_active（输入）分别表示同步
+  //       publication 窗口和 reset transaction 是否 active；allow_cleanup（输入）表示
+  //       调用方是否明确执行 stale-drain/rollback；operation_name（输入）用于错误诊断；
+  //       返回 detached rdma_status，不读取或修改 coordinator、router 或 epoch ledger。
+  // 失败/边界：任一 reset 标志 active 且 allow_cleanup=0 时返回 RESOURCE_BUSY；cleanup
+  //       意图或两个标志均 inactive 时返回 OK。该 policy 只描述同步 admission，不提供
+  //       跨线程、跨进程或仿真调度级互斥，调用方仍须执行 mapping authority/retry 校验。
+  static function rdma_status evaluate(
+    bit publication_active,
+    bit transaction_active,
+    bit allow_cleanup,
+    string operation_name
+  );
+    if (!allow_cleanup && (publication_active || transaction_active))
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        {"Host router dataplane blocked during reset: ", operation_name}
+      );
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_reset_coordinator extends uvm_object;
   `uvm_object_utils(rdma_reset_coordinator)
   protected rdma_reset_epoch_t m_function_epochs[string];
@@ -343,24 +373,37 @@ class rdma_reset_coordinator extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：为一个已经完成 scope 选择的 Function 名称队列构造 detached epoch map，先验证
-  //       每个条目的登记/容量，再把所有下一值写入局部 map，供 reset 事务在最后一步整体替换。
-  // 输入/输出及副作用：function_names（输入）列出本次要 bump 的 stable key；staged_epochs（输出）
-  //   获得 m_function_epochs 的独立 staged 值图；函数只读当前 ledger，不修改 coordinator、
+  // 功能：为一个已经完成 scope 选择的 Function 名称队列构造 detached epoch candidate，先验证
+  //       每个条目的登记/容量，再把所有下一值写入 candidate map，供 reset 事务在最后一步整体替换。
+  // 输入/输出及副作用：function_names（输入）列出本次要 bump 的 stable key；candidate（输出）
+  //   获得 m_function_epochs 的独立 snapshot 和递增值；函数只读当前 ledger，不修改 coordinator、
   //   Host router 或外部 identity。
   // 失败/边界：名称重复、条目缺失/null、容量预检失败、当前 counter 已达最大值或内部校验返回
-  //   null 时返回错误且 staged map 不得被调用方提交；成功后调用方只能在其它 scope 预检均通过时
+  //   null 时返回错误且 candidate 不得被调用方提交；成功后调用方只能在其它 scope 预检均通过时
   //   一次性赋值 m_function_epochs，避免逐条 bump 造成部分提交。
   protected function rdma_status prepare_function_epoch_commit(
     string function_names[$],
-    output rdma_reset_epoch_t staged_epochs[string]
+    output rdma_reset_epoch_candidate candidate
   );
     string name;
     bit seen[string];
     rdma_status status;
     rdma_reset_epoch_t current_epoch;
 
-    staged_epochs = m_function_epochs;
+    candidate = rdma_reset_epoch_candidate::type_id::create(
+      "function_epoch_candidate"
+    );
+    if (candidate == null)
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_EXHAUSTED,
+        "Function epoch candidate allocation failed"
+      );
+    status = candidate.capture_function_epochs(m_function_epochs);
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function epoch candidate capture returned null"
+      ) : status;
     foreach (function_names[index]) begin
       name = function_names[index];
       if (seen.exists(name))
@@ -376,14 +419,21 @@ class rdma_reset_coordinator extends uvm_object;
             RDMA_SC_INVALID_STATE,
             "Function epoch staging capacity validation returned null"
           ) : status;
-      current_epoch = staged_epochs.exists(name) ? staged_epochs[name] : 0;
+      current_epoch = candidate.function_epochs.exists(name) ?
+                       candidate.function_epochs[name] : 0;
       if (current_epoch == 64'hffff_ffff_ffff_ffff)
         return rdma_status::make(
           RDMA_SC_RESOURCE_EXHAUSTED,
           "Function epoch staging counter is exhausted"
         );
-      staged_epochs[name] = current_epoch + 1;
+      candidate.function_epochs[name] = current_epoch + 1;
     end
+    status = candidate.validate();
+    if (status == null || !status.ok())
+      return status == null ? rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        "Function epoch candidate validation returned null"
+      ) : status;
     return rdma_status::success();
   endfunction
 
@@ -668,13 +718,12 @@ class rdma_reset_coordinator extends uvm_object;
     string operation_name,
     bit allow_cleanup = 1'b0
   );
-    if (!allow_cleanup &&
-        (m_reset_operation_active || m_reset_transaction_active))
-      return rdma_status::make(
-        RDMA_SC_RESOURCE_BUSY,
-        {"Host router dataplane blocked during reset: ", operation_name}
-      );
-    return rdma_status::success();
+    return rdma_reset_tokenless_admission_policy::evaluate(
+      m_reset_operation_active,
+      m_reset_transaction_active,
+      allow_cleanup,
+      operation_name
+    );
   endfunction
 
   // 功能：以一次性 capability 授权 router 完成 legacy coordinator facade 的同步 attach，
@@ -1488,7 +1537,7 @@ class rdma_reset_coordinator extends uvm_object;
     uvm_object owner = null,
     longint unsigned lease_token = 0
   );
-    rdma_reset_epoch_t staged_epochs[string];
+    rdma_reset_epoch_candidate candidate;
     string function_names[$];
     rdma_status status;
 
@@ -1514,14 +1563,15 @@ class rdma_reset_coordinator extends uvm_object;
                           "registered Function validation returned null") :
         status;
     function_names.push_back(identity_name(identity));
-    status = prepare_function_epoch_commit(function_names, staged_epochs);
+    status = prepare_function_epoch_commit(function_names, candidate);
     if (status == null || !status.ok())
       return status == null ?
         rdma_status::make_direct(
           RDMA_SC_INVALID_STATE,
           "Function epoch staging returned null"
         ) : status;
-    m_function_epochs = staged_epochs;
+    m_function_epochs = candidate.function_epochs;
+    candidate.clear();
     return rdma_status::success();
   endfunction
   // 功能：执行 PF reset，收集目标 PF 及其同 Host、同 root、同 parent BDF 的所有 VF，并整体
@@ -1536,7 +1586,7 @@ class rdma_reset_coordinator extends uvm_object;
     uvm_object owner = null,
     longint unsigned lease_token = 0
   );
-    rdma_reset_epoch_t staged_epochs[string];
+    rdma_reset_epoch_candidate candidate;
     string function_names[$];
     rdma_status status;
     string name;
@@ -1580,14 +1630,15 @@ class rdma_reset_coordinator extends uvm_object;
         function_names.push_back(name);
       end
     end
-    status = prepare_function_epoch_commit(function_names, staged_epochs);
+    status = prepare_function_epoch_commit(function_names, candidate);
     if (status == null || !status.ok())
       return status == null ?
         rdma_status::make_direct(
           RDMA_SC_INVALID_STATE,
           "PF reset scope epoch staging returned null"
         ) : status;
-    m_function_epochs = staged_epochs;
+    m_function_epochs = candidate.function_epochs;
+    candidate.clear();
     return rdma_status::success();
   endfunction
   // 功能：推进指定 Host epoch，并对该 Host 上登记的全部 Function 构造一次性级联 bump。
@@ -1602,7 +1653,7 @@ class rdma_reset_coordinator extends uvm_object;
     uvm_object owner = null,
     longint unsigned lease_token = 0
   );
-    rdma_reset_epoch_t staged_epochs[string];
+    rdma_reset_epoch_candidate candidate;
     string function_names[$];
     rdma_status router_status;
     rdma_status status;
@@ -1644,7 +1695,7 @@ class rdma_reset_coordinator extends uvm_object;
         function_names.push_back(name);
       end
     end
-    status = prepare_function_epoch_commit(function_names, staged_epochs);
+    status = prepare_function_epoch_commit(function_names, candidate);
     if (status == null || !status.ok())
       return status == null ?
         rdma_status::make_direct(
@@ -1668,7 +1719,8 @@ class rdma_reset_coordinator extends uvm_object;
     end
     m_host_epochs[host_topology_key] = m_host_epochs.exists(host_topology_key) ?
                                        m_host_epochs[host_topology_key] + 1 : 1;
-    m_function_epochs = staged_epochs;
+    m_function_epochs = candidate.function_epochs;
+    candidate.clear();
     return rdma_status::success();
   endfunction
   // 功能：推进全局 Device epoch，并使所有已登记 Function 的 DMA 身份通过同一 staged map 同时失效。
@@ -1680,7 +1732,7 @@ class rdma_reset_coordinator extends uvm_object;
     uvm_object owner = null,
     longint unsigned lease_token = 0
   );
-    rdma_reset_epoch_t staged_epochs[string];
+    rdma_reset_epoch_candidate candidate;
     string function_names[$];
     string name;
     rdma_status status;
@@ -1706,7 +1758,7 @@ class rdma_reset_coordinator extends uvm_object;
         );
       function_names.push_back(name);
     end
-    status = prepare_function_epoch_commit(function_names, staged_epochs);
+    status = prepare_function_epoch_commit(function_names, candidate);
     if (status == null || !status.ok())
       return status == null ?
         rdma_status::make_direct(
@@ -1714,7 +1766,8 @@ class rdma_reset_coordinator extends uvm_object;
           "Device reset scope epoch staging returned null"
         ) : status;
     m_device_epoch++;
-    m_function_epochs = staged_epochs;
+    m_function_epochs = candidate.function_epochs;
+    candidate.clear();
     return rdma_status::success();
   endfunction
 

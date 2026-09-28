@@ -702,7 +702,10 @@ class rdma_multivf_recovery_test extends uvm_test;
       abandon_fixture("CQE fixture construction", status);
       return;
     end
-    cqe_fixture.setup(status);
+    // CQ poll follows the 0.1.34 driver path, which publishes consumer CI through
+    // the CQC context shadow; enable that backing explicitly instead of relying on
+    // the fixture's default no-shadow mode used by MMIO-only unit probes.
+    cqe_fixture.setup(status, 16, RDMA_CQE_BYTES, 16, 16, 1'b1);
     if (status == null || !status.ok()) begin
       `uvm_error("MULTIVF_CQE", status == null ?
                  "CQE fixture setup returned null" : status.convert2string())
