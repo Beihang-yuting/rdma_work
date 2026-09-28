@@ -46,6 +46,46 @@ typedef enum bit [1:0] { RDMA_QUEUE_AMBIG_NONE,
                          RDMA_QUEUE_AMBIG_OCC_FLUSH }
   rdma_queue_ambiguous_operation_e;
 
+// 中文设计：SRQ destroy 同时受硬件 OCC flush、SRQC delete、context release
+// 和 backing detach 的顺序约束；其中 SRQ_SGB 只在 max_sge>2 时存在。把这组
+// 不携带对象引用的值规则放在 model 层，policy 与 executor 只消费同一份 detached
+// recipe，避免在跨资源 QP→SRQ dependency guard 旁边复制角色顺序或误提交半份清理。
+// 功能：rdma_srq_destroy_value_policy 生成 SRQ 销毁所需的硬件 flush 与本地 backing
+//       释放顺序，供 SRQ lifecycle policy 在 destroy/recovery 路径中投影为独立数组。
+// 输入/输出及副作用：include_optional_sgb（输入）决定 local_roles 是否包含可选
+//       RDMA_QUEUE_ROLE_SRQ_SGB；flush_roles、flush_phases、local_roles 和两个顺序
+//       标志（输出）均为新写入的值数组/标志，不读取或修改 SRQ/QP/manager 对象。
+// 失败/边界：函数没有失败返回；include_optional_sgb=0 只省略 SRQ_SGB，仍保留
+//       SRFQ_PD→SRQ_PD flush 以及 SRFQ_PD→SRQ_PD→SRFQ_RING→SRQ_RING 释放顺序；
+//       调用方不得把该值 recipe 当作 backing ownership 或 hardware completion 证据。
+function automatic void rdma_srq_destroy_value_policy(
+  input bit include_optional_sgb,
+  output rdma_queue_backing_role_e flush_roles[$],
+  output rdma_queue_flush_phase_e flush_phases[$],
+  output bit delete_before_flush,
+  output rdma_queue_backing_role_e local_roles[$],
+  output bit release_context_first
+);
+  flush_roles.delete();
+  flush_phases.delete();
+  local_roles.delete();
+
+  delete_before_flush = 1'b0;
+  release_context_first = 1'b1;
+
+  flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
+  flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
+  flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
+  flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
+
+  local_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
+  local_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
+  if (include_optional_sgb)
+    local_roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB);
+  local_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING);
+  local_roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING);
+endfunction
+
 // 功能：rdma_queue_nested_status 将 queue lifecycle 模型依赖的嵌套 virtual
 //       validator 结果归一化为可安全消费的 rdma_status。
 // 输入/输出及副作用：status（输入）和 label（输入）；非空 status 原样返回，
