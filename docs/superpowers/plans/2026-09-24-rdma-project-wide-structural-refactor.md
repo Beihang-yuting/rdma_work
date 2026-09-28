@@ -3,8 +3,13 @@
 日期：2026-09-24。基线工作树：`feature/rdma-cmq-structural-phase2-batch160`。
 
 2026-09-28 本地合并：Batch160–221 已进入 `main` 的 `5f8dfe9`；主线原有 reset
-改动保存在 `bec0f8f`。后续工作树/分支为 `.worktrees/rdma-structural-batch222` /
-`feature/rdma-structural-batch222`，不推送远端。
+改动保存在 `bec0f8f`。本轮再将 `feature/rdma-structural-batch222` 的 Batch222–225
+四个提交快进合入 `main`，源码基线为 `93012a3`；未推送远端。
+原工作树/分支、已有缓存均保留。本轮除合并记录外不修改生产、测试或构建输入，
+沿用 Batch225 与当前源码一致的 VCS53 完整验证证据；不把快进合并称为重新运行仿真。
+合并后 Python 317/317、changed-SV style、lifecycle/profile/Phase-1A 和 diff 门禁通过；
+Python 日志为 `/tmp/rdma_batch225_main_merge_python.log`，style 日志为空。
+下文各批“未合回 main／不合并”均为当时的历史状态，以本段最新合并记录为准。
 
 ## 决策
 
