@@ -412,12 +412,9 @@ package rdma_host_mem_adapter_pkg;
       rdma_status candidate,
       string operation
     );
-      if (candidate == null)
-        return rdma_status::make_direct(
-          RDMA_SC_INVALID_STATE,
-          {"Host-memory adapter ", operation, " returned null status"}
-        );
-      return candidate;
+      return rdma_adapter_status_policy::normalize(
+        candidate, "Host-memory adapter", operation
+      );
     endfunction
 
     // 功能：在 rdma_host_mem_adapter 中，clone_function_handle 将 rhs 中 rdma_host_mem_adapter 的值字段复制到当前对象，建立与源对象隔离的快照。

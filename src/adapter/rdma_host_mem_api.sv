@@ -17,12 +17,9 @@ virtual class rdma_host_mem_api extends uvm_object;
     rdma_status candidate,
     string operation
   );
-    if (candidate == null)
-      return rdma_status::make_direct(
-        RDMA_SC_INVALID_STATE,
-        {"Host-memory ", operation, " returned null status"}
-      );
-    return candidate;
+    return rdma_adapter_status_policy::normalize(
+      candidate, "Host-memory", operation
+    );
   endfunction
 
   // 功能：构造 rdma_host_mem_api，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。

@@ -13,6 +13,7 @@ package rdma_adapter_pkg;
   import rdma_codec_pkg::*;
   `include "uvm_macros.svh"
 
+  `include "rdma_adapter_status_policy.sv"
   `include "rdma_host_mem_api.sv"
   `include "rdma_queue_host_mem_submitter.sv"
   `include "rdma_context_backing_api.sv"
