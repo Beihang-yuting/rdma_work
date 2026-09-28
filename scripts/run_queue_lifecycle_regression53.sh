@@ -43,6 +43,7 @@ readonly CORE_TESTS=(
   rdma_queue_aeqe_codec_final_fix_test
   rdma_queue_recovery_lifecycle_final_fix_test
   rdma_queue_data_engine_poll_test
+  rdma_host_producer_exit_test
   rdma_queue_data_engine_recovery_test
   rdma_cq_engine_resize_test
   rdma_cq_resize_exit_test

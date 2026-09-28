@@ -14,6 +14,7 @@
 //   仍决定 admission、shadow、幂等跳步、WQE release 和最终交付，runtime 是唯一账本 owner。
 // 设备发布：写入后的四类失败共用 evidence/recovery 收尾；写前取消和 replay 各自保留边界。
 //   准备阶段只生成本次调用的值记录，I/O task 统一处理准备失败取消；记录不成为第二账本。
+// Host 发布：SQ/RQ/SRQ 尾段共享未提交失败的恢复出口，仍按已写入/MMIO 阶段决定 evidence。
 // Resize 提交：发布前失败共享一个 rollback 出口；发布后只保留新 authority 与旧资源
 //   cleanup evidence，不回滚 manager swap，也不新增候选 owner 或延迟字段快照。
 
@@ -8370,10 +8371,12 @@ class rdma_queue_data_engine extends uvm_object;
   //   失败按同一规则保存 WQE evidence。pending clone 失败返回 RESOURCE_EXHAUSTED，
   //   且不伪造 result。SQ shadow gate 合法地返回 status=OK、
   //   doorbell_result=null 时仍继续 commit；正常 recovery admission 保留原始阶段
-  //   status，admission 拒绝或返回 null 时升级为 RECOVERY_REQUIRED，避免调用方把
+  //   status；admission 非空拒绝原样透传，null 归一化为 RECOVERY_REQUIRED，不得把
   //   未接管的 evidence 当作可安全重试。若调用方已完成 SQ SGB 的 Host-memory 写入，
   //   尾段 gate 失败也必须安装同一 cursor/image 的 NO_SUBMIT pending，不能把已发生
   //   的 SGB 副作用伪装成无事务返回。
+  //   七个未提交失败点只选择原 label/MMIO bit，统一调用原 recovery installer；
+  //   无 prior_host_write 的入口拒绝、已提交后的异常和正常成功均直接返回，不进共同出口。
   protected task complete_host_producer_tail(
     rdma_queue_data_attachment attachment,
     rdma_handle queue_h,
@@ -8405,126 +8408,121 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_doorbell_result doorbell_result;
     rdma_status next_status;
     uvm_object raw_result;
+    bit recovery_mmio_maybe_submitted;
+    string recovery_failure_label;
 
     result = null;
     status = null;
     next = null;
     result_candidate = null;
+    recovery_mmio_maybe_submitted = 1'b0;
+    recovery_failure_label = write_failure_label;
 
-    // reservation 返回的是 detached cursor；在 WQE 首次写回前再次确认当前
-    // Function route/epoch，避免编码期间发生 reset 后仍把旧 attachment 当作可写。
-    status = validate_host_producer_reservation_window(attachment, cursor);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("host producer reservation window returned null status",
-                     RDMA_SC_INVALID_STATE);
-      if (prior_host_write) begin
-        install_host_producer_recovery(
-          attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
-          reservation_route, reservation_epoch, reservation_route_valid,
-          reservation_epoch_valid, 1'b0, write_failure_label, status);
+    // 单次循环只统一本次调用的七个未提交失败续接；默认仍是 write/NO_SUBMIT，
+    // doorbell 或 ledger 拒绝才选 AMBIGUOUS。纯入口拒绝和已提交出口直接 return，
+    // 不使用会跨嵌套调用退出的命名块 disable，也不提前构造 pending 或读取 live 字段。
+    do begin : host_producer_io
+      // reservation 返回的是 detached cursor；在 WQE 首次写回前再次确认当前
+      // Function route/epoch，避免编码期间发生 reset 后仍把旧 attachment 当作可写。
+      status = validate_host_producer_reservation_window(attachment, cursor);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = bad("host producer reservation window returned null status",
+                       RDMA_SC_INVALID_STATE);
+        if (!prior_host_write)
+          return;
+        break;
       end
-      return;
-    end
 
-    status = write_and_verify(attachment, offset, image);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("host producer entry write returned null status",
-                     RDMA_SC_DMA_TRANSLATION);
-      install_host_producer_recovery(
-        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
-        reservation_route, reservation_epoch, reservation_route_valid,
-        reservation_epoch_valid, 1'b0, write_failure_label, status);
-      return;
-    end
+      status = write_and_verify(attachment, offset, image);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = bad("host producer entry write returned null status",
+                       RDMA_SC_DMA_TRANSLATION);
+        break;
+      end
 
-    // WQE 已成功写回；先以 nonfatal raw factory 物化 result，避免 hostile
-    // override 在已提交后触发 FCTTYP fatal 或把空 queue handle 伪装成成功。
-    raw_result = value_ops::factory_create_object_nonfatal(
-      rdma_queue_post_result::get_type(), result_name);
-    if (raw_result == null || !$cast(result_candidate, raw_result) ||
-        result_candidate == null) begin
-      result_candidate = null;
-      status = bad("host producer result allocation or cast failed",
-                   RDMA_SC_RESOURCE_EXHAUSTED);
-      install_host_producer_recovery(
-        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
-        reservation_route, reservation_epoch, reservation_route_valid,
-        reservation_epoch_valid, 1'b0, result_name, status);
-      return;
-    end
-    if (!clone_pending_handle_value(
-          queue_h, result_handle_label, result_candidate.queue_h) ||
-        result_candidate.queue_h == null) begin
-      result_candidate = null;
-      status = bad("host producer result queue snapshot allocation failed",
-                   RDMA_SC_RESOURCE_EXHAUSTED);
-      install_host_producer_recovery(
-        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
-        reservation_route, reservation_epoch, reservation_route_valid,
-        reservation_epoch_valid, 1'b0, result_name, status);
-      return;
-    end
+      // WQE 已成功写回；先以 nonfatal raw factory 物化 result，避免 hostile
+      // override 在已提交后触发 FCTTYP fatal 或把空 queue handle 伪装成成功。
+      raw_result = value_ops::factory_create_object_nonfatal(
+        rdma_queue_post_result::get_type(), result_name);
+      if (raw_result == null || !$cast(result_candidate, raw_result) ||
+          result_candidate == null) begin
+        result_candidate = null;
+        status = bad("host producer result allocation or cast failed",
+                     RDMA_SC_RESOURCE_EXHAUSTED);
+        recovery_failure_label = result_name;
+        break;
+      end
+      if (!clone_pending_handle_value(
+            queue_h, result_handle_label, result_candidate.queue_h) ||
+          result_candidate.queue_h == null) begin
+        result_candidate = null;
+        status = bad("host producer result queue snapshot allocation failed",
+                     RDMA_SC_RESOURCE_EXHAUSTED);
+        recovery_failure_label = result_name;
+        break;
+      end
 
-    next_status = make_next_poll_cursor_nonfatal(
-      attachment.runtime, cursor, next_name, next);
-    if (next_status == null || !next_status.ok() || next == null) begin
-      status = next_status == null ?
-        bad("host producer next cursor factory returned null status",
-            RDMA_SC_RESOURCE_EXHAUSTED) :
-        (!next_status.ok() ? next_status :
-         bad("host producer next cursor factory returned null cursor",
-             RDMA_SC_RESOURCE_EXHAUSTED));
-      install_host_producer_recovery(
-        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
-        reservation_route, reservation_epoch, reservation_route_valid,
-        reservation_epoch_valid, 1'b0, next_name, status);
-      return;
-    end
-    submit_producer_doorbell(
-      queue_h, kind, cursor, next, doorbell_sqe_image, local_id,
-      doorbell_result, status);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("host producer doorbell returned null status",
-                     RDMA_SC_INVALID_STATE);
-      install_host_producer_recovery(
-        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
-        reservation_route, reservation_epoch, reservation_route_valid,
-        reservation_epoch_valid, 1'b1, doorbell_failure_label, status);
-      return;
-    end
+      next_status = make_next_poll_cursor_nonfatal(
+        attachment.runtime, cursor, next_name, next);
+      if (next_status == null || !next_status.ok() || next == null) begin
+        status = next_status == null ?
+          bad("host producer next cursor factory returned null status",
+              RDMA_SC_RESOURCE_EXHAUSTED) :
+          (!next_status.ok() ? next_status :
+           bad("host producer next cursor factory returned null cursor",
+               RDMA_SC_RESOURCE_EXHAUSTED));
+        recovery_failure_label = next_name;
+        break;
+      end
+      submit_producer_doorbell(
+        queue_h, kind, cursor, next, doorbell_sqe_image, local_id,
+        doorbell_result, status);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = bad("host producer doorbell returned null status",
+                       RDMA_SC_INVALID_STATE);
+        recovery_mmio_maybe_submitted = 1'b1;
+        recovery_failure_label = doorbell_failure_label;
+        break;
+      end
 
-    status = commit_host_producer_ledger(
-      attachment, cursor, snapshot, wr_id, signaled, image);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("host producer ledger commit returned null status",
-                     RDMA_SC_INVALID_STATE);
-      install_host_producer_recovery(
-        attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
-        reservation_route, reservation_epoch, reservation_route_valid,
-        reservation_epoch_valid, 1'b1, commit_failure_label, status);
-      return;
-    end
+      status = commit_host_producer_ledger(
+        attachment, cursor, snapshot, wr_id, signaled, image);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = bad("host producer ledger commit returned null status",
+                       RDMA_SC_INVALID_STATE);
+        recovery_mmio_maybe_submitted = 1'b1;
+        recovery_failure_label = commit_failure_label;
+        break;
+      end
 
-    // ledger commit 已完成；candidate 已在 doorbell 前完成 factory/cast/handle
-    // 检查，因此这里只填充已提交值并使用 direct status，避免结果 status factory
-    // 失败把已提交事务降格成空 result。
-    result_candidate.wr_id = wr_id;
-    result_candidate.index = cursor.index;
-    result_candidate.wrap = cursor.wrap;
-    result_candidate.image = image;
-    result_candidate.status = rdma_status::make_direct(RDMA_SC_OK);
-    if (result_candidate.status == null) begin
-      result_candidate = null;
-      status = bad("host producer committed result status allocation failed",
-                   RDMA_SC_RECOVERY_REQUIRED);
+      // ledger commit 已完成；candidate 已在 doorbell 前完成 factory/cast/handle
+      // 检查，因此这里只填充已提交值并使用 direct status，避免结果 status factory
+      // 失败把已提交事务降格成空 result。
+      result_candidate.wr_id = wr_id;
+      result_candidate.index = cursor.index;
+      result_candidate.wrap = cursor.wrap;
+      result_candidate.image = image;
+      result_candidate.status = rdma_status::make_direct(RDMA_SC_OK);
+      if (result_candidate.status == null) begin
+        result_candidate = null;
+        status = bad("host producer committed result status allocation failed",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return;
+      end
+      result = result_candidate;
+      status = result_candidate.status;
       return;
-    end
-    result = result_candidate;
-    status = result_candidate.status;
+    end while (1'b0);
+
+    install_host_producer_recovery(
+      attachment, queue_h, kind, cursor, offset, image, snapshot, signaled,
+      reservation_route, reservation_epoch, reservation_route_valid,
+      reservation_epoch_valid, recovery_mmio_maybe_submitted,
+      recovery_failure_label, status);
   endtask
 
   // 功能：post_send 冻结并校验 request/QP authority，预留 SQ cursor，编码可选

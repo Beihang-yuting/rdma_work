@@ -106,6 +106,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_cq_engine_resize_test.sv"
   `include "unit/rdma_cq_resize_exit_test.sv"
   `include "unit/rdma_queue_data_engine_poll_test.sv"
+  `include "unit/rdma_host_producer_exit_test.sv"
   `include "unit/rdma_queue_data_engine_recovery_test.sv"
   `include "unit/rdma_sq_engine_test.sv"
   `include "unit/rdma_rq_engine_test.sv"
