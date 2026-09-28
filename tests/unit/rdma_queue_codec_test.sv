@@ -364,6 +364,70 @@ class rdma_queue_codec_test extends uvm_test;
     eq_bytes({label, "_BYTE_EXACT"}, raw_image, replay_image);
   endfunction
 
+  // 功能：check_sge_authority 验证共享 SGE authority seam 对 SQ 非零计数和 RQ
+  //   typed 数量/长度的正常、null 与保留位失败路径；它把 canonical 统计结果
+  //   与 queue codec 后续使用的 wire gate 对齐。
+  // 输入/输出及副作用：无外部输入；函数只构造本地 rdma_sge fixture，调用静态
+  //   authority helper，并通过 UVM_ERROR 报告错误，不修改 codec registry 或外部资源。
+  // 失败/边界：合法零长度项必须被过滤；null 或 bit31 保留位必须返回失败且清零
+  //   output，任何 helper 返回 null、错误码或部分统计都视为 authority contract 破坏。
+  function automatic void check_sge_authority();
+    rdma_sge zero_sge;
+    rdma_sge first_sge;
+    rdma_sge second_sge;
+    rdma_sge bad_sge;
+    rdma_sge entries[$];
+    int unsigned nonzero_count;
+    int unsigned receive_count;
+    longint unsigned receive_length;
+    rdma_status status;
+
+    zero_sge = rdma_sge::type_id::create("authority_zero_sge");
+    first_sge = rdma_sge::type_id::create("authority_first_sge");
+    second_sge = rdma_sge::type_id::create("authority_second_sge");
+    zero_sge.length = 0;
+    first_sge.length = 8;
+    second_sge.length = 16;
+    entries.push_back(zero_sge);
+    entries.push_back(first_sge);
+    entries.push_back(second_sge);
+
+    rdma_sge_authority::count_nonzero(entries, nonzero_count);
+    if (nonzero_count != 2)
+      `uvm_error("SGE_AUTHORITY_COUNT", "SQ nonzero SGE count mismatch")
+    status = rdma_sge_authority::derive_receive(
+        entries, receive_count, receive_length);
+    if (status == null || !status.ok() || receive_count != 2 ||
+        receive_length != 24)
+      `uvm_error("SGE_AUTHORITY_RECEIVE", $sformatf(
+          "legal typed authority mismatch: %s count=%0d length=%0d",
+          status == null ? "<null>" : status.message,
+          receive_count, receive_length))
+
+    entries.delete();
+    entries.push_back(null);
+    receive_count = 17;
+    receive_length = 19;
+    status = rdma_sge_authority::derive_receive(
+        entries, receive_count, receive_length);
+    if (status == null || status.ok() || receive_count != 0 ||
+        receive_length != 0)
+      `uvm_error("SGE_AUTHORITY_NULL", "null SGE was not rejected atomically")
+
+    bad_sge = rdma_sge::type_id::create("authority_bad_sge");
+    bad_sge.length = 32'h8000_0001;
+    entries.delete();
+    entries.push_back(bad_sge);
+    receive_count = 17;
+    receive_length = 19;
+    status = rdma_sge_authority::derive_receive(
+        entries, receive_count, receive_length);
+    if (status == null || status.ok() || receive_count != 0 ||
+        receive_length != 0)
+      `uvm_error("SGE_AUTHORITY_RESERVED",
+                 "reserved-bit SGE was not rejected atomically")
+  endfunction
+
   // 功能：在 rdma_queue_codec_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -430,6 +494,7 @@ class rdma_queue_codec_test extends uvm_test;
     rdma_hw_image rqe_bad_signature_image;
     rdma_hw_rqe_codec rqe_codec;
     phase.raise_objection(this);
+    check_sge_authority();
     r=rdma_codec_registry::type_id::create("r"); s=rdma_register_queue_codecs(r); ok("register",s);
     // 设计说明：CQ handle.object_id 是 resource manager 分配的 global incarnation，
     // cqn 是 Function-local CQ ID；二者不共享命名空间，model/codec 只能校验 handle

@@ -267,11 +267,7 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
       output int unsigned inline_payload_bytes,
       output bit inline_bytes_are_authority,
       output int unsigned canonical_sge_num);
-    valid_sge_count = 0;
-    foreach (sges[i]) begin
-      if (sges[i] != null && sges[i].length != 0)
-        valid_sge_count++;
-    end
+    rdma_sge_authority::count_nonzero(sges, valid_sge_count);
 
     inline_bytes_are_authority = inline_bytes.size() != 0;
     inline_payload_bytes = inline_bytes_are_authority ?
@@ -344,6 +340,7 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     int unsigned inline_payload_bytes;
     int unsigned canonical_sge_num;
     bit inline_bytes_are_authority;
+    longint unsigned canonical_sge_payload_len;
 
     derive_payload_authority(mode, valid_sge_count, inline_payload_bytes,
                              inline_bytes_are_authority,
@@ -549,43 +546,8 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
       output int unsigned valid_sge_count,
       output longint unsigned valid_payload_len
   );
-    valid_sge_count = 0;
-    valid_payload_len = 0;
-
-    if (sges.size() > RDMA_MAX_WQ_SGE)
-      return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "RQE raw SGE list exceeds driver limit of 32");
-
-    foreach (sges[i]) begin
-      if (sges[i] == null)
-        return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            "RQE SGE handle is null");
-
-      if (sges[i].length == 0)
-        continue;
-
-      if (sges[i].length != 32'h8000_0000 && sges[i].length[31])
-        return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            "RQE SGE length uses reserved bit 31");
-
-      if (valid_payload_len > 64'h8000_0000 - sges[i].length)
-        return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            "RQE payload length exceeds 2 GiB");
-
-      valid_sge_count++;
-      valid_payload_len += sges[i].length;
-    end
-
-    if (valid_sge_count > RDMA_MAX_WQ_SGE)
-      return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "RQE valid SGE count exceeds driver limit of 32");
-
-    return rdma_status::success();
+    return rdma_sge_authority::derive_receive(
+        sges, valid_sge_count, valid_payload_len);
   endfunction
 
   // 功能：build_typed_sgb_descriptor_bytes 将 canonical typed SGE 列表按驱动的
@@ -750,14 +712,10 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
       return rdma_status::success();
     end
 
-    status = derive_typed_sge_authority(valid_sge_count, valid_payload_len);
+    status = rdma_sge_authority::validate_receive_declaration(
+        sges, sge_num, payload_len, valid_sge_count, valid_payload_len);
     if (!status.ok())
       return status;
-    if (valid_sge_count != sge_num ||
-        valid_payload_len != payload_len)
-      return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "RQE external SGB authority disagrees with typed SGE list");
 
     status = build_typed_sgb_descriptor_bytes(typed_descriptor_bytes);
     if (!status.ok())
@@ -802,20 +760,9 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
       return rdma_status::success();
     end
 
-    status = derive_typed_sge_authority(
+    return rdma_sge_authority::validate_receive_declaration(
+        sges, sge_num, payload_len,
         effective_sge_count, effective_payload_len);
-    if (!status.ok())
-      return status;
-    if (effective_sge_count != sge_num)
-      return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "RQE SGE_NUM does not match canonical SGE count");
-    if (effective_payload_len != payload_len)
-      return rdma_status::make(
-          RDMA_SC_INVALID_ARGUMENT,
-          "RQE payload length does not match canonical SGE sum");
-
-    return rdma_status::success();
   endfunction
 
   // 功能：set_external_sgb_descriptor_bytes 安装与当前 external-SGB RQE
@@ -875,13 +822,10 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
             "RQE external SGB authority lacks raw provenance");
     end
     else begin
-      status = derive_typed_sge_authority(valid_sge_count, valid_payload_len);
+      status = rdma_sge_authority::validate_receive_declaration(
+          sges, sge_num, payload_len, valid_sge_count, valid_payload_len);
       if (!status.ok())
         return status;
-      if (valid_sge_count != sge_num || valid_payload_len != payload_len)
-        return rdma_status::make(
-            RDMA_SC_INVALID_ARGUMENT,
-            "RQE external SGB authority disagrees with typed SGE list");
       status = build_typed_sgb_descriptor_bytes(typed_descriptor_bytes);
       if (!status.ok())
         return status;
@@ -2287,6 +2231,7 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     int unsigned inline_payload_bytes;
     int unsigned canonical_sge_num;
     bit inline_bytes_are_authority;
+    longint unsigned canonical_sge_payload_len;
 
     s = rdma_status::success();
     x.derive_payload_authority(mode, valid_sge_count,
@@ -2320,19 +2265,11 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     length = payload_length(x, mode, inline_payload_bytes);
     if (mode inside {RDMA_SQ_PAYLOAD_SGE_WQE,
                      RDMA_SQ_PAYLOAD_SGE_SGB}) begin
-      sge_length = 0;
-      foreach (x.sges[i]) begin
-        if (x.sges[i] == null)
-          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                   "RC SQE contains a null SGE");
-        if (x.sges[i].length == 0)
-          continue;
-        if (x.sges[i].length != 32'h8000_0000 &&
-            x.sges[i].length[31])
-          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                   "RC SGE length uses reserved bit 31");
-        sge_length += x.sges[i].length;
-      end
+      s = rdma_sge_authority::derive_send(
+          x.sges, valid_sge_count, canonical_sge_payload_len);
+      if (!s.ok())
+        return s;
+      sge_length = canonical_sge_payload_len;
       if (x.total_payload_len != 0 && x.total_payload_len != sge_length)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RC total payload length does not match SGEs");
@@ -3166,6 +3103,7 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
     int unsigned inline_payload_bytes;
     int unsigned sge_count;
     bit inline_bytes_are_authority;
+    longint unsigned canonical_sge_payload_len;
 
     if (!$cast(x, model)) return err("UD SQE model type mismatch");
     if (x.transport != RDMA_TRANSPORT_UD) return err("UD codec received non-UD SQE");
@@ -3231,23 +3169,19 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
 
       RDMA_SQ_PAYLOAD_SGE_WQE,
       RDMA_SQ_PAYLOAD_SGE_SGB: begin
+        s = rdma_sge_authority::derive_send(
+            x.sges, valid_sge_count, canonical_sge_payload_len);
+        if (!s.ok())
+          return s;
         if (valid_sge_count != sge_count)
           return rdma_status::make(
               RDMA_SC_INVALID_STATE,
               "UD payload authority count is inconsistent");
-        if (sge_count > RDMA_MAX_WQ_SGE)
-          return rdma_status::make(
-              RDMA_SC_INVALID_ARGUMENT,
-              "UD external SGB SGE count exceeds driver limit of 32");
+        length = canonical_sge_payload_len;
 
         foreach (x.sges[i]) begin
-          if (x.sges[i] == null)
-            return rdma_status::make(
-                RDMA_SC_INVALID_ARGUMENT,
-                "UD SQE contains a null SGE");
           if (x.sges[i].length == 0)
             continue;
-          length += x.sges[i].length;
           if (x.sges[i].length == 32'h8000_0000)
             encoded_sge_length = 32'h0000_0000;
           else

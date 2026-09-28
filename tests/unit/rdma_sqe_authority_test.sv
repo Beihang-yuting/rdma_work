@@ -112,6 +112,105 @@ class rdma_sqe_authority_test extends uvm_test;
                            status == null ? "<null>" : status.code.name()))
   endfunction
 
+  // 功能：check_send_sge_authority 验证共享 SQ SGE authority 对零长度过滤、
+  //   2GiB sentinel、null handle 和保留 bit31 的 canonical count/length 契约。
+  // 输入/输出及副作用：无输入；任务只创建本地 SGE fixture 并调用纯值 helper，
+  //   通过 UVM error 发布断言，不修改 codec、queue runtime 或外部 backing。
+  // 失败/边界：helper 返回 null、错误 code、非预期 count/length 或失败后仍发布
+  //   非零 output 时报告错误；合法 sentinel 必须保留为 2GiB 长度而不能被过滤。
+  task automatic check_send_sge_authority();
+    rdma_sge sge;
+    rdma_sge sges[$];
+    rdma_status status;
+    int unsigned count;
+    longint unsigned payload_len;
+
+    sge = rdma_sge::type_id::create("authority_zero");
+    sge.length = 0;
+    sges.push_back(sge);
+    sge = rdma_sge::type_id::create("authority_sentinel");
+    sge.length = 32'h8000_0000;
+    sges.push_back(sge);
+    status = rdma_sge_authority::derive_send(
+        sges, count, payload_len);
+    if (status == null || !status.ok() || count != 1 ||
+        payload_len != 64'h8000_0000)
+      `uvm_error("SQE_AUTH",
+                 "send authority did not filter zero-length or preserve sentinel")
+
+    sges.delete();
+    sges.push_back(null);
+    status = rdma_sge_authority::derive_send(
+        sges, count, payload_len);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+        count != 0 || payload_len != 0)
+      `uvm_error("SQE_AUTH",
+                 "send authority accepted null SGE or published partial output")
+
+    sges.delete();
+    sge = rdma_sge::type_id::create("authority_reserved");
+    sge.length = 32'hC000_0000;
+    sges.push_back(sge);
+    status = rdma_sge_authority::derive_send(
+        sges, count, payload_len);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+        count != 0 || payload_len != 0)
+      `uvm_error("SQE_AUTH",
+                 "send authority accepted reserved bit31 length")
+  endtask
+
+  // 功能：check_receive_sge_authority 验证 RQ typed 声明值必须与共享 receive
+  //   authority 的过滤后数量和 payload 总长度一致，覆盖合法 sentinel、数量漂移、
+  //   长度漂移以及 null SGE 的 fail-closed 结果。
+  // 输入/输出及副作用：无输入；任务只创建本地 SGE fixture，调用纯值声明校验并
+  //   通过 UVM error 发布断言，不修改 RQE model、runtime、Host-memory 或 backing。
+  // 失败/边界：合法 zero-length 过滤与 2GiB sentinel 未被保留、声明 count/length
+  //   不匹配仍被接受、null 输入发布了部分 output，或 helper 返回空 status 时报告错误。
+  task automatic check_receive_sge_authority();
+    rdma_sge sge;
+    rdma_sge sges[$];
+    rdma_status status;
+    int unsigned count;
+    longint unsigned payload_len;
+
+    sge = rdma_sge::type_id::create("receive_authority_zero");
+    sge.length = 0;
+    sges.push_back(sge);
+    sge = rdma_sge::type_id::create("receive_authority_sentinel");
+    sge.length = 32'h8000_0000;
+    sges.push_back(sge);
+
+    status = rdma_sge_authority::validate_receive_declaration(
+        sges, 1, 64'h8000_0000, count, payload_len);
+    if (status == null || !status.ok() || count != 1 ||
+        payload_len != 64'h8000_0000)
+      `uvm_error("RQE_AUTH",
+                 "receive authority did not publish canonical sentinel values")
+
+    status = rdma_sge_authority::validate_receive_declaration(
+        sges, 2, 64'h8000_0000, count, payload_len);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+        count != 0 || payload_len != 0)
+      `uvm_error("RQE_AUTH",
+                 "receive authority accepted declared count drift")
+
+    status = rdma_sge_authority::validate_receive_declaration(
+        sges, 1, 0, count, payload_len);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+        count != 0 || payload_len != 0)
+      `uvm_error("RQE_AUTH",
+                 "receive authority accepted declared payload drift")
+
+    sges.delete();
+    sges.push_back(null);
+    status = rdma_sge_authority::validate_receive_declaration(
+        sges, 0, 0, count, payload_len);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT ||
+        count != 0 || payload_len != 0)
+      `uvm_error("RQE_AUTH",
+                 "receive authority accepted null SGE or published partial output")
+  endtask
+
   // 功能：运行 completion QP、MR/MW 和 FLUSH 的 Function/generation/对象身份拒绝契约。
   // 输入/输出及副作用：phase 为 UVM 阶段输入；任务只创建本地请求、调用 validate 并发布断言结果。
   // 失败/边界：任一错误 authority 被接受、错误 code 被返回或合法 authority 被拒绝时报告 UVM error。
@@ -127,6 +226,8 @@ class rdma_sqe_authority_test extends uvm_test;
     rdma_status status;
 
     phase.raise_objection(this);
+    check_send_sge_authority();
+    check_receive_sge_authority();
     owner = make_function();
     foreign_owner = make_function(64'h5566_7788, owner.object_id,
                                   owner.generation);
