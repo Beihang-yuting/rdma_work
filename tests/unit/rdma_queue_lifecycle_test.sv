@@ -736,6 +736,97 @@ class rdma_queue_lifecycle_test extends uvm_test;
                            status.code.name(), status.convert2string()))
   endfunction
 
+  // 功能：check_srq_preflight_value_policy 直接验证 SRQ 纯值策略的 SGB 判定、标量
+  //   capability 边界和 borrowed backing 角色集合，确保生命周期 policy 的薄调用层
+  //   与原始错误优先级保持一致。
+  // 输入/输出及副作用：无显式输入；函数创建本地 spec/slice/status fixture 并产生
+  //   UVM 错误报告，不修改 manager、binding、request 或外部 backing 所有权。
+  // 失败/边界：任一边界返回 null、错误码漂移、额外 SGB 未拒绝或缺失角色未拒绝时
+  //   报告 UVM_ERROR；重复合法角色仍由被测策略按其契约接受。
+  function automatic void check_srq_preflight_value_policy();
+    rdma_queue_backing_spec spec;
+    rdma_queue_backing_slice slice;
+
+    if (rdma_srq_preflight_value_policy::requires_sgb(2) ||
+        !rdma_srq_preflight_value_policy::requires_sgb(3))
+      `uvm_error("SRQ_VALUE_SGB", "SGB threshold classification drifted")
+    expect_status("SRQ_VALUE_LIMIT_OK",
+      rdma_srq_preflight_value_policy::validate_limits(
+        64, 4, 16, 16, 1024, 8), RDMA_SC_OK);
+    expect_status("SRQ_VALUE_DEPTH_LOW",
+      rdma_srq_preflight_value_policy::validate_limits(
+        8, 4, 16, 16, 1024, 8), RDMA_SC_INVALID_ARGUMENT);
+    expect_status("SRQ_VALUE_SGE_HIGH",
+      rdma_srq_preflight_value_policy::validate_limits(
+        64, 9, 16, 16, 1024, 8), RDMA_SC_INVALID_ARGUMENT);
+    expect_status("SRQ_VALUE_LIMIT_WIDE",
+      rdma_srq_preflight_value_policy::validate_limits(
+        64, 4, (32'h4000 * 4), 16, 1024, 8),
+      RDMA_SC_INVALID_ARGUMENT);
+
+    spec = rdma_queue_backing_spec::type_id::create("srq_value_spec");
+    spec.mode = RDMA_QUEUE_BACKING_BORROWED;
+    slice = rdma_queue_backing_slice::type_id::create("srq_value_ring");
+    slice.role = RDMA_QUEUE_ROLE_SRQ_RING;
+    spec.slices.push_back(slice);
+    slice = rdma_queue_backing_slice::type_id::create("srq_value_srfq");
+    slice.role = RDMA_QUEUE_ROLE_SRFQ_RING;
+    spec.slices.push_back(slice);
+    expect_status("SRQ_VALUE_MISSING_SGB",
+      rdma_srq_preflight_value_policy::validate_borrowed_backing(spec, 1'b1),
+      RDMA_SC_INVALID_ARGUMENT);
+    slice = rdma_queue_backing_slice::type_id::create("srq_value_sgb");
+    slice.role = RDMA_QUEUE_ROLE_SRQ_SGB;
+    spec.slices.push_back(slice);
+    expect_status("SRQ_VALUE_COMPLETE",
+      rdma_srq_preflight_value_policy::validate_borrowed_backing(spec, 1'b1),
+      RDMA_SC_OK);
+    expect_status("SRQ_VALUE_EXTRA_SGB",
+      rdma_srq_preflight_value_policy::validate_borrowed_backing(spec, 1'b0),
+      RDMA_SC_INVALID_ARGUMENT);
+    spec.slices[2] = null;
+    expect_status("SRQ_VALUE_NULL_SLICE",
+      rdma_srq_preflight_value_policy::validate_borrowed_backing(spec, 1'b1),
+      RDMA_SC_INVALID_ARGUMENT);
+  endfunction
+
+  // 功能：check_borrowed_role_policy 验证 CQ/CEQ/AEQ 共用 borrowed ring 角色策略的
+  //   单角色、空集合和 hostile role 边界，确保公共 helper 没有放宽 caller 原有门禁。
+  // 输入/输出及副作用：无显式输入；函数只创建本地 backing spec/slice fixture 并产生
+  //   UVM 错误报告，不修改 manager、runtime ledger、mapping 或外部 adapter 所有权。
+  // 失败/边界：空 spec、错误 role 或 null slice 未返回 INVALID_ARGUMENT，或合法重复
+  //   role 被错误拒绝时报告 UVM_ERROR；诊断文本由 caller 传入并由 helper 原样保留。
+  function automatic void check_borrowed_role_policy();
+    rdma_queue_backing_spec spec;
+    rdma_queue_backing_slice slice;
+
+    spec = rdma_queue_backing_spec::type_id::create("borrowed_role_spec");
+    spec.mode = RDMA_QUEUE_BACKING_BORROWED;
+    expect_status("BORROWED_ROLE_EMPTY",
+      rdma_queue_borrowed_role_policy::validate_single_role(
+        spec, RDMA_QUEUE_ROLE_CQ_RING, "bad role", "missing role"),
+      RDMA_SC_INVALID_ARGUMENT);
+    slice = rdma_queue_backing_slice::type_id::create("borrowed_role_cq");
+    slice.role = RDMA_QUEUE_ROLE_CQ_RING;
+    spec.slices.push_back(slice);
+    expect_status("BORROWED_ROLE_VALID",
+      rdma_queue_borrowed_role_policy::validate_single_role(
+        spec, RDMA_QUEUE_ROLE_CQ_RING, "bad role", "missing role"),
+      RDMA_SC_OK);
+    slice = rdma_queue_backing_slice::type_id::create("borrowed_role_wrong");
+    slice.role = RDMA_QUEUE_ROLE_CEQ_RING;
+    spec.slices.push_back(slice);
+    expect_status("BORROWED_ROLE_WRONG",
+      rdma_queue_borrowed_role_policy::validate_single_role(
+        spec, RDMA_QUEUE_ROLE_CQ_RING, "bad role", "missing role"),
+      RDMA_SC_INVALID_ARGUMENT);
+    spec.slices[1] = null;
+    expect_status("BORROWED_ROLE_NULL",
+      rdma_queue_borrowed_role_policy::validate_single_role(
+        spec, RDMA_QUEUE_ROLE_CQ_RING, "bad role", "missing role"),
+      RDMA_SC_INVALID_ARGUMENT);
+  endfunction
+
   // 功能：make_handle 创建独立的 rdma_handle；根据 name、owner、kind、object_id 设置字段 handle、handle.kind、handle.function_uid、handle.generation、handle.object_id，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：name（输入）、owner（输入）、kind（输入）、object_id（输入）；make_handle 读取 name、owner、kind、object_id 并使用字段 handle、handle.kind、handle.function_uid、handle.generation、handle.object_id；函数返回 rdma_handle，不取得调用方资源所有权。
   // 失败/边界：make_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
@@ -5093,14 +5184,26 @@ class rdma_queue_lifecycle_test extends uvm_test;
                   RDMA_SC_INVALID_STATE);
   endtask
 
-  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_recipe_contract 中构造或驱动“destroy recipe contract”场景，并断言 DUT
-  //   的状态、错误码和资源账本符合契约。
-  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
+  // 功能：在测试辅助 rdma_queue_lifecycle_test.check_destroy_recipe_contract 中构造
+  //   CQ/SRQ/CEQ/AEQ destroy recipe，并将 SRQ policy 的输出与 detached value policy
+  //   逐项比对，同时直接验证 cleanup recipe policy 的 canonical 与 hostile cardinality
+  //   边界。
+  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时产生
+  //   UVM assertion/report，不向 DUT 转移 queue、QP 或 backing 所有权。
+  // 失败/边界：fixture 未初始化、SRQ_SGB 可选项错误、flush phase/role 顺序漂移
+  //   或 policy 与 value recipe 不一致时报告 UVM_ERROR；测试不会吞掉失败，也不把
+  //   recipe 误当成 CMQ completion。
   task automatic check_destroy_recipe_contract();
     rdma_queue_lifecycle_policy policy;
     rdma_queue_backing_role_e fr[$], lr[$];
     rdma_queue_flush_phase_e fp[$];
+    rdma_queue_backing_role_e recipe_fr[$], recipe_lr[$];
+    rdma_queue_flush_phase_e recipe_fp[$];
+    rdma_queue_backing_plan recipe_plan;
+    rdma_queue_backing_ref recipe_ref;
+    rdma_queue_flush_target recipe_target;
+    rdma_status recipe_status;
+    bit recipe_d, recipe_c;
     bit d, c;
     policy = rdma_cq_lifecycle_policy::type_id::create("recipe_cq");
     policy.hardware_cleanup_roles(fr, fp, d);
@@ -5109,10 +5212,57 @@ class rdma_queue_lifecycle_test extends uvm_test;
     policy.local_cleanup_roles(lr, c);
     if (!c || lr.size()!=2 || lr[0]!=RDMA_QUEUE_ROLE_CQ_PD || lr[1]!=RDMA_QUEUE_ROLE_CQ_RING)
       `uvm_error("DESTROY_RECIPE_CQ_LOCAL", "CQ local recipe mismatch")
+    recipe_plan = rdma_queue_backing_plan::type_id::create("recipe_policy_plan");
+    recipe_plan.context_ref = rdma_context_backing_ref::type_id::create(
+      "recipe_policy_context");
+    foreach (lr[idx]) begin
+      recipe_ref = rdma_queue_backing_ref::type_id::create(
+        $sformatf("recipe_policy_ref_%0d", idx));
+      recipe_ref.role = lr[lr.size() - 1 - idx];
+      recipe_plan.refs.push_back(recipe_ref);
+    end
+    foreach (fr[idx]) begin
+      recipe_target = rdma_queue_flush_target::type_id::create(
+        $sformatf("recipe_policy_flush_%0d", idx));
+      recipe_target.role = fr[idx];
+      recipe_target.phase = fp[idx];
+      recipe_plan.flush_targets.push_back(recipe_target);
+    end
+    recipe_status = rdma_queue_cleanup_recipe_policy::validate(
+      RDMA_RESOURCE_CQ, recipe_plan, fr, fp, c, lr);
+    expect_status("DESTROY_RECIPE_POLICY_VALID", recipe_status, RDMA_SC_OK);
+    recipe_plan.refs[0].role = RDMA_QUEUE_ROLE_CQ_PD;
+    recipe_status = rdma_queue_cleanup_recipe_policy::validate(
+      RDMA_RESOURCE_CQ, recipe_plan, fr, fp, c, lr);
+    expect_status("DESTROY_RECIPE_POLICY_DUPLICATE", recipe_status,
+                  RDMA_SC_INVALID_STATE);
     policy = rdma_srq_lifecycle_policy::type_id::create("recipe_srq");
     policy.hardware_cleanup_roles(fr, fp, d);
     if (d || fr.size()!=2 || fr[0]!=RDMA_QUEUE_ROLE_SRFQ_PD || fr[1]!=RDMA_QUEUE_ROLE_SRQ_PD)
       `uvm_error("DESTROY_RECIPE_SRQ", "SRQ recipe mismatch")
+    rdma_srq_destroy_value_policy(
+      1'b1, recipe_fr, recipe_fp, recipe_d, recipe_lr, recipe_c);
+    if (recipe_d || !recipe_c || recipe_fr.size() != 2 ||
+        recipe_fp.size() != 2 || recipe_fr[0] != RDMA_QUEUE_ROLE_SRFQ_PD ||
+        recipe_fr[1] != RDMA_QUEUE_ROLE_SRQ_PD ||
+        recipe_fp[0] != RDMA_QUEUE_FLUSH_PRE_DELETE ||
+        recipe_fp[1] != RDMA_QUEUE_FLUSH_PRE_DELETE ||
+        recipe_lr.size() != 5 ||
+        recipe_lr[0] != RDMA_QUEUE_ROLE_SRFQ_PD ||
+        recipe_lr[1] != RDMA_QUEUE_ROLE_SRQ_PD ||
+        recipe_lr[2] != RDMA_QUEUE_ROLE_SRQ_SGB ||
+        recipe_lr[3] != RDMA_QUEUE_ROLE_SRFQ_RING ||
+        recipe_lr[4] != RDMA_QUEUE_ROLE_SRQ_RING)
+      `uvm_error("DESTROY_RECIPE_SRQ_VALUE", "SRQ detached value recipe mismatch")
+    rdma_srq_destroy_value_policy(
+      1'b0, recipe_fr, recipe_fp, recipe_d, recipe_lr, recipe_c);
+    if (recipe_d || !recipe_c || recipe_fr.size() != 2 || recipe_fp.size() != 2 ||
+        recipe_lr.size() != 4 || recipe_lr[2] != RDMA_QUEUE_ROLE_SRFQ_RING ||
+        recipe_lr[3] != RDMA_QUEUE_ROLE_SRQ_RING)
+      `uvm_error("DESTROY_RECIPE_SRQ_NO_SGB", "SRQ optional SGB cardinality mismatch")
+    policy.local_cleanup_roles(lr, c);
+    if (!c || lr.size() != 5)
+      `uvm_error("DESTROY_RECIPE_SRQ_LOCAL", "SRQ policy local recipe mismatch")
     policy = rdma_ceq_lifecycle_policy::type_id::create("recipe_ceq");
     policy.hardware_cleanup_roles(fr, fp, d);
     if (!d || fr.size()!=0)
@@ -5147,6 +5297,8 @@ class rdma_queue_lifecycle_test extends uvm_test;
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_srq_preflight_value_policy();
+    check_borrowed_role_policy();
     check_preflight();
     check_backing_planner_positive();
     check_backing_planner_negative();

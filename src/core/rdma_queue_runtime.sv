@@ -1,328 +1,15 @@
 // 目录/层次：src/core，为 RDMA queue-data engine 提供单队列运行时账本。
 // 文件职责：统一管理 SQ/RQ/SRQ host-producer ledger 以及 CQ/CEQ/AEQ
 // device-producer 的 PI/CI、wrap、credit、reservation、quiesce/resize 和 recovery evidence。
-// 主要依赖：rdma_types_pkg 的 status/route/reset epoch、rdma_model_pkg 的 handle、
-// semantic request 与 hardware image，以及 UVM object factory；本文件不访问 Host-memory 或 PCIe。
+// 主要依赖：依赖 rdma_queue_runtime_transaction_models.sv 提供的枚举、cursor、pending
+// 和 slot 值模型，以及 rdma_types_pkg、rdma_model_pkg 与 UVM；本文件不访问
+// Host-memory 或 PCIe。
 // 所有权/生命周期：runtime 拥有 queue handle 值快照、host slot ledger、
 // device reservation 和 pending recovery 证据；route/epoch 是从 dpu_common 权威快照锁存的值。
 // 外部 backing、scheduler、QP/Function 资源由各自 lifecycle owner 管理，runtime 不释放它们。
 
-typedef enum bit [2:0] {
-  RDMA_QUEUE_RUNTIME_DETACHED = 3'd0,
-  RDMA_QUEUE_RUNTIME_ATTACHED = 3'd1,
-  RDMA_QUEUE_RUNTIME_ACTIVE = 3'd2,
-  RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED = 3'd3,
-  // 设计说明：resize 在 QUIESCING 窗口禁止新事务；它与 DETACHED 分离，
-  // 使 replacement 失败时还能恢复旧 attachment 而不丢失游标账本。
-  RDMA_QUEUE_RUNTIME_QUIESCING = 3'd4
-} rdma_queue_runtime_state_e;
-
-typedef enum bit [2:0] {
-  RDMA_QUEUE_RUNTIME_SQ = 3'd0,
-  RDMA_QUEUE_RUNTIME_RQ = 3'd1,
-  RDMA_QUEUE_RUNTIME_SRQ = 3'd2,
-  RDMA_QUEUE_RUNTIME_CQ = 3'd3,
-  RDMA_QUEUE_RUNTIME_CEQ = 3'd4,
-  RDMA_QUEUE_RUNTIME_AEQ = 3'd5
-} rdma_queue_runtime_kind_e;
-
-typedef enum bit {
-  RDMA_QUEUE_RECOVERY_RETRY_PENDING = 1'b0,
-  RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH = 1'b1
-} rdma_queue_recovery_action_e;
-
-typedef enum bit [2:0] {
-  RDMA_QUEUE_MMIO_NONE           = 3'd0,
-  RDMA_QUEUE_MMIO_NOT_APPLICABLE = 3'd1,
-  RDMA_QUEUE_MMIO_NO_SUBMIT      = 3'd2,
-  RDMA_QUEUE_MMIO_SUCCESS        = 3'd3,
-  RDMA_QUEUE_MMIO_AMBIGUOUS      = 3'd4
-} rdma_queue_mmio_evidence_e;
-
-// 设计说明：ring cursor 必须把 index 和 wrap 作为一个值传递，否则
-// 在回卷边界仅比较 index 会把 stale reservation 误认为当前事务。
-class rdma_queue_cursor_snapshot extends uvm_object;
-  `uvm_object_utils(rdma_queue_cursor_snapshot)
-  int unsigned index;
-  bit wrap;
-
-  // 功能：构造默认指向 ring 第 0 项、未回卷的 cursor 值对象。
-  // 输入/输出及副作用：name（输入）仅设置 UVM 对象名；初始化 index=0/wrap=0。
-  // 失败/边界：构造不知道 ring depth，因此 0/0 只是值默认项，不是已授权 reservation。
-  function new(string name = "rdma_queue_cursor_snapshot");
-    super.new(name);
-    index = 0;
-    wrap = 0;
-  endfunction
-
-  // 功能：将 rhs 中 rdma_queue_cursor_snapshot 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；类型正确时覆盖当前 index/wrap，不修改 rhs。
-  // 失败/边界：rhs 为 null 或类型不匹配时保留当前 cursor；本函数不验证 index<depth。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_queue_cursor_snapshot source;
-    super.do_copy(rhs);
-    if (!$cast(source, rhs)) return;
-    index = source.index;
-    wrap = source.wrap;
-  endfunction
-
-endclass
-
-// 设计说明：pending operation 是 recovery 的唯一事务证据载体，必须同时
-// 冻结 queue identity、cursor/next_cursor、image、route/epoch、MMIO enum 和阶段位。
-// runtime 使用专用 non-fatal helper 建立 detached 快照，不信任 caller 的兼容 bit。
-class rdma_queue_pending_operation extends uvm_object;
-  `uvm_object_utils(rdma_queue_pending_operation)
-  // 中文设计：以下是队列进入 recovery 后保留的事务证据；不包含原始
-  // Host-memory 地址。request_snapshot/routed_qp_h 在 do_copy 兼容入口中仍是非拥有引用。
-  rdma_handle queue_h;
-  rdma_queue_runtime_kind_e kind;
-  bit producer;
-  bit device_producer;
-  bit device_write_attempted;
-  bit consumer_committed;
-  bit cq_consumer_committed;
-  bit completion_released;
-  bit consumer_doorbell_succeeded;
-  // CQ shadow publication is a host-memory write, not an MMIO doorbell.  Keep
-  // its immutable target and phase markers separate so NO_SUBMIT remains the
-  // truthful MMIO evidence while recovery can still prove publication.
-  bit consumer_shadow_required;
-  // 0 = ordinary RC/UD CQC CI shadow; 1 = URC packed SQ/RQ consumer cursors.
-  // This authority is frozen with the pending value so recovery never guesses
-  // a layout from the payload's high byte.
-  bit consumer_shadow_urc;
-  bit consumer_shadow_attempted;
-  bit consumer_shadow_published;
-  longint unsigned consumer_shadow_offset;
-  int unsigned consumer_shadow_length;
-  int unsigned consumer_shadow_value;
-  longint unsigned entry_offset;
-  rdma_queue_cursor_snapshot cursor;
-  // 中文设计：next_cursor 是事务成功后的唯一预期位置，防止 recovery
-  // 在之后的 geometry 环境下重新推导出不同状态迁移。
-  rdma_queue_cursor_snapshot next_cursor;
-  rdma_hw_image image;
-  // 中文设计：host producer retry 用 request_snapshot 重建 ledger；runtime 的
-  // clone_pending_value 会深拷贝它，普通 UVM do_copy 只保留兼容的非拥有引用。
-  rdma_semantic_request request_snapshot;
-  longint unsigned wr_id;
-  bit signaled;
-  // 中文设计：CQ consumer retry 必须在 doorbell 成功后用 completion cursor
-  // 释放相关 WQE ledger，该阶段独立记录以保证幂等。
-  int unsigned completion_index;
-  bit completion_wrap;
-  bit completion_target_valid;
-  // 中文设计：completion_wq_kind 冻结 CQE admission 时已经解析出的实际
-  // SQ/RQ/SRQ ledger 类型；SUCCESS recovery 不得重新 decode CQE 推导方向。
-  rdma_queue_runtime_kind_e completion_wq_kind;
-  // 中文设计：routed_qp_h 与 completion_released 一起标识 CQ 专用释放阶段，
-  // 防止“WQE 已释放、CI 尚未提交”的 retry 重复释放同一 WQE。
-  rdma_handle routed_qp_h;
-  bit mmio_maybe_submitted;
-  bit known_no_mmio;
-  rdma_queue_mmio_evidence_e mmio_evidence;
-  rdma_queue_cursor_snapshot committed_consumer_cursor;
-  rdma_status failure_status;
-  int unsigned entry_size;
-  rdma_route_key_t route;
-  bit route_valid;
-  rdma_reset_epoch_t reset_epoch;
-  bit epoch_valid;
-
-  // 功能：构造一个尚未具备任何可提交 authority 的 pending evidence 外壳。
-  // 输入/输出及副作用：name（输入）设置 UVM 名称；所有 handle/快照置 null、
-  //   阶段位清零、kind 默认 SQ、MMIO authority 置 RDMA_QUEUE_MMIO_NONE。
-  // 失败/边界：默认对象不能直接交给 recovery；缺 queue_h/cursor/image/status/
-  //   route/epoch 的 device evidence 必须在 enter_recovery_prepared 被拒绝。
-  function new(string name = "rdma_queue_pending_operation");
-    super.new(name);
-    queue_h = null;
-    kind = RDMA_QUEUE_RUNTIME_SQ;
-    producer = 0;
-    device_producer = 0;
-    device_write_attempted = 0;
-    consumer_committed = 0;
-    cq_consumer_committed = 0;
-    completion_released = 0;
-    consumer_doorbell_succeeded = 0;
-    consumer_shadow_required = 0;
-    consumer_shadow_urc = 0;
-    consumer_shadow_attempted = 0;
-    consumer_shadow_published = 0;
-    consumer_shadow_offset = 0;
-    consumer_shadow_length = 0;
-    consumer_shadow_value = 0;
-    entry_offset = 0;
-    cursor = null;
-    next_cursor = null;
-    image = null;
-    request_snapshot = null;
-    wr_id = 0;
-    signaled = 0;
-    completion_index = 0;
-    completion_wrap = 0;
-    completion_target_valid = 0;
-    completion_wq_kind = RDMA_QUEUE_RUNTIME_SQ;
-    routed_qp_h = null;
-    mmio_maybe_submitted = 0;
-    known_no_mmio = 0;
-    mmio_evidence = RDMA_QUEUE_MMIO_NONE;
-    committed_consumer_cursor = null;
-    failure_status = null;
-    entry_size = 0;
-    route = '0;
-    route_valid = 0;
-    reset_epoch = 0;
-    epoch_valid = 0;
-  endfunction
-
-  // 功能：do_copy 为 UVM print/clone 兼容复制 pending 标量，并为 queue/cursor/
-  //   image/status 建立局部值对象。
-  // 输入/输出及副作用：rhs（输入）；覆盖当前对象。routed_qp_h 和
-  //   request_snapshot 按兼容契约复制为非拥有别名，因为本 void 入口无法返回深拷贝失败。
-  // 失败/边界：rhs 为 null/类型不匹配时保留当前值；需要全局 detached、
-  //   non-fatal 的 recovery 调用方必须使用 runtime.query_pending/clone_pending_value。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_queue_pending_operation source;
-    super.do_copy(rhs);
-    if (!$cast(source, rhs)) return;
-    // do_copy 是 UVM 兼容入口；关键 recovery 路径使用 runtime 的
-    // clone_pending_value，避免这里的兼容复制失败升级为 simulator fatal。
-    if (source.queue_h == null) queue_h = null;
-    else begin
-      queue_h = new("pending_copy_queue");
-      if (queue_h != null) begin
-        queue_h.kind = source.queue_h.kind;
-        queue_h.function_uid = source.queue_h.function_uid;
-        queue_h.object_id = source.queue_h.object_id;
-        queue_h.generation = source.queue_h.generation;
-      end
-    end
-    kind = source.kind;
-    producer = source.producer;
-    device_producer = source.device_producer;
-    device_write_attempted = source.device_write_attempted;
-    consumer_committed = source.consumer_committed;
-    cq_consumer_committed = source.cq_consumer_committed;
-    completion_released = source.completion_released;
-    consumer_doorbell_succeeded = source.consumer_doorbell_succeeded;
-    consumer_shadow_required = source.consumer_shadow_required;
-    consumer_shadow_urc = source.consumer_shadow_urc;
-    consumer_shadow_attempted = source.consumer_shadow_attempted;
-    consumer_shadow_published = source.consumer_shadow_published;
-    consumer_shadow_offset = source.consumer_shadow_offset;
-    consumer_shadow_length = source.consumer_shadow_length;
-    consumer_shadow_value = source.consumer_shadow_value;
-    entry_offset = source.entry_offset;
-    mmio_maybe_submitted = source.mmio_maybe_submitted;
-    known_no_mmio = source.known_no_mmio;
-    mmio_evidence = source.mmio_evidence;
-    entry_size = source.entry_size;
-    route = source.route;
-    route_valid = source.route_valid;
-    reset_epoch = source.reset_epoch;
-    epoch_valid = source.epoch_valid;
-    if (source.committed_consumer_cursor == null) committed_consumer_cursor = null;
-    else begin
-      committed_consumer_cursor = new("pending_copy_committed_cursor");
-      if (committed_consumer_cursor != null) begin
-        committed_consumer_cursor.index = source.committed_consumer_cursor.index;
-        committed_consumer_cursor.wrap = source.committed_consumer_cursor.wrap;
-      end
-    end
-    if (source.failure_status == null) failure_status = null;
-    else begin
-      failure_status = new("pending_copy_failure_status");
-      if (failure_status != null) begin
-        failure_status.category = source.failure_status.category;
-        failure_status.code = source.failure_status.code;
-        failure_status.hardware_code = source.failure_status.hardware_code;
-        failure_status.hardware_code_valid = source.failure_status.hardware_code_valid;
-        failure_status.source_engine = source.failure_status.source_engine;
-        failure_status.function_uid = source.failure_status.function_uid;
-        failure_status.generation = source.failure_status.generation;
-        failure_status.resource_id = source.failure_status.resource_id;
-        failure_status.command_id = source.failure_status.command_id;
-        failure_status.wr_id = source.failure_status.wr_id;
-        failure_status.severity = source.failure_status.severity;
-        failure_status.retryable = source.failure_status.retryable;
-        failure_status.message = source.failure_status.message;
-      end
-    end
-    if (source.cursor == null) cursor = null;
-    else begin
-      cursor = new("pending_copy_cursor");
-      cursor.index = source.cursor.index;
-      cursor.wrap = source.cursor.wrap;
-    end
-    if (source.next_cursor == null) next_cursor = null;
-    else begin
-      next_cursor = new("pending_copy_next_cursor");
-      next_cursor.index = source.next_cursor.index;
-      next_cursor.wrap = source.next_cursor.wrap;
-    end
-    if (source.image == null) image = null;
-    else begin
-      image = new("pending_copy_image");
-      if (image != null) begin
-        image.length = source.image.length;
-        image.alignment = source.image.alignment;
-        image.endian = source.image.endian;
-        image.image_kind = source.image.image_kind;
-        image.hardware_version = source.image.hardware_version;
-        image.function_generation = source.image.function_generation;
-        image.write_target_kind = source.image.write_target_kind;
-        image.backing_target = source.image.backing_target;
-        image.hmc_target = source.image.hmc_target;
-        image.bar_target = source.image.bar_target;
-        image.bytes = source.image.bytes;
-        image.field_summary = source.image.field_summary;
-      end
-    end
-    signaled = source.signaled;
-    wr_id = source.wr_id;
-    completion_index = source.completion_index;
-    completion_wrap = source.completion_wrap;
-    completion_target_valid = source.completion_target_valid;
-    completion_wq_kind = source.completion_wq_kind;
-    routed_qp_h = source.routed_qp_h;
-    request_snapshot = source.request_snapshot;
-  endfunction
-endclass
-
-// 设计说明：host-produced ring 需要以 slot 记录 request/image/wr_id 与
-// completion 状态，才能按 signaled completion 连续释放前置 unsignaled WQE。
-class rdma_queue_slot_ledger_entry extends uvm_object;
-  `uvm_object_utils(rdma_queue_slot_ledger_entry)
-  bit posted;
-  bit consumed;
-  bit signaled;
-  bit [63:0] wr_id;
-  int unsigned index;
-  bit wrap;
-  rdma_semantic_request request_snapshot;
-  rdma_hw_image image;
-  rdma_status completion_status;
-
-  // 功能：构造一个未 post、未 consume 的 host WQE ledger slot。
-  // 输入/输出及副作用：name（输入）设置 UVM 名称；清零游标/元数据并置
-  //   request_snapshot、image、completion_status 为 null。
-  // 失败/边界：初始 slot 不代表可消费 WQE；只有 commit_producer 可以将 posted 置位。
-  function new(string name = "rdma_queue_slot_ledger_entry");
-    super.new(name);
-    posted = 0;
-    consumed = 0;
-    signaled = 0;
-    wr_id = 0;
-    index = 0;
-    wrap = 0;
-    request_snapshot = null;
-    image = null;
-    completion_status = null;
-  endfunction
-endclass
-
+// Queue value models are defined in rdma_queue_runtime_transaction_models.sv.
+// This file keeps the mutable lock, ledger, attachment and publication owner.
 // 设计说明：rdma_queue_runtime 是单 attachment 的并发状态 authority；所有
 // reservation/pending/ledger/retry 变更都必须在同一把 lock 下完成。仅保留既有
 // state/depth/PI/CI/used 标量兼容读取；identity、方向、polarity 与 route/epoch
@@ -2429,9 +2116,8 @@ class rdma_queue_runtime extends uvm_object;
         pending_operation_state.committed_consumer_cursor == null ||
         !pending_operation_state.completion_target_valid ||
         pending_operation_state.completion_released ||
-        !(pending_operation_state.completion_wq_kind inside {
-            RDMA_QUEUE_RUNTIME_SQ, RDMA_QUEUE_RUNTIME_RQ,
-            RDMA_QUEUE_RUNTIME_SRQ}) ||
+        !rdma_queue_release_order_policy::allows_consumer_release(
+            kind, pending_operation_state.completion_wq_kind) ||
         pending_operation_state.routed_qp_h == null ||
         pending_operation_state.routed_qp_h.kind != RDMA_RESOURCE_QP ||
         !consumer_recovery_invariant_locked(
@@ -3155,19 +2841,14 @@ class rdma_queue_runtime extends uvm_object;
            slot.index == expected_index && slot.wrap == expected_wrap;
   endfunction
 
-  // 功能：cursor_advance 按当前 depth 将 ring cursor 前进一步，并在末项后
-  //   回到 index=0、翻转 wrap。
-  // 输入/输出及副作用：i/w（输入/输出）被原地更新；只读 runtime.depth，不修改
-  //   occupancy、reservation 或 slot ledger。
-  // 失败/边界：该内部 void helper 假定 depth>0 且 i<depth，不返回错误；所有
-  //   对外调用方必须在进入前完成 geometry 校验。
+  // 功能：cursor_advance 为 queue runtime 保留兼容 wrapper，把当前 ring successor
+  //   计算转发给共享 detached cursor policy，并原地更新 runtime caller 的 i/w。
+  // 输入/输出及副作用：i/w（输入/输出）被更新；只读 runtime.depth，不修改 occupancy、
+  //   reservation 或 slot ledger；policy 本身不访问 runtime 或外部资源。
+  // 失败/边界：该内部 wrapper 假定 caller 已完成 depth>0 且 i<depth 校验，不返回错误；
+  //   对外拒绝条件仍由各 runtime admission 分支负责，不能把 successor 当作 commit。
   function void cursor_advance(inout int unsigned i, inout bit w);
-    if (i + 1 >= depth) begin
-      i = 0;
-      w = ~w;
-    end
-    else
-      i++;
+    rdma_queue_cursor_policy::advance(depth, i, w, i, w);
   endfunction
 
   // 功能：release_range_target_reachable 从当前 host consumer cursor 沿 ring
@@ -4455,8 +4136,6 @@ class rdma_queue_runtime extends uvm_object;
   protected function rdma_status project_mmio_evidence_locked(
     rdma_queue_mmio_evidence_e evidence
   );
-    rdma_queue_mmio_evidence_e current;
-    bit transition_allowed;
     bit consume_confirmation;
 
     if (pending_operation_state == null || state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED)
@@ -4467,59 +4146,11 @@ class rdma_queue_runtime extends uvm_object;
                            RDMA_QUEUE_MMIO_AMBIGUOUS}))
       return make_runtime_status(RDMA_SC_INVALID_ARGUMENT,
                                  "MMIO evidence is invalid");
-    current = pending_operation_state.mmio_evidence;
-    transition_allowed = 1'b0;
-    consume_confirmation = 1'b0;
-
-    // 设计说明：NONE 表示尚无结论，因此可以接收第一次真实 backend 结果；
-    // NO_SUBMIT 之后再次进入 backend 则必须绑定一次 caller confirmation。
-    // SUCCESS/AMBIGUOUS 和 device NOT_APPLICABLE 都是终态，不能由本 helper
-    // 根据兼容 bit 或调用方向反推、降级或消解。
-    if (pending_operation_state.device_producer) begin
-      case (current)
-        RDMA_QUEUE_MMIO_NONE: begin
-          transition_allowed = evidence inside {
-            RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NO_SUBMIT};
-          if (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE)
-            transition_allowed = pending_operation_state.device_write_attempted;
-        end
-        RDMA_QUEUE_MMIO_NO_SUBMIT: begin
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_NO_SUBMIT);
-          if (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE) begin
-            transition_allowed = recovery_retry_confirmed &&
-                                 pending_operation_state.device_write_attempted;
-            consume_confirmation = transition_allowed;
-          end
-        end
-        RDMA_QUEUE_MMIO_NOT_APPLICABLE:
-          transition_allowed =
-            (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE);
-        default:
-          transition_allowed = 1'b0;
-      endcase
-    end else begin
-      case (current)
-        RDMA_QUEUE_MMIO_NONE:
-          transition_allowed = evidence inside {
-            RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NO_SUBMIT,
-            RDMA_QUEUE_MMIO_SUCCESS, RDMA_QUEUE_MMIO_AMBIGUOUS};
-        RDMA_QUEUE_MMIO_NO_SUBMIT: begin
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_NO_SUBMIT);
-          if (evidence inside {RDMA_QUEUE_MMIO_SUCCESS,
-                               RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
-            transition_allowed = recovery_retry_confirmed;
-            consume_confirmation = transition_allowed;
-          end
-        end
-        RDMA_QUEUE_MMIO_SUCCESS:
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_SUCCESS);
-        RDMA_QUEUE_MMIO_AMBIGUOUS:
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_AMBIGUOUS);
-        default:
-          transition_allowed = 1'b0;
-      endcase
-    end
-    if (!transition_allowed)
+    if (!rdma_queue_mmio_transition_policy::decide(
+          pending_operation_state.mmio_evidence, evidence,
+          pending_operation_state.device_producer,
+          pending_operation_state.device_write_attempted,
+          recovery_retry_confirmed, consume_confirmation))
       return make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "MMIO evidence transition is unauthorized");
 
@@ -4775,6 +4406,37 @@ class rdma_queue_runtime extends uvm_object;
                                "recovery action is invalid");
   endfunction
 
+  // 功能：copy_recovery_failure_status_locked 把 backend 返回的真实错误字段复制到
+  //   当前 pending 的 caller-owned failure_status，供 status/noalloc 两条 recovery
+  //   入口共享，避免一条路径漏复制 authority 字段。
+  // 输入/输出及副作用：actual_failure（输入）与 pending_operation_state.failure_status
+  //   为当前锁保护的对象；成功时按值覆盖 category、code、hardware、source、identity、
+  //   resource、command、wr、severity、retryable 和 message，不创建新 status。
+  // 失败/边界：actual_failure、pending 或 failure_status 为空，或 actual_failure 为
+  //   OK 时返回 0 且不写入；调用方必须先完成 evidence/成功码校验。
+  protected function bit copy_recovery_failure_status_locked(
+      rdma_status actual_failure
+  );
+    if (actual_failure == null || pending_operation_state == null ||
+        pending_operation_state.failure_status == null || actual_failure.ok())
+      return 1'b0;
+    pending_operation_state.failure_status.category = actual_failure.category;
+    pending_operation_state.failure_status.code = actual_failure.code;
+    pending_operation_state.failure_status.hardware_code = actual_failure.hardware_code;
+    pending_operation_state.failure_status.hardware_code_valid =
+      actual_failure.hardware_code_valid;
+    pending_operation_state.failure_status.source_engine = actual_failure.source_engine;
+    pending_operation_state.failure_status.function_uid = actual_failure.function_uid;
+    pending_operation_state.failure_status.generation = actual_failure.generation;
+    pending_operation_state.failure_status.resource_id = actual_failure.resource_id;
+    pending_operation_state.failure_status.command_id = actual_failure.command_id;
+    pending_operation_state.failure_status.wr_id = actual_failure.wr_id;
+    pending_operation_state.failure_status.severity = actual_failure.severity;
+    pending_operation_state.failure_status.retryable = actual_failure.retryable;
+    pending_operation_state.failure_status.message = actual_failure.message;
+    return 1'b1;
+  endfunction
+
   // 功能：record_recovery_failure 原样记录 backend MMIO enum，并可把本次真实
   //   doorbell/commit/release 错误写入 admission 前预分配的 failure_status。
   // 输入/输出及副作用：evidence 与可选 actual_failure 为输入；成功时在同一锁内
@@ -4809,31 +4471,8 @@ class rdma_queue_runtime extends uvm_object;
     end
     project_status = project_mmio_evidence_locked(evidence);
     if (status_is_ok(project_status)) begin
-      if (actual_failure != null) begin
-        pending_operation_state.failure_status.category =
-          actual_failure.category;
-        pending_operation_state.failure_status.code = actual_failure.code;
-        pending_operation_state.failure_status.hardware_code =
-          actual_failure.hardware_code;
-        pending_operation_state.failure_status.hardware_code_valid =
-          actual_failure.hardware_code_valid;
-        pending_operation_state.failure_status.source_engine =
-          actual_failure.source_engine;
-        pending_operation_state.failure_status.function_uid =
-          actual_failure.function_uid;
-        pending_operation_state.failure_status.generation =
-          actual_failure.generation;
-        pending_operation_state.failure_status.resource_id =
-          actual_failure.resource_id;
-        pending_operation_state.failure_status.command_id =
-          actual_failure.command_id;
-        pending_operation_state.failure_status.wr_id = actual_failure.wr_id;
-        pending_operation_state.failure_status.severity =
-          actual_failure.severity;
-        pending_operation_state.failure_status.retryable =
-          actual_failure.retryable;
-        pending_operation_state.failure_status.message = actual_failure.message;
-      end
+      if (actual_failure != null)
+        void'(copy_recovery_failure_status_locked(actual_failure));
       recovery_retry_confirmed = 1'b0;
       recovery_commit_allowed = 1'b0;
     end
@@ -4854,8 +4493,6 @@ class rdma_queue_runtime extends uvm_object;
     rdma_status actual_failure,
     rdma_status status_slot
   );
-    rdma_queue_mmio_evidence_e current;
-    bit transition_allowed;
     bit consume_confirmation;
 
     if (status_slot == null) return 1'b0;
@@ -4892,55 +4529,11 @@ class rdma_queue_runtime extends uvm_object;
       return 1'b0;
     end
 
-    current = pending_operation_state.mmio_evidence;
-    transition_allowed = 1'b0;
-    consume_confirmation = 1'b0;
-    if (pending_operation_state.device_producer) begin
-      case (current)
-        RDMA_QUEUE_MMIO_NONE: begin
-          transition_allowed = evidence inside {
-            RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NO_SUBMIT};
-          if (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE)
-            transition_allowed = pending_operation_state.device_write_attempted;
-        end
-        RDMA_QUEUE_MMIO_NO_SUBMIT: begin
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_NO_SUBMIT);
-          if (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE) begin
-            transition_allowed = recovery_retry_confirmed &&
-                                 pending_operation_state.device_write_attempted;
-            consume_confirmation = transition_allowed;
-          end
-        end
-        RDMA_QUEUE_MMIO_NOT_APPLICABLE:
-          transition_allowed =
-            (evidence == RDMA_QUEUE_MMIO_NOT_APPLICABLE);
-        default:
-          transition_allowed = 1'b0;
-      endcase
-    end
-    else begin
-      case (current)
-        RDMA_QUEUE_MMIO_NONE:
-          transition_allowed = evidence inside {
-            RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NO_SUBMIT,
-            RDMA_QUEUE_MMIO_SUCCESS, RDMA_QUEUE_MMIO_AMBIGUOUS};
-        RDMA_QUEUE_MMIO_NO_SUBMIT: begin
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_NO_SUBMIT);
-          if (evidence inside {RDMA_QUEUE_MMIO_SUCCESS,
-                               RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
-            transition_allowed = recovery_retry_confirmed;
-            consume_confirmation = transition_allowed;
-          end
-        end
-        RDMA_QUEUE_MMIO_SUCCESS:
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_SUCCESS);
-        RDMA_QUEUE_MMIO_AMBIGUOUS:
-          transition_allowed = (evidence == RDMA_QUEUE_MMIO_AMBIGUOUS);
-        default:
-          transition_allowed = 1'b0;
-      endcase
-    end
-    if (!transition_allowed) begin
+    if (!rdma_queue_mmio_transition_policy::decide(
+          pending_operation_state.mmio_evidence, evidence,
+          pending_operation_state.device_producer,
+          pending_operation_state.device_write_attempted,
+          recovery_retry_confirmed, consume_confirmation)) begin
       lock.put(1);
       void'(set_runtime_status_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
@@ -4958,28 +4551,8 @@ class rdma_queue_runtime extends uvm_object;
       (evidence == RDMA_QUEUE_MMIO_AMBIGUOUS);
     pending_operation_state.consumer_doorbell_succeeded =
       (evidence == RDMA_QUEUE_MMIO_SUCCESS);
-    if (actual_failure != null) begin
-      pending_operation_state.failure_status.category = actual_failure.category;
-      pending_operation_state.failure_status.code = actual_failure.code;
-      pending_operation_state.failure_status.hardware_code =
-        actual_failure.hardware_code;
-      pending_operation_state.failure_status.hardware_code_valid =
-        actual_failure.hardware_code_valid;
-      pending_operation_state.failure_status.source_engine =
-        actual_failure.source_engine;
-      pending_operation_state.failure_status.function_uid =
-        actual_failure.function_uid;
-      pending_operation_state.failure_status.generation =
-        actual_failure.generation;
-      pending_operation_state.failure_status.resource_id =
-        actual_failure.resource_id;
-      pending_operation_state.failure_status.command_id =
-        actual_failure.command_id;
-      pending_operation_state.failure_status.wr_id = actual_failure.wr_id;
-      pending_operation_state.failure_status.severity = actual_failure.severity;
-      pending_operation_state.failure_status.retryable = actual_failure.retryable;
-      pending_operation_state.failure_status.message = actual_failure.message;
-    end
+    if (actual_failure != null)
+      void'(copy_recovery_failure_status_locked(actual_failure));
     if (consume_confirmation)
       recovery_retry_confirmed = 1'b0;
     recovery_commit_allowed = 1'b0;

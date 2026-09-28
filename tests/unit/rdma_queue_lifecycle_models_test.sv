@@ -250,6 +250,50 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     return context_ref;
   endfunction
 
+  // 功能：check_opcode_policy 验证生命周期 opcode policy 对四类队列资源的 create/query/delete 映射及非队列 fail-closed 结果。
+  // 输入/输出及副作用：无显式输入；函数只读取静态 policy 返回值并产生 UVM 断言，不创建 resource、CMQ ticket 或外部 adapter。
+  // 失败/边界：任一映射不符合固定 CMQ opcode，或 FUNCTION 返回非零 opcode，均报告测试错误；policy 本身不改变 executor 的状态门禁。
+  function automatic void check_opcode_policy();
+    rdma_resource_kind_e unsupported_kind;
+
+    unsupported_kind = RDMA_RESOURCE_FUNCTION;
+    if (rdma_queue_lifecycle_opcode_policy::create_opcode(RDMA_RESOURCE_CQ) !=
+          RDMA_OP_CQC_CREATE ||
+        rdma_queue_lifecycle_opcode_policy::create_opcode(RDMA_RESOURCE_SRQ) !=
+          RDMA_OP_SRFQC_CREATE ||
+        rdma_queue_lifecycle_opcode_policy::create_opcode(RDMA_RESOURCE_CEQ) !=
+          RDMA_OP_CEQC_CREATE ||
+        rdma_queue_lifecycle_opcode_policy::create_opcode(RDMA_RESOURCE_AEQ) !=
+          RDMA_OP_AEQC_CREATE)
+      `uvm_error("QUEUE_OPCODE_CREATE", "queue create opcode policy mismatch")
+    if (rdma_queue_lifecycle_opcode_policy::query_opcode(RDMA_RESOURCE_CQ) !=
+          RDMA_OP_CQC_QUERY ||
+        rdma_queue_lifecycle_opcode_policy::query_opcode(RDMA_RESOURCE_SRQ) !=
+          RDMA_OP_SRFQC_QUERY ||
+        rdma_queue_lifecycle_opcode_policy::query_opcode(RDMA_RESOURCE_CEQ) !=
+          RDMA_OP_CEQC_QUERY ||
+        rdma_queue_lifecycle_opcode_policy::query_opcode(RDMA_RESOURCE_AEQ) !=
+          RDMA_OP_AEQC_QUERY)
+      `uvm_error("QUEUE_OPCODE_QUERY", "queue query opcode policy mismatch")
+    if (rdma_queue_lifecycle_opcode_policy::delete_opcode(RDMA_RESOURCE_CQ) !=
+          RDMA_OP_CQC_DELETE ||
+        rdma_queue_lifecycle_opcode_policy::delete_opcode(RDMA_RESOURCE_SRQ) !=
+          RDMA_OP_SRFQC_DELETE ||
+        rdma_queue_lifecycle_opcode_policy::delete_opcode(RDMA_RESOURCE_CEQ) !=
+          RDMA_OP_CEQC_DELETE ||
+        rdma_queue_lifecycle_opcode_policy::delete_opcode(RDMA_RESOURCE_AEQ) !=
+          RDMA_OP_AEQC_DELETE)
+      `uvm_error("QUEUE_OPCODE_DELETE", "queue delete opcode policy mismatch")
+    if (rdma_queue_lifecycle_opcode_policy::create_opcode(unsupported_kind) !=
+          8'h00 ||
+        rdma_queue_lifecycle_opcode_policy::query_opcode(unsupported_kind) !=
+          8'h00 ||
+        rdma_queue_lifecycle_opcode_policy::delete_opcode(unsupported_kind) !=
+          8'h00)
+      `uvm_error("QUEUE_OPCODE_FAIL_CLOSED",
+                 "unsupported resource kind produced a queue opcode")
+  endfunction
+
   // 功能：在 rdma_queue_lifecycle_models_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
@@ -291,6 +335,8 @@ class rdma_queue_lifecycle_models_test extends uvm_test;
     uvm_object cloned;
 
     phase.raise_objection(this);
+
+    check_opcode_policy();
 
     // 嵌套 validator 返回 null 时，所有上层模型都必须返回确定的
     // INVALID_STATE，而不是解引用空 status 或发布半成品 authority。

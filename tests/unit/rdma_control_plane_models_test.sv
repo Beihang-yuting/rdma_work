@@ -182,6 +182,8 @@ class rdma_control_plane_models_test extends uvm_test;
     rdma_mr_backing_desc descriptor_clone;
     rdma_control_result result;
     rdma_control_result result_clone;
+    rdma_control_result seeded_result;
+    rdma_lifecycle_result_seed result_seed;
     rdma_recovery_record recovery;
     rdma_recovery_record recovery_clone;
     rdma_cmq_ticket ticket;
@@ -199,6 +201,40 @@ class rdma_control_plane_models_test extends uvm_test;
     uvm_object cloned_object;
 
     phase.raise_objection(this);
+
+    result_seed = rdma_lifecycle_result_seed::type_id::create(
+      "queue_result_seed_fixture"
+    );
+    result_seed.transaction_id = 64'd77;
+    result_seed.domain = RDMA_LIFECYCLE_DOMAIN_QUEUE;
+    result_seed.pending_message = "queue seed pending";
+    seeded_result = rdma_control_result::type_id::create(
+      "queue_seeded_result"
+    );
+    status = result_seed.initialize_result(seeded_result);
+    expect_status("LIFECYCLE_SEED_INIT", status, RDMA_SC_OK);
+    if (seeded_result.transaction_id != 64'd77 ||
+        seeded_result.status == null ||
+        seeded_result.primary_status == null ||
+        seeded_result.status.code != RDMA_SC_INVALID_STATE ||
+        seeded_result.status.message != "queue seed pending" ||
+        seeded_result.primary_status == seeded_result.status ||
+        seeded_result.final_resource_state != RDMA_RESOURCE_NEW ||
+        seeded_result.final_resource_state_known ||
+        seeded_result.recovery_required)
+      `uvm_error("LIFECYCLE_SEED_INIT",
+                 "seed did not produce an isolated pending result")
+    seeded_result.status.message = "mutated result status";
+    if (seeded_result.primary_status.message != "queue seed pending")
+      `uvm_error("LIFECYCLE_SEED_CLONE",
+                 "seeded status fields alias each other")
+    result_seed.pending_message = "";
+    expect_status("LIFECYCLE_SEED_EMPTY_MESSAGE", result_seed.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
+    result_seed.pending_message = "queue seed pending";
+    result_seed.domain = rdma_lifecycle_domain_e'(2'd3);
+    expect_status("LIFECYCLE_SEED_DOMAIN", result_seed.validate(),
+                  RDMA_SC_INVALID_ARGUMENT);
 
     if (RDMA_CTRL_STEP_RESOURCE_RESERVED != 0 ||
         RDMA_CTRL_STEP_RESOURCE_RELEASED != 10 ||

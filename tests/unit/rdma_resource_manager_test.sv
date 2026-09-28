@@ -1,12 +1,142 @@
 // 目录：测试层 unit/rdma_resource_manager_test.sv。
-// 职责：验证 rdma_resource_manager_test 对应模块的接口、错误路径和边界行为。
-// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
-// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
-
-// 中文说明：rdma_resource_manager_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：验证资源分配/发布/恢复/释放、QP/CQ 业务状态与 generation/authority 拒绝契约。
+// 依赖：rdma_core/model package、resource projector、UVM 和本文件的 mapping/CQC/probe fixture。
+//   probe 直接使用集中投影组件构造冲突快照，不依赖 manager 已移出的 protected helper。
+// 所有权与生命周期：测试拥有本地 manager/值对象；opaque backing 仍遵守 adapter 完成证明。
+//   static callback target 只借用 manager，逐场景清空；held mutation guard 由测试显式归还。
+// 设计：通过真实 clone/completion 窗口注入重入，不为生产 manager 增加专用测试 observer。
 
 class rdma_resource_manager_probe extends rdma_resource_manager;
+
+  // 功能：observe_binding_count 读取已登记的 binding 快照数量，检查 admission 失败无半登记。
+  // 输入/输出及副作用：无参数；只返回 binding_snapshots.num()，不投影或修改 authority。
+  // 失败/边界：没有登记时返回零；它不是 live resource 数，不能据此回收 binding。
+  function int unsigned observe_binding_count();
+    return binding_snapshots.num();
+  endfunction
+
+  // 功能：configure_allocator_boundary 为新建测试 manager 设置 fresh ID/epoch 极限状态。
+  // 输入/输出及副作用：kind、next_id、epoch 写入对应 allocator 游标和 publication_epoch，
+  //   不创建 registry 或外部资源；供饱和/最大 ID 的补偿测试使用。
+  // 失败/边界：只允许没有预留或 live resource 的独立 fixture 使用，不能模拟生产回滚。
+  function void configure_allocator_boundary(
+    rdma_resource_kind_e kind, int unsigned next_id, longint unsigned epoch
+  );
+    next_local_id[kind] = next_id;
+    publication_epoch = epoch;
+  endfunction
+
+  // 仅测试持有的回调计数/注入配置；不为生产 manager 增加 observer 或第二份账本。
+  int unsigned registry_window_calls;
+  int unsigned registry_window_trigger;
+  int unsigned registry_window_fault;
+  bit registry_window_fired;
+  rdma_handle registry_window_handle;
+
+  // 功能：registry_window_probe 从真实 CQC clone/mapping completion 回调注入最终提交冲突。
+  // 输入/输出及副作用：使用测试设置的 handle/trigger/fault；第 trigger 次回调推进 epoch、
+  //   占用 guard 或用等值 detached source 替换 registry，并记录 fired；其它回调只计数。
+  // 失败/边界：fault=0 禁用注入；注入前清 fault 防止递归，guard 忙或投影失败使 fixture fatal；
+  //   guard 故障必须由测试归还，source 替换故意不推进 epoch 以独立验证引用检查。
+  function void registry_window_probe();
+    rdma_resource projected;
+    rdma_status status;
+    int unsigned fault;
+    string key;
+
+    registry_window_calls++;
+    if (registry_window_fault == 0 || registry_window_calls != registry_window_trigger)
+      return;
+    fault = registry_window_fault;
+    registry_window_fault = 0;
+    registry_window_fired = 1'b1;
+    key = resource_key(registry_window_handle);
+    case (fault)
+      1: advance_publication_epoch();
+      2: begin
+        if (!hold_mutation_guard_probe())
+          `uvm_fatal("REGISTRY_WINDOW_GUARD", "could not hold mutation guard")
+      end
+      3: begin
+        status = rdma_resource_projector::project_resource_value(
+          registry[key], "registry source conflict", projected
+        );
+        if (!status.ok())
+          `uvm_fatal("REGISTRY_WINDOW_SOURCE", status.convert2string())
+        registry[key] = projected;
+      end
+      default: return;
+    endcase
+  endfunction
+
+  // 功能：restore_registry_fixture 为同一生命周期入口的多个故障窗口恢复初始 fixture。
+  // 输入/输出及副作用：source 是测试保存的非别名 canonical 快照，staged 是初始暂存标志；
+  //   只替换测试 manager 的该条目/标志，不回退 epoch、generation 或外部 completion。
+  // 失败/边界：fixture 保证 source/handle 非空且无并发使用；禁止用于生产回滚或释放 backing。
+  function void restore_registry_fixture(rdma_resource source, bit staged);
+    string key;
+
+    key = resource_key(source.handle);
+    registry[key] = source;
+    if (staged)
+      staged_allocations[key] = 1'b1;
+    else
+      staged_allocations.delete(key);
+  endfunction
+
+  // 功能：release_keys_probe 将测试给出的 handle 集合送入真实批量释放提交点。
+  // 输入/输出及副作用：handles 和 epoch 为输入；成功时删除对应 manager 记录并归还 ID。
+  // 失败/边界：fixture 必须提供非空 handle；旧 epoch、重复 key、free-list 冲突和锁忙原样返回。
+  function rdma_status release_keys_probe(
+    rdma_handle handles[$], longint unsigned epoch
+  );
+    string keys[$];
+
+    foreach (handles[i]) keys.push_back(resource_key(handles[i]));
+    return commit_resource_releases(keys, epoch, "release probe");
+  endfunction
+
+  // 功能：set_free_id_probe 注入或移除指定 local ID 的 free-list 冲突，用于整批原子性断言。
+  // 输入/输出及副作用：kind、local_id 定位 ID，present 选择插入或删除；只改测试 manager 池。
+  // 失败/边界：插入只用于本来不存在的 ID；删除只移除首个匹配项，不重排其它空闲 ID。
+  function void set_free_id_probe(
+    rdma_resource_kind_e kind, int unsigned local_id, bit present
+  );
+    if (present) begin
+      free_local_ids[kind].push_back(local_id);
+      return;
+    end
+    foreach (free_local_ids[kind][i]) begin
+      if (free_local_ids[kind][i] == local_id) begin
+        free_local_ids[kind].delete(i);
+        return;
+      end
+    end
+  endfunction
+
+  // 功能：observe_free_count 读取特定资源池空闲 ID 数，检查失败未回收和成功恰好回收一次。
+  // 输入/输出及副作用：kind 为输入，返回队列长度；不修改 allocator 或 resource。
+  // 失败/边界：尚未创建的 kind 池返回零，不隐式创建可用 ID。
+  function int unsigned observe_free_count(rdma_resource_kind_e kind);
+    return free_local_ids.exists(kind) ? free_local_ids[kind].size() : 0;
+  endfunction
+
+  // 功能：observe_resource_source 暴露 registry 原引用，用于断言查询不会偷偷替换 authority。
+  // 输入/输出及副作用：handle 定位测试资源；返回非拥有引用，测试只能观察，不经其修改生产状态。
+  // 失败/边界：handle 非空由 fixture 保证；不存在的 incarnation 返回 null。
+  function rdma_resource observe_resource_source(rdma_handle handle);
+    string key;
+
+    key = resource_key(handle);
+    return registry.exists(key) ? registry[key] : null;
+  endfunction
+
+  // 功能：observe_staged 检查失败的 ERROR publication 是否保留暂存标志。
+  // 输入/输出及副作用：handle 为资源键；返回 staged presence，不更新状态。
+  // 失败/边界：fixture 保证 handle 非空；未知/未暂存的 incarnation 返回零。
+  function bit observe_staged(rdma_handle handle);
+    return staged_allocations.exists(resource_key(handle));
+  endfunction
 
   // 功能：构造 rdma_resource_manager_probe，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -49,6 +179,301 @@ class rdma_resource_manager_probe extends rdma_resource_manager;
   function int unsigned observed_recovery_count();
     return recovery_records.num();
   endfunction
+
+  // 功能：observe_activity_blockers 读取 manager 对指定资源计算出的 detached 依赖/在途快照，
+  //   供测试直接验证 blocker 计数与布尔值来自同一次 registry 扫描。
+  // 输入/输出及副作用：resource（输入）定位 manager registry 条目；snapshot（输出）获得
+  //   dependent_count、outstanding_count 及对应 bit；函数只读账本，不修改 registry 或资源状态。
+  // 失败/边界：resource 为 null 时输出全零；调用方仍须先确保资源属于本 manager，函数不把未知
+  //   句柄转换为错误码，也不取得外部资源所有权。
+  function void observe_activity_blockers(
+    rdma_resource resource,
+    output rdma_resource_activity_blocker_snapshot snapshot
+  );
+    snapshot_activity_blockers(resource, snapshot);
+  endfunction
+
+  // 功能：stage_publication_probe 暴露 resource manager 的 detached publication staging
+  //   seam，供测试验证外部 projection 完成后 registry 仍未发生 mutation。
+  // 输入/输出及副作用：resource、copy_label 为输入，candidate 为输出；调用受保护的
+  //   stage_resource_publication，可能执行 clone/factory，但不提交 registry 或代际账本。
+  // 失败/边界：输入对象不完整、投影失败或 publication identity 不一致时返回明确错误，
+  //   candidate 置空；测试不能把失败 candidate 继续交给 commit probe。
+  function rdma_status stage_publication_probe(
+    rdma_resource resource,
+    string copy_label,
+    output rdma_resource_publication_candidate candidate
+  );
+    return stage_resource_publication(resource, copy_label, candidate);
+  endfunction
+
+  // 功能：commit_publication_probe 暴露无外部调用的 publication commit seam，供测试验证
+  //   已 staged candidate 能一次性安装 registry/owner/handle/generation 四份账本。
+  // 输入/输出及副作用：candidate 为输入；成功时更新 manager publication 账本，不创建对象、
+  //   不调用 factory，也不接管外部 resource/backing 所有权。
+  // 失败/边界：candidate 为空或 valid() 失败时返回 INVALID_STATE 且保持 registry 不变；
+  //   成功后 candidate 仍有效，调用方必须显式 clear 以结束 detached 生命周期。
+  function rdma_status commit_publication_probe(
+    rdma_resource_publication_candidate candidate
+  );
+    return commit_resource_publication(candidate);
+  endfunction
+
+  // 功能：observe_registry_count 读取 manager 当前 live registry 条目数，作为 publication
+  //   stage/commit 测试的无副作用账本快照。
+  // 输入/输出及副作用：无输入；函数只读 registry 并返回条目数量，不修改 manager 状态。
+  // 失败/边界：空 registry 返回 0；该计数不包含已释放但仍保留在 incarnation tombstone
+  //   中的 owner/handle 记录。
+  function int unsigned observe_registry_count();
+    return registry.num();
+  endfunction
+
+  // 功能：registry_schema_status_probe 暴露 registry schema 的 detached→commit
+  //   事务边界，供 hostile fixture 验证投影失败时不会留下部分写回。
+  // 输入/输出及副作用：operation（输入）决定诊断前缀；函数只转发到受保护
+  //   registry_schema_status，成功时可能原子替换 registry 快照，不接管外部资源。
+  // 失败/边界：任一 registry carrier 不兼容、epoch/引用变化或 mutation guard 忙时
+  //   原样返回错误；调用方不得把失败视为已提交。
+  function rdma_status registry_schema_status_probe(string operation);
+    return registry_schema_status(operation);
+  endfunction
+
+  // 功能：recovery_schema_status_probe 暴露 recovery schema 的全量 detached→commit
+  //   事务边界，供 hostile fixture 验证恢复账本不会半提交。
+  // 输入/输出及副作用：operation（输入）决定诊断前缀；成功时可能原子替换
+  //   recovery_records 快照，不创建或释放 backing、mapping 或 adapter 资源。
+  // 失败/边界：投影失败、epoch/引用变化或 mutation guard 忙时返回错误并保留原账本。
+  function rdma_status recovery_schema_status_probe(string operation);
+    return recovery_schema_status(operation);
+  endfunction
+
+  // 功能：recovery_entry_schema_status_probe 暴露单条 recovery schema 提交边界，
+  //   供测试验证单 key 的引用一致性拒绝路径。
+  // 输入/输出及副作用：key、operation（输入）定位记录并设置诊断前缀；成功时只更新
+  //   对应 recovery_records 条目，不取得外部 backing 所有权。
+  // 失败/边界：未知 key 保持幂等成功；记录为空、投影失败或 commit window 忙时返回错误。
+  function rdma_status recovery_entry_schema_status_probe(
+    string key,
+    string operation
+  );
+    return recovery_entry_schema_status(key, operation);
+  endfunction
+
+  // 功能：observe_publication_epoch 读取 manager 的 publication mutation 代际，供测试验证
+  //   detached stage 在外部 projection 前捕获的 epoch 与当前账本一致。
+  // 输入/输出及副作用：无显式输入；函数只读 publication_epoch，返回 longint unsigned，
+  //   不修改 registry、allocator、candidate 或外部资源所有权。
+  // 失败/边界：新建 manager 的 epoch 为 0；该值仅用于测试观察，调用方不得据此直接写入
+  //   manager 账本或绕过 stage/commit 校验。
+  function longint unsigned observe_publication_epoch();
+    return publication_epoch;
+  endfunction
+
+  // 功能：reserve_identity_probe 暴露普通 resource identity 的 detached 预留 seam，供测试
+  //   在构造 authoritative resource 与 publication 之间注入 manager mutation。
+  // 输入/输出及副作用：binding、kind 为输入，candidate 为输出；函数只委托 manager 的
+  //   reserve_identity_candidate，成功时更新 allocator reservation，不发布 registry 条目。
+  // 失败/边界：binding/kind 不满足 reserve_identity_candidate 的代际、容量或 kind 门禁时
+  //   原样返回错误；失败 candidate 置空，测试不得继续构造资源。
+  function rdma_status reserve_identity_probe(
+    rdma_function_binding binding,
+    rdma_resource_kind_e kind,
+    output rdma_resource_identity_candidate candidate
+  );
+    return reserve_identity_candidate(binding, kind, candidate);
+  endfunction
+
+  // 功能：publish_identity_probe 暴露普通 identity candidate 的 freshness/publication seam，
+  //   供测试验证 stale reservation 会先回滚而不写入 registry。
+  // 输入/输出及副作用：candidate、authoritative、copy_label 为输入，published 为输出；
+  //   函数委托 publish_identity_candidate，成功时登记 registry，失败时按 candidate epoch
+  //   规则回滚 allocator reservation。
+  // 失败/边界：candidate 为空、不完整或 epoch 落后时返回 INVALID_STATE；失败不得留下
+  //   半发布 resource 或额外 registry 条目。
+  function rdma_status publish_identity_probe(
+    rdma_resource_identity_candidate candidate,
+    rdma_resource authoritative,
+    string copy_label,
+    output rdma_resource published
+  );
+    return publish_identity_candidate(candidate, authoritative, copy_label, published);
+  endfunction
+
+  // 功能：advance_publication_epoch_probe 在测试中模拟外部调用窗口内的 manager mutation，
+  //   只推进 publication epoch，不伪造 registry/resource 条目。
+  // 输入/输出及副作用：无显式输入；函数更新 manager-owned publication_epoch，供 stale
+  //   candidate 门禁观察；不接管外部 adapter 或 backing 所有权。
+  // 失败/边界：epoch 到达饱和值时保持不变；该 probe 只用于故障注入，生产 caller 不应
+  //   绕过实际 allocator/registry mutation 直接调用。
+  function void advance_publication_epoch_probe();
+    advance_publication_epoch();
+  endfunction
+
+  // 功能：reserve_function_identity_probe 暴露 Function 专用 identity candidate 的 detached
+  //   预留 seam，供测试在 binding/resource projection 窗口注入 epoch mutation。
+  // 输入/输出及副作用：binding 为输入，candidate 为输出；函数只更新 manager 自有
+  //   generation/local-ID/binding reservation，不发布 Function registry 条目。
+  // 失败/边界：重复 incarnation、旧 generation、tombstone、容量或 binding authority
+  //   不满足时原样返回错误；失败 candidate 置空。
+  function rdma_status reserve_function_identity_probe(
+    rdma_function_binding binding,
+    output rdma_function_identity_candidate candidate
+  );
+    return reserve_function_identity_candidate(binding, candidate);
+  endfunction
+
+  // 功能：publish_function_identity_probe 暴露 Function candidate publication seam，验证
+  //   stale generation reservation 在 registry commit 前回滚。
+  // 输入/输出及副作用：candidate、authoritative 为输入，published 为输出；函数委托
+  //   Function 专用 publish helper，成功时登记 Function ledger，失败时清除并回滚 candidate。
+  // 失败/边界：candidate 不完整、epoch 落后或 authoritative 缺失时返回 INVALID_STATE，
+  //   不创建 registry alias，也不保留 local-ID/binding reservation。
+  function rdma_status publish_function_identity_probe(
+    rdma_function_identity_candidate candidate,
+    rdma_function authoritative,
+    output rdma_resource published
+  );
+    return publish_function_identity_candidate(candidate, authoritative, published);
+  endfunction
+
+  // 功能：hold_mutation_guard_probe 故意占用 manager 的最终 mutation guard，供测试在
+  //   已 staged candidate 提交前注入确定性的 commit contention。
+  // 输入/输出及副作用：无显式输入；成功时消耗一枚 guard token 并返回 1，调用方必须
+  //   调用 release_mutation_guard_probe；不修改 registry、recovery、allocator 或外部资源。
+  // 失败/边界：guard 未构造或已被其他事务占用时返回 0，不阻塞、不伪造提交结果。
+  function bit hold_mutation_guard_probe();
+    return mutation_guard != null && mutation_guard.try_get(1);
+  endfunction
+
+  // 功能：release_mutation_guard_probe 归还 hold_mutation_guard_probe 持有的最终写入锁，
+  //   让后续 publication/queue/QP commit 恢复正常。
+  // 输入/输出及副作用：无显式输入；成功时向 mutation_guard 归还一个 token，不修改任何
+  //   registry、recovery、allocator 或外部 backing。
+  // 失败/边界：guard 未构造时静默返回；调用方不得在未成功 hold 后重复归还 token。
+  function void release_mutation_guard_probe();
+    if (mutation_guard != null)
+      mutation_guard.put(1);
+  endfunction
+endclass
+
+// Function 默认 binding 的 factory 构造发生在 identity reserve 之后；这里模拟真实同步重入，
+// 不在生产 manager 添加专用测试 observer。static 引用由用例建立并在退出前清空。
+class rdma_rm_allocator_reentry_binding extends rdma_function_binding;
+  `uvm_object_utils(rdma_rm_allocator_reentry_binding)
+
+  static rdma_resource_manager_probe target;
+  static rdma_function_binding source;
+  static rdma_pd successor;
+  static rdma_status successor_status;
+
+  // 功能：构造默认 binding 时一次性重入 manager.create_pd，验证外层 Function 失败补偿隔离。
+  // 输入/输出及副作用：name 传给父类；target/source 非空时先清 target 再分配 PD，将 status/
+  //   successor 保存给测试断言；本对象不取得 manager 或 authority 生命周期所有权。
+  // 失败/边界：未配置 target 时完全保持默认构造；先清 target 防止递归，分配失败不伪造 PD，
+  //   由用例检查 successor_status，factory override 与 static source 必须在调用后恢复。
+  function new(string name = "rdma_rm_allocator_reentry_binding");
+    rdma_resource_manager_probe manager;
+
+    super.new(name);
+    manager = target;
+    target = null;
+    if (manager != null)
+      successor_status = manager.create_pd(source, successor);
+  endfunction
+endclass
+
+// status::success 的 factory 也是同步外部窗口；仅在第一次 PD 消费完成后触发嵌套分配，
+// admission 阶段 epoch=0 时不注入，以独立验证 reservation 的 epoch 冻结点。
+class rdma_rm_allocator_reentry_status extends rdma_status;
+  `uvm_object_utils(rdma_rm_allocator_reentry_status)
+
+  static rdma_resource_manager_probe target;
+  static rdma_function_binding source;
+  static rdma_pd successor;
+  static rdma_status successor_status;
+
+  // 功能：在普通 PD 预留的返回 status factory 内重入一次 create_pd。
+  // 输入/输出及副作用：name 传给父类；target 的 epoch=1 时清空 target 后分配 PD，
+  //   保存 successor/status 供用例验证；不取得 manager 或 source 的所有权。
+  // 失败/边界：未配置 target 或消费前 epoch=0 时不注入；嵌套失败不伪造资源，
+  //   static 引用与 factory 必须由用例恢复，先清 target 避免递归。
+  function new(string name = "rdma_rm_allocator_reentry_status");
+    rdma_resource_manager_probe manager;
+
+    super.new(name);
+    manager = target;
+    if (manager != null && manager.observe_publication_epoch() == 1) begin
+      target = null;
+      successor_status = manager.create_pd(source, successor);
+    end
+  endfunction
+endclass
+
+// 逐个遍历消费前的真实 status factory 窗口；先断开 target 再注入，避免嵌套分配递归注入。
+// 此 fixture 只观察 manager 既有测试接口，不为生产代码增加回调或第二份资源账本。
+class rdma_rm_admission_window_status extends rdma_status;
+  `uvm_object_utils(rdma_rm_admission_window_status)
+
+  static rdma_resource_manager_probe target;
+  static rdma_function_binding source;
+  static rdma_resource_kind_e kind;
+  static longint unsigned initial_epoch;
+  static int unsigned calls;
+  static int unsigned trigger;
+  static int unsigned fault;
+  static bit fired;
+  static bit guard_held;
+  static rdma_resource survivor;
+  static rdma_status nested_status;
+  static longint unsigned expected_epoch;
+  static int unsigned expected_cursor;
+  static int unsigned expected_serial;
+  static int unsigned expected_free;
+  static int unsigned expected_bindings;
+  static int unsigned expected_resources;
+
+  // 功能：构造 status 时在第 trigger 个消费前窗口嵌套分配，或注入锁忙/epoch/代际冲突。
+  // 输入/输出及副作用：name 传给父类；target/source/kind/fault 由用例配置，记录 calls、
+  //   fired、survivor 和注入后 allocator 快照；guard_held 由用例归还，不拥有外部资源。
+  // 失败/边界：target 为空或 epoch 已离开初始值时不计数；trigger=0 只计数，注入前清
+  //   target 防止递归；嵌套分配失败由用例检查，未知 fault 报 fixture fatal。
+  function new(string name = "rdma_rm_admission_window_status");
+    rdma_resource_manager_probe manager;
+    rdma_pd pd;
+    rdma_function function_resource;
+
+    super.new(name);
+    manager = target;
+    if (manager == null || manager.observe_publication_epoch() != initial_epoch)
+      return;
+    calls++;
+    if (trigger == 0 || calls != trigger)
+      return;
+    target = null;
+    fired = 1'b1;
+    case (fault)
+      1: begin
+        if (kind == RDMA_RESOURCE_FUNCTION) begin
+          nested_status = manager.create_function(source, function_resource);
+          survivor = function_resource;
+        end
+        else begin
+          nested_status = manager.create_pd(source, pd);
+          survivor = pd;
+        end
+      end
+      2: guard_held = manager.hold_mutation_guard_probe();
+      3: manager.advance_publication_epoch_probe();
+      4: source.generation++;
+      default: `uvm_fatal("ADMISSION_FAULT", "unknown admission fixture fault")
+    endcase
+    expected_epoch = manager.observe_publication_epoch();
+    expected_cursor = manager.observed_next_local_id(kind);
+    expected_serial = manager.observed_next_object_serial(kind);
+    expected_free = manager.observe_free_count(kind);
+    expected_bindings = manager.observe_binding_count();
+    expected_resources = manager.observe_registry_count();
+  endfunction
 endclass
 
 // Generic QP mutation bypass tests need exact staged and ACTIVE registry
@@ -71,7 +496,7 @@ class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
     rdma_status status;
     string key;
 
-    status = project_public_resource_value(
+    status = rdma_resource_projector::project_public_resource_value(
       candidate, "force QP staged precondition", projected
     );
     if (!status.ok() || !$cast(replacement, projected))
@@ -103,7 +528,7 @@ class rdma_qp_generic_bypass_probe_manager extends rdma_resource_manager;
     rdma_status status;
     string key;
 
-    status = project_public_resource_value(
+    status = rdma_resource_projector::project_public_resource_value(
       candidate, "force QP ACTIVE precondition", projected
     );
     if (!status.ok() || !$cast(replacement, projected))
@@ -212,6 +637,9 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
   local bit allocation_token_initialized;
   local bit release_complete;
   local static longint unsigned next_allocation_token = 1;
+  // 非拥有、一次性重入注入：仅测试显式设置时生效，跨 clone 共享以命中真实 completion 窗口。
+  static rdma_resource_manager_probe completion_epoch_target;
+  static rdma_resource_manager_probe registry_window_target;
 
   // 功能：构造 rdma_rm_independent_release_mapping，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：allocation_token=0；allocation_token_initialized=1'b0；release_complete=1'b0。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -239,9 +667,12 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     release_complete = value;
   endfunction
 
-  // 功能：在 rdma_rm_independent_release_mapping 中，snapshot_release_authority 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：snapshot（输出）；snapshot_release_authority 读取 snapshot 并使用字段 snapshot、candidate、candidate.allocation_token、candidate.allocation_token_initialized，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：snapshot_release_authority 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：snapshot_release_authority 返回独立 carrier，保留同一 opaque allocation token，
+  //   并允许在真实 authority 查询窗口注入 manager 提交冲突。
+  // 输入/输出及副作用：snapshot 输出新 carrier；registry_window_target 非空时计数/注入，
+  //   不改变本 mapping 的 token、完成事实或资源所有权。
+  // 失败/边界：token 未初始化返回 INVALID_STATE 且 snapshot=null；成功 snapshot 只代表
+  //   释放权威，不复制可写 backing 或伪造 release_complete。
   virtual function rdma_status snapshot_release_authority(
     output rdma_dma_mapping snapshot
   );
@@ -258,6 +689,8 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     candidate.allocation_token = allocation_token;
     candidate.allocation_token_initialized = 1'b1;
     snapshot = candidate;
+    if (registry_window_target != null)
+      registry_window_target.registry_window_probe();
     return rdma_status::success();
   endfunction
 
@@ -279,13 +712,22 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_rm_independent_release_mapping 中，release_completion_status 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：release_complete（输出）；release_completion_status 可能更新本对象明确拥有的状态，并写入 release_complete；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：release_completion_status 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：release_completion_status 返回本 mapping 的独立完成事实，并可一次性注入 manager
+  //   代际变化，验证外部 completion 查询到 commit 的窗口确实受 OCC 保护。
+  // 输入/输出及副作用：release_complete 为输出；completion_epoch_target 非空时推进其
+  //   publication epoch 并清空注入指针；registry_window_target 可计数/注入 registry 提交冲突；
+  //   不改 mapping 的值、seal 或 backing 生命周期。
+  // 失败/边界：未配置注入时纯读取；注入只触发一次，正常返回 OK，由 caller 拒绝 stale 提交。
   virtual function rdma_status release_completion_status(
     output bit release_complete
   );
     release_complete = this.release_complete;
+    if (registry_window_target != null)
+      registry_window_target.registry_window_probe();
+    if (completion_epoch_target != null) begin
+      completion_epoch_target.advance_publication_epoch_probe();
+      completion_epoch_target = null;
+    end
     return rdma_status::success();
   endfunction
 
@@ -301,6 +743,32 @@ class rdma_rm_independent_release_mapping extends rdma_dma_mapping;
     allocation_token = rhs_mapping.allocation_token;
     allocation_token_initialized = rhs_mapping.allocation_token_initialized;
     release_complete = rhs_mapping.release_complete;
+  endfunction
+endclass
+
+// CQC 必须保留多态 clone 契约；用真实 clone 窗口测试 caller 的 epoch/source 捕获顺序。
+class rdma_rm_registry_window_cqc extends rdma_cqc_model;
+  `uvm_object_utils(rdma_rm_registry_window_cqc)
+
+  static rdma_resource_manager_probe registry_window_target;
+
+  // 功能：构造保留标准 CQC 默认值的 clone 重入 fixture。
+  // 输入/输出及副作用：name 传给父类；实例只拥有本地 CQC 值，static target 是非拥有引用。
+  // 失败/边界：构造不启用注入，使用前由测试填充合法 handle/depth/page_layout。
+  function new(string name = "rdma_rm_registry_window_cqc");
+    super.new(name);
+  endfunction
+
+  // 功能：clone 完成标准 detached CQC 复制后，在真实外部投影窗口触发测试计数器。
+  // 输入/输出及副作用：无参数；返回父类 clone 的新对象，target 非空时可注入 manager 冲突。
+  // 失败/边界：不改变 CQC 字段或伪造 clone 成功；target 由测试在每个场景后清空。
+  virtual function uvm_object clone();
+    uvm_object result;
+
+    result = super.clone();
+    if (registry_window_target != null)
+      registry_window_target.registry_window_probe();
+    return result;
   endfunction
 endclass
 
@@ -504,9 +972,11 @@ class rdma_qp_lifecycle_probe_manager
   endfunction
 endclass
 
-class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
+class rdma_queue_recovery_probe_manager extends rdma_resource_manager_probe;
   rdma_recovery_record observed_pre_retire_recovery;
   bit force_queue_restore_late_failure;
+  // 0=正常，1=epoch mutation，2=占用 commit guard，3=resource source 替换，4=recovery source 替换。
+  int unsigned restore_commit_fault = 0;
 
   // 功能：构造 rdma_queue_recovery_probe_manager，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：observed_pre_retire_recovery=null；force_queue_restore_late_failure=1'b0。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -849,13 +1319,19 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     `uvm_fatal("QUEUE_SEGMENT_RELEASE", "queue role is unavailable")
   endfunction
 
-  // 功能：在 rdma_queue_recovery_probe_manager 中，queue_restore_pre_publish_observer 读取或发布队列/QP 恢复进度快照，使恢复步骤可重复执行且不会重复释放资源。
-  // 输入/输出及副作用：prepared_recovery（输入）；queue_restore_pre_publish_observer 读取 prepared_recovery 并使用字段 observed_pre_retire_recovery、cloned_object；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：queue_restore_pre_publish_observer 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（recovery snapshot clone failed），不保留部分有效快照。
+  // 功能：queue_restore_pre_publish_observer 保存即将退休的 detached recovery，
+  //   并在最终提交前定向注入 epoch、guard 或 source 引用冲突，验证恢复的双账本原子性。
+  // 输入/输出及副作用：prepared_recovery 为候选；observed_pre_retire_recovery 接收 clone，
+  //   restore_commit_fault 选择故障；guard 故障由测试调用者在断言后归还 token。
+  // 失败/边界：空候选只清观测值；clone/cast、注入 projection 或占锁失败报 fatal，
+  //   正常模式不改变 live registry/recovery；source 故障只替换等值快照，不修改业务内容。
   virtual function void queue_restore_pre_publish_observer(
     rdma_recovery_record prepared_recovery
   );
     uvm_object cloned_object;
+    rdma_resource replacement;
+    rdma_status status;
+    string key;
 
     observed_pre_retire_recovery = null;
     if (prepared_recovery == null)
@@ -864,6 +1340,25 @@ class rdma_queue_recovery_probe_manager extends rdma_resource_manager;
     if (cloned_object == null ||
         !$cast(observed_pre_retire_recovery, cloned_object))
       `uvm_fatal("QUEUE_RESTORE_OBSERVER", "recovery snapshot clone failed")
+    key = resource_key(prepared_recovery.resource_h);
+    case (restore_commit_fault)
+      1: advance_publication_epoch();
+      2:
+        if (!hold_mutation_guard_probe())
+          `uvm_fatal("QUEUE_RESTORE_OBSERVER", "could not inject busy guard")
+      3: begin
+        status = rdma_resource_projector::project_resource_value(registry[key], "restore source fault", replacement);
+        if (!status.ok())
+          `uvm_fatal("QUEUE_RESTORE_OBSERVER", status.convert2string())
+        registry[key] = replacement;
+      end
+      4: begin
+        status = recovery_entry_schema_status(key, "restore source fault");
+        if (!status.ok())
+          `uvm_fatal("QUEUE_RESTORE_OBSERVER", status.convert2string())
+      end
+      default: return;
+    endcase
   endfunction
 
   // 功能：queue_restore_pre_validate_observer 校验 prepared_resource 与当前对象状态的一致性，返回 void 供上层决定是否提交。
@@ -2553,6 +3048,28 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     super.new(name);
   endfunction
 
+  // 功能：registry_schema_status_probe 暴露 registry schema 的 detached→commit
+  //   事务边界，供 hostile fixture 验证投影失败时不会留下部分写回。
+  // 输入/输出及副作用：operation（输入）决定诊断前缀；函数只转发到受保护
+  //   registry_schema_status，成功时可能原子替换 registry 快照，不接管外部资源。
+  // 失败/边界：任一 registry carrier 不兼容、epoch/引用变化或 mutation guard 忙时
+  //   原样返回错误；调用方不得把失败视为已提交。
+  function rdma_status registry_schema_status_probe(string operation);
+    return registry_schema_status(operation);
+  endfunction
+
+  // 功能：recovery_entry_schema_status_probe 暴露单条 recovery schema 提交边界，
+  //   供测试验证单 key 的引用一致性拒绝路径。
+  // 输入/输出及副作用：key、operation（输入）定位记录并设置诊断前缀；成功时只更新
+  //   对应 recovery_records 条目，不取得外部 backing 所有权。
+  // 失败/边界：未知 key 保持幂等成功；记录为空、投影失败或 commit window 忙时返回错误。
+  function rdma_status recovery_entry_schema_status_probe(
+    string key,
+    string operation
+  );
+    return recovery_entry_schema_status(key, operation);
+  endfunction
+
   // 功能：replace_authoritative 更新字段 函数体列出的状态字段，并在提交前保持 Function authority、generation 和资源所有权约束。
   // 输入/输出及副作用：replacement（输入）；replace_authoritative 读取 replacement 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
   // 失败/边界：replace_authoritative 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
@@ -2608,7 +3125,7 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     rdma_resource source,
     output rdma_resource result
   );
-    return project_public_resource_value(source, "projection gate probe",
+    return rdma_resource_projector::project_public_resource_value(source, "projection gate probe",
                                          result);
   endfunction
 
@@ -2621,7 +3138,7 @@ class rdma_clone_probe_manager extends rdma_resource_manager;
     rdma_status status;
 
     key = resource_key(replacement.handle);
-    status = project_resource_value(replacement, "error probe reset",
+    status = rdma_resource_projector::project_resource_value(replacement, "error probe reset",
                                     replacement_copy);
     if (!status.ok())
       `uvm_fatal("RM_TEST_SCHEMA", status.convert2string())
@@ -4759,13 +5276,1375 @@ class rdma_resource_manager_test extends uvm_test;
            lhs.message == rhs.message;
   endfunction
 
+  // 功能：test_dependency_policy_matrix 直接验证跨资源 dependent 的 QP/SRQ/其它分类
+  //   以及 parent release blocker 规则，作为 resource manager snapshot 的值策略契约。
+  // 输入/输出及副作用：无显式参数；调用 detached policy 并通过 UVM report 发布断言，
+  //   不创建 manager registry、不修改 resource state，也不取得外部资源所有权。
+  // 失败/边界：QP 无 outstanding 时允许特殊 release，QP 有 outstanding 时拒绝；SRQ/
+  //   OTHER 即使空闲也拒绝；NONE 不阻塞；未知 kind 必须 fail-closed 为 OTHER。
+  task automatic test_dependency_policy_matrix();
+    rdma_resource_dependency_class_e dependency_class;
+    rdma_resource_activity_blocker_snapshot snapshot;
+
+    dependency_class = rdma_resource_dependency_policy::classify(
+      RDMA_RESOURCE_QP);
+    if (dependency_class != RDMA_RESOURCE_DEP_QP ||
+        rdma_resource_dependency_policy::blocks_parent_release(
+          dependency_class, 1'b0) ||
+        !rdma_resource_dependency_policy::blocks_parent_release(
+          dependency_class, 1'b1))
+      `uvm_error("DEPENDENCY_POLICY", "QP blocker matrix is inconsistent")
+
+    dependency_class = rdma_resource_dependency_policy::classify(
+      RDMA_RESOURCE_SRQ);
+    if (dependency_class != RDMA_RESOURCE_DEP_SRQ ||
+        !rdma_resource_dependency_policy::blocks_parent_release(
+          dependency_class, 1'b0) ||
+        !rdma_resource_dependency_policy::blocks_parent_release(
+          dependency_class, 1'b1))
+      `uvm_error("DEPENDENCY_POLICY", "SRQ blocker matrix is inconsistent")
+
+    dependency_class = rdma_resource_dependency_policy::classify(
+      RDMA_RESOURCE_CQ);
+    if (dependency_class != RDMA_RESOURCE_DEP_OTHER ||
+        !rdma_resource_dependency_policy::blocks_parent_release(
+          dependency_class, 1'b0))
+      `uvm_error("DEPENDENCY_POLICY", "OTHER blocker matrix is inconsistent")
+
+    dependency_class = rdma_resource_dependency_policy::classify(
+      rdma_resource_kind_e'(4'hf));
+    if (dependency_class != RDMA_RESOURCE_DEP_OTHER ||
+        !rdma_resource_dependency_policy::blocks_parent_release(
+          RDMA_RESOURCE_DEP_OTHER, 1'b0))
+      `uvm_error("DEPENDENCY_POLICY", "unknown blocker must fail closed")
+
+    if (rdma_resource_dependency_policy::blocks_parent_release(
+          RDMA_RESOURCE_DEP_NONE, 1'b0) ||
+        rdma_resource_dependency_policy::blocks_parent_release(
+          RDMA_RESOURCE_DEP_NONE, 1'b1))
+      `uvm_error("DEPENDENCY_POLICY", "NONE dependency unexpectedly blocks")
+
+    snapshot = '{default: '0};
+    snapshot.has_qp_dependents = 1'b1;
+    if (rdma_resource_dependency_policy::blocks_release(
+          snapshot, RDMA_RESOURCE_RELEASE_CQ_RESIZE))
+      `uvm_error("DEPENDENCY_POLICY", "idle QP must not block CQ resize")
+
+    snapshot.has_qp_dependents_with_outstanding = 1'b1;
+    if (!rdma_resource_dependency_policy::blocks_release(
+          snapshot, RDMA_RESOURCE_RELEASE_CQ_RESIZE))
+      `uvm_error("DEPENDENCY_POLICY", "busy QP must block CQ resize")
+
+    snapshot = '{default: '0};
+    snapshot.has_srq_dependents = 1'b1;
+    snapshot.has_non_qp_dependents = 1'b1;
+    if (!rdma_resource_dependency_policy::blocks_release(
+          snapshot, RDMA_RESOURCE_RELEASE_CQ_RESIZE))
+      `uvm_error("DEPENDENCY_POLICY", "idle SRQ must block CQ resize")
+
+    snapshot = '{default: '0};
+    snapshot.has_outstanding_operations = 1'b1;
+    if (!rdma_resource_dependency_policy::blocks_release(
+          snapshot, RDMA_RESOURCE_RELEASE_CQ_RESIZE))
+      `uvm_error("DEPENDENCY_POLICY", "resource activity must block CQ resize")
+
+    snapshot = '{default: '0};
+    snapshot.has_qp_dependents = 1'b1;
+    snapshot.has_live_dependents = 1'b1;
+    if (!rdma_resource_dependency_policy::blocks_release(
+          snapshot, RDMA_RESOURCE_RELEASE_STRICT))
+      `uvm_error("DEPENDENCY_POLICY", "strict release must reject idle QP")
+  endtask
+
+  // 功能：test_queue_progress_candidate_shape 验证 queue progress detached candidate
+  //   在无 recovery、需要 recovery、完整 recovery 和 clear 后的 shape 门禁，确保
+  //   manager 的 snapshot/commit seam 不接受参数半成品。
+  // 输入/输出及副作用：无显式参数；task 只创建本地 resource/recovery fixture 并读取
+  //   candidate.valid()，不写 manager registry/recovery_records，也不取得外部 backing。
+  // 失败/边界：默认 candidate、空 key、缺失 resource 或缺失 recovery 必须拒绝；补齐
+  //   对应 detached 值后必须接受，clear 后再次拒绝且不保留快照引用。
+  task automatic test_queue_progress_candidate_shape();
+    rdma_queue_progress_candidate candidate;
+
+    candidate = new("queue_progress_candidate_shape");
+    if (candidate.valid())
+      `uvm_error("QUEUE_PROGRESS_CANDIDATE", "default candidate was accepted")
+    candidate.key = "queue-progress-shape";
+    candidate.resource_copy = rdma_resource::type_id::create(
+      "queue_progress_shape_resource"
+    );
+    if (!candidate.valid())
+      `uvm_error("QUEUE_PROGRESS_CANDIDATE", "quiescing shape was rejected")
+    candidate.has_recovery = 1'b1;
+    if (candidate.valid())
+      `uvm_error("QUEUE_PROGRESS_CANDIDATE",
+                 "recovery candidate without snapshot was accepted")
+    candidate.recovery_copy = rdma_recovery_record::type_id::create(
+      "queue_progress_shape_recovery"
+    );
+    if (!candidate.valid())
+      `uvm_error("QUEUE_PROGRESS_CANDIDATE",
+                 "complete recovery shape was rejected")
+    candidate.clear();
+    if (candidate.valid() || candidate.key != "" ||
+        candidate.resource_copy != null || candidate.recovery_copy != null ||
+        candidate.manager_epoch != '0 ||
+        candidate.source_resource != null || candidate.source_recovery != null ||
+        candidate.has_recovery)
+      `uvm_error("QUEUE_PROGRESS_CANDIDATE",
+                 "clear did not detach candidate values")
+  endtask
+
+  // 功能：test_resource_allocator_policy_matrix 验证 allocator 的静态 kind 集合和
+  //   local-ID 硬件宽度映射与 manager 既有边界一致，避免纯值规则随账本代码漂移。
+  // 输入/输出及副作用：无显式参数；task 只读取 policy 返回值并发出 UVM 断言，不创建
+  //   resource、修改 manager registry/free-list 或取得外部 backing 所有权。
+  // 失败/边界：合法资源必须逐项通过，FUNCTION/CMQ/未知 kind 的宽度 fallback 不能被误判
+  //   为可分配资源；任一映射或合法性漂移都报告错误并停止该矩阵的后续断言。
+  task automatic test_resource_allocator_policy_matrix();
+    if (!rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_FUNCTION) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_PD) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_MR) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_CQ) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_QP) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_SRQ) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_CMQ) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_CEQ) ||
+        !rdma_resource_allocator_policy::valid_kind(RDMA_RESOURCE_AEQ) ||
+        rdma_resource_allocator_policy::valid_kind(rdma_resource_kind_e'(4'hf)))
+      `uvm_error("ALLOCATOR_POLICY_KIND", "resource kind policy matrix drifted")
+    if (rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_PD) !=
+          16'hffff ||
+        rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_MR) !=
+          24'hff_ffff ||
+        rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_CQ) !=
+          21'h1f_ffff ||
+        rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_QP) !=
+          21'h1f_ffff ||
+        rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_SRQ) !=
+          16'hffff ||
+        rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_CEQ) !=
+          12'hfff ||
+        rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_AEQ) !=
+          12'hfff)
+      `uvm_error("ALLOCATOR_POLICY_WIDTH", "resource local-ID width mapping drifted")
+    if (rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_FUNCTION) !=
+          32'hffff_ffff ||
+        rdma_resource_allocator_policy::local_id_limit(RDMA_RESOURCE_CMQ) !=
+          32'hffff_ffff)
+      `uvm_error("ALLOCATOR_POLICY_FALLBACK", "non-allocating kind fallback changed")
+  endtask
+
+  // 功能：check_queue_role_cardinality_policy 验证 flush target 与 backing ref 的公共
+  //   role-cardinality policy 对空 plan、缺失 role、单一 role、重复 role 和 null 元素的
+  //   计数/index 契约；该矩阵不启动 resource manager 事务。
+  // 输入/输出及副作用：无显式输入；任务创建 detached plan/target/ref fixture 并产生
+  //   UVM 断言，不修改 registry、recovery、allocator、runtime 或外部 backing 所有权。
+  // 失败/边界：policy 返回非预期 count/index 时报告可定位错误；重复 role 的 index 只用于
+  //   诊断，调用方仍必须按 count!=1 拒绝，null 元素不能被误计为合法 role。
+  task automatic check_queue_role_cardinality_policy();
+    rdma_queue_backing_plan plan;
+    rdma_queue_flush_target target;
+    rdma_queue_backing_ref ref_value;
+    int unsigned index;
+
+    if (rdma_queue_role_cardinality_policy::count_flush_targets(
+          null, RDMA_QUEUE_ROLE_CQ_PD, index) != 0 || index != 0)
+      `uvm_error("ROLE_CARD_NULL_PLAN", "null flush plan was counted")
+
+    plan = rdma_queue_backing_plan::type_id::create("role_cardinality_plan");
+    if (rdma_queue_role_cardinality_policy::count_flush_targets(
+          plan, RDMA_QUEUE_ROLE_CQ_PD, index) != 0 || index != 0)
+      `uvm_error("ROLE_CARD_EMPTY_FLUSH", "empty flush plan was counted")
+    target = rdma_queue_flush_target::type_id::create("role_cardinality_target");
+    target.role = RDMA_QUEUE_ROLE_CQ_PD;
+    plan.flush_targets.push_back(target);
+    plan.flush_targets.push_back(null);
+    if (rdma_queue_role_cardinality_policy::count_flush_targets(
+          plan, RDMA_QUEUE_ROLE_CQ_PD, index) != 1 || index != 0)
+      `uvm_error("ROLE_CARD_SINGLE_FLUSH", "single flush role cardinality drifted")
+    target = rdma_queue_flush_target::type_id::create("role_cardinality_target_dup");
+    target.role = RDMA_QUEUE_ROLE_CQ_PD;
+    plan.flush_targets.push_back(target);
+    if (rdma_queue_role_cardinality_policy::count_flush_targets(
+          plan, RDMA_QUEUE_ROLE_CQ_PD, index) != 2 || index != 2)
+      `uvm_error("ROLE_CARD_DUP_FLUSH", "duplicate flush role cardinality drifted")
+
+    if (rdma_queue_role_cardinality_policy::count_backing_refs(
+          null, RDMA_QUEUE_ROLE_CQ_RING, index) != 0 || index != 0)
+      `uvm_error("ROLE_CARD_NULL_REF_PLAN", "null ref plan was counted")
+    plan.refs.push_back(null);
+    if (rdma_queue_role_cardinality_policy::count_backing_refs(
+          plan, RDMA_QUEUE_ROLE_CQ_RING, index) != 0 || index != 0)
+      `uvm_error("ROLE_CARD_NULL_REF", "null backing ref was counted")
+    ref_value = rdma_queue_backing_ref::type_id::create("role_cardinality_ref");
+    ref_value.role = RDMA_QUEUE_ROLE_CQ_RING;
+    plan.refs.push_back(ref_value);
+    if (rdma_queue_role_cardinality_policy::count_backing_refs(
+          plan, RDMA_QUEUE_ROLE_CQ_RING, index) != 1 || index != 1)
+      `uvm_error("ROLE_CARD_SINGLE_REF", "single backing role cardinality drifted")
+  endtask
+
+  // 功能：check_resource_publication_stage_commit_seam 验证 manager 的 publication
+  //   candidate 在 detached projection 与 registry commit 之间保持清晰边界：失败 staging
+  //   不改账本，成功 commit 一次性安装新的 resource incarnation。
+  // 输入/输出及副作用：task 创建本地 Function/PD fixture，调用 probe 的 stage/commit
+  //   seam 并执行 lookup 断言；fixture 只由测试拥有，不改变外部 adapter 生命周期。
+  // 失败/边界：null resource 必须返回 INVALID_ARGUMENT 且 registry 计数不变；合法 candidate
+  //   在 stage 后不能提前可 lookup，commit 后必须可按完整 handle lookup；candidate clear 后
+  //   不得再次提交，任何不满足这些条件的情况均报告 UVM error。
+  task automatic check_resource_publication_stage_commit_seam();
+    rdma_resource_manager_probe manager;
+    rdma_function_binding binding;
+    rdma_function function_resource;
+    rdma_pd staged_pd;
+    rdma_pd concurrent_pd;
+    rdma_handle staged_handle;
+    rdma_resource_publication_candidate candidate;
+    rdma_resource_publication_candidate duplicate_candidate;
+    rdma_resource_identity_candidate identity_candidate;
+    rdma_pd stale_identity_pd;
+    rdma_resource stale_identity_published;
+    rdma_function_identity_candidate function_identity_candidate;
+    rdma_function_binding stale_function_binding;
+    rdma_function stale_identity_function;
+    rdma_resource stale_function_published;
+    rdma_resource lookup_resource;
+    rdma_status status;
+    int unsigned registry_before;
+
+    manager = new("publication_stage_commit_manager");
+    binding = make_active_binding(
+      "publication_stage_commit_binding", 64'hca11_0000_0000_0001,
+      32'hca11_0101, 32'd193
+    );
+    expect_status(
+      "PUBLICATION_STAGE_FUNCTION",
+      manager.create_function(binding, function_resource),
+      RDMA_SC_OK
+    );
+    registry_before = manager.observe_registry_count();
+
+    expect_status(
+      "PUBLICATION_STAGE_NULL",
+      manager.stage_publication_probe(
+        null, "publication null", candidate
+      ),
+      RDMA_SC_INVALID_ARGUMENT
+    );
+    if (candidate != null ||
+        manager.observe_registry_count() != registry_before)
+      `uvm_error("PUBLICATION_STAGE_NULL_ATOMIC",
+                 "null publication staging changed candidate or registry")
+
+    staged_pd = rdma_pd::type_id::create("publication_staged_pd");
+    staged_pd.owner = clone_function_handle(
+      "PUBLICATION_STAGE_OWNER", function_resource.owner
+    );
+    staged_handle = clone_handle(
+      "PUBLICATION_STAGE_HANDLE", function_resource.handle
+    );
+    staged_handle.kind = RDMA_RESOURCE_PD;
+    staged_handle.object_id = {RDMA_RESOURCE_PD, 28'h0ab_cdef};
+    staged_pd.handle = staged_handle;
+    staged_pd.state = RDMA_RESOURCE_ALLOCATED;
+    staged_pd.local_pd_id = 16'h1234;
+    staged_pd.global_pd_id = staged_handle.object_id;
+
+    registry_before = manager.observe_registry_count();
+    expect_status(
+      "PUBLICATION_STAGE_VALID",
+      manager.stage_publication_probe(
+        staged_pd, "publication staged", candidate
+      ),
+      RDMA_SC_OK
+    );
+    if (candidate == null || !candidate.valid() ||
+        manager.observe_registry_count() != registry_before)
+      `uvm_error("PUBLICATION_STAGE_DETACHED",
+                 "valid stage published or lost its detached candidate")
+    if (candidate != null &&
+        candidate.manager_epoch != manager.observe_publication_epoch())
+      `uvm_error("PUBLICATION_STAGE_EPOCH",
+                 "stage candidate did not capture the pre-projection manager epoch")
+
+    // A separate allocator/publication mutation must invalidate the first
+    // detached stage even when it targets a different identity.  This models
+    // the external-call window between projection and commit and proves that
+    // an old candidate cannot overwrite a newer manager epoch.
+    expect_status(
+      "PUBLICATION_CONCURRENT_CREATE",
+      manager.create_pd(binding, concurrent_pd),
+      RDMA_SC_OK
+    );
+    registry_before = manager.observe_registry_count();
+    expect_status(
+      "PUBLICATION_COMMIT_STALE",
+      manager.commit_publication_probe(candidate),
+      RDMA_SC_INVALID_STATE
+    );
+    if (manager.observe_registry_count() != registry_before)
+      `uvm_error("PUBLICATION_STALE_MUTATION",
+                 "stale publication candidate changed registry")
+    candidate.clear();
+
+    registry_before = manager.observe_registry_count();
+    expect_status(
+      "PUBLICATION_RESTAGE_VALID",
+      manager.stage_publication_probe(
+        staged_pd, "publication restaged", candidate
+      ),
+      RDMA_SC_OK
+    );
+    if (candidate == null || !candidate.valid() ||
+        manager.observe_registry_count() != registry_before)
+      `uvm_error("PUBLICATION_RESTAGE_DETACHED",
+                 "restaged candidate was not detached from registry")
+
+    registry_before = manager.observe_registry_count();
+    if (!manager.hold_mutation_guard_probe())
+      `uvm_error("PUBLICATION_GUARD_SETUP",
+                 "could not inject publication commit contention")
+    expect_status(
+      "PUBLICATION_COMMIT_BUSY",
+      manager.commit_publication_probe(candidate),
+      RDMA_SC_RESOURCE_BUSY
+    );
+    if (candidate == null || !candidate.valid() ||
+        manager.observe_registry_count() != registry_before)
+      `uvm_error("PUBLICATION_COMMIT_BUSY_ATOMIC",
+                 "busy publication commit changed candidate or registry")
+    manager.release_mutation_guard_probe();
+
+    expect_status(
+      "PUBLICATION_COMMIT_VALID",
+      manager.commit_publication_probe(candidate),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "PUBLICATION_COMMIT_LOOKUP",
+      manager.lookup(staged_handle, lookup_resource),
+      RDMA_SC_OK
+    );
+    if (lookup_resource == null ||
+        lookup_resource.handle == null ||
+        lookup_resource.handle.object_id != staged_handle.object_id ||
+        manager.observe_registry_count() != registry_before + 1)
+      `uvm_error("PUBLICATION_COMMIT_IDENTITY",
+                 "commit did not publish the staged resource identity")
+
+    candidate.clear();
+    status = manager.commit_publication_probe(candidate);
+    expect_status(
+      "PUBLICATION_COMMIT_CLEARED",
+      status,
+      RDMA_SC_INVALID_STATE
+    );
+
+    // Detached publication candidates are untrusted values after stage.  A
+    // hostile key mutation must be rejected without creating an alias entry.
+    status = manager.stage_publication_probe(
+      staged_pd, "publication hostile key", candidate
+    );
+    expect_status(
+      "PUBLICATION_STAGE_HOSTILE",
+      status,
+      RDMA_SC_OK
+    );
+    candidate.registry_key = "hostile-publication-key";
+    registry_before = manager.observe_registry_count();
+    expect_status(
+      "PUBLICATION_COMMIT_HOSTILE_KEY",
+      manager.commit_publication_probe(candidate),
+      RDMA_SC_INVALID_STATE
+    );
+    if (manager.observe_registry_count() != registry_before)
+      `uvm_error("PUBLICATION_HOSTILE_ALIAS",
+                 "tampered publication key created an alias registry entry")
+    candidate.clear();
+
+    status = manager.stage_publication_probe(
+      staged_pd, "publication hostile owner", candidate
+    );
+    expect_status(
+      "PUBLICATION_STAGE_HOSTILE_OWNER",
+      status,
+      RDMA_SC_OK
+    );
+    candidate.owner_copy.generation++;
+    registry_before = manager.observe_registry_count();
+    expect_status(
+      "PUBLICATION_COMMIT_HOSTILE_OWNER",
+      manager.commit_publication_probe(candidate),
+      RDMA_SC_INVALID_STATE
+    );
+    if (manager.observe_registry_count() != registry_before)
+      `uvm_error("PUBLICATION_HOSTILE_OWNER",
+                 "tampered publication owner created an inconsistent entry")
+    candidate.clear();
+
+    // Two detached stages for one identity may both be valid, but only the
+    // first commit is allowed to install the registry entry.
+    staged_pd.handle.object_id = {RDMA_RESOURCE_PD, 28'h0ab_cde0};
+    staged_pd.global_pd_id = staged_pd.handle.object_id;
+    status = manager.stage_publication_probe(
+      staged_pd, "publication duplicate first", candidate
+    );
+    expect_status(
+      "PUBLICATION_STAGE_DUPLICATE_FIRST",
+      status,
+      RDMA_SC_OK
+    );
+    status = manager.stage_publication_probe(
+      staged_pd, "publication duplicate second", duplicate_candidate
+    );
+    expect_status(
+      "PUBLICATION_STAGE_DUPLICATE_SECOND",
+      status,
+      RDMA_SC_OK
+    );
+    registry_before = manager.observe_registry_count();
+    expect_status(
+      "PUBLICATION_COMMIT_DUPLICATE_FIRST",
+      manager.commit_publication_probe(candidate),
+      RDMA_SC_OK
+    );
+    expect_status(
+      "PUBLICATION_COMMIT_DUPLICATE_SECOND",
+      manager.commit_publication_probe(duplicate_candidate),
+      RDMA_SC_INVALID_STATE
+    );
+    if (manager.observe_registry_count() != registry_before + 1)
+      `uvm_error("PUBLICATION_DUPLICATE_MUTATION",
+                 "duplicate publication did not preserve first commit only")
+    candidate.clear();
+    duplicate_candidate.clear();
+
+    // Identity reservation also crosses an external construction window.  A
+    // mutation after reserve must reject publication and return the reserved
+    // local ID instead of combining an old allocator token with a new ledger.
+    expect_status(
+      "IDENTITY_STAGE_VALID",
+      manager.reserve_identity_probe(
+        binding, RDMA_RESOURCE_PD, identity_candidate
+      ),
+      RDMA_SC_OK
+    );
+    stale_identity_pd = new("stale_identity_pd");
+    stale_identity_pd.owner = clone_function_handle(
+      "STALE_IDENTITY_OWNER", identity_candidate.owner
+    );
+    stale_identity_pd.handle = clone_handle(
+      "STALE_IDENTITY_HANDLE", identity_candidate.handle
+    );
+    stale_identity_pd.state = RDMA_RESOURCE_ALLOCATED;
+    stale_identity_pd.local_pd_id = identity_candidate.local_id;
+    stale_identity_pd.global_pd_id = identity_candidate.handle.object_id;
+    registry_before = manager.observe_registry_count();
+    manager.advance_publication_epoch_probe();
+    expect_status(
+      "IDENTITY_COMMIT_STALE",
+      manager.publish_identity_probe(
+        identity_candidate, stale_identity_pd,
+        "stale identity publication", stale_identity_published
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+    if (stale_identity_published != null ||
+        manager.observe_registry_count() != registry_before ||
+        identity_candidate.valid())
+      `uvm_error("IDENTITY_STALE_MUTATION",
+                 "stale identity publication changed registry or retained reservation")
+
+    stale_function_binding = make_active_binding(
+      "stale_function_binding", 64'hca11_0000_0000_0002,
+      32'hca11_0102, 32'd194
+    );
+    expect_status(
+      "FUNCTION_IDENTITY_STAGE_VALID",
+      manager.reserve_function_identity_probe(
+        stale_function_binding, function_identity_candidate
+      ),
+      RDMA_SC_OK
+    );
+    stale_identity_function = new("stale_identity_function");
+    stale_identity_function.owner = clone_function_handle(
+      "STALE_FUNCTION_OWNER", function_identity_candidate.owner
+    );
+    stale_identity_function.handle = clone_handle(
+      "STALE_FUNCTION_HANDLE", function_identity_candidate.handle
+    );
+    stale_identity_function.state = RDMA_RESOURCE_ALLOCATED;
+    stale_identity_function.local_function_id = function_identity_candidate.local_id;
+    stale_identity_function.global_function_id =
+      function_identity_candidate.owner.object_id;
+    stale_identity_function.rdma_vf_id =
+      function_identity_candidate.trusted_binding.rdma_vf_id;
+    stale_identity_function.vsi_id =
+      function_identity_candidate.trusted_binding.vsi_id;
+    stale_identity_function.pfvf_id =
+      function_identity_candidate.trusted_binding.pfvf_id;
+    stale_identity_function.binding = function_identity_candidate.trusted_binding;
+    registry_before = manager.observe_registry_count();
+    manager.advance_publication_epoch_probe();
+    expect_status(
+      "FUNCTION_IDENTITY_COMMIT_STALE",
+      manager.publish_function_identity_probe(
+        function_identity_candidate, stale_identity_function,
+        stale_function_published
+      ),
+      RDMA_SC_INVALID_STATE
+    );
+    if (stale_function_published != null ||
+        manager.observe_registry_count() != registry_before ||
+        function_identity_candidate.valid())
+      `uvm_error("FUNCTION_IDENTITY_STALE_MUTATION",
+                 "stale Function publication changed registry or retained reservation")
+  endtask
+
+  // 功能：check_schema_commit_atomicity 构造两个 registry carrier，并把第二项替换为
+  //   handle kind 与 carrier 类型不一致的 hostile fixture，验证 schema 投影失败不会
+  //   把第一项已经投影的快照部分写回；随后验证未知 recovery key 的幂等边界。
+  // 输入/输出及副作用：函数创建本地 manager、binding 和 resource fixture，调用
+  //   registry_schema_status_probe/recovery_entry_schema_status_probe 并产生 UVM 断言；
+  //   fixture 生命周期仅属于测试，不转移外部 backing 所有权。
+  // 失败/边界：create 或 probe 返回意外状态、registry carrier 被部分替换、或未知 key
+  //   不再保持幂等成功时报告错误；任务不把失败 fixture 继续交给业务提交路径。
+  task check_schema_commit_atomicity();
+    rdma_clone_probe_manager manager;
+    rdma_function_binding binding;
+    rdma_pd first_pd;
+    rdma_pd second_pd;
+    rdma_mr malformed_pd;
+    rdma_resource first_before;
+    rdma_resource second_before;
+    rdma_status status;
+
+    manager = new("schema_commit_atomicity_manager");
+    binding = make_active_binding(
+      "schema_commit_atomicity_binding", 64'h5343_4845_4D41_5449,
+      32'h5343_0101, 32'd3
+    );
+    expect_status(
+      "SCHEMA_ATOMIC_CREATE_FIRST",
+      manager.create_pd(binding, first_pd), RDMA_SC_OK
+    );
+    expect_status(
+      "SCHEMA_ATOMIC_CREATE_SECOND",
+      manager.create_pd(binding, second_pd), RDMA_SC_OK
+    );
+    first_before = manager.observed_resource_probe(first_pd.handle);
+    second_before = manager.observed_resource_probe(second_pd.handle);
+    malformed_pd = rdma_mr::type_id::create("schema_malformed_pd");
+    malformed_pd.handle = clone_handle(
+      "SCHEMA_ATOMIC_MALFORMED_HANDLE", second_pd.handle
+    );
+    malformed_pd.owner = clone_function_handle(
+      "SCHEMA_ATOMIC_MALFORMED_OWNER", second_pd.owner
+    );
+    malformed_pd.state = second_pd.state;
+    manager.replace_authoritative(malformed_pd);
+
+    status = manager.registry_schema_status_probe("schema atomicity");
+    expect_status(
+      "SCHEMA_ATOMIC_PROJECTION_FAILURE", status, RDMA_SC_INVALID_ARGUMENT
+    );
+    if (manager.observed_resource_probe(first_pd.handle) != first_before ||
+        manager.observed_resource_probe(second_pd.handle) != malformed_pd)
+      `uvm_error(
+        "SCHEMA_ATOMIC_PARTIAL_WRITE",
+        "registry schema failure changed an already projected entry"
+      )
+
+    expect_status(
+      "SCHEMA_ATOMIC_UNKNOWN_RECOVERY",
+      manager.recovery_entry_schema_status_probe(
+        "missing-recovery-key", "schema atomicity"
+      ),
+      RDMA_SC_OK
+    );
+  endtask
+
+  // 功能：check_release_commit_atomicity 验证整批释放的锁竞争、旧代际、重复 key 和第二项
+  //   free-list 冲突不会删除任何资源，并检查正常提交只推进一次 epoch、local ID 可复用。
+  // 输入/输出及副作用：构造独立 PD 池；通过 probe 注入冲突、观察 canonical 引用和 ID 数量，
+  //   最后调用 Function teardown，所有 UVM 断言只影响本 fixture。
+  // 失败/边界：任何拒绝若留下部分回收、退休标志或泄漏 guard 即报错；成功重试必须完整释放。
+  task check_release_commit_atomicity();
+    rdma_resource_manager_probe manager;
+    rdma_function_binding binding;
+    rdma_pd first_pd;
+    rdma_pd second_pd;
+    rdma_pd reused_pd;
+    rdma_resource first_source;
+    rdma_resource snapshot;
+    rdma_handle handles[$];
+    longint unsigned epoch;
+
+    manager = new("release_commit_manager");
+    binding = make_active_binding(
+      "release_commit_binding", 64'h2170_0000_0000_0001, 32'h2170_0101, 3
+    );
+    expect_status("RELEASE_CREATE_FIRST", manager.create_pd(binding, first_pd),
+                  RDMA_SC_OK);
+    expect_status("RELEASE_CREATE_SECOND", manager.create_pd(binding, second_pd),
+                  RDMA_SC_OK);
+    first_source = manager.observe_resource_source(first_pd.handle);
+    epoch = manager.observe_publication_epoch();
+    expect_status("LOOKUP_NO_PUBLICATION", manager.lookup(first_pd.handle, snapshot),
+                  RDMA_SC_OK);
+    if (snapshot == first_source ||
+        manager.observe_resource_source(first_pd.handle) != first_source ||
+        manager.observe_publication_epoch() != epoch)
+      `uvm_error("LOOKUP_NO_MUTATION", "lookup published or aliased canonical storage")
+
+    handles.push_back(first_pd.handle);
+    handles.push_back(second_pd.handle);
+    if (!manager.hold_mutation_guard_probe())
+      `uvm_fatal("RELEASE_GUARD_SETUP", "could not hold mutation guard")
+    expect_status("RELEASE_COMMIT_BUSY", manager.release_keys_probe(handles, epoch),
+                  RDMA_SC_RESOURCE_BUSY);
+    manager.release_mutation_guard_probe();
+    manager.advance_publication_epoch_probe();
+    expect_status("RELEASE_COMMIT_STALE", manager.release_keys_probe(handles, epoch),
+                  RDMA_SC_INVALID_STATE);
+    epoch = manager.observe_publication_epoch();
+    handles[1] = first_pd.handle;
+    expect_status("RELEASE_COMMIT_DUPLICATE",
+                  manager.release_keys_probe(handles, epoch), RDMA_SC_INVALID_STATE);
+    handles[1] = second_pd.handle;
+    manager.set_free_id_probe(RDMA_RESOURCE_PD, second_pd.local_pd_id, 1'b1);
+    expect_status("RELEASE_SECOND_ID_CONFLICT",
+                  manager.release_keys_probe(handles, epoch), RDMA_SC_INVALID_STATE);
+    if (manager.observe_registry_count() != 2 ||
+        manager.observe_resource_source(first_pd.handle) != first_source ||
+        first_source.state != RDMA_RESOURCE_ALLOCATED ||
+        manager.observe_free_count(RDMA_RESOURCE_PD) != 1 ||
+        manager.observe_publication_epoch() != epoch)
+      `uvm_error("RELEASE_FAILURE_ATOMIC", "rejected set partially released resources")
+    expect_status("TEARDOWN_SECOND_ID_CONFLICT",
+                  manager.release_function(binding.make_handle()), RDMA_SC_INVALID_STATE);
+    if (manager.observe_registry_count() != 2 ||
+        manager.observe_free_count(RDMA_RESOURCE_PD) != 1 ||
+        manager.observe_publication_epoch() != epoch)
+      `uvm_error("TEARDOWN_FAILURE_ATOMIC", "Function teardown partially committed")
+    manager.set_free_id_probe(RDMA_RESOURCE_PD, second_pd.local_pd_id, 1'b0);
+    expect_status("RELEASE_COMMIT_RETRY", manager.release_keys_probe(handles, epoch),
+                  RDMA_SC_OK);
+    if (manager.observe_registry_count() != 0 ||
+        manager.observe_free_count(RDMA_RESOURCE_PD) != 2 ||
+        manager.observe_publication_epoch() != epoch + 1)
+      `uvm_error("RELEASE_SUCCESS_ATOMIC", "release did not commit one complete set")
+    expect_status("RELEASE_COMMIT_REPLAY",
+                  manager.release_keys_probe(handles, manager.observe_publication_epoch()),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("RELEASE_REUSE", manager.create_pd(binding, reused_pd), RDMA_SC_OK);
+    if (reused_pd.local_pd_id != first_pd.local_pd_id ||
+        reused_pd.handle.object_id == first_pd.handle.object_id)
+      `uvm_error("RELEASE_ID_REUSE", "local ID or incarnation reuse violated")
+    expect_status("TEARDOWN_RETRY", manager.release_function(binding.make_handle()),
+                  RDMA_SC_OK);
+    expect_status("TEARDOWN_RETIRED", manager.release_function(binding.make_handle()),
+                  RDMA_SC_STALE_GENERATION);
+  endtask
+
+  // 功能：check_restore_release_external_epoch 用真实 owned mapping completion hook 推进
+  //   manager epoch，验证 restore 与 reserved ERROR completion 拒绝跨外部窗口的过期提交。
+  // 输入/输出及副作用：构造 staged/QUIESCING/ERROR MR，注入单次 callback 和 guard busy；
+  //   检查失败不清 staged/recovery、不回收 ID，撤销注入后正常重试。
+  // 失败/边界：注入未被消费、状态改变、锁未归还或 retry 失败均报告 UVM 错误；
+  //   completion_epoch_target 在结束时清空，不污染后续测试。
+  task check_restore_release_external_epoch();
+    rdma_resource_manager_probe manager;
+    rdma_function_binding binding;
+    rdma_pd pd;
+    rdma_mr mr;
+    rdma_mr reserved_mr;
+    rdma_rm_independent_release_mapping mapping;
+    rdma_backing_ref backing;
+    rdma_recovery_record recovery;
+    rdma_resource resource;
+    longint unsigned epoch;
+
+    manager = new("external_epoch_manager");
+    binding = make_active_binding(
+      "external_epoch_binding", 64'h2170_0000_0000_0002, 32'h2170_0102, 4
+    );
+    expect_status("EXT_PD", manager.create_pd(binding, pd), RDMA_SC_OK);
+    expect_status("EXT_PD_ACTIVE", manager.activate(pd.handle), RDMA_SC_OK);
+    mapping = new("external_epoch_mapping");
+    mapping.initialize_release_authority();
+    initialize_restore_gate_mapping(mapping, binding, 64'h2170_1000);
+    create_prepared_restore_gate_mr(
+      "EXT_MR", manager, binding, pd, mapping.iova.value, mr
+    );
+    backing = make_restore_gate_backing_ref(
+      "external_epoch_backing", mapping, RDMA_OWNERSHIP_CONTROL_PLANE
+    );
+    mr.backing_refs.push_back(backing);
+    expect_status("EXT_STAGE", manager.stage_allocated(mr), RDMA_SC_OK);
+    recovery = make_restore_gate_recovery("external_epoch_recovery", mr);
+    recovery.backing_refs.push_back(backing);
+    if (!manager.hold_mutation_guard_probe())
+      `uvm_fatal("EXT_GUARD_SETUP", "could not hold guard")
+    expect_status("EXT_MARK_BUSY", manager.mark_error(mr.handle, recovery),
+                  RDMA_SC_RESOURCE_BUSY);
+    manager.release_mutation_guard_probe();
+    if (!manager.observe_staged(mr.handle) || manager.observed_recovery_count() != 0 ||
+        manager.observe_resource_source(mr.handle).state != RDMA_RESOURCE_ALLOCATED)
+      `uvm_error("EXT_MARK_ATOMIC", "busy ERROR publication changed staged/registry/recovery")
+    expect_status("EXT_MARK", manager.mark_error(mr.handle, recovery), RDMA_SC_OK);
+    epoch = manager.observe_publication_epoch();
+    rdma_rm_independent_release_mapping::completion_epoch_target = manager;
+    expect_status("EXT_RESTORE_STALE", manager.restore_active(mr.handle),
+                  RDMA_SC_INVALID_STATE);
+    if (rdma_rm_independent_release_mapping::completion_epoch_target != null ||
+        manager.observe_publication_epoch() != epoch + 1 ||
+        manager.observed_recovery_count() != 1 ||
+        manager.observe_resource_source(mr.handle).state != RDMA_RESOURCE_ERROR)
+      `uvm_error("EXT_RESTORE_ATOMIC", "completion callback escaped restore OCC guard")
+    expect_status("EXT_RESTORE_RETRY", manager.restore_active(mr.handle), RDMA_SC_OK);
+    if (manager.observed_recovery_count() != 0 ||
+        manager.observe_resource_source(mr.handle).state != RDMA_RESOURCE_ACTIVE)
+      `uvm_error("EXT_RESTORE_RETRY_ATOMIC", "restore failed to clear recovery atomically")
+
+    // reserved ERROR 的 RESOURCE_RELEASED 证据在发布前已具备，completion hook 只重入
+    // manager，不伪造或改变外部释放事实。失败后必须仍能以同一 recovery 重试。
+    expect_status("EXT_RESERVED_CREATE",
+                  manager.create_mr(binding, pd.handle, reserved_mr), RDMA_SC_OK);
+    mapping.set_release_complete(1'b1);
+    mapping.state = RDMA_MAPPING_RELEASED;
+    backing.release_complete = 1'b1;
+    recovery = make_restore_gate_recovery("external_release_recovery", reserved_mr);
+    recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    recovery.pending_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
+    recovery.backing_refs.push_back(backing);
+    expect_status("EXT_RESERVED_MARK",
+                  manager.mark_reserved_error(reserved_mr.handle, recovery), RDMA_SC_OK);
+    rdma_rm_independent_release_mapping::completion_epoch_target = manager;
+    expect_status("EXT_RELEASE_STALE",
+                  manager.complete_reserved_error(reserved_mr.handle), RDMA_SC_INVALID_STATE);
+    expect_status("EXT_RELEASE_RETAINED", manager.lookup(reserved_mr.handle, resource),
+                  RDMA_SC_OK);
+    if (rdma_rm_independent_release_mapping::completion_epoch_target != null ||
+        resource.state != RDMA_RESOURCE_ERROR ||
+        manager.observed_recovery_count() != 1 ||
+        manager.observe_free_count(RDMA_RESOURCE_MR) != 0)
+      `uvm_error("EXT_RELEASE_ATOMIC", "release callback lost recovery or recycled local ID")
+    expect_status("EXT_RELEASE_RETRY",
+                  manager.complete_reserved_error(reserved_mr.handle), RDMA_SC_OK);
+    if (manager.observed_recovery_count() != 0 ||
+        manager.observe_free_count(RDMA_RESOURCE_MR) != 1)
+      `uvm_error("EXT_RELEASE_RETRY_ATOMIC", "retry did not clear ledger and return one ID")
+    rdma_rm_independent_release_mapping::completion_epoch_target = null;
+    expect_status("EXT_TEARDOWN", manager.release_function(binding.make_handle()), RDMA_SC_OK);
+  endtask
+
+  // 功能：check_allocator_rollback_isolation 刻画旧预留失败与后续成功分配交错时的补偿契约。
+  // 输入/输出及副作用：无输入；独立 manager 分别覆盖普通/Function 预留、同池/跨池后续分配，
+  //   断言旧 candidate 清空、后续句柄可查询、serial 不回退、返还 ID 只复用一次。
+  // 失败/边界：使用 null authoritative 使旧 publication 明确失败，不依赖硬件错误；fixture
+  //   自有对象不持有外部 backing，所有失效与重试结果都通过真实 manager API 观察。
+  task check_allocator_rollback_isolation();
+    rdma_resource_manager_probe manager;
+    rdma_function_binding binding;
+    rdma_function_binding other_binding;
+    rdma_resource_identity_candidate identity;
+    rdma_function_identity_candidate function_identity;
+    rdma_pd successor_pd;
+    rdma_pd reused_pd;
+    rdma_pd next_pd;
+    rdma_cq successor_cq;
+    rdma_function successor_function;
+    rdma_function reused_function;
+    rdma_function next_function;
+    rdma_resource published;
+    rdma_resource looked_up;
+    rdma_handle successor;
+    rdma_resource_kind_e kind;
+    int unsigned reserved_id;
+    int unsigned serial_after_success;
+    longint unsigned epoch;
+    bit is_function;
+    string label;
+
+    for (int unsigned scenario = 0; scenario < 5; scenario++) begin
+      label = $sformatf("ALLOCATOR_ROLLBACK_%0d", scenario);
+      manager = new(label);
+      binding = make_active_binding(label, 64'h2190_0000_0000_0001 + scenario,
+                                    32'h2190_0101 + scenario, 32'd219);
+      other_binding = make_active_binding({label, "_other"},
+        64'h2191_0000_0000_0001 + scenario, 32'h2191_0101 + scenario, 32'd219);
+      is_function = scenario inside {2, 3};
+      kind = is_function ? RDMA_RESOURCE_FUNCTION : RDMA_RESOURCE_PD;
+      if (scenario == 4) begin
+        expect_status({label, "_SEED"}, manager.create_pd(binding, reused_pd), RDMA_SC_OK);
+        expect_status({label, "_SEED_RELEASE"},
+                      manager.release_reserved(reused_pd.handle), RDMA_SC_OK);
+      end
+      if (!is_function) begin
+        expect_status({label, "_RESERVE"}, manager.reserve_identity_probe(
+          binding, kind, identity), RDMA_SC_OK);
+        reserved_id = identity.local_id;
+      end
+      else begin
+        expect_status({label, "_RESERVE"}, manager.reserve_function_identity_probe(
+          binding, function_identity), RDMA_SC_OK);
+        reserved_id = function_identity.local_id;
+      end
+
+      case (scenario)
+        0, 2, 4: begin
+          expect_status({label, "_SUCCESSOR"}, manager.create_pd(binding, successor_pd), RDMA_SC_OK);
+          successor = successor_pd.handle;
+        end
+        1: begin
+          expect_status({label, "_SUCCESSOR"}, manager.create_cq(binding, null, successor_cq), RDMA_SC_OK);
+          successor = successor_cq.handle;
+        end
+        3: begin
+          expect_status({label, "_SUCCESSOR"},
+            manager.create_function(other_binding, successor_function), RDMA_SC_OK);
+          successor = successor_function.handle;
+        end
+        default: `uvm_fatal("ALLOCATOR_FIXTURE", "unknown scenario")
+      endcase
+      serial_after_success = manager.observed_next_object_serial(kind);
+      epoch = manager.observe_publication_epoch();
+      if (!is_function) begin
+        expect_status({label, "_STALE"}, manager.publish_identity_probe(
+          identity, null, label, published), RDMA_SC_INVALID_STATE);
+        if (identity.valid())
+          `uvm_error("ALLOCATOR_CANDIDATE", "failed ordinary reservation remains usable")
+      end
+      else begin
+        expect_status({label, "_STALE"}, manager.publish_function_identity_probe(
+          function_identity, null, published), RDMA_SC_INVALID_STATE);
+        if (function_identity.valid())
+          `uvm_error("ALLOCATOR_CANDIDATE", "failed Function reservation remains usable")
+      end
+      if (published != null || manager.observe_registry_count() != 1 ||
+          manager.observe_publication_epoch() != epoch + 1)
+        `uvm_error("ALLOCATOR_ROLLBACK_ATOMIC", label)
+      expect_status({label, "_SUCCESSOR_LOOKUP"}, manager.lookup(successor, looked_up), RDMA_SC_OK);
+      if (manager.observed_next_object_serial(kind) != serial_after_success)
+        `uvm_error("ALLOCATOR_SERIAL_REWIND", "old rollback rewound a newer allocator epoch")
+
+      if (!is_function) begin
+        expect_status({label, "_REUSE"}, manager.create_pd(binding, reused_pd), RDMA_SC_OK);
+        expect_status({label, "_NEXT"}, manager.create_pd(binding, next_pd), RDMA_SC_OK);
+        if (reused_pd == null || next_pd == null ||
+            reused_pd.local_pd_id != reserved_id || next_pd.local_pd_id == reserved_id ||
+            (scenario inside {0, 4} &&
+             (next_pd.local_pd_id == successor_pd.local_pd_id ||
+              reused_pd.local_pd_id == successor_pd.local_pd_id)) ||
+            next_pd.handle.object_id == reused_pd.handle.object_id ||
+            (scenario inside {0, 4} && next_pd.handle.object_id == successor.object_id))
+          `uvm_error("ALLOCATOR_ID_ALIAS", "old rollback recycled another live identity")
+      end
+      else begin
+        expect_status({label, "_REUSE"}, manager.create_function(binding, reused_function), RDMA_SC_OK);
+        // 使用新的 Function authority，避免重复 incarnation 的合法拒绝掩盖 local-ID 碰撞。
+        binding = make_active_binding({label, "_third"},
+          64'h2192_0000_0000_0001 + scenario, 32'h2192_0101 + scenario, 32'd219);
+        expect_status({label, "_NEXT"}, manager.create_function(binding, next_function), RDMA_SC_OK);
+        if (reused_function == null || next_function == null ||
+            reused_function.local_function_id != reserved_id ||
+            next_function.local_function_id == reserved_id ||
+            (scenario == 3 && next_function.local_function_id == successor_function.local_function_id))
+          `uvm_error("ALLOCATOR_FUNCTION_ALIAS", "old rollback recycled another Function local ID")
+      end
+      expect_status({label, "_SUCCESSOR_RECHECK"}, manager.lookup(successor, looked_up), RDMA_SC_OK);
+    end
+  endtask
+
+  // 功能：check_allocator_compensation_boundaries 验证独占回滚、两个 pending 预留依次补偿、
+  //   最大 local ID、epoch 饱和和 generation high-water/wrap 保留，并覆盖真实 factory 重入。
+  // 输入/输出及副作用：无参数；全部使用独立 fixture，检查 ID 恰好返还一次、游标/serial、
+  //   后续成功分配以及旧 generation 拒绝；factory override 仅在单次 create_function 内启用。
+  // 失败/边界：故意传 null authoritative 触发失败；二次提交已 clear candidate 不再补偿；
+  //   极限 fixture 不访问外部硬件，恢复 factory 并清空 static 引用后才执行后续场景。
+  task check_allocator_compensation_boundaries();
+    rdma_resource_manager_probe manager;
+    rdma_function_binding binding;
+    rdma_function_binding replacement_binding;
+    rdma_resource_identity_candidate first;
+    rdma_resource_identity_candidate second;
+    rdma_function_identity_candidate function_identity;
+    rdma_resource published;
+    rdma_resource looked_up;
+    rdma_pd pd;
+    rdma_pd next_pd;
+    rdma_function function_resource;
+    rdma_status status;
+    uvm_factory original_factory;
+    uvm_default_factory isolated_factory;
+    uvm_coreservice_t core_service;
+    longint unsigned epoch;
+    int unsigned reserved_id;
+
+    manager = new("allocator_exclusive");
+    binding = make_active_binding("allocator_exclusive", 64'h2193_0001, 32'h2193_0101, 219);
+    expect_status("ALLOC_EXCLUSIVE_RESERVE", manager.reserve_identity_probe(
+      binding, RDMA_RESOURCE_PD, first), RDMA_SC_OK);
+    if (manager.observe_publication_epoch() != 1)
+      `uvm_error("ALLOC_RESERVE_EPOCH", "one reservation must advance epoch once")
+    expect_status("ALLOC_EXCLUSIVE_FAIL", manager.publish_identity_probe(
+      first, null, "exclusive failure", published), RDMA_SC_INVALID_STATE);
+    if (manager.observed_next_local_id(RDMA_RESOURCE_PD) != 0 ||
+        manager.observed_next_object_serial(RDMA_RESOURCE_PD) != 0 ||
+        manager.observe_free_count(RDMA_RESOURCE_PD) != 0)
+      `uvm_error("ALLOC_EXCLUSIVE_RESTORE", "exclusive rollback did not restore initial allocator")
+    // 同 authority 的新 binding 实例可被接受，证明独占失败撤销了首次 registration。
+    replacement_binding = make_active_binding(
+      "allocator_exclusive_retry", 64'h2193_0001, 32'h2193_0101, 219);
+    expect_status("ALLOC_EXCLUSIVE_RETRY", manager.create_pd(replacement_binding, pd), RDMA_SC_OK);
+
+    manager = new("allocator_pending");
+    expect_status("ALLOC_PENDING_FIRST", manager.reserve_identity_probe(
+      binding, RDMA_RESOURCE_PD, first), RDMA_SC_OK);
+    expect_status("ALLOC_PENDING_SECOND", manager.reserve_identity_probe(
+      binding, RDMA_RESOURCE_PD, second), RDMA_SC_OK);
+    expect_status("ALLOC_PENDING_FIRST_FAIL", manager.publish_identity_probe(
+      first, null, "first pending", published), RDMA_SC_INVALID_STATE);
+    expect_status("ALLOC_PENDING_SECOND_FAIL", manager.publish_identity_probe(
+      second, null, "second pending", published), RDMA_SC_INVALID_STATE);
+    epoch = manager.observe_publication_epoch();
+    expect_status("ALLOC_PENDING_REPEAT", manager.publish_identity_probe(
+      first, null, "already cleared", published), RDMA_SC_INVALID_STATE);
+    if (manager.observe_free_count(RDMA_RESOURCE_PD) != 2 ||
+        manager.observed_next_object_serial(RDMA_RESOURCE_PD) != 3 ||
+        manager.observe_publication_epoch() != epoch)
+      `uvm_error("ALLOC_PENDING_COMPENSATE", "pending/repeated rollback changed shared state")
+    expect_status("ALLOC_PENDING_REUSE", manager.create_pd(binding, pd), RDMA_SC_OK);
+    expect_status("ALLOC_PENDING_NEXT", manager.create_pd(binding, next_pd), RDMA_SC_OK);
+    if (pd.local_pd_id == next_pd.local_pd_id ||
+        pd.handle.object_id == next_pd.handle.object_id)
+      `uvm_error("ALLOC_PENDING_ALIAS", "two returned IDs alias")
+
+    // PD 与 Function 分别覆盖 16-bit 和 32-bit 最大 ID；过期补偿不能清除 fresh exhausted。
+    for (int unsigned is_function = 0; is_function < 2; is_function++) begin
+      manager = new("allocator_maximum");
+      reserved_id = is_function ? 32'hffff_ffff : 16'hffff;
+      manager.configure_allocator_boundary(
+        is_function ? RDMA_RESOURCE_FUNCTION : RDMA_RESOURCE_PD, reserved_id, 0);
+      if (is_function)
+        expect_status("ALLOC_MAX_RESERVE_FUNCTION", manager.reserve_function_identity_probe(
+          binding, function_identity), RDMA_SC_OK);
+      else
+        expect_status("ALLOC_MAX_RESERVE_PD", manager.reserve_identity_probe(
+          binding, RDMA_RESOURCE_PD, first), RDMA_SC_OK);
+      manager.advance_publication_epoch_probe();
+      if (is_function) begin
+        expect_status("ALLOC_MAX_FAIL_FUNCTION", manager.publish_function_identity_probe(
+          function_identity, null, published), RDMA_SC_INVALID_STATE);
+        expect_status("ALLOC_MAX_REUSE_FUNCTION", manager.create_function(binding, function_resource),
+                      RDMA_SC_OK);
+        if (function_resource.local_function_id != reserved_id)
+          `uvm_error("ALLOC_MAX_FUNCTION_ID", "maximum Function ID was not returned")
+        expect_status("ALLOC_MAX_EXHAUST_FUNCTION", manager.create_function(
+          replacement_binding, function_resource), RDMA_SC_INVALID_ARGUMENT);
+        replacement_binding = make_active_binding(
+          "allocator_max_other", 64'h2193_0002, 32'h2193_0102, 219);
+        expect_status("ALLOC_MAX_EXHAUST_OTHER_FUNCTION", manager.create_function(
+          replacement_binding, function_resource), RDMA_SC_RESOURCE_EXHAUSTED);
+      end
+      else begin
+        expect_status("ALLOC_MAX_FAIL_PD", manager.publish_identity_probe(
+          first, null, "maximum PD", published), RDMA_SC_INVALID_STATE);
+        expect_status("ALLOC_MAX_REUSE_PD", manager.create_pd(binding, pd), RDMA_SC_OK);
+        if (pd.local_pd_id != reserved_id)
+          `uvm_error("ALLOC_MAX_PD_ID", "maximum PD ID was not returned")
+        expect_status("ALLOC_MAX_EXHAUST_PD", manager.create_pd(binding, next_pd),
+                      RDMA_SC_RESOURCE_EXHAUSTED);
+      end
+    end
+
+    manager = new("allocator_epoch_saturated");
+    // 最后一次可区分的 admission 能推进到饱和；之后只允许补偿，不接纳新预留。
+    manager.configure_allocator_boundary(RDMA_RESOURCE_PD, 0, 64'hffff_ffff_ffff_fffe);
+    expect_status("ALLOC_SATURATED_RESERVE", manager.reserve_identity_probe(
+      binding, RDMA_RESOURCE_PD, first), RDMA_SC_OK);
+    expect_status("ALLOC_SATURATED_FAIL", manager.publish_identity_probe(
+      first, null, "saturated epoch", published), RDMA_SC_INVALID_STATE);
+    if (manager.observe_free_count(RDMA_RESOURCE_PD) != 1 ||
+        manager.observed_next_local_id(RDMA_RESOURCE_PD) != 1 ||
+        manager.observed_next_object_serial(RDMA_RESOURCE_PD) != 2)
+      `uvm_error("ALLOC_SATURATED_REWIND", "saturated epoch was treated as exclusive")
+    expect_status("ALLOC_SATURATED_ADMISSION", manager.create_pd(binding, pd), RDMA_SC_INVALID_STATE);
+    if (pd != null || manager.observe_free_count(RDMA_RESOURCE_PD) != 1 ||
+        manager.observed_next_local_id(RDMA_RESOURCE_PD) != 1 ||
+        manager.observed_next_object_serial(RDMA_RESOURCE_PD) != 2)
+      `uvm_error("ALLOC_SATURATED_ADMISSION", "exhausted epoch admitted another reservation")
+
+    for (int unsigned wrapped = 0; wrapped < 2; wrapped++) begin
+      manager = new("allocator_generation");
+      binding = make_active_binding("allocator_generation", 64'h2194_0001, 32'h2194_0101,
+                                    wrapped ? 32'hffff_ffff : 219);
+      expect_status("ALLOC_GENERATION_RESERVE", manager.reserve_identity_probe(
+        binding, RDMA_RESOURCE_PD, first), RDMA_SC_OK);
+      binding.generation = wrapped ? 0 : 220;
+      expect_status("ALLOC_GENERATION_FAIL", manager.publish_identity_probe(
+        first, null, "generation change", published), RDMA_SC_INVALID_STATE);
+      if (!wrapped)
+        binding.generation = 219;
+      expect_status("ALLOC_GENERATION_REJECT", manager.create_pd(binding, pd),
+                    wrapped ? RDMA_SC_RESOURCE_EXHAUSTED : RDMA_SC_STALE_GENERATION);
+    end
+
+    manager = new("allocator_factory_reentry");
+    binding = make_active_binding("allocator_factory_reentry", 64'h2195_0001, 32'h2195_0101, 219);
+    // 独立 factory 的生命周期只包住同步 create_function；恢复原引用才能保留其它用例的
+    // override。self-override 会产生 TYPDUP warning，且不能准确恢复已有配置。
+    original_factory = uvm_factory::get();
+    isolated_factory = new();
+    core_service = uvm_coreservice_t::get();
+    core_service.set_factory(isolated_factory);
+    rdma_rm_allocator_reentry_binding::target = manager;
+    rdma_rm_allocator_reentry_binding::source = binding;
+    isolated_factory.set_type_override_by_type(rdma_function_binding::get_type(),
+                                              rdma_rm_allocator_reentry_binding::get_type());
+    status = manager.create_function(binding, function_resource);
+    core_service.set_factory(original_factory);
+    expect_status("ALLOC_FACTORY_OUTER_STALE", status, RDMA_SC_INVALID_STATE);
+    expect_status("ALLOC_FACTORY_INNER_SUCCESS", rdma_rm_allocator_reentry_binding::successor_status,
+                  RDMA_SC_OK);
+    pd = rdma_rm_allocator_reentry_binding::successor;
+    if (pd == null || function_resource != null || manager.observe_registry_count() != 1)
+      `uvm_fatal("ALLOC_FACTORY_FIXTURE", "factory did not produce one surviving nested PD")
+    expect_status("ALLOC_FACTORY_SURVIVOR", manager.lookup(pd.handle, looked_up), RDMA_SC_OK);
+    expect_status("ALLOC_FACTORY_RETRY", manager.create_function(binding, function_resource), RDMA_SC_OK);
+    rdma_rm_allocator_reentry_binding::target = null;
+    rdma_rm_allocator_reentry_binding::source = null;
+    rdma_rm_allocator_reentry_binding::successor = null;
+    rdma_rm_allocator_reentry_binding::successor_status = null;
+
+    manager = new("allocator_status_reentry");
+    binding = make_active_binding("allocator_status_reentry", 64'h2196_0001, 32'h2196_0101, 219);
+    isolated_factory = new();
+    core_service.set_factory(isolated_factory);
+    rdma_rm_allocator_reentry_status::target = manager;
+    rdma_rm_allocator_reentry_status::source = binding;
+    isolated_factory.set_type_override_by_type(rdma_status::get_type(),
+                                              rdma_rm_allocator_reentry_status::get_type());
+    status = manager.reserve_identity_probe(binding, RDMA_RESOURCE_PD, first);
+    core_service.set_factory(original_factory);
+    expect_status("ALLOC_STATUS_OUTER_RESERVED", status, RDMA_SC_OK);
+    expect_status("ALLOC_STATUS_INNER_SUCCESS", rdma_rm_allocator_reentry_status::successor_status,
+                  RDMA_SC_OK);
+    pd = rdma_rm_allocator_reentry_status::successor;
+    if (pd == null || first == null || first.manager_epoch != 1 ||
+        manager.observe_publication_epoch() <= first.manager_epoch)
+      `uvm_fatal("ALLOC_STATUS_FIXTURE", "return status did not preserve the original reservation epoch")
+    expect_status("ALLOC_STATUS_OUTER_STALE", manager.publish_identity_probe(
+      first, null, "status factory stale", published), RDMA_SC_INVALID_STATE);
+    expect_status("ALLOC_STATUS_SURVIVOR", manager.lookup(pd.handle, looked_up), RDMA_SC_OK);
+    expect_status("ALLOC_STATUS_RETRY", manager.create_pd(binding, next_pd), RDMA_SC_OK);
+    if (next_pd == null || next_pd.local_pd_id == pd.local_pd_id ||
+        next_pd.handle.object_id == pd.handle.object_id)
+      `uvm_error("ALLOC_STATUS_ALIAS", "return status rollback reused the nested PD identity")
+    rdma_rm_allocator_reentry_status::target = null;
+    rdma_rm_allocator_reentry_status::source = null;
+    rdma_rm_allocator_reentry_status::successor = null;
+    rdma_rm_allocator_reentry_status::successor_status = null;
+  endtask
+
+  // 功能：check_allocator_admission_windows 遍历 fresh PD、free-list PD、Function 和同身份
+  //   不同 binding 来源的消费前
+  //   status factory 窗口，验证旧 admission 不覆盖嵌套分配、不遗留 registration 或消耗 ID。
+  // 输入/输出及副作用：无参数；独立 manager 和 factory 先计数再逐窗嵌套分配，最后一个
+  //   窗口另测 guard/epoch/代际冲突；检查 allocator 不变、存活资源可查、失败后可重试。
+  // 失败/边界：fixture 无外部 backing；每次恢复原 factory、归还故障 guard 并清 static，
+  //   无可注入窗口或嵌套分配失败视为 fixture fatal，不能把未触发的测试算作通过。
+  task check_allocator_admission_windows();
+    rdma_resource_manager_probe manager;
+    rdma_function_binding binding;
+    rdma_function_binding nested_binding;
+    rdma_pd pd;
+    rdma_function function_resource;
+    rdma_resource looked_up;
+    rdma_status status;
+    uvm_factory original_factory;
+    uvm_default_factory isolated_factory;
+    uvm_coreservice_t core_service;
+    rdma_resource_kind_e kind;
+    int unsigned windows;
+    int unsigned injected_fault;
+    string label;
+
+    original_factory = uvm_factory::get();
+    core_service = uvm_coreservice_t::get();
+    for (int unsigned scenario = 0; scenario < 4; scenario++) begin
+      windows = 0;
+      kind = scenario == 2 ? RDMA_RESOURCE_FUNCTION : RDMA_RESOURCE_PD;
+      for (int unsigned attempt = 0; attempt <= windows + 3; attempt++) begin
+        label = $sformatf("ADMISSION_%0d_%0d", scenario, attempt);
+        manager = new(label);
+        binding = make_active_binding(label, 64'h2200_0001, 32'h2200_0101, 220);
+        nested_binding = scenario == 2 ? make_active_binding(
+          {label, "_nested"}, 64'h2200_0002, 32'h2200_0102, 220) : binding;
+        if (scenario == 3)
+          nested_binding = make_active_binding(
+            {label, "_competitor"}, 64'h2200_0001, 32'h2200_0101, 220);
+        if (scenario == 1) begin
+          expect_status("ADMISSION_SEED", manager.create_pd(binding, pd), RDMA_SC_OK);
+          expect_status("ADMISSION_FREE", manager.release_reserved(pd.handle), RDMA_SC_OK);
+        end
+        // baseline(0)、逐窗口嵌套分配(1..windows)、最后窗口的 busy/epoch/generation。
+        injected_fault = attempt <= windows ? 1 : attempt - windows + 1;
+        rdma_rm_admission_window_status::target = manager;
+        rdma_rm_admission_window_status::source = nested_binding;
+        rdma_rm_admission_window_status::kind = kind;
+        rdma_rm_admission_window_status::initial_epoch = manager.observe_publication_epoch();
+        rdma_rm_admission_window_status::calls = 0;
+        rdma_rm_admission_window_status::trigger = attempt <= windows ? attempt : windows;
+        rdma_rm_admission_window_status::fault = injected_fault;
+        rdma_rm_admission_window_status::fired = 0;
+        rdma_rm_admission_window_status::guard_held = 0;
+        rdma_rm_admission_window_status::survivor = null;
+        rdma_rm_admission_window_status::nested_status = null;
+        // generation 故障针对外层 source；其它场景可分配另一个 Function owner。
+        if (injected_fault == 4)
+          rdma_rm_admission_window_status::source = binding;
+        isolated_factory = new();
+        core_service.set_factory(isolated_factory);
+        isolated_factory.set_type_override_by_type(rdma_status::get_type(),
+                                                  rdma_rm_admission_window_status::get_type());
+        if (scenario == 2)
+          status = manager.create_function(binding, function_resource);
+        else
+          status = manager.create_pd(binding, pd);
+        core_service.set_factory(original_factory);
+        rdma_rm_admission_window_status::target = null;
+        if (attempt == 0) begin
+          expect_status(label, status, RDMA_SC_OK);
+          windows = rdma_rm_admission_window_status::calls;
+          if (windows == 0)
+            `uvm_fatal("ADMISSION_WINDOWS", "no pre-consume status factory window observed")
+          `uvm_info("ADMISSION_WINDOWS", $sformatf("scenario=%0d windows=%0d", scenario, windows), UVM_LOW)
+          continue;
+        end
+        if (!rdma_rm_admission_window_status::fired)
+          `uvm_fatal("ADMISSION_INJECT", "selected factory window was not reached")
+        if (injected_fault == 2 && !rdma_rm_admission_window_status::guard_held)
+          `uvm_fatal("ADMISSION_GUARD", "busy fault did not hold the commit guard")
+        if (rdma_rm_admission_window_status::guard_held)
+          manager.release_mutation_guard_probe();
+        if (status == null || status.ok() ||
+            (scenario == 2 ? function_resource != null : pd != null))
+          `uvm_error("ADMISSION_REJECT", {label, " old admission was not rejected"})
+        if (manager.observe_publication_epoch() != rdma_rm_admission_window_status::expected_epoch ||
+            manager.observed_next_local_id(kind) != rdma_rm_admission_window_status::expected_cursor ||
+            manager.observed_next_object_serial(kind) != rdma_rm_admission_window_status::expected_serial ||
+            manager.observe_free_count(kind) != rdma_rm_admission_window_status::expected_free ||
+            manager.observe_binding_count() != rdma_rm_admission_window_status::expected_bindings ||
+            manager.observe_registry_count() != rdma_rm_admission_window_status::expected_resources)
+          `uvm_error("ADMISSION_ATOMIC", {label, " failed admission consumed or rolled back shared state"})
+        if (injected_fault == 1) begin
+          expect_status("ADMISSION_NESTED", rdma_rm_admission_window_status::nested_status, RDMA_SC_OK);
+          if (rdma_rm_admission_window_status::survivor == null)
+            `uvm_fatal("ADMISSION_SURVIVOR", "nested allocation produced no resource")
+          expect_status("ADMISSION_LOOKUP", manager.lookup(
+            rdma_rm_admission_window_status::survivor.handle, looked_up), RDMA_SC_OK);
+        end
+        if (injected_fault == 4) begin
+          // 故障只改代际 observer；重试先由 fixture 完成真实 identity/mirror 同步，
+          // 不把未知 source 的不一致 identity 当作合法的新代际输入。
+          expect_status("ADMISSION_GENERATION_SYNC",
+                        binding.synchronize_identity_from_legacy_mirrors(), RDMA_SC_OK);
+          binding.owner_h = binding.make_handle();
+        end
+        if (scenario == 2)
+          expect_status("ADMISSION_RETRY_FUNCTION", manager.create_function(binding, function_resource), RDMA_SC_OK);
+        else
+          expect_status("ADMISSION_RETRY_PD", manager.create_pd(
+            scenario == 3 && injected_fault == 1 ? nested_binding : binding, pd), RDMA_SC_OK);
+      end
+    end
+    rdma_rm_admission_window_status::source = null;
+    rdma_rm_admission_window_status::survivor = null;
+    rdma_rm_admission_window_status::nested_status = null;
+  endtask
+
+  // 功能：invoke_registry_transition 以明确业务编号调用九个 registry 生命周期入口及旧代际 QP 附着。
+  // 输入/输出及副作用：manager/cq/qp 为 fixture，operation=0..9 选择操作；返回真实 status，
+  //   不吞掉错误或改写候选，只有被调用 manager 能发布资源状态。
+  // 失败/边界：0..6 使用 CQ，7..9 使用 QP，8 为 RESET→INIT；未知编号返回 INVALID_ARGUMENT。
+  function rdma_status invoke_registry_transition(
+    rdma_resource_manager_probe manager, int unsigned operation, rdma_cq cq, rdma_qp qp
+  );
+    case (operation)
+      0: return manager.stage_allocated(cq);
+      1: return manager.attach_cq_programming(cq);
+      2: return manager.commit_programmed(cq);
+      3: return manager.activate(cq.handle);
+      4: return manager.begin_quiesce(cq.handle);
+      5: return manager.begin_cq_resize(cq.handle);
+      6: return manager.replace_active_cq(cq);
+      7, 9: return manager.attach_qp_programming(qp);
+      8: return manager.commit_qp_semantic_state(qp.handle, RDMA_QPS_INIT);
+      default: return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT, "unknown registry test operation"
+      );
+    endcase
+  endfunction
+
+  // 功能：check_registry_transition_windows 对九个生命周期入口逐一遍历真实 clone/completion
+  //   回调窗口，验证 epoch 冲突、最终 guard 忙和等值 source 替换不会发布旧状态。
+  // 输入/输出及副作用：无输入；创建独立 CQ/QP fixture，先测成功路径回调数，再逐窗口注入；
+  //   断言 state/staged/QPC/CQC 与 epoch，最后验证重试成功及旧 QP fallback 的错误优先级。
+  // 失败/边界：fixture 不合法或无外部窗口 fatal；每次注入后归还 guard、清空 static 非拥有
+  //   target，不回退 generation/epoch，也不借测试恢复 helper 执行真实硬件或资源回收。
+  task check_registry_transition_windows();
+    rdma_resource_manager_probe manager;
+    rdma_function_binding binding;
+    rdma_pd pd;
+    rdma_ceq ceq;
+    rdma_cq cq;
+    rdma_cq observed_cq;
+    rdma_qp qp;
+    rdma_qp observed_qp;
+    rdma_rm_registry_window_cqc cqc;
+    rdma_resource original;
+    rdma_resource observed;
+    rdma_handle handle;
+    rdma_handle release_handles[$];
+    rdma_status status;
+    longint unsigned epoch;
+    int unsigned windows;
+    int unsigned fault;
+    bit staged;
+    string label;
+
+    for (int unsigned operation = 0; operation < 10; operation++) begin
+      label = $sformatf("REGISTRY_OCC_%0d", operation);
+      manager = new(label);
+      binding = make_active_binding(label, 64'h2180_0000_0000_0001 + operation,
+                                    32'h2180_0101 + operation, 32'd218);
+      expect_status({label, "_CEQ"}, manager.create_ceq(binding, ceq), RDMA_SC_OK);
+      expect_status({label, "_CQ"}, manager.create_cq(binding, ceq.handle, cq), RDMA_SC_OK);
+      cq.depth = 8;
+      cq.cqe_size_bytes = 64;
+      cq.queue_plan = make_queue_test_plan(label, RDMA_RESOURCE_CQ, cq.depth,
+                                          cq.owner, cq.handle, cq.local_cq_id);
+      cq.queue_iova = cq.queue_plan.refs[0].mapping.iova;
+      cqc = new({label, "_cqc"});
+      cqc.cq_h = make_qp_projected_handle(label, RDMA_RESOURCE_CQ, cq.owner, cq.local_cq_id);
+      cqc.ceq_h = make_qp_projected_handle(label, RDMA_RESOURCE_CEQ, ceq.owner, ceq.local_ceq_id);
+      cqc.state = RDMA_CONTEXT_VALID;
+      cqc.depth = cq.depth;
+      cqc.cqe_size_bytes = cq.cqe_size_bytes;
+
+      // CQ attach 的 authority 必须尚无 CQC；其它场景通过正常 stage 保留可重入的 CQC。
+      if (operation == 1)
+        expect_status({label, "_STAGE"}, manager.stage_allocated(cq), RDMA_SC_OK);
+      cq.programmed_cqc = cqc;
+      if (operation inside {[2:6]})
+        expect_status({label, "_STAGE"}, manager.stage_allocated(cq), RDMA_SC_OK);
+      if (operation inside {[3:6]})
+        expect_status({label, "_PROGRAM"}, manager.commit_programmed(cq), RDMA_SC_OK);
+      if (operation inside {[4:6]})
+        expect_status({label, "_ACTIVE"}, manager.activate(cq.handle), RDMA_SC_OK);
+      if (operation == 6) begin
+        expect_status({label, "_QUIESCE"}, manager.begin_cq_resize(cq.handle), RDMA_SC_OK);
+        cq.state = RDMA_RESOURCE_ACTIVE;
+      end
+      handle = cq.handle;
+      if (operation >= 7) begin
+        expect_status({label, "_PD"}, manager.create_pd(binding, pd), RDMA_SC_OK);
+        expect_status({label, "_QP"}, manager.create_qp(
+          binding, pd.handle, cq.handle, cq.handle, null, qp), RDMA_SC_OK);
+        prepare_qp_candidate(qp, pd, cq, cq, label);
+        handle = qp.handle;
+        if (operation == 8) begin
+          expect_status({label, "_ATTACH"}, manager.attach_qp_programming(qp), RDMA_SC_OK);
+          expect_status({label, "_ACTIVE"}, manager.activate(qp.handle), RDMA_SC_OK);
+        end
+        if (operation == 9) begin
+          binding.generation++;
+          expect_status({label, "_STALE_LOOKUP"}, manager.lookup(handle, observed),
+                        RDMA_SC_STALE_GENERATION);
+        end
+      end
+      original = manager.observe_resource_source(handle);
+      staged = manager.observe_staged(handle);
+      manager.registry_window_handle = handle;
+      rdma_rm_registry_window_cqc::registry_window_target = manager;
+      rdma_rm_independent_release_mapping::registry_window_target = manager;
+      epoch = manager.observe_publication_epoch();
+      status = invoke_registry_transition(manager, operation, cq, qp);
+      expect_status({label, "_BASELINE"}, status, RDMA_SC_OK);
+      windows = manager.registry_window_calls;
+      if (!status.ok() || windows == 0)
+        `uvm_fatal("REGISTRY_OCC_FIXTURE", {label, " has no valid external window"})
+      if (manager.observe_publication_epoch() != epoch + 1)
+        `uvm_error("REGISTRY_OCC_BASELINE_EPOCH", label)
+
+      // 每个真实回调都注入 epoch；最后再独立检查 guard 和 source。attach 的 source 在
+      // 初始候选 projection 后才被读取，因此不把此前合法的等值替换误判为 source 冲突。
+      for (int unsigned attempt = 1; attempt <= windows + 2; attempt++) begin
+        fault = attempt <= windows ? 1 : (attempt == windows + 1 ? 2 : 3);
+        if (fault == 3 && operation inside {1, 7, 9})
+          continue;
+        manager.restore_registry_fixture(original, staged);
+        manager.registry_window_calls = 0;
+        manager.registry_window_trigger = attempt <= windows ? attempt : windows;
+        manager.registry_window_fault = fault;
+        manager.registry_window_fired = 1'b0;
+        epoch = manager.observe_publication_epoch();
+        status = invoke_registry_transition(manager, operation, cq, qp);
+        if (manager.registry_window_fired && fault == 2)
+          manager.release_mutation_guard_probe();
+        expect_status($sformatf("%s_FAULT_%0d_WINDOW_%0d", label, fault,
+                               manager.registry_window_trigger), status,
+                      fault == 2 ? RDMA_SC_RESOURCE_BUSY : RDMA_SC_INVALID_STATE);
+        observed = manager.observe_resource_source(handle);
+        if (!manager.registry_window_fired || observed == null ||
+            observed.state != original.state || manager.observe_staged(handle) != staged ||
+            manager.observed_recovery_count() != 0 ||
+            manager.observe_publication_epoch() != epoch + (fault == 1 ? 1 : 0))
+          `uvm_error("REGISTRY_OCC_ATOMIC", $sformatf("%s attempt %0d changed state", label, attempt))
+        if (operation == 8 &&
+            (!$cast(observed_qp, observed) || observed_qp.qp_state != RDMA_QPS_RESET))
+          `uvm_error("REGISTRY_OCC_QP_STATE", "failed INIT changed semantic state")
+        if (operation == 1 && (!$cast(observed_cq, observed) || observed_cq.programmed_cqc != null))
+          `uvm_error("REGISTRY_OCC_CQC", "failed attach published CQC")
+        if (operation inside {7, 9} && (!$cast(observed_qp, observed) || observed_qp.qp_plan != null ||
+                                       observed_qp.programmed_qpc != null))
+          `uvm_error("REGISTRY_OCC_QPC", "failed attach published QP programming")
+        manager.registry_window_fault = 0;
+      end
+      rdma_rm_registry_window_cqc::registry_window_target = null;
+      rdma_rm_independent_release_mapping::registry_window_target = null;
+      manager.restore_registry_fixture(original, staged);
+      epoch = manager.observe_publication_epoch();
+      expect_status({label, "_RETRY"},
+                    invoke_registry_transition(manager, operation, cq, qp), RDMA_SC_OK);
+      if (manager.observe_publication_epoch() != epoch + 1)
+        `uvm_error("REGISTRY_OCC_RETRY_EPOCH", label)
+      if (operation == 9) begin
+        expect_status({label, "_DUPLICATE"}, manager.attach_qp_programming(qp),
+                      RDMA_SC_INVALID_STATE);
+        // 模拟旧 incarnation 已结束；fallback 不得把未知/已释放的旧 QP 伪造成新 reservation。
+        release_handles.delete();
+        release_handles.push_back(handle);
+        expect_status({label, "_REMOVE"}, manager.release_keys_probe(
+          release_handles, manager.observe_publication_epoch()), RDMA_SC_OK);
+        expect_status({label, "_MISSING"}, manager.attach_qp_programming(qp),
+                      RDMA_SC_STALE_GENERATION);
+      end
+      `uvm_info("REGISTRY_OCC_WINDOWS",
+                $sformatf("%s verified %0d callback windows", label, windows), UVM_LOW)
+    end
+  endtask
+
   // 功能：在 rdma_resource_manager_test 中，run_phase 驱动 UVM 阶段中的场景初始化、事务执行和断言收尾，并在退出前释放 objection 或测试资源。
   // 输入/输出及副作用：phase（输入）；phase 由 UVM 提供；task 通过 objection、日志和断言暴露结果，可能调用 DUT 接口但不改变其所有权规则。
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_status status;
     rdma_resource_manager rm;
-    rdma_resource_manager dep_rm;
+    rdma_resource_manager_probe dep_rm;
     rdma_resource_manager teardown_rm;
     rdma_resource_manager identity_rm;
     rdma_resource_manager all_kind_rm;
@@ -4985,6 +6864,7 @@ class rdma_resource_manager_test extends uvm_test;
     rdma_cq qp_width_send_cq;
     rdma_cq qp_width_recv_cq;
     rdma_qp dep_qp;
+    rdma_resource_activity_blocker_snapshot dep_blockers;
     rdma_qp teardown_qp;
     rdma_qp snapshot_qp;
     rdma_qp snapshot_qp_lookup;
@@ -5181,11 +7061,23 @@ class rdma_resource_manager_test extends uvm_test;
     bit [7:0] qp_sequence_reused;
 
     phase.raise_objection(this);
+    test_dependency_policy_matrix();
+    test_queue_progress_candidate_shape();
+    test_resource_allocator_policy_matrix();
+    check_queue_role_cardinality_policy();
+    check_resource_publication_stage_commit_seam();
     check_owned_mapping_clone_contract_rejections();
     check_owned_mapping_capability_snapshots();
     check_reserved_error_completion_proof();
     check_error_restore_active_gate();
     check_error_restore_ref_authority_gate();
+    check_schema_commit_atomicity();
+    check_release_commit_atomicity();
+    check_restore_release_external_epoch();
+    check_registry_transition_windows();
+    check_allocator_rollback_isolation();
+    check_allocator_compensation_boundaries();
+    check_allocator_admission_windows();
 
     queue_snapshot_rm =
       rdma_resource_manager::type_id::create("queue_snapshot_rm");
@@ -5828,6 +7720,28 @@ class rdma_resource_manager_test extends uvm_test;
             late_failure_recovery_before.queue_plan.flush_targets[1].flush_complete)
         `uvm_error("RESTORE_LATE_FAILURE_ATOMIC",
                    "late restore failure changed live queue recovery evidence")
+      // 准备完成以后仍可能有 callback 重入或 guard 竞争。任一冲突均须保留 ERROR
+      // resource 与 ambiguity/flush 恢复进度，随后相同业务请求仍可成功重试。
+      for (int fault = 1; fault <= 4; fault++) begin
+        queue_recovery_manager.restore_commit_fault = fault;
+        expect_status($sformatf("RESTORE_COMMIT_FAULT_%0d", fault),
+          queue_recovery_manager.restore_active(srq.handle),
+          fault == 2 ? RDMA_SC_RESOURCE_BUSY : RDMA_SC_INVALID_STATE);
+        if (fault == 2)
+          queue_recovery_manager.release_mutation_guard_probe();
+        queue_recovery_manager.restore_commit_fault = 0;
+        expect_status("RESTORE_CONFLICT_RESOURCE",
+          queue_recovery_manager.lookup(srq.handle, resource), RDMA_SC_OK);
+        expect_status("RESTORE_CONFLICT_RECOVERY",
+          queue_recovery_manager.lookup_recovery(srq.handle, queue_recovery_lookup),
+          RDMA_SC_OK);
+        if (resource.state != RDMA_RESOURCE_ERROR ||
+            queue_recovery_lookup.ambiguous_queue_operation !=
+              late_failure_recovery_before.ambiguous_queue_operation ||
+            queue_recovery_lookup.queue_plan.flush_targets[0].flush_complete !=
+              late_failure_recovery_before.queue_plan.flush_targets[0].flush_complete)
+          `uvm_error("RESTORE_CONFLICT_ATOMIC", "restore conflict changed durable evidence")
+      end
       expect_status("RESTORE_QUEUE_SAFE", queue_recovery_manager.
         restore_active(srq.handle), RDMA_SC_OK);
       expect_status("RESTORE_QUEUE_LOOKUP", queue_recovery_manager.lookup(
@@ -8841,7 +10755,7 @@ class rdma_resource_manager_test extends uvm_test;
 
     // Dependency checks reject unsafe release; explicit leaf-first release is
     // accepted once all dependents are gone.
-    dep_rm = rdma_resource_manager::type_id::create("dep_rm");
+    dep_rm = new("dep_rm");
     binding_a = make_active_binding("dep_binding");
     expect_status("DEP_CREATE_PD",
                   dep_rm.create_pd(binding_a, dep_pd), RDMA_SC_OK);
@@ -8860,6 +10774,31 @@ class rdma_resource_manager_test extends uvm_test;
                   dep_rm.create_qp(binding_a, dep_pd.handle,
                                    dep_cq.handle, dep_cq.handle,
                                    dep_srq.handle, dep_qp), RDMA_SC_OK);
+    dep_rm.observe_activity_blockers(dep_pd, dep_blockers);
+    if (!dep_blockers.has_live_dependents ||
+        dep_blockers.dependent_count != 3 ||
+        dep_blockers.qp_dependent_count != 1 ||
+        dep_blockers.srq_dependent_count != 1 ||
+        !dep_blockers.has_non_qp_dependents ||
+        dep_blockers.has_qp_dependents_with_outstanding ||
+        dep_blockers.has_outstanding_operations ||
+        dep_blockers.outstanding_count != 0)
+      `uvm_error("DEP_BLOCKER_SNAPSHOT",
+                 "PD dependency blocker snapshot is inconsistent")
+
+    // The SRQ/QP edge is intentionally checked independently from the PD
+    // graph: a QP using an SRQ must block SRQ teardown, while the SRQ itself
+    // has no nested SRQ dependent.  This hostile combination also proves the
+    // snapshot reports QP classification rather than only total count.
+    dep_rm.observe_activity_blockers(dep_srq, dep_blockers);
+    if (!dep_blockers.has_live_dependents ||
+        dep_blockers.dependent_count != 1 ||
+        dep_blockers.qp_dependent_count != 1 ||
+        dep_blockers.srq_dependent_count != 0 ||
+        dep_blockers.has_non_qp_dependents ||
+        dep_blockers.has_qp_dependents_with_outstanding)
+      `uvm_error("DEP_SRQ_QP_COMBINATION",
+                 "SRQ/QP dependency classification is inconsistent")
     expect_status("DEP_RELEASE_PD_BUSY", dep_rm.\release (dep_pd.handle),
                   RDMA_SC_INVALID_STATE);
     expect_status("DEP_RELEASE_CQ_BUSY", dep_rm.\release (dep_cq.handle),

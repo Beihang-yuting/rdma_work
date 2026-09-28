@@ -221,6 +221,7 @@ class rdma_adapter_contract_test extends uvm_test;
     rdma_bar_decode decode;
     rdma_bar_decode decode_result;
     rdma_status status;
+    rdma_status normalized_status;
     rdma_status injected;
     uvm_object cloned_object;
     rdma_bdf_t bdf;
@@ -238,6 +239,24 @@ class rdma_adapter_contract_test extends uvm_test;
     byte identity_read_data[];
 
     phase.raise_objection(this);
+
+    normalized_status = rdma_adapter_status_policy::normalize(
+      null, "test adapter", "status probe"
+    );
+    if (normalized_status == null ||
+        normalized_status.code != RDMA_SC_INVALID_STATE ||
+        normalized_status.message !=
+          "test adapter status probe returned null status")
+      `uvm_error("ADAPTER_STATUS_POLICY",
+                 "null backend status was not normalized fail-closed")
+    normalized_status = rdma_status::make(
+      RDMA_SC_TIMEOUT, "backend timeout"
+    );
+    if (rdma_adapter_status_policy::normalize(
+          normalized_status, "test adapter", "status probe") !=
+        normalized_status)
+      `uvm_error("ADAPTER_STATUS_POLICY",
+                 "non-null backend status was not preserved")
 
     function_h = make_function_handle("function_h");
     bdf = '{segment:16'h1, bus:8'h22, device:5'h3, function_num:3'h4};

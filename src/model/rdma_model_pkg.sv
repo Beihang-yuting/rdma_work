@@ -32,4 +32,6 @@ package rdma_model_pkg;
   `include "rdma_cmq_journal_value_contract.sv"
   `include "rdma_queue_models.sv"
   `include "rdma_cmq_body_value_contract.sv"
+  `include "rdma_lifecycle_transaction_models.sv"
+  `include "rdma_reset_transaction_models.sv"
 endpackage

@@ -1,7 +1,8 @@
 // 目录：测试层 unit/rdma_control_plane_test.sv。
-// 职责：验证 rdma_control_plane_test 对应模块的接口、错误路径和边界行为。
-// 依赖：依赖被测 package、UVM 测试基类和必要的 mock/fixture。
-// 所有权与生命周期：测试对象只拥有本地 fixture；外部后端句柄由测试环境提供并在测试结束释放。
+// 职责：验证控制面 resource 生命周期、事务结果和 CMQ 失败/reconcile 后的恢复证据。
+// 依赖：core/model package、resource projector、UVM 及本文件的故障注入 manager/CMQ fixture。
+// 所有权与生命周期：测试拥有本地 fixture；probe 只借用 manager 账本并返回 detached 投影，
+//   不代替生产 lookup 的准入，也不取得外部 backing 或 completion authority 的所有权。
 
 // 中文说明：rdma_control_plane_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
@@ -246,16 +247,17 @@ endclass
 class rdma_recovery_probe_manager extends rdma_resource_manager;
   `uvm_object_utils(rdma_recovery_probe_manager)
 
-  // 功能：构造 rdma_recovery_probe_manager，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_recovery_probe_manager 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造允许测试读取故障快照的 manager，继承空 registry/allocator/recovery 和初始 guard。
+  // 输入/输出及副作用：name 传给父类；本 fixture 拥有 manager 本地账本，不创建外部 adapter。
+  // 失败/边界：构造不登记资源；peek 在空账本返回 INVALID_STATE，生产创建仍须合法 binding。
   function new(string name = "rdma_recovery_probe_manager");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_recovery_probe_manager 中，peek_resource 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
-  // 输入/输出及副作用：handle（输入）、resource（输出）；peek_resource 读取 handle、resource 并使用字段 resource、key，并写入 resource；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：目标不存在、route/authority 不匹配或快照代际失效时返回错误/空值；不得返回陈旧或歧义条目。
+  // 功能：peek_resource 绕过正常 lookup 准入，供测试观察故障后 registry 的 detached 值。
+  // 输入/输出及副作用：handle 决定精确 key，resource 输出 projector 构造的快照；不发布状态。
+  // 失败/边界：空 handle 返回 INVALID_ARGUMENT，缺少条目返回 INVALID_STATE；投影错误原样传播，
+  //   不检查当前 generation/route，不能用作生产查询或 authority 证明。
   function rdma_status peek_resource(
     rdma_handle handle,
     output rdma_resource resource
@@ -270,12 +272,15 @@ class rdma_recovery_probe_manager extends rdma_resource_manager;
     if (!registry.exists(key))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "probe resource is absent");
-    return project_resource_value(registry[key], "probe resource", resource);
+    return rdma_resource_projector::project_resource_value(
+      registry[key], "probe resource", resource
+    );
   endfunction
 
-  // 功能：在 rdma_recovery_probe_manager 中，peek_recovery 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
-  // 输入/输出及副作用：handle（输入）、recovery（输出）；peek_recovery 读取 handle、recovery 并使用字段 recovery、key，并写入 recovery；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：目标不存在、route/authority 不匹配或快照代际失效时返回错误/空值；不得返回陈旧或歧义条目。
+  // 功能：peek_recovery 直接观察精确 key 的恢复记录，供测试核对故障保留的 cleanup 证据。
+  // 输入/输出及副作用：handle 为输入，recovery 输出 projector 构造的 detached record，不推进恢复。
+  // 失败/边界：空 handle 返回 INVALID_ARGUMENT，记录不存在返回 INVALID_STATE；投影错误原样传播，
+  //   不检查该记录与 live resource 是否一致，测试调用方须单独断言配对关系。
   function rdma_status peek_recovery(
     rdma_handle handle,
     output rdma_recovery_record recovery
@@ -290,8 +295,9 @@ class rdma_recovery_probe_manager extends rdma_resource_manager;
     if (!recovery_records.exists(key))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "probe recovery is absent");
-    return project_recovery_value(recovery_records[key], "probe recovery",
-                                  recovery);
+    return rdma_resource_projector::project_recovery_value(
+      recovery_records[key], "probe recovery", recovery
+    );
   endfunction
 
 endclass

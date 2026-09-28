@@ -1768,6 +1768,39 @@ class rdma_qp_lifecycle_test extends uvm_test;
       `uvm_error("URC_PLAN", "URC RSQ/RDSQ/DSQ owned geometry is wrong")
   endtask
 
+  // 功能：在测试辅助 rdma_qp_lifecycle_test.check_urc_backing_policy 中直接验证
+  //   URC typed backing factory 的 transport gate、角色顺序和固定长度。
+  // 输入/输出及副作用：函数构造 detached 规格数组并读取其值，不创建 Host-memory
+  //   mapping、QP plan 或 manager 账本；失败通过 UVM_ERROR 暴露，不改变 DUT 状态。
+  // 失败/边界：RC/UD 或 X/Z transport 必须返回空数组；URC 必须恰好返回 RSQ、RDSQ、
+  //   DSQ 三项，任意数量、顺序或长度漂移均报告错误，测试不会把规格当作分配完成证据。
+  task automatic check_urc_backing_policy();
+    rdma_qp_urc_backing_spec_t specs[$];
+
+    rdma_qp_urc_backing_policy::specs_for_transport(
+      RDMA_TRANSPORT_RC, specs
+    );
+    if (specs.size() != 0)
+      `uvm_error("URC_POLICY_RC", "RC unexpectedly received URC backing specs")
+    rdma_qp_urc_backing_policy::specs_for_transport(
+      RDMA_TRANSPORT_UD, specs
+    );
+    if (specs.size() != 0)
+      `uvm_error("URC_POLICY_UD", "UD unexpectedly received URC backing specs")
+
+    rdma_qp_urc_backing_policy::specs_for_transport(
+      RDMA_TRANSPORT_URC, specs
+    );
+    if (specs.size() != 3 ||
+        specs[0].role != RDMA_QUEUE_ROLE_QP_URC_RSQ ||
+        specs[0].length != 4096 ||
+        specs[1].role != RDMA_QUEUE_ROLE_QP_URC_RDSQ ||
+        specs[1].length != 4096 ||
+        specs[2].role != RDMA_QUEUE_ROLE_QP_URC_DSQ ||
+        specs[2].length != 8192)
+      `uvm_error("URC_POLICY_URC", "URC typed backing policy matrix is wrong")
+  endtask
+
   // 功能：在测试辅助 rdma_qp_lifecycle_test.check_allocate_error_cleanup 中构造或驱动“allocate error cleanup”场景，并断言 DUT
   //   的状态、错误码和资源账本符合契约。
   // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
@@ -4234,9 +4267,11 @@ class rdma_qp_lifecycle_test extends uvm_test;
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    check_qp_transition_policy();
     check_rc_plan_and_staging_authority();
     check_ud_semantic_round_trip();
     check_rc_srq_geometry();
+    check_urc_backing_policy();
     check_urc_internal_geometry();
     check_urc_nonzero_rejected();
     check_allocate_error_cleanup();
@@ -4275,6 +4310,84 @@ class rdma_qp_lifecycle_test extends uvm_test;
     check_destroy_ticketless_ambiguity();
     check_destroy_stale_generation_boundary();
     phase.drop_objection(this);
+  endtask
+
+  // 功能：在测试辅助 rdma_qp_lifecycle_test.check_qp_transition_policy 中验证集中式
+  //   QP 状态矩阵覆盖标准主干、ERROR/RESET 回退和当前未支持的 SQD/SQE 能力边界。
+  // 输入/输出及副作用：无显式输入；函数只构造纯 decision value 并通过 UVM_ERROR
+  //   暴露契约偏差，不创建 QP、CMQ、Host-memory、backing 或 recovery 账本。
+  // 失败/边界：任一动作、错误码或拒绝原因与 executor 现有可观察语义不一致时报告失败；
+  //   测试不把 SQD/SQE 拒绝误判为实现缺陷，只有 capability policy 漂移才失败。
+  task automatic check_qp_transition_policy();
+    rdma_qp_transition_decision_t decision;
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_RESET, RDMA_QPS_INIT);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "RESET to INIT policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_INIT, RDMA_QPS_RTR);
+    if (decision.action != RDMA_QP_TRANSITION_FULL_MODIFY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "INIT to RTR policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_RTR, RDMA_QPS_RTS);
+    if (decision.action != RDMA_QP_TRANSITION_FULL_MODIFY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "RTR to RTS policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_RTS, RDMA_QPS_ERROR);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "RTS to ERROR policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_INIT, RDMA_QPS_ERROR);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "INIT to ERROR policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_INIT, RDMA_QPS_RESET);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "INIT to RESET policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_RTR, RDMA_QPS_ERROR);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "RTR to ERROR policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_RTR, RDMA_QPS_RESET);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "RTR to RESET policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_ERROR, RDMA_QPS_RESET);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "ERROR to RESET policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_RTS, RDMA_QPS_RESET);
+    if (decision.action != RDMA_QP_TRANSITION_SEMANTIC_ONLY ||
+        decision.reject_code != RDMA_SC_OK)
+      `uvm_error("QP_TRANSITION_POLICY", "RTS to RESET policy is invalid")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_RESET, RDMA_QPS_RTS);
+    if (decision.action != RDMA_QP_TRANSITION_INVALID ||
+        decision.reject_code != RDMA_SC_INVALID_STATE ||
+        decision.reject_reason != "QP state transition is invalid")
+      `uvm_error("QP_TRANSITION_POLICY", "invalid transition was accepted")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_INIT, RDMA_QPS_SQD);
+    if (decision.action != RDMA_QP_TRANSITION_INVALID ||
+        decision.reject_code != RDMA_SC_UNSUPPORTED_OPCODE ||
+        decision.reject_reason != "QP SQD/SQE modify is unsupported")
+      `uvm_error("QP_TRANSITION_POLICY", "SQD capability gate changed")
+
+    decision = rdma_qp_transition_decide(RDMA_QPS_SQE, RDMA_QPS_RESET);
+    if (decision.action != RDMA_QP_TRANSITION_INVALID ||
+        decision.reject_code != RDMA_SC_UNSUPPORTED_OPCODE ||
+        decision.reject_reason != "QP SQD/SQE modify is unsupported")
+      `uvm_error("QP_TRANSITION_POLICY", "SQE capability gate changed")
   endtask
 
   // 功能：在测试辅助 rdma_qp_lifecycle_test.check_destroy_stale_generation_boundary 中构造或驱动“destroy stale generation

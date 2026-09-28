@@ -101,6 +101,34 @@ class rdma_queue_runtime_retry_authority_probe extends rdma_queue_runtime;
   endfunction
 endclass
 
+// 设计说明：并发验证只需要让一个受限测试线程暂时持有生产 runtime 的唯一 semaphore；
+// 该 probe 不改变任何业务账本，也不提供绕过锁的写入口。
+class rdma_queue_runtime_lock_probe extends rdma_queue_runtime;
+  `uvm_object_utils(rdma_queue_runtime_lock_probe)
+
+  // 功能：构造可复用生产 lock 实现的 runtime probe，不预先配置 ring 或 route。
+  // 输入/输出及副作用：name（输入）传给基类；构造只初始化生产 runtime 默认状态。
+  // 失败/边界：probe 与生产对象相同，未 configure/activate 前仍拒绝业务查询；测试只能
+  //   通过 hold_lock_for_test 观察 lock 忙语义，不能直接修改 protected ledger。
+  function new(string name = "rdma_queue_runtime_lock_probe");
+    super.new(name);
+  endfunction
+
+  // 功能：在受控时间窗内占用 runtime 唯一 lock，模拟另一线程持锁访问，验证并发 caller
+  //   会收到 RESOURCE_BUSY 而不是读取半提交的 cursor/occupancy。
+  // 输入/输出及副作用：hold_time（输入）指定持锁时长；status（输出）返回 acquire_lock
+  //   结果；成功时短暂消耗并归还 semaphore token，不改变 runtime 状态或外部资源。
+  // 失败/边界：lock 未构造或 token 已被占用时直接返回 RESOURCE_BUSY；延时为零仍保证
+  //   归还 token，调用方必须等待 task 结束后再继续生命周期操作。
+  task automatic hold_lock_for_test(time hold_time, output rdma_status status);
+    status = acquire_lock();
+    if (status == null || !status.ok())
+      return;
+    #(hold_time);
+    lock.put(1);
+  endtask
+endclass
+
 // 设计说明：测试只通过 runtime 公开查询和事务入口观察状态，
 // 不直接读写 reservation、pending、occupancy 或 PI/CI 内部字段。
 class rdma_queue_runtime_test extends uvm_test;
@@ -2072,6 +2100,162 @@ class rdma_queue_runtime_test extends uvm_test;
                  "image rejection changed runtime")
   endtask
 
+  // 功能：check_mmio_policy_case 对单个 producer 方向和 evidence 迁移组合执行
+  //   detached policy 决策，并核对允许位与一次性 confirmation 消费位。
+  // 输入/输出及副作用：label/current/evidence/device_producer/device_write_attempted/
+  //   retry_confirmed/expected_allowed/expected_consume 为输入；只发布 UVM 断言，
+  //   不创建 runtime、pending、锁或外部 MMIO 资源。
+  // 失败/边界：非法组合必须由调用方显式标为 expected_allowed=0；若 policy 返回值
+  //   或 consume_confirmation 与期望不一致，任务只报告错误，不修改任何状态。
+  task automatic check_mmio_policy_case(
+      string label,
+      rdma_queue_mmio_evidence_e current,
+      rdma_queue_mmio_evidence_e evidence,
+      bit device_producer,
+      bit device_write_attempted,
+      bit retry_confirmed,
+      bit expected_allowed,
+      bit expected_consume
+  );
+    bit consume_confirmation;
+    bit allowed;
+
+    allowed = rdma_queue_mmio_transition_policy::decide(
+      current, evidence, device_producer, device_write_attempted,
+      retry_confirmed, consume_confirmation);
+    if (allowed !== expected_allowed ||
+        consume_confirmation !== expected_consume)
+      `uvm_error("MMIO_POLICY_MATRIX", $sformatf(
+        "%s allowed=%0b/%0b consume=%0b/%0b",
+        label, allowed, expected_allowed,
+        consume_confirmation, expected_consume))
+  endtask
+
+  // 功能：test_mmio_transition_policy_matrix 覆盖 consumer/device producer 的
+  //   AMBIGUOUS 终态、NO_SUBMIT confirmation、device 写入前置条件及非法回退。
+  // 输入/输出及副作用：无显式参数；调用纯 policy 并发布矩阵断言，不触碰 runtime
+  //   mutable ledger、pending evidence、retry marker 或外部 adapter。
+  // 失败/边界：consumer 只能在一次 confirmation 后从 NO_SUBMIT 到 SUCCESS 或
+  //   AMBIGUOUS；AMBIGUOUS 不得转为 SUCCESS；device 未尝试写入不得伪造
+  //   NOT_APPLICABLE；所有拒绝路径都必须不消费 confirmation。
+  task automatic test_mmio_transition_policy_matrix();
+    check_mmio_policy_case("consumer_none_to_ambiguous",
+      RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_AMBIGUOUS,
+      1'b0, 1'b0, 1'b0, 1'b1, 1'b0);
+    check_mmio_policy_case("consumer_ambiguous_stable",
+      RDMA_QUEUE_MMIO_AMBIGUOUS, RDMA_QUEUE_MMIO_AMBIGUOUS,
+      1'b0, 1'b0, 1'b0, 1'b1, 1'b0);
+    check_mmio_policy_case("consumer_ambiguous_to_success",
+      RDMA_QUEUE_MMIO_AMBIGUOUS, RDMA_QUEUE_MMIO_SUCCESS,
+      1'b0, 1'b0, 1'b1, 1'b0, 1'b0);
+    check_mmio_policy_case("consumer_no_submit_without_confirmation",
+      RDMA_QUEUE_MMIO_NO_SUBMIT, RDMA_QUEUE_MMIO_SUCCESS,
+      1'b0, 1'b0, 1'b0, 1'b0, 1'b0);
+    check_mmio_policy_case("consumer_no_submit_success_confirmed",
+      RDMA_QUEUE_MMIO_NO_SUBMIT, RDMA_QUEUE_MMIO_SUCCESS,
+      1'b0, 1'b0, 1'b1, 1'b1, 1'b1);
+    check_mmio_policy_case("consumer_no_submit_ambiguous_confirmed",
+      RDMA_QUEUE_MMIO_NO_SUBMIT, RDMA_QUEUE_MMIO_AMBIGUOUS,
+      1'b0, 1'b0, 1'b1, 1'b1, 1'b1);
+    check_mmio_policy_case("consumer_success_downgrade",
+      RDMA_QUEUE_MMIO_SUCCESS, RDMA_QUEUE_MMIO_NO_SUBMIT,
+      1'b0, 1'b0, 1'b1, 1'b0, 1'b0);
+    check_mmio_policy_case("device_none_to_no_submit",
+      RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NO_SUBMIT,
+      1'b1, 1'b0, 1'b0, 1'b1, 1'b0);
+    check_mmio_policy_case("device_none_not_applicable_without_write",
+      RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NOT_APPLICABLE,
+      1'b1, 1'b0, 1'b1, 1'b0, 1'b0);
+    check_mmio_policy_case("device_none_not_applicable_after_write",
+      RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_NOT_APPLICABLE,
+      1'b1, 1'b1, 1'b0, 1'b1, 1'b0);
+    check_mmio_policy_case("device_no_submit_not_applicable_confirmed",
+      RDMA_QUEUE_MMIO_NO_SUBMIT, RDMA_QUEUE_MMIO_NOT_APPLICABLE,
+      1'b1, 1'b1, 1'b1, 1'b1, 1'b1);
+    check_mmio_policy_case("device_no_submit_not_applicable_unconfirmed",
+      RDMA_QUEUE_MMIO_NO_SUBMIT, RDMA_QUEUE_MMIO_NOT_APPLICABLE,
+      1'b1, 1'b1, 1'b0, 1'b0, 1'b0);
+    check_mmio_policy_case("device_ambiguous_rejected",
+      RDMA_QUEUE_MMIO_AMBIGUOUS, RDMA_QUEUE_MMIO_AMBIGUOUS,
+      1'b1, 1'b1, 1'b1, 1'b0, 1'b0);
+  endtask
+
+  // 功能：test_consumer_release_order_policy_matrix 验证跨 queue consumer release
+  //   只允许 CQ→SQ/RQ/SRQ 的单向锁序，覆盖同类、反向、device-ring 和未知枚举拒绝。
+  // 输入/输出及副作用：无显式参数；只调用无状态 release-order policy 并发布 UVM
+  //   断言，不创建 runtime、不获取 semaphore、不修改 pending/ledger 或外部资源。
+  // 失败/边界：任一不属于 CQ→host-WQ 的组合被允许、合法 host-WQ 被拒绝或 X/Z
+  //   enum 未 fail-closed 时报告错误；policy 结果不代表 caller 已取得任何 lock。
+  task automatic test_consumer_release_order_policy_matrix();
+    rdma_queue_runtime_kind_e unknown_kind;
+
+    if (!rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_RUNTIME_SQ) ||
+        !rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_RUNTIME_RQ) ||
+        !rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_RUNTIME_SRQ))
+      `uvm_error("RELEASE_ORDER_POLICY",
+                 "CQ to host-WQ release order was rejected")
+
+    if (rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_RUNTIME_CQ) ||
+        rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_SQ, RDMA_QUEUE_RUNTIME_CQ) ||
+        rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_SQ, RDMA_QUEUE_RUNTIME_RQ) ||
+        rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_RUNTIME_CEQ) ||
+        rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_CQ, RDMA_QUEUE_RUNTIME_AEQ))
+      `uvm_error("RELEASE_ORDER_POLICY",
+                 "invalid cross-runtime release order was accepted")
+
+    // VCS 会把 enum'(X) 在赋值时规范化成第一个枚举值，无法再从 helper
+    // 参数区分；这里使用枚举范围外的 3'd7 作为稳定的 unknown sentinel，
+    // 同样验证 policy 对未注册 runtime kind 的 fail-closed 行为。
+    unknown_kind = rdma_queue_runtime_kind_e'(3'd7);
+    if (rdma_queue_release_order_policy::allows_consumer_release(
+          unknown_kind, RDMA_QUEUE_RUNTIME_SQ) ||
+        rdma_queue_release_order_policy::allows_consumer_release(
+          RDMA_QUEUE_RUNTIME_CQ, unknown_kind))
+      `uvm_error("RELEASE_ORDER_POLICY",
+                 "unknown runtime kind bypassed release-order gate")
+  endtask
+
+  // 功能：test_runtime_lock_contention 通过两个并发线程验证 runtime semaphore 的单 owner
+  //   约束，并确认锁释放后查询可恢复。
+  // 输入/输出及副作用：无显式参数；构造并激活 SQ runtime，fork 持锁 task 与 occupancy
+  //   query，发布并发拒绝/恢复断言，不取得外部资源所有权。
+  // 失败/边界：配置或激活失败立即报告并返回；持锁线程必须先取得 token，查询线程在窗口
+  //   内必须返回 RESOURCE_BUSY，窗口结束后的查询必须成功且 occupancy 保持为零。
+  task automatic test_runtime_lock_contention();
+    rdma_queue_runtime_lock_probe probe;
+    rdma_status hold_status;
+    rdma_status query_status;
+    int unsigned occupancy;
+
+    probe = rdma_queue_runtime_lock_probe::type_id::create("runtime_lock_probe");
+    expect_ok("LOCK_CONFIGURE", probe.configure(
+      queue_handle("lock_qp", RDMA_RESOURCE_QP, 31),
+      RDMA_QUEUE_RUNTIME_SQ, 4, 0, 1'b0, 0, 1'b0, 1'b1));
+    expect_ok("LOCK_ACTIVATE", probe.activate());
+    fork
+      begin
+        probe.hold_lock_for_test(100ns, hold_status);
+      end
+      begin
+        #1ns;
+        query_status = probe.query_occupancy(occupancy);
+      end
+    join
+    expect_ok("LOCK_HOLDER", hold_status);
+    expect_code("LOCK_CONTENTION", query_status, RDMA_SC_RESOURCE_BUSY);
+    expect_ok("LOCK_RELEASED", probe.query_occupancy(occupancy));
+    if (occupancy != 0)
+      `uvm_error("LOCK_RELEASED", "lock contention changed committed occupancy")
+  endtask
+
   // 功能：run_phase 安装可控 factory fault，依次运行 runtime 边界场景，再执行
   //   legacy host ledger/wrap/recovery 兼容回归。
   // 输入/输出及副作用：phase（输入）由 UVM 提供；task raise/drop objection，
@@ -2099,6 +2283,9 @@ class rdma_queue_runtime_test extends uvm_test;
 
     phase.raise_objection(this);
     configure_factory_faults();
+    test_mmio_transition_policy_matrix();
+    test_consumer_release_order_policy_matrix();
+    test_runtime_lock_contention();
     test_attachment_config_query_is_detached();
     test_activate_without_authority_preserves_boundaries();
     test_device_ring_reserve_commit_and_visibility();

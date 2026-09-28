@@ -114,6 +114,7 @@ package rdma_codec_pkg;
   `include "rdma_cmq_hw_profile.sv"
   `include "rdma/rdma_qword_codec.sv"
   `include "rdma/rdma_queue_page_codec.sv"
+  `include "rdma/rdma_sge_authority.sv"
   `include "rdma/rdma_queue_codecs.sv"
   `include "rdma/rdma_doorbell_codecs.sv"
   `include "rdma/rdma_qpc_codecs.sv"

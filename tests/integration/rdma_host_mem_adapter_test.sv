@@ -184,9 +184,9 @@ class rdma_failure_atomic_release_identity
   endfunction
 endclass
 
-// 设计说明：normalize_adapter_status 是 adapter 自己拥有的 fail-closed 边界，
-// 不应通过全局 rdma_status factory 注入来测试。factory override 会在
-// rdma_status::make() 写字段前返回 null，反而把故障点移到状态工厂内部。
+// 设计说明：adapter status policy 是共享的 fail-closed 边界，但 probe 仍通过
+// concrete adapter 的 protected wrapper 验证 component 前缀，避免把故障注入到
+// rdma_status factory 内部而失去对 adapter 契约的定位。
 class rdma_host_mem_status_normalization_probe extends rdma_host_mem_adapter;
   `uvm_object_utils(rdma_host_mem_status_normalization_probe)
 
