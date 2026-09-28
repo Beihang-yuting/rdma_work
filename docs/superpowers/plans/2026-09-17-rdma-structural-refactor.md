@@ -22,6 +22,16 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch227 基于 `2ee9ff6` 沿用 `feature/rdma-structural-batch226`：把设备发布准备提取为
+内部函数，九个准备失败取消续接统一由 I/O task 编排；普通局部值记录不新增 owner，
+入口拒绝/reservation-only/完整 pending 三类取消权限不混用。生产净增 15 行，engine
+9,916→9,931 行、138→139 methods，I/O task 268→121 行；全部原声明、137 个正文和
+I/O 尾段不变，准备段规范化后 token 等价。新增 126-case 准备/取消/恢复矩阵和六项
+Python 门禁；最终 126-case focused、core 101/84、CMQ 28/11（PROCESS/LOGICAL）、
+integration 10、E2E 3、Host-memory 3、PCIe 1、Python 329/329、驱动契约与静态/注释
+门禁全部通过，E2E 保留基线编译警告。不合并、不推送，main 保持 `083e0d7`；详见
+`task-rdma-batch227-device-publish-prepare-report.md`，项目仍 active。
+
 Batch226 从已合并的 `083e0d7` 建立独立 `feature/rdma-structural-batch226`：
 将 CQ/CEQ/AEQ 设备发布的四类写后失败续接统一到单次循环外的恢复出口；写前 cancel、
 异常未写成功、正常成功与 replay 不混用。无新增生产方法/类级状态/owner，engine

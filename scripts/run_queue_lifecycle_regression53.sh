@@ -30,6 +30,7 @@ readonly CORE_TESTS=(
   # 必须在定义共享 fixture 的 post 测试之后执行。
   rdma_queue_data_engine_device_publish_test
   rdma_device_publish_exit_test
+  rdma_device_publish_prepare_test
   rdma_queue_event_route_consume_test
   rdma_aeqe_f5_e2e_test
   rdma_queue_host_codec_final_fix_test

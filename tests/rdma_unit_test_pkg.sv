@@ -97,6 +97,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_queue_consumer_steps_test.sv"
   `include "unit/rdma_queue_data_engine_device_publish_test.sv"
   `include "unit/rdma_device_publish_exit_test.sv"
+  `include "unit/rdma_device_publish_prepare_test.sv"
   `include "unit/rdma_queue_event_route_consume_test.sv"
   `include "unit/rdma_aeqe_f5_e2e_test.sv"
   `include "unit/rdma_aeqe_route_test.sv"

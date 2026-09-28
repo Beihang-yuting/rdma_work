@@ -13,6 +13,7 @@
 // 消费提交：live CQ、event 与 replay 共享 doorbell evidence/CI commit 步骤；各 caller
 //   仍决定 admission、shadow、幂等跳步、WQE release 和最终交付，runtime 是唯一账本 owner。
 // 设备发布：写入后的四类失败共用 evidence/recovery 收尾；写前取消和 replay 各自保留边界。
+//   准备阶段只生成本次调用的值记录，I/O task 统一处理准备失败取消；记录不成为第二账本。
 // Resize 提交：发布前失败共享一个 rollback 出口；发布后只保留新 authority 与旧资源
 //   cleanup evidence，不回滚 manager swap，也不新增候选 owner 或延迟字段快照。
 
@@ -36,6 +37,18 @@ class rdma_queue_data_engine extends uvm_object;
   typedef enum bit [1:0] {
     CONSUMER_DIAG_CQ, CONSUMER_DIAG_EVENT, CONSUMER_DIAG_REPLAY
   } consumer_diagnostic_e;
+
+  // 设备发布准备值只活到本次 task 结束：聚合原有局部对象/bytes，不经过 factory，
+  // 不保存 runtime/access，不提前填充 candidate 的成功字段；cancel_context 为空表示
+  // 准备失败时不可取消，非空时 pending 再区分 reservation-only 与完整证据两种取消。
+  typedef struct {
+    rdma_queue_pending_operation pending;
+    rdma_queue_device_publish_result candidate;
+    rdma_hw_image detached_image;
+    rdma_handle detached_queue;
+    byte data[];
+    string cancel_context;
+  } device_publish_prepared_t;
 
   rdma_resource_manager manager;
   rdma_function_binding binding;
@@ -1513,57 +1526,41 @@ class rdma_queue_data_engine extends uvm_object;
     return attachment.runtime.cancel_device_producer(reservation);
   endfunction
 
-  // 功能：write_commit_device_entry 执行 CQ/CEQ/AEQ 共享的设备发布事务，从
-  //   reservation 到 DEVICE_WRITE、readback、producer commit 和 detached result。
-  // 输入/输出及副作用：attachment、reservation、image 为已校验输入，result/status
-  //   为输出；成功写入真实 backing 并推进 device runtime occupancy，不发送 producer
-  //   doorbell，也不创建 host WQE ledger。
-  // 失败/边界：写入前纯校验失败只允许 cancel；一旦 backend write 开始，任何失败都
-  //   必须保存 pending 并返回 RECOVERY_REQUIRED，绝不能回滚或伪造成功 result。
-  //   写后失败只选择诊断并退出当前调用的 I/O 阶段，共用末尾的状态复制和 recovery admission。
-  protected task write_commit_device_entry(
+  // 功能：prepare_device_publish 校验已取得的 reservation，并按原顺序准备恢复证据、
+  //   返回候选、payload 和 detached image/queue；不执行 write、cancel 或 commit。
+  // 输入/输出及副作用：attachment/reservation/image 输入；prepared 输出本次调用的值记录，
+  //   status 输出原有状态，返回 1 表示可进入 I/O；只创建原有对象，不提前填充成功 result。
+  // 失败/边界：attachment/geometry/reservation 拒绝时 cancel_context 为空，不取消他人槽位；
+  //   后续失败填入原取消上下文并返回 0，next/pending 准备失败强制 pending=null，
+  //   其余失败保留完整 pending，供 caller 处理取消失败；返回 0 不等于 status 必为非 OK。
+  protected function bit prepare_device_publish(
     rdma_queue_data_attachment attachment,
     rdma_queue_cursor_snapshot reservation,
     rdma_hw_image image,
-    output rdma_queue_device_publish_result result,
+    output device_publish_prepared_t prepared,
     output rdma_status status
   );
     rdma_queue_cursor_snapshot current_reservation;
     rdma_queue_cursor_snapshot next;
-    rdma_queue_pending_operation pending;
-    rdma_queue_device_publish_result candidate;
-    rdma_hw_image detached_image;
-    rdma_handle detached_queue;
-    rdma_status local_status;
-    rdma_status original_status;
-    rdma_status recovery_status;
-    byte data[];
-    byte readback[];
     bit reservation_valid;
-    bit backend_write_started;
-    int unsigned occupancy;
-    longint unsigned offset;
     uvm_object raw_next;
-    string failure_copy_message;
 
-    result = null;
     status = null;
+    prepared.cancel_context = "";
     current_reservation = null;
     next = null;
-    pending = null;
-    candidate = null;
-    detached_image = null;
-    detached_queue = null;
-    data = new[0];
-    readback = new[0];
-    occupancy = 0;
+    prepared.pending = null;
+    prepared.candidate = null;
+    prepared.detached_image = null;
+    prepared.detached_queue = null;
+    prepared.data = new[0];
 
     if (attachment == null || attachment.queue_h == null ||
         attachment.runtime == null || attachment.access == null ||
         reservation == null || image == null) begin
       status = bad("device publish attachment/evidence is incomplete",
                    RDMA_SC_INVALID_STATE);
-      return;
+      return 1'b0;
     end
     if (!(attachment.kind inside {RDMA_QUEUE_RUNTIME_CQ,
                                   RDMA_QUEUE_RUNTIME_CEQ,
@@ -1571,7 +1568,7 @@ class rdma_queue_data_engine extends uvm_object;
         attachment.entry_size == 0 || (attachment.entry_size & 64'h7) != 0) begin
       status = bad("device publish kind/geometry is invalid",
                    RDMA_SC_INVALID_STATE);
-      return;
+      return 1'b0;
     end
     reservation_valid = 1'b0;
     status = attachment.runtime.query_device_reservation(
@@ -1580,27 +1577,26 @@ class rdma_queue_data_engine extends uvm_object;
       status = status == null ?
         bad("device reservation query returned null status",
             RDMA_SC_INVALID_STATE) : status;
-      return;
+      return 1'b0;
     end
     if (!reservation_valid || current_reservation == null ||
         !value_ops::same_cursor_value(current_reservation, reservation)) begin
       status = bad("device reservation is stale or not owned");
-      return;
+      return 1'b0;
     end
-    // 设计说明：所有可能触发 cancel 的纯 preflight 分支之前，先准备完整 pending。
-    // 这样取消本身失败时，runtime 能立刻接管同一 queue/cursor/image evidence，
-    // 调用方可经 query_runtime_pending/recover_queue 查询或显式 abort，而不是只
+    // 设计说明：后续 image/result 预检之前先准备完整 pending；next/pending
+    // 自身准备失败仍只允许 reservation-only 取消。其余取消失败时，runtime 可接管
+    // 同一 queue/cursor/image evidence，调用方可查询或显式 abort，而不是只
     // 留下无法处理的 reservation。
     raw_next = value_ops::factory_create_object_nonfatal(
       rdma_queue_cursor_snapshot::get_type(), "device_publish_next");
     if (raw_next == null || !$cast(next, raw_next)) begin
       next = null;
-      original_status = bad("device publish next cursor allocation failed",
+      status = bad("device publish next cursor allocation failed",
                             RDMA_SC_RESOURCE_EXHAUSTED);
-      finish_device_producer_cancel(attachment, reservation, null,
-                                    original_status, "device publish next cursor",
-                                    status);
-      return;
+      prepared.pending = null;
+      prepared.cancel_context = "device publish next cursor";
+      return 1'b0;
     end
     next.index = reservation.index;
     next.wrap = reservation.wrap;
@@ -1608,96 +1604,115 @@ class rdma_queue_data_engine extends uvm_object;
                                reservation.index, reservation.wrap,
                                next.index, next.wrap);
     status = prepare_device_pending(attachment, reservation, next, image,
-                                    1'b0, pending);
-    if (status == null || !status.ok() || pending == null) begin
+                                    1'b0, prepared.pending);
+    if (status == null || !status.ok() || prepared.pending == null) begin
       if (status == null)
         status = bad("device publish recovery evidence allocation failed",
                      RDMA_SC_RESOURCE_EXHAUSTED);
-      original_status = status;
-      finish_device_producer_cancel(attachment, reservation, null,
-                                    original_status,
-                                    "device publish pending preparation", status);
-      return;
+      prepared.pending = null;
+      prepared.cancel_context = "device publish pending preparation";
+      return 1'b0;
     end
     if (reservation.index >= attachment.runtime.depth ||
         reservation.index > 64'hffff_ffff_ffff_ffff /
                            longint'(attachment.entry_size)) begin
-      original_status = bad("device publish slot offset is out of range",
+      status = bad("device publish slot offset is out of range",
                             RDMA_SC_DMA_TRANSLATION);
-      finish_device_producer_cancel(attachment, reservation, pending,
-                                    original_status, "device publish offset",
-                                    status);
-      return;
+      prepared.cancel_context = "device publish offset";
+      return 1'b0;
     end
     if (image.length != attachment.entry_size ||
         image.bytes.size() != attachment.entry_size ||
         image.alignment != attachment.entry_size ||
         image.endian != RDMA_ENDIAN_BIG) begin
-      original_status = bad("device publish image length/alignment mismatch",
+      status = bad("device publish image length/alignment mismatch",
                             RDMA_SC_CODEC_ERROR);
-      finish_device_producer_cancel(attachment, reservation, pending,
-                                    original_status, "device publish image",
-                                    status);
-      return;
+      prepared.cancel_context = "device publish image";
+      return 1'b0;
     end
 
-    candidate = rdma_queue_device_publish_result::type_id::create(
+    prepared.candidate = rdma_queue_device_publish_result::type_id::create(
       "device_publish_result");
-    if (candidate == null) begin
-      original_status = bad("device publish result allocation failed",
+    if (prepared.candidate == null) begin
+      status = bad("device publish result allocation failed",
                             RDMA_SC_RESOURCE_EXHAUSTED);
-      finish_device_producer_cancel(attachment, reservation, pending,
-                                    original_status, "device publish result",
-                                    status);
-      return;
+      prepared.cancel_context = "device publish result";
+      return 1'b0;
     end
-    // candidate.status 必须在 backend write 前完成分配。commit 成功后只原位
+    // prepared.candidate.status 在 backend write 前完成分配。commit 成功后只原位
     // 更新这份状态，避免已提交槽位因结果状态工厂失败而没有 result/evidence。
-    candidate.status = rdma_status::success(
+    prepared.candidate.status = rdma_status::success(
       "device publish candidate; commit not yet acknowledged");
-    if (candidate.status == null) begin
-      original_status = bad("device publish result status allocation failed",
+    if (prepared.candidate.status == null) begin
+      status = bad("device publish result status allocation failed",
                             RDMA_SC_RESOURCE_EXHAUSTED);
-      finish_device_producer_cancel(attachment, reservation, pending,
-                                    original_status,
-                                    "device publish result status", status);
-      return;
+      prepared.cancel_context = "device publish result status";
+      return 1'b0;
     end
-    status = copy_image_bytes(image, data);
+    status = copy_image_bytes(image, prepared.data);
     if (status == null || !status.ok()) begin
       if (status == null)
         status = bad("device publish image copy returned null status",
                      RDMA_SC_CODEC_ERROR);
-      original_status = status;
-      finish_device_producer_cancel(attachment, reservation, pending,
-                                    original_status, "device publish byte copy",
-                                    status);
-      return;
+      prepared.cancel_context = "device publish byte copy";
+      return 1'b0;
     end
-    status = clone_publish_image(image, detached_image);
-    if (status == null || !status.ok() || detached_image == null) begin
+    status = clone_publish_image(image, prepared.detached_image);
+    if (status == null || !status.ok() || prepared.detached_image == null) begin
       if (status == null)
         status = bad("device publish image clone returned null status",
                      RDMA_SC_RESOURCE_EXHAUSTED);
-      original_status = status;
-      finish_device_producer_cancel(attachment, reservation, pending,
-                                    original_status, "device publish image clone",
-                                    status);
-      return;
+      prepared.cancel_context = "device publish image clone";
+      return 1'b0;
     end
     status = clone_publish_handle(attachment.queue_h, "publish result queue",
-                                  detached_queue);
-    if (status == null || !status.ok() || detached_queue == null) begin
+                                  prepared.detached_queue);
+    if (status == null || !status.ok() || prepared.detached_queue == null) begin
       if (status == null)
         status = bad("device publish queue clone returned null status",
                      RDMA_SC_RESOURCE_EXHAUSTED);
-      original_status = status;
-      finish_device_producer_cancel(attachment, reservation, pending,
-                                    original_status, "device publish queue clone",
-                                    status);
+      prepared.cancel_context = "device publish queue clone";
+      return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：write_commit_device_entry 编排 CQ/CEQ/AEQ 的准备、DEVICE_WRITE、回读、
+  //   producer commit 和结果交付；准备失败在唯一入口按证据完整性取消预留。
+  // 输入/输出及副作用：attachment/reservation/image 输入，result/status 输出；成功写 backing
+  //   并推进 occupancy，不发送 producer doorbell、不建立 host WQE ledger；prepared 仅本次调用持有。
+  // 失败/边界：准备阶段的输入/过期 reservation 拒绝不取消；已确认预留后的失败尝试取消，
+  //   取消失败保留 reservation/pending；写后四类失败共用恢复出口，绝不回滚或发布半成品。
+  protected task write_commit_device_entry(
+    rdma_queue_data_attachment attachment,
+    rdma_queue_cursor_snapshot reservation,
+    rdma_hw_image image,
+    output rdma_queue_device_publish_result result,
+    output rdma_status status
+  );
+    device_publish_prepared_t prepared;
+    rdma_status local_status;
+    rdma_status original_status;
+    rdma_status recovery_status;
+    byte readback[];
+    bit backend_write_started;
+    int unsigned occupancy;
+    longint unsigned offset;
+    string failure_copy_message;
+
+    result = null;
+    status = null;
+    readback = new[0];
+    occupancy = 0;
+    if (!prepare_device_publish(attachment, reservation, image, prepared, status)) begin
+      if (prepared.cancel_context != "") begin
+        original_status = status;
+        finish_device_producer_cancel(attachment, reservation, prepared.pending,
+                                      original_status, prepared.cancel_context, status);
+      end
       return;
     end
-    pending.device_write_attempted = 1'b1;
+    prepared.pending.device_write_attempted = 1'b1;
     offset = longint'(reservation.index) * longint'(attachment.entry_size);
     readback = new[attachment.entry_size];
     backend_write_started = 1'b0;
@@ -1706,14 +1721,14 @@ class rdma_queue_data_engine extends uvm_object;
     // 写前拒绝、backend 未开始的异常成功与最终成功直接返回；四类写后失败才到尾段。
     // 字节比较先退出 foreach，再按已选诊断退出 I/O 阶段，不比较或处理首个错误之后的字节。
     do begin : device_publish_io
-      status = attachment.access.write_device(offset, data,
+      status = attachment.access.write_device(offset, prepared.data,
                                               backend_write_started);
       if (status == null || !status.ok()) begin
         original_status = status;
         if (original_status == null)
           original_status = bad("device write returned null status");
         if (!backend_write_started) begin
-          finish_device_producer_cancel(attachment, reservation, pending,
+          finish_device_producer_cancel(attachment, reservation, prepared.pending,
                                         original_status,
                                         "device publish write preflight", status);
           return;
@@ -1723,14 +1738,14 @@ class rdma_queue_data_engine extends uvm_object;
       end
       if (!backend_write_started) begin
         original_status = bad("device write did not enter backend");
-        enter_device_publish_recovery(attachment, pending, original_status,
+        enter_device_publish_recovery(attachment, prepared.pending, original_status,
                                       RDMA_QUEUE_MMIO_NOT_APPLICABLE,
                                       recovery_status);
         status = recovery_status;
         return;
       end
       status = attachment.access.read(offset, attachment.entry_size, readback);
-      if (status == null || !status.ok() || readback.size() != data.size()) begin
+      if (status == null || !status.ok() || readback.size() != prepared.data.size()) begin
         if (status == null)
           status = bad("device publish readback returned null status",
                        RDMA_SC_DMA_TRANSLATION);
@@ -1742,7 +1757,7 @@ class rdma_queue_data_engine extends uvm_object;
         break;
       end
       foreach (readback[i]) begin
-        if (readback[i] !== data[i]) begin
+        if (readback[i] !== prepared.data[i]) begin
           original_status = bad("device publish readback bytes differ",
                                RDMA_SC_DMA_TRANSLATION);
           failure_copy_message = "device readback mismatch status copy failed";
@@ -1760,32 +1775,32 @@ class rdma_queue_data_engine extends uvm_object;
         failure_copy_message = "device producer commit failure status copy failed";
         break;
       end
-      candidate.queue_h = detached_queue;
-      candidate.index = reservation.index;
-      candidate.wrap = reservation.wrap;
-      candidate.image = detached_image;
-      candidate.occupancy_valid = 1'b0;
+      prepared.candidate.queue_h = prepared.detached_queue;
+      prepared.candidate.index = reservation.index;
+      prepared.candidate.wrap = reservation.wrap;
+      prepared.candidate.image = prepared.detached_image;
+      prepared.candidate.occupancy_valid = 1'b0;
       local_status = attachment.runtime.query_occupancy(occupancy);
       if (local_status != null && local_status.ok()) begin
-        candidate.occupancy_valid = 1'b1;
-        candidate.occupancy = occupancy;
+        prepared.candidate.occupancy_valid = 1'b1;
+        prepared.candidate.occupancy = occupancy;
       end
-      else candidate.occupancy = 0;
-      candidate.status.code = RDMA_SC_OK;
-      candidate.status.message = "device publish committed";
-      result = candidate;
+      else prepared.candidate.occupancy = 0;
+      prepared.candidate.status.code = RDMA_SC_OK;
+      prepared.candidate.status.message = "device publish committed";
+      result = prepared.candidate;
       status = rdma_status::success();
       return;
     end while (1'b0);
 
     // 两次字段复制之间原有 status factory 回调窗口必须保留；不可视为重复赋值删除。
     // pending.failure_status 与 attachment.runtime 仍在各调用点读取，不提前冻结成员。
-    local_status = copy_publish_status_into(original_status, pending.failure_status);
+    local_status = copy_publish_status_into(original_status, prepared.pending.failure_status);
     if (local_status == null || !local_status.ok()) begin
-      pending.failure_status.code = RDMA_SC_RECOVERY_REQUIRED;
-      pending.failure_status.message = failure_copy_message;
+      prepared.pending.failure_status.code = RDMA_SC_RECOVERY_REQUIRED;
+      prepared.pending.failure_status.message = failure_copy_message;
     end
-    enter_device_publish_recovery(attachment, pending, original_status,
+    enter_device_publish_recovery(attachment, prepared.pending, original_status,
                                   RDMA_QUEUE_MMIO_NOT_APPLICABLE, recovery_status);
     status = recovery_status;
   endtask

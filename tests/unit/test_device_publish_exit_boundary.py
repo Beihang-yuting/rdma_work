@@ -23,8 +23,8 @@ class DevicePublishExitBoundaryTest(unittest.TestCase):
         self.assertEqual(len(re.findall(r"failure_copy_message\s*=", body)), 5)
         self.assertNotRegex(body, r"\bdisable\b")
         tail = body.split("end while (1'b0);", 1)[1]
-        self.assertIn("pending.failure_status.message = failure_copy_message;", tail)
-        self.assertRegex(tail, r"enter_device_publish_recovery\(attachment, pending, original_status,"
+        self.assertIn("prepared.pending.failure_status.message = failure_copy_message;", tail)
+        self.assertRegex(tail, r"enter_device_publish_recovery\(attachment, prepared.pending, original_status,"
                          r"\s+RDMA_QUEUE_MMIO_NOT_APPLICABLE, recovery_status\);"
                          r"\s+status = recovery_status;\s+endtask\s*$")
 
@@ -60,17 +60,22 @@ class DevicePublishExitBoundaryTest(unittest.TestCase):
 
     def test_write_read_commit_and_success_return_order(self):
         """功能：守卫 prepare→write→read→compare→commit→result 的原业务顺序与成功旁路。
-        输入输出及副作用：比较方法关键步骤位置，检查成功在循环内直接返回；只读。
+        输入输出及副作用：分别比较准备函数和 I/O task 的步骤，检查成功在循环内直接返回；只读。
         失败边界：任何重排、成功落入 recovery、或把业务逻辑移到恢复尾段即失败。
         """
-        body = methods(read_code(CORE / "rdma_queue_data_engine.sv"))["write_commit_device_entry"][2]
+        declared = methods(read_code(CORE / "rdma_queue_data_engine.sv"))
+        prepare = declared["prepare_device_publish"][2]
         steps = ("prepare_device_pending(", "copy_image_bytes(", "clone_publish_image(",
-                 "clone_publish_handle(", "attachment.access.write_device(",
+                 "clone_publish_handle(")
+        positions = [prepare.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+        body = declared["write_commit_device_entry"][2]
+        steps = ("prepare_device_publish(", "attachment.access.write_device(",
                  "attachment.access.read(", "foreach (readback[i])",
-                 "attachment.runtime.commit_device_producer(", "result = candidate;")
+                 "attachment.runtime.commit_device_producer(", "result = prepared.candidate;")
         positions = [body.index(step) for step in steps]
         self.assertEqual(positions, sorted(positions))
-        self.assertRegex(body, r"result = candidate;\s+status = rdma_status::success\(\);"
+        self.assertRegex(body, r"result = prepared.candidate;\s+status = rdma_status::success\(\);"
                          r"\s+return;\s+end while \(1'b0\);")
 
     def test_second_copy_and_replay_remain_separate(self):
