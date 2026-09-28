@@ -1,7 +1,7 @@
 // 目录：测试层 unit/rdma_queue_detached_snapshot_test.sv。
-// 职责：验证 queue-data engine 在 scheduler/consumer barrier 前构造的 CQE、CEQE
-//   和 AEQE detached candidate 不丢失驱动定义的 typed/raw 字段。
-// 依赖：依赖 rdma_queue_data_engine、queue codec model、runtime slot model 与 UVM
+// 职责：独立验证 queue-data projector 的身份/route 值边界，以及在 consumer barrier 前
+//   构造的 CQE、CEQE 和 AEQE candidate 不丢失驱动 typed/raw 字段。
+// 依赖：依赖 rdma_queue_data_projector、queue codec model、runtime slot model 与 UVM
 //   factory；本文件不访问 Host-memory、PCIe 或真实生命周期 executor。
 // 所有权与生命周期：测试只拥有本地 probe、model、handle 和 candidate；被测 helper
 //   不取得这些对象的外部所有权，测试在 run_phase 结束时释放 objection。
@@ -9,14 +9,13 @@
 // 设计说明：prepare_*_candidate 是 queue-data 的值边界。它们必须把已解码的
 // 驱动物理 overlay 一起搬到 detached 结果，不能只复制当前业务分支恰好使用的
 // 字段；否则 poll 成功后原始字节审计和异常上下文都会丢失。
-class rdma_queue_detached_snapshot_probe extends rdma_queue_data_engine;
+// probe 不再继承或构造 engine，确保值投影的测试无需 planner、配置、attachment 或运行时账本。
+class rdma_queue_detached_snapshot_probe extends uvm_object;
   `uvm_object_utils(rdma_queue_detached_snapshot_probe)
 
-  // 功能：构造 detached snapshot probe，保持生产 engine 的默认未配置状态。
-  // 输入/输出及副作用：name 为输入；只调用基类构造，不创建 attachment、runtime
-  //   或 backing，也不改变 UVM factory 的生产注册。
-  // 失败/边界：probe 未 configure 时不能执行公开 post/poll；本测试只调用两个
-  //   不依赖外部 authority 的 candidate preparation seam。
+  // 功能：构造只转发值投影的测试对象，不再创建生产 engine 或其 backing planner。
+  // 输入/输出及副作用：name 只设置 UVM 名称；对象不保存 fixture、runtime 或 adapter 引用。
+  // 失败/边界：该 probe 不能执行 post/poll，也不提供 authority admission；只用于本地值契约测试。
   function new(string name = "rdma_queue_detached_snapshot_probe");
     super.new(name);
   endfunction
@@ -24,9 +23,9 @@ class rdma_queue_detached_snapshot_probe extends rdma_queue_data_engine;
   // 功能：prepare_cqe 暴露生产 CQ completion candidate helper，供测试直接检查
   //   detached CQE 的字段和值隔离，不执行 consumer admission 或 WQE release。
   // 输入/输出及副作用：cq_h、decoded_cqe、result_qp_h、completion_status 和
-  //   release_snapshots 为输入；candidate/final_success 为输出；只分配新对象图。
-  // 失败/边界：输入缺失、factory 分配失败或 slot evidence 不完整时返回非成功，
-  //   candidate 保持 null，生产 helper 的 fail-closed 语义不被测试绕过。
+  //   release_snapshots 为输入；candidate/final_success 为输出；更新并复用输入 detached slot。
+  // 失败/边界：输入缺失、factory 或 slot 失败时返回非成功，可能留下 final_success 和已更新
+  //   slot；最终 status 创建失败也可留下 candidate，测试必须以返回状态判断，不使用失败输出。
   function rdma_status prepare_cqe(
     rdma_handle cq_h,
     rdma_hw_cqe_model decoded_cqe,
@@ -36,7 +35,7 @@ class rdma_queue_detached_snapshot_probe extends rdma_queue_data_engine;
     output rdma_queue_completion_result candidate,
     output rdma_status final_success
   );
-    return prepare_cq_completion_candidate(
+    return rdma_queue_data_projector::prepare_cq_completion_candidate(
       cq_h, decoded_cqe, result_qp_h, completion_status,
       release_snapshots, candidate, final_success);
   endfunction
@@ -55,7 +54,7 @@ class rdma_queue_detached_snapshot_probe extends rdma_queue_data_engine;
     output rdma_queue_event_result candidate,
     output rdma_status final_success
   );
-    return prepare_event_result_candidate(
+    return rdma_queue_data_projector::prepare_event_result_candidate(
       queue_h, decoded_event, routed_target_h, event_status,
       candidate, final_success);
   endfunction
@@ -117,6 +116,109 @@ class rdma_queue_detached_snapshot_test extends uvm_test;
     slot.wrap = wrap;
     return slot;
   endfunction
+
+  // 功能：check_identity_value_boundary 独立验证完整 incarnation 与跨 generation cleanup key
+  //   的区别，并锁定 attachment/link、cursor、route/epoch 的只读值门禁。
+  // 输入/输出及副作用：无参数；创建不绑定 runtime 的本地 handle/attachment/pending/link/cursor，
+  //   逐字段改变 route 副本，检查 pending authority 写入/清空；不配置 engine 或外部 authority。
+  // 失败/边界：null、代际/方向/游标不符、任一 route 字段或 epoch/valid 位漂移必须拒绝；
+  //   显式 valid 的零 epoch 沿用值层接受语义，不把值相等当作资源准入；任一违例报告 UVM_ERROR。
+  task automatic check_identity_value_boundary();
+    rdma_handle old_h;
+    rdma_handle fresh_h;
+    rdma_queue_data_attachment attachment;
+    rdma_queue_data_qp_link link;
+    rdma_queue_pending_operation pending;
+    rdma_queue_cursor_snapshot lhs;
+    rdma_queue_cursor_snapshot rhs;
+    rdma_route_key_t route;
+    rdma_route_key_t changed_route;
+
+    old_h = make_handle(RDMA_RESOURCE_CQ, 3, 9);
+    fresh_h = make_handle(RDMA_RESOURCE_CQ, 3, 10);
+    if (old_h == null || fresh_h == null) begin
+      `uvm_error("VALUE_ID_SETUP", "identity fixture allocation failed")
+      return;
+    end
+    if (rdma_queue_data_projector::same_handle_instance(old_h, fresh_h) ||
+        !rdma_queue_data_projector::same_cq_recovery_identity(old_h, fresh_h) ||
+        rdma_queue_data_projector::identity_key(old_h) ==
+          rdma_queue_data_projector::identity_key(fresh_h) ||
+        rdma_queue_data_projector::cq_recovery_key(old_h) !=
+          rdma_queue_data_projector::cq_recovery_key(fresh_h))
+      `uvm_error("VALUE_ID_GENERATION", "live identity and cleanup identity were conflated")
+    if (rdma_queue_data_projector::identity_key(null) != "" ||
+        rdma_queue_data_projector::attachment_key(null, RDMA_QUEUE_RUNTIME_SQ) != "" ||
+        rdma_queue_data_projector::cq_recovery_key(null) != "" ||
+        rdma_queue_data_projector::same_handle_instance(null, old_h) ||
+        rdma_queue_data_projector::attachment_key(old_h, RDMA_QUEUE_RUNTIME_SQ) ==
+          rdma_queue_data_projector::attachment_key(old_h, RDMA_QUEUE_RUNTIME_RQ))
+      `uvm_error("VALUE_ID_NULL_KIND", "null or SQ/RQ key isolation changed")
+
+    attachment = new("value_attachment");
+    pending = new("value_pending");
+    link = new("value_link");
+    attachment.queue_h = old_h;
+    pending.queue_h = old_h;
+    link.send_cq_h = old_h;
+    link.recv_cq_h = fresh_h;
+    if (!rdma_queue_data_projector::attachment_matches_queue_identity(attachment, old_h) ||
+        rdma_queue_data_projector::attachment_matches_queue_identity(attachment, fresh_h) ||
+        !rdma_queue_data_projector::pending_queue_handle_matches_attachment(pending, attachment) ||
+        !rdma_queue_data_projector::qp_link_cq_route_matches(link, old_h, 1'b0) ||
+        rdma_queue_data_projector::qp_link_cq_route_matches(link, old_h, 1'b1) ||
+        attachment.runtime != null)
+      `uvm_error("VALUE_ID_ROUTE", "identity predicates depended on runtime or lost direction")
+    lhs = new("value_cursor_lhs");
+    rhs = new("value_cursor_rhs");
+    lhs.index = 7;
+    rhs.index = 7;
+    if (!rdma_queue_data_projector::same_cursor_value(lhs, rhs) ||
+        rdma_queue_data_projector::same_cursor_value(null, rhs))
+      `uvm_error("VALUE_CURSOR", "equal/null cursor comparison changed")
+    rhs.wrap = ~lhs.wrap;
+    if (rdma_queue_data_projector::same_cursor_value(lhs, rhs))
+      `uvm_error("VALUE_CURSOR_WRAP", "cursor wrap was ignored")
+
+    route = '0;
+    route.bdf.bus = 1;
+    if (!rdma_queue_data_projector::apply_host_producer_pending_route_epoch(
+          pending, route, 7, 1'b1, 1'b1) ||
+        !rdma_queue_data_projector::pending_route_epoch_matches(pending, route, 1'b1, 7, 1'b1) ||
+        rdma_queue_data_projector::pending_route_epoch_matches(pending, route, 1'b1, 8, 1'b1) ||
+        rdma_queue_data_projector::pending_route_epoch_matches(pending, route, 1'b0, 7, 1'b1) ||
+        rdma_queue_data_projector::pending_route_epoch_matches(pending, route, 1'b1, 7, 1'b0))
+      `uvm_error("VALUE_EPOCH", "pending authority value or valid-bit comparison changed")
+    for (int unsigned field = 0; field < 7; field++) begin
+      changed_route = route;
+      case (field)
+        0: changed_route.host_topology_key++;
+        1: changed_route.root_id++;
+        2: changed_route.segment++;
+        3: changed_route.bdf.segment++;
+        4: changed_route.bdf.bus++;
+        5: changed_route.bdf.device++;
+        default: changed_route.bdf.function_num++;
+      endcase
+      if (rdma_queue_data_projector::same_route(route, changed_route) ||
+          rdma_queue_data_projector::pending_route_epoch_matches(
+            pending, changed_route, 1'b1, 7, 1'b1))
+        `uvm_error("VALUE_ROUTE_FIELD", $sformatf("route field %0d was ignored", field))
+    end
+    if (!rdma_queue_data_projector::apply_host_producer_pending_route_epoch(
+          pending, route, 0, 1'b1, 1'b1) ||
+        !rdma_queue_data_projector::pending_route_epoch_matches(pending, route, 1'b1, 0, 1'b1))
+      `uvm_error("VALUE_ZERO_EPOCH", "value layer unexpectedly added epoch admission")
+    if (rdma_queue_data_projector::apply_host_producer_pending_route_epoch(
+          pending, route, 7, 1'b1, 1'b0) ||
+        pending.route_valid || pending.epoch_valid || pending.route != '0 ||
+        pending.reset_epoch != 0 ||
+        rdma_queue_data_projector::apply_host_producer_pending_route_epoch(
+          pending, '0, 7, 1'b1, 1'b1) ||
+        rdma_queue_data_projector::apply_host_producer_pending_route_epoch(
+          null, route, 7, 1'b1, 1'b1))
+      `uvm_error("VALUE_AUTHORITY_CLEAR", "invalid pending authority was not cleared/rejected")
+  endtask
 
   // 功能：check_cqe_snapshot 验证 RC CQE candidate 复制公共头、variant、flags、
   //   qword2 raw/typed overlay、UD metadata 和 detached payload 的完整值。
@@ -326,9 +428,9 @@ class rdma_queue_detached_snapshot_test extends uvm_test;
     end
   endtask
 
-  // 功能：run_phase 执行 CQE/CEQE/AEQE detached candidate 的值完整性回归，并在
+  // 功能：run_phase 先检查独立 identity/route 值边界，再执行 CQE/CEQE/AEQE candidate 回归，并在
   //   所有断言完成后释放 UVM objection。
-  // 输入/输出及副作用：phase 为输入；创建 probe、调用两个检查 task 并向 UVM
+  // 输入/输出及副作用：phase 为输入；创建不继承 engine 的 probe、调用三个检查 task 并向 UVM
   //   报告失败，不访问外部 backing 或生命周期资源。
   // 失败/边界：probe allocation 失败时报告错误并安全结束；任一字段差异由 UVM
   //   summary 汇总为非零 error，防止缺字段修复被误判为通过。
@@ -336,6 +438,7 @@ class rdma_queue_detached_snapshot_test extends uvm_test;
     rdma_queue_detached_snapshot_probe probe;
 
     phase.raise_objection(this);
+    check_identity_value_boundary();
     probe = rdma_queue_detached_snapshot_probe::type_id::create(
       "detached_snapshot_probe");
     if (probe == null)

@@ -16,6 +16,16 @@
 
 ## 当前执行状态（2026-09-28）
 
+Batch223 在 `1a1322c` 基线上继续：25 个 queue-data 值投影/身份谓词集中迁入
+`rdma_queue_data_projector`，engine 从 10,872 行/161 methods 降到 10,000 行/136 methods。
+新组件 889 行，两生产文件合计 +17 行，属于职责收缩而非总代码净减。全部 161 方法
+token（限定/两处改名/static 除外）与 27 个公开业务声明核对一致；新增独立值边界
+与六项 Python 结构门禁；最终 core 97/80、CMQ 28/11（PROCESS/LOGICAL）、
+integration 10、E2E 3、Host-memory 3、PCIe 1、focused snapshot、Python 305/305、
+驱动契约及静态门禁均通过，E2E 保留已记录的基线编译警告。
+本地主线仍为 `5f8dfe9`，继续使用上一批工作树/分支，不合并或推送；详见
+`task-rdma-batch223-queue-data-projector-report.md`，项目计划仍 active。
+
 已按用户要求先完成本地合并：`main` 为 `5f8dfe9`，覆盖 Batch160–221；主线原有
 reset 改动单独保存在 `bec0f8f`，最终源码/测试/构建输入与已验证 Batch221 快照一致。
 后续 Batch222 改在 `.worktrees/rdma-structural-batch222`、分支

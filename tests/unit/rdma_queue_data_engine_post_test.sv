@@ -1,7 +1,7 @@
 // 目录：测试层 unit/rdma_queue_data_engine_post_test.sv。
 // 职责：提供 queue-data engine 单元测试及跨 post/poll/CQ 测试复用的完整 lifecycle fixture。
 // 依赖：依赖 UVM、resource/lifecycle executor、mock Host-memory/PCIe/CMQ/context
-//       与 queue-data engine。
+//       与 queue-data engine/projector；value_ops 是 engine 的类型别名，不持有服务实例。
 // 所有权与生命周期：fixture 拥有 Function、ACTIVE PD、owned CEQ/AEQ/CQ/QP，
 //                   以及按需创建的 UD/URC transport QP；engine 只借用
 //                   attachment，调用方必须执行聚合 cleanup。
@@ -161,23 +161,24 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
     core_service.set_factory(isolated_factory);
     isolated_factory.set_type_override_by_type(rdma_status::get_type(), wrapper);
 
-    if (!copy_status_fields(source, destination) ||
+    if (!value_ops::copy_status_fields(source, destination) ||
         destination.convert2string() != source_value || destination != saved_destination)
       `uvm_error("STATUS_VALUE_COPY", "field copy lost diagnostic values or object identity")
-    if (copy_status_fields(null, destination) || copy_status_fields(source, null) ||
-        copy_status_fields(null, null) ||
+    if (value_ops::copy_status_fields(
+      null, destination) || value_ops::copy_status_fields(source, null) ||
+        value_ops::copy_status_fields(null, null) ||
         destination.convert2string() != source_value)
       `uvm_error("STATUS_VALUE_NULL", "null field copy changed the destination")
-    if (!copy_status_fields(destination, destination) ||
+    if (!value_ops::copy_status_fields(destination, destination) ||
         destination.convert2string() != source_value || wrapper.calls != 0)
       `uvm_error("STATUS_VALUE_SELF", "self copy changed values or allocated a status")
-    if (set_engine_status_noalloc(null, RDMA_SC_OK, "null slot"))
+    if (value_ops::set_status_noalloc(null, RDMA_SC_OK, "null slot"))
       `uvm_error("STATUS_VALUE_INIT_NULL", "null slot was accepted")
 
     foreach (codes[i]) begin
-      void'(copy_status_fields(source, destination));
+      void'(value_ops::copy_status_fields(source, destination));
       expected = rdma_status::make_direct(codes[i], "reset diagnosis");
-      if (!set_engine_status_noalloc(destination, codes[i], "reset diagnosis") ||
+      if (!value_ops::set_status_noalloc(destination, codes[i], "reset diagnosis") ||
           destination.convert2string() != expected.convert2string() ||
           destination.hardware_code != 0 || destination != saved_destination ||
           wrapper.calls != 0)
@@ -186,7 +187,7 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
 
     foreach (codes[i]) begin
       wrapper.calls = 0;
-      result = make_engine_status_nonfatal(codes[i], "raw status");
+      result = value_ops::make_status_nonfatal(codes[i], "raw status");
       expected = rdma_status::make_direct(codes[i], "raw status");
       if (result == null || result.convert2string() != expected.convert2string() ||
           result.hardware_code != 0 || wrapper.calls != 1)
@@ -195,7 +196,7 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
     for (int unsigned fault = 1; fault <= 2; fault++) begin
       wrapper.fault = fault;
       wrapper.calls = 0;
-      result = make_engine_status_nonfatal(RDMA_SC_OK, "injected raw fault");
+      result = value_ops::make_status_nonfatal(RDMA_SC_OK, "injected raw fault");
       if (result != null || wrapper.calls != 1)
         `uvm_error("STATUS_VALUE_RAW_FAULT", "null/wrong raw factory result was hidden")
     end
@@ -333,11 +334,11 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
         rdma_status::make(RDMA_SC_INVALID_STATE,
                           "CQ poll validator probe SQ lookup returned null") :
         status;
-    if (!qp_links.exists(identity_key(qp_h)) ||
-        qp_links[identity_key(qp_h)] == null)
+    if (!qp_links.exists(value_ops::identity_key(qp_h)) ||
+        qp_links[value_ops::identity_key(qp_h)] == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "CQ poll validator probe QP link is missing");
-    link = qp_links[identity_key(qp_h)];
+    link = qp_links[value_ops::identity_key(qp_h)];
     cqe = rdma_hw_cqe_model::type_id::create(
       "cq_poll_validator_probe_cqe");
     if (cqe == null)
@@ -355,11 +356,11 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
     // class-handle output；focused test 不应把 simulator 的 output 复制差异误报为
     // attachment validator 失败，真正的 hostile 变形仍由后续 validator 判定。
     if (expected_kind == RDMA_QUEUE_RUNTIME_SRQ) begin
-      if (target_h == null || !same_handle_instance(target_h, link.srq_h))
+      if (target_h == null || !value_ops::same_handle_instance(target_h, link.srq_h))
         target_h = link.srq_h;
     end
     else begin
-      if (target_h == null || !same_handle_instance(target_h, link.qp_h))
+      if (target_h == null || !value_ops::same_handle_instance(target_h, link.qp_h))
         target_h = link.qp_h;
     end
     if (target_h == null)
@@ -465,7 +466,7 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
           RDMA_SC_INVALID_STATE,
           "CQ poll canonicalization probe SQ lookup returned null") :
         status;
-    qp_key = identity_key(qp_h);
+    qp_key = value_ops::identity_key(qp_h);
     if (qp_key == "" || !qp_links.exists(qp_key) || qp_links[qp_key] == null)
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
@@ -724,11 +725,11 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
         rdma_status::make(RDMA_SC_INVALID_STATE,
                           "SGB mutation probe SQ lookup returned null status") :
         status;
-    if (!qp_links.exists(identity_key(request.qp_h)) ||
-        qp_links[identity_key(request.qp_h)] == null)
+    if (!qp_links.exists(value_ops::identity_key(request.qp_h)) ||
+        qp_links[value_ops::identity_key(request.qp_h)] == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "SGB mutation probe QP route is unavailable");
-    link = qp_links[identity_key(request.qp_h)];
+    link = qp_links[value_ops::identity_key(request.qp_h)];
 
     cursor = rdma_queue_cursor_snapshot::type_id::create(
       "sgb_mutation_probe_cursor");

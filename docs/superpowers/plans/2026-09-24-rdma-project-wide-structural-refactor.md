@@ -19,7 +19,15 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch222 在合并主线之后继续：复用 queue-data 既有无分配字段 helper，移除
+当前 Batch223：从 queue-data engine 集中迁出 25 个值投影/身份谓词，形成无状态
+`rdma_queue_data_projector`；engine 10,872→10,000 行、161→136 methods，两个生产
+文件合计 +17 行，不冒充总代码净减。全部原方法 token 与 27 个公开业务声明核对
+一致，owner/I/O/commit 顺序保留；最终 core 97/80、CMQ 28/11（PROCESS/LOGICAL）、
+integration 10、E2E 3、Host-memory 3、PCIe 1、独立值测试、Python 305/305、驱动契约
+及静态门禁均通过，E2E 保留已记录的基线编译警告。
+详见 `task-rdma-batch223-queue-data-projector-report.md`，项目计划仍 active。
+
+前批 Batch222 在合并主线之后继续：复用 queue-data 既有无分配字段 helper，移除
 状态初始化/复制的两段重复赋值；engine 10,896→10,872 行，161 methods 与公开声明
 不变，不新增生产组件。新增 null、自复制、全部字段及 factory/hook 边界测试；最终
 core 97/80、CMQ 28/11（PROCESS/LOGICAL）、integration 10、E2E 3、Host-memory 3、
@@ -62,7 +70,7 @@ L6 只协调外部生命周期并在边界验证完整 route、authority 和 res
 
 | 优先级 | 组件 | 当前规模 | 目标 | 首个可迁移职责 |
 | --- | --- | ---: | --- | --- |
-| P0 | `rdma_queue_data_engine.sv` | 10,872 行/161 methods | 拆出 queue value/kernel 与统一 transaction seam | cursor、route/epoch snapshot、producer/consumer candidate |
+| P0 | `rdma_queue_data_engine.sv` | 10,000 行/136 methods | 继续收束统一 transaction seam | 值 projector 已分离；下一步 producer/consumer/resize 编排骨架 |
 | P1 | `rdma_resource_manager.sv` | 7,936 行/139 methods | 继续收束 allocator、registry、rollback transaction | projector 已分离；继续检查 publication 后更新，不改变 resource owner |
 | P1 | `rdma_queue_runtime.sv` | 4,646 行/94 methods | 纯 runtime snapshot/predicate 与 mutation owner 分界 | cursor/occupancy/attachment snapshot |
 | P2 | `rdma_queue_lifecycle_policy.sv` + queue/QP executors | 2,118 / 2,819 / 4,338 行 | policy、执行副作用、状态迁移表分离 | operation envelope 与 transition candidate |
@@ -73,8 +81,9 @@ SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 
 公共复杂度回收到 queue-data/runtime transaction 层。Host-memory、PCIe、网络和
 dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 adapter/router。
 
-上表 queue-data/manager 已分别按 Batch222/221 源码重测，其余维持 Batch218；独立 projector 为
-2,217 行/47 methods。后续在统一 owner/提交契约稳定后仍须收敛重复校验，
+上表 queue-data/manager 已分别按 Batch223/221 源码重测，其余维持 Batch218；独立 queue-data
+projector 为 889 行/25 methods，resource projector 为 2,217 行/47 methods。
+后续在统一 owner/提交契约稳定后仍须收敛重复校验，
 不以删注释、压缩行或新增大量单函数文件代替可读性改进。
 
 Batch221 按 Batch220 的候选闭包完成逐项复审与集中提取：33 个 projector 加支撑方法

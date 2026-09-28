@@ -1,7 +1,8 @@
 // 目录：测试层 unit/rdma_queue_data_engine_device_publish_test.sv。
 // 职责：验证 CQE/CEQE/AEQE device-producer publish、真实 backing 写入、route、
 //   authority/polarity/full 原子性，以及 poll 释放 WQE/事件的端到端契约。
-// 依赖：依赖 rdma_queue_data_engine_fixture、mock Host-memory、CQE codec 与 UVM。
+// 依赖：依赖 rdma_queue_data_engine_fixture、mock Host-memory、CQE codec 与 UVM；
+//   派生 probe 通过 value_ops 类型别名调用无状态 projector，原位状态更新仍无分配。
 // 所有权与生命周期：测试只拥有本地 fixture；queue、mapping、runtime 和 Host-memory
 //   都由 fixture 或其生命周期执行器管理，测试仅读取其已发布快照。
 
@@ -608,7 +609,7 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
       fail_doorbell_once = 1'b0;
       result = null;
       if (prepared_status != null) begin
-        void'(set_engine_status_noalloc(
+        void'(value_ops::set_status_noalloc(
           prepared_status, RDMA_SC_PCIE_COMPLETION,
           "injected consumer doorbell failure"));
         status = prepared_status;
@@ -731,7 +732,7 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
     if (fail_commit_once) begin
       fail_commit_once = 1'b0;
       if (prepared_status != null) begin
-        void'(set_engine_status_noalloc(
+        void'(value_ops::set_status_noalloc(
           prepared_status, RDMA_SC_INVALID_STATE,
           "injected CQ consumer commit failure"));
         return prepared_status;
@@ -784,7 +785,7 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
       fail_release_once = 1'b0;
       released.delete();
       if (prepared_status != null) begin
-        void'(set_engine_status_noalloc(
+        void'(value_ops::set_status_noalloc(
           prepared_status, RDMA_SC_INVALID_STATE,
           "injected CQ WQE release failure"));
         return prepared_status;
@@ -873,7 +874,7 @@ class rdma_device_publish_recovery_fault_engine extends rdma_queue_data_engine;
     string source_key;
 
     reservation_alias_key = "";
-    source_key = attachment_key(queue_h, RDMA_QUEUE_RUNTIME_CQ);
+    source_key = value_ops::attachment_key(queue_h, RDMA_QUEUE_RUNTIME_CQ);
     if (!attachments.exists(source_key) || attachments[source_key] == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "reservation alias source is unavailable");
@@ -1037,7 +1038,7 @@ class rdma_device_publish_width_runtime_engine extends rdma_queue_data_engine;
       return status == null || status.ok() ?
         rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                           "wide CQ dependency snapshot is unavailable") : status;
-    key = attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
+    key = value_ops::attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
     if (key == "" || !attachments.exists(key) || attachments[key] == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "wide CQ runtime attachment is missing");
