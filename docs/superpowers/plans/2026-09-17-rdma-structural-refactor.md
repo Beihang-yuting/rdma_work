@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch226 从已合并的 `083e0d7` 建立独立 `feature/rdma-structural-batch226`：
+将 CQ/CEQ/AEQ 设备发布的四类写后失败续接统一到单次循环外的恢复出口；写前 cancel、
+异常未写成功、正常成功与 replay 不混用。无新增生产方法/类级状态/owner，engine
+9,934→9,916 行；137 个正文、全部 138 声明/类壳不变，发布方法展开后 token 等价。
+新增三队列 30-case factory/I/O/commit/admission 矩阵与六项 Python 门禁；最终 focused、
+core 100/83、CMQ 28/11（PROCESS/LOGICAL）、integration 10、E2E 3、Host-memory 3、
+PCIe 1、Python 323/323、驱动契约与静态检查通过，E2E 保留基线编译警告。main 保持
+`083e0d7`；详见 `task-rdma-batch226-device-publish-exit-report.md`，项目仍 active。
+
 Batch225 在 `aa2518f` 基线上将 CQ resize 的 20 个发布前失败续接收束到唯一回滚
 出口，发布后仍直接返回并保留新 authority/旧资源 cleanup evidence。不新增生产
 组件、方法或状态，engine 9,977→9,934 行；138 声明/类壳不变、137 正文 token 不变，

@@ -12,6 +12,7 @@
 //   业务 wrapper 自己决定返回 status 分配；scheduler 后仍禁止新建对象或虚拟 clone/copy。
 // 消费提交：live CQ、event 与 replay 共享 doorbell evidence/CI commit 步骤；各 caller
 //   仍决定 admission、shadow、幂等跳步、WQE release 和最终交付，runtime 是唯一账本 owner。
+// 设备发布：写入后的四类失败共用 evidence/recovery 收尾；写前取消和 replay 各自保留边界。
 // Resize 提交：发布前失败共享一个 rollback 出口；发布后只保留新 authority 与旧资源
 //   cleanup evidence，不回滚 manager swap，也不新增候选 owner 或延迟字段快照。
 
@@ -1519,6 +1520,7 @@ class rdma_queue_data_engine extends uvm_object;
   //   doorbell，也不创建 host WQE ledger。
   // 失败/边界：写入前纯校验失败只允许 cancel；一旦 backend write 开始，任何失败都
   //   必须保存 pending 并返回 RECOVERY_REQUIRED，绝不能回滚或伪造成功 result。
+  //   写后失败只选择诊断并退出当前调用的 I/O 阶段，共用末尾的状态复制和 recovery admission。
   protected task write_commit_device_entry(
     rdma_queue_data_attachment attachment,
     rdma_queue_cursor_snapshot reservation,
@@ -1542,6 +1544,7 @@ class rdma_queue_data_engine extends uvm_object;
     int unsigned occupancy;
     longint unsigned offset;
     uvm_object raw_next;
+    string failure_copy_message;
 
     result = null;
     status = null;
@@ -1698,114 +1701,93 @@ class rdma_queue_data_engine extends uvm_object;
     offset = longint'(reservation.index) * longint'(attachment.entry_size);
     readback = new[attachment.entry_size];
     backend_write_started = 1'b0;
-    status = attachment.access.write_device(offset, data,
-                                            backend_write_started);
-    if (status == null || !status.ok()) begin
-      original_status = status;
-      if (original_status == null)
-        original_status = bad("device write returned null status");
+    failure_copy_message = "";
+    // 单次循环只收束本次调用的写后失败，不能用跨 activation 的命名块 disable。
+    // 写前拒绝、backend 未开始的异常成功与最终成功直接返回；四类写后失败才到尾段。
+    // 字节比较先退出 foreach，再按已选诊断退出 I/O 阶段，不比较或处理首个错误之后的字节。
+    do begin : device_publish_io
+      status = attachment.access.write_device(offset, data,
+                                              backend_write_started);
+      if (status == null || !status.ok()) begin
+        original_status = status;
+        if (original_status == null)
+          original_status = bad("device write returned null status");
+        if (!backend_write_started) begin
+          finish_device_producer_cancel(attachment, reservation, pending,
+                                        original_status,
+                                        "device publish write preflight", status);
+          return;
+        end
+        failure_copy_message = "device write failure status copy failed";
+        break;
+      end
       if (!backend_write_started) begin
-        finish_device_producer_cancel(attachment, reservation, pending,
-                                      original_status,
-                                      "device publish write preflight", status);
-      end
-      else begin
-        local_status = copy_publish_status_into(original_status,
-                                                 pending.failure_status);
-        if (local_status == null || !local_status.ok()) begin
-          pending.failure_status.code = RDMA_SC_RECOVERY_REQUIRED;
-          pending.failure_status.message =
-            "device write failure status copy failed";
-        end
-        enter_device_publish_recovery(attachment, pending, original_status,
-                                      RDMA_QUEUE_MMIO_NOT_APPLICABLE,
-                                      recovery_status);
-        status = recovery_status;
-      end
-      return;
-    end
-    if (!backend_write_started) begin
-      original_status = bad("device write did not enter backend");
-      enter_device_publish_recovery(attachment, pending, original_status,
-                                    RDMA_QUEUE_MMIO_NOT_APPLICABLE,
-                                    recovery_status);
-      status = recovery_status;
-      return;
-    end
-    status = attachment.access.read(offset, attachment.entry_size, readback);
-    if (status == null || !status.ok() || readback.size() != data.size()) begin
-      if (status == null)
-        status = bad("device publish readback returned null status",
-                     RDMA_SC_DMA_TRANSLATION);
-      else if (status.ok())
-        status = bad("device publish readback length differs",
-                     RDMA_SC_DMA_TRANSLATION);
-      original_status = status;
-      local_status = copy_publish_status_into(original_status,
-                                               pending.failure_status);
-      if (local_status == null || !local_status.ok()) begin
-        pending.failure_status.code = RDMA_SC_RECOVERY_REQUIRED;
-        pending.failure_status.message =
-          "device readback failure status copy failed";
-      end
-      enter_device_publish_recovery(attachment, pending, original_status,
-                                    RDMA_QUEUE_MMIO_NOT_APPLICABLE,
-                                    recovery_status);
-      status = recovery_status;
-      return;
-    end
-    foreach (readback[i]) begin
-      if (readback[i] !== data[i]) begin
-        original_status = bad("device publish readback bytes differ",
-                             RDMA_SC_DMA_TRANSLATION);
-        local_status = copy_publish_status_into(original_status,
-                                                 pending.failure_status);
-        if (local_status == null || !local_status.ok()) begin
-          pending.failure_status.code = RDMA_SC_RECOVERY_REQUIRED;
-          pending.failure_status.message =
-            "device readback mismatch status copy failed";
-        end
+        original_status = bad("device write did not enter backend");
         enter_device_publish_recovery(attachment, pending, original_status,
                                       RDMA_QUEUE_MMIO_NOT_APPLICABLE,
                                       recovery_status);
         status = recovery_status;
         return;
       end
-    end
-    status = attachment.runtime.commit_device_producer(reservation);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("device producer commit returned null status",
-                     RDMA_SC_INVALID_STATE);
-      original_status = status;
-      local_status = copy_publish_status_into(original_status,
-                                               pending.failure_status);
-      if (local_status == null || !local_status.ok()) begin
-        pending.failure_status.code = RDMA_SC_RECOVERY_REQUIRED;
-        pending.failure_status.message =
-          "device producer commit failure status copy failed";
+      status = attachment.access.read(offset, attachment.entry_size, readback);
+      if (status == null || !status.ok() || readback.size() != data.size()) begin
+        if (status == null)
+          status = bad("device publish readback returned null status",
+                       RDMA_SC_DMA_TRANSLATION);
+        else if (status.ok())
+          status = bad("device publish readback length differs",
+                       RDMA_SC_DMA_TRANSLATION);
+        original_status = status;
+        failure_copy_message = "device readback failure status copy failed";
+        break;
       end
-      enter_device_publish_recovery(attachment, pending, original_status,
-                                    RDMA_QUEUE_MMIO_NOT_APPLICABLE,
-                                    recovery_status);
-      status = recovery_status;
+      foreach (readback[i]) begin
+        if (readback[i] !== data[i]) begin
+          original_status = bad("device publish readback bytes differ",
+                               RDMA_SC_DMA_TRANSLATION);
+          failure_copy_message = "device readback mismatch status copy failed";
+          break;
+        end
+      end
+      if (failure_copy_message != "")
+        break;
+      status = attachment.runtime.commit_device_producer(reservation);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = bad("device producer commit returned null status",
+                       RDMA_SC_INVALID_STATE);
+        original_status = status;
+        failure_copy_message = "device producer commit failure status copy failed";
+        break;
+      end
+      candidate.queue_h = detached_queue;
+      candidate.index = reservation.index;
+      candidate.wrap = reservation.wrap;
+      candidate.image = detached_image;
+      candidate.occupancy_valid = 1'b0;
+      local_status = attachment.runtime.query_occupancy(occupancy);
+      if (local_status != null && local_status.ok()) begin
+        candidate.occupancy_valid = 1'b1;
+        candidate.occupancy = occupancy;
+      end
+      else candidate.occupancy = 0;
+      candidate.status.code = RDMA_SC_OK;
+      candidate.status.message = "device publish committed";
+      result = candidate;
+      status = rdma_status::success();
       return;
+    end while (1'b0);
+
+    // 两次字段复制之间原有 status factory 回调窗口必须保留；不可视为重复赋值删除。
+    // pending.failure_status 与 attachment.runtime 仍在各调用点读取，不提前冻结成员。
+    local_status = copy_publish_status_into(original_status, pending.failure_status);
+    if (local_status == null || !local_status.ok()) begin
+      pending.failure_status.code = RDMA_SC_RECOVERY_REQUIRED;
+      pending.failure_status.message = failure_copy_message;
     end
-    candidate.queue_h = detached_queue;
-    candidate.index = reservation.index;
-    candidate.wrap = reservation.wrap;
-    candidate.image = detached_image;
-    candidate.occupancy_valid = 1'b0;
-    local_status = attachment.runtime.query_occupancy(occupancy);
-    if (local_status != null && local_status.ok()) begin
-      candidate.occupancy_valid = 1'b1;
-      candidate.occupancy = occupancy;
-    end
-    else candidate.occupancy = 0;
-    candidate.status.code = RDMA_SC_OK;
-    candidate.status.message = "device publish committed";
-    result = candidate;
-    status = rdma_status::success();
+    enter_device_publish_recovery(attachment, pending, original_status,
+                                  RDMA_QUEUE_MMIO_NOT_APPLICABLE, recovery_status);
+    status = recovery_status;
   endtask
 
   // 功能：query_runtime_producer_polarity 查询设备生产 ring 当前 producer owner 位。
