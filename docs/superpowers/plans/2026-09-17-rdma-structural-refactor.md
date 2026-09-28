@@ -14,14 +14,53 @@
 `00b8ff6`（`feature/rdma-cmq-contract-foundation`），当时存在大量未提交改动。该历史
 现场及已有验证证据仍须保留。
 
-## 当前执行状态（2026-09-23）
+## 当前执行状态（2026-09-28）
 
-当前工作树为
-`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-structural-refactor-batch159`，分支为
-`feature/rdma-structural-refactor-batch159`，HEAD/基线为 `9be3470`。Batch159 的源码、
-测试和文档尚未提交；计划保持 `active`，不得把 focused GREEN 解释为整份重构完成。
+Batch221 继续从大文件职责入手：47 个快照投影/身份比较方法集中迁入无状态
+`rdma_resource_projector`，manager 减少 2,214 行，剩余 7,936 行/139 methods。
+公开 API、唯一账本 owner、authority/clone 回调和 commit 门禁保持原位；两文件合计
+净增 3 行，不将职责分离称为总代码量下降。最终 core 97/80（PROCESS/LOGICAL）、
+integration 10、CMQ 28/11、E2E 3、Host-memory 3、PCIe 1、Python 299/299、驱动契约
+和静态门禁全部通过；证据与既有编译警告见 `task-rdma-batch221-resource-projector-report.md`。
+该批不关闭项目级 Phase B/D/E、跨 owner 原子性和最终可读性验收，计划仍 active。
 
-## 批次进展记录（更新至 2026-09-23）
+Batch159 已合并到主线 `94ba894`（`refactor: consolidate CMQ transport envelope decode`）。
+当前 Phase 2 工作树为
+`/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-cmq-structural-phase2-batch160`，分支为
+`feature/rdma-cmq-structural-phase2-batch160`，以 `94ba894` 为基线；本批的 transaction-model
+拆分尚未提交。计划保持 `active`，不得把 focused GREEN 解释为整份重构完成。
+
+Batch217 在同一未提交工作树继续：restore/mark-error 统一双账本提交，单资源和 Function
+teardown 统一整批释放 commit，lookup 不再隐式写 registry；补充 completion 重入与
+四种 restore commit 冲突测试，并修复非零 MR reservation 的 lkey index 初值。
+本批 core 97/80（PROCESS/LOGICAL）、integration 10、CMQ 28/11、三项 E2E、
+Host-memory/PCIe adapter、驱动契约、Python 293/293 和静态门禁已通过；结果与未关闭项
+记录在 `task-rdma-batch217-resource-release-atomicity-report.md`，不复用旧批次 GREEN。
+
+Batch218 继续将 9 个普通生命周期入口纳入统一强制 epoch/source 提交契约，删除
+helper 默认关闭 snapshot 的分支；QP exact-old recovery 保留原错误优先级。
+新增逐真实 clone/authority/completion 窗口注入测试，最终回归结果记录在
+`task-rdma-batch218-registry-snapshot-contract-report.md`，计划仍 active。
+本批 core 97/80、integration 10、CMQ 28/11、E2E 3、Host-memory 3、PCIe 1、
+驱动契约、Python 293/293 和静态门禁均已通过；源码指纹及保留的早期失败见报告。
+
+Batch219 统一普通对象/Function 的 allocator 补偿，旧预留失败只回收自己的 local ID，
+不破坏窗口内成功分配的 cursor/serial/binding；epoch 在消费完成时冻结，覆盖返回
+status 的 factory 重入。五种交错场景、耗尽/代际/幂等边界和两个真实 factory 重入
+已在最终 focused 通过；core 97/80（PROCESS/LOGICAL）、integration 10、CMQ 28/11、
+E2E 3、Host-memory 3、PCIe 1、Python 293/293、驱动契约和静态门禁全部通过。
+记录见 `task-rdma-batch219-allocator-compensation-report.md`；registration/admission
+原子性、大文件收缩和包 DAG 仍未关闭，计划继续 active。
+
+Batch220 继续把 admission 前的 epoch 冻结、锁外 binding 准备和最终 ID/serial 消费
+纳入同一公共提交路径，不新增 owner/账本/锁；过期或饱和 epoch 拒绝新的 reservation。
+4 个 fixture、131 个 factory 窗口及额外 guard/epoch/generation 故障的最终 focused 已
+通过；core 97/80（PROCESS/LOGICAL）、integration 10、CMQ 28/11、E2E 3、Host-memory 3、
+PCIe 1、Python 293/293、驱动契约及静态门禁全部通过。
+记录见 `task-rdma-batch220-allocator-admission-commit-report.md`，大文件职责
+收缩、跨 owner 组合验收和包 DAG 仍保持 active。
+
+## 批次进展记录（更新至 2026-09-24）
 
 - Batch100 已关闭本项目 RC raw `INLINE_SGB` 的固定 512B/32-chunk 容量拒绝 guard；这不等于
   广义 Phase 1C F2 收口，`sge_num` canonical-authority/whole-plan 工作仍暂停。
@@ -623,7 +662,9 @@
   （`.sv` 5,483、`.svh` 2）；Batch159 transport envelope decoder 与 recovery probe 后
   当前边界为 5,488 methods（`.sv` 5,486、`.svh` 2）、0 diagnostics；扫描继续复用
   `sanitize_source`、`method_ranges`、`check_method_comments` 和 `check_file_header`，覆盖
-  `src/`、`tests/`、`sim/`，不把历史计数冒充当前证据。
+  `src/`、`tests/`、`sim/`，不把历史计数冒充当前证据。Batch160 transaction-model/kernel
+  文件与 polled journal commit seam 后当前边界为 191 个文件（189 `.sv`、2 `.svh`）、
+  5,496 methods、0 diagnostics；完整 CMQ gate 已追加复跑并通过。
 
 计划状态：`active`。Batch109/110 已关闭当前严格一对一 ownership/close/candidate seam
 和同步 publication callback 重入 seam；Batch111 关闭 legacy Host epoch capability bypass；
@@ -657,7 +698,96 @@ rollback legacy execution 去重 seam、Batch137 的 create/destroy legacy execu
   Batch159 的 shared transport envelope decode 收缩；完整公开
   post/replay 矩阵、广义 F2、coordinator 的全局并发/更深
 生命周期语义、manager 外部调用窗口补偿、全目录后续生命周期审计和外部锁仍未关闭，
-不得标记为 `complete`。
+  不得标记为 `complete`。
+
+- Batch160（Phase 2）开始真正的 CMQ 物理职责拆分：新增
+  `src/core/rdma_cmq_engine_transaction_models.sv`，迁出 slot record、预分配发布值、reset
+  candidate、MMIO arm observer 以及 submit/recovery/expiry/cancel staging 类型；engine 继续
+  独占 runtime/journal/fence/lock 和所有可变状态。`rdma_core_pkg.sv` 按依赖顺序 include 新文件，
+  UVM factory 注册、observer callback 和字段布局均未改变。engine 从 14,270 行降至当前 13,785
+  行；新增 transaction-model 502 行、transaction-kernel 237 行。ring geometry 纯校验移入
+  kernel，expiry/generation-cancel 的同形 staging 合并为一个 terminal-transition stage，
+  不复制账本、不引入第二 owner；随后把正常 CQE 与 late completion 重复的 retained
+  journal transition staging/commit 收束为 `commit_polled_journal_transition_locked()`，
+  completion/diagnostic、FIFO、token 和 slot 终态仍由 caller 分支负责；随后将
+  completion/timeout/late/reset 共用的 journal predecessor 表提取为
+  `rdma_cmq_transition_predecessor_valid()` 纯值函数，保留 engine 的 journal/slot/reset
+  authority；observed/wait/reconcile 的四处终态 phase 枚举统一为
+  `rdma_cmq_completion_phase_has_terminal_evidence()`，caller 继续负责 completion handle
+  与 authority 校验。CMQ engine models focused test 在 VCS53 编译并通过，静态 comment/style、
+  CMQ manifest（23/23）和 keyword gates 均通过。完整 CMQ gate 在 VCS53 登录 bash 环境
+  追加完成 11/11 logical、18/18 engine process，严格 UVM warning/error/fatal 为 0/0/0，
+  字段变异证据 PASS；全目录复审覆盖 191 个文件、5,496 个 function/task，hard diagnostics=0。
+  纯值层与 journal ownership 的后续拆分仍开放。
+
+- Batch161 将 QP 状态迁移矩阵抽为无状态 `rdma_qp_transition_decide()`，保留 executor 的
+  QPC/CMQ/outstanding/resource owner；Batch162 又在 resource manager 内以
+  `snapshot_activity_blockers()` 统一读取 live dependents 与 `outstanding_ids`，让
+  quiesce、QP/facade finalize 和 reservation release 共用只读 blocker seam，而不复制
+  mutable ledger。QP transition、resource manager、queue lifecycle、QP recovery 和
+  control-plane focused VCS53 均 PROCESS/LOGICAL PASS，UVM warning/error/fatal 为 0/0/0；
+  当前全目录复审为 192 个
+  文件（190 `.sv`、2 `.svh`）、5,499 methods、0 diagnostics。QP 的 SQD/SQE drain/flush、
+  跨资源 destroy dependency、跨队列并发、reset 统一验收、manager 外部调用窗口补偿和
+  最终 ownership 审计仍保持 OPEN，计划继续为 `active`。
+
+- Batch163 新增 `rdma_resource_identity_candidate` detached transaction value，把
+  `reserve_identity()` 的 owner/handle/local-id/serial/free-list/binding-registration 回滚
+  证据集中起来；PD/MR/CQ/QP/SRQ/CMQ/CEQ/AEQ 的 `create_*` 入口复用
+  `reserve→construct→register→publish` 与 `rollback_identity_candidate()`。allocator 数组、
+  registry、publication 和 Function 专用 incarnation 路径仍由 `rdma_resource_manager` 唯一
+  拥有，`create_function()` 未被泛化。resource-manager、queue lifecycle、QP lifecycle、QP
+  recovery 和 control-plane 五项 VCS53 focused 均 PROCESS/LOGICAL PASS，UVM 0/0/0；Python
+  293/293、changed-SV style、diff、queue/profile/Phase-1A 通过。当前源码为 193 文件（191
+  `.sv`、2 `.svh`）、5,504 个 function/task（`.sv` 5,502、`.svh` 2）、新增 5 个中文契约方法；allocator 并发、跨 incarnation destroy、
+  queue runtime snapshot、reset 统一验收和最终 ownership 审计继续 OPEN，计划保持 `active`。
+  详见 `task-rdma-batch163-resource-allocator-transaction-report.md`。
+
+- Batch164 新增 `src/core/rdma_queue_runtime_transaction_models.sv`，将 runtime 专用枚举、
+  cursor snapshot、pending recovery evidence 和 host slot ledger 从
+  `rdma_queue_runtime.sv` 移到 detached value-model 层；runtime 仍唯一拥有 attachment、
+  lock、PI/CI、occupancy、reservation、ledger、pending publication 与 route/epoch mutation。
+  既有 do_copy 兼容语义和 non-fatal clone 边界保持不变，未改变 pending recovery、shadow/
+  MMIO evidence、slot completion、cursor wrap 或 reset-epoch 验证。runtime、queue-data
+  post/poll/recovery 四项 VCS53 focused 均 PROCESS/LOGICAL PASS，UVM 0/0/0；Python
+  293/293、changed-SV style、diff、queue/profile/Phase-1A 通过。当前源码为 194 文件（192
+  `.sv`、2 `.svh`）、5,502 methods、0 diagnostics。跨队列/跨线程并发、SRQ lifecycle、
+  reset 统一验收、外部 ordering/error、manager 外部调用窗口补偿和最终 ownership 审计继续
+OPEN，计划保持 `active`。详见 `task-rdma-batch164-runtime-value-models-report.md`。
+
+- Batch165 处理 Batch163 保留的 Function 专用 allocator 路径：新增
+  `rdma_function_identity_candidate`，保存 detached owner、handle、trusted binding、owner key、
+  local ID、free-list 来源和首次 registration 标记；`create_function()` 复用专用
+  `reserve_function_identity_candidate()`/`rollback_function_identity_candidate()` 骨架，
+  但保留 duplicate incarnation、older generation、released tombstone 和 binding projection
+  顺序。resource-manager focused VCS53 PROCESS/LOGICAL PASS，UVM 0/0/0；changed-SV style、
+  diff 和全目录 scanner 为 194 个源码文件、5,507 methods、0 diagnostics。allocator/registry
+  并发、跨 incarnation destroy dependency、queue runtime snapshot、reset 统一验收、manager
+  外部调用窗口补偿和最终 ownership 审计继续 OPEN，计划保持 `active`。详见
+  `task-rdma-batch165-function-identity-candidate-report.md`。
+
+## CMQ Phase 2 驱动业务对齐决策（2026-09-23）
+
+对照冻结的 `rdma-driver-0.1.34` CMQ 业务锚点（`xtrdma_sc_cmq_post_sq`、
+`xtrdma_sc_cmq_next_cqe_valid`、`xtrdma_get_cqe_common_info`）和本项目 C oracle，
+后续拆分以业务流程而不是驱动源码结构为准：
+
+- 公共能力统一承载 SQ/CQ ring cursor、index/wrap/polarity、slot/token 生命周期、
+  journal locator、completion/timeout/late 状态和 reset epoch 隔离。
+- profile 只负责 SQE/CQE/doorbell 字段编码解码；不得把 opcode、端序、owner/wrap 位域
+  再复制到 transaction core。
+- observed submit、recovery retry、generation cancel 和 reset 作为 policy/admission，
+  共享 `admit → stage → external I/O → commit` 骨架；它们不能各自拥有 ring/journal。
+- 保留项目相对驱动的必要增强：batch 单 doorbell、32 项全部 outstanding、software
+  command ID、retained journal、observed/recovery evidence 和 UVM hostile-fault seam。
+  这些增强不改变驱动可观察的 SQE/CQE、doorbell、completion 和 reset 业务顺序。
+- 不复制驱动的 C 结构、锁粒度或软件数组；CMQ engine 继续是 runtime/journal/fence 的
+  唯一 owner，公共能力通过显式 plan/value 输入输出工作。
+
+因此，下一阶段不得新增 `submit_transaction`、`recovery_transaction`、
+`reset_transaction` 三套平行实现；应先建立一个精简 transaction kernel，再由三个 policy
+适配器提供差异化 admission 和 commit 规则。当前 Batch160 的 686 行 transaction-model/
+kernel 物理迁移保留为准备性边界，尚不代表最终公共能力已经完成。
 
 ## 0. 主线接管与冻结
 
@@ -747,3 +877,132 @@ CMQ 每批至少覆盖 engine logical gate、port、codec/profile 及受影响�
 
 每批报告拆出的职责、状态归属、重复逻辑的实际减少、最长流程变化、验证结果及
 遗留问题。跨业务改动拆成可审查的小批次，最终交付覆盖矩阵和尚需恢复的原修复任务。
+
+### Batch190 当前状态（2026-09-24）
+
+Phase-1C F2 新增 SQ `sge_num`/payload-length authority 子批：
+`rdma_sge_authority::derive_send()` 已被 RC/UD codec 与 SQ-SGB writer 共同使用，
+focused SQ authority/codec 验证通过。该子批不改变 mode、signature、Host-memory I/O
+或错误优先级；RQ typed/raw authority、SRQ lifecycle、并发、legacy descriptor、外部
+ordering/error/backpressure、manager 调用窗口和最终 ownership 仍 OPEN，计划保持 `active`。
+
+### Batch191 当前状态（2026-09-24）
+
+Queue-data CQ consumer release 子批已完成：live poll 与 recovery retry 共用
+`execute_consumer_wqe_release()`，统一 CQ→WQ gate、routed WQ release、finish 和失败
+evidence；runtime/ledger/外部 backing owner 未移动。runtime、queue-data poll、queue-data
+recovery focused 在 VCS53 通过，Python 293/293、style/diff gate 通过。该子批不关闭
+SRQ lifecycle、跨 queue/engine 并发、legacy descriptor、外部 ordering/error/backpressure、
+Phase-1C F2 whole-plan 或最终 ownership 审计，计划继续保持 `active`。
+
+### Batch192 当前状态（2026-09-25）
+
+Resource manager 普通资源 publication 子批已完成：新增受保护
+`publish_identity_candidate()`，统一 PD/MR/CQ/QP/SRQ/CMQ/CEQ/AEQ 的 identity candidate
+校验、`register_resource()`、失败回滚与成功清除；Function 创建继续保留独立的
+generation/tombstone candidate 路径。该 helper 不复制 allocator/registry/lock，也不接管
+外部 adapter 生命周期。resource-manager、queue-lifecycle、QP-lifecycle 和 control-plane
+focused 在 VCS53 均 PROCESS/LOGICAL PASS，UVM warning/error/fatal 为 0/0/0；Python
+293/293、changed-SV style 与 `git diff --check` 通过。项目级计划仍保持 `active`，剩余
+并发、SRQ 全生命周期、legacy descriptor、外部 ordering/error、Phase-1C F2 whole-plan
+和最终 ownership 审计不因本批关闭而提前宣称完成。详见
+`task-rdma-batch192-resource-publish-seam-report.md`。
+
+### Batch195 当前状态（2026-09-25）
+
+Queue progress detached candidate 子批已完成：新增 `rdma_queue_progress_candidate`，统一
+携带 queue progress 的 key、authoritative resource snapshot、可选 ERROR recovery snapshot
+和 `has_recovery`；`queue_progress_snapshots()` 的拒绝分支清除半成品，
+`commit_queue_progress()` 在统一校验后一次性发布两份账本。flush、cleanup、context 三个
+入口保留原 role cardinality、authority、SRFQ flush 前置、错误优先级和 publication 顺序，
+manager 仍是 registry/recovery ledger 的唯一 owner。resource-manager、queue-lifecycle、
+QP-lifecycle、control-plane focused VCS53 均 PROCESS/LOGICAL PASS，UVM warning/error/fatal
+均为 0/0/0；详见 `task-rdma-batch195-queue-progress-candidate-report.md`。
+
+本批不关闭 registry 并发、manager 外部调用窗口、SRQ 全生命周期、跨 queue/engine 并发、
+Phase-1C F2 whole-plan 或最终 ownership 审计，项目计划继续保持 `active`。
+
+### Batch199 当前状态（2026-09-25）
+
+Resource publication projection 子批已完成：`stage_resource_publication()` 在第一次外部
+clone/factory projection 前捕获 `publication_epoch`，完成 registry/published/owner/handle
+四类 detached projection 后检查 epoch；若 manager 在 projection 窗口发生 mutation，stage
+清除 candidate 并返回 `RDMA_SC_INVALID_STATE`。commit 的 stale epoch、canonical key/identity
+与 duplicate incarnation gate 保持不变；普通及 Function identity candidate 也锁存 reserve
+后 epoch，publication 前发现 stale reservation 时先回滚 allocator/binding，再拒绝发布；
+Function 路径通过 `publish_function_identity_candidate()` 统一 freshness、authoritative 完整性、
+registry publication 与失败回滚，manager 仍是 publication ledger 的唯一 owner。
+
+`rdma_resource_manager_test` 增加 epoch observation，并保留 concurrent create、hostile
+key/owner、duplicate commit 与 clear 后二次提交矩阵；resource-manager、control-plane、
+QP-lifecycle、queue-lifecycle focused VCS53 均 PROCESS/LOGICAL PASS，UVM warning/error/fatal
+均为 0/0/0，Python 293/293、changed-SV style、diff、queue/profile/Phase-1A 门禁通过。详见
+`task-rdma-batch199-publication-epoch-gate-report.md`。
+
+本批不关闭 allocator/registry 跨线程或跨进程互斥、manager 更广泛外部调用窗口补偿、SRQ
+全生命周期、跨 queue/engine 并发、SQD/SQE drain/flush、legacy descriptor、外部
+ordering/error/backpressure、Phase-1C F2 whole-plan 或最终 ownership 审计；计划继续保持
+`active`。
+
+### Batch200 当前状态（2026-09-25）
+
+Allocator 静态决策子批已完成：新增 `rdma_resource_allocator_policy.sv`，把资源 kind
+合法集合和 PD/MR/CQ/QP/SRQ/CEQ/AEQ local-ID 宽度映射提取为无状态纯值 policy；manager
+兼容 wrapper 继续保留，free-list、serial、binding、registry、generation 和 publication
+epoch 仍只有 manager 一个 mutable owner。测试补充未知 kind 与 FUNCTION/CMQ fallback
+矩阵。本批不关闭并发、manager 外部调用窗口、SRQ lifecycle、legacy descriptor、外部
+ordering/error/backpressure、Phase-1C F2 或最终 ownership 审计，计划继续 `active`。详见
+`task-rdma-batch200-resource-allocator-policy-report.md`。
+
+### Batch201 当前状态（2026-09-25）
+
+SRQ preflight 纯值判定子批已完成：新增 `rdma_srq_preflight_value_policy.sv`，统一
+SGB threshold、Function capability/encoded limit 和 borrowed SRQ backing role 集合；
+`rdma_srq_lifecycle_policy::preflight()` 继续保留 authority、PD dependency、backing
+clone、ring layout 与 publication owner。`rdma_queue_lifecycle_test` 及 dpu_common
+integration focused 在 VCS53 PROCESS/LOGICAL PASS，UVM warning/error/fatal 为 `0/0/0`；
+Python 293/293、style、queue/profile/Phase-1A、diff 门禁通过。SRQ 完整 lifecycle、并发、
+legacy descriptor、外部 ordering/error、Phase-1C F2 和最终 ownership 审计仍 OPEN，计划
+保持 `active`。详见 `task-rdma-batch201-srq-preflight-value-policy-report.md`。
+
+### Batch202 当前状态（2026-09-25）
+
+Borrowed ring 单角色校验已完成收缩：新增 `rdma_queue_borrowed_role_policy`，CQ、CEQ、
+AEQ preflight 共享同一 detached pure-value helper；`rdma_queue_lifecycle_policy` 不再
+保留重复的 `backing_role_count()`。空 spec、合法/错误 role 和 null slice 矩阵已加入
+`rdma_queue_lifecycle_test`，queue-lifecycle 与 dpu_common integration focused、Python
+293/293、style、queue/profile/Phase-1A 和 diff 门禁均通过。该批不改变 authority、
+dependency、ring layout、backing clone、CMQ 或 publication owner。
+
+allocator/registry 并发、manager 外部调用窗口、SRQ 全生命周期、跨 queue/engine 原子性、
+SQD/SQE drain/flush、legacy descriptor、外部 ordering/error/backpressure、Phase-1C F2
+whole-plan 和最终 ownership 审计仍 OPEN，历史结构重构计划继续保持 `active`。详见
+`task-rdma-batch202-borrowed-role-policy-report.md`。
+
+### Batch203 当前状态（2026-09-25）
+
+Queue progress 的 flush target 与 backing ref role-cardinality 扫描已完成收缩：新增
+`rdma_queue_role_cardinality_policy`，resource manager 的两个旧 helper 保留为兼容
+wrapper 并只转发纯值策略。`rdma_resource_manager_test` 的 null/empty/single/duplicate
+矩阵和 resource-manager focused VCS53、Python、style、queue/profile/Phase-1A、diff
+门禁均通过；registry/recovery/allocator ownership 与 commit 顺序未改变。
+
+随后 core regression 达到 `97/97 PROCESS`、`80/80 LOGICAL`，dpu_common integration
+regression 达到 `10/10` pristine，所有 UVM warning/error/fatal 均为 `0/0/0`。
+
+SRQ 全生命周期、并发、跨 queue/engine 原子性、SQD/SQE drain/flush、legacy descriptor、
+外部 ordering/error/backpressure、Phase-1C F2 和最终 ownership 审计仍 OPEN，计划继续
+保持 `active`。详见 `task-rdma-batch203-role-cardinality-policy-report.md`。
+
+### Batch204 当前状态（2026-09-25）
+
+Resource manager 的 detached publication、QP progress、queue progress 最终 commit seam
+已增加统一 `mutation_guard`；busy 时返回 `RDMA_SC_RESOURCE_BUSY` 且 candidate/registry/
+recovery 不变，成功/失败均释放 token。focused contention、core `97/97 PROCESS` +
+`80/80 LOGICAL`、dpu_common integration `10/10`、Python/manifest/style/queue/profile/
+Phase-1A/diff 门禁全部通过。该 guard 不进入外部 projection 或 allocator reservation。
+
+完整 registry/allocator 并发、SRQ lifecycle、跨 queue/engine 原子性、SQD/SQE drain/flush、
+legacy descriptor、外部 ordering/error/backpressure、Phase-1C F2 和最终 ownership 审计仍
+OPEN，计划继续保持 `active`。详见
+`task-rdma-batch204-publication-mutation-guard-report.md`。
