@@ -5,11 +5,86 @@
 // 所有权与生命周期：fixture 拥有 Function、ACTIVE PD、owned CEQ/AEQ/CQ/QP，
 //                   以及按需创建的 UD/URC transport QP；engine 只借用
 //                   attachment，调用方必须执行聚合 cleanup。
+// 状态 helper 测试只拥有本地值对象与临时 factory；恢复原 factory 引用后再运行 lifecycle fixture。
 
 // 中文说明：rdma_queue_data_engine_post_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-// 设计说明：该 probe 只把一个受保护的准备阶段暴露给 focused test，仍复用生产
+// 设计说明：用 hostile status 记录虚拟复制回调，防止无分配字段传输被误改为 UVM copy/clone。
+class rdma_queue_status_transfer_value extends rdma_status;
+  int unsigned clone_calls;
+  int unsigned copy_calls;
+
+  // 功能：构造带回调计数的本地 status，保留基类默认值，不安装任何 factory override。
+  // 输入/输出及副作用：name 传给父类，clone_calls/copy_calls 清零；对象只拥有诊断标量。
+  // 失败/边界：构造不代表事务成功；测试须先填充字段才能用它检查完整复制或初始化覆盖。
+  function new(string name = "status_transfer_value");
+    super.new(name);
+    clone_calls = 0;
+    copy_calls = 0;
+  endfunction
+
+  // 功能：记录禁止发生的 source.clone 调用，并返回别名以暴露偷用虚拟复制的错误。
+  // 输入/输出及副作用：无参数；增加 clone_calls 并返回 this，不创建状态或外部资源。
+  // 失败/边界：该 hostile 行为只供局部测试，生产字段 helper 必须完全不调用本方法。
+  virtual function uvm_object clone();
+    clone_calls++;
+    return this;
+  endfunction
+
+  // 功能：记录禁止发生的 destination.do_copy，故意不复制 rhs 的任何字段。
+  // 输入/输出及副作用：rhs 为被拒绝的复制源；只增加 copy_calls，保留目标原始字段。
+  // 失败/边界：测试以计数和字段快照同时检测调用；不调用 super，不能作为生产状态复制器。
+  virtual function void do_copy(uvm_object rhs);
+    copy_calls++;
+  endfunction
+endclass
+
+// 设计说明：wrapper 只在局部隔离 factory 中统计 status 分配，并观察分配时目标字段是否已写完。
+class rdma_queue_status_transfer_wrapper extends uvm_object_wrapper;
+  uvm_object_wrapper delegate;
+  rdma_status observed_status;
+  string observed_value;
+  int unsigned calls;
+  int unsigned fault;
+
+  // 功能：保存真实 status wrapper，初始化分配计数和关闭的 null/wrong-type 故障。
+  // 输入/输出及副作用：source_type 为借用 delegate；本对象只拥有计数及观察字符串。
+  // 失败/边界：不自行安装 factory；调用方必须在每个测试窗口后恢复原 factory 引用。
+  function new(uvm_object_wrapper source_type);
+    delegate = source_type;
+    observed_status = null;
+    observed_value = "";
+    calls = 0;
+    fault = 0;
+  endfunction
+
+  // 功能：在真实 status 创建边界计数、冻结目标诊断值，并按 fault 注入 null 或错误类型。
+  // 输入/输出及副作用：name 透传 delegate；fault=1 返回 null，=2 返回新 handle，=0 正常构造。
+  // 失败/边界：delegate 为空也返回 null；observed_status 只借用，观察后不修改其字段或生命周期。
+  virtual function uvm_object create_object(string name = "");
+    rdma_handle wrong;
+
+    calls++;
+    observed_value = observed_status == null ? "" : observed_status.convert2string();
+    if (fault == 1 || delegate == null)
+      return null;
+    if (fault == 2) begin
+      wrong = new(name);
+      return wrong;
+    end
+    return delegate.create_object(name);
+  endfunction
+
+  // 功能：为隔离 factory 的 override 提供固定类型名，便于诊断注入来源。
+  // 输入/输出及副作用：无参数；返回 wrapper 名称，不创建对象或增加 calls。
+  // 失败/边界：该名称只用于测试注册，不构成任何 RDMA 资源或 completion authority。
+  virtual function string get_type_name();
+    return "rdma_queue_status_transfer_wrapper";
+  endfunction
+endclass
+
+// 设计说明：该 probe 把受保护的准备阶段和状态值契约暴露给 focused test，仍复用生产
 // engine 的 configure/attach 与真实 registry，不复制或旁路 consumer admission。
 // 它不改变生产类的可见接口，也不持有 fixture 资源；测试结束时由调用方显式
 // detach，避免借用 attachment 跨过 reset/cleanup 生命周期。
@@ -37,6 +112,126 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
     reservation_epoch_flip_value = 0;
     reservation_epoch_flip_gate = 1;
     reservation_window_gate_count = 0;
+  endfunction
+
+  // 功能：check_status_value_helpers 验证完整诊断复制、清零初始化与 raw/publish 分配边界。
+  // 输入/输出及副作用：无参数；构造 hostile status 和隔离 factory，检查 null、自复制、
+  //   未知 code、raw null/错型及 publish 返回 factory 的观察顺序；结束恢复原 factory。
+  // 失败/边界：任一字段、对象身份、回调数或状态错误均报告 UVM_ERROR；不 configure engine，
+  //   不申请队列或 backing，失败断言也继续走同一 factory 恢复尾段，不让 override 泄漏。
+  function void check_status_value_helpers();
+    rdma_queue_status_transfer_value source;
+    rdma_queue_status_transfer_value destination;
+    rdma_status saved_destination;
+    rdma_status result;
+    rdma_status expected;
+    rdma_status_code_e codes[3];
+    rdma_queue_status_transfer_wrapper wrapper;
+    uvm_factory original_factory;
+    uvm_default_factory isolated_factory;
+    uvm_coreservice_t core_service;
+    string source_value;
+    string saved_value;
+
+    source = new("status_source");
+    destination = new("status_destination");
+    saved_destination = destination;
+    source.category = RDMA_STATUS_PCIE;
+    source.code = RDMA_SC_TIMEOUT;
+    source.hardware_code = 32'h1357_2468;
+    source.hardware_code_valid = 1'b1;
+    source.source_engine = RDMA_ENGINE_CMQ;
+    source.function_uid = 64'h1234_5678_9abc_def0;
+    source.generation = 32'h2468_1357;
+    source.resource_id = 64'h1111_2222_3333_4444;
+    source.command_id = 64'h5555_6666_7777_8888;
+    source.wr_id = 64'h9999_aaaa_bbbb_cccc;
+    source.severity = RDMA_SEVERITY_ERROR;
+    source.retryable = 1'b1;
+    source.message = "original completion evidence";
+    source_value = source.convert2string();
+    codes[0] = RDMA_SC_OK;
+    codes[1] = RDMA_SC_STALE_GENERATION;
+    codes[2] = rdma_status_code_e'('1);
+
+    original_factory = uvm_factory::get();
+    isolated_factory = new();
+    wrapper = new(rdma_status::get_type());
+    core_service = uvm_coreservice_t::get();
+    core_service.set_factory(isolated_factory);
+    isolated_factory.set_type_override_by_type(rdma_status::get_type(), wrapper);
+
+    if (!copy_status_fields(source, destination) ||
+        destination.convert2string() != source_value || destination != saved_destination)
+      `uvm_error("STATUS_VALUE_COPY", "field copy lost diagnostic values or object identity")
+    if (copy_status_fields(null, destination) || copy_status_fields(source, null) ||
+        copy_status_fields(null, null) ||
+        destination.convert2string() != source_value)
+      `uvm_error("STATUS_VALUE_NULL", "null field copy changed the destination")
+    if (!copy_status_fields(destination, destination) ||
+        destination.convert2string() != source_value || wrapper.calls != 0)
+      `uvm_error("STATUS_VALUE_SELF", "self copy changed values or allocated a status")
+    if (set_engine_status_noalloc(null, RDMA_SC_OK, "null slot"))
+      `uvm_error("STATUS_VALUE_INIT_NULL", "null slot was accepted")
+
+    foreach (codes[i]) begin
+      void'(copy_status_fields(source, destination));
+      expected = rdma_status::make_direct(codes[i], "reset diagnosis");
+      if (!set_engine_status_noalloc(destination, codes[i], "reset diagnosis") ||
+          destination.convert2string() != expected.convert2string() ||
+          destination.hardware_code != 0 || destination != saved_destination ||
+          wrapper.calls != 0)
+        `uvm_error("STATUS_VALUE_INIT", "initialization retained old evidence or invoked factory")
+    end
+
+    foreach (codes[i]) begin
+      wrapper.calls = 0;
+      result = make_engine_status_nonfatal(codes[i], "raw status");
+      expected = rdma_status::make_direct(codes[i], "raw status");
+      if (result == null || result.convert2string() != expected.convert2string() ||
+          result.hardware_code != 0 || wrapper.calls != 1)
+        `uvm_error("STATUS_VALUE_RAW", "raw status changed value or allocation count")
+    end
+    for (int unsigned fault = 1; fault <= 2; fault++) begin
+      wrapper.fault = fault;
+      wrapper.calls = 0;
+      result = make_engine_status_nonfatal(RDMA_SC_OK, "injected raw fault");
+      if (result != null || wrapper.calls != 1)
+        `uvm_error("STATUS_VALUE_RAW_FAULT", "null/wrong raw factory result was hidden")
+    end
+    wrapper.fault = 0;
+    wrapper.calls = 0;
+    wrapper.observed_status = destination;
+    result = copy_publish_status_into(source, destination);
+    if (result == null || !result.ok() || wrapper.calls != 1 ||
+        destination.convert2string() != source_value || wrapper.observed_value != source_value)
+      `uvm_error("STATUS_VALUE_PUBLISH", "publish status factory ran before complete field copy")
+    wrapper.calls = 0;
+    result = copy_publish_status_into(destination, destination);
+    if (result == null || !result.ok() || wrapper.calls != 1 ||
+        destination.convert2string() != source_value)
+      `uvm_error("STATUS_VALUE_PUBLISH_SELF", "publish self copy lost values or status allocation")
+
+    for (int unsigned fault = 0; fault < 3; fault++) begin
+      wrapper.calls = 0;
+      saved_value = destination.convert2string();
+      result = copy_publish_status_into(fault == 0 ? source : null,
+                                        fault == 1 ? destination : null);
+      if (result == null || result.code != RDMA_SC_INVALID_ARGUMENT || wrapper.calls != 1 ||
+          result.message != "publish status copy input is null" ||
+          destination.convert2string() != saved_value || wrapper.observed_value != saved_value)
+        `uvm_error("STATUS_VALUE_PUBLISH_NULL",
+                   "publish null inputs changed fields or error contract")
+    end
+
+    core_service.set_factory(original_factory);
+    wrapper.observed_status = null;
+    if (uvm_factory::get() != original_factory ||
+        source.convert2string() != source_value || source.clone_calls != 0 ||
+        source.copy_calls != 0 || destination.clone_calls != 0 || destination.copy_calls != 0 ||
+        configured || attachments.num() != 0 || qp_links.num() != 0)
+      `uvm_error("STATUS_VALUE_SIDE_EFFECT",
+                 "status helpers invoked hooks or changed engine ownership")
   endfunction
 
   // 功能：arm_reservation_epoch_flip 配置 probe 在 producer reservation 返回后的
@@ -3241,17 +3436,20 @@ class rdma_queue_data_engine_post_test extends uvm_test;
                  "non-WQ receive target resource kind was accepted")
   endtask
 
-  // 功能：run_phase 验证未配置门禁与真实 SQ/RQ post/readback；direct mixed-zero
+  // 功能：run_phase 先验证 status 值传输和工厂边界，再验证未配置门禁与真实 SQ/RQ
+  //   post/readback；direct mixed-zero
   //   SEND 锁定 filtered SGE count 与跨零项压紧布局，17-byte inline SEND 锁定
   //   canonical 两个 chunk 及 actual-slot 持久化，并覆盖 513B UD inline admission。
-  // 输入/输出及副作用：phase 为输入；task 管理 objection，创建并驱动主 fixture，
+  // 输入/输出及副作用：phase 为输入；task 管理 objection，在局部 probe 恢复 factory 后
+  //   创建并驱动主 fixture，
   //   读取 returned image 对应的实际 SQ/RQ backing，通过 UVM 报告暴露结果，最终
   //   释放 fixture-owned lifecycle 资源。
-  // 失败/边界：主 fixture setup、actual-slot read/decode、raw SGE_NUM、descriptor
+  // 失败/边界：status helper、主 fixture setup、actual-slot read/decode、raw SGE_NUM、descriptor
   //   布局或子场景失败时报告；513B UD 拒绝还要求 cursor/occupancy、pending、
   //   Host-memory 与 doorbell 计数全不变；cleanup 失败单独报告且始终 drop objection。
   task run_phase(uvm_phase phase);
     rdma_queue_data_engine engine;
+    rdma_queue_data_engine_probe status_probe;
     rdma_queue_data_engine_fixture fixture;
     rdma_status status;
     rdma_status cleanup_status;
@@ -3273,6 +3471,8 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     byte unsigned inline_payload_byte;
 
     phase.raise_objection(this);
+    status_probe = new("status_value_probe");
+    status_probe.check_status_value_helpers();
     begin : post_flow
       engine = rdma_queue_data_engine::type_id::create("unconfigured_engine");
 

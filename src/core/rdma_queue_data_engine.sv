@@ -8,6 +8,8 @@
 // evidence 与 detached CQ→CEQ dependency 快照；runtime、backing capability、mapping
 // 与 QP route 均为非拥有引用，
 // 其生命周期由 lifecycle/resource manager 或外部环境管理，detach/abort 不越权释放 mapping。
+// 状态值边界：字段初始化/复制复用无分配 helper；业务 wrapper 自己决定是否创建返回 status，
+//   因而不会给 scheduler 之后的无分配窗口引入 factory 或虚拟 clone/copy 回调。
 
 // 设计说明：本层是 host 侧 queue-data facade。queue 的生命周期仍归 lifecycle
 // resource 所有；engine 仅在 attachment 存活期间保存 detached runtime cursor 和
@@ -170,8 +172,8 @@ class rdma_queue_data_engine extends uvm_object;
     return status;
   endfunction
 
-  // 功能：make_engine_status_nonfatal 经 raw factory 构造可显式检查类型的 engine
-  //   状态，供 consumer admission 前的本地准备和其它非致命边界使用。
+  // 功能：make_engine_status_nonfatal 经 raw factory 构造 engine 状态，再复用无分配
+  //   初始化清除所有硬件/身份诊断字段，供 consumer admission 前的本地准备使用。
   // 输入/输出及副作用：code/message 为输入；返回独立 status，不改变 transaction
   //   evidence、cursor、backing 或 scheduler history。
   // 失败/边界：raw factory 返回 null/错误类型时返回 null，禁止用隐藏 new 或共享
@@ -186,29 +188,16 @@ class rdma_queue_data_engine extends uvm_object;
     raw_result = factory_create_object_nonfatal(
       rdma_status::get_type(), "queue_data_engine_status");
     if (raw_result == null || !$cast(result, raw_result)) return null;
-    result.category = rdma_status::category_for(code);
-    result.code = code;
-    result.hardware_code = '0;
-    result.hardware_code_valid = 1'b0;
-    result.source_engine = RDMA_ENGINE_NONE;
-    result.function_uid = '0;
-    result.generation = '0;
-    result.resource_id = '0;
-    result.command_id = '0;
-    result.wr_id = '0;
-    result.severity = code == RDMA_SC_OK ? RDMA_SEVERITY_INFO :
-                                           RDMA_SEVERITY_ERROR;
-    result.retryable = 1'b0;
-    result.message = message;
+    void'(set_engine_status_noalloc(result, code, message));
     return result;
   endfunction
 
-  // 功能：copy_status_fields 把完整 status 值写入 admission 前已分配的目标对象，
-  //   避免 CQ poll 在 scheduler 后再 clone 或分配 nested status。
+  // 功能：copy_status_fields 为 consumer 与 device publish 共用完整 status 值复制，
+  //   只写入已分配对象，不因进入 scheduler 后的错误路径而 clone 或创建 nested status。
   // 输入/输出及副作用：source/destination 为输入；成功覆盖 destination 全部诊断
   //   字段，不修改 source、runtime 或外部资源。
-  // 失败/边界：任一对象为空返回 0 且不写 destination；本 helper 不判断 source
-  //   是否成功，调用方按 transaction 阶段决定其语义。
+  // 失败/边界：任一对象为空返回 0 且不写 destination；自复制成功且值不变；不规范化
+  //   source.category/code，不调用虚拟 copy/clone，调用方自己决定是否创建返回 status。
   protected function bit copy_status_fields(
     rdma_status source,
     rdma_status destination
@@ -230,12 +219,12 @@ class rdma_queue_data_engine extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：set_engine_status_noalloc 将 code/message 写入 caller 预建的 status slot，
-  //   供 consumer scheduler/continuation barrier 后归一化 null 或不完整返回。
+  // 功能：set_engine_status_noalloc 为新建状态与预建 slot 共用 code/message 初始化，
+  //   清除上一条诊断的硬件/身份字段，支持 consumer barrier 后无分配地归一化错误。
   // 输入/输出及副作用：destination、code、message 为输入；成功覆盖完整诊断字段，
   //   返回 1，不创建对象、不调用 codec，也不修改 runtime/pending/ledger。
-  // 失败/边界：destination=null 时返回 0 且无副作用；该 helper 不推断 MMIO
-  //   evidence，调用方仍必须把 backend enum 交给 runtime 单调校验。
+  // 失败/边界：destination=null 返回 0；未知 code 按 category_for 归类，只有 OK 使用
+  //   INFO severity，其余使用 ERROR；不调用 factory 或虚拟 hook，不推断 MMIO evidence。
   protected function bit set_engine_status_noalloc(
     rdma_status destination,
     rdma_status_code_e code,
@@ -2058,30 +2047,17 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：copy_publish_status_into 在 pending 已预分配的诊断对象中更新原始
-  //   失败字段，避免写后故障路径再次依赖可能失败的 clone/工厂分配。
+  // 功能：copy_publish_status_into 复用无分配字段复制更新 publish pending 的原始
+  //   失败证据，再创建业务返回 status；保留“字段写完后才执行 status factory”的顺序。
   // 输入/输出及副作用：source、destination 为输入；destination 的受控状态字段
   //   会被覆盖，source、queue cursor 和 backing 不受影响。
-  // 失败/边界：任一状态为空返回 INVALID_ARGUMENT，destination 保持原值；成功后
-  //   不会改变 status 的对象身份或其拥有关系。
+  // 失败/边界：任一状态为空返回 INVALID_ARGUMENT 且不写 destination；自复制合法。
+  //   字段复制不执行虚拟 hook，但返回 status 仍经过 factory，本 wrapper 不是无分配接口。
   protected function rdma_status copy_publish_status_into(
     rdma_status source, rdma_status destination
   );
-    if (source == null || destination == null)
+    if (!copy_status_fields(source, destination))
       return bad("publish status copy input is null");
-    destination.category = source.category;
-    destination.code = source.code;
-    destination.hardware_code = source.hardware_code;
-    destination.hardware_code_valid = source.hardware_code_valid;
-    destination.source_engine = source.source_engine;
-    destination.function_uid = source.function_uid;
-    destination.generation = source.generation;
-    destination.resource_id = source.resource_id;
-    destination.command_id = source.command_id;
-    destination.wr_id = source.wr_id;
-    destination.severity = source.severity;
-    destination.retryable = source.retryable;
-    destination.message = source.message;
     return rdma_status::success();
   endfunction
 

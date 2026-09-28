@@ -16,6 +16,16 @@
 
 ## 当前执行状态（2026-09-28）
 
+已按用户要求先完成本地合并：`main` 为 `5f8dfe9`，覆盖 Batch160–221；主线原有
+reset 改动单独保存在 `bec0f8f`，最终源码/测试/构建输入与已验证 Batch221 快照一致。
+后续 Batch222 改在 `.worktrees/rdma-structural-batch222`、分支
+`feature/rdma-structural-batch222` 继续，不推送远端，旧工作树和历史记录保留。
+本批复用 queue-data 既有状态字段 helper，生产净减 24 行，不新增生产组件；新增
+完整字段、null/自复制、工厂次数/顺序和无虚拟回调测试。最终 core 97/80、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、E2E 3、Host-memory 3、PCIe 1、Python 299/299、
+驱动契约与静态门禁全部通过；E2E 每项既有 4 个编译警告单列。本批尚未合回 main。
+详见 `task-rdma-batch222-queue-status-transfer-report.md`，项目仍 active。
+
 Batch221 继续从大文件职责入手：47 个快照投影/身份比较方法集中迁入无状态
 `rdma_resource_projector`，manager 减少 2,214 行，剩余 7,936 行/139 methods。
 公开 API、唯一账本 owner、authority/clone 回调和 commit 门禁保持原位；两文件合计
@@ -24,11 +34,12 @@ integration 10、CMQ 28/11、E2E 3、Host-memory 3、PCIe 1、Python 299/299、�
 和静态门禁全部通过；证据与既有编译警告见 `task-rdma-batch221-resource-projector-report.md`。
 该批不关闭项目级 Phase B/D/E、跨 owner 原子性和最终可读性验收，计划仍 active。
 
-Batch159 已合并到主线 `94ba894`（`refactor: consolidate CMQ transport envelope decode`）。
-当前 Phase 2 工作树为
+历史起点：Batch159 曾合并到主线 `94ba894`（`refactor: consolidate CMQ transport envelope decode`）。
+当时 Phase 2 工作树为
 `/home/ryan/workspace/ryan/rdma_work/.worktrees/rdma-cmq-structural-phase2-batch160`，分支为
-`feature/rdma-cmq-structural-phase2-batch160`，以 `94ba894` 为基线；本批的 transaction-model
-拆分尚未提交。计划保持 `active`，不得把 focused GREEN 解释为整份重构完成。
+`feature/rdma-cmq-structural-phase2-batch160`，以 `94ba894` 为基线；该树 Batch160–221
+已在本轮分组提交并合入上述主线，不再是当前开发位置。计划保持 `active`，不得把
+focused GREEN 解释为整份重构完成。
 
 Batch217 在同一未提交工作树继续：restore/mark-error 统一双账本提交，单资源和 Function
 teardown 统一整批释放 commit，lookup 不再隐式写 registry；补充 completion 重入与
