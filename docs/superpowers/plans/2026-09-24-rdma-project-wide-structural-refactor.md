@@ -24,7 +24,18 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch228：基于 `508ba49` 沿用 `feature/rdma-structural-batch226`，统一 SQ/RQ/SRQ
+当前 Batch229：基于 `cf502a5` 沿用 `feature/rdma-structural-batch226`，把 runtime
+深复制/值比较/状态构造集中迁入无状态 projector，原 owner 保留锁、authority、游标/
+credit/reservation/recovery admission 与提交。20 个 protected 方法迁出，公开 cursor
+比较入口保留，58 个公开声明不变；94 原方法 token 等价。runtime 4,646→3,814 行、
+94→74 methods，新 projector 884 行/21 methods，生产合计 +53 行，属于职责收缩。
+独立深复制/24-case 工厂/嵌套复制专项、core 103/86、CMQ 28/11（PROCESS/LOGICAL）、
+integration 10、E2E 3、Host-memory 3、PCIe 1、Python 341/341、驱动契约与静态/注释
+门禁全部通过；E2E 保留基线编译告警。
+不合并、不推送，main 保持 `083e0d7`。详见
+`task-rdma-batch229-runtime-projector-report.md`，项目仍 active。
+
+前批 Batch228：基于 `508ba49` 沿用 `feature/rdma-structural-batch226`，统一 SQ/RQ/SRQ
 提交尾段七处恢复调用；入口 prior-write、NO_SUBMIT/AMBIGUOUS 和已提交出口仍各自
 保留原规则。只增加两个调用局部值，不增加 owner/方法/实例状态；engine 9,931→9,929
 行、方法 token 828→679，属于恢复调用去重而非大规模代码收缩。139 声明、27 public
@@ -127,7 +138,7 @@ L6 只协调外部生命周期并在边界验证完整 route、authority 和 res
 | --- | --- | ---: | --- | --- |
 | P0 | `rdma_queue_data_engine.sv` | 9,929 行/139 methods | 继续收束统一 transaction seam | 值 projector、consumer 步骤、resize 回滚、设备发布准备/取消/写后出口和 host-producer 失败出口已分层；继续完整业务编排与组合边界 |
 | P1 | `rdma_resource_manager.sv` | 7,936 行/139 methods | 继续收束 allocator、registry、rollback transaction | projector 已分离；继续检查 publication 后更新，不改变 resource owner |
-| P1 | `rdma_queue_runtime.sv` | 4,646 行/94 methods | 纯 runtime snapshot/predicate 与 mutation owner 分界 | cursor/occupancy/attachment snapshot |
+| P1 | `rdma_queue_runtime.sv` | 3,814 行/74 methods | runtime snapshot/predicate 与 mutation owner 分界 | 深复制/值比较已迁入 projector；继续 snapshot/commit 业务组合与重复状态处理 |
 | P2 | `rdma_queue_lifecycle_policy.sv` + queue/QP executors | 2,118 / 2,819 / 4,338 行 | policy、执行副作用、状态迁移表分离 | operation envelope 与 transition candidate |
 | P2 | `rdma_reset_coordinator.sv` | 2,127 行/55 methods | 只保留全局 reset lease/epoch 协调 | reset evidence/candidate，禁止复制 queue/CMQ ledger |
 | P3 | `rdma_doorbell_scheduler.sv` | 1,690 行/47 methods | descriptor/polarity/cursor 纯值层 | detached doorbell plan |
@@ -136,8 +147,9 @@ SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 
 公共复杂度回收到 queue-data/runtime transaction 层。Host-memory、PCIe、网络和
 dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 adapter/router。
 
-上表 queue-data/manager 已分别按 Batch228/221 源码重测，其余维持 Batch218；独立 queue-data
-projector 为 889 行/25 methods，resource projector 为 2,217 行/47 methods。
+上表 queue-data/manager/runtime 已分别按 Batch228/221/229 源码重测，其余维持 Batch218；
+独立 queue-data projector 为 889 行/25 methods，resource projector 为 2,217 行/47 methods，
+runtime projector 为 884 行/21 methods。
 后续在统一 owner/提交契约稳定后仍须收敛重复校验，
 不以删注释、压缩行或新增大量单函数文件代替可读性改进。
 

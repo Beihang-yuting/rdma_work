@@ -22,6 +22,16 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch229 基于 `cf502a5` 沿用 `feature/rdma-structural-batch226`：将 runtime 的 20 个
+值快照/比较方法迁入单一无状态 projector，公开 cursor 比较保留兼容入口；不新增
+owner/实例，58 个公开声明与原锁/账本不变。runtime 4,646→3,814 行、94→74 methods，
+projector 884 行/21 methods，生产合计 +53 行，不冒充总代码净减。94 原方法 token
+核对等价；独立深复制/24-case 工厂/重入专项、core 103/86、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、E2E 3、Host-memory 3、PCIe 1、Python 341/341、
+驱动契约及静态/注释门禁全部通过；E2E 保留基线编译告警。
+不合并、不推送，main 保持 `083e0d7`。见
+`task-rdma-batch229-runtime-projector-report.md`，项目仍 active。
+
 Batch228 基于 `508ba49` 沿用 `feature/rdma-structural-batch226`：SQ/RQ/SRQ 提交尾段
 七处恢复调用统一为一个出口；prior-write gate、五类 NO_SUBMIT、两类 AMBIGUOUS
 与已提交直接返回保持原语义。无新增方法/owner/实例状态，engine 9,931→9,929 行，

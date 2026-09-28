@@ -166,7 +166,7 @@ class rdma_queue_pending_operation extends uvm_object;
   // 功能：do_copy 为 UVM print/clone 兼容复制 pending 标量，并为 queue/cursor/image/status
   //   建立局部值对象；request_snapshot/routed_qp_h 保留兼容的非拥有引用。
   // 输入/输出及副作用：rhs（输入）；覆盖当前对象，不修改 rhs；关键 recovery 深拷贝由
-  //   runtime.clone_pending_value 提供，以便传播 non-fatal 失败。
+  //   rdma_queue_runtime_projector::clone_pending_value 提供，以便传播 non-fatal 失败。
   // 失败/边界：rhs 为 null 或类型不匹配时保留当前值；本 void 入口不保证完整 detached
   //   graph，不能替代 runtime 的带状态 clone helper。
   virtual function void do_copy(uvm_object rhs);

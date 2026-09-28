@@ -36,6 +36,7 @@ package rdma_core_pkg;
   `include "rdma_queue_backing_planner.sv"
   `include "rdma_queue_cursor_policy.sv"
   `include "rdma_queue_runtime_transaction_models.sv"
+  `include "rdma_queue_runtime_projector.sv"
   `include "rdma_queue_release_order_policy.sv"
   `include "rdma_queue_mmio_transition_policy.sv"
   `include "rdma_queue_runtime.sv"
