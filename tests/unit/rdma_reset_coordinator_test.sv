@@ -260,6 +260,41 @@ class rdma_reset_coordinator_test extends uvm_test;
 
     phase.raise_objection(this);
     coordinator = rdma_reset_coordinator::type_id::create("coordinator");
+
+    // Batch160 detached admission policy matrix：先独立验证 tokenless 数据面 policy
+    // 的输入/输出，再由后续 coordinator/router 场景证明 wrapper 仍沿用同一判定。
+    // policy 不持有 coordinator 状态，因此这些组合不会改变本测试的 Function/Host
+    // ledger，也不会把同步 guard 误报成跨线程锁。
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b0, 1'b0, 1'b0, "idle read"
+    );
+    if (status == null || !status.ok())
+      `uvm_error("RESET_ADMISSION_POLICY", "idle dataplane was rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b1, 1'b0, 1'b0, "publication write"
+    );
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "publication-active dataplane was not rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b0, 1'b1, 1'b0, "transaction allocate"
+    );
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "transaction-active dataplane was not rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b1, 1'b1, 1'b0, "nested reset read"
+    );
+    if (status == null || status.code != RDMA_SC_RESOURCE_BUSY)
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "combined reset-active dataplane was not rejected")
+    status = rdma_reset_tokenless_admission_policy::evaluate(
+      1'b1, 1'b1, 1'b1, "rollback release"
+    );
+    if (status == null || !status.ok())
+      `uvm_error("RESET_ADMISSION_POLICY",
+                 "cleanup dataplane was blocked during reset")
+
     pf0 = make_identity(0, 0, RDMA_FUNCTION_PF, 0, 16'h0100, 0, 10);
     vf0 = make_identity(0, 0, RDMA_FUNCTION_VF, 1, 16'h0101, 16'h0100, 11);
     pf1 = make_identity(1, 1, RDMA_FUNCTION_PF, 0, 16'h0100, 0, 20);

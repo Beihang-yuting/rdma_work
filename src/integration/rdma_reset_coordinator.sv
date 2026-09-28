@@ -61,6 +61,36 @@ class rdma_reset_router_epoch_capability extends uvm_object;
   endfunction
 endclass
 
+// 设计说明：tokenless Host-router 数据面需要在调用外部 manager 前做一个可重复的
+// reset-admission 判定，但该判定不应读取或改变 coordinator 的 owner、epoch 或 router
+// ledger。将三态输入冻结为 detached policy，既能让 allocate/write/read 共用同一契约，
+// 也能让测试直接覆盖 publication、transaction 和 cleanup 的组合，而不伪造并发锁。
+class rdma_reset_tokenless_admission_policy;
+
+  // 功能：根据同步 publication guard、leased reset transaction 和 cleanup 意图，决定
+  //       tokenless Host-router 数据面操作是否可以继续访问外部 manager。
+  // 输入/输出及副作用：publication_active、transaction_active（输入）分别表示同步
+  //       publication 窗口和 reset transaction 是否 active；allow_cleanup（输入）表示
+  //       调用方是否明确执行 stale-drain/rollback；operation_name（输入）用于错误诊断；
+  //       返回 detached rdma_status，不读取或修改任何 coordinator、router 或 epoch 状态。
+  // 失败/边界：任一 reset 标志 active 且 allow_cleanup=0 时返回 RESOURCE_BUSY；cleanup
+  //       意图或两个标志均 inactive 时返回 OK。该 policy 只描述同步 admission，不提供
+  //       跨线程、跨进程或仿真调度级互斥，调用方仍须执行自身的 authority/retry 校验。
+  static function rdma_status evaluate(
+    bit publication_active,
+    bit transaction_active,
+    bit allow_cleanup,
+    string operation_name
+  );
+    if (!allow_cleanup && (publication_active || transaction_active))
+      return rdma_status::make(
+        RDMA_SC_RESOURCE_BUSY,
+        {"Host router dataplane blocked during reset: ", operation_name}
+      );
+    return rdma_status::success();
+  endfunction
+endclass
+
 class rdma_reset_coordinator extends uvm_object;
   `uvm_object_utils(rdma_reset_coordinator)
   protected rdma_reset_epoch_t m_function_epochs[string];
@@ -668,13 +698,12 @@ class rdma_reset_coordinator extends uvm_object;
     string operation_name,
     bit allow_cleanup = 1'b0
   );
-    if (!allow_cleanup &&
-        (m_reset_operation_active || m_reset_transaction_active))
-      return rdma_status::make(
-        RDMA_SC_RESOURCE_BUSY,
-        {"Host router dataplane blocked during reset: ", operation_name}
-      );
-    return rdma_status::success();
+    return rdma_reset_tokenless_admission_policy::evaluate(
+      m_reset_operation_active,
+      m_reset_transaction_active,
+      allow_cleanup,
+      operation_name
+    );
   endfunction
 
   // 功能：以一次性 capability 授权 router 完成 legacy coordinator facade 的同步 attach，
