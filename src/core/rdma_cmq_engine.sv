@@ -2,7 +2,8 @@
 // 职责：管理 CMQ backing、ring/slot 账本、提交/完成/恢复状态，并在 prepare
 //   生命周期安装无状态 transport facade；完成路径按读取、匹配、提交和回收组织，
 //   各阶段只在同一次 engine_lock 调用内借用候选；恢复入口统一拒绝出口，并把
-//   RETRY 提交/发布/证据交付交给同类持锁业务阶段，不增加持久 authority。
+//   RETRY 提交/发布/证据交付交给同类持锁业务阶段；execute 按 retained 状态选择
+//   观测策略后统一交付 detached 结果，不增加持久 authority。
 // 依赖：依赖 CMQ model/profile、Host-memory adapter、doorbell scheduler、
 //   rdma_cmq_transport 与共享 submission evidence。
 // 所有权与生命周期：engine 拥有本地锁、快照、账本和每次 prepare 新建的
@@ -11131,11 +11132,13 @@ class rdma_cmq_engine extends uvm_object;
   endtask
 
   // 功能：执行单条 command 的 observed 生命周期，并在提交返回后依据锁内
-  //   retained journal 行决定立即返回或等待精确 pending 项。
+  //   retained journal 行选择立即观测或等待精确 pending 项，共用快照/失败回退出口。
   // 输入/输出及副作用：command 为只读输入，result 为 caller-owned detached 图；
-  //   submit_observed 只调用一次，armed pending 才调用 wait_for，终态仅快照 journal。
-  // 失败/边界：STAGED/PENDING_EFFECT、缺失 journal、坏 envelope 或 authority 变化均
-  //   fail-closed；不会把 ticket/FIFO/status 当作 wait 判据，也不读写 last_* seam。
+  //   submit_observed 只调用一次，armed pending 才在锁外调用 wait_for；锁内选择
+  //   observation code/message 并复制 journal，不用 delegated status 覆盖当前结果。
+  // 失败/边界：坏零 identity envelope 降为 UNOBSERVED；缺行、身份/生命周期损坏
+  //   或快照失败回退 submitted 并报 observation INVALID_STATE；STAGED/PENDING_EFFECT
+  //   立即返回未决观测，wait 后缺终态不伪造 completion，不读写 last_* seam。
   task execute_observed(
     input rdma_cmq_command_desc command,
     output rdma_cmq_execution_result result
@@ -11148,6 +11151,9 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status lookup_status;
     rdma_status snapshot_status;
     rdma_status identity_status;
+    rdma_status_code_e observation_code;
+    string observation_message;
+    string snapshot_failure_message;
     int unsigned item_index;
     bit armed_pending;
 
@@ -11227,28 +11233,18 @@ class rdma_cmq_engine extends uvm_object;
       return;
     end
 
+    // 生命周期分支只决定本次观测的诊断；实际快照与失败回退只在末尾执行一次。
+    // retained 行在当前锁窗口内有效，只有 armed pending 分支允许释放锁等待，
+    // 并在重新取锁后按同一 ticket 重定位，绝不沿用 wait 返回的临时 completion。
     if (journal_item.state inside {
           RDMA_CMQ_SUBMISSION_STAGED,
           RDMA_CMQ_SUBMISSION_PENDING_EFFECT
         }) begin
-      snapshot_status = build_observed_result_locked(
-        batch_record, journal_item, RDMA_SC_INVALID_STATE,
-        "CMQ observed item has pending external effect", result
-      );
-      if (snapshot_status == null || !snapshot_status.ok()) begin
-        result = submitted;
-        result.observation_status = rdma_cmq_direct_status(
-          RDMA_SC_INVALID_STATE,
-          (snapshot_status == null) ?
-            "CMQ observed pending item snapshot returned null status" :
-            snapshot_status.message
-        );
-      end
-      engine_lock.put(1);
-      return;
+      observation_code = RDMA_SC_INVALID_STATE;
+      observation_message = "CMQ observed item has pending external effect";
+      snapshot_failure_message = "CMQ observed pending item snapshot returned null status";
     end
-
-    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
+    else if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
       if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
           journal_item.completion != null) begin
         result = submitted;
@@ -11259,99 +11255,67 @@ class rdma_cmq_engine extends uvm_object;
         engine_lock.put(1);
         return;
       end
-      snapshot_status = build_observed_result_locked(
-        batch_record, journal_item, RDMA_SC_OK,
-        "CMQ retained host-visible journal observed", result
-      );
-      if (snapshot_status == null || !snapshot_status.ok()) begin
-        result = submitted;
-        result.observation_status = rdma_cmq_direct_status(
-          RDMA_SC_INVALID_STATE,
-          (snapshot_status == null) ?
-            "CMQ retained host-visible snapshot returned null status" :
-            snapshot_status.message
-        );
-      end
-      engine_lock.put(1);
-      return;
+      observation_code = RDMA_SC_OK;
+      observation_message = "CMQ retained host-visible journal observed";
+      snapshot_failure_message = "CMQ retained host-visible snapshot returned null status";
     end
-
-    if (journal_item.completion != null &&
-        rdma_cmq_completion_phase_has_terminal_evidence(
-          journal_item.completion_phase
-        )) begin
-      snapshot_status = build_observed_result_locked(
-        batch_record, journal_item, RDMA_SC_OK,
-        "CMQ retained journal completion observed", result
-      );
-      if (snapshot_status == null || !snapshot_status.ok()) begin
-        result = submitted;
-        result.observation_status = rdma_cmq_direct_status(
-          RDMA_SC_INVALID_STATE,
-          (snapshot_status == null) ?
-            "CMQ retained completion snapshot returned null status" :
-            snapshot_status.message
-        );
-      end
-      engine_lock.put(1);
-      return;
-    end
-
-    armed_pending = journal_item.state inside {
-      RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
-      RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
-    } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING;
-    engine_lock.put(1);
-    if (!armed_pending) begin
-      result = submitted;
-      result.observation_status = rdma_cmq_direct_status(
-        RDMA_SC_INVALID_STATE, "CMQ observed journal lifecycle is malformed"
-      );
-      return;
-    end
-
-    // wait_for 在锁外执行；它完成后再次按同一 ticket 读取 retained journal。
-    waited_completion = null;
-    waited_status = null;
-    wait_for(submitted.ticket, waited_completion, waited_status);
-    engine_lock.get(1);
-    lookup_status = locate_journal_item_by_ticket_locked(
-      submitted.ticket, batch_record, journal_item, item_index
-    );
-    if (lookup_status != null && lookup_status.ok() &&
-        journal_item != null && journal_item.completion != null &&
-        rdma_cmq_completion_phase_has_terminal_evidence(
-          journal_item.completion_phase
-        )) begin
-      snapshot_status = build_observed_result_locked(
-        batch_record, journal_item, RDMA_SC_OK,
-        "CMQ retained journal completion observed after wait", result
-      );
-      if (snapshot_status == null || !snapshot_status.ok()) begin
-        result = submitted;
-        result.observation_status = rdma_cmq_direct_status(
-          RDMA_SC_INVALID_STATE,
-          (snapshot_status == null) ?
-            "CMQ retained completion snapshot returned null status" :
-            snapshot_status.message
-        );
-      end
+    else if (journal_item.completion != null &&
+             rdma_cmq_completion_phase_has_terminal_evidence(
+               journal_item.completion_phase
+             )) begin
+      observation_code = RDMA_SC_OK;
+      observation_message = "CMQ retained journal completion observed";
+      snapshot_failure_message = "CMQ retained completion snapshot returned null status";
     end
     else begin
-      snapshot_status = (journal_item == null) ? null :
-        build_observed_result_locked(
-          batch_record, journal_item, RDMA_SC_INVALID_STATE,
-          "CMQ observed wait produced no retained completion", result
-        );
-      if (snapshot_status == null || !snapshot_status.ok()) begin
+      armed_pending = journal_item.state inside {
+        RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+        RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+      } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING;
+      engine_lock.put(1);
+      if (!armed_pending) begin
         result = submitted;
         result.observation_status = rdma_cmq_direct_status(
-          RDMA_SC_INVALID_STATE,
-          (snapshot_status == null) ?
-            "CMQ observed wait produced no retained snapshot" :
-            snapshot_status.message
+          RDMA_SC_INVALID_STATE, "CMQ observed journal lifecycle is malformed"
         );
+        return;
       end
+
+      waited_completion = null;
+      waited_status = null;
+      wait_for(submitted.ticket, waited_completion, waited_status);
+      engine_lock.get(1);
+      lookup_status = locate_journal_item_by_ticket_locked(
+        submitted.ticket, batch_record, journal_item, item_index
+      );
+      if (lookup_status != null && lookup_status.ok() &&
+          journal_item != null && journal_item.completion != null &&
+          rdma_cmq_completion_phase_has_terminal_evidence(
+            journal_item.completion_phase
+          )) begin
+        observation_code = RDMA_SC_OK;
+        observation_message = "CMQ retained journal completion observed after wait";
+        snapshot_failure_message = "CMQ retained completion snapshot returned null status";
+      end
+      else begin
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message = "CMQ observed wait produced no retained completion";
+        snapshot_failure_message = "CMQ observed wait produced no retained snapshot";
+      end
+    end
+
+    // 仅 wait 后重定位失败可能没有 item；此时不调用 builder，也不暴露半成品。
+    // 其余路径保持原快照分配顺序；失败只替换 submitted 的 observation status。
+    snapshot_status = (journal_item == null) ? null :
+      build_observed_result_locked(
+        batch_record, journal_item, observation_code, observation_message, result
+      );
+    if (snapshot_status == null || !snapshot_status.ok()) begin
+      result = submitted;
+      result.observation_status = rdma_cmq_direct_status(
+        RDMA_SC_INVALID_STATE,
+        (snapshot_status == null) ? snapshot_failure_message : snapshot_status.message
+      );
     end
     engine_lock.put(1);
   endtask

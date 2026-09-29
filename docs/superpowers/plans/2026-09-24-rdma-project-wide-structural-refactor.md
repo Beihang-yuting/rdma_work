@@ -24,7 +24,16 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch239：基于 `1d577d3`，同类 protected RETRY 阶段承接 attempt 提交、
+当前 Batch240：基于 `43b40b5`，execute 的五段快照/失败回退共用一个锁内出口；
+生命周期分支只选 observation 策略，armed pending 仍在锁外 wait，之后重新定位
+retained authority。方法 219→180 行、tokens 1,036→851，生产净减 36 行；
+213 方法声明与字段不变，没有新增 helper/owner/公开 API。修订旧版与重构版
+24-case 专项、core 109/92、CMQ 28/11（PROCESS/LOGICAL）、integration 10、
+Host-memory 3、PCIe 1、E2E 3、Python 397/397、驱动及静态对照门禁全部通过；
+UVM 0/0/0，E2E 保留既有编译告警，最终送测哈希一致。详见
+`task-rdma-batch240-cmq-execute-observation-report.md`；不合并、不推送，计划仍 active。
+
+前批 Batch239：基于 `1d577d3`，同类 protected RETRY 阶段承接 attempt 提交、
 transport 与证据交付；公共 recovery 361→227 行，不新增组件/owner/锁/公开 API，
 保留真实 arm、历史累计值和首次 submit 不同的策略。生产净增 30 行，tokens
 1,982→2,024，明确是主流程可读性整理。修订旧版/重构版 96-case 专项、core

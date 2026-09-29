@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch240 基于 `43b40b5` 沿用 `feature/rdma-structural-batch226`：execute 的五段
+快照/失败回退合为一个锁内出口，保留各生命周期诊断及锁外等待后的重定位。
+方法 219→180 行、tokens 1,036→851，生产净减 36 行；213 声明/字段不变，
+不增加方法、owner 或公开 API。修订旧版/重构版 24-case 专项、core 109/92、
+CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、
+Python 397/397、驱动及静态对照门禁全部通过；最终哈希一致，UVM 0/0/0，
+E2E 保留既有编译告警。不合并、不推送，见
+`task-rdma-batch240-cmq-execute-observation-report.md`；项目仍 active。
+
 Batch239 基于 `1d577d3` 沿用 `feature/rdma-structural-batch226`：RETRY 的 attempt
 提交、同步 transport 和 evidence 交付进入同类持锁阶段；公共 recovery 361→227 行，
 锁/状态/CONFIRM/失败交付及 31 非 protected 声明不变。生产净增 30 行，不宣称
