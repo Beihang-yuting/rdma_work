@@ -1,6 +1,7 @@
 // 目录：核心执行层 core/rdma_cmq_engine.sv。
 // 职责：管理 CMQ backing、ring/slot 账本、提交/完成/恢复状态，并在 prepare
-//   生命周期安装无状态 transport facade。
+//   生命周期安装无状态 transport facade；完成路径按读取、匹配、提交和回收组织，
+//   各阶段只在同一次 engine_lock 调用内借用候选，不增加持久 authority。
 // 依赖：依赖 CMQ model/profile、Host-memory adapter、doorbell scheduler、
 //   rdma_cmq_transport 与共享 submission evidence。
 // 所有权与生命周期：engine 拥有本地锁、快照、账本和每次 prepare 新建的
@@ -186,9 +187,10 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，decoded_status_contract 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：decoded（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decoded_status_contract 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：核对已解码 hardware_ecode 与 command_status 的 code/category/severity 契约。
+  // 输入/输出及副作用：decoded 只读；返回独立校验状态，不解码 wire、不改 command_status。
+  // 失败/边界：decoded/status 缺失或 category 不符时拒绝；零 ecode 必须为 OK/INFO
+  //   且无硬件错误标记，非零必须为非 OK、精确硬件码及 WARNING/ERROR/FATAL 之一。
   protected function rdma_status decoded_status_contract(
     rdma_cmq_decoded_cqe decoded
   );
@@ -388,9 +390,12 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：make_polled_completion 创建独立的 rdma_status；根据 record、raw_cqe、decoded、completion 设置字段 completion、snapshot_status、completion.ticket、completion.status、completion.raw_cqe、completion.decoded_response、status.source_engine、status.function_uid、status.generation、status.resource_id，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：record（输入）、raw_cqe（输入）、decoded（输入）、completion（输出）；make_polled_completion 读取 record、raw_cqe、decoded、completion 并使用字段 completion、snapshot_status、completion.ticket、completion.status、completion.raw_cqe、completion.decoded_response、status.source_engine、status.function_uid，并写入 completion；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：make_polled_completion 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ completion ticket authority is missing”“CMQ completion decode authority is missing”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：为 normal/late CQE 构造 completion，复制 ticket/status/payload 并补齐 CMQ 身份。
+  // 输入/输出及副作用：record/decoded 只读；raw_cqe 是读取阶段已独立化的原始证据，
+  //   直接交给 completion.raw_cqe，不再次 clone。completion 输出通过 validate 的对象，
+  //   不写 journal、FIFO 或 slot；调用会触发 UVM factory 和 profile payload snapshot。
+  // 失败/边界：ticket/function/CMQ、raw/decode/status 缺失、factory 返回 null、ticket/
+  //   payload snapshot 失败、嵌套结果不全或 completion.validate 失败时输出 null 并拒绝。
   protected function rdma_status make_polled_completion(
     rdma_cmq_slot_record record,
     rdma_hw_image raw_cqe,
@@ -1788,9 +1793,11 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：prospective_retirement_status 校验 prospective_record、prospective_retire_seq 与当前对象状态的一致性，并显式处理“CMQ prospective retirement record is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：prospective_record（输入）、prospective_retire_seq（输出）；prospective_retirement_status 读取 prospective_record、prospective_retire_seq 并使用字段 prospective_retire_seq、index、record，并写入 prospective_retire_seq；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：prospective_retirement_status 返回 函数体规定的失败状态；具体拒绝条件包括 “CMQ prospective retirement record is null”；“CMQ retirement slot ledger is inconsistent”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：假定 prospective_record 即将完成，从 retire_seq 预演可连续回收的 SQ 前缀。
+  // 输入/输出及副作用：prospective_record 非拥有；prospective_retire_seq 从当前 retire
+  //   开始，跨过该 record 及已完成/晚到/取消的连续 slot；只读账本并返回校验状态。
+  // 失败/边界：record 缺失、sequence 越界、index/wrap 不符、扫描几何无效或 slot
+  //   身份不符返回 INVALID_STATE；遇未完成前驱正常停止，失败输出不能用于实际回收。
   protected function rdma_status prospective_retirement_status(
     rdma_cmq_slot_record prospective_record,
     output longint unsigned prospective_retire_seq
@@ -1838,10 +1845,11 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，commit_retired_prefix 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：prospective_retire_seq（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过
-  //   output 返回结果。
-  // 失败/边界：commit_retired_prefix 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：在当前 CQE 完成提交之后，回收已预验的连续 SQ slot/entry 前缀。
+  // 输入/输出及副作用：prospective_retire_seq 是锁内认证的结束位置；逐项删除 entry、
+  //   清空 slot 并递增 retire_seq，不改 journal/token，不分配状态或获取锁。
+  // 失败/边界：调用方必须先预验并提交 completion；结束位置不大于 retire_seq 时无操作。
+  //   几何转换失败直接停止，已回收前缀不回滚；此函数不另做 epoch、null slot 或超时检查。
   protected function void commit_retired_prefix(
     longint unsigned prospective_retire_seq
   );
@@ -11527,9 +11535,9 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 设计说明：该外层函数只负责区分正常终态与 late 诊断交付；两条分支共享
-  //   上面的 journal transition 能力，但仍分别保留 completion/diagnostic
-  //   构造、FIFO 发布和 slot/token 的业务副作用。
+  // 设计说明：正常与 late 共用 completion 构造及 journal 提交；只在 late 时
+  //   先构造 diagnostic。late 在原分支点冻结，不能在 factory/profile 回调后
+  //   再读取 record.state 改变交付种类。journal 成功后才发布 FIFO 并释放 token。
   // 功能：提交一个已经完成全部输入校验的 CQE completion；为 PUBLISHED row
   //   构造 terminal completion，为 TIMED_OUT_QUARANTINED row 构造 late
   //   diagnostic/completion，并把对应 journal、交付 FIFO、registry、token 与
@@ -11553,6 +11561,8 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status diagnostic_status;
     rdma_cmq_completion completion;
     rdma_cmq_diagnostic diagnostic;
+    bit late;
+    string transition_name;
 
     completion = null;
     diagnostic = null;
@@ -11565,30 +11575,9 @@ class rdma_cmq_engine extends uvm_object;
           }))
       return invalid_state("CMQ polled completion slot state is not terminal");
 
-    if (record.state == CMQ_SLOT_PUBLISHED) begin
-      completion_status = make_polled_completion(
-        record, raw_snapshot, decoded, completion
-      );
-      if (completion_status == null || !completion_status.ok() ||
-          completion == null)
-        return (completion_status == null) ? invalid_state(
-          "CMQ completion construction returned null status"
-        ) : completion_status;
-      completion_status = commit_polled_journal_transition_locked(
-        record, completion,
-        RDMA_CMQ_SUBMISSION_COMPLETED, RDMA_CMQ_COMPLETION_TERMINAL,
-        "normal completion"
-      );
-      if (completion_status == null || !completion_status.ok())
-        return (completion_status == null) ? invalid_state(
-          "CMQ normal completion journal commit returned null status"
-        ) : completion_status;
-      terminal_fifo.push_back(completion);
-      command_registry.delete(software_key);
-      token_in_use[token_index] = 1'b0;
-      record.state = CMQ_SLOT_COMPLETED;
-    end
-    else begin
+    late = record.state != CMQ_SLOT_PUBLISHED;
+    transition_name = late ? "late completion" : "normal completion";
+    if (late) begin
       diagnostic_status = make_late_diagnostic(
         record, raw_snapshot, diagnostic
       );
@@ -11597,61 +11586,299 @@ class rdma_cmq_engine extends uvm_object;
         return (diagnostic_status == null) ? invalid_state(
           "CMQ late diagnostic returned null status"
         ) : diagnostic_status;
-      completion_status = make_polled_completion(
-        record, raw_snapshot, decoded, completion
-      );
-      if (completion_status == null || !completion_status.ok() ||
-          completion == null)
-        return (completion_status == null) ? invalid_state(
-          "CMQ late final completion construction returned null status"
-        ) : completion_status;
-      completion_status = commit_polled_journal_transition_locked(
-        record, completion,
-        RDMA_CMQ_SUBMISSION_LATE_COMPLETED,
-        RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY,
-        "late completion"
-      );
-      if (completion_status == null || !completion_status.ok())
-        return (completion_status == null) ? invalid_state(
-          "CMQ late completion journal commit returned null status"
-        ) : completion_status;
+    end
+    completion_status = make_polled_completion(
+      record, raw_snapshot, decoded, completion
+    );
+    if (completion_status == null || !completion_status.ok() ||
+        completion == null)
+      return (completion_status == null) ? invalid_state(
+        late ? "CMQ late final completion construction returned null status" :
+               "CMQ completion construction returned null status"
+      ) : completion_status;
+    completion_status = commit_polled_journal_transition_locked(
+      record, completion,
+      late ? RDMA_CMQ_SUBMISSION_LATE_COMPLETED : RDMA_CMQ_SUBMISSION_COMPLETED,
+      late ? RDMA_CMQ_COMPLETION_DIAGNOSTIC_ONLY : RDMA_CMQ_COMPLETION_TERMINAL,
+      transition_name
+    );
+    if (completion_status == null || !completion_status.ok())
+      return (completion_status == null) ? invalid_state(
+        {"CMQ ", transition_name, " journal commit returned null status"}
+      ) : completion_status;
+    if (late) begin
       diagnostic_fifo.push_back(diagnostic);
       late_final_fifo.push_back(completion);
-      token_in_use[token_index] = 1'b0;
-      record.state = CMQ_SLOT_LATE_COMPLETED;
     end
+    else begin
+      terminal_fifo.push_back(completion);
+      command_registry.delete(software_key);
+    end
+    token_in_use[token_index] = 1'b0;
+    record.state = late ? CMQ_SLOT_LATE_COMPLETED : CMQ_SLOT_COMPLETED;
     return rdma_status::success();
   endfunction
 
-  // 功能：按 CQ consumer 顺序读取并解码 ready CQE，把正常完成或
-  //   same-incarnation 超时晚到完成先写入 exact retained journal item，
-  //   再发布 delivery FIFO/诊断并推进 CQ/retire cursor。
-  // 输入/输出及副作用：status 输出整个 poll 的首个失败或 OK；
-  //   函数读 Host-memory CQ backing/调用 profile，成功后更新 journal、
-  //   terminal/diagnostic/late FIFO、command/token/entry/slot 账本及 consumer cursor。
-  // 失败/边界：engine/mapping/profile/ledger 不完整、CQ read/decode 失败、
-  //   owner/opcode/slot/token/locator 不匹配或 journal snapshot/reducer 失败时，
-  //   不消费当前 CQE，不发布该项 FIFO；not-ready CQE 正常返回 OK。
-  protected task poll_locked(output rdma_status status);
+  // 设计说明：完成事务分为 CQ 读取/解码、命令匹配、journal/交付提交与连续前缀回收。
+  //   所有阶段仍在同一 engine_lock 下执行；读取失败与未就绪不能进入账本提交。
+  // 功能：读取 cq_consume_seq 对应的 64B CQE，并让 profile 按预期 owner 解码。
+  // 输入/输出及副作用：raw_snapshot 输出独立原始证据，decoded 输出 profile 结果，
+  //   ready 仅在全部检查通过且 CQE 就绪时为 1；status 沿用原读取/快照/解码状态。
+  //   只访问 Host-memory 和 profile，
+  //   不推进 ring；畸形解码经 poison 隔离 engine，并可能发布诊断。
+  // 失败/边界：几何/read/snapshot 失败直接返回；先检查 profile 未改写 raw input，
+  //   再检查 inspect status。null、CODEC_ERROR、UNSUPPORTED_OPCODE 走 poison；
+  //   其它 inspect 失败复制原状态，not-ready 返回 OK；caller 按 ready 判断是否继续，
+  //   不用错误路径构造出的 status 再推测该项是否完成了检查。
+  protected task read_polled_cqe_locked(
+    output rdma_hw_image raw_snapshot,
+    output rdma_cmq_decoded_cqe decoded,
+    output bit ready,
+    output rdma_status status
+  );
     byte data[];
     rdma_status read_status;
     rdma_status inspect_status;
-    rdma_status validation_status;
-    rdma_status retirement_status;
     rdma_hw_image raw_cqe;
-    rdma_hw_image raw_snapshot;
-    rdma_cmq_decoded_cqe decoded;
-    rdma_cmq_slot_record record;
     longint unsigned read_offset;
     rdma_cmq_ring_position_t cq_position;
     int unsigned cq_index;
-    int unsigned token_index;
     bit expected_owner;
-    bit ready;
+    bit inspected_ready;
+
+    ready = 1'b0;
+    if (!rdma_cmq_ring_position_for_sequence(
+          cq_consume_seq, CMQ_DEPTH, cq_position
+        ) || !rdma_cmq_cq_owner_for_sequence(
+          cq_consume_seq, CMQ_DEPTH, expected_owner
+        )) begin
+      status = invalid_state(
+        "CMQ CQ consumer sequence cannot be mapped to ring geometry"
+      );
+      return;
+    end
+    cq_index = cq_position.index;
+    read_offset = CQ_OFFSET + (longint'(cq_index) * CMQE_BYTES);
+    data = new[0];
+    read_status = host_mem.read(
+      backing_mapping, read_offset, CMQE_BYTES, data
+    );
+    if (read_status == null) begin
+      status = invalid_state("CMQ CQ backing read returned null status");
+      return;
+    end
+    if (!read_status.ok()) begin
+      status = rdma_cmq_clone_status_value(read_status);
+      return;
+    end
+    status = make_raw_cqe_image(data, raw_cqe);
+    if (!status.ok())
+      return;
+    status = checked_image_snapshot(
+      raw_cqe, "CMQ CQE inspection", RDMA_SC_INVALID_STATE,
+      raw_snapshot
+    );
+    if (!status.ok())
+      return;
+    inspected_ready = 1'b0;
+    decoded = null;
+    inspect_status = profile.inspect_cqe(
+      raw_cqe, expected_owner, inspected_ready, decoded
+    );
+    if (!same_image_value(raw_cqe, raw_snapshot)) begin
+      status = invalid_state("CMQ profile changed its raw CQE input");
+      return;
+    end
+    if (inspect_status == null) begin
+      status = poison(
+        RDMA_CMQ_DIAG_MALFORMED_CQE,
+        "CMQ profile inspection returned null status", raw_snapshot
+      );
+      return;
+    end
+    if (!inspect_status.ok()) begin
+      if (inspect_status.code inside {
+            RDMA_SC_CODEC_ERROR, RDMA_SC_UNSUPPORTED_OPCODE
+          })
+        status = poison(
+          RDMA_CMQ_DIAG_MALFORMED_CQE,
+          inspect_status.message, raw_snapshot
+        );
+      else
+        status = rdma_cmq_clone_status_value(inspect_status);
+      return;
+    end
+    if (!inspected_ready) begin
+      status = rdma_status::success();
+      return;
+    end
+    ready = 1'b1;
+  endtask
+
+  // 功能：把 ready CQE 与 exact slot/entry/command/token 匹配，预验连续可回收前缀。
+  // 输入/输出及副作用：raw_snapshot/decoded 是读取阶段的非拥有输入；stage 仅在
+  //   成功时交付 record、software_key、token_index、retire_seq；返回是否匹配成功，
+  //   status 输出原校验结果，不安装第二份账本或额外构造成功状态。
+  //   正常路径只读 engine 状态；失败可调用 poison，保留原隔离和诊断副作用。
+  // 失败/边界：decoded/index、entry/slot/ticket、status/opcode、counter、registry、
+  //   token incarnation 或 prospective retirement 不符时按原优先级拒绝；当前项
+  //   不写 journal/FIFO 完成、不释放 token、不回收 ring。仅允许持锁的 ready 路径调用。
+  protected function bit match_polled_cqe_locked(
+    input rdma_hw_image raw_snapshot,
+    input rdma_cmq_decoded_cqe decoded,
+    output rdma_cmq_polled_completion_stage_t stage,
+    output rdma_status status
+  );
+    rdma_status validation_status;
+    rdma_status retirement_status;
+    rdma_cmq_slot_record record;
     string hardware_key;
     string software_key;
-    longint unsigned ledger_used;
+    int unsigned token_index;
     longint unsigned prospective_retire_seq;
+    bit late;
+
+    if (decoded == null || decoded.wqe_index >= CMQ_DEPTH) begin
+      status = poison(
+        RDMA_CMQ_DIAG_MALFORMED_CQE,
+        "CMQ profile returned an invalid decoded CQE", raw_snapshot
+      );
+      return 1'b0;
+    end
+
+    hardware_key = entry_key(decoded.wqe_index, decoded.wqe_wrap);
+    if (!entry_registry.exists(hardware_key)) begin
+      status = poison(
+        RDMA_CMQ_DIAG_UNKNOWN_CQE,
+        "CMQ decoded CQE has no registered entry", raw_snapshot
+      );
+      return 1'b0;
+    end
+    record = entry_registry[hardware_key];
+    if (record == null || slots[decoded.wqe_index] == null ||
+        slots[decoded.wqe_index] != record ||
+        record.sq_index != decoded.wqe_index ||
+        record.sq_wrap != decoded.wqe_wrap ||
+        record.ticket == null || record.expected == null ||
+        record.ticket.sq_index != record.sq_index ||
+        record.ticket.sq_wrap != record.sq_wrap ||
+        record.ticket.slot_sequence != record.slot_sequence ||
+        record.ticket.command_id[4:0] != record.command_token ||
+        !(record.state inside {
+          CMQ_SLOT_PUBLISHED,
+          CMQ_SLOT_TIMED_OUT_QUARANTINED
+        })) begin
+      status = poison(
+        RDMA_CMQ_DIAG_POISON,
+        "CMQ decoded CQE entry ledger is inconsistent", raw_snapshot
+      );
+      return 1'b0;
+    end
+    if (decoded.command_status == null) begin
+      status = poison(
+        RDMA_CMQ_DIAG_MALFORMED_CQE,
+        "CMQ profile returned a null decoded command status",
+        raw_snapshot, record.ticket
+      );
+      return 1'b0;
+    end
+    validation_status = decoded.validate();
+    if (validation_status == null || !validation_status.ok()) begin
+      status = poison(
+        RDMA_CMQ_DIAG_MALFORMED_CQE,
+        "CMQ decoded CQE validation failed", raw_snapshot,
+        record.ticket
+      );
+      return 1'b0;
+    end
+    status = decoded_status_contract(decoded);
+    if (!status.ok()) begin
+      status = poison(
+        RDMA_CMQ_DIAG_MALFORMED_CQE, status.message, raw_snapshot,
+        record.ticket
+      );
+      return 1'b0;
+    end
+    if (record.expected.hardware_opcode != decoded.hardware_opcode) begin
+      status = poison(
+        RDMA_CMQ_DIAG_MALFORMED_CQE,
+        "CMQ decoded CQE opcode does not match command", raw_snapshot,
+        record.ticket
+      );
+      return 1'b0;
+    end
+    software_key = command_key(record.ticket);
+    if (cq_consume_seq == 64'hffff_ffff_ffff_ffff) begin
+      status = poison(
+        RDMA_CMQ_DIAG_POISON,
+        "CMQ completion consumer counter overflows", raw_snapshot,
+        record.ticket
+      );
+      return 1'b0;
+    end
+
+    late = record.state != CMQ_SLOT_PUBLISHED;
+    if (!late) begin
+      if (!command_registry.exists(software_key) ||
+          command_registry[software_key] != record) begin
+        status = poison(
+          RDMA_CMQ_DIAG_POISON,
+          "CMQ decoded CQE command registry is inconsistent",
+          raw_snapshot, record.ticket
+        );
+        return 1'b0;
+      end
+    end
+    else if (command_registry.exists(software_key)) begin
+      status = poison(
+        RDMA_CMQ_DIAG_POISON,
+        "CMQ quarantined command remains in the command registry",
+        raw_snapshot, record.ticket
+      );
+      return 1'b0;
+    end
+    token_index = record.command_token;
+    if (token_index >= CMQ_DEPTH || !token_in_use[token_index] ||
+        token_incarnation[token_index] != record.ticket.command_id[63:5]) begin
+      status = poison(
+        RDMA_CMQ_DIAG_POISON,
+        late ? "CMQ quarantined completion token incarnation is inconsistent" :
+               "CMQ decoded CQE command token is inconsistent",
+        raw_snapshot, record.ticket
+      );
+      return 1'b0;
+    end
+    retirement_status = prospective_retirement_status(
+      record, prospective_retire_seq
+    );
+    if (retirement_status == null || !retirement_status.ok()) begin
+      status = poison(
+        RDMA_CMQ_DIAG_POISON,
+        (retirement_status == null) ?
+          "CMQ prospective retirement returned null status" :
+          retirement_status.message,
+        raw_snapshot
+      );
+      return 1'b0;
+    end
+
+    stage = '{record:record, software_key:software_key,
+              token_index:token_index, retire_seq:prospective_retire_seq};
+    return 1'b1;
+  endfunction
+
+  // 功能：按 CQ consumer 顺序执行读取、匹配、完成提交和连续 SQ 前缀回收。
+  // 输入/输出及副作用：status 输出首个失败或 OK；持锁调用各阶段，逐项提交 journal、
+  //   delivery/诊断、registry/token/slot，再推进 cq_consume_seq 和 retire_seq。
+  // 失败/边界：非 ACTIVE、缺依赖、mapping/ledger 不符时不读 CQ；未建立格式且空账本
+  //   直接成功。not-ready 正常停止；本项失败不回收本项，之前已完成的项不回滚，
+  //   poison 的隔离/诊断副作用仍保留；候选 struct 只在本次锁内调用有效。
+  protected task poll_locked(output rdma_status status);
+    rdma_hw_image raw_snapshot;
+    rdma_cmq_decoded_cqe decoded;
+    rdma_cmq_polled_completion_stage_t stage;
+    bit ready;
+    longint unsigned ledger_used;
 
     status = invalid_state("CMQ poll did not complete");
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
@@ -11676,209 +11903,13 @@ class rdma_cmq_engine extends uvm_object;
 
     status = rdma_status::success();
     while (status.ok()) begin
-      if (!rdma_cmq_ring_position_for_sequence(
-            cq_consume_seq, CMQ_DEPTH, cq_position
-          ) || !rdma_cmq_cq_owner_for_sequence(
-            cq_consume_seq, CMQ_DEPTH, expected_owner
-          )) begin
-        status = invalid_state(
-          "CMQ CQ consumer sequence cannot be mapped to ring geometry"
-        );
+      read_polled_cqe_locked(raw_snapshot, decoded, ready, status);
+      if (!ready)
         break;
-      end
-      cq_index = cq_position.index;
-      read_offset = CQ_OFFSET + (longint'(cq_index) * CMQE_BYTES);
-      data = new[0];
-      read_status = host_mem.read(
-        backing_mapping, read_offset, CMQE_BYTES, data
-      );
-      if (read_status == null) begin
-        status = invalid_state("CMQ CQ backing read returned null status");
+      if (!match_polled_cqe_locked(raw_snapshot, decoded, stage, status))
         break;
-      end
-      if (!read_status.ok()) begin
-        status = rdma_cmq_clone_status_value(read_status);
-        break;
-      end
-      status = make_raw_cqe_image(data, raw_cqe);
-      if (!status.ok())
-        break;
-      status = checked_image_snapshot(
-        raw_cqe, "CMQ CQE inspection", RDMA_SC_INVALID_STATE,
-        raw_snapshot
-      );
-      if (!status.ok())
-        break;
-      ready = 1'b0;
-      decoded = null;
-      inspect_status = profile.inspect_cqe(
-        raw_cqe, expected_owner, ready, decoded
-      );
-      if (!same_image_value(raw_cqe, raw_snapshot)) begin
-        status = invalid_state("CMQ profile changed its raw CQE input");
-        break;
-      end
-      if (inspect_status == null) begin
-        status = poison(
-          RDMA_CMQ_DIAG_MALFORMED_CQE,
-          "CMQ profile inspection returned null status", raw_snapshot
-        );
-        break;
-      end
-      if (!inspect_status.ok()) begin
-        if (inspect_status.code inside {
-              RDMA_SC_CODEC_ERROR, RDMA_SC_UNSUPPORTED_OPCODE
-            })
-          status = poison(
-            RDMA_CMQ_DIAG_MALFORMED_CQE,
-            inspect_status.message, raw_snapshot
-          );
-        else
-          status = rdma_cmq_clone_status_value(inspect_status);
-        break;
-      end
-      if (!ready) begin
-        status = rdma_status::success();
-        break;
-      end
-      if (decoded == null || decoded.wqe_index >= CMQ_DEPTH) begin
-        status = poison(
-          RDMA_CMQ_DIAG_MALFORMED_CQE,
-          "CMQ profile returned an invalid decoded CQE", raw_snapshot
-        );
-        break;
-      end
-
-      hardware_key = entry_key(decoded.wqe_index, decoded.wqe_wrap);
-      if (!entry_registry.exists(hardware_key)) begin
-        status = poison(
-          RDMA_CMQ_DIAG_UNKNOWN_CQE,
-          "CMQ decoded CQE has no registered entry", raw_snapshot
-        );
-        break;
-      end
-      record = entry_registry[hardware_key];
-      if (record == null || slots[decoded.wqe_index] == null ||
-          slots[decoded.wqe_index] != record ||
-          record.sq_index != decoded.wqe_index ||
-          record.sq_wrap != decoded.wqe_wrap ||
-          record.ticket == null || record.expected == null ||
-          record.ticket.sq_index != record.sq_index ||
-          record.ticket.sq_wrap != record.sq_wrap ||
-          record.ticket.slot_sequence != record.slot_sequence ||
-          record.ticket.command_id[4:0] != record.command_token ||
-          !(record.state inside {
-            CMQ_SLOT_PUBLISHED,
-            CMQ_SLOT_TIMED_OUT_QUARANTINED
-          })) begin
-        status = poison(
-          RDMA_CMQ_DIAG_POISON,
-          "CMQ decoded CQE entry ledger is inconsistent", raw_snapshot
-        );
-        break;
-      end
-      if (decoded.command_status == null) begin
-        status = poison(
-          RDMA_CMQ_DIAG_MALFORMED_CQE,
-          "CMQ profile returned a null decoded command status",
-          raw_snapshot, record.ticket
-        );
-        break;
-      end
-      validation_status = decoded.validate();
-      if (validation_status == null || !validation_status.ok()) begin
-        status = poison(
-          RDMA_CMQ_DIAG_MALFORMED_CQE,
-          "CMQ decoded CQE validation failed", raw_snapshot,
-          record.ticket
-        );
-        break;
-      end
-      status = decoded_status_contract(decoded);
-      if (!status.ok()) begin
-        status = poison(
-          RDMA_CMQ_DIAG_MALFORMED_CQE, status.message, raw_snapshot,
-          record.ticket
-        );
-        break;
-      end
-      if (record.expected.hardware_opcode != decoded.hardware_opcode) begin
-        status = poison(
-          RDMA_CMQ_DIAG_MALFORMED_CQE,
-          "CMQ decoded CQE opcode does not match command", raw_snapshot,
-          record.ticket
-        );
-        break;
-      end
-      software_key = command_key(record.ticket);
-      if (cq_consume_seq == 64'hffff_ffff_ffff_ffff) begin
-        status = poison(
-          RDMA_CMQ_DIAG_POISON,
-          "CMQ completion consumer counter overflows", raw_snapshot,
-          record.ticket
-        );
-        break;
-      end
-
-      if (record.state == CMQ_SLOT_PUBLISHED) begin
-        if (!command_registry.exists(software_key) ||
-            command_registry[software_key] != record) begin
-          status = poison(
-            RDMA_CMQ_DIAG_POISON,
-            "CMQ decoded CQE command registry is inconsistent",
-            raw_snapshot, record.ticket
-          );
-          break;
-        end
-        token_index = record.command_token;
-        if (token_index >= CMQ_DEPTH || !token_in_use[token_index] ||
-            token_incarnation[token_index] !=
-              record.ticket.command_id[63:5]) begin
-          status = poison(
-            RDMA_CMQ_DIAG_POISON,
-            "CMQ decoded CQE command token is inconsistent", raw_snapshot,
-            record.ticket
-          );
-          break;
-        end
-      end
-      else begin
-        if (command_registry.exists(software_key)) begin
-          status = poison(
-            RDMA_CMQ_DIAG_POISON,
-            "CMQ quarantined command remains in the command registry",
-            raw_snapshot, record.ticket
-          );
-          break;
-        end
-        token_index = record.command_token;
-        if (token_index >= CMQ_DEPTH || !token_in_use[token_index] ||
-            token_incarnation[token_index] !=
-              record.ticket.command_id[63:5]) begin
-          status = poison(
-            RDMA_CMQ_DIAG_POISON,
-            "CMQ quarantined completion token incarnation is inconsistent",
-            raw_snapshot, record.ticket
-          );
-          break;
-        end
-      end
-      retirement_status = prospective_retirement_status(
-        record, prospective_retire_seq
-      );
-      if (retirement_status == null || !retirement_status.ok()) begin
-        status = poison(
-          RDMA_CMQ_DIAG_POISON,
-          (retirement_status == null) ?
-            "CMQ prospective retirement returned null status" :
-            retirement_status.message,
-          raw_snapshot
-        );
-        break;
-      end
-
       status = commit_polled_completion_locked(
-        record, raw_snapshot, decoded, software_key, token_index
+        stage.record, raw_snapshot, decoded, stage.software_key, stage.token_index
       );
       if (status == null || !status.ok()) begin
         status = (status == null) ? invalid_state(
@@ -11887,17 +11918,17 @@ class rdma_cmq_engine extends uvm_object;
         break;
       end
       cq_consume_seq++;
-      commit_retired_prefix(prospective_retire_seq);
+      commit_retired_prefix(stage.retire_seq);
       if (publish_seq == retire_seq)
         break;
     end
-
   endtask
 
-  // 功能：在 rdma_cmq_engine 中，poll 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：completions（输出）、diagnostics（输出）、status（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
-  //   快照，读取不取得外部资源所有权。
-  // 失败/边界：poll 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：持有唯一 engine_lock，先发布过期命令，再 drain ready CQE 并交付完成/诊断。
+  // 输入/输出及副作用：completions/diagnostics 入口清空，输出消费 terminal/diagnostic
+  //   FIFO；status 为 gate、expiry 或 poll 的结果。清空 late_final_fifo，不释放外部资源。
+  // 失败/边界：reset release gate 拒绝时不消费 FIFO；非 ACTIVE 仍交付已有诊断。
+  //   expiry/poll 失败仍交付已提交的结果，不回滚前项；late final 不重复作为普通完成输出。
   task poll(
     output rdma_cmq_completion completions[$],
     output rdma_cmq_diagnostic diagnostics[$],

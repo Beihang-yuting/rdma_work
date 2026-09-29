@@ -2977,7 +2977,7 @@ fi
     #   不启动 simulator，不修改任何源码或运行时状态。
     # 失败边界：kernel helper 缺失、engine 重新声明 protected 几何实现、旧的 expiry/
     #   generation-cancel 类型残留、两条 policy 未使用统一 staging 类型，或正常/late
-    #   CQE 分支绕过共享 journal commit seam 时失败。
+    #   CQE 交付绕过共享 journal commit seam 时失败。
     def test_transaction_kernel_and_terminal_stage_are_shared(self):
         kernel = (ROOT / "src" / "core" / "rdma_cmq_transaction_kernel.sv").read_text(
             encoding="utf-8"
@@ -3024,7 +3024,7 @@ fi
             len(re.findall(
                 r"\bcommit_polled_journal_transition_locked\s*\(", engine
             )),
-            3,
+            2,
         )
         polled_body = engine.split(
             "protected function rdma_status commit_polled_completion_locked(",

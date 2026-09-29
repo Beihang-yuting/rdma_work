@@ -76,6 +76,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_doorbell_scheduler_authority_test.sv"
   `include "unit/rdma_cmq_journal_factory_fixture.sv"
   `include "unit/rdma_cmq_engine_test.sv"
+  `include "unit/rdma_cmq_poll_transaction_test.sv"
   `include "unit/rdma_cmq_port_test.sv"
   `include "unit/rdma_control_plane_test.sv"
   `include "unit/rdma_control_plane_cmq_engine_test.sv"

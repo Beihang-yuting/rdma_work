@@ -24,7 +24,17 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch236：基于 `5a07c57` 沿用 `feature/rdma-structural-batch226`，runtime 两个
+当前 Batch237：基于 `837afbc`，CMQ 完成 drain 按读取/匹配/提交/回收组织，
+poll 主方法 261→50 行；normal/late 共用 completion 构造、journal 调用和 token
+规则，保留原错误优先级、回调顺序及 partial drain。仅新增调用期四字段 struct
+和两个 engine 内阶段，不新增 owner/锁/公开 API。生产净增 41 行，相关方法 tokens
+1,636→1,693，明确不把主方法变短称为整体代码收缩。16-case 基线对照、core
+106/89、CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、
+E2E 3、Python 383/383、驱动、静态/等价门禁全部通过；UVM 0/0/0，E2E 保留既有
+编译告警，最终输入哈希一致；见
+`task-rdma-batch237-cmq-poll-transaction-report.md`。不合并、不推送，计划仍 active。
+
+前批 Batch236：基于 `5a07c57` 沿用 `feature/rdma-structural-batch226`，runtime 两个
 恢复提交授权入口共用一份持锁证据校验/授权消费规则；锁、factory 回调和 noalloc
 状态交付各守原边界。生产 3,814→3,797 行，相关 tokens 526→312；58 public 与
 实例字段不变，新增一个同类 protected 方法，不新增组件。独立 345-call 双入口/

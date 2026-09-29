@@ -1,5 +1,5 @@
 // 目录：核心执行层 core/rdma_cmq_engine_transaction_models.sv。
-// 职责：集中定义 CMQ runtime 提交、复位候选、slot 记录和 MMIO arm observer 等事务值模型，
+// 职责：集中定义 CMQ runtime 提交/完成、复位候选、slot 记录和 MMIO arm observer 等事务值模型，
 //   让 rdma_cmq_engine 只负责状态机、账本所有权和跨组件协调。
 // 依赖：依赖 rdma_model_pkg 的 CMQ 快照/提交记录、rdma_adapter_pkg 的 Host-memory 与
 //   scheduler 契约，以及 rdma_doorbell_scheduler.sv 中的 observer 基类。
@@ -500,3 +500,13 @@ typedef struct {
   bit staged_recovery_required[$];
   string staged_command_keys[$];
 } rdma_cmq_terminal_transition_candidate_stage_t;
+
+// 设计说明：ready CQE 完成匹配后，只把已认证的 slot 引用、命令 key、token 与
+//   prospective retire cursor 交给原 engine 提交点；不拥有 slot，不构造 UVM 对象，
+//   不保留 profile/adapter。仅在同一次 engine_lock 调用内有效，不能跨 poll/reset 缓存。
+typedef struct {
+  rdma_cmq_slot_record record;
+  string software_key;
+  int unsigned token_index;
+  longint unsigned retire_seq;
+} rdma_cmq_polled_completion_stage_t;

@@ -66,6 +66,7 @@ readonly CORE_TESTS=(
   rdma_doorbell_scheduler_authority_test
   rdma_doorbell_scheduler_reset_epoch_test
   rdma_cmq_engine_test
+  rdma_cmq_poll_transaction_test
   rdma_cmq_port_test
   rdma_control_plane_test
   rdma_control_plane_cmq_engine_test
