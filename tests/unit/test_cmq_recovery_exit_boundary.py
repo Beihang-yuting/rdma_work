@@ -59,7 +59,7 @@ class CmqRecoveryExitBoundaryTest(unittest.TestCase):
         self.assertRegex(body, r"owner_rejected = 1'b1;\s*break;")
         self.assertRegex(body, r"if \(owner_rejected\)\s*break;")
         self.assertLess(body.index("if (owner_rejected)"), body.index("validate_reset_confirmation_locked("))
-        self.assertLess(body.index("if (owner_rejected)"), body.index("attempt_id_counter = candidate_attempt;"))
+        self.assertLess(body.index("if (owner_rejected)"), body.index("publish_recovery_retry_locked("))
 
     def test_stale_status_has_no_callback_before_fanout(self):
         """功能：固定三处 stale 直接 status 的文本，使共同尾段取 message 等价于旧字面量。
@@ -81,16 +81,17 @@ class CmqRecoveryExitBoundaryTest(unittest.TestCase):
 
     def test_retry_commit_and_regression_registration(self):
         """功能：固定最终 stale 门禁仍在 CAS/I/O 前，并将 36-call 专项独立注册。
-        输入输出及副作用：只读生产路径、manifest、package 和测试文件。
+        输入输出及副作用：只读公开入口与持锁发布阶段、manifest、package 和测试文件。
         失败边界：提前分配 attempt/调用 transport、漏注册、重复注册或运行父矩阵时失败。
         """
         body = self.body()
         self.assertLess(body.index("stage_recovery_candidate_locked("),
                         body.rindex("request.expected_attempt_id != record.attempt_id"))
         self.assertLess(body.rindex("request.expected_attempt_id != record.attempt_id"),
-                        body.index("attempt_id_counter = candidate_attempt;"))
-        self.assertLess(body.index("attempt_id_counter = candidate_attempt;"),
-                        body.index("transport.submit_observed("))
+                        body.index("publish_recovery_retry_locked("))
+        publish = methods(read_code(CORE / "rdma_cmq_engine.sv"))["publish_recovery_retry_locked"][2]
+        self.assertLess(publish.index("attempt_id_counter = candidate_attempt;"),
+                        publish.index("transport.submit_observed("))
         name = "rdma_cmq_recovery_exit_test"
         self.assertEqual((ROOT / "tests/rdma_unit_test_pkg.sv").read_text().count(f'"unit/{name}.sv"'), 1)
         self.assertEqual(len(re.findall(rf"^  {name}$", (ROOT / "scripts/run_queue_lifecycle_regression53.sh").read_text(), re.M)), 1)

@@ -1,8 +1,8 @@
 // 目录：核心执行层 core/rdma_cmq_engine.sv。
 // 职责：管理 CMQ backing、ring/slot 账本、提交/完成/恢复状态，并在 prepare
 //   生命周期安装无状态 transport facade；完成路径按读取、匹配、提交和回收组织，
-//   各阶段只在同一次 engine_lock 调用内借用候选；恢复拒绝统一回填并解锁，
-//   不增加持久 authority。
+//   各阶段只在同一次 engine_lock 调用内借用候选；恢复入口统一拒绝出口，并把
+//   RETRY 提交/发布/证据交付交给同类持锁业务阶段，不增加持久 authority。
 // 依赖：依赖 CMQ model/profile、Host-memory adapter、doorbell scheduler、
 //   rdma_cmq_transport 与共享 submission evidence。
 // 所有权与生命周期：engine 拥有本地锁、快照、账本和每次 prepare 新建的
@@ -10720,6 +10720,168 @@ class rdma_cmq_engine extends uvm_object;
     return 1'b1;
   endfunction
 
+  // 设计说明：最终 expected-attempt 重验之后，RETRY 不再走 admission 拒绝出口。
+  //   本阶段把唯一 CAS、同步 transport 与证据交付留在同一个 engine 的锁内；
+  //   transport 的操作失败不是 orchestration 回滚，必须保留已提交 attempt 和历史证据。
+  // 功能：提交已准入的恢复 attempt，登记 observer、发布一次 transport，并把真实
+  //   arm 与本次 effect 折叠到 retained journal，按原顺序交付各项恢复结果。
+  // 输入/输出及副作用：record/preallocated 是 engine-owned 行的非拥有引用，
+  //   recovery_stage 是调用期 descriptor/observer，candidate_attempt 是刚重验的
+  //   下一身份；results 借用已对齐的对象数组并原位更新，不替换数组或取得其所有权。
+  //   推进 counter/行、登记并消费 capability，transport 可能等待或产生 Host/MMIO 副作用；
+  //   不取放锁，调用方必须全程持有 engine_lock，返回后才构造 orchestration OK 并解锁。
+  // 失败/边界：只接受完成全部准入、staging 和最终 stale 重验的非空参数；不重复验证。
+  //   null/畸形 envelope、无真实 arm 的 MMIO 自报、arm/effect 矛盾及 classifier
+  //   失败均保守记录 operation/observation/recovery，不撤销 attempt 或降低累计证据。
+  //   未 arm 的 PRE 不清 journal；真实 arm 的累计输入必须读取回调后的 record，
+  //   未 arm 则使用发布前 prior_cumulative，不能共用首次 submit 的回滚/分类策略。
+  protected task publish_recovery_retry_locked(
+    input rdma_cmq_batch_submission_record record,
+    input rdma_cmq_preallocated_publish_batch preallocated,
+    input rdma_cmq_recovery_candidate_stage_t recovery_stage,
+    input longint unsigned candidate_attempt,
+    input rdma_cmq_execution_result results[]
+  );
+    rdma_doorbell_submission_result transport_result;
+    rdma_status nested_status;
+    rdma_status operation_status;
+    rdma_status_code_e observation_code;
+    rdma_submission_effect_e prior_cumulative;
+    rdma_submission_effect_e current_attempt_effect;
+    rdma_submission_effect_e cumulative_effect;
+    rdma_submission_effect_e fold_evidence;
+    string observation_message;
+    bit observer_armed;
+    bit retry_safe;
+    bit classified_recovery;
+
+    prior_cumulative = record.submission_effect;
+    attempt_id_counter = candidate_attempt;
+    record.attempt_id = candidate_attempt;
+    record.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+    record.attempt_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+    record.observer_armed = 1'b0;
+    record.publication_retry_safe = 1'b0;
+    preallocated.attempt_id = candidate_attempt;
+    foreach (record.items[i]) begin
+      record.items[i].state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
+      record.items[i].attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      record.items[i].completion_phase = RDMA_CMQ_COMPLETION_NONE;
+      record.items[i].completion = null;
+      record.items[i].reset_isolation_confirmed = 1'b0;
+      record.items[i].recovery_required = 1'b1;
+      record.items[i].status = rdma_cmq_direct_status(RDMA_SC_OK);
+      results[i].attempt_id = candidate_attempt;
+      results[i].submission_effect = prior_cumulative;
+      results[i].attempt_effect =
+        RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
+      results[i].completion_phase = RDMA_CMQ_COMPLETION_NONE;
+      results[i].recovery_required = 1'b1;
+    end
+    arm_observers[recovery_stage.capability_key] =
+      recovery_stage.observer;
+
+    transport_result = null;
+    transport.submit_observed(
+      record.binding, recovery_stage.doorbell_snapshot_desc,
+      recovery_stage.observer, transport_result
+    );
+    observer_armed = record.observer_armed;
+    if (!observer_armed)
+      arm_observers.delete(recovery_stage.capability_key);
+
+    decode_transport_envelope(
+      transport_result, 1'b1, operation_status, observation_code,
+      observation_message, current_attempt_effect
+    );
+
+    retry_safe = 1'b1;
+    if (observer_armed) begin
+      record.publication_retry_safe = 1'b0;
+      if (current_attempt_effect == RDMA_SUBMIT_EFFECT_MMIO_VISIBLE) begin
+        record.state = RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED;
+        fold_evidence = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+      end
+      else begin
+        record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
+        fold_evidence = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+        if (current_attempt_effect !=
+              RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE &&
+            current_attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED) begin
+          current_attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+          observation_code = RDMA_SC_INVALID_STATE;
+          observation_message =
+            "CMQ recovery transport effect contradicts authentic MMIO arm";
+        end
+      end
+      if (!rdma_cmq_fold_attempt_effect(
+            record.submission_effect, fold_evidence, cumulative_effect
+          ))
+        cumulative_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
+    end
+    else begin
+      record.state = RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
+      if (!(current_attempt_effect inside {
+            RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED,
+            RDMA_SUBMIT_EFFECT_UNOBSERVED,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
+            RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
+          })) begin
+        current_attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+        retry_safe = 1'b0;
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message =
+          "CMQ recovery transport reported MMIO without authentic arm";
+      end
+      if (!rdma_cmq_fold_attempt_effect(
+            prior_cumulative, current_attempt_effect, cumulative_effect
+          ))
+        cumulative_effect = prior_cumulative;
+      record.publication_retry_safe = retry_safe;
+    end
+    record.submission_effect = cumulative_effect;
+    record.attempt_effect = current_attempt_effect;
+
+    foreach (record.items[i]) begin
+      record.items[i].state = record.state;
+      record.items[i].submission_effect = cumulative_effect;
+      record.items[i].attempt_effect = current_attempt_effect;
+      record.items[i].completion_phase = observer_armed ?
+        RDMA_CMQ_COMPLETION_PENDING : RDMA_CMQ_COMPLETION_NONE;
+      record.items[i].status = copy_submit_status_direct(
+        operation_status, $sformatf("cmq_recovery_journal_status_%0d", i)
+      );
+      nested_status = rdma_cmq_classify_recovery_required(
+        record.items[i].state, record.items[i].completion_phase,
+        record.items[i].submission_effect,
+        record.items[i].reset_isolation_confirmed,
+        record.items[i].recovery_owner.is_legacy_unmigrated(),
+        classified_recovery
+      );
+      if (nested_status == null || !nested_status.ok()) begin
+        classified_recovery = 1'b1;
+        observation_code = RDMA_SC_INVALID_STATE;
+        observation_message = (nested_status == null) ?
+          "CMQ recovery classifier returned null status" :
+          nested_status.message;
+      end
+      record.items[i].recovery_required = classified_recovery;
+      results[i].status = copy_submit_status_direct(
+        operation_status, $sformatf("cmq_recovery_result_status_%0d", i)
+      );
+      results[i].observation_status = rdma_cmq_direct_status(
+        observation_code, observation_message
+      );
+      results[i].submission_effect = cumulative_effect;
+      results[i].attempt_effect = current_attempt_effect;
+      results[i].completion_phase = record.items[i].completion_phase;
+      results[i].attempt_id = candidate_attempt;
+      results[i].recovery_required = classified_recovery;
+    end
+  endtask
+
   // 设计说明：恢复入口在同一 engine_lock 临界区内完成 locate、双图重算、完整值
   //   认证、candidate staging、唯一 CAS 与 transport 调用。这样第二个相同 expected
   //   attempt 只能在首个调用释放锁后观察新 attempt，并以 stale 结束。
@@ -10733,6 +10895,8 @@ class rdma_cmq_engine extends uvm_object;
   //   CONFIRM 的 lifecycle/proof 重验也借给只读 helper，attempt 重验与提交保留在此。
   //   结构对齐后所有拒绝汇合到同一回填/解锁出口，owner 扫描拒绝先退出 foreach
   //   再退出单次事务；两条成功路径各自返回，不能落入统一失败出口。
+  //   RETRY 的 CAS/transport/结果交付只在最终 stale 重验后进入同类业务阶段；
+  //   本入口继续独占锁、CONFIRM 提交、失败回填及最终 orchestration status。
   // 失败/边界：无法 locate/结构对齐返回空 results；其后 stale、action、digest、
   //   owner、proof/lifecycle、binding/mapping/fence/deadline/staging/collision 失败返回 aligned results，
   //   且在唯一 CAS 前不修改 counter、journal、preallocation、observer 或外部 I/O。
@@ -10747,21 +10911,9 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_preallocated_publish_batch preallocated;
     rdma_cmq_recovery_candidate_stage_t recovery_stage;
     rdma_cmq_hw_profile profile_service;
-    rdma_doorbell_submission_result transport_result;
     rdma_status stage_status;
-    rdma_status nested_status;
-    rdma_status operation_status;
     rdma_status owner_status;
-    rdma_status_code_e observation_code;
-    rdma_submission_effect_e prior_cumulative;
-    rdma_submission_effect_e current_attempt_effect;
-    rdma_submission_effect_e cumulative_effect;
-    rdma_submission_effect_e fold_evidence;
     longint unsigned candidate_attempt;
-    string observation_message;
-    bit observer_armed;
-    bit retry_safe;
-    bit classified_recovery;
     bit owner_rejected;
 
     results = new[0];
@@ -10958,139 +11110,17 @@ class rdma_cmq_engine extends uvm_object;
         break;
       end
 
-      // 所有 fallible staging 已完成。以下连续赋值是唯一 locked CAS commit；
-      // admission owner provenance 与 ticket absolute deadline 保持逐位不变。
+      // 所有 fallible staging 已完成；最终 stale 重验与下方唯一提交阶段间没有
+      // factory/adapter 回调或锁释放，owner provenance 和 absolute deadline 不变。
       if (request.expected_attempt_id != record.attempt_id) begin
         status = journal_status(
           RDMA_SC_INVALID_STATE, "stale CMQ recovery attempt"
         );
         break;
       end
-      prior_cumulative = record.submission_effect;
-      attempt_id_counter = candidate_attempt;
-      record.attempt_id = candidate_attempt;
-      record.state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
-      record.attempt_effect = RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
-      record.observer_armed = 1'b0;
-      record.publication_retry_safe = 1'b0;
-      preallocated.attempt_id = candidate_attempt;
-      foreach (record.items[i]) begin
-        record.items[i].state = RDMA_CMQ_SUBMISSION_PENDING_EFFECT;
-        record.items[i].attempt_effect =
-          RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
-        record.items[i].completion_phase = RDMA_CMQ_COMPLETION_NONE;
-        record.items[i].completion = null;
-        record.items[i].reset_isolation_confirmed = 1'b0;
-        record.items[i].recovery_required = 1'b1;
-        record.items[i].status = rdma_cmq_direct_status(RDMA_SC_OK);
-        results[i].attempt_id = candidate_attempt;
-        results[i].submission_effect = prior_cumulative;
-        results[i].attempt_effect =
-          RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE;
-        results[i].completion_phase = RDMA_CMQ_COMPLETION_NONE;
-        results[i].recovery_required = 1'b1;
-      end
-      arm_observers[recovery_stage.capability_key] =
-        recovery_stage.observer;
-
-      transport_result = null;
-      transport.submit_observed(
-        record.binding, recovery_stage.doorbell_snapshot_desc,
-        recovery_stage.observer, transport_result
+      publish_recovery_retry_locked(
+        record, preallocated, recovery_stage, candidate_attempt, results
       );
-      observer_armed = record.observer_armed;
-      if (!observer_armed)
-        arm_observers.delete(recovery_stage.capability_key);
-
-      decode_transport_envelope(
-        transport_result, 1'b1, operation_status, observation_code,
-        observation_message, current_attempt_effect
-      );
-
-      retry_safe = 1'b1;
-      if (observer_armed) begin
-        record.publication_retry_safe = 1'b0;
-        if (current_attempt_effect == RDMA_SUBMIT_EFFECT_MMIO_VISIBLE) begin
-          record.state = RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED;
-          fold_evidence = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
-        end
-        else begin
-          record.state = RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS;
-          fold_evidence = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
-          if (current_attempt_effect !=
-                RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE &&
-              current_attempt_effect != RDMA_SUBMIT_EFFECT_UNOBSERVED) begin
-            current_attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
-            observation_code = RDMA_SC_INVALID_STATE;
-            observation_message =
-              "CMQ recovery transport effect contradicts authentic MMIO arm";
-          end
-        end
-        if (!rdma_cmq_fold_attempt_effect(
-              record.submission_effect, fold_evidence, cumulative_effect
-            ))
-          cumulative_effect = RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE;
-      end
-      else begin
-        record.state = RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED;
-        if (!(current_attempt_effect inside {
-              RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED,
-              RDMA_SUBMIT_EFFECT_UNOBSERVED,
-              RDMA_SUBMIT_EFFECT_HOST_MEMORY_MAYBE_VISIBLE,
-              RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN,
-              RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED
-            })) begin
-          current_attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
-          retry_safe = 1'b0;
-          observation_code = RDMA_SC_INVALID_STATE;
-          observation_message =
-            "CMQ recovery transport reported MMIO without authentic arm";
-        end
-        if (!rdma_cmq_fold_attempt_effect(
-              prior_cumulative, current_attempt_effect, cumulative_effect
-            ))
-          cumulative_effect = prior_cumulative;
-        record.publication_retry_safe = retry_safe;
-      end
-      record.submission_effect = cumulative_effect;
-      record.attempt_effect = current_attempt_effect;
-
-      foreach (record.items[i]) begin
-        record.items[i].state = record.state;
-        record.items[i].submission_effect = cumulative_effect;
-        record.items[i].attempt_effect = current_attempt_effect;
-        record.items[i].completion_phase = observer_armed ?
-          RDMA_CMQ_COMPLETION_PENDING : RDMA_CMQ_COMPLETION_NONE;
-        record.items[i].status = copy_submit_status_direct(
-          operation_status, $sformatf("cmq_recovery_journal_status_%0d", i)
-        );
-        nested_status = rdma_cmq_classify_recovery_required(
-          record.items[i].state, record.items[i].completion_phase,
-          record.items[i].submission_effect,
-          record.items[i].reset_isolation_confirmed,
-          record.items[i].recovery_owner.is_legacy_unmigrated(),
-          classified_recovery
-        );
-        if (nested_status == null || !nested_status.ok()) begin
-          classified_recovery = 1'b1;
-          observation_code = RDMA_SC_INVALID_STATE;
-          observation_message = (nested_status == null) ?
-            "CMQ recovery classifier returned null status" :
-            nested_status.message;
-        end
-        record.items[i].recovery_required = classified_recovery;
-        results[i].status = copy_submit_status_direct(
-          operation_status, $sformatf("cmq_recovery_result_status_%0d", i)
-        );
-        results[i].observation_status = rdma_cmq_direct_status(
-          observation_code, observation_message
-        );
-        results[i].submission_effect = cumulative_effect;
-        results[i].attempt_effect = current_attempt_effect;
-        results[i].completion_phase = record.items[i].completion_phase;
-        results[i].attempt_id = candidate_attempt;
-        results[i].recovery_required = classified_recovery;
-      end
       status = journal_status(RDMA_SC_OK);
       engine_lock.put(1);
       return;

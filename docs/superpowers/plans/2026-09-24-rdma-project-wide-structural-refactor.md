@@ -24,7 +24,16 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch238：基于 `e04e7c5`，CMQ recovery 12 处 aligned 拒绝收为一个出口，
+当前 Batch239：基于 `1d577d3`，同类 protected RETRY 阶段承接 attempt 提交、
+transport 与证据交付；公共 recovery 361→227 行，不新增组件/owner/锁/公开 API，
+保留真实 arm、历史累计值和首次 submit 不同的策略。生产净增 30 行，tokens
+1,982→2,024，明确是主流程可读性整理。修订旧版/重构版 96-case 专项、core
+108/91、CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、
+E2E 3、Python 393/393、驱动和静态/等价门禁全部通过；UVM 0/0/0，E2E 保留既有
+编译告警，最终送测哈希一致。详见
+`task-rdma-batch239-cmq-recovery-publish-report.md`；不合并、不推送，计划仍 active。
+
+前批 Batch238：基于 `e04e7c5`，CMQ recovery 12 处 aligned 拒绝收为一个出口，
 保留早拒绝空结果、owner 两层退出、首错、成功 CAS/transport/effect 顺序及原锁；
 212 声明/实例字段不变，仅增加调用期旗标。方法 375→361 行、tokens 2,161→1,982，
 生产净减 9 行。旧版/重构版 36-call 专项、core 107/90、CMQ 28/11

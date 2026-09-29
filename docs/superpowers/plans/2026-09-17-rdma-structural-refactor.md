@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch239 基于 `1d577d3` 沿用 `feature/rdma-structural-batch226`：RETRY 的 attempt
+提交、同步 transport 和 evidence 交付进入同类持锁阶段；公共 recovery 361→227 行，
+锁/状态/CONFIRM/失败交付及 31 非 protected 声明不变。生产净增 30 行，不宣称
+整体收缩。修订旧版/重构版 96-case 专项、core 108/91、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+393/393、驱动及静态/展开审计全部通过，最终哈希一致；UVM 0/0/0，E2E 保留
+既有编译告警。不合并、不推送，见
+`task-rdma-batch239-cmq-recovery-publish-report.md`；项目仍 active。
+
 Batch238 基于 `e04e7c5` 沿用 `feature/rdma-structural-batch226`：CMQ recovery 的
 12 个 aligned 拒绝共用一个回填/解锁出口，四类空结果早拒绝及 CONFIRM/RETRY
 成功路径不变；不增加 owner/状态/API。方法 375→361 行、tokens 2,161→1,982，
