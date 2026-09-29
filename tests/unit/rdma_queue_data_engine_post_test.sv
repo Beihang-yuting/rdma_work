@@ -161,24 +161,24 @@ class rdma_queue_data_engine_probe extends rdma_queue_data_engine;
     core_service.set_factory(isolated_factory);
     isolated_factory.set_type_override_by_type(rdma_status::get_type(), wrapper);
 
-    if (!value_ops::copy_status_fields(source, destination) ||
+    if (!rdma_status::copy_fields_noalloc(source, destination) ||
         destination.convert2string() != source_value || destination != saved_destination)
       `uvm_error("STATUS_VALUE_COPY", "field copy lost diagnostic values or object identity")
-    if (value_ops::copy_status_fields(
-      null, destination) || value_ops::copy_status_fields(source, null) ||
-        value_ops::copy_status_fields(null, null) ||
+    if (rdma_status::copy_fields_noalloc(
+      null, destination) || rdma_status::copy_fields_noalloc(source, null) ||
+        rdma_status::copy_fields_noalloc(null, null) ||
         destination.convert2string() != source_value)
       `uvm_error("STATUS_VALUE_NULL", "null field copy changed the destination")
-    if (!value_ops::copy_status_fields(destination, destination) ||
+    if (!rdma_status::copy_fields_noalloc(destination, destination) ||
         destination.convert2string() != source_value || wrapper.calls != 0)
       `uvm_error("STATUS_VALUE_SELF", "self copy changed values or allocated a status")
-    if (value_ops::set_status_noalloc(null, RDMA_SC_OK, "null slot"))
+    if (rdma_status::set_fields_noalloc(null, RDMA_SC_OK, "null slot"))
       `uvm_error("STATUS_VALUE_INIT_NULL", "null slot was accepted")
 
     foreach (codes[i]) begin
-      void'(value_ops::copy_status_fields(source, destination));
+      void'(rdma_status::copy_fields_noalloc(source, destination));
       expected = rdma_status::make_direct(codes[i], "reset diagnosis");
-      if (!value_ops::set_status_noalloc(destination, codes[i], "reset diagnosis") ||
+      if (!rdma_status::set_fields_noalloc(destination, codes[i], "reset diagnosis") ||
           destination.convert2string() != expected.convert2string() ||
           destination.hardware_code != 0 || destination != saved_destination ||
           wrapper.calls != 0)

@@ -7,7 +7,7 @@
 // 设计说明：业务 owner 继续决定 admission、I/O、commit 与恢复；本类只处理显式输入的值。
 //   static automatic 保持每次调用局部变量独立，不建立第二账本，也不增加 factory 对象层。
 //   “无状态”不代表“无分配/无回调”：raw factory 和 AEQE profile 设置保留原调用窗口；
-//   post-scheduler 只能使用 copy_status_fields/set_status_noalloc 等明确无分配的值操作。
+//   post-scheduler 使用 rdma_status::copy_fields_noalloc/set_fields_noalloc 等无分配值操作。
 
 class rdma_queue_data_projector;
 
@@ -43,66 +43,8 @@ class rdma_queue_data_projector;
       rdma_status::get_type(), "queue_data_engine_status");
     if (raw_result == null || !$cast(result, raw_result))
       return null;
-    void'(set_status_noalloc(result, code, message));
+    void'(rdma_status::set_fields_noalloc(result, code, message));
     return result;
-  endfunction
-
-  // 功能：copy_status_fields 为 consumer 与 device publish 共用完整 status 值复制，
-  //   只写入已分配对象，不因进入 scheduler 后的错误路径而 clone 或创建 nested status。
-  // 输入/输出及副作用：source/destination 为输入；成功覆盖 destination 全部诊断
-  //   字段，不修改 source、runtime 或外部资源。
-  // 失败/边界：任一对象为空返回 0 且不写 destination；自复制成功且值不变；不规范化
-  //   source.category/code，不调用虚拟 copy/clone，调用方自己决定是否创建返回 status。
-  static function automatic bit copy_status_fields(
-    rdma_status source,
-    rdma_status destination
-  );
-    if (source == null || destination == null)
-      return 1'b0;
-    destination.category = source.category;
-    destination.code = source.code;
-    destination.hardware_code = source.hardware_code;
-    destination.hardware_code_valid = source.hardware_code_valid;
-    destination.source_engine = source.source_engine;
-    destination.function_uid = source.function_uid;
-    destination.generation = source.generation;
-    destination.resource_id = source.resource_id;
-    destination.command_id = source.command_id;
-    destination.wr_id = source.wr_id;
-    destination.severity = source.severity;
-    destination.retryable = source.retryable;
-    destination.message = source.message;
-    return 1'b1;
-  endfunction
-
-  // 功能：set_status_noalloc 为新建状态与预建 slot 共用 code/message 初始化，
-  //   清除上一条诊断的硬件/身份字段，支持 consumer barrier 后无分配地归一化错误。
-  // 输入/输出及副作用：destination、code、message 为输入；成功覆盖完整诊断字段，
-  //   返回 1，不创建对象、不调用 codec，也不修改 runtime/pending/ledger。
-  // 失败/边界：destination=null 返回 0；未知 code 按 category_for 归类，只有 OK 使用
-  //   INFO severity，其余使用 ERROR；不调用 factory 或虚拟 hook，不推断 MMIO evidence。
-  static function automatic bit set_status_noalloc(
-    rdma_status destination,
-    rdma_status_code_e code,
-    string message = ""
-  );
-    if (destination == null)
-      return 1'b0;
-    destination.category = rdma_status::category_for(code);
-    destination.code = code;
-    destination.hardware_code = '0;
-    destination.hardware_code_valid = 1'b0;
-    destination.source_engine = RDMA_ENGINE_NONE;
-    destination.function_uid = '0;
-    destination.generation = '0;
-    destination.resource_id = '0;
-    destination.command_id = '0;
-    destination.wr_id = '0;
-    destination.severity = code == RDMA_SC_OK ? RDMA_SEVERITY_INFO :
-                                                RDMA_SEVERITY_ERROR;
-    destination.retryable = 1'b0;
-    destination.message = message;
-    return 1'b1;
   endfunction
 
   // 功能：为 consumer candidate 逐字段物化 kind/Function/object/generation 句柄，不调用 clone。
@@ -216,7 +158,7 @@ class rdma_queue_data_projector;
     if (raw_candidate == null || !$cast(candidate, raw_candidate))
       return make_status_nonfatal(RDMA_SC_RESOURCE_EXHAUSTED,
                                          {label, " status allocation failed"});
-    if (!copy_status_fields(source, candidate))
+    if (!rdma_status::copy_fields_noalloc(source, candidate))
       return make_status_nonfatal(RDMA_SC_INVALID_STATE,
                                          {label, " status copy failed"});
     copy = candidate;

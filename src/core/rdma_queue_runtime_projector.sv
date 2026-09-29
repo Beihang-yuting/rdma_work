@@ -1,5 +1,5 @@
 // 目录/层次：src/core 的 runtime 值投影层。
-// 职责：深复制 request/slot/pending 对象图并比较恢复证据，集中状态构造与无分配初始化。
+// 职责：深复制 request/slot/pending 对象图并比较恢复证据，保留 runtime 状态构造策略。
 // 依赖：types/model、runtime transaction 值类型与 UVM raw factory；不依赖 runtime 实例。
 // 所有权/生命周期：无字段、锁、缓存、UVM 注册或 provider 实例；只处理显式输入值。
 //   调用方拥有输入和结果，runtime 仍唯一负责锁、authority、PI/CI/credit 与恢复阶段提交。
@@ -31,8 +31,8 @@ class rdma_queue_runtime_projector;
 
   // 功能：make_runtime_status 统一构造 runtime 对外状态；UVM factory
   //   被注入 null/错误类型时，改用直接构造的非空 fallback。
-  // 输入/输出及副作用：code、message（输入）；返回独立 rdma_status 值，
-  //   不修改 runtime 账本或外部资源。
+  // 输入/输出及副作用：code、message（输入）；通过 rdma_status 的无分配 setter
+  //   初始化非空结果的全部字段；不修改 runtime 账本或外部资源。
   // 失败/边界：factory 创建失败时仍返回同一 code/message；fallback 只初始化
   //   诊断字段，不会把错误码伪造成成功。
   static function automatic rdma_status make_runtime_status(
@@ -48,51 +48,8 @@ class rdma_queue_runtime_projector;
     if (raw_result == null || !$cast(result, raw_result)) begin
       result = new("runtime_status_fallback");
     end
-    result.category = rdma_status::category_for(code);
-    result.code = code;
-    result.hardware_code = '0;
-    result.hardware_code_valid = 1'b0;
-    result.source_engine = RDMA_ENGINE_NONE;
-    result.function_uid = '0;
-    result.generation = '0;
-    result.resource_id = '0;
-    result.command_id = '0;
-    result.wr_id = '0;
-    result.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO
-                                           : RDMA_SEVERITY_ERROR;
-    result.retryable = 1'b0;
-    result.message = message;
+    void'(rdma_status::set_fields_noalloc(result, code, message));
     return result;
-  endfunction
-
-  // 功能：set_runtime_status_noalloc 在 caller 已拥有的 status slot 中写入一个
-  //   完整 runtime 结果，供 scheduler/continuation barrier 后的零分配路径复用。
-  // 输入/输出及副作用：slot、code、message 为输入；slot 非空时覆盖全部诊断字段
-  //   并返回 1，不创建对象，也不修改 queue cursor、ledger 或 pending evidence。
-  // 失败/边界：slot=null 时返回 0 且无任何副作用；message 只记录当前失败原因，
-  //   不从兼容位推导 authority，也不把非 OK code 伪装成成功。
-  static function automatic bit set_runtime_status_noalloc(
-    rdma_status slot,
-    rdma_status_code_e code,
-    string message = ""
-  );
-    if (slot == null)
-      return 1'b0;
-    slot.category = rdma_status::category_for(code);
-    slot.code = code;
-    slot.hardware_code = '0;
-    slot.hardware_code_valid = 1'b0;
-    slot.source_engine = RDMA_ENGINE_NONE;
-    slot.function_uid = '0;
-    slot.generation = '0;
-    slot.resource_id = '0;
-    slot.command_id = '0;
-    slot.wr_id = '0;
-    slot.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO :
-                                           RDMA_SEVERITY_ERROR;
-    slot.retryable = 1'b0;
-    slot.message = message;
-    return 1'b1;
   endfunction
 
   // 功能：status_is_ok 对可能为空的下游状态执行安全成功判断，避免 recovery/clone 异常路径解引用 null handle。
@@ -188,7 +145,8 @@ class rdma_queue_runtime_projector;
   endfunction
 
   // 功能：clone_status_value_nonfatal 复制 rdma_status 的完整诊断字段，保留错误码、硬件上下文和 retry 语义。
-  // 输入/输出及副作用：source（输入）、copy（输出）先置 null；成功时返回独立 status 快照，不调用 source.clone/do_copy。
+  // 输入/输出及副作用：source（输入）、copy（输出）先置 null；成功时使用 rdma_status 的
+  //   无分配字段复制发布独立快照，不调用 source.clone/do_copy。
   // 失败/边界：source 为空返回成功空值；status 对象分配失败返回 RESOURCE_EXHAUSTED，失败不伪造 OK 状态。
   static function automatic rdma_status clone_status_value_nonfatal(
     rdma_status source, output rdma_status copy
@@ -204,19 +162,7 @@ class rdma_queue_runtime_projector;
     if (raw_candidate == null || !$cast(candidate, raw_candidate))
       return make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "status copy allocation failed");
-    candidate.category = source.category;
-    candidate.code = source.code;
-    candidate.hardware_code = source.hardware_code;
-    candidate.hardware_code_valid = source.hardware_code_valid;
-    candidate.source_engine = source.source_engine;
-    candidate.function_uid = source.function_uid;
-    candidate.generation = source.generation;
-    candidate.resource_id = source.resource_id;
-    candidate.command_id = source.command_id;
-    candidate.wr_id = source.wr_id;
-    candidate.severity = source.severity;
-    candidate.retryable = source.retryable;
-    candidate.message = source.message;
+    void'(rdma_status::copy_fields_noalloc(source, candidate));
     copy = candidate;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction

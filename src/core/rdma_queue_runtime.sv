@@ -1164,7 +1164,7 @@ class rdma_queue_runtime extends uvm_object;
 
     if (status_slot == null) return 1'b0;
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
@@ -1197,20 +1197,20 @@ class rdma_queue_runtime extends uvm_object;
            pending_operation_state.next_cursor.index,
            pending_operation_state.next_cursor.wrap))) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(status_slot, failure_code,
+      void'(rdma_status::set_fields_noalloc(status_slot, failure_code,
                                        failure_message));
       return 1'b0;
     end
     if (used == 0) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_QUEUE_EMPTY,
         "device ring has no committed entries"));
       return 1'b0;
     end
     if (used > depth) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "device ring occupancy exceeds depth"));
       return 1'b0;
@@ -1223,7 +1223,7 @@ class rdma_queue_runtime extends uvm_object;
                       pending_operation_state.next_cursor.index,
                       pending_operation_state.next_cursor.wrap)) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "consumer recovery CI advance mismatched evidence"));
       return 1'b0;
@@ -1244,7 +1244,7 @@ class rdma_queue_runtime extends uvm_object;
     consumer_release_gate_active = 1'b0;
     recovery_retry_confirmed = 1'b0;
     lock.put(1);
-    void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
   endfunction
 
@@ -1259,13 +1259,13 @@ class rdma_queue_runtime extends uvm_object;
   function bit begin_consumer_release_noalloc(rdma_status status_slot);
     if (status_slot == null) return 1'b0;
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
     if (consumer_release_gate_active) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY,
         "consumer release gate is already active"));
       return 1'b0;
@@ -1297,14 +1297,14 @@ class rdma_queue_runtime extends uvm_object;
           pending_operation_state.committed_consumer_cursor.index,
           pending_operation_state.committed_consumer_cursor.wrap)) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "consumer release authority is invalid"));
       return 1'b0;
     end
 
     consumer_release_gate_active = 1'b1;
-    void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
   endfunction
 
@@ -1322,7 +1322,7 @@ class rdma_queue_runtime extends uvm_object;
   );
     if (!consumer_release_gate_active) begin
       if (status_slot != null)
-        void'(value_ops::set_runtime_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           status_slot, RDMA_SC_INVALID_STATE,
           "consumer release gate is not active"));
       return 1'b0;
@@ -1331,7 +1331,7 @@ class rdma_queue_runtime extends uvm_object;
     if (release_succeeded) begin
       pending_operation_state.completion_released = 1'b1;
       if (status_slot != null)
-        void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+        void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     end
     consumer_release_gate_active = 1'b0;
     lock.put(1);
@@ -2144,7 +2144,7 @@ class rdma_queue_runtime extends uvm_object;
 
     if (status_slot == null) return 1'b0;
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
@@ -2155,14 +2155,14 @@ class rdma_queue_runtime extends uvm_object;
          !(recovery_commit_allowed &&
            state == RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED))) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "queue runtime is not an active host WQ"));
       return 1'b0;
     end
     if (depth == 0 || target_index >= depth) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_ARGUMENT,
         "completion index is outside depth"));
       return 1'b0;
@@ -2170,7 +2170,7 @@ class rdma_queue_runtime extends uvm_object;
     if (consumer_index >= depth || slots.size() < depth || used == 0 ||
         used > depth) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "completion ledger geometry or occupancy is invalid"));
       return 1'b0;
@@ -2184,7 +2184,7 @@ class rdma_queue_runtime extends uvm_object;
     do begin
       if (count >= depth || count >= used) begin
         lock.put(1);
-        void'(value_ops::set_runtime_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           status_slot, RDMA_SC_INVALID_STATE,
           "completion cursor is not outstanding"));
         return 1'b0;
@@ -2192,7 +2192,7 @@ class rdma_queue_runtime extends uvm_object;
       slot = slots[i];
       if (!release_range_slot_shape_valid(slot, i, w)) begin
         lock.put(1);
-        void'(value_ops::set_runtime_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           status_slot, RDMA_SC_INVALID_STATE,
           "completion skips an unposted slot"));
         return 1'b0;
@@ -2204,7 +2204,7 @@ class rdma_queue_runtime extends uvm_object;
     end while (count <= depth);
     if (!reached_target) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "completion cursor is not outstanding"));
       return 1'b0;
@@ -2226,7 +2226,7 @@ class rdma_queue_runtime extends uvm_object;
     consumer_index = i;
     consumer_wrap = w;
     lock.put(1);
-    void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
   endfunction
 
@@ -2988,7 +2988,7 @@ class rdma_queue_runtime extends uvm_object;
       return 1'b0;
     end
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
@@ -3003,7 +3003,7 @@ class rdma_queue_runtime extends uvm_object;
           pending_operation_state.consumer_committed,
           pending_operation_state.committed_consumer_cursor)) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "CQ shadow write attempt evidence is invalid"));
       return 1'b0;
@@ -3014,7 +3014,7 @@ class rdma_queue_runtime extends uvm_object;
     pending_operation_state.mmio_maybe_submitted = 1'b0;
     pending_operation_state.consumer_doorbell_succeeded = 1'b0;
     lock.put(1);
-    void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
   endfunction
 
@@ -3031,7 +3031,7 @@ class rdma_queue_runtime extends uvm_object;
       return 1'b0;
     end
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
@@ -3047,14 +3047,14 @@ class rdma_queue_runtime extends uvm_object;
           pending_operation_state.consumer_committed,
           pending_operation_state.committed_consumer_cursor)) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "CQ shadow publication evidence is invalid"));
       return 1'b0;
     end
     pending_operation_state.consumer_shadow_published = 1'b1;
     lock.put(1);
-    void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
   endfunction
 
@@ -3433,14 +3433,14 @@ class rdma_queue_runtime extends uvm_object;
   function bit enable_recovery_commit_noalloc(rdma_status status_slot);
     if (status_slot == null) return 1'b0;
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
     if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
         pending_operation_state == null) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "queue runtime has no pending recovery"));
       return 1'b0;
@@ -3449,7 +3449,7 @@ class rdma_queue_runtime extends uvm_object;
         pending_operation_state.consumer_shadow_published) begin
       if (!consumer_shadow_phase_valid(pending_operation_state, 1'b1)) begin
         lock.put(1);
-        void'(value_ops::set_runtime_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           status_slot, RDMA_SC_INVALID_STATE,
           "CQ shadow publication is incomplete"));
         return 1'b0;
@@ -3458,7 +3458,7 @@ class rdma_queue_runtime extends uvm_object;
     else if (pending_operation_state.mmio_evidence inside {
           RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RECOVERY_REQUIRED,
         "recovery commit lacks definitive MMIO evidence"));
       return 1'b0;
@@ -3470,7 +3470,7 @@ class rdma_queue_runtime extends uvm_object;
           RDMA_QUEUE_MMIO_NOT_APPLICABLE}) begin
       if (!recovery_retry_confirmed) begin
         lock.put(1);
-        void'(value_ops::set_runtime_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           status_slot, RDMA_SC_INVALID_STATE,
           "recovery commit lacks retry confirmation"));
         return 1'b0;
@@ -3479,7 +3479,7 @@ class rdma_queue_runtime extends uvm_object;
     end
     recovery_commit_allowed = 1'b1;
     lock.put(1);
-    void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
   endfunction
 
@@ -3665,14 +3665,14 @@ class rdma_queue_runtime extends uvm_object;
 
     if (status_slot == null) return 1'b0;
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
     if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
         pending_operation_state == null) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "queue runtime has no pending recovery"));
       return 1'b0;
@@ -3683,7 +3683,7 @@ class rdma_queue_runtime extends uvm_object;
                            RDMA_QUEUE_MMIO_SUCCESS,
                            RDMA_QUEUE_MMIO_AMBIGUOUS})) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_ARGUMENT,
         "MMIO evidence is invalid"));
       return 1'b0;
@@ -3691,7 +3691,7 @@ class rdma_queue_runtime extends uvm_object;
     if (actual_failure != null &&
         (actual_failure.ok() || pending_operation_state.failure_status == null)) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_ARGUMENT,
         "recovery failure status is invalid"));
       return 1'b0;
@@ -3703,7 +3703,7 @@ class rdma_queue_runtime extends uvm_object;
           pending_operation_state.device_write_attempted,
           recovery_retry_confirmed, consume_confirmation)) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "MMIO evidence transition is unauthorized"));
       return 1'b0;
@@ -3745,7 +3745,7 @@ class rdma_queue_runtime extends uvm_object;
 
     if (status_slot == null) return 1'b0;
     if (lock == null || !lock.try_get(1)) begin
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
@@ -3768,7 +3768,7 @@ class rdma_queue_runtime extends uvm_object;
           pending_operation_state.committed_consumer_cursor.index,
           pending_operation_state.committed_consumer_cursor.wrap)) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "consumer recovery stages are incomplete"));
       return 1'b0;
@@ -3781,7 +3781,7 @@ class rdma_queue_runtime extends uvm_object;
           (pending_operation_state.completion_target_valid &&
            !release_complete)) begin
         lock.put(1);
-        void'(value_ops::set_runtime_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           status_slot, RDMA_SC_INVALID_STATE,
           "CQ completion release is incomplete"));
         return 1'b0;
@@ -3791,7 +3791,7 @@ class rdma_queue_runtime extends uvm_object;
              pending_operation_state.completion_target_valid ||
              pending_operation_state.completion_released) begin
       lock.put(1);
-      void'(value_ops::set_runtime_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_INVALID_STATE,
         "event recovery cannot publish a CQ release stage"));
       return 1'b0;
@@ -3808,7 +3808,7 @@ class rdma_queue_runtime extends uvm_object;
     recovery_retry_confirmed = 1'b0;
     state = RDMA_QUEUE_RUNTIME_ACTIVE;
     lock.put(1);
-    void'(value_ops::set_runtime_status_noalloc(status_slot, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
   endfunction
 endclass

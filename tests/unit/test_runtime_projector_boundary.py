@@ -13,13 +13,13 @@ class RuntimeProjectorBoundaryTest(unittest.TestCase):
     """值复制不接管 mutable ledger；保留 status fallback 和原 factory callback 边界。"""
 
     def test_projector_has_no_instance_state(self):
-        """功能：固定二十个迁移值方法和公开 cursor 比较实现为无实例的 static automatic 集合。
+        """功能：固定状态原位更新归入 types 后的二十个值方法为无实例 static automatic 集合。
         输入输出及副作用：移除方法正文后比较类壳，只读取源码。
         失败边界：新增字段、锁、注册、继承或非 automatic 方法均拒绝。
         """
         code = read_code(CORE / "rdma_queue_runtime_projector.sv")
         declared = methods(code)
-        self.assertEqual(len(declared), 21)
+        self.assertEqual(len(declared), 20)
         lines = code.splitlines(keepends=True)
         for start, end, body in declared.values():
             self.assertRegex(body.lstrip(), r"^static function automatic\b")
@@ -73,7 +73,7 @@ class RuntimeProjectorBoundaryTest(unittest.TestCase):
 
     def test_status_and_callback_contracts_remain_distinct(self):
         """功能：保持 runtime 独有的 status fallback 与无分配原位更新，不借用其它层的 null 策略。
-        输入输出及副作用：读取 raw factory、make/set 和 pending clone 的输出时机，只读。
+        输入输出及副作用：读取 raw factory、make、types setter 和 pending clone 的输出时机，只读。
         失败边界：吞掉 factory 窗口、去掉 fallback、在 noalloc 中分配或提前交付 pending 均失败。
         """
         raw = (CORE / "rdma_queue_runtime_projector.sv").read_text()
@@ -81,7 +81,11 @@ class RuntimeProjectorBoundaryTest(unittest.TestCase):
         self.assertIn('result = new("runtime_status_fallback");', raw)
         self.assertIn('"runtime_status"', raw)
         self.assertIn("factory.create_object_by_type(", declared["factory_create_object_nonfatal"][2])
-        self.assertNotRegex(declared["set_runtime_status_noalloc"][2],
+        status = methods(read_code(ROOT / "src/types/rdma_status.sv"))
+        self.assertNotIn("set_runtime_status_noalloc", declared)
+        self.assertIn("rdma_status::set_fields_noalloc(result, code, message)",
+                      declared["make_runtime_status"][2])
+        self.assertNotRegex(status["set_fields_noalloc"][2],
                             r"\b(?:new|factory|create|clone|do_copy)\b")
         body = declared["clone_pending_value"][2]
         self.assertLess(body.index("candidate.epoch_valid = source.epoch_valid;"),

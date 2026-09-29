@@ -1241,7 +1241,7 @@ class rdma_queue_data_engine extends uvm_object;
   protected function rdma_status copy_publish_status_into(
     rdma_status source, rdma_status destination
   );
-    if (!value_ops::copy_status_fields(source, destination))
+    if (!rdma_status::copy_fields_noalloc(source, destination))
       return bad("publish status copy input is null");
     return rdma_status::success();
   endfunction
@@ -5834,7 +5834,7 @@ class rdma_queue_data_engine extends uvm_object;
     end
 
     if (pending.consumer_shadow_published) begin
-      void'(value_ops::set_status_noalloc(noalloc_status, RDMA_SC_OK, ""));
+      void'(rdma_status::set_fields_noalloc(noalloc_status, RDMA_SC_OK, ""));
       status = noalloc_status;
       return;
     end
@@ -5842,7 +5842,7 @@ class rdma_queue_data_engine extends uvm_object;
     shadow_status = context_backing.write(
       attachment.context_ref, offset, payload);
     if (shadow_status == null) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
         "CQC shadow context write returned null status"));
       status = noalloc_status;
@@ -5851,7 +5851,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (!shadow_status.ok()) begin
       if (!attachment.runtime.record_recovery_failure_noalloc(
             RDMA_QUEUE_MMIO_NO_SUBMIT, shadow_status, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
           "CQC shadow write failure evidence could not be retained"));
         status = noalloc_status;
@@ -6046,7 +6046,7 @@ class rdma_queue_data_engine extends uvm_object;
         RDMA_SC_RESOURCE_EXHAUSTED,
         "consumer no-allocation status slot allocation failed");
     end
-    void'(value_ops::set_status_noalloc(noalloc_status, RDMA_SC_OK, ""));
+    void'(rdma_status::set_fields_noalloc(noalloc_status, RDMA_SC_OK, ""));
     prepared_desc = desc_candidate;
     return noalloc_status;
   endfunction
@@ -6089,13 +6089,13 @@ class rdma_queue_data_engine extends uvm_object;
     if (status != null && status.ok() && result != null)
       evidence = RDMA_QUEUE_MMIO_SUCCESS;
     else if (status == null) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         prepared_status, RDMA_SC_INVALID_STATE,
         "consumer doorbell scheduler returned null status"));
       status = prepared_status;
     end
     else if (status.ok() && result == null) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         prepared_status, RDMA_SC_INVALID_STATE,
         "consumer doorbell scheduler returned null result"));
       status = prepared_status;
@@ -6402,7 +6402,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (prepared_status != null) begin
       if (cq_attachment == null || cq_attachment.runtime == null ||
           cursor == null) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           prepared_status, RDMA_SC_INVALID_ARGUMENT,
           "consumer commit input is incomplete"));
         return prepared_status;
@@ -6446,7 +6446,7 @@ class rdma_queue_data_engine extends uvm_object;
       attachment, next, db_result, status, evidence, link, descriptor,
       noalloc_status);
     if (status == null) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         noalloc_status, RDMA_SC_INVALID_STATE,
         diagnostic == CONSUMER_DIAG_CQ ? "CQ consumer doorbell returned null status" :
         diagnostic == CONSUMER_DIAG_EVENT ? "event consumer doorbell returned null status" :
@@ -6455,7 +6455,7 @@ class rdma_queue_data_engine extends uvm_object;
     end
     else if (status.ok() &&
              (db_result == null || evidence != RDMA_QUEUE_MMIO_SUCCESS)) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         noalloc_status, RDMA_SC_INVALID_STATE,
         diagnostic == CONSUMER_DIAG_CQ ?
           "CQ consumer doorbell returned incomplete success evidence" :
@@ -6467,7 +6467,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok()) begin
       if (!attachment.runtime.record_recovery_failure_noalloc(
             evidence, status, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
           diagnostic == CONSUMER_DIAG_CQ ? "CQ doorbell failure evidence could not be retained" :
           diagnostic == CONSUMER_DIAG_EVENT ?
@@ -6479,7 +6479,7 @@ class rdma_queue_data_engine extends uvm_object;
     end
     if (!attachment.runtime.record_recovery_failure_noalloc(
           RDMA_QUEUE_MMIO_SUCCESS, null, noalloc_status)) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
         diagnostic == CONSUMER_DIAG_CQ ? "CQ doorbell success evidence could not be retained" :
         diagnostic == CONSUMER_DIAG_EVENT ?
@@ -6514,7 +6514,7 @@ class rdma_queue_data_engine extends uvm_object;
     end
     status = commit_cq_consumer(attachment, cursor, noalloc_status);
     if (status == null) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         noalloc_status, RDMA_SC_INVALID_STATE,
         diagnostic == CONSUMER_DIAG_CQ ? "CQ consumer commit returned null status" :
         diagnostic == CONSUMER_DIAG_EVENT ? "event consumer commit returned null status" :
@@ -6524,7 +6524,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (!status.ok()) begin
       if (!attachment.runtime.record_recovery_failure_noalloc(
             failure_evidence, status, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
           diagnostic == CONSUMER_DIAG_CQ ? "CQ consumer commit failure could not be retained" :
           diagnostic == CONSUMER_DIAG_EVENT ?
@@ -6708,7 +6708,7 @@ class rdma_queue_data_engine extends uvm_object;
     released.delete();
     if (prepared_status != null) begin
       if (wqe_attachment == null || wqe_attachment.runtime == null) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           prepared_status, RDMA_SC_INVALID_ARGUMENT,
           "CQ WQE release attachment is incomplete"));
         return prepared_status;
@@ -6722,7 +6722,7 @@ class rdma_queue_data_engine extends uvm_object;
         target_wrap = frozen_target_wrap;
       end
       else begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           prepared_status, RDMA_SC_INVALID_ARGUMENT,
           "CQ WQE release target is unavailable"));
         return prepared_status;
@@ -6792,7 +6792,7 @@ class rdma_queue_data_engine extends uvm_object;
       wqe_attachment, cqe, released, noalloc_status,
       frozen_target_valid, frozen_target_index, frozen_target_wrap);
     if (status == null) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         noalloc_status, RDMA_SC_INVALID_STATE,
         {diagnostic_context, " WQE release returned null status"}));
       status = noalloc_status;
@@ -6801,7 +6801,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (!attachment.runtime.finish_consumer_release_noalloc(
           release_succeeded, status)) begin
       if (status == null || status.ok()) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           noalloc_status, RDMA_SC_INVALID_STATE,
           {diagnostic_context, " release gate finalization failed"}));
         status = noalloc_status;
@@ -6811,7 +6811,7 @@ class rdma_queue_data_engine extends uvm_object;
     if (!release_succeeded) begin
       if (!attachment.runtime.record_recovery_failure_noalloc(
             failure_evidence, status, noalloc_status)) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           noalloc_status, RDMA_SC_RECOVERY_REQUIRED,
           {diagnostic_context, " WQE release failure could not be retained"}));
         status = noalloc_status;
@@ -9502,7 +9502,7 @@ class rdma_queue_data_engine extends uvm_object;
         if (status == null || !status.ok())
           return;
       end
-      else if (!value_ops::set_status_noalloc(noalloc_status, RDMA_SC_OK, "")) begin
+      else if (!rdma_status::set_fields_noalloc(noalloc_status, RDMA_SC_OK, "")) begin
         status = value_ops::make_status_nonfatal(
           RDMA_SC_RESOURCE_EXHAUSTED,
           "published CQC shadow continuation status is unavailable");
@@ -9530,7 +9530,7 @@ class rdma_queue_data_engine extends uvm_object;
     end
     else if (pending.mmio_evidence == RDMA_QUEUE_MMIO_SUCCESS) begin
       noalloc_status = pending.failure_status;
-      if (!value_ops::set_status_noalloc(noalloc_status, RDMA_SC_OK, "")) begin
+      if (!rdma_status::set_fields_noalloc(noalloc_status, RDMA_SC_OK, "")) begin
         status = value_ops::make_status_nonfatal(
           RDMA_SC_RESOURCE_EXHAUSTED,
           "consumer recovery continuation status is unavailable");

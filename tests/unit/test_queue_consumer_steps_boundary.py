@@ -37,7 +37,7 @@ class QueueConsumerStepsBoundaryTest(unittest.TestCase):
             self.assertNotRegex(body, r"\b(?:new|create|clone|copy|make|make_direct|"
                                 r"make_status_nonfatal|sformatf|query_\w+|snapshot_\w+)\b")
             self.assertNotRegex(body, r"[{}]")
-            self.assertIn("value_ops::set_status_noalloc(", body)
+            self.assertIn("rdma_status::set_fields_noalloc(", body)
             self.assertNotRegex(body, r"\b(?:enter_recovery\w*|publish_cqc_shadow|"
                                 r"execute_consumer_wqe_release|complete_consumer_recovery_noalloc)\s*\(")
 

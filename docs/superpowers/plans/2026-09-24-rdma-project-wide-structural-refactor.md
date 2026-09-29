@@ -24,7 +24,17 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch229：基于 `cf502a5` 沿用 `feature/rdma-structural-batch226`，把 runtime
+当前 Batch230：基于 `b4d81b0` 沿用 `feature/rdma-structural-batch226`，将 runtime/
+queue-data 的重复状态字段操作归入 `rdma_status`，移除三个旧 helper，新增两个
+static automatic 值方法；不新增组件/owner/转发壳，生产净减 65 行。runtime fallback、
+queue-data null、typed-create 与 legacy 枚举检查仍分别保留；264 个保留方法展开后
+token 等价，runtime/engine 的公开业务声明与类壳不变。新增 162-case 状态矩阵、
+五项 Python 门禁；最终专项、core 103/86、CMQ 28/11（PROCESS/LOGICAL）、integration
+10、E2E 3、Host-memory 3、PCIe 1、Python 346/346、驱动契约及静态/注释门禁全部
+通过；三项 E2E 各保留 4 条基线编译告警。不合并、不推送，main 保持
+`083e0d7`。详见 `task-rdma-batch230-status-values-report.md`，项目仍 active。
+
+前批 Batch229：基于 `cf502a5` 沿用 `feature/rdma-structural-batch226`，把 runtime
 深复制/值比较/状态构造集中迁入无状态 projector，原 owner 保留锁、authority、游标/
 credit/reservation/recovery admission 与提交。20 个 protected 方法迁出，公开 cursor
 比较入口保留，58 个公开声明不变；94 原方法 token 等价。runtime 4,646→3,814 行、
@@ -148,8 +158,9 @@ SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 
 dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 adapter/router。
 
 上表 queue-data/manager/runtime 已分别按 Batch228/221/229 源码重测，其余维持 Batch218；
-独立 queue-data projector 为 889 行/25 methods，resource projector 为 2,217 行/47 methods，
-runtime projector 为 884 行/21 methods。
+独立 queue-data projector 为 831 行/23 methods，resource projector 为 2,217 行/47 methods，
+runtime projector 为 830 行/20 methods；公共 rdma_status 为 280 行/10 methods。
+Batch230 将无分配状态字段操作归入 types，不改变三个业务 owner 的规模和生命周期职责。
 后续在统一 owner/提交契约稳定后仍须收敛重复校验，
 不以删注释、压缩行或新增大量单函数文件代替可读性改进。
 

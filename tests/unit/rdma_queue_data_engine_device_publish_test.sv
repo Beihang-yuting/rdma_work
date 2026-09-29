@@ -609,7 +609,7 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
       fail_doorbell_once = 1'b0;
       result = null;
       if (prepared_status != null) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           prepared_status, RDMA_SC_PCIE_COMPLETION,
           "injected consumer doorbell failure"));
         status = prepared_status;
@@ -732,7 +732,7 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
     if (fail_commit_once) begin
       fail_commit_once = 1'b0;
       if (prepared_status != null) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           prepared_status, RDMA_SC_INVALID_STATE,
           "injected CQ consumer commit failure"));
         return prepared_status;
@@ -785,7 +785,7 @@ class rdma_queue_data_engine_ordering_fault extends rdma_queue_data_engine;
       fail_release_once = 1'b0;
       released.delete();
       if (prepared_status != null) begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           prepared_status, RDMA_SC_INVALID_STATE,
           "injected CQ WQE release failure"));
         return prepared_status;

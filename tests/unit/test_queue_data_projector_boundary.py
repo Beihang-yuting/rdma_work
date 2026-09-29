@@ -43,12 +43,12 @@ class QueueDataProjectorBoundaryTest(unittest.TestCase):
 
     def test_stateless_automatic_methods(self):
         """功能：禁止 projector 增加实例字段、缓存、锁、继承或 UVM 工厂注册。
-        输入输出及副作用：读取全部 25 个方法并移除其正文，检查剩余类壳；只读。
+        输入输出及副作用：读取状态字段操作归入 types 后的 23 个方法，移除正文检查类壳；只读。
         失败边界：方法数变化、非 static automatic 声明或类级状态均失败。
         """
         code = read_code(CORE / "rdma_queue_data_projector.sv")
         declared = methods(code)
-        self.assertEqual(len(declared), 25)
+        self.assertEqual(len(declared), 23)
         lines = code.splitlines(keepends=True)
         for start, end, body in declared.values():
             self.assertRegex(body.lstrip(), r"^static function automatic\b")
@@ -85,8 +85,10 @@ class QueueDataProjectorBoundaryTest(unittest.TestCase):
         for name in projector:
             self.assertNotRegex(engine, rf"(?<![\w:]){name}\s*\(")
         for name in ("prepare_cq_completion_candidate", "prepare_event_result_candidate_ex",
-                     "identity_key", "copy_status_fields", "set_status_noalloc"):
+                     "identity_key"):
             self.assertIn(f"value_ops::{name}(", engine)
+        for name in ("copy_fields_noalloc", "set_fields_noalloc"):
+            self.assertIn(f"rdma_status::{name}(", engine)
 
     def test_package_orders_value_types_projector_engine(self):
         """功能：保证结果/attachment 类型先于 projector，projector 先于 engine，无反向 include。
@@ -106,12 +108,15 @@ class QueueDataProjectorBoundaryTest(unittest.TestCase):
 
     def test_noallocation_helpers_stay_separate_from_factory(self):
         """功能：防止字段原位更新被改成 factory/copy/clone，保留 barrier 后的无分配契约。
-        输入输出及副作用：检查两个 helper 正文与 raw factory/AEQE profile 的真实调用；只读。
+        输入输出及副作用：检查 types 的两个 helper 正文与 projector 的 raw/profile 调用；只读。
         失败边界：字段 helper 增加分配/虚拟复制，或 raw/profile 创建边界丢失时失败。
         """
         declared = methods(read_code(CORE / "rdma_queue_data_projector.sv"))
-        for name in ("copy_status_fields", "set_status_noalloc"):
-            self.assertNotRegex(declared[name][2], r"\b(?:new|factory|create|copy|clone|do_copy)\b")
+        status = methods(read_code(ROOT / "src/types/rdma_status.sv"))
+        for name in ("copy_fields_noalloc", "set_fields_noalloc"):
+            self.assertNotRegex(status[name][2], r"\b(?:new|factory|create|copy|clone|do_copy)\b")
+        self.assertNotIn("copy_status_fields", declared)
+        self.assertNotIn("set_status_noalloc", declared)
         self.assertIn("factory.create_object_by_type(", declared["factory_create_object_nonfatal"][2])
         self.assertIn("set_profile_owner_authority(", declared["prepare_event_result_candidate_ex"][2])
         self.assertIn("slot.consumed = 1'b1;", declared["prepare_cq_completion_candidate"][2])

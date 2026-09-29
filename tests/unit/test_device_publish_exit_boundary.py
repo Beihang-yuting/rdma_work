@@ -88,7 +88,7 @@ class DevicePublishExitBoundaryTest(unittest.TestCase):
         self.assertLess(enter.index("copy_publish_status_into("),
                         enter.index("admit_device_publish_recovery("))
         copy = declared["copy_publish_status_into"][2]
-        self.assertIn("value_ops::copy_status_fields(source, destination)", copy)
+        self.assertIn("rdma_status::copy_fields_noalloc(source, destination)", copy)
         self.assertIn("return rdma_status::success();", copy)
         replay = declared["replay_device_producer_pending"][2]
         self.assertNotIn("write_commit_device_entry(", replay)

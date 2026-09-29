@@ -122,7 +122,7 @@ class rdma_queue_consumer_steps_probe extends rdma_queue_data_engine;
       2: result = null;
       3: evidence = RDMA_QUEUE_MMIO_NO_SUBMIT;
       4, 5, 9: begin
-        void'(value_ops::set_status_noalloc(
+        void'(rdma_status::set_fields_noalloc(
           seam_status, RDMA_SC_PCIE_COMPLETION, "injected step failure"));
         seam_status.hardware_code = 8'h5a;
         seam_status.hardware_code_valid = 1'b1;
@@ -147,7 +147,7 @@ class rdma_queue_consumer_steps_probe extends rdma_queue_data_engine;
     if (fault == 1)
       return null;
     if (fault inside {2, 4}) begin
-      void'(value_ops::set_status_noalloc(
+      void'(rdma_status::set_fields_noalloc(
         seam_status, RDMA_SC_PCIE_COMPLETION, "injected step failure"));
       seam_status.hardware_code = 8'h5a;
       seam_status.hardware_code_valid = 1'b1;

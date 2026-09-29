@@ -14,13 +14,23 @@
 `00b8ff6`（`feature/rdma-cmq-contract-foundation`），当时存在大量未提交改动。该历史
 现场及已有验证证据仍须保留。
 
-## 当前执行状态（2026-09-28）
+## 当前执行状态（2026-09-29）
 
 最新本地合并：Batch222–225 的四个提交已从 `feature/rdma-structural-batch222`
 快进进入 `main`，源码基线为 `93012a3`；原工作树与已有改动保留，不推送远端。
 本轮只补合并记录，生产/测试/构建输入与已完整验证的 Batch225 一致。
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
+
+Batch230 基于 `b4d81b0` 沿用 `feature/rdma-structural-batch226`：将两个 projector
+的三处原位状态 helper 合为 `rdma_status` 的两个 static automatic 值方法，调用者
+直接使用 types，不留转发壳；runtime 状态构造/复制与 direct 构造复用字段实现。
+runtime fallback、queue-data null、typed factory 拒绝与 legacy 枚举准入不合并。
+生产净减 65 行；264 个保留方法展开后 token 等价，owner/锁/公开业务声明不变。
+新增 162-case 初始化/分配矩阵及五项 Python 门禁；最终专项、core 103/86、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、E2E 3、Host-memory 3、PCIe 1、Python 346/346、
+驱动契约及静态/注释门禁全部通过；三项 E2E 各保留 4 条基线编译告警。
+不合并、不推送，见 `task-rdma-batch230-status-values-report.md`，项目仍 active。
 
 Batch229 基于 `cf502a5` 沿用 `feature/rdma-structural-batch226`：将 runtime 的 20 个
 值快照/比较方法迁入单一无状态 projector，公开 cursor 比较保留兼容入口；不新增

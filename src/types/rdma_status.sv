@@ -1,10 +1,11 @@
 // 目录：公共类型层 types/rdma_status.sv。
-// 职责：实现 rdma_status 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：定义完整诊断值、错误分类、值复制及无分配原位初始化；不承载业务状态机。
+// 依赖：rdma_status/engine/severity 枚举和 UVM；不反向依赖 core、adapter 或 runtime。
+// 所有权与生命周期：对象仅含标量和 string，由调用方持有；不拥有外部资源或 authority。
 
-// 中文说明：rdma_status.sv 属于基础类型层，集中定义 RDMA 枚举、地址、身份和状态契约。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 分配策略与字段操作分开：make 使用 typed factory，make_direct 直接构造；
+// set/copy_fields_noalloc 不分配、不调用虚拟 hook，允许在提交后的预建 slot 中使用。
+// 各业务层仍负责 null/错型 fallback、枚举准入与 MMIO evidence，不能由诊断值推导提交结果。
 
 class rdma_status extends uvm_object;
   `uvm_object_utils(rdma_status)
@@ -23,9 +24,9 @@ class rdma_status extends uvm_object;
   bit retryable;
   string message;
 
-  // 功能：构造 rdma_status，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：category=RDMA_STATUS_STATE；code=RDMA_SC_OK；hardware_code='0；hardware_code_valid=1'b0；source_engine=RDMA_ENGINE_NONE；function_uid='0；generation='0；resource_id='0；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_status 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：建立默认 OK/STATE/INFO 诊断，清零硬件码、身份字段与 retryable，message 为空。
+  // 输入/输出及副作用：name 透传 UVM 基类；只初始化本对象，不申请队列或取得外部资源。
+  // 失败/边界：直接构造不调用 factory；默认 OK 不是已提交事务或有效 authority 的证明。
   function new(string name = "rdma_status");
     super.new(name);
     category = RDMA_STATUS_STATE;
@@ -45,9 +46,10 @@ class rdma_status extends uvm_object;
 
   // 中文：状态进入事务 evidence 后必须是 detached snapshot，保留错误码、
   // 硬件上下文与诊断文本，避免 clone 后只剩默认 OK 状态。
-  // 功能：将 rhs 中 rdma_status 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（rdma_status copy type mismatch），不保留部分有效快照。
+  // 功能：实现 UVM copy hook，先执行基类复制，再逐字段保留 rhs 的完整原始诊断。
+  // 输入/输出及副作用：rhs 为源 uvm_object；覆盖当前对象标量/string，不重新分类或分配嵌套值。
+  // 失败/边界：错型触发 RDMA_COPY_TYPE fatal；直接传 null 不在契约内，无非致命降级保证。
+  //   需要 nullable/noalloc 行为的调用方使用 copy_fields_noalloc，不经过此虚拟 hook。
   virtual function void do_copy(uvm_object rhs);
     rdma_status source;
     super.do_copy(rhs);
@@ -68,9 +70,67 @@ class rdma_status extends uvm_object;
     message = source.message;
   endfunction
 
-  // 功能：在 rdma_status 中，make 创建新的 rdma_status 值并填充 category、code、severity 和诊断消息，不修改调用方对象。
-  // 输入/输出及副作用：code（输入）、message（输入）；make 读取 code、message 并使用字段 status、status.category、status.code、status.hardware_code、status.hardware_code_valid、status.source_engine、status.function_uid、status.generation；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：make 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：copy_fields_noalloc 逐字段保留完整诊断，供预建结果槽与 detached 值快照共用。
+  // 输入/输出及副作用：source/destination 为输入；成功覆盖 destination 全部诊断
+  //   字段并返回 1，不修改 source 或外部资源，不改变对象身份或名称。
+  // 失败/边界：任一对象为空返回 0 且不写 destination；自复制成功且值不变；不规范化
+  //   source.category/code，不调用虚拟 copy/clone，调用方自己决定是否创建返回 status。
+  static function automatic bit copy_fields_noalloc(
+    rdma_status source,
+    rdma_status destination
+  );
+    if (source == null || destination == null)
+      return 1'b0;
+    destination.category = source.category;
+    destination.code = source.code;
+    destination.hardware_code = source.hardware_code;
+    destination.hardware_code_valid = source.hardware_code_valid;
+    destination.source_engine = source.source_engine;
+    destination.function_uid = source.function_uid;
+    destination.generation = source.generation;
+    destination.resource_id = source.resource_id;
+    destination.command_id = source.command_id;
+    destination.wr_id = source.wr_id;
+    destination.severity = source.severity;
+    destination.retryable = source.retryable;
+    destination.message = source.message;
+    return 1'b1;
+  endfunction
+
+  // 功能：set_fields_noalloc 为新建状态与预建 slot 共用 code/message 初始化，
+  //   清除上一条诊断的硬件/身份字段，避免预建结果槽残留前一事务的 evidence。
+  // 输入/输出及副作用：destination、code、message 为输入；成功覆盖完整诊断字段，
+  //   返回 1，不创建对象、不调用虚拟 hook，不改变 destination 的对象身份或名称。
+  // 失败/边界：destination=null 返回 0；未知 code 按 category_for 归类，只有 OK 使用
+  //   INFO severity，其余使用 ERROR；不调用 factory 或虚拟 hook，不推断 MMIO evidence。
+  static function automatic bit set_fields_noalloc(
+    rdma_status destination,
+    rdma_status_code_e code,
+    string message = ""
+  );
+    if (destination == null)
+      return 1'b0;
+    destination.category = rdma_status::category_for(code);
+    destination.code = code;
+    destination.hardware_code = '0;
+    destination.hardware_code_valid = 1'b0;
+    destination.source_engine = RDMA_ENGINE_NONE;
+    destination.function_uid = '0;
+    destination.generation = '0;
+    destination.resource_id = '0;
+    destination.command_id = '0;
+    destination.wr_id = '0;
+    destination.severity = code == RDMA_SC_OK ? RDMA_SEVERITY_INFO :
+                                                RDMA_SEVERITY_ERROR;
+    destination.retryable = 1'b0;
+    destination.message = message;
+    return 1'b1;
+  endfunction
+
+  // 功能：make 经 typed factory 创建名为 rdma_status 的诊断，覆盖 factory 预填的全部值字段。
+  // 输入/输出及副作用：code/message 决定分类、严重性与消息，其余上下文清零；保留 factory 回调。
+  // 失败/边界：沿用 typed-create 的错型 fatal；要求 factory 返回非空，不提供 null/fallback 契约。
+  //   此入口保留直接字段写入，不能用 nullable setter 默默接受失效 factory。
   static function automatic rdma_status make(
     rdma_status_code_e code,
     string message = ""
@@ -108,40 +168,27 @@ class rdma_status extends uvm_object;
     rdma_status status;
 
     status = new("rdma_status_direct");
-    status.category = category_for(code);
-    status.code = code;
-    status.hardware_code = '0;
-    status.hardware_code_valid = 1'b0;
-    status.source_engine = RDMA_ENGINE_NONE;
-    status.function_uid = '0;
-    status.generation = '0;
-    status.resource_id = '0;
-    status.command_id = '0;
-    status.wr_id = '0;
-    status.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO
-                                           : RDMA_SEVERITY_ERROR;
-    status.retryable = 1'b0;
-    status.message = message;
+    void'(set_fields_noalloc(status, code, message));
     return status;
   endfunction
 
-  // 功能：在 rdma_status 中，success 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；success 读取 message 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：success 的结果直接由 return make(RDMA_SC_OK, message) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：success 创建 code=OK、category=STATE、severity=INFO 的完整默认诊断。
+  // 输入/输出及副作用：message 透传 make；返回 factory 状态对象，不读取或修改业务账本。
+  // 失败/边界：继承 make 的 typed factory 回调及非空前提；不是无分配或非致命错误入口。
   static function automatic rdma_status success(string message = "");
     return make(RDMA_SC_OK, message);
   endfunction
 
-  // 功能：ok 按函数体读取当前字段并生成 bit 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：无显式参数；ok 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：ok 仅按当前 code 是否等于 RDMA_SC_OK 判断成功，不用 category 或 severity 代替错误码。
+  // 输入/输出及副作用：无参数；读取 code 并返回 bit，不修改诊断字段。
+  // 失败/边界：所有非 OK 编码返回 0；调用方必须先排除 null 对象。
   function bit ok();
     return code == RDMA_SC_OK;
   endfunction
 
-  // 功能：在 rdma_status 中，category_for 把输入枚举或资源类型映射成对应的状态类别、执行引擎、opcode 或生命周期策略。
-  // 输入/输出及副作用：code（输入）；category_for 读取 code 并使用输入参数和固定枚举/常量；函数返回 rdma_status_category_e，不取得调用方资源所有权。
-  // 失败/边界：category_for 的结果直接由 return RDMA_STATUS_STATE 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：category_for 将错误码映射为配置、资源、状态、codec、超时、PCIe、DMA、队列、硬件或复位类别。
+  // 输入/输出及副作用：只读 code；返回 case 中对应的 category，不分配对象或改写任何字段。
+  // 失败/边界：OK 属于 STATE；未列出的编码保守归入 HARDWARE，不将未知编码改写为 OK。
   static function automatic rdma_status_category_e category_for(
     rdma_status_code_e code
   );
@@ -179,9 +226,9 @@ class rdma_status extends uvm_object;
     endcase
   endfunction
 
-  // 功能：convert2string 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：convert2string 输出分类、错误码、硬件有效位、引擎、身份、严重性、重试位与消息的诊断文本。
+  // 输入/输出及副作用：无参数；读取本对象字段并返回 string，无 factory 或业务副作用。
+  // 失败/边界：无枚举名称时输出 UNKNOWN(数值)；hardware_code_valid=0 时省略硬件码文本。
   virtual function string convert2string();
     string category_text;
     string code_text;

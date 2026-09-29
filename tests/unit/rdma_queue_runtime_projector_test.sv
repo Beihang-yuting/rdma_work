@@ -1,5 +1,5 @@
 // 目录/层次：tests/unit；职责：独立验证 runtime 值投影，不构造 runtime 或生命周期环境。
-// 依赖：UVM factory、runtime transaction models 和 rdma_queue_runtime_projector。
+// 依赖：UVM factory、runtime transaction models、runtime/data projector 和 rdma_status 值接口。
 // 所有权/生命周期：测试拥有合成对象图与临时 factory；结束恢复原 factory，不申请外部资源。
 
 // 错型对象不携带任何 RDMA 值字段，确保所有 typed cast 都必须拒绝。
@@ -18,6 +18,9 @@ class rdma_runtime_value_factory extends uvm_default_factory;
   bit wrong_type;
   bit fired;
   bit reenter;
+  bit dirty_status;
+  bit reenter_status;
+  rdma_status nested_status;
   int unsigned calls;
   rdma_queue_pending_operation inner_source;
   rdma_queue_pending_operation inner_copy;
@@ -32,12 +35,37 @@ class rdma_runtime_value_factory extends uvm_default_factory;
     wrong_type = 1'b0;
     fired = 1'b0;
     reenter = 1'b0;
+    dirty_status = 1'b0;
+    reenter_status = 1'b0;
     calls = 0;
   endfunction
 
-  // 功能：截获精确名称的一次创建，或在 image 窗口递归进入同一 static automatic 值链。
+  // 功能：创建所有诊断字段均带旧证据的 status，暴露遗漏清零或只覆盖部分字段的初始化。
+  // 输入/输出及副作用：name 命名直接 new 的测试独占对象；不访问 factory，不改变调用计数。
+  // 失败/边界：故意使 category/code 不匹配；对象不代表可提交事务，也不调用生产初始化 helper。
+  function rdma_status make_dirty_status(string name);
+    rdma_status result;
+
+    result = new(name);
+    result.category = RDMA_STATUS_PCIE;
+    result.code = RDMA_SC_TIMEOUT;
+    result.hardware_code = '1;
+    result.hardware_code_valid = 1'b1;
+    result.source_engine = RDMA_ENGINE_CMQ;
+    result.function_uid = '1;
+    result.generation = '1;
+    result.resource_id = '1;
+    result.command_id = '1;
+    result.wr_id = '1;
+    result.severity = RDMA_SEVERITY_ERROR;
+    result.retryable = 1'b1;
+    result.message = "old evidence";
+    return result;
+  endfunction
+
+  // 功能：截获单次 null/错型、status 预填，或在 image/status 窗口递归进入 automatic 值链。
   // 输入/输出及副作用：requested_type/parent_inst_path/name 默认透传；累计 calls，
-  //   命中故障置 fired；重入前清 reenter，inner_copy/inner_status 保存嵌套结果。
+  //   命中故障置 fired；重入前清对应开关，inner_copy/inner_status 或 nested_status 保存嵌套结果。
   // 失败/边界：注入返回 null 或独立错型对象；不改变原 source，不持续递归，不吞生产错误。
   virtual function uvm_object create_object_by_type(
     uvm_object_wrapper requested_type, string parent_inst_path = "", string name = ""
@@ -45,6 +73,10 @@ class rdma_runtime_value_factory extends uvm_default_factory;
     rdma_runtime_value_wrong wrong;
 
     calls++;
+    if (reenter_status && name == "runtime_status") begin
+      reenter_status = 1'b0;
+      nested_status = rdma_queue_runtime_projector::make_runtime_status(RDMA_SC_TIMEOUT, "inner");
+    end
     if (reenter && name == "nonfatal_image_copy") begin
       reenter = 1'b0;
       inner_status = rdma_queue_runtime_projector::clone_pending_value(inner_source, inner_copy);
@@ -56,6 +88,8 @@ class rdma_runtime_value_factory extends uvm_default_factory;
       wrong = new();
       return wrong;
     end
+    if (dirty_status && requested_type == rdma_status::get_type())
+      return make_dirty_status(name);
     return super.create_object_by_type(requested_type, parent_inst_path, name);
   endfunction
 endclass
@@ -287,10 +321,10 @@ class rdma_queue_runtime_projector_test extends uvm_test;
     status.function_uid = '1;
     status.retryable = 1'b1;
     calls_before = factory.calls;
-    if (!values::set_runtime_status_noalloc(status, RDMA_SC_OK, "reset") ||
+    if (!rdma_status::set_fields_noalloc(status, RDMA_SC_OK, "reset") ||
         !status.ok() || status.hardware_code_valid || status.hardware_code != 0 ||
         status.function_uid != 0 || status.retryable || factory.calls != calls_before ||
-        values::set_runtime_status_noalloc(null, RDMA_SC_OK))
+        rdma_status::set_fields_noalloc(null, RDMA_SC_OK))
       `uvm_error("RUNTIME_VALUE", "noalloc status contract changed")
     status = values::clone_handle_value_nonfatal(null, handle_copy);
     if (!values::status_is_ok(status) || handle_copy != null ||
@@ -318,7 +352,98 @@ class rdma_queue_runtime_projector_test extends uvm_test;
       `uvm_error("RUNTIME_VALUE", "identity/route/cursor comparison changed")
   endfunction
 
-  // 功能：运行独立对象图/故障/边界测试，并在 image factory 窗口嵌套第二次完整 pending clone。
+  // 功能：逐字段断言初始化后的全部诊断，不用另一个构造器作为预期值，避免共用 helper 掩盖缺陷。
+  // 输入/输出及副作用：status/code/message 为待验值与预期；分类按既有 category_for，逐项检查清零字段。
+  // 失败/边界：null、任一残留字段或错误严重度报告 UVM_ERROR；不调用虚拟复制或分配 status。
+  function void check_initialized_status(
+    rdma_status status, rdma_status_code_e code, string message
+  );
+    if (status == null) begin
+      `uvm_error("STATUS_INIT", "missing status")
+      return;
+    end
+    if (status.category != rdma_status::category_for(code) || status.code != code ||
+        status.hardware_code != 0 || status.hardware_code_valid ||
+        status.source_engine != RDMA_ENGINE_NONE || status.function_uid != 0 ||
+        status.generation != 0 || status.resource_id != 0 || status.command_id != 0 ||
+        status.wr_id != 0 || status.retryable || status.message != message ||
+        status.severity != (code == RDMA_SC_OK ? RDMA_SEVERITY_INFO : RDMA_SEVERITY_ERROR))
+      `uvm_error("STATUS_INIT", "initialization retained old diagnosis")
+  endfunction
+
+  // 功能：覆盖全部 17 个错误码及未知码的九种状态入口，检查原位身份、factory 计数和分配策略差异。
+  // 输入/输出及副作用：factory 临时启用脏字段、null/错型；每个 code 覆盖 noalloc/direct/typed、
+  //   runtime 三模式和 data 三模式；另嵌套 runtime 状态创建，结束关闭注入。
+  // 失败/边界：runtime 故障必须 fallback，data 故障必须 null；typed 只测合法 factory，保留其 fatal 契约。
+  function void check_status_matrix(rdma_runtime_value_factory factory);
+    rdma_status status, saved;
+    rdma_status_code_e code;
+    int unsigned before_calls;
+    int unsigned cases;
+
+    code = code.first();
+    cases = 0;
+    factory.dirty_status = 1'b1;
+    for (int index = 0; index <= code.num(); index++) begin
+      if (index == code.num())
+        code = rdma_status_code_e'('1);
+      status = factory.make_dirty_status("slot");
+      saved = status;
+      before_calls = factory.calls;
+      if (!rdma_status::set_fields_noalloc(status, code, "matrix") ||
+          status != saved || status.get_name() != "slot" || factory.calls != before_calls)
+        `uvm_error("STATUS_INIT", "noalloc identity or callback changed")
+      check_initialized_status(status, code, "matrix");
+      status = rdma_status::make_direct(code, "matrix");
+      check_initialized_status(status, code, "matrix");
+      if (factory.calls != before_calls || status.get_name() != "rdma_status_direct")
+        `uvm_error("STATUS_INIT", "direct construction entered factory")
+      status = rdma_status::make(code, "matrix");
+      check_initialized_status(status, code, "matrix");
+      if (factory.calls != before_calls + 1 || status.get_name() != "rdma_status")
+        `uvm_error("STATUS_INIT", "typed factory name or count changed")
+      cases += 3;
+      for (int fault = 0; fault < 3; fault++) begin
+        before_calls = factory.calls;
+        factory.fail_name = fault == 0 ? "" : "runtime_status";
+        factory.wrong_type = fault == 2;
+        factory.fired = 1'b0;
+        status = values::make_runtime_status(code, "matrix");
+        check_initialized_status(status, code, "matrix");
+        if (factory.calls != before_calls + 1 || factory.fired != (fault != 0) ||
+            status.get_name() != (fault == 0 ? "runtime_status" : "runtime_status_fallback"))
+          `uvm_error("STATUS_INIT", "runtime allocation policy changed")
+        before_calls = factory.calls;
+        factory.fail_name = fault == 0 ? "" : "queue_data_engine_status";
+        factory.fired = 1'b0;
+        status = rdma_queue_data_projector::make_status_nonfatal(code, "matrix");
+        if (fault == 0)
+          check_initialized_status(status, code, "matrix");
+        else if (status != null)
+          `uvm_error("STATUS_INIT", "data factory failure was hidden")
+        if (factory.calls != before_calls + 1 || factory.fired != (fault != 0))
+          `uvm_error("STATUS_INIT", "data allocation count or fault changed")
+        cases += 2;
+      end
+      code = code.next();
+    end
+    factory.fail_name = "";
+    factory.reenter_status = 1'b1;
+    before_calls = factory.calls;
+    status = values::make_runtime_status(RDMA_SC_OK, "outer");
+    check_initialized_status(status, RDMA_SC_OK, "outer");
+    check_initialized_status(factory.nested_status, RDMA_SC_TIMEOUT, "inner");
+    if (factory.calls != before_calls + 2 || status == factory.nested_status ||
+        factory.reenter_status)
+      `uvm_error("STATUS_INIT", "nested status factory corrupted automatic locals")
+    factory.dirty_status = 1'b0;
+    if (cases != 162)
+      `uvm_error("STATUS_INIT", "status matrix coverage changed")
+    `uvm_info("STATUS_INIT",
+      $sformatf("completed %0d status initialization cases and nested callback", cases), UVM_LOW)
+  endfunction
+
+  // 功能：运行对象图/故障/边界与状态矩阵，并在 image factory 窗口嵌套第二次完整 pending clone。
   // 输入/输出及副作用：phase 管理 objection；临时替换全局 factory，完成后恢复 saved_factory。
   // 失败/边界：内外层 source/tag/copy 不得串扰；完成标记不能替代 runner 的 UVM error 检查。
   task run_phase(uvm_phase phase);
@@ -337,6 +462,7 @@ class rdma_queue_runtime_projector_test extends uvm_test;
     check_graph(1'b1);
     check_factory_faults(factory);
     check_boundaries(factory);
+    check_status_matrix(factory);
     source = make_source(1'b0, 229);
     factory.inner_source = make_source(1'b1, 230);
     factory.reenter = 1'b1;
