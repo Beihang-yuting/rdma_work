@@ -24,7 +24,17 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch240：基于 `43b40b5`，execute 的五段快照/失败回退共用一个锁内出口；
+当前 Batch241：基于 `4c5b76a`，reconcile 的十处解锁/返回合为一个锁出口，
+Host-visible/current pending 共用状态快照；保留 retained-first、live-only
+expire/poll/reread、终态独立快照及 FIFO 不消费。入口 146→140 行，projector
+91→88 行，相关 tokens 1,081→988，生产净减 6 行；不新增方法、字段、owner/API。
+修订旧版/重构版 25 场景、63 查询专项、core 110/93、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+401/401、驱动及静态对照门禁全部通过；UVM 0/0/0，E2E 保留既有编译告警，
+最终送测哈希一致。详见
+`task-rdma-batch241-cmq-reconcile-delivery-report.md`；不合并、不推送，计划仍 active。
+
+前批 Batch240：基于 `43b40b5`，execute 的五段快照/失败回退共用一个锁内出口；
 生命周期分支只选 observation 策略，armed pending 仍在锁外 wait，之后重新定位
 retained authority。方法 219→180 行、tokens 1,036→851，生产净减 36 行；
 213 方法声明与字段不变，没有新增 helper/owner/公开 API。修订旧版与重构版

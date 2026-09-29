@@ -22,6 +22,16 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch241 基于 `4c5b76a` 沿用 `feature/rdma-structural-batch226`：reconcile 的十处
+解锁/返回统一为一个出口，Host-visible/current pending 共用状态快照；保留
+retained-first、仅 live pending 驱动 expire/poll、终态独立快照与 FIFO 不消费。
+相关方法 tokens 1,081→988，生产净减 6 行；213 声明/字段不变，不新增 owner/API。
+修订旧版/重构版 25 场景、63 查询专项、core 110/93、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+401/401、驱动及静态对照门禁全部通过；最终哈希一致，UVM 0/0/0，E2E 保留
+既有编译告警。不合并、不推送，见
+`task-rdma-batch241-cmq-reconcile-delivery-report.md`；项目仍 active。
+
 Batch240 基于 `43b40b5` 沿用 `feature/rdma-structural-batch226`：execute 的五段
 快照/失败回退合为一个锁内出口，保留各生命周期诊断及锁外等待后的重定位。
 方法 219→180 行、tokens 1,036→851，生产净减 36 行；213 声明/字段不变，

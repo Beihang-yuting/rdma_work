@@ -3,7 +3,8 @@
 //   生命周期安装无状态 transport facade；完成路径按读取、匹配、提交和回收组织，
 //   各阶段只在同一次 engine_lock 调用内借用候选；恢复入口统一拒绝出口，并把
 //   RETRY 提交/发布/证据交付交给同类持锁业务阶段；execute 按 retained 状态选择
-//   观测策略后统一交付 detached 结果，不增加持久 authority。
+//   观测策略后统一交付 detached 结果；reconcile 共用非终态状态投影和锁出口，
+//   不增加持久 authority。
 // 依赖：依赖 CMQ model/profile、Host-memory adapter、doorbell scheduler、
 //   rdma_cmq_transport 与共享 submission evidence。
 // 所有权与生命周期：engine 拥有本地锁、快照、账本和每次 prepare 新建的
@@ -12377,15 +12378,16 @@ class rdma_cmq_engine extends uvm_object;
   //   与 completion snapshot 规则各自保持唯一 owner。
   // 功能：按 retained journal item 的 lifecycle state/phase 分类 reconcile
   //   结果，构造 operation-status 或 detached terminal completion，并返回
-  //   terminal_known 与 completion 输出；该阶段不取放 engine_lock、不推进
+  //   terminal_known 与 completion 输出；Host-visible/current pending 共用状态
+  //   快照，但保留各自 phase 拒绝和 null 诊断；该阶段不取放 engine_lock、不推进
   //   journal/FIFO/cursor，也不触发新的 runtime 操作。
   // 输入/输出及副作用：batch_record、journal_item、pending_active 为锁内已
   //   定位输入；terminal_known、completion、projected_status 为输出。helper
   //   只调用受控 snapshot/copy helper，输出图与 retained row 隔离，不接管外部
   //   资源所有权。
-  // 失败/边界：null retained row、STAGED/PENDING_EFFECT、pending/terminal
-  //   phase 与 completion 形状不一致、completion/status snapshot 或 copy 返回
-  //   null/non-OK 时返回 INVALID_STATE；HOST_VISIBLE_NOT_PUBLISHED 与仍 pending
+  // 失败/边界：null retained row、STAGED/PENDING_EFFECT、pending/terminal phase
+  //   与 completion 组合错误或 status copy 缺失返回 INVALID_STATE；嵌套 snapshot
+  //   拒绝保留原码，null snapshot status 映射为 INVALID_STATE。Host-visible/仍 pending
   //   的合法 operation failure 通过 projected_status 原样传播而不是误报结构错。
   protected function rdma_status
   project_reconciled_journal_item_locked(
@@ -12400,6 +12402,7 @@ class rdma_cmq_engine extends uvm_object;
     rdma_status operation_status;
     rdma_cmq_completion detached_completion;
     bit terminal_row;
+    string status_snapshot_failure_message;
 
     terminal_known = 1'b0;
     completion = null;
@@ -12416,39 +12419,35 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ reconcile item is staged or has a pending external effect"
       );
 
-    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
-      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
-          journal_item.completion != null)
-        return invalid_state(
-          "CMQ unarmed reconcile item has terminal evidence"
-        );
+    // 未 arm 行不能误走 current pending 的 phase 门禁；先按原优先级区分业务，
+    // 再复制相同的 operation-status 值。没有终态时不创建 completion 或消费 FIFO。
+    if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED ||
+        pending_active) begin
+      if (journal_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
+        if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
+            journal_item.completion != null)
+          return invalid_state(
+            "CMQ unarmed reconcile item has terminal evidence"
+          );
+        status_snapshot_failure_message = "CMQ unarmed reconcile status snapshot returned null";
+      end
+      else begin
+        if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_PENDING ||
+            journal_item.completion != null ||
+            !(journal_item.state inside {
+              RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+              RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+            }))
+          return invalid_state("CMQ reconcile pending item is malformed");
+        status_snapshot_failure_message = "CMQ pending reconcile status snapshot returned null";
+      end
       snapshot_status = snapshot_retained_operation_status_locked(
         journal_item, operation_status
       );
       if (snapshot_status == null || !snapshot_status.ok() ||
           operation_status == null)
         return (snapshot_status == null) ? invalid_state(
-          "CMQ unarmed reconcile status snapshot returned null"
-        ) : snapshot_status;
-      projected_status = operation_status;
-      return rdma_status::success();
-    end
-
-    if (pending_active) begin
-      if (journal_item.completion_phase != RDMA_CMQ_COMPLETION_PENDING ||
-          journal_item.completion != null ||
-          !(journal_item.state inside {
-            RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
-            RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
-          }))
-        return invalid_state("CMQ reconcile pending item is malformed");
-      snapshot_status = snapshot_retained_operation_status_locked(
-        journal_item, operation_status
-      );
-      if (snapshot_status == null || !snapshot_status.ok() ||
-          operation_status == null)
-        return (snapshot_status == null) ? invalid_state(
-          "CMQ pending reconcile status snapshot returned null"
+          status_snapshot_failure_message
         ) : snapshot_status;
       projected_status = operation_status;
       return rdma_status::success();
@@ -12483,7 +12482,8 @@ class rdma_cmq_engine extends uvm_object;
   //   生命周期为唯一观察依据，按状态返回未发布 operation status 或终态 completion。
   // 输入/输出及副作用：ticket 为 caller 的只读输入；terminal_known、completion、
   //   status 为 detached 输出。只有当前 ACTIVE incarnation 的 PENDING 项会调用
-  //   一次 expire_locked()/poll_locked()；终态、未发布和复位证据只读 journal。
+  //   一次 expire_locked()/poll_locked()；终态、未发布和复位证据只读 journal，
+  //   所有结果均通过单次观察段后的唯一出口释放 engine_lock。
   // 失败/边界：坏 ticket、journal index 歧义、STAGED/PENDING_EFFECT、旧 pending
   //   缺少当前 runtime authority 或 retained graph 不完整时 fail closed；不删除
   //   FIFO/journal completion、不重试发布、不敲 doorbell，重复终态观察保持幂等。
@@ -12509,128 +12509,122 @@ class rdma_cmq_engine extends uvm_object;
     completion = null;
     status = invalid_state("CMQ ticket reconcile did not complete");
     engine_lock.get(1);
-    status = reset_release_gate_status();
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
-    if (ticket == null) begin
-      status = invalid_argument("CMQ reconcile ticket is null");
-      engine_lock.put(1);
-      return;
-    end
-    if (!rdma_cmq_ticket_shape_valid(ticket)) begin
-      status = invalid_argument("CMQ reconcile ticket is invalid");
-      engine_lock.put(1);
-      return;
-    end
+    // 单次观察段保留首错和 poll/reread 次序；break 只退出本段，不推断 status
+    // 是否代表 terminal，也不抹除合法的 operation failure，锁在段后统一归还。
+    do begin : reconcile_observation
+      status = reset_release_gate_status();
+      if (!status.ok()) begin
+        break;
+      end
+      if (ticket == null) begin
+        status = invalid_argument("CMQ reconcile ticket is null");
+        break;
+      end
+      if (!rdma_cmq_ticket_shape_valid(ticket)) begin
+        status = invalid_argument("CMQ reconcile ticket is invalid");
+        break;
+      end
 
-    // 用 direct nonfatal seam 冻结 caller ticket；reconcile 不应因当前
-    // runtime 已 reset，或因 delivery FIFO 已被其他消费者清空，而改变查询值。
-    snapshot_context = new();
-    if (!snapshot_context.try_snapshot_optional_ticket(
-          ticket, ticket_snapshot, failure_reason
-        ) || ticket_snapshot == null) begin
-      status = invalid_argument(
-        {"CMQ reconcile ticket snapshot failed: ", failure_reason}
-      );
-      engine_lock.put(1);
-      return;
-    end
-
-    // 先查稳定 ticket index，再决定是否需要当前 runtime authority；这是
-    // old reset/timeout/late ticket 能跨 reprepare 被观察的关键顺序。
-    validation_status = locate_journal_item_by_ticket_locked(
-      ticket_snapshot, batch_record, journal_item,
-      journal_item_index
-    );
-    if (validation_status == null || !validation_status.ok()) begin
-      status = (validation_status == null) ? invalid_state(
-        "CMQ reconcile journal locator returned null status"
-      ) : validation_status;
-      engine_lock.put(1);
-      return;
-    end
-
-    pending_active =
-      journal_item.state inside {
-        RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
-        RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
-      } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
-      journal_item.completion == null;
-
-    if (pending_active) begin
-      // 只有同一 ACTIVE engine incarnation 的真实 published item 才能
-      // 触发一次 expire/poll；unarmed fenced row 与旧 incarnation 直接失败。
-      current_identity = null;
-      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
-          prepared_binding == null || cmq_snapshot == null ||
-          cmq_snapshot.handle == null ||
-          batch_record.engine_incarnation != engine_incarnation ||
-          batch_record.function_identity == null ||
-          !rdma_cmq_try_snapshot_identity_direct(
-            prepared_binding.function_identity_snapshot(), current_identity
-          ) || current_identity == null ||
-          !batch_record.function_identity.same_incarnation(current_identity) ||
-          !same_handle(cmq_snapshot.handle, batch_record.cmq_h) ||
-          !ticket_has_engine_authority(ticket_snapshot)) begin
-        status = invalid_state(
-          "CMQ reconcile pending ticket lacks current runtime authority"
+      // 用 direct nonfatal seam 冻结 caller ticket；reconcile 不应因当前
+      // runtime 已 reset，或因 delivery FIFO 已被其他消费者清空，而改变查询值。
+      snapshot_context = new();
+      if (!snapshot_context.try_snapshot_optional_ticket(
+            ticket, ticket_snapshot, failure_reason
+          ) || ticket_snapshot == null) begin
+        status = invalid_argument(
+          {"CMQ reconcile ticket snapshot failed: ", failure_reason}
         );
-        engine_lock.put(1);
-        return;
+        break;
       end
 
-      helper_status = expire_locked();
-      if (helper_status == null || !helper_status.ok()) begin
-        status = (helper_status == null) ? invalid_state(
-          "CMQ reconcile expiry returned null status"
-        ) : helper_status;
-        engine_lock.put(1);
-        return;
-      end
-      helper_status = rdma_status::success();
-      poll_locked(helper_status);
-      if (helper_status == null || !helper_status.ok()) begin
-        status = (helper_status == null) ? invalid_state(
-          "CMQ reconcile poll returned null status"
-        ) : helper_status;
-        engine_lock.put(1);
-        return;
-      end
-
-      // expire/poll 可能同时推进其他 slot；只重新读取原 ticket 对应的
-      // retained item，绝不从 FIFO 顺序或 slot index 猜测结果。
+      // 先查稳定 ticket index，再决定是否需要当前 runtime authority；这是
+      // old reset/timeout/late ticket 能跨 reprepare 被观察的关键顺序。
       validation_status = locate_journal_item_by_ticket_locked(
         ticket_snapshot, batch_record, journal_item,
         journal_item_index
       );
       if (validation_status == null || !validation_status.ok()) begin
         status = (validation_status == null) ? invalid_state(
-          "CMQ reconcile journal reread returned null status"
+          "CMQ reconcile journal locator returned null status"
         ) : validation_status;
-        engine_lock.put(1);
-        return;
+        break;
       end
+
       pending_active =
         journal_item.state inside {
           RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
           RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
         } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
         journal_item.completion == null;
-    end
 
-    projection_status = project_reconciled_journal_item_locked(
-      batch_record, journal_item, pending_active, terminal_known,
-      completion, status
-    );
-    if (projection_status == null || !projection_status.ok()) begin
-      status = (projection_status == null) ? invalid_state(
-        "CMQ reconcile projection returned null status"
-      ) : projection_status;
-      engine_lock.put(1);
-      return;
-    end
+      if (pending_active) begin
+        // 只有同一 ACTIVE engine incarnation 的真实 published item 才能
+        // 触发一次 expire/poll；unarmed fenced row 与旧 incarnation 直接失败。
+        current_identity = null;
+        if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
+            prepared_binding == null || cmq_snapshot == null ||
+            cmq_snapshot.handle == null ||
+            batch_record.engine_incarnation != engine_incarnation ||
+            batch_record.function_identity == null ||
+            !rdma_cmq_try_snapshot_identity_direct(
+              prepared_binding.function_identity_snapshot(), current_identity
+            ) || current_identity == null ||
+            !batch_record.function_identity.same_incarnation(current_identity) ||
+            !same_handle(cmq_snapshot.handle, batch_record.cmq_h) ||
+            !ticket_has_engine_authority(ticket_snapshot)) begin
+          status = invalid_state(
+            "CMQ reconcile pending ticket lacks current runtime authority"
+          );
+          break;
+        end
+
+        helper_status = expire_locked();
+        if (helper_status == null || !helper_status.ok()) begin
+          status = (helper_status == null) ? invalid_state(
+            "CMQ reconcile expiry returned null status"
+          ) : helper_status;
+          break;
+        end
+        helper_status = rdma_status::success();
+        poll_locked(helper_status);
+        if (helper_status == null || !helper_status.ok()) begin
+          status = (helper_status == null) ? invalid_state(
+            "CMQ reconcile poll returned null status"
+          ) : helper_status;
+          break;
+        end
+
+        // expire/poll 可能同时推进其他 slot；只重新读取原 ticket 对应的
+        // retained item，绝不从 FIFO 顺序或 slot index 猜测结果。
+        validation_status = locate_journal_item_by_ticket_locked(
+          ticket_snapshot, batch_record, journal_item,
+          journal_item_index
+        );
+        if (validation_status == null || !validation_status.ok()) begin
+          status = (validation_status == null) ? invalid_state(
+            "CMQ reconcile journal reread returned null status"
+          ) : validation_status;
+          break;
+        end
+        pending_active =
+          journal_item.state inside {
+            RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+            RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+          } && journal_item.completion_phase == RDMA_CMQ_COMPLETION_PENDING &&
+          journal_item.completion == null;
+      end
+
+      projection_status = project_reconciled_journal_item_locked(
+        batch_record, journal_item, pending_active, terminal_known,
+        completion, status
+      );
+      if (projection_status == null || !projection_status.ok()) begin
+        status = (projection_status == null) ? invalid_state(
+          "CMQ reconcile projection returned null status"
+        ) : projection_status;
+        break;
+      end
+    end while (1'b0);
     engine_lock.put(1);
   endtask
 

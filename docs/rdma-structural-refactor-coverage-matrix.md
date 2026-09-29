@@ -12,6 +12,7 @@
 
 | 业务边界 | 已落地的结构 seam | 主要验证入口 | 当前状态 | 遗留边界 |
 | --- | --- | --- | --- | --- |
+| CMQ reconcile 查询交付 | Batch241 将十处解锁/返回合为一个出口，Host-visible/current pending 共用 operation-status 快照；retained-first、live-only expire/poll/reread 和终态快照不变 | 独立 25 场景/63 查询矩阵、四项 Python 门禁、固定基线整方法结构对照 | 入口 146→140 行、projector 91→88 行，生产净减 6 行；修订旧版/重构版专项、core 110/93、CMQ 28/11、integration 10、Host-memory 3、PCIe 1、E2E 3、Python 401/401、驱动及静态审计全部通过；见 Batch241 报告 | 未合回 main；CMQ 总规模、整体编排、跨组件并发及最终架构验收仍 OPEN |
 | CMQ execute 观测交付 | Batch240 将五段快照/失败回退收为一个锁内出口；生命周期策略、锁外 wait 和重定位仍在入口 | 独立 24-case retained/等待/故障矩阵、四项 Python 门禁、固定基线整方法结构对照 | execute 219→180 行，生产净减 36 行；修订旧版/重构版专项、core 109/92、CMQ 28/11、integration 10、Host-memory 3、PCIe 1、E2E 3、Python 397/397、驱动及静态审计全部通过；见 Batch240 报告 | 未合回 main；CMQ 总规模、整体编排、跨组件并发及最终架构验收仍 OPEN |
 | CMQ RETRY 发布阶段 | Batch239 将 attempt 提交、同步 transport 和 evidence 交付收进同类持锁阶段；caller 持有准入、CONFIRM、最终 stale、失败和锁交付 | 独立 96-case 历史 evidence/真实 arm/合法及畸形返回矩阵、五项 Python 门禁、整方法展开对照 | recovery 361→227 行，生产净增 30 行，不称为整体收缩；修订旧版/重构版专项、core 108/91、CMQ 28/11、integration 10、Host-memory 3、PCIe 1、E2E 3、Python 393/393、驱动及静态/等价审计全部通过；见 Batch239 报告 | 未合回 main；CMQ 总规模与整体编排、跨组件并发及最终架构验收仍 OPEN |
 | CMQ recovery 失败收尾 | Batch238 将 12 个 aligned 拒绝收为一个回填/解锁出口；早拒绝和两条成功路径保留，owner 失败退出两层循环 | 独立 36-call 连续拒绝/修复矩阵、五项 Python 门禁、固定基线整方法展开对照 | 方法 375→361 行，生产净减 9 行，212 声明/字段不变；旧版/重构版专项、core 107/90、CMQ 28/11、integration 10、Host-memory 3、PCIe 1、E2E 3、Python 388/388、驱动及静态/等价审计全通过，UVM 0/0/0；见 Batch238 报告 | 未合回 main；submit/recovery/reset 整体编排、CMQ 总规模、跨组件并发及最终架构验收仍 OPEN |
