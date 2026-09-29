@@ -1,6 +1,7 @@
 // 目录：测试层 tests/unit。
 // 职责：验证 doorbell scheduler 的预检、分阶段 Host-memory 写、barrier、
 //   MMIO 截止时间、按 Function 串行化及每次调用 submission evidence 契约。
+//   状态矩阵分别验证 adapter 原始诊断传输与 legacy 枚举准入，避免重构时混用两者。
 // 依赖：rdma core 公开类型、UVM，rdma_mock_host_mem/rdma_mock_pcie、
 //   可控 factory 故障 wrapper 与调用 trace。
 // 所有权与生命周期：测试 phase 拥有本地 fixture 和断言证据；传给 DUT 的
@@ -1114,6 +1115,186 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                  "malformed observed result did not fail closed")
   endtask
 
+  // 功能：构造带完整非默认诊断的 hostile status，按 field 覆盖一个枚举坐标。
+  // 输入/输出及副作用：field=0/1/2/3 分别选 category/code/source_engine/severity，
+  //   encoding 按实际位宽转换；直接 new 返回测试独占值，故意保留 category/code 不匹配。
+  // 失败/边界：其它 field 不覆盖；枚举是二态 bit，不把保留编码矩阵称作 X/Z 注入；
+  //   source.clone 仍由既有 hostile 类型拒绝，不调用 factory 或生产字段 helper。
+  function automatic rdma_doorbell_clone_fault_status make_status_evidence(
+    int field, int encoding
+  );
+    rdma_doorbell_clone_fault_status value;
+
+    value = new("status_evidence");
+    value.category = RDMA_STATUS_PCIE;
+    value.code = RDMA_SC_TIMEOUT;
+    value.hardware_code = 32'h8765_4321;
+    value.hardware_code_valid = 1'b1;
+    value.source_engine = RDMA_ENGINE_CMQ;
+    value.function_uid = 64'h1234_5678_9abc_def0;
+    value.generation = 32'h1122_3344;
+    value.resource_id = 64'h3141_5926_5358_9793;
+    value.command_id = 64'h2384_6264_3383_2795;
+    value.wr_id = 64'h0123_4567_89ab_cdef;
+    value.severity = RDMA_SEVERITY_WARNING;
+    value.retryable = 1'b1;
+    value.message = "unmodified adapter evidence";
+    case (field)
+      0: value.category = rdma_status_category_e'(encoding);
+      1: value.code = rdma_status_code_e'(encoding);
+      2: value.source_engine = rdma_engine_kind_e'(encoding);
+      3: value.severity = rdma_severity_e'(encoding);
+      default: ;
+    endcase
+    return value;
+  endfunction
+
+  // 功能：独立断言 status 初始化覆盖全部 13 个字段，并保留指定直接构造名称。
+  // 输入/输出及副作用：value/code/message/name 为待验对象及预期；只发布 UVM_ERROR，
+  //   不调用生产初始化 helper 生成预期，也不创建状态对象。
+  // 失败/边界：null 时立即返回以避免解引用；旧硬件/身份/retry 字段残留或分类/严重度不符均拒绝。
+  function automatic void expect_fresh_status(
+    rdma_status value, rdma_status_code_e code, string message, string name
+  );
+    if (value == null) begin
+      `uvm_error("DOORBELL_STATUS", "missing initialized status")
+      return;
+    end
+    if (value.category != rdma_status::category_for(code) || value.code != code ||
+        value.hardware_code != 0 || value.hardware_code_valid ||
+        value.source_engine != RDMA_ENGINE_NONE || value.function_uid != 0 ||
+        value.generation != 0 || value.resource_id != 0 || value.command_id != 0 ||
+        value.wr_id != 0 || value.retryable || value.message != message ||
+        value.severity != (code == RDMA_SC_OK ? RDMA_SEVERITY_INFO : RDMA_SEVERITY_ERROR) ||
+        value.get_name() != name)
+      `uvm_error("DOORBELL_STATUS", "initialization retained old evidence or changed object name")
+  endfunction
+
+  // 功能：穷举 legacy 四个枚举坐标的全部编码，并验证三种 PCIe 调用的原始状态捕获不套用 legacy 准入。
+  // 输入/输出及副作用：scheduler/binding/mem/pcie/trace 复用本 test fixture；136 次
+  //   legacy 投影使用临时 null/错型 factory，恢复后执行 12 次故障提交；不分配外部 backing。
+  // 失败/边界：legacy 拒绝 category/code/source_engine 越界但保留 severity 和合法不匹配分类；
+  //   adapter 原始诊断不得规范化，effect/observer 必须保持对应阶段；所有偏差报 UVM_ERROR。
+  task automatic check_status_transfer_matrix(
+    rdma_doorbell_scheduler scheduler,
+    rdma_function_binding binding,
+    rdma_mock_host_mem mem,
+    rdma_mock_pcie pcie,
+    rdma_mock_call_trace trace
+  );
+    uvm_coreservice_t service;
+    uvm_factory saved_factory;
+    uvm_default_factory isolated_factory;
+    rdma_cmq_value_factory_fault_wrapper fault;
+    rdma_doorbell_clone_fault_status source;
+    rdma_doorbell_submission_result envelope, observed;
+    rdma_doorbell_result projected_result;
+    rdma_status projected_status;
+    rdma_doorbell_desc desc;
+    rdma_doorbell_counting_observer observer;
+    int limits[4] = '{16, 32, 16, 4};
+    string operations[3] = '{"dma_visibility_barrier", "mmio_ordering_barrier", "mmio_write"};
+    rdma_submission_effect_e effects[3] = '{
+      RDMA_SUBMIT_EFFECT_HOST_MEMORY_WRITTEN, RDMA_SUBMIT_EFFECT_HOST_MEMORY_ORDERED,
+      RDMA_SUBMIT_EFFECT_MMIO_MAYBE_VISIBLE
+    };
+    string reason, source_text;
+    bit accepted, expected;
+    int unsigned cases;
+
+    service = uvm_coreservice_t::get();
+    saved_factory = service.get_factory();
+    isolated_factory = new();
+    fault = new("legacy_status_fault", rdma_status::get_type());
+    isolated_factory.set_type_override_by_type(rdma_status::get_type(), fault);
+    service.set_factory(isolated_factory);
+    rdma_doorbell_clone_fault_status::clear_clone_calls();
+    cases = 0;
+    foreach (limits[field]) begin
+      for (int encoding = 0; encoding < limits[field]; encoding++) begin
+        source = make_status_evidence(field, encoding);
+        source_text = source.convert2string();
+        expected = (field == 0) ? encoding <= 10 :
+                   (field == 1) ? encoding <= 16 :
+                   (field == 2) ? encoding <= 11 : 1'b1;
+        for (int wrong = 0; wrong < 2; wrong++) begin
+          fault.arm(bit'(wrong));
+          expect_fresh_status(scheduler.configure(null, pcie), RDMA_SC_INVALID_ARGUMENT,
+            "host memory adapter is null", "doorbell_direct_status");
+          envelope = new("status_matrix_envelope");
+          expect_fresh_status(envelope.status, RDMA_SC_INVALID_STATE,
+            "doorbell submission has not completed validation",
+            "doorbell_submission_initial_status");
+          envelope.status = source;
+          envelope.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+          envelope.dependency_count = 3;
+          envelope.before_mmio_maybe_visible_called = 1'b1;
+          accepted = envelope.try_project_legacy(projected_result, projected_status, reason);
+          if (projected_status == null)
+            `uvm_fatal("DOORBELL_STATUS", "legacy projection returned null status")
+          if (accepted != expected || projected_result != null || projected_status == source ||
+              projected_status.get_name() != "legacy_doorbell_status")
+            `uvm_error("DOORBELL_STATUS", "legacy admission or detached shape changed")
+          if (expected) begin
+            if (projected_status.convert2string() != source_text || reason != "")
+              `uvm_error("DOORBELL_STATUS", "legacy projection normalized valid evidence")
+          end
+          else begin
+            expect_fresh_status(projected_status, RDMA_SC_INVALID_STATE,
+              "observed doorbell status is null or malformed", "legacy_doorbell_status");
+            if (reason != "observed doorbell status is null or malformed")
+              `uvm_error("DOORBELL_STATUS", "legacy rejection reason changed")
+          end
+          if (fault.call_count() != 0 || source.convert2string() != source_text ||
+              rdma_doorbell_clone_fault_status::get_clone_calls() != 0 ||
+              envelope.status != source || envelope.dependency_count != 3 ||
+              !envelope.before_mmio_maybe_visible_called ||
+              envelope.submission_effect != RDMA_SUBMIT_EFFECT_MMIO_VISIBLE)
+            `uvm_error("DOORBELL_STATUS", "projection invoked factory/clone or changed evidence")
+          fault.disarm();
+          cases++;
+        end
+      end
+    end
+    service.set_factory(saved_factory);
+
+    observer = new("status_matrix_observer");
+    foreach (operations[operation]) begin
+      for (int variant = 0; variant < 4; variant++) begin
+        source = make_status_evidence(variant - 1, 31);
+        source_text = source.convert2string();
+        desc = make_desc("status_matrix_desc", binding);
+        desc.barrier_policy = operation == 0 ? RDMA_DB_BARRIER_DMA :
+                              operation == 1 ? RDMA_DB_BARRIER_MMIO : RDMA_DB_BARRIER_NONE;
+        clear_observation(mem, pcie, trace);
+        expect_status("STATUS_MATRIX_ARM",
+          pcie.fail_next(operations[operation], source), RDMA_SC_OK);
+        observer.clear();
+        scheduler.submit_observed(binding, desc, observer, observed);
+        expect_observed_contract("STATUS_MATRIX_CAPTURE", observed, effects[operation], 0,
+          observer, operation == 2 ? 1 : 0, desc, source, 0);
+        if (observed == null || observed.status == null)
+          `uvm_fatal("DOORBELL_STATUS", "observed capture returned null evidence")
+        if (observed.status.get_name() !=
+              (operation == 0 ? "doorbell_dma_barrier_status" :
+               operation == 1 ? "doorbell_mmio_barrier_status" : "doorbell_mmio_write_status") ||
+            observed.status.convert2string() != source_text ||
+            source.convert2string() != source_text || pcie.calls.size() != 1)
+          `uvm_error("DOORBELL_STATUS", "adapter capture normalized or lost raw diagnostic fields")
+        accepted = observed.try_project_legacy(projected_result, projected_status, reason);
+        if (accepted != (variant == 0) || projected_result != null ||
+            observed.status.convert2string() != source_text ||
+            observed.submission_effect != effects[operation])
+          `uvm_error("DOORBELL_STATUS", "legacy rejection changed observed effect or diagnostic")
+        cases++;
+      end
+    end
+    clear_observation(mem, pcie, trace);
+    if (cases != 148)
+      `uvm_error("DOORBELL_STATUS", "status transfer matrix coverage changed")
+    `uvm_info("DOORBELL_STATUS", "completed 148 doorbell status transfer cases", UVM_LOW)
+  endtask
+
   // 功能：验证 observed 入口在参数/snapshot/preflight/锁/写/barrier/MMIO
   //   各边界发布精确单调 effect。
   // 输入/输出及副作用：scheduler/binding/mapping/mem/pcie/trace/request_context
@@ -1583,7 +1764,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     end
   endtask
 
-  // 功能：建立共享 mock 环境，依次验证 value copy、observed effect、预检、
+  // 功能：建立共享 mock 环境，依次验证 value copy、状态传输/legacy 准入、observed effect、预检、
   //   正常顺序、adapter 失败恢复、immutable snapshot 和 Function-lock/deadline 并发契约。
   // 输入/输出及副作用：phase 由 UVM 提供；task 持有 objection，分配 mock mapping、
   //   驱动 scheduler/adapter 并以 UVM report 发布所有可观测结果。
@@ -1698,6 +1879,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     //   同时保留具体 mapping 子类的不透明 allocation identity。
     check_value_clone_contracts(binding_a, mapping);
     check_observed_value_projection(binding_a);
+    check_status_transfer_matrix(scheduler, binding_a, mem, pcie, trace);
     check_observed_submission_contracts(
       scheduler, binding_a, mapping, mem, pcie, trace, request_context
     );

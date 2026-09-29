@@ -83,6 +83,59 @@ class StatusValueBoundaryTest(unittest.TestCase):
                       "rdma_status::copy_fields_noalloc(null, null)"):
             self.assertIn(token, post)
 
+    def test_doorbell_uses_types_without_duplicate_field_helpers(self):
+        """功能：要求 scheduler 直接复用 types，保留自己的直接构造名称和外部捕获边界。
+        输入输出及副作用：读取 scheduler 类的方法及原始文件；不构造对象或调用 factory。
+        失败边界：重复 set/copy helper、转发壳、丢失创建名或将外部捕获接入 legacy 校验时失败。
+        """
+        path = CORE / "rdma_doorbell_scheduler.sv"
+        code = read_code(path)
+        scheduler = code.split("class rdma_doorbell_scheduler extends", 1)[1]
+        declared = methods(scheduler)
+        self.assertNotIn("set_status_fields", code)
+        self.assertNotIn("copy_status_fields", scheduler)
+        self.assertIn("rdma_status::copy_fields_noalloc(source, candidate)",
+                      declared["capture_external_status"][2])
+        self.assertIn("rdma_status::copy_fields_noalloc(source, result.status)",
+                      declared["capture_pre_submit_status"][2])
+        self.assertIn("rdma_status::set_fields_noalloc(status, code, message)",
+                      declared["make_status_direct"][2])
+        for name in ("doorbell_direct_status", "doorbell_submission_initial_status",
+                     "legacy_doorbell_status"):
+            self.assertIn(f'new("{name}")', path.read_text())
+
+    def test_legacy_keeps_exact_enum_gate_before_copy(self):
+        """功能：保持 legacy 独有的 null/三枚举未知位及上界拒绝，字段传输不得抢在准入之前。
+        输入输出及副作用：提取 envelope 的 copy_status_fields，比较净化后的完整逻辑。
+        失败边界：少任一门禁、新增 severity/配对校验、改变检查顺序或内联回字段赋值均失败。
+        """
+        code = read_code(CORE / "rdma_doorbell_scheduler.sv")
+        envelope = code.split("class rdma_doorbell_submission_result extends", 1)[1]
+        body = methods(envelope.split("endclass", 1)[0])["copy_status_fields"][2]
+        expected = """protected static function bit copy_status_fields(
+          rdma_status source, rdma_status destination);
+          if (source == null || destination == null) return 1'b0;
+          if ($isunknown(source.category) || $isunknown(source.code) ||
+              $isunknown(source.source_engine) || source.category > RDMA_STATUS_RESET ||
+              source.code > RDMA_SC_RECOVERY_REQUIRED || source.source_engine > RDMA_ENGINE_RESET)
+            return 1'b0;
+          return rdma_status::copy_fields_noalloc(source, destination);
+          endfunction"""
+        self.assertEqual(re.sub(r"\s+", "", body), re.sub(r"\s+", "", expected))
+
+    def test_doorbell_matrix_covers_raw_capture_and_legacy_separately(self):
+        """功能：固定 136-case legacy 编码/factory 与 12-case PCIe 捕获矩阵在既有测试内运行。
+        输入输出及副作用：读取 scheduler test 的 fixture、独立断言与调用；只读。
+        失败边界：移除字段穷举、factory 恢复、原始诊断/高水位检查或矩阵入口即失败。
+        """
+        code = read_code(ROOT / "tests/unit/rdma_doorbell_scheduler_test.sv")
+        for token in ("limits[4] = '{16, 32, 16, 4}", "cases != 148",
+                      "service.set_factory(saved_factory)", "fault.call_count() != 0",
+                      "observed.status.convert2string() != source_text",
+                      "observed.submission_effect != effects[operation]",
+                      "check_status_transfer_matrix(scheduler, binding_a, mem, pcie, trace)"):
+            self.assertIn(token, code)
+
 
 if __name__ == "__main__":
     unittest.main()

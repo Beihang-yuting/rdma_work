@@ -2,6 +2,8 @@
 // 职责：定义 doorbell descriptor/result，并按依赖写、barrier、MMIO 顺序执行，发布每次调用的副作用证据。
 // 依赖：依赖 model 中的 Function/handle/image/effect 值，以及 Host-memory、PCIe adapter 契约。
 // 所有权与生命周期：descriptor/result/envelope 拥有 detached 值；scheduler/observer 只借用外部 adapter 或回调引用。
+// 状态边界：普通字段初始化/复制由 rdma_status 提供；legacy 的枚举准入保留在 envelope，
+//   raw factory、直接构造名称和 submission_effect 高水位仍由当前业务边界决定。
 
 // 设计说明：依赖阶段和 barrier policy 是硬件发布顺序的显式输入；effect 则是
 // 恢复方可消费的单调高水位，禁止从最终 status 反推已经发生的外部副作用。
@@ -321,43 +323,18 @@ class rdma_doorbell_submission_result extends uvm_object;
     super.new(name);
     doorbell_result = null;
     status = new("doorbell_submission_initial_status");
-    set_status_fields(status, RDMA_SC_INVALID_STATE,
+    rdma_status::set_fields_noalloc(status, RDMA_SC_INVALID_STATE,
                       "doorbell submission has not completed validation");
     submission_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
     dependency_count = 0;
     before_mmio_maybe_visible_called = 1'b0;
   endfunction
 
-  // 功能：把 code/message 及标准默认诊断上下文写入已存在的 status 值。
-  // 输入/输出及副作用：destination、code、message 为输入；覆盖 destination 的全部 rdma_status 字段。
-  // 失败/边界：destination 为 null 时返回 0 且不写状态；未知 code 由 category_for 保守归类。
-  protected static function bit set_status_fields(
-    rdma_status destination,
-    rdma_status_code_e code,
-    string message
-  );
-    if (destination == null)
-      return 1'b0;
-    destination.category = rdma_status::category_for(code);
-    destination.code = code;
-    destination.hardware_code = '0;
-    destination.hardware_code_valid = 1'b0;
-    destination.source_engine = RDMA_ENGINE_NONE;
-    destination.function_uid = '0;
-    destination.generation = '0;
-    destination.resource_id = '0;
-    destination.command_id = '0;
-    destination.wr_id = '0;
-    destination.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO
-                                                 : RDMA_SEVERITY_ERROR;
-    destination.retryable = 1'b0;
-    destination.message = message;
-    return 1'b1;
-  endfunction
-
-  // 功能：逐字段复制完整 status 诊断值，供 legacy 投影避开 source.clone 和 factory。
-  // 输入/输出及副作用：source/destination 为输入；成功只覆盖 destination，不修改 source。
-  // 失败/边界：任一对象为空，或 category/code/source_engine 含未知或越界编码时返回 0。
+  // 功能：copy_status_fields 先执行 legacy 专属的枚举准入，再复用公共无分配字段复制。
+  // 输入/输出及副作用：source/destination 为输入；准入通过后覆盖 destination 全部诊断，
+  //   不重新分类、不修改 source，也不调用 clone/factory；不根据 status 推导 submission_effect。
+  // 失败/边界：任一对象为空，或 category/code/source_engine 含未知或超过各自最大枚举值时
+  //   返回 0 且不写 destination；不检查 severity 或 category/code 的配对，自复制允许。
   protected static function bit copy_status_fields(
     rdma_status source,
     rdma_status destination
@@ -370,20 +347,7 @@ class rdma_doorbell_submission_result extends uvm_object;
         source.code > RDMA_SC_RECOVERY_REQUIRED ||
         source.source_engine > RDMA_ENGINE_RESET)
       return 1'b0;
-    destination.category = source.category;
-    destination.code = source.code;
-    destination.hardware_code = source.hardware_code;
-    destination.hardware_code_valid = source.hardware_code_valid;
-    destination.source_engine = source.source_engine;
-    destination.function_uid = source.function_uid;
-    destination.generation = source.generation;
-    destination.resource_id = source.resource_id;
-    destination.command_id = source.command_id;
-    destination.wr_id = source.wr_id;
-    destination.severity = source.severity;
-    destination.retryable = source.retryable;
-    destination.message = source.message;
-    return 1'b1;
+    return rdma_status::copy_fields_noalloc(source, destination);
   endfunction
 
   // 功能：把任意有效 handle 的 identity 标量直接复制为独立 base-handle 值。
@@ -475,7 +439,7 @@ class rdma_doorbell_submission_result extends uvm_object;
     projected_status = new("legacy_doorbell_status");
     failure_reason = "";
     if (!copy_status_fields(status, projected_status)) begin
-      set_status_fields(projected_status, RDMA_SC_INVALID_STATE,
+      rdma_status::set_fields_noalloc(projected_status, RDMA_SC_INVALID_STATE,
                         "observed doorbell status is null or malformed");
       failure_reason = "observed doorbell status is null or malformed";
       return 1'b0;
@@ -487,7 +451,7 @@ class rdma_doorbell_submission_result extends uvm_object;
                                         function_copy) ||
         !project_handle_direct(doorbell_result.target_h, target_copy)) begin
       projected_result = null;
-      set_status_fields(projected_status, RDMA_SC_INVALID_STATE,
+      rdma_status::set_fields_noalloc(projected_status, RDMA_SC_INVALID_STATE,
                         "observed doorbell result is malformed");
       failure_reason = "observed doorbell result is malformed";
       return 1'b0;
@@ -547,35 +511,9 @@ class rdma_doorbell_scheduler extends uvm_object;
     return make_status_direct(RDMA_SC_OK);
   endfunction
 
-  // 功能：将指定 code/message 和标准默认诊断上下文写入既有 status 对象。
-  // 输入/输出及副作用：destination、code、message 为输入；成功覆盖 destination 全部字段并返回 1。
-  // 失败/边界：destination 为 null 时返回 0；未知 code 由 category_for 保守归类，不触发 factory。
-  protected function bit set_status_fields(
-    rdma_status destination,
-    rdma_status_code_e code,
-    string message
-  );
-    if (destination == null)
-      return 1'b0;
-    destination.category = rdma_status::category_for(code);
-    destination.code = code;
-    destination.hardware_code = '0;
-    destination.hardware_code_valid = 1'b0;
-    destination.source_engine = RDMA_ENGINE_NONE;
-    destination.function_uid = '0;
-    destination.generation = '0;
-    destination.resource_id = '0;
-    destination.command_id = '0;
-    destination.wr_id = '0;
-    destination.severity = (code == RDMA_SC_OK) ? RDMA_SEVERITY_INFO
-                                                 : RDMA_SEVERITY_ERROR;
-    destination.retryable = 1'b0;
-    destination.message = message;
-    return 1'b1;
-  endfunction
-
   // 功能：直接构造独立 rdma_status，供 entry fallback 和外部 I/O 后 factory 故障降级。
-  // 输入/输出及副作用：code/message 为输入；返回 new 创建并完整初始化的非空 status。
+  // 输入/输出及副作用：code/message 为输入；直接 new doorbell_direct_status，
+  //   再由 rdma_status 的无分配 setter 初始化全部字段并返回非空结果。
   // 失败/边界：不调用 type_id::create/clone，故 null/错误 factory override 不会把恢复证据变成 fatal。
   protected function rdma_status make_status_direct(
     rdma_status_code_e code,
@@ -584,7 +522,7 @@ class rdma_doorbell_scheduler extends uvm_object;
     rdma_status status;
 
     status = new("doorbell_direct_status");
-    void'(set_status_fields(status, code, message));
+    void'(rdma_status::set_fields_noalloc(status, code, message));
     return status;
   endfunction
 
@@ -606,34 +544,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     );
   endfunction
 
-  // 功能：把 source 的完整诊断标量复制到已存在的 destination status。
-  // 输入/输出及副作用：source/destination 为输入；成功仅覆盖 destination，不修改或借用 source。
-  // 失败/边界：任一对象为空时返回 0 且不写 destination；不调用 clone/factory，也不推断 effect。
-  protected function bit copy_status_fields(
-    rdma_status source,
-    rdma_status destination
-  );
-    if (source == null || destination == null)
-      return 1'b0;
-    destination.category = source.category;
-    destination.code = source.code;
-    destination.hardware_code = source.hardware_code;
-    destination.hardware_code_valid = source.hardware_code_valid;
-    destination.source_engine = source.source_engine;
-    destination.function_uid = source.function_uid;
-    destination.generation = source.generation;
-    destination.resource_id = source.resource_id;
-    destination.command_id = source.command_id;
-    destination.wr_id = source.wr_id;
-    destination.severity = source.severity;
-    destination.retryable = source.retryable;
-    destination.message = source.message;
-    return 1'b1;
-  endfunction
-
   // 功能：在尚未触发外部 I/O 的路径把 validator/lock/snapshot status 写入初始 observed slot。
-  // 输入/输出及副作用：source 和 result 为输入；更新 result.status，但不分配 envelope 或 nested status。
-  // 失败/边界：source/result/status slot 为空时安装直接构造 INVALID_STATE；始终保持 result.status 非空。
+  // 输入/输出及副作用：source/result 为输入；只改写 result.status，非空槽原位复用，空槽直接补建。
+  // 失败/边界：result=null 时不处理；status slot=null 时直接补建；source=null 时
+  //   将 slot 重置为 INVALID_STATE，非空 source 原样复制且不执行 legacy 枚举准入。
   protected function void capture_pre_submit_status(
     rdma_status source,
     rdma_doorbell_submission_result result
@@ -644,8 +558,8 @@ class rdma_doorbell_scheduler extends uvm_object;
       result.status = make_status_direct(
         RDMA_SC_INVALID_STATE, "observed doorbell status slot is null"
       );
-    if (!copy_status_fields(source, result.status))
-      void'(set_status_fields(result.status, RDMA_SC_INVALID_STATE,
+    if (!rdma_status::copy_fields_noalloc(source, result.status))
+      void'(rdma_status::set_fields_noalloc(result.status, RDMA_SC_INVALID_STATE,
                               "doorbell operation returned null status"));
   endfunction
 
@@ -667,8 +581,10 @@ class rdma_doorbell_scheduler extends uvm_object;
   endfunction
 
   // 功能：在一次 adapter 调用结束后把其 status 捕获为 observed envelope 独占快照。
-  // 输入/输出及副作用：source/result/operation_context 为输入；恰好尝试一次 raw status 创建并替换 result.status。
-  // 失败/边界：source 为空或 raw factory 返回 null/错误类型时直接安装 INVALID_STATE 并返回 0；不回退 submission_effect。
+  // 输入/输出及副作用：source/result/operation_context 为输入；result 非空时尝试一次 raw 创建并替换其 status。
+  // 失败/边界：result=null 返回 0 且不创建对象；raw factory null/错型直接安装
+  //   INVALID_STATE，source=null 则复用 candidate 写入 INVALID_STATE；不回退 effect，
+  //   不执行 legacy 枚举准入，原始 adapter 诊断与旧接口投影策略分开。
   protected function bit capture_external_status(
     rdma_status source,
     rdma_doorbell_submission_result result,
@@ -689,8 +605,8 @@ class rdma_doorbell_scheduler extends uvm_object;
       );
       return 1'b0;
     end
-    if (!copy_status_fields(source, candidate)) begin
-      void'(set_status_fields(candidate, RDMA_SC_INVALID_STATE,
+    if (!rdma_status::copy_fields_noalloc(source, candidate)) begin
+      void'(rdma_status::set_fields_noalloc(candidate, RDMA_SC_INVALID_STATE,
                               {operation_context, " returned null status"}));
       result.status = candidate;
       return 1'b0;
@@ -1588,12 +1504,12 @@ class rdma_doorbell_scheduler extends uvm_object;
     result = new("doorbell_submission_result");
     result.dependency_count = (desc == null) ? 0 : desc.dependencies.size();
     if (binding == null) begin
-      void'(set_status_fields(result.status, RDMA_SC_INVALID_ARGUMENT,
+      void'(rdma_status::set_fields_noalloc(result.status, RDMA_SC_INVALID_ARGUMENT,
                               "function binding is null"));
       return;
     end
     if (desc == null) begin
-      void'(set_status_fields(result.status, RDMA_SC_INVALID_ARGUMENT,
+      void'(rdma_status::set_fields_noalloc(result.status, RDMA_SC_INVALID_ARGUMENT,
                               "doorbell descriptor is null"));
       return;
     end
@@ -1602,13 +1518,13 @@ class rdma_doorbell_scheduler extends uvm_object;
     //   因此 caller 在排队期间的 mutation 不能延长本次请求预算。
     request_timeout = desc.timeout;
     if (request_timeout == 0) begin
-      void'(set_status_fields(result.status, RDMA_SC_INVALID_ARGUMENT,
+      void'(rdma_status::set_fields_noalloc(result.status, RDMA_SC_INVALID_ARGUMENT,
                               "doorbell timeout is zero"));
       return;
     end
     deadline = $time + request_timeout;
     if (deadline < $time) begin
-      void'(set_status_fields(
+      void'(rdma_status::set_fields_noalloc(
         result.status, RDMA_SC_INVALID_ARGUMENT,
         "doorbell deadline overflows simulation time"
       ));

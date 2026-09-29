@@ -24,7 +24,18 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch230：基于 `b4d81b0` 沿用 `feature/rdma-structural-batch226`，将 runtime/
+当前 Batch231：基于 `dad8d20` 沿用 `feature/rdma-structural-batch226`，让门铃
+envelope/scheduler 复用 rdma_status 字段实现，删除三个重复 helper；legacy 的枚举
+准入仍留在 envelope，不变成通用字段 helper 的额外校验。生产净减 84 行，
+文件 1,690→1,606 行、47→44 methods；44 保留方法 token 等价，15 个公开声明及
+六个类壳不变。新增 148-case 原始诊断/legacy 编码/factory 矩阵与三项 Python 门禁，
+最终专项、core 103/86、CMQ 28/11（PROCESS/LOGICAL）、integration 10、E2E 3、
+Host-memory 3、PCIe 1、Python 349/349、驱动契约及静态/注释门禁全部通过；
+三项 E2E 各保留 4 条基线编译告警，送测输入 hashes 一致。
+不合并、不推送，main 保持 `083e0d7`；详见
+`task-rdma-batch231-doorbell-status-report.md`，项目仍 active。
+
+前批 Batch230：基于 `b4d81b0` 沿用 `feature/rdma-structural-batch226`，将 runtime/
 queue-data 的重复状态字段操作归入 `rdma_status`，移除三个旧 helper，新增两个
 static automatic 值方法；不新增组件/owner/转发壳，生产净减 65 行。runtime fallback、
 queue-data null、typed-create 与 legacy 枚举检查仍分别保留；264 个保留方法展开后
@@ -151,7 +162,7 @@ L6 只协调外部生命周期并在边界验证完整 route、authority 和 res
 | P1 | `rdma_queue_runtime.sv` | 3,814 行/74 methods | runtime snapshot/predicate 与 mutation owner 分界 | 深复制/值比较已迁入 projector；继续 snapshot/commit 业务组合与重复状态处理 |
 | P2 | `rdma_queue_lifecycle_policy.sv` + queue/QP executors | 2,118 / 2,819 / 4,338 行 | policy、执行副作用、状态迁移表分离 | operation envelope 与 transition candidate |
 | P2 | `rdma_reset_coordinator.sv` | 2,127 行/55 methods | 只保留全局 reset lease/epoch 协调 | reset evidence/candidate，禁止复制 queue/CMQ ledger |
-| P3 | `rdma_doorbell_scheduler.sv` | 1,690 行/47 methods | descriptor/polarity/cursor 纯值层 | detached doorbell plan |
+| P3 | `rdma_doorbell_scheduler.sv` | 1,606 行/44 methods | descriptor/polarity/cursor 纯值层 | 通用状态字段已复用 types；detached doorbell plan 待推进 |
 
 SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 L4 policy adapter，
 公共复杂度回收到 queue-data/runtime transaction 层。Host-memory、PCIe、网络和
