@@ -24,7 +24,17 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch233：基于 `e1b8ed5` 沿用 `feature/rdma-structural-batch226`，把 CEQ/AEQ
+当前 Batch234：基于 `f4933f0` 沿用 `feature/rdma-structural-batch226`，将 backing
+四入口的重复搬运收为一个写循环和一个读循环。各入口保留原 DMA 方向、预检/null
+策略、诊断和 device backend-started 语义；不新增 owner/字段。生产 619→603 行，
+搬运相关 tokens 951→725，11 个公开声明不变，增加两个 protected helper。
+新增 80-case queue/QP 三段故障矩阵与六项 Python 门禁；修订旧版基线、重构版专项、
+core 103/86、CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、
+E2E 3、Python 365/365、驱动及等价/静态门禁全部通过。E2E 各保留 4 条基线编译
+告警；送测后仅修订一处测试注释，tokens 与最终 hashes 已核对。详见
+`task-rdma-batch234-backing-transfer-report.md`；不合并、不推送，项目仍 active。
+
+前批 Batch233：基于 `e1b8ed5` 沿用 `feature/rdma-structural-batch226`，把 CEQ/AEQ
 路由后的 result/continuation 准备收进原提交入口，改名 `consume_routed_event`。
 decode、owner、route、AEQ epoch 与 CQ flush partial 判定仍留在各自 caller；不新增
 生产组件/owner/状态。生产净减 46 行，两个 poll_once 从 93/109→50/68 行；27 个公开
@@ -192,6 +202,8 @@ dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 ad
 其余维持 Batch218；
 独立 queue-data projector 为 831 行/23 methods，resource projector 为 2,217 行/47 methods，
 runtime projector 为 830 行/20 methods；公共 rdma_status 为 280 行/10 methods。
+Batch234 backing access 为 603 行；access 类 24 methods，另含 span 构造函数，
+读写字节循环共享，DMA 方向和后端失败策略仍由明确的公开入口决定。
 Batch230 将无分配状态字段操作归入 types，不改变三个业务 owner 的规模和生命周期职责。
 后续在统一 owner/提交契约稳定后仍须收敛重复校验，
 不以删注释、压缩行或新增大量单函数文件代替可读性改进。

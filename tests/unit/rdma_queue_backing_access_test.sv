@@ -1,9 +1,89 @@
 // 目录：测试层 unit/rdma_queue_backing_access_test.sv。
-// 职责：验证 queue backing/QP backing 的绑定、分段解析及 Host-memory 访问原子性。
+// 职责：验证 queue/QP backing 的绑定、分段解析、完整权限预检与失败时的 I/O 前缀。
 // 依赖：依赖 rdma_queue_backing_access、UVM、rdma_mock_host_mem 和 DMA mapping fixture。
 // 所有权与生命周期：本测试创建 mock、mapping 与 backing；access 只借用它们，run_phase 结束后由 UVM 回收本地对象。
 
-// 设计说明：把 null-status、权限和跨段失败放在同一 fixture 中，直接检查失败不会发布半绑定引用或触发部分后端 I/O。
+// 设计说明：预检失败必须零 I/O；后端失败可以留下已写前缀但不能继续后续 span，
+// 读取失败必须清空输出。这三种契约不能混称为整个 Host-memory 事务可回滚。
+
+// 只在 armed 的访问窗口记录实际 span 调用；故障发生在指定 span，已有成功写入不撤销。
+class rdma_backing_span_fault_mem extends rdma_mock_host_mem;
+  bit armed;
+  bit fired;
+  int unsigned mode;
+  int unsigned fail_at;
+  rdma_status failure;
+  rdma_dma_mapping seen_mapping[$];
+  longint unsigned seen_offset[$];
+  int unsigned seen_length[$];
+
+  // 功能：构造未启用的分段后端，预建带硬件码的错误供透传引用断言。
+  // 输入/输出及副作用：name 传给 mock；本对象拥有 mock 内存，mapping 由 case 显式释放。
+  // 失败/边界：armed 默认关闭，setup/cleanup 不注入；失败 status 不通过 factory 重建。
+  function new(string name = "rdma_backing_span_fault_mem");
+    super.new(name);
+    armed = 1'b0;
+    fired = 1'b0;
+    failure = rdma_status::make_direct(RDMA_SC_DMA_TRANSLATION, "injected span failure");
+    failure.hardware_code_valid = 1'b1;
+    failure.hardware_code = 32'h12345678;
+  endfunction
+
+  // 功能：记录一个 backend span 的 mapping/offset/length，并判断是否抵达故障序号。
+  // 输入/输出及副作用：mapping/offset/length 输入；armed 时追加借用引用和标量，命中置 fired。
+  // 失败/边界：关闭注入不记录且返回 0；fail_at=0 不命中；不访问或释放 mapping。
+  function bit visit(rdma_dma_mapping mapping, longint unsigned offset, int unsigned length);
+    if (!armed)
+      return 1'b0;
+    seen_mapping.push_back(mapping);
+    seen_offset.push_back(offset);
+    seen_length.push_back(length);
+    if (seen_mapping.size() != fail_at)
+      return 1'b0;
+    fired = 1'b1;
+    return 1'b1;
+  endfunction
+
+  // 功能：在 write 的指定 span 注入 null/原始错误，其他 span 委托真实 mock 写入。
+  // 输入/输出及副作用：mapping/offset/data 输入；成功前缀实际保留在内存中，返回原 status。
+  // 失败/边界：mode=2/3 返回 null，4/5/6 返回 failure；这些失败 span 自身不写入，
+  //   测试不得把这个注入器行为推断为所有真实后端都具备失败原子性。
+  virtual function rdma_status write(
+    rdma_dma_mapping mapping, longint unsigned offset, byte data[]
+  );
+    if (visit(mapping, offset, data.size())) begin
+      if (mode inside {2, 3})
+        return null;
+      if (mode inside {4, 5, 6})
+        return failure;
+    end
+    return super.write(mapping, offset, data);
+  endfunction
+
+  // 功能：在 read 指定 span 注入 null/原始错误，或返回成功但长度短/长的 payload。
+  // 输入/输出及副作用：mapping/offset/size 输入，data 输出；正常读取实际 mock bytes。
+  // 失败/边界：mode=2/3/4/5/6 的 data 故意预填垃圾以检查 caller 清空，7/8 修改
+  //   实际读取长度；未 armed 的 setup/验证读取不记录，也不改变故障命中数。
+  virtual function rdma_status read(
+    rdma_dma_mapping mapping, longint unsigned offset, int unsigned size, output byte data[]
+  );
+    bit hit;
+    rdma_status status;
+
+    hit = visit(mapping, offset, size);
+    if (hit && mode inside {2, 3, 4, 5, 6}) begin
+      data = new[3];
+      foreach (data[i]) data[i] = 8'hee;
+      return mode inside {2, 3} ? null : failure;
+    end
+    status = super.read(mapping, offset, size, data);
+    if (hit && status != null && status.ok()) begin
+      if (mode == 7) data = new[size - 1](data);
+      if (mode == 8) data = new[size + 1](data);
+    end
+    return status;
+  endfunction
+endclass
 
 // 功能：构造故障注入用 queue backing reference，模拟扩展校验器返回空状态句柄。
 // 输入/输出及副作用：name（输入）；new 只初始化基类字段，不取得 mapping 或 Host-memory 所有权。
@@ -148,9 +228,179 @@ class rdma_queue_backing_access_test extends uvm_test;
       `uvm_error("DEVICE_PREFLIGHT", "failed span was written")
   endtask
 
-  // 功能：构造两个相邻 DMA segment，依次覆盖 null 校验、重复/混合绑定、跨段读写、权限预检和 borrowed backing 不释放的契约。
+  // 功能：check_span_transfer_case 用三个非零 mapping offset 的 segment 检查四种访问
+  //   入口的顺序、字节拼接、权限与部分失败，分别经 queue/QP backing 路径执行。
+  // 输入/输出及副作用：qp_view/operation/mode 选择 backing、write/device-write/read/
+  //   readback 与故障；每例新建三个 16-KiB mapping，记录后端调用，结束时显式 release。
+  // 失败/边界：mode=0 成功，1 后段权限不足，2/3 首/末 null，4/5/6 首/中/末错误，
+  //   7/8 中段短读/末段长读，9 未对齐，10 超 coverage；拒绝后不执行后续 span，
+  //   read 输出清空、write 只保留成功前缀，device started 仅在进入后端时为 1。
+  task automatic check_span_transfer_case(bit qp_view, int unsigned operation, int unsigned mode);
+    rdma_backing_span_fault_mem mem;
+    rdma_queue_backing_access access;
+    rdma_dma_mapping mappings[3];
+    rdma_queue_backing_ref backing;
+    rdma_qp_backing_ref qp_backing;
+    rdma_queue_backing_segment segment;
+    rdma_status status;
+    byte payload[], data[], seed[], observed[];
+    int unsigned offsets[3] = '{8184, 8192, 12288};
+    int unsigned lengths[3] = '{8, 4096, 8};
+    int unsigned positions[3] = '{0, 8, 4104};
+    int unsigned expected_calls, completed_writes;
+    longint unsigned offset;
+    bit started, is_read;
+    string label;
+
+    mem = new();
+    access = new("span_matrix_access");
+    backing = new("span_matrix_queue");
+    qp_backing = new("span_matrix_qp");
+    is_read = operation >= 2;
+    payload = new[4112];
+    foreach (payload[i]) payload[i] = byte'(8'h30 + i);
+    foreach (mappings[i]) begin
+      status = mem.allocate(ctx(), 16384, 4096, RDMA_DMA_BIDIRECTIONAL, mappings[i]);
+      if (status == null || !status.ok() || mappings[i] == null)
+        `uvm_fatal("SPAN_TRANSFER", "mapping fixture allocation failed")
+      seed = new[16384];
+      foreach (seed[j]) seed[j] = 8'ha5;
+      if (is_read)
+        for (int unsigned j = 0; j < lengths[i]; j++)
+          seed[offsets[i] + j] = payload[positions[i] + j];
+      status = mem.write(mappings[i], 0, seed);
+      expect_code("SPAN_SEED", status, RDMA_SC_OK);
+    end
+    backing.role = RDMA_QUEUE_ROLE_CQ_RING;
+    backing.mapping = mappings[0];
+    backing.mapping_offset = 4096;
+    backing.length = 4096;
+    backing.ownership = RDMA_OWNERSHIP_BORROWED;
+    qp_backing.role = RDMA_QUEUE_ROLE_QP_SQ_RING;
+    qp_backing.mapping = mappings[0];
+    qp_backing.mapping_offset = 4096;
+    qp_backing.length = 4096;
+    qp_backing.ownership = RDMA_OWNERSHIP_BORROWED;
+    for (int unsigned i = 1; i < 3; i++) begin
+      segment = new("span_matrix_segment");
+      segment.role = qp_view ? qp_backing.role : backing.role;
+      segment.mapping = mappings[i];
+      segment.mapping_offset = offsets[i];
+      segment.logical_queue_offset = i * 4096;
+      segment.length = 4096;
+      segment.ownership = RDMA_OWNERSHIP_BORROWED;
+      if (qp_view) qp_backing.additional_segments.push_back(segment);
+      else backing.additional_segments.push_back(segment);
+    end
+    status = access.configure(fn(), mem);
+    expect_code("SPAN_CONFIG", status, RDMA_SC_OK);
+    if (qp_view) status = access.attach_qp(qp_backing);
+    else status = access.attach_queue(backing);
+    if (status == null || !status.ok())
+      `uvm_fatal("SPAN_TRANSFER", status == null ? "backing fixture attach returned null" :
+                 {"backing fixture attach failed: ", status.convert2string()})
+
+    // 只授予当前业务方向；对面权限始终关闭，避免误把 readback 当成 device write。
+    foreach (mappings[i]) begin
+      mappings[i].permissions.device_read = operation inside {0, 3};
+      mappings[i].permissions.device_write = operation inside {1, 2};
+    end
+    if (mode == 1) begin
+      mappings[2].permissions.device_read = 1'b0;
+      mappings[2].permissions.device_write = 1'b0;
+    end
+    mem.mode = mode;
+    case (mode)
+      2, 4: mem.fail_at = 1;
+      5, 7: mem.fail_at = 2;
+      3, 6, 8: mem.fail_at = 3;
+      default: mem.fail_at = 0;
+    endcase
+    expected_calls = mode inside {1, 9, 10} ? 0 :
+                     mode == 0 ? 3 : mem.fail_at;
+    offset = mode == 9 ? 4089 : mode == 10 ? 12280 : 4088;
+    label = operation == 0 ? "write" : operation == 1 ? "device write" :
+            operation == 2 ? "read" : "readback";
+    data = new[5];
+    started = 1'b1;
+    mem.armed = 1'b1;
+    case (operation)
+      0: status = access.write(offset, payload);
+      1: status = access.write_device(offset, payload, started);
+      2: status = access.read(offset, payload.size(), data);
+      3: status = access.readback(offset, payload.size(), data);
+      default: `uvm_fatal("SPAN_TRANSFER", "unknown operation")
+    endcase
+    mem.armed = 1'b0;
+    if (mem.seen_mapping.size() != expected_calls ||
+        mem.fired != (mode >= 2 && mode <= 8))
+      `uvm_error("SPAN_TRANSFER", "wrong backend prefix or fault did not fire")
+    foreach (mem.seen_mapping[i]) begin
+      if (i >= 3 || mem.seen_mapping[i] != mappings[i] ||
+          mem.seen_offset[i] != offsets[i] || mem.seen_length[i] != lengths[i])
+        `uvm_error("SPAN_TRANSFER", "mapping/offset/length order changed")
+    end
+    if (operation == 1 && started != (expected_calls != 0))
+      `uvm_error("SPAN_TRANSFER", "device backend-started evidence changed")
+    if (mode == 0) expect_code("SPAN_SUCCESS", status, RDMA_SC_OK);
+    else if (mode == 1) expect_code("SPAN_PERMISSION", status, RDMA_SC_DMA_PERMISSION);
+    else if (mode == 9) expect_code("SPAN_ALIGNMENT", status, RDMA_SC_INVALID_ARGUMENT);
+    else if (mode == 10) expect_code("SPAN_COVERAGE", status, RDMA_SC_DMA_TRANSLATION);
+    else if (mode inside {2, 3}) begin
+      expect_code("SPAN_NULL", status, RDMA_SC_INVALID_STATE);
+      if (status != null && status.message != {"host memory ", label, " returned null status"})
+        `uvm_error("SPAN_TRANSFER", "null status diagnostic changed")
+    end
+    else if (mode inside {7, 8}) begin
+      expect_code("SPAN_LENGTH", status, RDMA_SC_DMA_TRANSLATION);
+      if (status != null && status.message != {"host memory ", label, " returned short data"})
+        `uvm_error("SPAN_TRANSFER", "short/oversize read diagnostic changed")
+    end
+    else if (status != mem.failure || status.hardware_code != 32'h12345678)
+      `uvm_error("SPAN_TRANSFER", "backend error was not passed through unchanged")
+    if (is_read) begin
+      if (mode != 0 && data.size() != 0)
+        `uvm_error("SPAN_TRANSFER", "failed read exposed partial bytes")
+      if (mode == 0) begin
+        if (data.size() != payload.size())
+          `uvm_error("SPAN_TRANSFER", "successful read length changed")
+        else foreach (data[i])
+          if (data[i] !== payload[i])
+            `uvm_error("SPAN_TRANSFER", "cross-span read byte order changed")
+      end
+    end
+    completed_writes = is_read ? 0 : mode == 0 ? 3 :
+                       expected_calls == 0 ? 0 : expected_calls - 1;
+    foreach (mappings[i]) begin
+      status = mem.read(mappings[i], 0, 16384, observed);
+      expect_code("SPAN_VERIFY_MEMORY", status, RDMA_SC_OK);
+      foreach (observed[j]) begin
+        if ((is_read || i < completed_writes) &&
+            j >= offsets[i] && j < offsets[i] + lengths[i]) begin
+          if (observed[j] !== payload[positions[i] + j - offsets[i]])
+            `uvm_error("SPAN_TRANSFER", "successful prefix bytes changed")
+        end
+        else if (observed[j] !== 8'ha5)
+          `uvm_error("SPAN_TRANSFER", "failed/unvisited span or guard byte was overwritten")
+      end
+    end
+    access.clear();
+    if (call_count(mem, "release") != 0)
+      `uvm_error("SPAN_TRANSFER", "access released borrowed mapping")
+    foreach (mappings[i]) begin
+      status = mem.\release (mappings[i]);
+      expect_code("SPAN_RELEASE", status, RDMA_SC_OK);
+    end
+    if (mem.live_allocations() != 0)
+      `uvm_error("SPAN_TRANSFER", "fixture leaked mapping")
+    `uvm_info("SPAN_TRANSFER", $sformatf("completed span transfer case qp=%0b op=%0d mode=%0d",
+      qp_view, operation, mode), UVM_LOW)
+  endtask
+
+  // 功能：构造相邻 DMA segment，覆盖原绑定/解析契约及 80-case 分段访问矩阵。
   // 输入/输出及副作用：phase（输入）；raise/drop objection 包围所有检查；task 创建并修改本地 mock、mapping、backing 与 access，UVM error 是可观察失败输出。
-  // 失败/边界：每个 expect_code/UVM 检查失配后仍继续执行剩余场景以收集错误；本 task 没有 configure/build/activate gate，唯一生命周期保证是结尾无条件 drop objection。
+  // 失败/边界：普通断言失败仍继续收集错误；新矩阵的 allocation/attach 失败以 fatal
+  //   终止仿真，正常完成才 drop objection；矩阵每例显式释放自身 mapping。
   task run_phase(uvm_phase phase);
     rdma_mock_host_mem mem;
     rdma_dma_mapping m0;
@@ -329,6 +579,14 @@ class rdma_queue_backing_access_test extends uvm_test;
       `uvm_error("BORROWED_RELEASE", "access helper released borrowed backing")
 
     assert_device_write_contract(access, mem, m0, m1);
+
+    for (int unsigned qp = 0; qp < 2; qp++)
+      for (int unsigned operation = 0; operation < 4; operation++)
+        for (int unsigned mode = 0; mode < 11; mode++) begin
+          if (operation < 2 && mode inside {7, 8}) continue;
+          check_span_transfer_case(qp != 0, operation, mode);
+        end
+    `uvm_info("SPAN_TRANSFER", "completed 80 span transfer cases", UVM_LOW)
 
     phase.drop_objection(this);
   endtask

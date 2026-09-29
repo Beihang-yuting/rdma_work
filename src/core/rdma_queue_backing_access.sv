@@ -1,14 +1,11 @@
 // 目录：核心执行层 core/rdma_queue_backing_access.sv。
-// 职责：实现 rdma_queue_backing_access 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：把 queue/QP 逻辑范围解析为 mapping-relative spans，完整预检后按顺序搬运字节。
+// 依赖：DMA handle/mapping、queue/QP backing reference、Host-memory adapter 与 UVM factory。
+// 所有权与生命周期：access 拥有 detached Function owner，借用 adapter/backing/mapping；
+//   clear 只解除 backing 引用，不释放资源。span 是调用局部视图，不是第二份内存账本。
+// 设计：公开入口决定 DMA 方向与诊断；公共循环只搬运 bytes，不推进 PI/CI、不安装 recovery。
 
-// 中文说明：rdma_queue_backing_access.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
-// 中文设计：本层把 queue/QP backing reference 归一化为 mapping-relative DMA
-// span；access 对象只借用 lifecycle-owned mapping，绝不取得或执行释放权。
-
+// span 保留逻辑与物理偏移以跨 mapping 拼接数据；mapping 生命周期始终由外部 owner 管理。
 class rdma_queue_backing_span extends uvm_object;
   `uvm_object_utils(rdma_queue_backing_span)
 
@@ -17,9 +14,9 @@ class rdma_queue_backing_span extends uvm_object;
   longint unsigned logical_offset;
   longint unsigned length;
 
-  // 功能：构造 rdma_queue_backing_span，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mapping=null；mapping_offset=0；logical_offset=0；length=0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_backing_span 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造尚未解析的 span，mapping=null，两个 offset 和 length 均为零。
+  // 输入/输出及副作用：name 传给 UVM；不创建、复制或接管 mapping。
+  // 失败/边界：初始空 span 不能执行 I/O，必须由 resolve_ref 填充后再经 check_span 校验。
   function new(string name = "rdma_queue_backing_span");
     super.new(name);
     mapping = null;
@@ -29,6 +26,7 @@ class rdma_queue_backing_span extends uvm_object;
   endfunction
 endclass
 
+// access 只提供地址与 DMA 权限边界；预检不能保证后端原子写入，调用方负责部分失败恢复。
 class rdma_queue_backing_access extends uvm_object;
   `uvm_object_utils(rdma_queue_backing_access)
 
@@ -37,9 +35,9 @@ class rdma_queue_backing_access extends uvm_object;
   protected rdma_queue_backing_ref queue_ref;
   protected rdma_qp_backing_ref qp_ref;
 
-  // 功能：构造 rdma_queue_backing_access，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：owner=null；host_mem=null；queue_ref=null；qp_ref=null。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_backing_access 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造未配置/未挂接的 access，清空 owner、host_mem、queue_ref 与 qp_ref。
+  // 输入/输出及副作用：name 传给 UVM；不分配 mapping，也不拥有外部 adapter。
+  // 失败/边界：须先 configure 再 attach 才能 resolve；构造不验证任何外部 authority。
   function new(string name = "rdma_queue_backing_access");
     super.new(name);
     owner = null;
@@ -217,8 +215,8 @@ class rdma_queue_backing_access extends uvm_object;
   //   当前 host_mem 与 backing 引用，但不共享本 access 的 queue/QP 指针状态容器。
   // 输入/输出及副作用：无显式输入；成功返回新 access 对象，host_mem、queue_ref、
   //   qp_ref 仍是非拥有引用，不释放或复制外部 backing。
-  // 失败/边界：owner/host_mem/queue_ref 任一缺失时返回 null；factory 或 owner clone
-  //   失败没有 status 通道，调用方必须检查返回对象并保留旧 access。
+  // 失败/边界：owner/host_mem/queue_ref 任一缺失时返回 null；沿用 typed factory，
+  //   copy 的 null 无防御，owner clone 为空也不拒绝，调用方须再校验所得视图的可用性。
   function rdma_queue_backing_access clone_for_resize();
     rdma_queue_backing_access copy;
     if (owner == null || host_mem == null || queue_ref == null)
@@ -457,6 +455,38 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 设计说明：两种写入口的预检/空状态策略不同，继续留在入口；这里只共用 payload
+  //   切片和 backend 循环。每个 span 的字段仍在实际调用时读取，不跨 adapter 回调缓存。
+  // 功能：write_spans 把 data 按已准入 spans 的顺序切片并写入 Host-memory。
+  // 输入/输出及副作用：spans/data/null_message 输入；backend_write_started 先置 0，
+  //   首次调用 host_mem.write 前置 1；可能留下成功写入前缀，不修改 cursor 或 ownership。
+  // 失败/边界：caller 必须完整预检 spans；后端 null 用原 null_message 返回 INVALID_STATE，
+  //   非成功状态原引用返回且不继续后续 span；不回滚已发生写入，不创建恢复记录。
+  protected function rdma_status write_spans(
+    rdma_queue_backing_span spans[$], byte data[], string null_message,
+    output bit backend_write_started
+  );
+    rdma_status status;
+    longint unsigned position;
+    byte chunk[];
+
+    backend_write_started = 1'b0;
+    position = 0;
+    foreach (spans[i]) begin
+      chunk = new[spans[i].length];
+      foreach (chunk[j])
+        chunk[j] = data[position + j];
+      backend_write_started = 1'b1;
+      status = host_mem.write(spans[i].mapping, spans[i].mapping_offset, chunk);
+      if (status == null)
+        return invalid_state(null_message);
+      if (!status.ok())
+        return status;
+      position += spans[i].length;
+    end
+    return rdma_status::success();
+  endfunction
+
   // 设计说明：access 实例由 UVM factory 创建；保留 virtual 分派可让隔离测试替换
   //   未开始 backend 的预检结果，而生产实现仍在本函数集中执行完整 span 校验。
   // 功能：write_device 按 RDMA_DMA_DEVICE_WRITE 方向预检并将调用方 payload 依次写入所有 backing span，供 Host-memory device producer 发布使用。
@@ -469,8 +499,6 @@ class rdma_queue_backing_access extends uvm_object;
   );
     rdma_queue_backing_span spans[$];
     rdma_status status;
-    longint unsigned position;
-    byte chunk[];
 
     backend_write_started = 1'b0;
     status = resolve(offset, data.size(), spans);
@@ -483,32 +511,19 @@ class rdma_queue_backing_access extends uvm_object;
       return status == null ?
         rdma_status::make(RDMA_SC_INVALID_STATE,
                           "device write preflight returned null status") : status;
-    position = 0;
-    foreach (spans[i]) begin
-      chunk = new[spans[i].length];
-      foreach (chunk[j])
-        chunk[j] = data[position + j];
-      backend_write_started = 1'b1;
-      status = host_mem.write(spans[i].mapping, spans[i].mapping_offset,
-                              chunk);
-      if (status == null)
-        return invalid_state("host memory device write returned null status");
-      if (!status.ok())
-        return status;
-      position += spans[i].length;
-    end
-    return rdma_status::success();
+    return write_spans(spans, data, "host memory device write returned null status",
+                       backend_write_started);
   endfunction
 
-  // 功能：在 rdma_queue_backing_access 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output
-  //   返回结果。
-  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：write 为 host 发布 SQ/RQ 等条目，按 DEVICE_READ 权限预检后写入所有 spans。
+  // 输入/输出及副作用：offset/data 输入，返回后端或范围/权限 status；只写 backing bytes，
+  //   不推进 PI/CI、不修改 ledger/pending，也不取得 mapping 所有权。
+  // 失败/边界：resolve/preflight 失败零写入，沿用其非空 status 契约；后端 null 归一化
+  //   INVALID_STATE，其他错误原样返回；中途失败可留下前缀，恢复由调用方处理。
   function rdma_status write(longint unsigned offset, byte data[]);
     rdma_queue_backing_span spans[$];
     rdma_status status;
-    longint unsigned position;
-    byte chunk[];
+    bit backend_write_started;
 
     status = resolve(offset, data.size(), spans);
     if (!status.ok())
@@ -516,29 +531,21 @@ class rdma_queue_backing_access extends uvm_object;
     status = preflight_spans(spans, RDMA_DMA_DEVICE_READ);
     if (!status.ok())
       return status;
-    position = 0;
-    foreach (spans[i]) begin
-      chunk = new[spans[i].length];
-      foreach (chunk[j])
-        chunk[j] = data[position + j];
-      status = host_mem.write(spans[i].mapping, spans[i].mapping_offset,
-                              chunk);
-      if (status == null)
-        return invalid_state("host memory write returned null status");
-      if (!status.ok())
-        return status;
-      position += spans[i].length;
-    end
-    return rdma_status::success();
+    return write_spans(spans, data, "host memory write returned null status",
+                       backend_write_started);
   endfunction
 
-  // 功能：在 rdma_queue_backing_access 中，read 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：offset（输入）、length（输入）、data（输出）；read 读取 offset、length、data 并使用字段 data、status、position、chunk，并写入 data；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：read 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
-  function rdma_status read(
-      longint unsigned offset,
-      longint unsigned length,
-      output byte data[]);
+  // 设计说明：consumer read 与 host readback 的搬运相同，区别仅为 caller 指定的
+  //   DMA 权限和原诊断。先预检全部 spans，再按顺序读取，禁止交付失败的部分 payload。
+  // 功能：read_with_permission 解析 offset/length，以 direction 完整预检后拼接各段 bytes。
+  // 输入/输出及副作用：offset/length/direction/operation_name 输入，data 先清空；成功输出
+  //   独立字节数组，只调用 Host-memory read，不修改 mapping/cursor/ledger。
+  // 失败/边界：resolve/preflight 沿用非空 status 契约；后端 null 返回 INVALID_STATE，
+  //   非成功 status 原样传播，短/长读均返回 DMA_TRANSLATION；所有失败保持 data 为空。
+  protected function rdma_status read_with_permission(
+    longint unsigned offset, longint unsigned length,
+    rdma_dma_direction_e direction, string operation_name, output byte data[]
+  );
     rdma_queue_backing_span spans[$];
     rdma_status status;
     longint unsigned position;
@@ -548,7 +555,7 @@ class rdma_queue_backing_access extends uvm_object;
     status = resolve(offset, length, spans);
     if (!status.ok())
       return status;
-    status = preflight_spans(spans, RDMA_DMA_DEVICE_WRITE);
+    status = preflight_spans(spans, direction);
     if (!status.ok())
       return status;
     data = new[length];
@@ -560,11 +567,11 @@ class rdma_queue_backing_access extends uvm_object;
       if (status == null || !status.ok()) begin
         data = new[0];
         return status == null ? invalid_state(
-          "host memory read returned null status") : status;
+          {"host memory ", operation_name, " returned null status"}) : status;
       end
       if (chunk.size() != spans[i].length) begin
         data = new[0];
-        return dma_error("host memory read returned short data");
+        return dma_error({"host memory ", operation_name, " returned short data"});
       end
       foreach (chunk[j])
         data[position + j] = chunk[j];
@@ -573,47 +580,24 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 中文设计：readback 专用于 host 刚发布 queue entry 后的回读确认，刻意与
-  // read() 隔离。read() 模拟 CQ/CEQ/AEQ consumer 的 device-write DMA，要求
-  // DEVICE_WRITE；posting ring mapping 仅授予 DEVICE_READ，但 host 仍须在敲
-  // producer doorbell 前确认自己的写入已到达 backing memory。
-  // 功能：在 rdma_queue_backing_access 中，readback 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：offset（输入）、length（输入）、data（输出）；readback 读取 offset、length、data 并使用字段 data、status、position、chunk，并写入 data；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：readback 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：read 读取设备发布的 CQ/CEQ/AEQ 等 backing bytes，要求 DEVICE_WRITE 权限。
+  // 输入/输出及副作用：offset/length 输入，data 输出；只读 Host-memory，不确认或消费事件。
+  // 失败/边界：范围/权限/后端/null/短长读失败均清空 data，按 read 诊断返回；不自动重试。
+  function rdma_status read(
+      longint unsigned offset,
+      longint unsigned length,
+      output byte data[]);
+    return read_with_permission(offset, length, RDMA_DMA_DEVICE_WRITE, "read", data);
+  endfunction
+
+  // 设计：host 发布后的回读只要求 posting ring 的 DEVICE_READ，不额外要求反向写权限。
+  // 功能：readback 确认 host 刚写入的 queue bytes，读取循环与 read 共用但权限策略独立。
+  // 输入/输出及副作用：offset/length 输入，data 输出；不发送 doorbell，不改变 cursor。
+  // 失败/边界：范围/权限/后端/null/短长读失败均清空 data，保留原 readback 诊断；不回滚写入。
   function rdma_status readback(
       longint unsigned offset,
       longint unsigned length,
       output byte data[]);
-    rdma_queue_backing_span spans[$];
-    rdma_status status;
-    longint unsigned position;
-    byte chunk[];
-
-    data = new[0];
-    status = resolve(offset, length, spans);
-    if (!status.ok()) return status;
-    // 中文设计：这里只验证 posting ring 使用的 device-read 权限；单纯检查 host
-    // memory 不应额外要求反向 DMA write 权限，否则会错误拒绝只读 posting mapping。
-    status = preflight_spans(spans, RDMA_DMA_DEVICE_READ);
-    if (!status.ok()) return status;
-    data = new[length];
-    position = 0;
-    foreach (spans[i]) begin
-      chunk = new[0];
-      status = host_mem.read(spans[i].mapping, spans[i].mapping_offset,
-                             int'(spans[i].length), chunk);
-      if (status == null || !status.ok()) begin
-        data = new[0];
-        return status == null ? invalid_state(
-          "host memory readback returned null status") : status;
-      end
-      if (chunk.size() != spans[i].length) begin
-        data = new[0];
-        return dma_error("host memory readback returned short data");
-      end
-      foreach (chunk[j]) data[position + j] = chunk[j];
-      position += spans[i].length;
-    end
-    return rdma_status::success();
+    return read_with_permission(offset, length, RDMA_DMA_DEVICE_READ, "readback", data);
   endfunction
 endclass
