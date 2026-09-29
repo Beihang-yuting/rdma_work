@@ -1,4 +1,4 @@
-"""目录/层次：tests/unit；职责：守卫 CQ resize 发布前回滚与发布后 cleanup 的出口边界。
+"""目录/层次：tests/unit；职责：守卫 CQ resize 回滚、发布后 cleanup 与 retry 的出口边界。
 依赖：unittest 与既有 SV 词法工具；只读源码，动态资源与锁行为由 VCS 故障矩阵验证。
 所有权与生命周期：不创建 runtime、mapping 或外部对象，不修改被测文件。
 """
@@ -108,6 +108,83 @@ class CqResizeExitBoundaryTest(unittest.TestCase):
                          "run_nested_case();", "null_wrapper.hits != 2",
                          "null_wrapper.nested_status.code != RDMA_SC_RESOURCE_EXHAUSTED"):
             self.assertIn(contract, test)
+
+    def test_retry_has_one_recorded_failure_exit(self):
+        """功能：要求 retry 的 17 个记录内失败点共用原诊断保存、解锁、返回续接。
+        输入输出及副作用：只读 retry_cq_resize_cleanup 的完整方法，不构造运行时对象。
+        失败边界：重复 last_status、遗漏失败点、新增跨调用 disable 或额外嵌套循环均失败。
+        """
+        body = methods(read_code(CORE / "rdma_queue_data_engine.sv"))["retry_cq_resize_cleanup"][2]
+        self.assertEqual(body.count("do begin : resize_recovery"), 1)
+        self.assertEqual(body.count("break;"), 17)
+        self.assertEqual(body.count("recovery.last_status = status;"), 1)
+        self.assertNotRegex(body, r"\b(?:disable|for|foreach|repeat)\b")
+        self.assertRegex(body, r"end while \(1'b0\);\s+recovery.last_status = status;\s+"
+                         r"resize_lock.put\(1\);\s+return status;\s+endfunction\s*$")
+
+    def test_retry_entry_errors_stay_outside_recorded_exit(self):
+        """功能：保持未配置、非法 handle、锁忙和无记录拒绝在已捕获 recovery 之前。
+        输入输出及副作用：读取 loop 之前的准入片段，核对返回数量、解锁及记录读取顺序。
+        失败边界：早拒绝写 last_status、重复解锁、无记录返回变为成功或进入公共出口即失败。
+        """
+        body = methods(read_code(CORE / "rdma_queue_data_engine.sv"))["retry_cq_resize_cleanup"][2]
+        entry = body.split("do begin : resize_recovery", 1)[0]
+        self.assertEqual(entry.count("return bad("), 4)
+        self.assertEqual(entry.count("resize_lock.put(1);"), 1)
+        self.assertNotIn("last_status", entry)
+        self.assertRegex(entry, r"recovery = cq_resize_recoveries\[key\];\s*$")
+        for code in ("RDMA_SC_INVALID_STATE", "RDMA_SC_RESOURCE_BUSY"):
+            self.assertIn(code, entry)
+        # handle 拒绝沿用 bad 的缺省 INVALID_ARGUMENT，不额外分配分类对象。
+        self.assertIn('bad("CQ resize recovery handle is invalid")',
+                      (CORE / "rdma_queue_data_engine.sv").read_text())
+
+    def test_retry_success_unlocks_before_status_factory(self):
+        """功能：保持发布前/后两条成功路径删除记录并解锁后再创建 OK status。
+        输入输出及副作用：检查完整成功 token 序列和 finish_resize 缺席；不执行 factory。
+        失败边界：成功也写 last_status、factory 提前到锁内、合并成延迟成功旗标均失败。
+        """
+        body = methods(read_code(CORE / "rdma_queue_data_engine.sv"))["retry_cq_resize_cleanup"][2]
+        success = (r"cq_resize_recoveries.delete\(key\);\s+resize_lock.put\(1\);\s+"
+                   r"return rdma_status::success\(\);")
+        self.assertEqual(len(re.findall(success, body)), 2)
+        self.assertNotIn("finish_resize(", body)
+        self.assertEqual(body.count("resize_lock.put(1);"), 4)
+
+    def test_retry_keeps_stage_order_and_incremental_progress(self):
+        """功能：固定 authority 门禁、发布前恢复/候选清理、发布后依赖恢复/旧资源清理顺序。
+        输入输出及副作用：读取 retry 阶段标记和原 flag 更新；不重算 authority 或 snapshot。
+        失败边界：在 backing 校验前恢复、跨 publication 清理错 ref、删除进度标记或重做 detach 即失败。
+        """
+        body = methods(read_code(CORE / "rdma_queue_data_engine.sv"))["retry_cq_resize_cleanup"][2]
+        steps = ("same_cq_recovery_identity(", "binding.function_identity_snapshot(",
+                 "find_cq_recovery_attachment(", "recovery_backing_matches(",
+                 "if (!recovery.published)", "recovery.old_runtime.restore_active(",
+                 "recovery.cq_restore_pending = 1'b0;", "restore_cq_dependents(",
+                 "manager.restore_active(", "recovery.manager_restore_pending = 1'b0;",
+                 "recovery.prepublish_restore_pending = 1'b0;",
+                 "backing_planner.cleanup_local_role(")
+        positions = [body.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(body.count("restore_cq_dependents(recovery.dependents)"), 2)
+        self.assertIn("else if (recovery.old_runtime.state != RDMA_QUEUE_RUNTIME_DETACHED)", body)
+        self.assertIn("recovery.pending_ref, cleanup_complete", body)
+        self.assertRegex(body, r"cleanup_local_role\(recovery.old_ref,\s+cleanup_complete\)")
+
+    def test_retry_matrix_covers_retention_progress_and_reentrancy(self):
+        """功能：要求既有 resize test 同时运行 21 个单故障与一个嵌套 retry 场景。
+        输入输出及副作用：读取独立注入、诊断/记录/进度/资源检查与 run_phase 调用。
+        失败边界：场景缩水、遗漏准确错误或移除同 owner busy/异 owner 嵌套检查均失败。
+        """
+        test = read_code(ROOT / "tests/unit/rdma_cq_resize_exit_test.sv")
+        for token in ("mode < 21", "run_retry_case(mode)", "run_nested_retry_case()",
+                      "failure.message != expected", "record.last_status != failure",
+                      "probe.borrow_recovery(fixture.cq.handle) != record",
+                      "fixture.mem.live_allocations() != live_before - 1",
+                      "callback.busy_status.code != RDMA_SC_RESOURCE_BUSY",
+                      "records[1].last_status != callback.nested_status",
+                      "callback.evidence_unchanged", "record.cq_restore_pending"):
+            self.assertIn(token, test)
 
 
 if __name__ == "__main__":

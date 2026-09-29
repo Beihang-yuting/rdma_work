@@ -1,4 +1,4 @@
-// 目录/层次：tests/unit；职责：验证 CQ resize 统一回滚出口与发布后恢复之间的边界。
+// 目录/层次：tests/unit；职责：验证 CQ resize 回滚、发布后恢复与 retry 失败收尾的边界。
 // 依赖：完整 queue-data lifecycle fixture、真实 manager/runtime 与 mock Host-memory。
 // 所有权与生命周期：每个 case 拥有独立 fixture 和隔离 factory；完成 recovery 后聚合
 //   cleanup 并检查零 live allocation；resize 返回立即恢复原 factory，probe 只借用锁。
@@ -41,7 +41,7 @@ class rdma_cq_resize_null_wrapper extends uvm_object_wrapper;
   endfunction
 endclass
 
-// 设计说明：不代理 resize；只观察生产函数返回后是否恰好剩一个 semaphore token。
+// 设计说明：不代理 resize/retry；只检查锁并借用恢复记录/attachment 做可还原的故障注入。
 class rdma_cq_resize_exit_probe extends rdma_queue_data_engine;
   `uvm_object_utils(rdma_cq_resize_exit_probe)
 
@@ -67,12 +67,34 @@ class rdma_cq_resize_exit_probe extends rdma_queue_data_engine;
     if (second) resize_lock.put(1);
     return first && !second;
   endfunction
+
+  // 功能：借出 engine 唯一持有的 resize recovery，供测试观察 last_status 和注入单字段漂移。
+  // 输入/输出及副作用：cq_h 仅作稳定 identity 查找键；返回原记录引用，不 clone 或修改索引。
+  // 失败/边界：记录不存在返回 null；caller 必须恢复被破坏的 authority，不能另行释放 backing。
+  function rdma_cq_resize_recovery borrow_recovery(rdma_handle cq_h);
+    string key;
+
+    key = value_ops::cq_recovery_key(cq_h);
+    return cq_resize_recoveries.exists(key) ? cq_resize_recoveries[key] : null;
+  endfunction
+
+  // 功能：借出当前 CQ attachment，以隔离测试 runtime 缺失和 publication 阶段校验。
+  // 输入/输出及副作用：cq_h 为当前代际查找键；返回 engine 原引用，不改变 attachment 索引。
+  // 失败/边界：找不到返回 null；测试只暂改字段并恢复，不取得 runtime/access 生命周期。
+  function rdma_queue_data_attachment borrow_cq_attachment(rdma_handle cq_h);
+    string key;
+
+    key = value_ops::attachment_key(cq_h, RDMA_QUEUE_RUNTIME_CQ);
+    return attachments.exists(key) ? attachments[key] : null;
+  endfunction
 endclass
 
 // 设计说明：复用已有 dependent restore 注入，补齐发布后旧 CQ detach 的独立窗口。
 class rdma_cq_resize_exit_runtime extends rdma_resize_fault_runtime;
   `uvm_object_utils(rdma_cq_resize_exit_runtime)
   static bit fail_detach;
+  static bit null_detach;
+  static bit null_restore;
 
   // 功能：构造默认 detached runtime，保留真实账本与基类 begin/restore 故障开关。
   // 输入/输出及副作用：name 传给基类；不分配 mapping，不改变静态注入开关。
@@ -81,15 +103,73 @@ class rdma_cq_resize_exit_runtime extends rdma_resize_fault_runtime;
     super.new(name);
   endfunction
 
-  // 功能：在已发布 resize 清理旧 CQ 时注入一次 detach 失败。
-  // 输入/输出及副作用：无输入；命中时清除 fail_detach 并保留 QUIESCING 状态。
-  // 失败/边界：仅 CQ 且 fail_detach=1 返回 RESOURCE_BUSY；其余沿基类真实 detach。
+  // 功能：在已发布 resize 清理旧 CQ 时注入一次 detach null 或 RESOURCE_BUSY。
+  // 输入/输出及副作用：无输入；命中时仅清除对应开关并保留 QUIESCING 状态。
+  // 失败/边界：只对 CQ 注入，null_detach 优先；其余沿基类真实 detach，不释放 backing。
   virtual function rdma_status detach_quiesced();
+    if (kind == RDMA_QUEUE_RUNTIME_CQ && null_detach) begin
+      null_detach = 1'b0;
+      return null;
+    end
     if (kind == RDMA_QUEUE_RUNTIME_CQ && fail_detach) begin
       fail_detach = 1'b0;
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY, "injected old CQ detach");
     end
     return super.detach_quiesced();
+  endfunction
+
+  // 功能：在 retry 的旧 CQ 或 dependent restore 边界注入一次 null status。
+  // 输入/输出及副作用：无输入；匹配基类 fail_restore_kind 时消费 null_restore，状态不变。
+  // 失败/边界：未匹配不消费开关；其余沿用基类 error 注入与真实 ACTIVE 恢复。
+  virtual function rdma_status restore_active();
+    if (null_restore && kind == fail_restore_kind) begin
+      null_restore = 1'b0;
+      return null;
+    end
+    return super.restore_active();
+  endfunction
+endclass
+
+// 设计说明：错误 status 的 factory 回调仍在 resize 锁内；嵌套另一 engine 的 retry
+// 必须只退出自己的调用，同 engine 重入则必须保持 RESOURCE_BUSY。
+class rdma_cq_resize_retry_status_wrapper extends uvm_object_wrapper;
+  rdma_cq_resize_exit_probe outer_engine, nested_engine;
+  rdma_handle outer_cq, nested_cq;
+  rdma_cq_resize_recovery outer_record;
+  rdma_status prior_status, nested_status, busy_status;
+  bit entered, completed, evidence_unchanged;
+
+  // 功能：建立未启用的 retry factory 回调探针，默认没有嵌套结果或资源引用。
+  // 输入/输出及副作用：无输入；清零回调标记，handle/record/engine 均为非拥有引用。
+  // 失败/边界：注册前 caller 必须填齐引用；探针不创建 recovery 或取得锁。
+  function new();
+    entered = 1'b0;
+    completed = 1'b0;
+    evidence_unchanged = 1'b0;
+  endfunction
+
+  // 功能：首次错误状态分配时嵌套同 engine 的 busy 检查及另一 engine 的失败 retry。
+  // 输入/输出及副作用：name 用于直接构造 status；保存两次重入结果及旧诊断未提前发布的证据。
+  // 失败/边界：entered 阻止递归注入；始终返回正确类型，completed 必须在两次调用后置位。
+  virtual function uvm_object create_object(string name = "");
+    rdma_status value;
+
+    value = new(name);
+    if (!entered) begin
+      entered = 1'b1;
+      busy_status = outer_engine.retry_cq_resize_cleanup(outer_cq);
+      nested_status = nested_engine.retry_cq_resize_cleanup(nested_cq);
+      evidence_unchanged = outer_record.last_status == prior_status;
+      completed = 1'b1;
+    end
+    return value;
+  endfunction
+
+  // 功能：为隔离 factory 提供稳定的 retry 回调 wrapper 类型名。
+  // 输入/输出及副作用：无输入；返回常量，不触发嵌套 retry 或分配。
+  // 失败/边界：名称只用于 factory 注册，不是 Function/CQ authority。
+  virtual function string get_type_name();
+    return "rdma_cq_resize_retry_status_wrapper";
   endfunction
 endclass
 
@@ -350,7 +430,309 @@ class rdma_cq_resize_exit_test extends uvm_test;
     `uvm_info("RESIZE_EXIT", "completed resize exit case 15", UVM_LOW)
   endtask
 
-  // 功能：运行完整的 16-case 发布前/后与嵌套退出矩阵，确保每种故障均进入核心回归。
+  // 功能：通过真实 resize 失败建立发布前或发布后恢复记录，供 retry 故障矩阵消费。
+  // 输入/输出及副作用：name/prepublish 选择独立 fixture 和阶段；输出 fixture/probe/record。
+  //   发布前注入候选创建、候选 release 与旧 CQ restore 失败；发布后只让旧 CQ detach 失败。
+  // 失败/边界：setup/记录形状不符 fatal；resize 返回即恢复 factory，注入不泄漏到后续 retry。
+  task setup_retry_fixture(
+    string name, bit prepublish,
+    output rdma_queue_data_engine_fixture fixture,
+    output rdma_cq_resize_exit_probe probe,
+    output rdma_cq_resize_recovery record
+  );
+    uvm_coreservice_t service;
+    uvm_factory saved_factory;
+    uvm_default_factory local_factory;
+    rdma_cq_resize_null_wrapper null_wrapper;
+    rdma_status status;
+
+    service = uvm_coreservice_t::get();
+    saved_factory = service.get_factory();
+    local_factory = new();
+    local_factory.set_type_override_by_type(
+      rdma_queue_data_engine::get_type(), rdma_cq_resize_exit_probe::get_type());
+    local_factory.set_type_override_by_type(
+      rdma_queue_runtime::get_type(), rdma_cq_resize_exit_runtime::get_type());
+    service.set_factory(local_factory);
+    rdma_resize_fault_runtime::fail_begin_once = 1'b0;
+    rdma_resize_fault_runtime::restore_failures = 0;
+    rdma_cq_resize_exit_runtime::fail_detach = 1'b0;
+    rdma_cq_resize_exit_runtime::null_detach = 1'b0;
+    rdma_cq_resize_exit_runtime::null_restore = 1'b0;
+    fixture = new(name);
+    fixture.setup(status);
+    if (status == null || !status.ok() || !$cast(probe, fixture.engine))
+      `uvm_fatal("RESIZE_RETRY", "retry fixture setup/probe failed")
+    status = probe.retry_cq_resize_cleanup(null);
+    if (status == null || status.code != RDMA_SC_INVALID_ARGUMENT || !probe.has_one_resize_token())
+      `uvm_error("RESIZE_RETRY", "null handle changed lock or admission code")
+    status = probe.retry_cq_resize_cleanup(fixture.cq.handle);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE || !probe.has_one_resize_token())
+      `uvm_error("RESIZE_RETRY", "missing record changed lock or admission code")
+
+    if (prepublish) begin
+      null_wrapper = new();
+      local_factory.set_inst_override_by_type(
+        rdma_queue_runtime::get_type(), null_wrapper, "cq_resize_runtime");
+      rdma_resize_fault_runtime::fail_restore_kind = RDMA_QUEUE_RUNTIME_CQ;
+      rdma_resize_fault_runtime::restore_failures = 1;
+      void'(fixture.mem.fail_next("release",
+        rdma_status::make(RDMA_SC_DMA_TRANSLATION, "prepare retained candidate")));
+    end
+    else
+      rdma_cq_resize_exit_runtime::fail_detach = 1'b1;
+    status = probe.resize_cq(fixture.cq.handle, 32, 64);
+    service.set_factory(saved_factory);
+    record = probe.borrow_recovery(fixture.cq.handle);
+    if (status == null || status.code != RDMA_SC_RECOVERY_REQUIRED ||
+        record == null || record.published == prepublish || record.old_runtime == null ||
+        record.dependents.size() == 0 || !probe.has_one_resize_token() ||
+        rdma_resize_fault_runtime::restore_failures != 0 ||
+        rdma_cq_resize_exit_runtime::fail_detach)
+      `uvm_fatal("RESIZE_RETRY", "real resize did not retain the expected recovery stage")
+    if (prepublish && (record.pending_ref == null || !record.prepublish_restore_pending ||
+        !record.cq_restore_pending || record.manager_restore_pending))
+      `uvm_fatal("RESIZE_RETRY", "prepublish fixture lost candidate or restore progress")
+  endtask
+
+  // 功能：覆盖 retry 的 17 个记录内失败出口，另加四个 runtime null-status 分支。
+  // 输入/输出及副作用：mode=0..20 选择 authority/阶段/恢复/释放故障；每次只改一个
+  //   测试借用字段或一次性开关，检查准确诊断、last_status 引用、锁、分配及幂等进度。
+  // 失败/边界：非法 mode fatal；恢复被破坏字段后真实 retry 必须完成，再次 retry 拒绝
+  //   且不改旧记录；最终 fixture cleanup 必须零分配，不能用直接释放掩盖恢复失败。
+  task run_retry_case(int unsigned mode);
+    rdma_queue_data_engine_fixture fixture;
+    rdma_cq_resize_exit_probe probe;
+    rdma_cq_resize_recovery record;
+    rdma_queue_data_attachment attachment;
+    rdma_queue_runtime old_runtime, attachment_runtime;
+    rdma_function_identity identity;
+    rdma_handle request_h, dependent_h;
+    rdma_status status, failure;
+    rdma_queue_runtime_state_e old_state, dependent_state;
+    rdma_queue_runtime_kind_e dependent_kind;
+    bit dependent_host_produced, dependent_polarity;
+    bit prepublish;
+    bit saved_epoch_valid;
+    bit [63:0] function_uid;
+    longint unsigned ring_iova;
+    int unsigned live_before, calls_before;
+    string expected;
+
+    prepublish = (mode >= 6 && mode <= 11) || mode == 17 || mode == 19;
+    setup_retry_fixture($sformatf("retry_exit_%0d", mode), prepublish, fixture, probe, record);
+    attachment = probe.borrow_cq_attachment(fixture.cq.handle);
+    if (attachment == null)
+      `uvm_fatal("RESIZE_RETRY", "missing CQ attachment")
+    identity = record.function_identity;
+    function_uid = identity.function_uid;
+    old_runtime = record.old_runtime;
+    attachment_runtime = attachment.runtime;
+    old_state = old_runtime.state;
+    dependent_state = record.dependents[0].state;
+    status = record.dependents[0].query_attachment_config(
+      dependent_h, dependent_kind, dependent_host_produced, dependent_polarity);
+    if (status == null || !status.ok())
+      `uvm_fatal("RESIZE_RETRY", "dependent kind snapshot unavailable")
+    saved_epoch_valid = record.backing_epoch_valid;
+    request_h = rdma_clone_handle_value(fixture.cq.handle, "retry input");
+    ring_iova = check_authority(fixture, prepublish ? 16 : 32, 0, 1'b0);
+    live_before = fixture.mem.live_allocations();
+
+    case (mode)
+      0: begin
+        request_h.generation += 2;
+        expected = "CQ resize recovery handle does not match record";
+      end
+      1: begin
+        record.function_identity = null;
+        expected = "CQ resize recovery Function identity is missing";
+      end
+      2: begin
+        identity.function_uid ^= 1;
+        expected = "CQ resize recovery Function route identity changed";
+      end
+      3: begin
+        attachment.runtime = null;
+        expected = "CQ resize recovery attachment authority is inconsistent";
+      end
+      4: begin
+        record.published = 1'b0;
+        expected = "CQ resize recovery attachment stage is inconsistent";
+      end
+      5: begin
+        record.backing_epoch_valid = 1'b0;
+        expected = "CQ resize recovery backing identity changed";
+      end
+      6: begin
+        record.old_runtime = null;
+        expected = "CQ pre-publish old runtime authority is missing";
+      end
+      7: begin
+        rdma_resize_fault_runtime::fail_restore_kind = RDMA_QUEUE_RUNTIME_CQ;
+        rdma_resize_fault_runtime::restore_failures = 1;
+        expected = "CQ pre-publish old runtime restore failed: injected dependent restore failure";
+      end
+      8: begin
+        old_runtime.state = RDMA_QUEUE_RUNTIME_DETACHED;
+        expected = "CQ pre-publish old runtime state is unexpected";
+      end
+      9, 13: begin
+        record.dependents[0].state = RDMA_QUEUE_RUNTIME_DETACHED;
+        expected = {mode == 9 ? "CQ pre-publish dependent restore failed: " :
+          "CQ resize dependent recovery retry failed: ",
+          "CQ dependent runtime has unexpected state"};
+      end
+      10: begin
+        record.manager_restore_pending = 1'b1;
+        expected = {"CQ pre-publish manager restore failed: ",
+          "only QUIESCING or safe ERROR MR can be restored ACTIVE"};
+      end
+      11, 16: begin
+        void'(fixture.mem.fail_next("release",
+          rdma_status::make(RDMA_SC_DMA_TRANSLATION, "injected retry release")));
+        expected = {mode == 11 ? "CQ candidate cleanup retry failed: " :
+          "CQ resize old backing cleanup retry failed: ", "injected retry release"};
+      end
+      12: begin
+        record.old_runtime = null;
+        expected = "CQ resize recovery authority is incomplete";
+      end
+      14: begin
+        rdma_cq_resize_exit_runtime::fail_detach = 1'b1;
+        expected = "CQ resize old runtime detach retry failed: injected old CQ detach";
+      end
+      15: begin
+        old_runtime.state = RDMA_QUEUE_RUNTIME_ACTIVE;
+        expected = "CQ resize old runtime has unexpected state";
+      end
+      17: begin
+        rdma_resize_fault_runtime::fail_restore_kind = RDMA_QUEUE_RUNTIME_CQ;
+        rdma_cq_resize_exit_runtime::null_restore = 1'b1;
+        expected = "CQ pre-publish old runtime restore returned null";
+      end
+      18: begin
+        rdma_cq_resize_exit_runtime::null_detach = 1'b1;
+        expected = "CQ resize old runtime detach returned null";
+      end
+      19, 20: begin
+        record.dependents[0].state = RDMA_QUEUE_RUNTIME_QUIESCING;
+        rdma_resize_fault_runtime::fail_restore_kind = dependent_kind;
+        rdma_cq_resize_exit_runtime::null_restore = 1'b1;
+        expected = {mode == 19 ? "CQ pre-publish dependent restore failed: " :
+          "CQ resize dependent recovery retry failed: ",
+          "CQ dependent runtime restore returned null"};
+      end
+      default: `uvm_fatal("RESIZE_RETRY", "retry mode out of range")
+    endcase
+    calls_before = fixture.mem.calls.size();
+    failure = probe.retry_cq_resize_cleanup(request_h);
+    if (failure == null || failure.code != RDMA_SC_RECOVERY_REQUIRED ||
+        failure.message != expected ||
+        record.last_status != failure || probe.borrow_recovery(fixture.cq.handle) != record ||
+        !probe.has_one_resize_token() || fixture.mem.live_allocations() != live_before)
+      `uvm_error("RESIZE_RETRY",
+        $sformatf("mode %0d lost diagnostic, record, lock or backing", mode))
+    if (fixture.mem.calls.size() != calls_before + ((mode == 11 || mode == 16) ? 1 : 0) ||
+        rdma_resize_fault_runtime::restore_failures != 0 ||
+        rdma_cq_resize_exit_runtime::fail_detach ||
+        rdma_cq_resize_exit_runtime::null_detach || rdma_cq_resize_exit_runtime::null_restore)
+      `uvm_error("RESIZE_RETRY", "fault skipped or unexpected external call")
+    if ((mode == 7 || mode == 17) && !record.cq_restore_pending)
+      `uvm_error("RESIZE_RETRY", "failed restore cleared its pending authority")
+    if ((mode == 9 || mode == 10 || mode == 11 || mode == 19) && record.cq_restore_pending)
+      `uvm_error("RESIZE_RETRY", "completed CQ restore lost its progress")
+    if ((mode == 11 && record.prepublish_restore_pending) ||
+        (mode == 16 && old_runtime.state != RDMA_QUEUE_RUNTIME_DETACHED))
+      `uvm_error("RESIZE_RETRY", "cleanup retry would repeat an already completed stage")
+
+    // 只修复测试故意破坏的字段，不回退 retry 已完成的 restore/detach 进度。
+    record.function_identity = identity;
+    identity.function_uid = function_uid;
+    attachment.runtime = attachment_runtime;
+    record.published = !prepublish;
+    record.backing_epoch_valid = saved_epoch_valid;
+    record.old_runtime = old_runtime;
+    if (mode == 8 || mode == 15) old_runtime.state = old_state;
+    if (mode == 9 || mode == 13 || mode == 19 || mode == 20)
+      record.dependents[0].state = dependent_state;
+    if (mode == 10) record.manager_restore_pending = 1'b0;
+    void'(check_authority(fixture, prepublish ? 16 : 32, ring_iova, 1'b0));
+    status = probe.retry_cq_resize_cleanup(fixture.cq.handle);
+    if (status == null || !status.ok() || record.last_status != failure ||
+        probe.has_pending_cq_resize(fixture.cq.handle) || !probe.has_one_resize_token() ||
+        fixture.mem.live_allocations() != live_before - 1)
+      `uvm_error("RESIZE_RETRY", "repaired retry did not finish exactly once")
+    status = probe.retry_cq_resize_cleanup(fixture.cq.handle);
+    if (status == null || status.code != RDMA_SC_INVALID_STATE ||
+        record.last_status != failure || !probe.has_one_resize_token())
+      `uvm_error("RESIZE_RETRY", "completed retry changed historical evidence or lock")
+    check_active(fixture);
+    fixture.cleanup(status);
+    if (status == null || !status.ok() || fixture.needs_cleanup() ||
+        fixture.mem.live_allocations() != 0)
+      `uvm_error("RESIZE_RETRY", "retry fixture cleanup leaked resources")
+    `uvm_info("RESIZE_RETRY", $sformatf("completed resize retry case %0d", mode), UVM_LOW)
+  endtask
+
+  // 功能：在错误 status factory 中嵌套两次 retry，验证共享出口只结束当前自动调用。
+  // 输入/输出及副作用：建立两个真实 published recovery；外层 factory 内同 owner 返回 busy，
+  //   另一 owner 返回 identity 拒绝，随后两者独立记录错误、解锁并完成真实 cleanup。
+  // 失败/边界：factory 回调中不得提前改写外层 last_status；两次失败均需留下一个锁 token，
+  //   内层退出不得跳过外层 completed，最终两个 fixture 必须零分配。
+  task run_nested_retry_case();
+    rdma_queue_data_engine_fixture fixtures[2];
+    rdma_cq_resize_exit_probe probes[2];
+    rdma_cq_resize_recovery records[2];
+    rdma_handle requests[2];
+    rdma_status failure, status;
+    uvm_coreservice_t service;
+    uvm_factory saved_factory;
+    uvm_default_factory local_factory;
+    rdma_cq_resize_retry_status_wrapper callback;
+
+    foreach (fixtures[i]) begin
+      setup_retry_fixture($sformatf("nested_retry_%0d", i), 1'b0,
+        fixtures[i], probes[i], records[i]);
+      requests[i] = rdma_clone_handle_value(fixtures[i].cq.handle, "nested stale request");
+      requests[i].generation += 2;
+    end
+    callback = new();
+    callback.outer_engine = probes[0];
+    callback.outer_cq = requests[0];
+    callback.nested_engine = probes[1];
+    callback.nested_cq = requests[1];
+    callback.outer_record = records[0];
+    callback.prior_status = records[0].last_status;
+    service = uvm_coreservice_t::get();
+    saved_factory = service.get_factory();
+    local_factory = new();
+    local_factory.set_type_override_by_type(rdma_status::get_type(), callback);
+    service.set_factory(local_factory);
+    failure = probes[0].retry_cq_resize_cleanup(requests[0]);
+    service.set_factory(saved_factory);
+    if (!callback.completed || !callback.evidence_unchanged || callback.busy_status == null ||
+        callback.busy_status.code != RDMA_SC_RESOURCE_BUSY || callback.nested_status == null ||
+        callback.nested_status.code != RDMA_SC_RECOVERY_REQUIRED || failure == null ||
+        failure.code != RDMA_SC_RECOVERY_REQUIRED || records[0].last_status != failure ||
+        records[1].last_status != callback.nested_status || failure == callback.nested_status)
+      `uvm_error("RESIZE_RETRY", "nested retry escaped its activation or published evidence early")
+    foreach (fixtures[i]) begin
+      if (!probes[i].has_one_resize_token())
+        `uvm_error("RESIZE_RETRY", "nested retry leaked or duplicated its lock")
+      status = probes[i].retry_cq_resize_cleanup(fixtures[i].cq.handle);
+      if (status == null || !status.ok() || probes[i].has_pending_cq_resize(fixtures[i].cq.handle))
+        `uvm_error("RESIZE_RETRY", "nested retry recovery did not complete")
+      check_active(fixtures[i]);
+      fixtures[i].cleanup(status);
+      if (status == null || !status.ok() || fixtures[i].needs_cleanup() ||
+          fixtures[i].mem.live_allocations() != 0)
+        `uvm_error("RESIZE_RETRY", "nested retry cleanup leaked resources")
+    end
+    `uvm_info("RESIZE_RETRY", "completed resize retry case 21", UVM_LOW)
+  endtask
+
+  // 功能：运行既有 16-case resize 与新增 22-case retry 矩阵，包含跨 engine factory 嵌套。
   // 输入/输出及副作用：phase 控制 objection；各 case 独立资源和 factory，不共享 ring。
   // 失败/边界：case 报告错误由 UVM 汇总，全部完成后才打印计数并释放 objection。
   task run_phase(uvm_phase phase);
@@ -359,6 +741,10 @@ class rdma_cq_resize_exit_test extends uvm_test;
       run_case(mode);
     run_nested_case();
     `uvm_info("RESIZE_EXIT", "completed 16 resize exit cases", UVM_LOW)
+    for (int unsigned mode = 0; mode < 21; mode++)
+      run_retry_case(mode);
+    run_nested_retry_case();
+    `uvm_info("RESIZE_RETRY", "completed 22 resize retry cases", UVM_LOW)
     phase.drop_objection(this);
   endtask
 endclass

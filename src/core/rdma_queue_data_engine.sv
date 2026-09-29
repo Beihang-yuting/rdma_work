@@ -17,6 +17,7 @@
 // Host 发布：SQ/RQ/SRQ 尾段共享未提交失败的恢复出口，仍按已写入/MMIO 阶段决定 evidence。
 // Resize 提交：发布前失败共享一个 rollback 出口；发布后只保留新 authority 与旧资源
 //   cleanup evidence，不回滚 manager swap，也不新增候选 owner 或延迟字段快照。
+// Resize 重试：记录内失败统一保存原位置物化的诊断并解锁；两个成功出口仍先解锁后分配状态。
 
 // 设计说明：本层是 host 侧 queue-data facade。queue 的生命周期仍归 lifecycle
 // resource 所有；engine 仅在 attachment 存活期间保存 detached runtime cursor 和
@@ -2966,9 +2967,9 @@ class rdma_queue_data_engine extends uvm_object;
     write_commit_device_entry(attachment, reservation, image, result, status);
   endtask
 
-  // 功能：has_pending_cq_resize 查询指定 CQ 是否存在已发布但尚未完成的旧 backing 清理。
+  // 功能：has_pending_cq_resize 查询 CQ 是否存在发布前恢复/候选清理或发布后旧资源清理记录。
   // 输入/输出及副作用：cq_h 为输入；函数只读取 engine recovery 表，不改变 runtime、manager 或 Host-memory。
-  // 失败/边界：空句柄、未配置或不存在记录均返回 0；调用方不得把 0 当作“CQ 一定可 resize”之外的证据。
+  // 失败/边界：未配置、null/非 CQ handle、空键或记录不存在/为空返回 0；不据此授予 resize authority。
   function bit has_pending_cq_resize(rdma_handle cq_h);
     string key;
     if (!configured || cq_h == null || cq_h.kind != RDMA_RESOURCE_CQ)
@@ -2978,12 +2979,14 @@ class rdma_queue_data_engine extends uvm_object;
            cq_resize_recoveries[key] != null;
   endfunction
 
-  // 功能：retry_cq_resize_cleanup 重试已发布 CQ resize 的依赖恢复、旧 runtime
-  //   detach 和旧 backing release。
-  // 输入/输出及副作用：cq_h 为输入；成功时删除 engine-owned recovery record，
-  //   失败时更新 last_status 并保留全部重试 authority。
-  // 失败/边界：当前 CQ 不存在 recovery、代际失效、依赖仍无法恢复、旧 runtime
-  //   状态异常或 Host-memory release 未完成时返回 RECOVERY_REQUIRED。
+  // 功能：retry_cq_resize_cleanup 按记录阶段重试 CQ/依赖/manager 恢复和候选清理，
+  //   或已发布后的依赖恢复、旧 runtime detach 与旧 backing release。
+  // 输入/输出及副作用：cq_h 为旧记录或当前 binding 代际的 CQ 输入；在 resize_lock 内
+  //   校验 authority，逐步清除已完成的 restore flag；记录内失败统一保存 last_status
+  //   后解锁，成功删除记录并先解锁后创建 OK，不重写成功前保留的历史诊断。
+  // 失败/边界：未配置/无记录为 INVALID_STATE，null/非 CQ 为 INVALID_ARGUMENT，锁忙为
+  //   RESOURCE_BUSY；记录身份/route/阶段/backing 不符，restore/detach/release 失败或未完成
+  //   为 RECOVERY_REQUIRED，保留记录和已完成进度；允许旧代际 cleanup 不等于恢复普通 I/O 权限。
   function rdma_status retry_cq_resize_cleanup(rdma_handle cq_h);
     rdma_cq_resize_recovery recovery;
     rdma_queue_data_attachment current_attachment;
@@ -3007,225 +3010,203 @@ class rdma_queue_data_engine extends uvm_object;
       return bad("CQ resize has no pending recovery", RDMA_SC_INVALID_STATE);
     end
     recovery = cq_resize_recoveries[key];
-    // 设计说明：Function reset 改变 binding.generation 后，recovery 仍允许完成
-    // 已记录的旧代际事务；caller 必须提供记录中的 identity，并携带旧代际或当前代际。
-    // 该例外只授权清理遗留事务，不能据此对 stale CQ 执行普通数据面操作。
-    if (!value_ops::same_cq_recovery_identity(recovery.cq_h, cq_h) ||
-        (cq_h.generation != recovery.cq_h.generation &&
-         (binding == null || cq_h.generation != binding.generation))) begin
-      status = bad("CQ resize recovery handle does not match record",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
-    if (binding == null || recovery.function_identity == null) begin
-      status = bad("CQ resize recovery Function identity is missing",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
-    current_identity = binding.function_identity_snapshot();
-    if (current_identity == null ||
-        current_identity.function_uid != recovery.function_identity.function_uid ||
-        !current_identity.same_function(recovery.function_identity)) begin
-      status = bad("CQ resize recovery Function route identity changed",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
-    status = find_cq_recovery_attachment(recovery, current_attachment,
-                                         current_attachment_key);
-    if (status == null || !status.ok() || current_attachment == null ||
-        current_attachment.runtime == null ||
-        current_attachment.access == null) begin
-      status = bad("CQ resize recovery attachment authority is inconsistent",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
-    attachment_is_old = current_attachment.runtime === recovery.old_runtime;
-    if ((recovery.published && attachment_is_old) ||
-        (!recovery.published && recovery.old_runtime != null &&
-         !attachment_is_old)) begin
-      status = bad("CQ resize recovery attachment stage is inconsistent",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
-    // 设计说明：释放 retained backing 前必须重验 opaque allocation identity 以及
-    // 不可变的 Function/CQ route evidence。检查刻意放在每次 retry 中执行，因为
-    // recovery record 是 engine 拥有的可变存储，并可能跨越 reset 边界继续存活。
-    if ((!recovery.published && recovery.pending_ref != null &&
-         !recovery_backing_matches(recovery.pending_ref, recovery)) ||
-        (recovery.published &&
-         !recovery_backing_matches(recovery.old_ref, recovery))) begin
-      status = bad("CQ resize recovery backing identity changed",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
-    // 发布前失败可能同时保留候选 backing 和尚未恢复的 quiesce 屏障。
-    // 先恢复原 CQ/dependents/manager，再处理候选 cleanup，避免在旧
-    // attachment 仍被阻塞时丢失可用的恢复入口。
-    if (!recovery.published) begin
-      if (recovery.prepublish_restore_pending) begin
-        if (recovery.old_runtime == null) begin
-          status = bad("CQ pre-publish old runtime authority is missing",
-                       RDMA_SC_RECOVERY_REQUIRED);
-          recovery.last_status = status;
-          resize_lock.put(1);
-          return status;
-        end
-        if (recovery.cq_restore_pending) begin
-          if (recovery.old_runtime.state == RDMA_QUEUE_RUNTIME_QUIESCING) begin
-            status = recovery.old_runtime.restore_active();
-            if (status == null || !status.ok()) begin
-              status = status == null ?
-                bad("CQ pre-publish old runtime restore returned null",
-                    RDMA_SC_RECOVERY_REQUIRED) :
-                rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
-                  {"CQ pre-publish old runtime restore failed: ",
-                   status.message});
-              recovery.last_status = status;
-              resize_lock.put(1);
-              return status;
-            end
-          end
-          else if (recovery.old_runtime.state !=
-                   RDMA_QUEUE_RUNTIME_ACTIVE) begin
-            status = bad("CQ pre-publish old runtime state is unexpected",
+
+    // 单次循环只统一本次调用的记录内失败；各分支先按原规则完成状态分配和进度更新。
+    // 成功仍在自己的阶段删除记录、解锁后再分配 OK，不进入失败出口；禁止命名块
+    // disable，以免 factory 嵌套另一 engine 的 retry 时同时退出外层同名调用。
+    do begin : resize_recovery
+      // 设计说明：Function reset 改变 binding.generation 后，recovery 仍允许完成
+      // 已记录的旧代际事务；caller 必须提供记录中的 identity，并携带旧代际或当前代际。
+      // 该例外只授权清理遗留事务，不能据此对 stale CQ 执行普通数据面操作。
+      if (!value_ops::same_cq_recovery_identity(recovery.cq_h, cq_h) ||
+          (cq_h.generation != recovery.cq_h.generation &&
+           (binding == null || cq_h.generation != binding.generation))) begin
+        status = bad("CQ resize recovery handle does not match record",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        break;
+      end
+      if (binding == null || recovery.function_identity == null) begin
+        status = bad("CQ resize recovery Function identity is missing",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        break;
+      end
+      current_identity = binding.function_identity_snapshot();
+      if (current_identity == null ||
+          current_identity.function_uid != recovery.function_identity.function_uid ||
+          !current_identity.same_function(recovery.function_identity)) begin
+        status = bad("CQ resize recovery Function route identity changed",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        break;
+      end
+      status = find_cq_recovery_attachment(recovery, current_attachment,
+                                           current_attachment_key);
+      if (status == null || !status.ok() || current_attachment == null ||
+          current_attachment.runtime == null ||
+          current_attachment.access == null) begin
+        status = bad("CQ resize recovery attachment authority is inconsistent",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        break;
+      end
+      attachment_is_old = current_attachment.runtime === recovery.old_runtime;
+      if ((recovery.published && attachment_is_old) ||
+          (!recovery.published && recovery.old_runtime != null &&
+           !attachment_is_old)) begin
+        status = bad("CQ resize recovery attachment stage is inconsistent",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        break;
+      end
+      // 设计说明：释放 retained backing 前必须重验 opaque allocation identity 以及
+      // 不可变的 Function/CQ route evidence。检查刻意放在每次 retry 中执行，因为
+      // recovery record 是 engine 拥有的可变存储，并可能跨越 reset 边界继续存活。
+      if ((!recovery.published && recovery.pending_ref != null &&
+           !recovery_backing_matches(recovery.pending_ref, recovery)) ||
+          (recovery.published &&
+           !recovery_backing_matches(recovery.old_ref, recovery))) begin
+        status = bad("CQ resize recovery backing identity changed",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        break;
+      end
+      // 发布前失败可能同时保留候选 backing 和尚未恢复的 quiesce 屏障。
+      // 先恢复原 CQ/dependents/manager，再处理候选 cleanup，避免在旧
+      // attachment 仍被阻塞时丢失可用的恢复入口。
+      if (!recovery.published) begin
+        if (recovery.prepublish_restore_pending) begin
+          if (recovery.old_runtime == null) begin
+            status = bad("CQ pre-publish old runtime authority is missing",
                          RDMA_SC_RECOVERY_REQUIRED);
-            recovery.last_status = status;
-            resize_lock.put(1);
-            return status;
+            break;
           end
-          recovery.cq_restore_pending = 1'b0;
-        end
-        status = restore_cq_dependents(recovery.dependents);
-        if (status == null || !status.ok()) begin
-          status = status == null ?
-            bad("CQ pre-publish dependent restore returned null",
-                RDMA_SC_RECOVERY_REQUIRED) :
-            rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
-              {"CQ pre-publish dependent restore failed: ", status.message});
-          recovery.last_status = status;
-          resize_lock.put(1);
-          return status;
-        end
-        if (recovery.manager_restore_pending) begin
-          status = manager.restore_active(recovery.cq_h);
+          if (recovery.cq_restore_pending) begin
+            if (recovery.old_runtime.state == RDMA_QUEUE_RUNTIME_QUIESCING) begin
+              status = recovery.old_runtime.restore_active();
+              if (status == null || !status.ok()) begin
+                status = status == null ?
+                  bad("CQ pre-publish old runtime restore returned null",
+                      RDMA_SC_RECOVERY_REQUIRED) :
+                  rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                    {"CQ pre-publish old runtime restore failed: ",
+                     status.message});
+                break;
+              end
+            end
+            else if (recovery.old_runtime.state !=
+                     RDMA_QUEUE_RUNTIME_ACTIVE) begin
+              status = bad("CQ pre-publish old runtime state is unexpected",
+                           RDMA_SC_RECOVERY_REQUIRED);
+              break;
+            end
+            recovery.cq_restore_pending = 1'b0;
+          end
+          status = restore_cq_dependents(recovery.dependents);
           if (status == null || !status.ok()) begin
             status = status == null ?
-              bad("CQ pre-publish manager restore returned null",
+              bad("CQ pre-publish dependent restore returned null",
                   RDMA_SC_RECOVERY_REQUIRED) :
               rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
-                {"CQ pre-publish manager restore failed: ", status.message});
-            recovery.last_status = status;
-            resize_lock.put(1);
-            return status;
+                {"CQ pre-publish dependent restore failed: ", status.message});
+            break;
           end
-          recovery.manager_restore_pending = 1'b0;
+          if (recovery.manager_restore_pending) begin
+            status = manager.restore_active(recovery.cq_h);
+            if (status == null || !status.ok()) begin
+              status = status == null ?
+                bad("CQ pre-publish manager restore returned null",
+                    RDMA_SC_RECOVERY_REQUIRED) :
+                rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                  {"CQ pre-publish manager restore failed: ", status.message});
+              break;
+            end
+            recovery.manager_restore_pending = 1'b0;
+          end
+          recovery.prepublish_restore_pending = 1'b0;
         end
-        recovery.prepublish_restore_pending = 1'b0;
-      end
-      if (recovery.pending_ref != null) begin
-        status = backing_planner.cleanup_local_role(
-          recovery.pending_ref, cleanup_complete);
-        if (status == null || !status.ok() || !cleanup_complete) begin
-          if (status == null)
-            status = bad("CQ candidate cleanup retry returned null",
-                         RDMA_SC_RECOVERY_REQUIRED);
-          else if (!status.ok())
-            status = rdma_status::make(
-              RDMA_SC_RECOVERY_REQUIRED,
-              {"CQ candidate cleanup retry failed: ", status.message});
-          else
-            status = bad("CQ candidate cleanup remains incomplete",
-                         RDMA_SC_RECOVERY_REQUIRED);
-          recovery.last_status = status;
-          resize_lock.put(1);
-          return status;
+        if (recovery.pending_ref != null) begin
+          status = backing_planner.cleanup_local_role(
+            recovery.pending_ref, cleanup_complete);
+          if (status == null || !status.ok() || !cleanup_complete) begin
+            if (status == null)
+              status = bad("CQ candidate cleanup retry returned null",
+                           RDMA_SC_RECOVERY_REQUIRED);
+            else if (!status.ok())
+              status = rdma_status::make(
+                RDMA_SC_RECOVERY_REQUIRED,
+                {"CQ candidate cleanup retry failed: ", status.message});
+            else
+              status = bad("CQ candidate cleanup remains incomplete",
+                           RDMA_SC_RECOVERY_REQUIRED);
+            break;
+          end
         end
+        cq_resize_recoveries.delete(key);
+        resize_lock.put(1);
+        return rdma_status::success();
       end
-      cq_resize_recoveries.delete(key);
-      resize_lock.put(1);
-      return rdma_status::success();
-    end
-    if (recovery.old_runtime == null || recovery.old_ref == null ||
-        recovery.old_ref.mapping == null) begin
-      status = bad("CQ resize recovery authority is incomplete",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
-
-    // 依赖恢复可能在上一轮只完成了部分 runtime；restore helper 对已经
-    // ACTIVE 的 runtime 幂等跳过，保证本入口可以安全重复调用。
-    status = restore_cq_dependents(recovery.dependents);
-    if (status == null || !status.ok()) begin
-      if (status == null)
-        status = bad("CQ resize dependent recovery returned null",
+      if (recovery.old_runtime == null || recovery.old_ref == null ||
+          recovery.old_ref.mapping == null) begin
+        status = bad("CQ resize recovery authority is incomplete",
                      RDMA_SC_RECOVERY_REQUIRED);
-      else
-        status = rdma_status::make(
-          RDMA_SC_RECOVERY_REQUIRED,
-          {"CQ resize dependent recovery retry failed: ", status.message});
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
+        break;
+      end
 
-    if (recovery.old_runtime.state == RDMA_QUEUE_RUNTIME_QUIESCING) begin
-      status = recovery.old_runtime.detach_quiesced();
+      // 依赖恢复可能在上一轮只完成了部分 runtime；restore helper 对已经
+      // ACTIVE 的 runtime 幂等跳过，保证本入口可以安全重复调用。
+      status = restore_cq_dependents(recovery.dependents);
       if (status == null || !status.ok()) begin
         if (status == null)
-          status = bad("CQ resize old runtime detach returned null",
+          status = bad("CQ resize dependent recovery returned null",
                        RDMA_SC_RECOVERY_REQUIRED);
         else
           status = rdma_status::make(
             RDMA_SC_RECOVERY_REQUIRED,
-            {"CQ resize old runtime detach retry failed: ", status.message});
-        recovery.last_status = status;
-        resize_lock.put(1);
-        return status;
+            {"CQ resize dependent recovery retry failed: ", status.message});
+        break;
       end
-    end
-    else if (recovery.old_runtime.state != RDMA_QUEUE_RUNTIME_DETACHED) begin
-      status = bad("CQ resize old runtime has unexpected state",
-                   RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
 
-    status = backing_planner.cleanup_local_role(recovery.old_ref,
-                                                cleanup_complete);
-    if (status == null || !status.ok() || !cleanup_complete) begin
-      if (status == null)
-        status = bad("CQ resize old backing cleanup returned null",
+      if (recovery.old_runtime.state == RDMA_QUEUE_RUNTIME_QUIESCING) begin
+        status = recovery.old_runtime.detach_quiesced();
+        if (status == null || !status.ok()) begin
+          if (status == null)
+            status = bad("CQ resize old runtime detach returned null",
+                         RDMA_SC_RECOVERY_REQUIRED);
+          else
+            status = rdma_status::make(
+              RDMA_SC_RECOVERY_REQUIRED,
+              {"CQ resize old runtime detach retry failed: ", status.message});
+          break;
+        end
+      end
+      else if (recovery.old_runtime.state != RDMA_QUEUE_RUNTIME_DETACHED) begin
+        status = bad("CQ resize old runtime has unexpected state",
                      RDMA_SC_RECOVERY_REQUIRED);
-      else if (!status.ok())
-        status = rdma_status::make(
-          RDMA_SC_RECOVERY_REQUIRED,
-          {"CQ resize old backing cleanup retry failed: ", status.message});
-      else
-        status = bad("CQ resize old backing cleanup is incomplete",
-                     RDMA_SC_RECOVERY_REQUIRED);
-      recovery.last_status = status;
-      resize_lock.put(1);
-      return status;
-    end
+        break;
+      end
 
-    cq_resize_recoveries.delete(key);
+      status = backing_planner.cleanup_local_role(recovery.old_ref,
+                                                  cleanup_complete);
+      if (status == null || !status.ok() || !cleanup_complete) begin
+        if (status == null)
+          status = bad("CQ resize old backing cleanup returned null",
+                       RDMA_SC_RECOVERY_REQUIRED);
+        else if (!status.ok())
+          status = rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED,
+            {"CQ resize old backing cleanup retry failed: ", status.message});
+        else
+          status = bad("CQ resize old backing cleanup is incomplete",
+                       RDMA_SC_RECOVERY_REQUIRED);
+        break;
+      end
+
+      cq_resize_recoveries.delete(key);
+      resize_lock.put(1);
+      return rdma_status::success();
+    end while (1'b0);
+
+    // 失败的 status 已在原位置物化；这里不重新分配或读取 live authority，
+    // 只发布到本次捕获的记录并恰好归还一个 token，保留已完成阶段供下次跳过。
+    recovery.last_status = status;
     resize_lock.put(1);
-    return rdma_status::success();
+    return status;
   endfunction
 
   // 功能：configure 验证当前 Function binding 与外部依赖，配置本地 backing
