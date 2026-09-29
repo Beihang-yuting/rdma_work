@@ -24,7 +24,16 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch234：基于 `f4933f0` 沿用 `feature/rdma-structural-batch226`，将 backing
+当前 Batch235：基于 `fc8b61f` 沿用 `feature/rdma-structural-batch226`，两个 doorbell
+barrier 限时 task 合为一个，不合并真正的 MMIO 写入、effect 或 Function lock。
+生产 1,606→1,580 行，44→43 methods；两份 barrier 的 tokens 270→167，公开接口
+不变。新增独立 23-case 策略/故障/总预算/并发取消矩阵与六项 Python 门禁；旧版
+基线、重构版专项、core 104/87、CMQ 28/11（PROCESS/LOGICAL）、integration 10、
+Host-memory 3、PCIe 1、E2E 3、Python 371/371、驱动及等价/静态审计全部通过。
+E2E 各保留 4 条基线编译告警，最终送测 hashes 一致。详见
+`task-rdma-batch235-doorbell-barrier-report.md`；不合并、不推送，项目仍 active。
+
+前批 Batch234：基于 `f4933f0` 沿用 `feature/rdma-structural-batch226`，将 backing
 四入口的重复搬运收为一个写循环和一个读循环。各入口保留原 DMA 方向、预检/null
 策略、诊断和 device backend-started 语义；不新增 owner/字段。生产 619→603 行，
 搬运相关 tokens 951→725，11 个公开声明不变，增加两个 protected helper。
@@ -192,13 +201,13 @@ L6 只协调外部生命周期并在边界验证完整 route、authority 和 res
 | P1 | `rdma_queue_runtime.sv` | 3,814 行/74 methods | runtime snapshot/predicate 与 mutation owner 分界 | 深复制/值比较已迁入 projector；继续 snapshot/commit 业务组合与重复状态处理 |
 | P2 | `rdma_queue_lifecycle_policy.sv` + queue/QP executors | 2,118 / 2,819 / 4,338 行 | policy、执行副作用、状态迁移表分离 | operation envelope 与 transition candidate |
 | P2 | `rdma_reset_coordinator.sv` | 2,127 行/55 methods | 只保留全局 reset lease/epoch 协调 | reset evidence/candidate，禁止复制 queue/CMQ ledger |
-| P3 | `rdma_doorbell_scheduler.sv` | 1,606 行/44 methods | descriptor/polarity/cursor 纯值层 | 通用状态字段已复用 types；detached doorbell plan 待推进 |
+| P3 | `rdma_doorbell_scheduler.sv` | 1,580 行/43 methods | descriptor/polarity/cursor 纯值层 | 通用状态字段已复用 types，barrier 限时能力已共用；detached doorbell plan 待推进 |
 
 SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 L4 policy adapter，
 公共复杂度回收到 queue-data/runtime transaction 层。Host-memory、PCIe、网络和
 dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 adapter/router。
 
-上表 queue-data/manager/runtime 已分别按 Batch233/221/229 源码重测，doorbell 按 Batch231，
+上表 queue-data/manager/runtime 已分别按 Batch233/221/229 源码重测，doorbell 按 Batch235，
 其余维持 Batch218；
 独立 queue-data projector 为 831 行/23 methods，resource projector 为 2,217 行/47 methods，
 runtime projector 为 830 行/20 methods；公共 rdma_status 为 280 行/10 methods。

@@ -22,6 +22,14 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch235 基于 `fc8b61f` 沿用 `feature/rdma-structural-batch226`：门铃 DMA/MMIO
+barrier 共用限时 worker/timer，保留阶段顺序、诊断、局部取消域与 MMIO 可见性边界；
+生产净减 26 行，不新增 owner 或状态。独立 23-case 矩阵在旧实现及重构版通过；
+core 104/87、CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、
+E2E 3、Python 371/371、驱动及等价/静态门禁全部通过；E2E 保留基线编译告警，
+最终送测 hashes 一致。
+不合并、不推送，见 `task-rdma-batch235-doorbell-barrier-report.md`；项目仍 active。
+
 Batch234 基于 `f4933f0` 沿用 `feature/rdma-structural-batch226`：backing read/readback
 和 write/write_device 各共用一套字节循环，保留方向、预检、诊断、失败前缀和
 device started；11 public 不变，不新增状态/owner。生产净减 16 行，相关 tokens

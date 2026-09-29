@@ -4,6 +4,7 @@
 // 所有权与生命周期：descriptor/result/envelope 拥有 detached 值；scheduler/observer 只借用外部 adapter 或回调引用。
 // 状态边界：普通字段初始化/复制由 rdma_status 提供；legacy 的枚举准入保留在 envelope，
 //   raw factory、直接构造名称和 submission_effect 高水位仍由当前业务边界决定。
+//   DMA/MMIO barrier 共用限时执行能力；顺序、effect 和真正的 MMIO 写入仍由提交流程决定。
 
 // 设计说明：依赖阶段和 barrier policy 是硬件发布顺序的显式输入；effect 则是
 // 恢复方可消费的单调高水位，禁止从最终 status 反推已经发生的外部副作用。
@@ -851,32 +852,46 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = make_status_direct(RDMA_SC_OK);
   endtask
 
-  // 功能：用总 deadline 的剩余预算执行一次 PCIe DMA visibility barrier。
-  // 输入/输出及副作用：function_h/deadline 为输入；调用 pcie task，并输出其 status 或本地失败 status。
-  // 失败/边界：入口/等待超时返回 TIMEOUT；adapter 返回 null 转为 INVALID_STATE；timer 胜出时终止本调用 worker。
-  protected task dma_barrier_before_deadline(
+  // 设计：DMA visibility 与 MMIO ordering 共用等待/取消机制，但不合并业务阶段。
+  //   worker/timer 必须放在本次调用独占的子进程内，disable fork 只取消其后代，
+  //   不能使用具名 disable 影响另一 Function 的并发 activation；不捕获或推进 effect。
+  // 功能：barrier_before_deadline 按 dma_visibility 选择一次 PCIe DMA 或 MMIO barrier，
+  //   消耗 caller 提供的总 deadline 剩余预算，不为各阶段重新计时。
+  // 输入/输出及副作用：function_h 为非拥有输入，dma_visibility=1 选择 DMA、0 选择 MMIO；
+  //   deadline 输入，status 输出原始后端引用或直接构造的本地错误；不写 Host-memory/MMIO。
+  // 失败/边界：caller 须先完成配置与 authority 预检；入口已到期时零后端调用，等待超时
+  //   返回 TIMEOUT 并终止本次 worker；后端 null 返回 INVALID_STATE，非空状态原样交付。
+  //   此处取消仿真 worker 不证明真实外部 barrier 可回滚；锁释放与可见性证据由 caller 管理。
+  protected task barrier_before_deadline(
     rdma_function_handle function_h,
+    bit dma_visibility,
     time deadline,
     output rdma_status status
   );
     rdma_status worker_status;
     bit worker_done;
     time remaining;
+    string operation;
 
     worker_status = null;
     worker_done = 1'b0;
+    operation = dma_visibility ? "DMA visibility barrier" :
+                                 "MMIO ordering barrier";
     if (!deadline_remaining(deadline, remaining)) begin
-      status = timeout_status("DMA visibility barrier");
+      status = timeout_status(operation);
       return;
     end
     fork
-      begin : dma_barrier_deadline_scope
+      begin : barrier_deadline_scope
         fork
-          begin : dma_barrier_worker
-            pcie.dma_visibility_barrier(function_h, worker_status);
+          begin : barrier_worker
+            if (dma_visibility)
+              pcie.dma_visibility_barrier(function_h, worker_status);
+            else
+              pcie.mmio_ordering_barrier(function_h, worker_status);
             worker_done = 1'b1;
           end
-          begin : dma_barrier_timer
+          begin : barrier_timer
             #(remaining);
           end
         join_any
@@ -884,55 +899,12 @@ class rdma_doorbell_scheduler extends uvm_object;
       end
     join
     if (!worker_done) begin
-      status = timeout_status("DMA visibility barrier");
+      status = timeout_status(operation);
       return;
     end
     if (worker_status == null) begin
       status = make_status_direct(RDMA_SC_INVALID_STATE,
-                                  "PCIe DMA barrier returned null status");
-      return;
-    end
-    status = worker_status;
-  endtask
-
-  // 功能：用总 deadline 的剩余预算执行一次 PCIe MMIO ordering barrier。
-  // 输入/输出及副作用：function_h/deadline 为输入；调用 pcie task，并输出其 status 或本地失败 status。
-  // 失败/边界：入口/等待超时返回 TIMEOUT；adapter 返回 null 转为 INVALID_STATE；timer 胜出时终止本调用 worker。
-  protected task mmio_barrier_before_deadline(
-    rdma_function_handle function_h,
-    time deadline,
-    output rdma_status status
-  );
-    rdma_status worker_status;
-    bit worker_done;
-    time remaining;
-
-    worker_status = null;
-    worker_done = 1'b0;
-    if (!deadline_remaining(deadline, remaining)) begin
-      status = timeout_status("MMIO ordering barrier");
-      return;
-    end
-    fork
-      begin : mmio_barrier_deadline_scope
-        fork
-          begin : mmio_barrier_worker
-            pcie.mmio_ordering_barrier(function_h, worker_status);
-            worker_done = 1'b1;
-          end
-          begin : mmio_barrier_timer
-            #(remaining);
-          end
-        join_any
-        disable fork;
-      end
-    join
-    if (!worker_done) begin
-      status = timeout_status("MMIO ordering barrier");
-      return;
-    end
-    if (worker_status == null) begin
-      status = make_status_direct(RDMA_SC_INVALID_STATE,
+                                  dma_visibility ? "PCIe DMA barrier returned null status" :
                                   "PCIe MMIO barrier returned null status");
       return;
     end
@@ -1438,8 +1410,9 @@ class rdma_doorbell_scheduler extends uvm_object;
 
     if (desc.barrier_policy inside {RDMA_DB_BARRIER_DMA,
                                     RDMA_DB_BARRIER_DMA_MMIO}) begin
-      dma_barrier_before_deadline(desc.function_h, deadline,
-                                  operation_status);
+      barrier_before_deadline(
+        .function_h(desc.function_h), .dma_visibility(1'b1),
+        .deadline(deadline), .status(operation_status));
       if (!capture_external_status(operation_status, result,
                                    "doorbell_dma_barrier") ||
           !result.status.ok())
@@ -1452,8 +1425,9 @@ class rdma_doorbell_scheduler extends uvm_object;
 
     if (desc.barrier_policy inside {RDMA_DB_BARRIER_MMIO,
                                     RDMA_DB_BARRIER_DMA_MMIO}) begin
-      mmio_barrier_before_deadline(desc.function_h, deadline,
-                                   operation_status);
+      barrier_before_deadline(
+        .function_h(desc.function_h), .dma_visibility(1'b0),
+        .deadline(deadline), .status(operation_status));
       if (!capture_external_status(operation_status, result,
                                    "doorbell_mmio_barrier") ||
           !result.status.ok())

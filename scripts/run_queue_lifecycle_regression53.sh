@@ -61,6 +61,7 @@ readonly CORE_TESTS=(
   rdma_queue_model_test
   rdma_queue_codec_test
   rdma_doorbell_scheduler_test
+  rdma_doorbell_barrier_test
   rdma_doorbell_scheduler_authority_test
   rdma_doorbell_scheduler_reset_epoch_test
   rdma_cmq_engine_test
