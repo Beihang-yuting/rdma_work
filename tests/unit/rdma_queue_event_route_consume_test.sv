@@ -1,10 +1,67 @@
 // 目录：测试层 unit/rdma_queue_event_route_consume_test.sv。
 // 职责：验证合法 CEQE/AEQE image 在 CQN/QPN route 已过期或未知时仍按驱动
 //   语义消费 ring entry：丢弃 payload、推进 CI 并发送 consumer doorbell。
+//   同时锁定结果/continuation 物化失败的零提交与解除注入后的单次消费契约。
 // 依赖：依赖 rdma_queue_data_engine_device_publish_test 提供的 lifecycle fixture、
 //   event topology helper、codec 与 UVM；只通过 mock Host-memory 改写已发布槽位。
 // 所有权与生命周期：测试拥有本地 fixture 和 detached model；queue、mapping、
 //   runtime、PCIe 与资源 executor 仍由 fixture/cleanup helper 管理，不接管外部资源。
+
+// 隔离 factory 只在一次公开 poll 中安装；用实例名定位 raw allocation，避免影响
+// typed-create 的基础 status。miss 最终 OK 紧跟 next cursor 的成功状态，单独计数。
+class rdma_event_consume_factory extends uvm_default_factory;
+  string target_name;
+  string next_name;
+  bit miss_final;
+  bit wrong_type;
+  bit fired;
+  bit next_seen;
+  int unsigned next_status_count;
+  rdma_status next_status;
+
+  // 功能：构造关闭注入的 event poll factory，初始化单次命中和 cursor 状态计数。
+  // 输入/输出及副作用：无输入；不安装全局 factory，不拥有 queue/runtime；next_status
+  //   只借用本次 poll 的值对象，用于验证 miss 最终分配失败仍返回原 cursor 状态。
+  // 失败/边界：case 必须先设置 target_name 或 miss_final/next_name，并在 poll 后恢复 factory。
+  function new();
+    super.new();
+    fired = 1'b0;
+    next_seen = 1'b0;
+    next_status_count = 0;
+  endfunction
+
+  // 功能：对结果、pending、门铃或状态的指定 raw 分配注入一次 null/错型。
+  // 输入/输出及副作用：requested_type/path/name 默认透传；miss_final 在 next_name
+  //   cursor 之后第二次 queue_data_engine_status 创建时注入，并保留第一次状态引用。
+  // 失败/边界：未匹配时不注入；fired 后恢复真实创建；不对 typed status 返回错型，
+  //   外层必须断言 fired，避免因调用名/顺序变化使故障场景静默退化为成功场景。
+  virtual function uvm_object create_object_by_type(
+    uvm_object_wrapper requested_type, string parent_inst_path = "", string name = ""
+  );
+    uvm_object created;
+    rdma_hw_image wrong;
+    bit inject;
+
+    if (name == next_name) next_seen = 1'b1;
+    if (next_seen && name == "queue_data_engine_status") next_status_count++;
+    inject = !fired && ((target_name != "" && name == target_name) ||
+      (miss_final && next_seen && name == "queue_data_engine_status" &&
+       next_status_count == 2));
+    if (inject) begin
+      fired = 1'b1;
+      if (wrong_type) begin
+        wrong = new("event_consume_wrong_type");
+        return wrong;
+      end
+      return null;
+    end
+    created = super.create_object_by_type(requested_type, parent_inst_path, name);
+    if (next_seen && name == "queue_data_engine_status" && next_status_count == 1)
+      if (!$cast(next_status, created))
+        `uvm_fatal("EVENT_PREP", "next cursor status capture failed")
+    return created;
+  endfunction
+endclass
 
 // 设计说明：真实驱动在 event.c 中先判断 wire valid/polarity；image 合法后即使
 // CQN/QPN 找不到对应对象，也会走 update_*_ci 并写 consumer doorbell。测试因此
@@ -29,7 +86,8 @@ class rdma_queue_event_route_consume_test
   // 输入/输出及副作用：fixture、queue、role、index 为输入；data 为输出；函数只读取
   //   对应 ring mapping，不推进 producer/consumer cursor，也不改变 pending/MMIO 记录。
   // 失败/边界：fixture/queue/plan/index、role mapping、Host-memory capability 或长度
-  //   不满足时返回非成功状态；CEQ/AEQ 以外 role、重复 mapping 和非 16-byte read 都拒绝。
+  //   不满足时返回非成功状态；重复 mapping 和非 16-byte read 拒绝；role 按传入值
+  //   查找，本测试只传 CEQ/AEQ，不额外实现 role 白名单。
   function automatic rdma_status read_event_slot_bytes(
     rdma_queue_data_engine_fixture fixture,
     rdma_queue_resource queue,
@@ -76,8 +134,8 @@ class rdma_queue_event_route_consume_test
   //   用于在 malformed rejection 后恢复可解码 entry，再验证后续 retry 只提交一次。
   // 输入/输出及副作用：fixture、queue、role、index、data 为输入；函数只写对应 ring
   //   mapping，不直接修改 runtime cursor、ledger、pending 或 resource ownership。
-  // 失败/边界：输入缺失、mapping 不唯一/不可用、data 非 16-byte 或 Host-memory write
-  //   失败时返回原始错误；调用方不得把 partial write 当作可重试成功。
+  // 失败/边界：输入缺失、mapping 不唯一/不可用、data 非 16-byte 时返回输入/状态错误；
+  //   Host-memory write 错误原样返回，调用方不得把 partial write 当作可重试成功。
   function automatic rdma_status write_event_slot_bytes(
     rdma_queue_data_engine_fixture fixture,
     rdma_queue_resource queue,
@@ -116,7 +174,8 @@ class rdma_queue_event_route_consume_test
   //   读取并重新写入对应 ring mapping 的一个 slot，不推进 runtime PI/CI、used、
   //   pending 或 doorbell ledger。
   // 失败/边界：queue plan、ring mapping、slot 范围或 Host-memory read/write 失败时
-  //   返回原始错误；函数只允许 CEQ/AEQ ring role，不能改写 CQ/WQ 或伪造 publish。
+  //   返回对应错误；调用方必须只传 CEQ/AEQ ring role，函数按 role 查找而不另设白名单，
+  //   不得用它改写 CQ/WQ 或伪造 publish。
   function automatic rdma_status rewrite_event_route_field(
     rdma_queue_data_engine_fixture fixture,
     rdma_queue_resource queue,
@@ -896,8 +955,180 @@ class rdma_queue_event_route_consume_test
     status = rdma_status::success();
   endtask
 
-  // 功能：run_phase 建立共享 event topology，分别执行 CEQ/AEQ stale-route
-  //   契约测试，并在任何阶段后按父类顺序释放所有 lifecycle-owned 资源。
+  // 功能：check_event_prepare_case 在真实 topology 发布一条 CEQE/AEQE，注入路由
+  //   命中/未命中后的物化故障，验证零 ack 与解除注入后的恰好一次消费。
+  // 输入/输出及副作用：fixture/ceq/aeq/cq/qp 提供借用资源；is_aeq/miss/mode/wrong_type
+  //   选择队列、route miss 和 raw allocation 故障；短暂替换 factory，读 CI/used/MMIO，
+  //   失败后正常 poll 清空该事件，不直接修改 runtime 或建立恢复记录。
+  // 失败/边界：mode=0 为成功；1/2/3 为结果/model/final status，4/5/6 为 pending/
+  //   descriptor/noalloc slot，7 只用于 miss 最终 OK；任何故障必须被命中且不 ack，
+  //   mode=7 保留原 next status 的 OK 引用，其余为准确 RESOURCE_EXHAUSTED 诊断。
+  task automatic check_event_prepare_case(
+    rdma_queue_data_engine_fixture fixture, rdma_ceq ceq, rdma_aeq aeq,
+    rdma_cq cq, rdma_qp qp, bit is_aeq, bit miss,
+    int unsigned mode, bit wrong_type
+  );
+    rdma_queue_resource queue;
+    rdma_queue_runtime_kind_e kind;
+    rdma_hw_ceqe_model ceqe;
+    rdma_hw_aeqe_model aeqe;
+    rdma_queue_device_publish_result published;
+    rdma_queue_event_result result;
+    rdma_status status;
+    rdma_event_consume_factory factory;
+    uvm_coreservice_t service;
+    uvm_factory saved_factory;
+    string expected_message;
+    int unsigned pi_before, ci_before, pi_after, ci_after, used, mmio_before;
+    bit pw_before, cw_before, pw_after, cw_after, pending, polarity;
+
+    if (is_aeq) queue = aeq;
+    else queue = ceq;
+    kind = is_aeq ? RDMA_QUEUE_RUNTIME_AEQ : RDMA_QUEUE_RUNTIME_CEQ;
+    status = fixture.engine.query_runtime_producer_polarity(queue.handle, kind, polarity);
+    if (status == null || !status.ok()) begin
+      `uvm_error("EVENT_PREP", "producer polarity unavailable")
+      return;
+    end
+    if (is_aeq) begin
+      aeqe = new("prepare_matrix_aeqe");
+      status = clone_test_handle_value(qp.handle, aeqe.target_h);
+      if (status == null || !status.ok()) begin
+        `uvm_error("EVENT_PREP", "AEQE target clone failed")
+        return;
+      end
+      aeqe.qpn = qp.local_qp_id;
+      aeqe.valid = polarity;
+      aeqe.ecode = 0;
+      aeqe.packet_opcode = 0;
+      fixture.engine.publish_aeqe(aeq.handle, aeqe, published, status);
+    end
+    else begin
+      make_ceqe_from_committed_cq(
+        fixture.engine, cq.handle, cq.local_cq_id, 0, polarity, ceqe, status);
+      if (status == null || !status.ok() || ceqe == null) begin
+        `uvm_error("EVENT_PREP", "CEQE model construction failed")
+        return;
+      end
+      fixture.engine.publish_ceqe(ceq.handle, ceqe, published, status);
+    end
+    if (status == null || !status.ok() || published == null) begin
+      `uvm_error("EVENT_PREP", "event publish failed")
+      return;
+    end
+    if (miss) begin
+      status = rewrite_event_route_field(fixture, queue,
+        is_aeq ? RDMA_QUEUE_ROLE_AEQ_RING : RDMA_QUEUE_ROLE_CEQ_RING,
+        published.index, is_aeq, is_aeq ? 18'h3ffff : 21'h1f_ffff);
+      if (status == null || !status.ok()) begin
+        `uvm_error("EVENT_PREP", "route miss rewrite failed")
+        return;
+      end
+    end
+    status = fixture.engine.query_runtime_cursors(
+      queue.handle, kind, pi_before, pw_before, ci_before, cw_before);
+    if (status == null || !status.ok()) begin
+      `uvm_error("EVENT_PREP", "baseline cursors unavailable")
+      return;
+    end
+    status = fixture.engine.query_runtime_occupancy(queue.handle, kind, used, pending);
+    if (status == null || !status.ok() || used != 1 || pending) begin
+      `uvm_error("EVENT_PREP", "baseline occupancy is not one clean event")
+      return;
+    end
+    mmio_before = mmio_write_count(fixture.pcie);
+    factory = new();
+    factory.next_name = is_aeq ? "next AEQ_cursor" : "next CEQ_cursor";
+    factory.wrong_type = wrong_type;
+    case (mode)
+      1: begin
+        factory.target_name = "prepared_event_result";
+        expected_message = "event result allocation failed";
+      end
+      2: begin
+        factory.target_name = is_aeq ? "prepared_aeqe_model" : "prepared_ceqe_model";
+        expected_message = is_aeq ? "AEQ event model allocation failed" :
+                                   "CEQ event model allocation failed";
+      end
+      3: begin
+        factory.target_name = "event poll final success_status";
+        expected_message = "event poll final success status allocation failed";
+      end
+      4: begin
+        factory.target_name = "prepared_consumer_pending";
+        expected_message = "consumer pending allocation failed";
+      end
+      5: begin
+        factory.target_name = "consumer_db_desc";
+        expected_message = "consumer doorbell descriptor allocation failed";
+      end
+      6: begin
+        factory.target_name = "consumer_noalloc_status";
+        expected_message = "consumer no-allocation status slot allocation failed";
+      end
+      7: factory.miss_final = 1'b1;
+      default: begin end
+    endcase
+    service = uvm_coreservice_t::get();
+    saved_factory = service.get_factory();
+    service.set_factory(factory);
+    if (is_aeq) fixture.engine.poll_aeqe(queue.handle, 0, result, status);
+    else fixture.engine.poll_ceqe(queue.handle, 0, result, status);
+    service.set_factory(saved_factory);
+
+    if (mode != 0) begin
+      if (!factory.fired || result != null || status == null)
+        `uvm_error("EVENT_PREP", "preparation fault not observed or leaked result/status")
+      else if (mode == 7) begin
+        if (!status.ok() || status != factory.next_status)
+          `uvm_error("EVENT_PREP", "miss final allocation changed prior cursor status")
+      end
+      else if (status.code != RDMA_SC_RESOURCE_EXHAUSTED ||
+               status.message != expected_message)
+        `uvm_error("EVENT_PREP", {"unexpected preparation error: ", status.convert2string()})
+      status = fixture.engine.query_runtime_cursors(
+        queue.handle, kind, pi_after, pw_after, ci_after, cw_after);
+      if (status == null || !status.ok() || pi_after != pi_before ||
+          pw_after != pw_before || ci_after != ci_before || cw_after != cw_before)
+        `uvm_error("EVENT_PREP", "preparation failure changed cursor")
+      status = fixture.engine.query_runtime_occupancy(queue.handle, kind, used, pending);
+      if (status == null || !status.ok() || used != 1 || pending ||
+          mmio_write_count(fixture.pcie) != mmio_before)
+        `uvm_error("EVENT_PREP", "preparation failure changed occupancy/pending/MMIO")
+      if (is_aeq) fixture.engine.poll_aeqe(queue.handle, 0, result, status);
+      else fixture.engine.poll_ceqe(queue.handle, 0, result, status);
+    end
+    if (status == null || !status.ok() || (miss ? result != null : result == null))
+      `uvm_error("EVENT_PREP", "normal/retry poll did not deliver hit or discard miss")
+    if (!miss && result != null) begin
+      if (result.queue_h == null || result.queue_h == queue.handle ||
+          result.queue_h.object_id != queue.handle.object_id ||
+          result.event_model == null || result.event_status == null ||
+          result.secondary_target_h != null)
+        `uvm_error("EVENT_PREP", "normal event result is not a complete detached value")
+    end
+    status = fixture.engine.query_runtime_cursors(
+      queue.handle, kind, pi_after, pw_after, ci_after, cw_after);
+    if (status == null || !status.ok() || pi_after != pi_before ||
+        pw_after != pw_before || ci_after != (ci_before + 1) % queue.depth ||
+        cw_after != (ci_before + 1 == queue.depth ? !cw_before : cw_before))
+      `uvm_error("EVENT_PREP", "normal/retry poll did not advance CI exactly once")
+    status = fixture.engine.query_runtime_occupancy(queue.handle, kind, used, pending);
+    if (status == null || !status.ok() || used != 0 || pending ||
+        mmio_write_count(fixture.pcie) != mmio_before + 1)
+      `uvm_error("EVENT_PREP", "normal/retry poll did not commit exactly once")
+    if (is_aeq) fixture.engine.poll_aeqe(queue.handle, 0, result, status);
+    else fixture.engine.poll_ceqe(queue.handle, 0, result, status);
+    if (status == null || status.code != RDMA_SC_QUEUE_EMPTY || result != null ||
+        mmio_write_count(fixture.pcie) != mmio_before + 1)
+      `uvm_error("EVENT_PREP", "consumed event was delivered/acknowledged again")
+    `uvm_info("EVENT_PREP", $sformatf(
+      "completed event prepare case aeq=%0b miss=%0b mode=%0d wrong=%0b",
+      is_aeq, miss, mode, wrong_type), UVM_LOW)
+  endtask
+
+  // 功能：run_phase 建立共享 event topology，执行 CEQ/AEQ stale-route、malformed、
+  //   44-case 物化与门铃恢复契约，并按父类顺序释放所有 lifecycle-owned 资源。
   // 输入/输出及副作用：phase 为 UVM 输入；任务通过 status/UVM_ERROR 暴露断言，
   //   只改写测试 backing，不修改生产资源所有权。
   // 失败/边界：setup 失败时跳过消费测试但仍 cleanup；任一 route test 失败不跳过
@@ -939,6 +1170,17 @@ class rdma_queue_event_route_consume_test
                  status.convert2string())
     end
     else begin
+      for (int unsigned aeq = 0; aeq < 2; aeq++) begin
+        for (int unsigned miss = 0; miss < 2; miss++) begin
+          for (int unsigned mode = 0; mode < 8; mode++) begin
+            if ((!miss && mode == 7) || (miss && mode >= 1 && mode <= 3)) continue;
+            for (int unsigned wrong = 0; wrong < (mode == 0 ? 1 : 2); wrong++)
+              check_event_prepare_case(fixture, lifecycle_ceq, lifecycle_aeq,
+                lifecycle_cq, event_qp, aeq != 0, miss != 0, mode, wrong != 0);
+          end
+        end
+      end
+      `uvm_info("EVENT_PREP", "completed 44 event prepare cases", UVM_LOW)
       check_stale_ceqe_route(fixture, lifecycle_ceq, lifecycle_cq, status);
       if (status == null || !status.ok())
         `uvm_error("EVENT_ROUTE_CEQE", status == null ?

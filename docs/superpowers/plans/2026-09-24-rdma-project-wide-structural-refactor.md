@@ -24,7 +24,17 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch232：基于 `8e7145d` 沿用 `feature/rdma-structural-batch226`，把 CQ resize
+当前 Batch233：基于 `e1b8ed5` 沿用 `feature/rdma-structural-batch226`，把 CEQ/AEQ
+路由后的 result/continuation 准备收进原提交入口，改名 `consume_routed_event`。
+decode、owner、route、AEQ epoch 与 CQ flush partial 判定仍留在各自 caller；不新增
+生产组件/owner/状态。生产净减 46 行，两个 poll_once 从 93/109→50/68 行；27 个公开
+声明不变，一个 protected task 改名/改签名。共同准备展开与原提交尾段 token 等价。
+重构前/后 44-case 矩阵、core 103/86、CMQ 28/11（PROCESS/LOGICAL）、integration 10、
+E2E 3、Host-memory 3、PCIe 1、Python 359/359、驱动及静态门禁全部通过；E2E 保留
+基线编译告警，原送测输入与最终注释修订版 token 相同，最终专项及 hashes 已核对。
+不合并、不推送，见 `task-rdma-batch233-event-consume-report.md`；项目仍 active。
+
+前批 Batch232：基于 `8e7145d` 沿用 `feature/rdma-structural-batch226`，把 CQ resize
 retry 的 17 份失败诊断保存/解锁/返回续接合为一个出口。入口拒绝、两阶段成功、
 authority 校验、恢复进度及 factory 时机保持原规则；不引入方法/状态/owner。
 生产文件 9,929→9,910 行，净减 19 行；retry 方法 243→221 行，139 声明/类壳不变。
@@ -167,7 +177,7 @@ L6 只协调外部生命周期并在边界验证完整 route、authority 和 res
 
 | 优先级 | 组件 | 当前规模 | 目标 | 首个可迁移职责 |
 | --- | --- | ---: | --- | --- |
-| P0 | `rdma_queue_data_engine.sv` | 9,910 行/139 methods | 继续收束统一 transaction seam | 值 projector、consumer 步骤、resize 回滚/retry 出口、设备发布准备/取消/写后出口和 host-producer 失败出口已分层；继续完整业务编排与组合边界 |
+| P0 | `rdma_queue_data_engine.sv` | 9,864 行/139 methods | 继续收束统一 transaction seam | 值 projector、consumer 步骤、event 路由后事务、resize 回滚/retry 出口、设备发布准备/取消/写后出口和 host-producer 失败出口已分层；继续完整业务编排与组合边界 |
 | P1 | `rdma_resource_manager.sv` | 7,936 行/139 methods | 继续收束 allocator、registry、rollback transaction | projector 已分离；继续检查 publication 后更新，不改变 resource owner |
 | P1 | `rdma_queue_runtime.sv` | 3,814 行/74 methods | runtime snapshot/predicate 与 mutation owner 分界 | 深复制/值比较已迁入 projector；继续 snapshot/commit 业务组合与重复状态处理 |
 | P2 | `rdma_queue_lifecycle_policy.sv` + queue/QP executors | 2,118 / 2,819 / 4,338 行 | policy、执行副作用、状态迁移表分离 | operation envelope 与 transition candidate |
@@ -178,7 +188,7 @@ SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 
 公共复杂度回收到 queue-data/runtime transaction 层。Host-memory、PCIe、网络和
 dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 adapter/router。
 
-上表 queue-data/manager/runtime 已分别按 Batch232/221/229 源码重测，doorbell 按 Batch231，
+上表 queue-data/manager/runtime 已分别按 Batch233/221/229 源码重测，doorbell 按 Batch231，
 其余维持 Batch218；
 独立 queue-data projector 为 831 行/23 methods，resource projector 为 2,217 行/47 methods，
 runtime projector 为 830 行/20 methods；公共 rdma_status 为 280 行/10 methods。

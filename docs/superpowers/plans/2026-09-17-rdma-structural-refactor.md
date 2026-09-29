@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch233 基于 `e1b8ed5` 沿用 `feature/rdma-structural-batch226`：CEQ/AEQ 路由后的
+结果/continuation 准备与提交合入 `consume_routed_event`，各自 decode/route/epoch
+和 CQ flush partial 规则不变；保留 miss 最终状态分配失败的原 status 引用。
+生产净减 46 行，27 个公开声明与 owner/类壳不变，一个 protected task 改名/改签名。
+重构前/后 44-case 矩阵、core 103/86、CMQ 28/11（PROCESS/LOGICAL）、integration 10、
+E2E 3、Host-memory 3、PCIe 1、Python 359/359、驱动及等价/静态门禁全部通过；E2E
+保留基线编译告警，原送测与最终注释版 token 相同，最终专项及 hashes 已核对。
+不合并、不推送，见 `task-rdma-batch233-event-consume-report.md`；项目仍 active。
+
 Batch232 基于 `8e7145d` 沿用 `feature/rdma-structural-batch226`：收束 CQ resize
 retry 的 17 个记录内失败出口，保留入口拒绝、发布前/后成功与全部 authority/恢复
 顺序；不合并正常 resize 与 retry 的不同错误策略。既有 resize test 增加 22-case

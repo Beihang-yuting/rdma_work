@@ -12,6 +12,7 @@
 //   业务 wrapper 自己决定返回 status 分配；scheduler 后仍禁止新建对象或虚拟 clone/copy。
 // 消费提交：live CQ、event 与 replay 共享 doorbell evidence/CI commit 步骤；各 caller
 //   仍决定 admission、shadow、幂等跳步、WQE release 和最终交付，runtime 是唯一账本 owner。
+//   CEQ/AEQ 各自解码和解析 route，共享路由后的结果物化、continuation 准备与消费事务。
 // 设备发布：写入后的四类失败共用 evidence/recovery 收尾；写前取消和 replay 各自保留边界。
 //   准备阶段只生成本次调用的值记录，I/O task 统一处理准备失败取消；记录不成为第二账本。
 // Host 发布：SQ/RQ/SRQ 尾段共享未提交失败的恢复出口，仍按已写入/MMIO 阶段决定 evidence。
@@ -5546,8 +5547,9 @@ class rdma_queue_data_engine extends uvm_object;
   //   与观测 engine 投影为业务 completion/event status。
   // 输入/输出及副作用：ecode、observed_engine 为输入，completion_status 先置 null；
   //   返回 codec 状态，成功输出新 rdma_status，不修改 model、runtime 或 backing。
-  // 失败/边界：error codec 创建或 decode_status 失败时返回非成功且不得消费 queue；
-  //   caller 必须同时检查返回 status 与 completion_status 非空，函数不自动重试。
+  // 失败/边界：沿用 typed factory，要求其返回非空 error codec，错型由 UVM 拒绝，
+  //   本函数没有 null codec fallback；decode_status 失败不得消费 queue，caller 必须
+  //   同时检查返回 status 与 completion_status 非空，函数不自动重试。
   protected function rdma_status completion_status_from_ecode(
       bit [7:0] ecode, rdma_engine_kind_e observed_engine,
       output rdma_status completion_status
@@ -6519,7 +6521,7 @@ class rdma_queue_data_engine extends uvm_object;
   endfunction
 
   // 设计说明：CEQ 与 AEQ 在 decode、route 和 result 物化之后都必须先准备完整的
-  //   consumer pending/doorbell evidence，才能进入 commit_event_poll_candidate 的
+  //   consumer pending/doorbell evidence，才能进入 consume_routed_event 的
   //   首个 runtime mutation。两条入口的 prepared continuation 过去各自维护同一段
   //   顺序，容易让一侧新增的 null-status 或 noalloc 保护漏到另一侧；这里仅收束
   //   这段无副作用 staging，不把 event route、result delivery 或 recovery commit
@@ -6583,47 +6585,83 @@ class rdma_queue_data_engine extends uvm_object;
     return status;
   endfunction
 
-  // 设计说明：CEQ 与 AEQ 的 poll 入口各自负责 image 解码、route 解析和
-  // detached event candidate 构造，但从 pending admission 开始共享同一条
-  // consumer-only 副作用链。将这段链路集中到一个 task，能够让两种事件队列
-  // 使用相同的 MMIO evidence、失败续接和 CI 提交顺序，同时明确它不拥有 CQ
-  // completion target，也不会触碰 CQ→WQ release gate。
-  // doorbell evidence 与 CI gate/commit 通过共用步骤执行；result 交付仍由本 event 流程决定。
-  // 功能：commit_event_poll_candidate 接管已完成准备的 CEQ/AEQ candidate，进入
-  // prepared recovery，提交 consumer doorbell，记录 MMIO evidence，推进事件队列
-  // consumer cursor，并在 recovery 完成后按 route 命中与否发布 detached result。
-  // 输入/输出及副作用：event_name、attachment、cursor、next、pending、prepared
-  //   descriptor/status、result_candidate、final_success 与 deliver_found 为 caller
-  //   冻结输入；result/status 为输出。task 可能写 doorbell、runtime pending、CI/used
-  //   和 recovery evidence，但不取得 queue、backing、route handle 或 event model 的
-  //   生命周期所有权；deliver_found=0 时只确认事件而丢弃 payload。
-  // 失败/边界：输入缺失、admission、doorbell、MMIO evidence、consumer commit 或
-  //   recovery completion 任一阶段失败时 result 保持 null；scheduler 返回 null 或
-  //   不完整 success 会写入预建 noalloc slot。失败 evidence 保留后立即停止，不重发
-  //   已提交 doorbell、不重复 CI，也不把 route miss 误报为 malformed；CEQ/AEQ caller
-  //   必须在本 task 外完成各自的 decode/route/result preparation。
-  protected task commit_event_poll_candidate(
+  // 设计说明：CEQ/AEQ 保留各自的 decode、owner、route 与 epoch gate；路由之后
+  // 都是“命中则准备结果，未命中则丢弃 payload，再确认事件”的同一业务事务。
+  // 将结果与 continuation 准备收进原提交入口，不新增 owner 或事务对象；门铃后的
+  // continuation 仍只使用预建值，不分配、不 clone，也不进入 CQ→WQ release gate。
+  // 功能：consume_routed_event 按已解析 route 准备 detached event/result/status 与
+  //   pending，依次 admission、consumer doorbell、MMIO evidence、CI commit 和 recovery
+  //   completion，最后交付命中结果或确认并丢弃合法的 stale/unknown 事件。
+  // 输入/输出及副作用：event_name/observed_engine/ecode 指定原诊断与错误映射；event_h、
+  //   attachment、cursor/next、entry_offset/image、decoded_event、primary/secondary route
+  //   与 deliver_found 来自 caller。result 为输出，status 为 inout，带入 next cursor
+  //   的成功状态；只在 admission 后改变 pending、MMIO、CI/used，不接管任何外部资源。
+  // 失败/边界：caller 必须先完成 decode/owner/route/next 校验；结果或 continuation
+  //   准备失败不 ack，miss 的 final_success 分配失败沿用传入 status 且 result=null。
+  //   输入不完整、admission 或提交链失败均不交付结果；doorbell/CI 失败保留单调恢复
+  //   evidence；CQ flush 的双路/partial 判定由 caller 决定，不把 miss 当成 malformed。
+  protected task consume_routed_event(
     string event_name,
+    rdma_handle event_h,
     rdma_queue_data_attachment attachment,
     rdma_queue_cursor_snapshot cursor,
     rdma_queue_cursor_snapshot next,
-    rdma_queue_pending_operation pending,
-    rdma_doorbell_desc prepared_db_desc,
-    rdma_status prepared_noalloc_status,
-    rdma_queue_event_result result_candidate,
-    rdma_status final_success,
+    longint unsigned entry_offset,
+    rdma_hw_image entry_image,
+    rdma_hw_model decoded_event,
+    bit [7:0] ecode,
+    rdma_engine_kind_e observed_engine,
+    rdma_handle primary_route_h,
+    rdma_handle secondary_route_h,
     bit deliver_found,
     output rdma_queue_event_result result,
-    output rdma_status status
+    inout rdma_status status
   );
     bit doorbell_completed;
     rdma_queue_data_qp_link no_route;
+    rdma_queue_pending_operation pending;
+    rdma_doorbell_desc prepared_db_desc;
+    rdma_queue_event_result result_candidate;
+    rdma_status event_status;
+    rdma_status final_success;
     rdma_status noalloc_status;
 
     result = null;
+    if (deliver_found) begin
+      // 只有命中 owner 才物化 payload；工厂失败不是 stale-route，不能消费 entry。
+      status = completion_status_from_ecode(ecode, observed_engine, event_status);
+      if (status == null || !status.ok() || event_status == null) begin
+        if (status == null || status.ok())
+          status = value_ops::make_status_nonfatal(
+            RDMA_SC_RESOURCE_EXHAUSTED,
+            {event_name, " event status materialization failed"});
+        return;
+      end
+      status = value_ops::prepare_event_result_candidate_ex(
+        event_h, decoded_event, primary_route_h, event_status,
+        result_candidate, final_success, secondary_route_h);
+      if (status == null || !status.ok() || result_candidate == null ||
+          final_success == null) begin
+        if (status == null || status.ok())
+          status = value_ops::make_status_nonfatal(
+            RDMA_SC_RESOURCE_EXHAUSTED, {event_name, " event candidate is incomplete"});
+        return;
+      end
+    end
+    else begin
+      // image 已通过 codec/owner 校验；无 route 仍需 ack。最终 OK 在 barrier 前
+      // 准备，分配失败保留调用者的 next cursor status，不引入新的错误归一化策略。
+      final_success = value_ops::make_status_nonfatal(RDMA_SC_OK, "");
+      if (final_success == null)
+        return;
+    end
+    status = prepare_event_poll_continuation(
+      event_name, attachment, cursor, next, entry_offset, entry_image,
+      pending, prepared_db_desc, noalloc_status);
+    if (status == null || !status.ok()) return;
+
     status = null;
     no_route = null;
-    noalloc_status = prepared_noalloc_status;
 
     if (attachment == null || attachment.runtime == null || cursor == null ||
         next == null || pending == null || pending.failure_status == null ||
@@ -7962,12 +8000,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_model decoded_model;
     rdma_hw_ceqe_model ceqe;
     rdma_handle routed_cq_h;
-    rdma_queue_pending_operation pending;
-    rdma_queue_event_result result_candidate;
-    rdma_doorbell_desc prepared_db_desc;
-    rdma_status event_status;
-    rdma_status final_success;
-    rdma_status noalloc_status;
     bit route_found;
     byte data[];
     longint unsigned offset;
@@ -8002,46 +8034,9 @@ class rdma_queue_data_engine extends uvm_object;
     status = make_next_poll_cursor_nonfatal(
       attachment.runtime, cursor, "next CEQ", next);
     if (status == null || !status.ok()) return;
-    if (route_found) begin
-      // 驱动 event.c 在 image 合法且 CQN 命中时才向上层交付 payload；ecode
-      // 映射或 detached result 的准备失败都必须保留 ring entry，不能把真实错误
-      // 混入 stale-route 的“成功消费、丢 payload”路径。
-      status = completion_status_from_ecode(
-        ceqe.ecode, RDMA_ENGINE_CEQ, event_status);
-      if (status == null || !status.ok() || event_status == null) begin
-        if (status == null || status.ok())
-          status = value_ops::make_status_nonfatal(
-            RDMA_SC_RESOURCE_EXHAUSTED,
-            "CEQ event status materialization failed");
-        return;
-      end
-      status = value_ops::prepare_event_result_candidate(
-        ceq_h, ceqe, routed_cq_h, event_status,
-        result_candidate, final_success);
-      if (status == null || !status.ok() || result_candidate == null ||
-          final_success == null) begin
-        if (status == null || status.ok())
-          status = value_ops::make_status_nonfatal(
-            RDMA_SC_RESOURCE_EXHAUSTED, "CEQ event candidate is incomplete");
-        return;
-      end
-    end
-    else begin
-      // 零 route 不是 malformed image：codec 已经完成 reserved/owner 校验，真实
-      // 驱动会推进 CEQ CI 并 ack。此处预先物化最终 OK，确保 scheduler barrier
-      // 之后不再分配状态对象；result 保持 null 代表 payload 被有意丢弃。
-      final_success = value_ops::make_status_nonfatal(RDMA_SC_OK, "");
-      if (final_success == null)
-        return;
-    end
-    status = prepare_event_poll_continuation(
-      "CEQ", attachment, cursor, next, offset, entry_image,
-      pending, prepared_db_desc, noalloc_status);
-    if (status == null || !status.ok()) return;
-    commit_event_poll_candidate(
-      "CEQ", attachment, cursor, next, pending, prepared_db_desc,
-      noalloc_status, result_candidate, final_success, route_found,
-      result, status);
+    consume_routed_event(
+      "CEQ", ceq_h, attachment, cursor, next, offset, entry_image,
+      ceqe, ceqe.ecode, RDMA_ENGINE_CEQ, routed_cq_h, null, route_found, result, status);
   endtask
 
   // 功能：poll_event_with_timeout 统一 CEQ/AEQ wrapper 的 deadline、QUEUE_EMPTY
@@ -8137,12 +8132,6 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_image entry_image;
     rdma_hw_model decoded_model;
     rdma_hw_aeqe_model aeqe;
-    rdma_queue_pending_operation pending;
-    rdma_queue_event_result result_candidate;
-    rdma_doorbell_desc prepared_db_desc;
-    rdma_status event_status;
-    rdma_status final_success;
-    rdma_status noalloc_status;
     rdma_aeqe_event_class_e event_class;
     rdma_handle primary_route_h;
     rdma_handle secondary_route_h;
@@ -8195,45 +8184,10 @@ class rdma_queue_data_engine extends uvm_object;
     status = make_next_poll_cursor_nonfatal(
       attachment.runtime, cursor, "next AEQ", next);
     if (status == null || !status.ok()) return;
-    if (deliver_found) begin
-      // 普通事件按 primary 命中交付；CQ flush 按两路 found 的 OR 交付，允许
-      // CQ-only 或 QP-only candidate。任何物化失败都发生在 pending admission 前，
-      // 必须保留 AEQ entry，不得越过既有 doorbell→evidence→CI commit 顺序。
-      status = completion_status_from_ecode(
-        aeqe.ecode, RDMA_ENGINE_AEQ, event_status);
-      if (status == null || !status.ok() || event_status == null) begin
-        if (status == null || status.ok())
-          status = value_ops::make_status_nonfatal(
-            RDMA_SC_RESOURCE_EXHAUSTED,
-            "AEQ event status materialization failed");
-        return;
-      end
-      status = value_ops::prepare_event_result_candidate_ex(
-        aeq_h, aeqe, primary_route_h, event_status,
-        result_candidate, final_success, secondary_route_h);
-      if (status == null || !status.ok() || result_candidate == null ||
-          final_success == null) begin
-        if (status == null || status.ok())
-          status = value_ops::make_status_nonfatal(
-            RDMA_SC_RESOURCE_EXHAUSTED, "AEQ event candidate is incomplete");
-        return;
-      end
-    end
-    else begin
-      // image 已通过 codec 的 reserved/owner 检查，零 route 仅表示驱动侧对象已
-      //   过期或未知。预先物化 OK 供 barrier 后返回，result=null 明确表示丢弃 payload。
-      final_success = value_ops::make_status_nonfatal(RDMA_SC_OK, "");
-      if (final_success == null)
-        return;
-    end
-    status = prepare_event_poll_continuation(
-      "AEQ", attachment, cursor, next, offset, entry_image,
-      pending, prepared_db_desc, noalloc_status);
-    if (status == null || !status.ok()) return;
-    commit_event_poll_candidate(
-      "AEQ", attachment, cursor, next, pending, prepared_db_desc,
-      noalloc_status, result_candidate, final_success, deliver_found,
-      result, status);
+    consume_routed_event(
+      "AEQ", aeq_h, attachment, cursor, next, offset, entry_image,
+      aeqe, aeqe.ecode, RDMA_ENGINE_AEQ, primary_route_h, secondary_route_h,
+      deliver_found, result, status);
   endtask
 
   // 功能：poll_aeqe 以 aeq_h 轮询一条 AEQE；poll_aeqe_once 在 prepared

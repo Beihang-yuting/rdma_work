@@ -18,7 +18,7 @@ class QueueConsumerStepsBoundaryTest(unittest.TestCase):
         失败边界：遗漏 caller、重复调用或重新绕过公共步骤直接提交均失败。
         """
         declared = methods(read_code(CORE / "rdma_queue_data_engine.sv"))
-        for name in ("commit_cq_poll_candidate", "commit_event_poll_candidate",
+        for name in ("commit_cq_poll_candidate", "consume_routed_event",
                      "replay_consumer_pending"):
             body = declared[name][2]
             for step in ("submit_consumer_doorbell_recorded", "commit_consumer_cursor_recorded"):
@@ -104,6 +104,88 @@ class QueueConsumerStepsBoundaryTest(unittest.TestCase):
         source = read_code(ROOT / f"tests/unit/{name}.sv")
         for bound in ("diagnostic < 3", "mode < 10", "mode < 5"):
             self.assertIn(bound, source)
+
+    def test_event_callers_delegate_only_after_route_and_next(self):
+        """功能：锁定 CEQ/AEQ 路由之后只调用一个消费事务，不重复物化候选或 continuation。
+        输入输出及副作用：读取两个 poll_once，检查 route/next/consume 顺序及委托次数；只读。
+        失败边界：路由被迁入共同 task、任一 caller 再复制结果/准备/提交链或漏掉委托即失败。
+        """
+        declared = methods(read_code(CORE / "rdma_queue_data_engine.sv"))
+        for name, route in (("poll_ceqe_once", "lookup_event_cq_route_for_poll"),
+                            ("poll_aeqe_once", "resolve_aeqe_routes")):
+            body = declared[name][2]
+            self.assertLess(body.index(route + "("), body.index("make_next_poll_cursor_nonfatal("))
+            self.assertLess(body.index("make_next_poll_cursor_nonfatal("),
+                            body.index("consume_routed_event("))
+            self.assertEqual(body.count("consume_routed_event("), 1)
+            self.assertNotRegex(body, r"\b(?:completion_status_from_ecode|prepare_event_\w+|"
+                                r"enter_recovery_prepared|submit_consumer_doorbell_recorded)\s*\(")
+        self.assertNotIn("commit_event_poll_candidate", declared)
+
+    def test_event_route_policy_stays_in_each_caller(self):
+        """功能：保留 AEQ 专有读前 epoch gate 和 CQ flush 任一路命中的交付规则。
+        输入输出及副作用：只读 CEQ/AEQ 和共同业务 task，核对门禁位置及 route 参数。
+        失败边界：向 CEQ 添加 epoch 检查、AEQ gate 后移、flush OR 改为 primary 或公共层重查 route 均失败。
+        """
+        declared = methods(read_code(CORE / "rdma_queue_data_engine.sv"))
+        ceq, aeq = declared["poll_ceqe_once"][2], declared["poll_aeqe_once"][2]
+        self.assertNotIn("validate_attachment_route_epoch(", ceq)
+        self.assertLess(aeq.index("validate_attachment_route_epoch("), aeq.index("peek_consumer("))
+        self.assertIn("is_cq_flush ? (primary_found || secondary_found)", aeq)
+        self.assertRegex(ceq, r"RDMA_ENGINE_CEQ,\s*routed_cq_h,\s*null,\s*route_found")
+        self.assertRegex(aeq, r"RDMA_ENGINE_AEQ,\s*primary_route_h,\s*secondary_route_h,\s*deliver_found")
+        self.assertNotRegex(declared["consume_routed_event"][2],
+                            r"\b(?:resolve_aeqe_routes|lookup_event_cq_route_for_poll|"
+                            r"validate_attachment_route_epoch)\s*\(")
+
+    def test_event_preparation_precedes_noallocation_commit(self):
+        """功能：保证 event 的结果/恢复证据全部在 admission 前准备，门铃后只执行无分配续接。
+        输入输出及副作用：扫描唯一消费 task 的阶段序列和 tail；不运行 scheduler。
+        失败边界：重复或颠倒阶段、提交后创建/clone/查询快照、提前交付 result 即失败。
+        """
+        body = methods(read_code(CORE / "rdma_queue_data_engine.sv"))["consume_routed_event"][2]
+        stages = ("completion_status_from_ecode(", "prepare_event_result_candidate_ex(",
+                  "prepare_event_poll_continuation(", "enter_recovery_prepared(",
+                  "submit_consumer_doorbell_recorded(", "commit_consumer_cursor_recorded(",
+                  "complete_consumer_recovery_noalloc(", "result = deliver_found ?")
+        for stage in stages:
+            self.assertEqual(body.count(stage), 1)
+        positions = [body.index(stage) for stage in stages]
+        self.assertEqual(positions, sorted(positions))
+        tail = body[body.index("submit_consumer_doorbell_recorded("):]
+        self.assertNotRegex(tail, r"\b(?:new|create|clone|copy|make|make_status_nonfatal|"
+                            r"sformatf|query_\w+|snapshot_\w+)\b")
+
+    def test_event_miss_null_final_retains_incoming_status(self):
+        """功能：保护 miss 最终状态 raw 分配失败沿用 next cursor status 的既有返回契约。
+        输入输出及副作用：读取 task 签名与 miss 分支，核对 inout 和清零边界；只读。
+        失败边界：改为 output、准备前清零 status、为 final_success=null 新建错误或继续 admission 均失败。
+        """
+        source = (CORE / "rdma_queue_data_engine.sv").read_text()
+        signature = source.split("protected task consume_routed_event(", 1)[1].split(");", 1)[0]
+        self.assertIn("inout rdma_status status", signature)
+        body = methods(read_code(CORE / "rdma_queue_data_engine.sv"))["consume_routed_event"][2]
+        self.assertRegex(body, r"if \(final_success == null\)\s*return;")
+        self.assertEqual(body.count("status = null;"), 1)
+        self.assertLess(body.index("prepare_event_poll_continuation("), body.index("status = null;"))
+
+    def test_event_preparation_matrix_remains_in_core(self):
+        """功能：锁定真实 topology 的 44-case hit/miss/null/错型与恢复后单次消费矩阵。
+        输入输出及副作用：读取既有 test/package/manifest，检查循环维度、状态引用与提交计数断言。
+        失败边界：测试退出完整 core、factory 未恢复、漏掉 miss 状态引用或故障未命中检查均失败。
+        """
+        name = "rdma_queue_event_route_consume_test"
+        package = (ROOT / "tests/rdma_unit_test_pkg.sv").read_text()
+        manifest = (ROOT / "scripts/run_queue_lifecycle_regression53.sh").read_text()
+        self.assertEqual(package.count(f'`include "unit/{name}.sv"'), 1)
+        core = manifest.split("readonly CORE_TESTS=(", 1)[1].split("\n)", 1)[0]
+        self.assertEqual(core.split().count(name), 1)
+        source = read_code(ROOT / f"tests/unit/{name}.sv")
+        for contract in ("aeq < 2", "miss < 2", "mode < 8", "mode == 0 ? 1 : 2",
+                         "status != factory.next_status", "!factory.fired",
+                         "service.set_factory(saved_factory)", "used != 1 || pending",
+                         "ci_after != ci_before", "mmio_before + 1"):
+            self.assertIn(contract, source)
 
 
 if __name__ == "__main__":
