@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch236 基于 `5a07c57` 沿用 `feature/rdma-structural-batch226`：runtime 普通/noalloc
+恢复授权共享持锁规则，保留错误优先级、shadow、一次性 confirmation、失败原状态和
+各自 factory/锁交付窗口。生产净减 17 行，相关 tokens 526→312，58 public 不变。
+345-call 矩阵旧版/重构版均通过；core 105/88、CMQ 28/11（PROCESS/LOGICAL）、
+integration 10、Host-memory 3、PCIe 1、E2E 3、Python 377/377、驱动及等价/静态
+门禁全部通过。UVM 0/0/0，E2E 保留基线编译告警，送测 hashes 一致。
+不合并、不推送，见 `task-rdma-batch236-runtime-commit-gate-report.md`；
+项目仍 active。
+
 Batch235 基于 `fc8b61f` 沿用 `feature/rdma-structural-batch226`：门铃 DMA/MMIO
 barrier 共用限时 worker/timer，保留阶段顺序、诊断、局部取消域与 MMIO 可见性边界；
 生产净减 26 行，不新增 owner 或状态。独立 23-case 矩阵在旧实现及重构版通过；

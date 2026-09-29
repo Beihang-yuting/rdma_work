@@ -9,6 +9,7 @@
 // 外部 backing、scheduler、QP/Function 资源由各自 lifecycle owner 管理，runtime 不释放它们。
 // 值快照：request/slot/pending 深拷贝与比较由无状态 projector 承担；所有调用保留原锁窗口，
 //   factory 重入、失败输出与无分配提交边界不因职责迁移而改变。
+// 恢复授权：普通/noalloc 入口共用持锁规则；锁与 status 交付留在入口，规则不创建对象。
 
 // Queue value models are defined in rdma_queue_runtime_transaction_models.sv.
 // This file keeps the mutable lock, ledger, attachment and publication owner.
@@ -209,7 +210,7 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：consumer_shadow_phase_valid 判断 pending 是否代表冻结的 CQC shadow
   //   publication；普通 RC/UD 使用 23-bit CQ CI，URC 使用 15-bit SQ/RQ packed
   //   cursors，二者都不是 CEQ/AEQ 的 MMIO consumer transaction。
-  // 输入/输出及副作用：pending 为输入；函数只读取 kind、shadow geometry、MMIO
+  // 输入/输出及副作用：pending、require_published 为输入；只读取 kind、shadow geometry、MMIO
   //   evidence 和阶段位，不修改 runtime 或 pending，返回是否满足冻结 ABI。
   // 失败/边界：非 CQ、长度/偏移/layout 宽度错误、shadow 尚未要求或误带 MMIO
   //   success/doorbell marker 时返回 0；该 helper 不把 shadow 写入伪装成 MMIO。
@@ -263,7 +264,7 @@ class rdma_queue_runtime extends uvm_object;
   //   committed_cursor（输入）描述待发布状态；函数只读 runtime CI/geometry，
   //   返回 bit，不修改 pending、游标、occupancy 或外部资源。
   // 失败/边界：非 device consumer、cursor 几何无效、未提交时 CI 不等于 cursor
-  //   或仍带 committed_cursor，以及已提交时 evidence 非 SUCCESS 或
+  //   或仍带 committed_cursor，以及已提交时未满足 MMIO SUCCESS/shadow 发布规则或
   //   CI/committed_cursor/next_cursor 不全等时返回 0。
   protected function bit consumer_recovery_invariant_locked(
     rdma_queue_pending_operation pending,
@@ -970,8 +971,8 @@ class rdma_queue_runtime extends uvm_object;
   //   临界区推进 CI、递减 used 并发布 committed_consumer_cursor/阶段位。
   // 输入/输出及副作用：reservation（输入）必须匹配当前 CI 或 recovery cursor；
   //   普通成功推进 CI/used，恢复成功还关闭 recovery_commit_allowed。
-  // 失败/边界：host ring、空 ring、stale cursor、未授权 recovery、非 SUCCESS
-  //   evidence 或 consumer invariant 损坏时返回错误；失败不得部分推进 CI/used。
+  // 失败/边界：host ring、空 ring、stale cursor、未授权 recovery、MMIO SUCCESS/
+  //   shadow 发布证据缺失或 consumer invariant 损坏时返回错误；失败不得部分推进 CI/used。
   function rdma_status commit_consumer(rdma_queue_cursor_snapshot reservation);
     rdma_status lock_status;
     rdma_queue_cursor_snapshot committed_copy;
@@ -2883,7 +2884,7 @@ class rdma_queue_runtime extends uvm_object;
 
   // 功能：reservation_matches 判断输入 cursor 是否与当前 device reservation 完全相等。
   // 输入/输出及副作用：cursor（输入）；仅读取 reservation 与 cursor，不修改 runtime。
-  // 失败/边界：无有效 reservation、输入为空或 runtime 非 device ring 时返回 0。
+  // 失败/边界：无有效 reservation、任一 cursor 为空或 index/wrap 不等时返回 0；不额外校验方向。
   function bit reservation_matches(rdma_queue_cursor_snapshot cursor);
     if (cursor == null || !device_reservation_valid || device_reservation == null)
       return 1'b0;
@@ -3062,7 +3063,7 @@ class rdma_queue_runtime extends uvm_object;
   //   CI commit，并把 next_cursor 保存为 committed_consumer_cursor；它不代替提交动作。
   // 输入/输出及副作用：无显式输入；仅当 runtime CI 已等于 next_cursor 时发布
   //   consumer_committed/committed_consumer_cursor，不修改 CI 或 used。
-  // 失败/边界：无 consumer pending、非 SUCCESS、CI 仍在旧 cursor、cursor 分配
+  // 失败/边界：无 consumer pending、MMIO SUCCESS/shadow 发布未完成、CI 仍在旧 cursor、cursor 分配
   //   失败或共享 invariant 不成立时返回错误，禁止 marker 自行声称提交成功。
   function rdma_status mark_pending_consumer_committed();
     rdma_status lock_status;
@@ -3377,35 +3378,36 @@ class rdma_queue_runtime extends uvm_object;
     return value_ops::make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：enable_recovery_commit 在 MMIO 结果确定后打开一次 producer/consumer
-  //   cursor commit gate；未改变的 no-submit 证据必须绑定本轮 retry confirmation。
-  // 输入/输出及副作用：无显式输入；成功置 recovery_commit_allowed；当前证据为
-  //   NO_SUBMIT/NOT_APPLICABLE 时同时消费 recovery_retry_confirmed，SUCCESS 不重复消费。
-  // 失败/边界：无 pending、NONE/AMBIGUOUS，或 no-submit 证据没有 caller
-  //   confirmation 时返回 RECOVERY_REQUIRED/INVALID_STATE，且 commit gate 保持关闭。
-  function rdma_status enable_recovery_commit();
-    rdma_status lock_status;
-    lock_status = acquire_lock();
-    if (!value_ops::status_is_ok(lock_status)) return lock_status;
+  // 设计说明：普通与 noalloc 入口必须在同一 runtime 锁内使用同一份恢复证据，
+  //   但不能互相调用：普通 acquire 的 factory 回调在持锁时发生，最终 status 在
+  //   解锁后构造；noalloc 全程不得创建对象。因此只共享证据判定和授权写入。
+  // 功能：enable_recovery_commit_locked 校验 MMIO 或已发布 CQC shadow 证据，
+  //   打开 cursor commit gate，并仅在未发布 shadow 的 no-submit 路径消费 retry 授权。
+  // 输入/输出及副作用：message 输出原诊断，返回 rdma_status_code_e；调用方已持有
+  //   lock，成功置 recovery_commit_allowed，必要时清 recovery_retry_confirmed；
+  //   不改 pending、游标、credit、锁或 status 对象。
+  // 失败/边界：非 recovery/无 pending、已发布 shadow 无效、NONE/AMBIGUOUS，
+  //   或 NO_SUBMIT/NOT_APPLICABLE 缺 confirmation 时依序拒绝，两个授权位保持原值。
+  //   合法 shadow 与 SUCCESS 不消费 confirmation；不重复执行 admission 的枚举校验。
+  protected function rdma_status_code_e enable_recovery_commit_locked(
+    output string message
+  );
     if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
         pending_operation_state == null) begin
-      lock.put(1);
-      return value_ops::make_runtime_status(RDMA_SC_INVALID_STATE,
-                                 "queue runtime has no pending recovery");
+      message = "queue runtime has no pending recovery";
+      return RDMA_SC_INVALID_STATE;
     end
     if (pending_operation_state.consumer_shadow_required &&
         pending_operation_state.consumer_shadow_published) begin
       if (!consumer_shadow_phase_valid(pending_operation_state, 1'b1)) begin
-        lock.put(1);
-        return value_ops::make_runtime_status(RDMA_SC_INVALID_STATE,
-                                   "CQ shadow publication is incomplete");
+        message = "CQ shadow publication is incomplete";
+        return RDMA_SC_INVALID_STATE;
       end
     end
     else if (pending_operation_state.mmio_evidence inside {
           RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
-      lock.put(1);
-      return value_ops::make_runtime_status(RDMA_SC_RECOVERY_REQUIRED,
-                                 "recovery commit lacks definitive MMIO evidence");
+      message = "recovery commit lacks definitive MMIO evidence";
+      return RDMA_SC_RECOVERY_REQUIRED;
     end
     if (!(pending_operation_state.consumer_shadow_required &&
           pending_operation_state.consumer_shadow_published) &&
@@ -3413,74 +3415,55 @@ class rdma_queue_runtime extends uvm_object;
           RDMA_QUEUE_MMIO_NO_SUBMIT,
           RDMA_QUEUE_MMIO_NOT_APPLICABLE}) begin
       if (!recovery_retry_confirmed) begin
-        lock.put(1);
-        return value_ops::make_runtime_status(RDMA_SC_INVALID_STATE,
-                                   "recovery commit lacks retry confirmation");
+        message = "recovery commit lacks retry confirmation";
+        return RDMA_SC_INVALID_STATE;
       end
       recovery_retry_confirmed = 1'b0;
     end
     recovery_commit_allowed = 1'b1;
+    message = "";
+    return RDMA_SC_OK;
+  endfunction
+
+  // 功能：enable_recovery_commit 在唯一 runtime 锁内授权后续 cursor commit，
+  //   并为普通 caller 构造独立状态对象。
+  // 输入/输出及副作用：无显式输入；持锁调用共同规则更新 commit/retry 位，
+  //   解锁后返回 code/message 对应的 status，保留 acquire 与结果的 factory 回调。
+  // 失败/边界：锁忙直接返回 acquire 状态；证据拒绝保留既有授权位（不强制关闭
+  //   已开的 gate），factory null/错型仍由 make_runtime_status fallback 交付原码。
+  function rdma_status enable_recovery_commit();
+    rdma_status lock_status;
+    rdma_status_code_e code;
+    string message;
+
+    lock_status = acquire_lock();
+    if (!value_ops::status_is_ok(lock_status)) return lock_status;
+    code = enable_recovery_commit_locked(message);
     lock.put(1);
-    return value_ops::make_runtime_status(RDMA_SC_OK, "");
+    return value_ops::make_runtime_status(code, message);
   endfunction
 
   // 功能：enable_recovery_commit_noalloc 使用 caller 预建 status 打开一次 consumer
   //   CI commit gate，使 scheduler/continuation barrier 后无需创建返回对象。
   // 输入/输出及副作用：status_slot 为 caller-owned 输入；成功置
-  //   recovery_commit_allowed，并在 NO_SUBMIT/NOT_APPLICABLE 时消费本轮 confirmation。
-  // 失败/边界：slot/null lock、无 pending、NONE/AMBIGUOUS 或确定未提交却无
-  //   confirmation 时返回 0；拒绝不打开 gate、不消费既有 recovery authority。
+  //   recovery_commit_allowed；未发布 shadow 的 NO_SUBMIT/NOT_APPLICABLE 消费本轮 confirmation。
+  // 失败/边界：slot/null lock、无 pending、已发布 shadow 无效、NONE/AMBIGUOUS 或
+  //   确定未提交却无 confirmation 时返回 0；拒绝保持原 gate/confirmation，包括已经打开的 gate。
+  //   合法已发布 shadow 不要求/消费 confirmation；status_slot 在解锁后原位写入，无 factory。
   function bit enable_recovery_commit_noalloc(rdma_status status_slot);
+    rdma_status_code_e code;
+    string message;
+
     if (status_slot == null) return 1'b0;
     if (lock == null || !lock.try_get(1)) begin
       void'(rdma_status::set_fields_noalloc(
         status_slot, RDMA_SC_RESOURCE_BUSY, "queue runtime is busy"));
       return 1'b0;
     end
-    if (state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
-        pending_operation_state == null) begin
-      lock.put(1);
-      void'(rdma_status::set_fields_noalloc(
-        status_slot, RDMA_SC_INVALID_STATE,
-        "queue runtime has no pending recovery"));
-      return 1'b0;
-    end
-    if (pending_operation_state.consumer_shadow_required &&
-        pending_operation_state.consumer_shadow_published) begin
-      if (!consumer_shadow_phase_valid(pending_operation_state, 1'b1)) begin
-        lock.put(1);
-        void'(rdma_status::set_fields_noalloc(
-          status_slot, RDMA_SC_INVALID_STATE,
-          "CQ shadow publication is incomplete"));
-        return 1'b0;
-      end
-    end
-    else if (pending_operation_state.mmio_evidence inside {
-          RDMA_QUEUE_MMIO_NONE, RDMA_QUEUE_MMIO_AMBIGUOUS}) begin
-      lock.put(1);
-      void'(rdma_status::set_fields_noalloc(
-        status_slot, RDMA_SC_RECOVERY_REQUIRED,
-        "recovery commit lacks definitive MMIO evidence"));
-      return 1'b0;
-    end
-    if (!(pending_operation_state.consumer_shadow_required &&
-          pending_operation_state.consumer_shadow_published) &&
-        pending_operation_state.mmio_evidence inside {
-          RDMA_QUEUE_MMIO_NO_SUBMIT,
-          RDMA_QUEUE_MMIO_NOT_APPLICABLE}) begin
-      if (!recovery_retry_confirmed) begin
-        lock.put(1);
-        void'(rdma_status::set_fields_noalloc(
-          status_slot, RDMA_SC_INVALID_STATE,
-          "recovery commit lacks retry confirmation"));
-        return 1'b0;
-      end
-      recovery_retry_confirmed = 1'b0;
-    end
-    recovery_commit_allowed = 1'b1;
+    code = enable_recovery_commit_locked(message);
     lock.put(1);
-    void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
-    return 1'b1;
+    void'(rdma_status::set_fields_noalloc(status_slot, code, message));
+    return code == RDMA_SC_OK;
   endfunction
 
   // 功能：snapshot_pending 为 legacy caller 返回当前 pending transaction 的
