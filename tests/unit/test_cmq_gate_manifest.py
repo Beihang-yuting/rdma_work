@@ -1752,8 +1752,7 @@ class CmqGateManifestTest(unittest.TestCase):
             "if(status==null)status=journal_status("
             "RDMA_SC_INVALID_STATE,"
             '"CMQrecoverygraphauthenticationreturnednullstatus");'
-            "reject_recovery_results_locked(results,status.code,"
-            "status.message);engine_lock.put(1);return;end",
+            "break;end",
             compact_recovery_caller,
         )
         self.assertLess(
@@ -1794,8 +1793,7 @@ class CmqGateManifestTest(unittest.TestCase):
         self.assertIn(
             "if(!admit_retry_live_authority_locked("
             "request,record,profile_service,preallocated,status))begin"
-            "reject_recovery_results_locked(results,status.code,"
-            "status.message);engine_lock.put(1);return;end",
+            "break;end",
             compact_recovery_caller,
         )
         compact_recovery_stage = re.sub(
@@ -1817,8 +1815,7 @@ class CmqGateManifestTest(unittest.TestCase):
         self.assertIn(
             "if(!stage_recovery_candidate_locked("
             "record,candidate_attempt,recovery_stage,status))begin"
-            "reject_recovery_results_locked(results,status.code,status.message);"
-            "engine_lock.put(1);return;end",
+            "break;end",
             compact_recovery_caller,
         )
 

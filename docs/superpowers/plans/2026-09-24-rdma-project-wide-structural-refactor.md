@@ -24,7 +24,16 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch237：基于 `837afbc`，CMQ 完成 drain 按读取/匹配/提交/回收组织，
+当前 Batch238：基于 `e04e7c5`，CMQ recovery 12 处 aligned 拒绝收为一个出口，
+保留早拒绝空结果、owner 两层退出、首错、成功 CAS/transport/effect 顺序及原锁；
+212 声明/实例字段不变，仅增加调用期旗标。方法 375→361 行、tokens 2,161→1,982，
+生产净减 9 行。旧版/重构版 36-call 专项、core 107/90、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+388/388、驱动、静态/等价门禁全部通过；UVM 0/0/0，E2E 保留既有编译告警，
+最终输入哈希一致。详见
+`task-rdma-batch238-cmq-recovery-exit-report.md`；不合并、不推送，计划仍 active。
+
+前批 Batch237：基于 `837afbc`，CMQ 完成 drain 按读取/匹配/提交/回收组织，
 poll 主方法 261→50 行；normal/late 共用 completion 构造、journal 调用和 token
 规则，保留原错误优先级、回调顺序及 partial drain。仅新增调用期四字段 struct
 和两个 engine 内阶段，不新增 owner/锁/公开 API。生产净增 41 行，相关方法 tokens
