@@ -61,7 +61,7 @@ class rdma_queue_cursor_snapshot extends uvm_object;
 
   // 功能：将 rhs 中 cursor 的 index/wrap 复制到当前对象，建立与源对象隔离的值快照。
   // 输入/输出及副作用：rhs（输入）；类型正确时覆盖当前 index/wrap，不修改 rhs。
-  // 失败/边界：rhs 为 null 或类型不匹配时保留当前 cursor；本函数不验证 index<depth。
+  // 失败/边界：类型不匹配时保留 cursor；rhs 必须非空，不验证 index<depth，自复制保值。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_cursor_snapshot source;
     super.do_copy(rhs);
@@ -164,11 +164,12 @@ class rdma_queue_pending_operation extends uvm_object;
   endfunction
 
   // 功能：do_copy 为 UVM print/clone 兼容复制 pending 标量，并为 queue/cursor/image/status
-  //   建立局部值对象；request_snapshot/routed_qp_h 保留兼容的非拥有引用。
-  // 输入/输出及副作用：rhs（输入）；覆盖当前对象，不修改 rhs；关键 recovery 深拷贝由
+  //   建立局部值对象；image 元数据复用模型值复制，队列仍直接赋值；
+  //   request_snapshot/routed_qp_h 保留兼容的非拥有引用。
+  // 输入/输出及副作用：rhs 输入；覆盖当前对象，非自别名时不修改 rhs；关键 recovery 深拷贝由
   //   rdma_queue_runtime_projector::clone_pending_value 提供，以便传播 non-fatal 失败。
-  // 失败/边界：rhs 为 null 或类型不匹配时保留当前值；本 void 入口不保证完整 detached
-  //   graph，不能替代 runtime 的带状态 clone helper。
+  // 失败/边界：rhs 必须非空，类型不匹配保留当前值；自复制会先替换子对象，不能保证保值。
+  //   本 void 入口不保证完整 detached graph，不能替代 runtime 的带状态 clone helper。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_pending_operation source;
     super.do_copy(rhs);
@@ -250,16 +251,7 @@ class rdma_queue_pending_operation extends uvm_object;
     else begin
       image = new("pending_copy_image");
       if (image != null) begin
-        image.length = source.image.length;
-        image.alignment = source.image.alignment;
-        image.endian = source.image.endian;
-        image.image_kind = source.image.image_kind;
-        image.hardware_version = source.image.hardware_version;
-        image.function_generation = source.image.function_generation;
-        image.write_target_kind = source.image.write_target_kind;
-        image.backing_target = source.image.backing_target;
-        image.hmc_target = source.image.hmc_target;
-        image.bar_target = source.image.bar_target;
+        rdma_hw_image::copy_metadata_noalloc(source.image, image);
         image.bytes = source.image.bytes;
         image.field_summary = source.image.field_summary;
       end

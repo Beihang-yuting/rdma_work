@@ -1087,10 +1087,10 @@ class rdma_queue_data_engine extends uvm_object;
 
   // 功能：clone_publish_image 深复制设备发布所需的镜像 metadata、payload 和
   //   field_summary，保证写后失败时仍能按原始槽位重放。
-  // 输入/输出及副作用：source 为输入，copy 为输出；只创建 detached image，源
-  //   image、runtime 和 backing 均保持不变。
-  // 失败/边界：source 为空、image 工厂分配失败或复制中止时返回错误且 copy=null；
-  //   调用方不得使用不完整镜像继续写入或提交。
+  // 输入/输出及副作用：source 输入、copy 输出；typed factory 创建 candidate，复用
+  //   模型元数据复制后清空并重填 bytes/summary；不修改 runtime 或 backing。
+  // 失败/边界：source 为空或 image 分配为空返回错误且 copy=null；typed factory 错型
+  //   沿用 FCTTYP fatal，不检测 hostile factory alias；若返回 source，会清空其队列。
   protected function rdma_status clone_publish_image(
     rdma_hw_image source, output rdma_hw_image copy
   );
@@ -1102,16 +1102,7 @@ class rdma_queue_data_engine extends uvm_object;
     candidate = rdma_hw_image::type_id::create("publish_image_copy");
     if (candidate == null)
       return bad("publish image allocation failed", RDMA_SC_RESOURCE_EXHAUSTED);
-    candidate.length = source.length;
-    candidate.alignment = source.alignment;
-    candidate.endian = source.endian;
-    candidate.image_kind = source.image_kind;
-    candidate.hardware_version = source.hardware_version;
-    candidate.function_generation = source.function_generation;
-    candidate.write_target_kind = source.write_target_kind;
-    candidate.backing_target = source.backing_target;
-    candidate.hmc_target = source.hmc_target;
-    candidate.bar_target = source.bar_target;
+    rdma_hw_image::copy_metadata_noalloc(source, candidate);
     candidate.bytes.delete();
     foreach (source.bytes[i]) candidate.bytes.push_back(source.bytes[i]);
     candidate.field_summary.delete();

@@ -22,6 +22,16 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch245 基于 `9bcce51` 沿用 `feature/rdma-structural-batch226`：八入口九处镜像
+元数据复制归入 model 的 static automatic 无分配操作；分配、队列追加/替换、
+clone 后源恢复与错误策略留在入口。生产净减 55 行、tokens 减 555；470 个已有
+声明、类壳/字段不变，新增一个公开模型值操作，不新增 owner。旧版/重构版/注释
+终版各 153 次专项、core 114/97、CMQ 28/11（PROCESS/LOGICAL）、integration 10、
+Host-memory 3、PCIe 1、E2E 3、Python 417/417、驱动与静态对照全部通过；UVM
+0/0/0，E2E 保留既有编译告警。送测后仅两份文件注释修正，code/string tokens
+一致，终版专项与最终源码哈希通过。不合并、不推送，main 保持 `083e0d7`，见
+`task-rdma-batch245-image-metadata-copy-report.md`；项目仍 active。
+
 Batch244 基于 `4718484` 沿用 `feature/rdma-structural-batch226`：runtime 四个
 完成/中止入口共用无分配恢复清理，各入口保留证据校验、最终状态、锁与 status
 交付。四个方法各少 6 行，含注释后生产净减 2 行；75 个已有声明、58 public 与

@@ -260,10 +260,11 @@ endfunction
 // 输入/输出及副作用：source/label/failure_code 为输入；snapshot 入口先清空，
 // 成功时输出非自别名、可转换且公开值相等的 clone，不要求保留
 // source runtime subtype；saved_value 由 factory 创建，clone 后按原字段与 queue
-// 顺序恢复 source。
+// 顺序恢复 source；捕获与恢复只复用无回调的模型元数据操作，不替换 clone 窗口。
 // 失败/边界：source 为 null、saved-value factory 返回 null、clone 为 null/不能
 // cast/自别名，或 source/snapshot 公开值与 saved_value 不等时按 failure_code 和原消息
 // 拒绝；本函数不执行 image shape 校验，保留对非 canonical 等值 image 的接受语义。
+// saved-value typed factory 错型仍报 FCTTYP fatal，不改成 raw factory 的 non-fatal 策略。
 function automatic rdma_status rdma_cmq_checked_image_snapshot(
   input rdma_hw_image source,
   input string label,
@@ -282,29 +283,11 @@ function automatic rdma_status rdma_cmq_checked_image_snapshot(
       failure_code, {label, " image value capture failed"}
     );
   saved_value.bytes = source.bytes;
-  saved_value.length = source.length;
-  saved_value.alignment = source.alignment;
-  saved_value.endian = source.endian;
-  saved_value.image_kind = source.image_kind;
-  saved_value.hardware_version = source.hardware_version;
-  saved_value.function_generation = source.function_generation;
-  saved_value.write_target_kind = source.write_target_kind;
-  saved_value.backing_target = source.backing_target;
-  saved_value.hmc_target = source.hmc_target;
-  saved_value.bar_target = source.bar_target;
+  rdma_hw_image::copy_metadata_noalloc(source, saved_value);
   saved_value.field_summary = source.field_summary;
   cloned_object = source.clone();
   source.bytes = saved_value.bytes;
-  source.length = saved_value.length;
-  source.alignment = saved_value.alignment;
-  source.endian = saved_value.endian;
-  source.image_kind = saved_value.image_kind;
-  source.hardware_version = saved_value.hardware_version;
-  source.function_generation = saved_value.function_generation;
-  source.write_target_kind = saved_value.write_target_kind;
-  source.backing_target = saved_value.backing_target;
-  source.hmc_target = saved_value.hmc_target;
-  source.bar_target = saved_value.bar_target;
+  rdma_hw_image::copy_metadata_noalloc(saved_value, source);
   source.field_summary = saved_value.field_summary;
   if (cloned_object == null || !$cast(snapshot, cloned_object) ||
       snapshot == source) begin

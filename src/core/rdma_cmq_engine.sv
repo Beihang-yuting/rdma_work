@@ -4930,7 +4930,8 @@ class rdma_cmq_engine extends uvm_object;
   //   长度、image/target metadata、generation 与 ticket Function generation 一致。
   // 输入/输出及副作用：source 为只读 completion 输入；canonical_raw_cqe 先清空，
   //   raw-CQE 缺失时返回 OK+null，存在时返回新建 base image；函数只复制字段和
-  //   执行 shape/value 检查，不取锁、不调用 profile/factory、不修改 source/engine。
+  //   执行 shape/value 检查；元数据复用模型无回调操作，不取锁、不调用 profile/factory，
+  //   不修改 source/engine，仍先复制 bytes 再复制 metadata/summary。
   // 失败/边界：非 CMQ CQE、长度/target 非法、ticket 或 Function 缺失、generation
   //   不一致或 image 值漂移返回 INVALID_ARGUMENT；source/raw null 是 timeout/reset
   //   合法边界并返回成功，不把 null raw 当作 malformed hardware completion。
@@ -4944,18 +4945,7 @@ class rdma_cmq_engine extends uvm_object;
 
     canonical_raw_cqe = new("cmq_completion_canonical_raw_cqe");
     canonical_raw_cqe.bytes = source.raw_cqe.bytes;
-    canonical_raw_cqe.length = source.raw_cqe.length;
-    canonical_raw_cqe.alignment = source.raw_cqe.alignment;
-    canonical_raw_cqe.endian = source.raw_cqe.endian;
-    canonical_raw_cqe.image_kind = source.raw_cqe.image_kind;
-    canonical_raw_cqe.hardware_version = source.raw_cqe.hardware_version;
-    canonical_raw_cqe.function_generation =
-      source.raw_cqe.function_generation;
-    canonical_raw_cqe.write_target_kind =
-      source.raw_cqe.write_target_kind;
-    canonical_raw_cqe.backing_target = source.raw_cqe.backing_target;
-    canonical_raw_cqe.hmc_target = source.raw_cqe.hmc_target;
-    canonical_raw_cqe.bar_target = source.raw_cqe.bar_target;
+    rdma_hw_image::copy_metadata_noalloc(source.raw_cqe, canonical_raw_cqe);
     canonical_raw_cqe.field_summary = source.raw_cqe.field_summary;
     if (!rdma_cmq_image_shape_valid(canonical_raw_cqe) ||
         canonical_raw_cqe.length != CMQE_BYTES ||

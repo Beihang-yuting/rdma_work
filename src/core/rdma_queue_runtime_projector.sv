@@ -109,9 +109,10 @@ class rdma_queue_runtime_projector;
   endfunction
 
   // 功能：clone_image_value_nonfatal 深复制硬件镜像 metadata、bytes 和 field_summary，保证 recovery 可重放原始内容。
-  // 输入/输出及副作用：source（输入）、copy（输出）先置 null；成功时发布独立 image，不引用 source 的动态数组。
+  // 输入/输出及副作用：source 输入、copy 先置 null；复用模型元数据复制，清空再重填
+  //   factory 镜像的 bytes/summary；正常 factory 返回独立副本，不调用 source.clone/copy。
   // 失败/边界：source 为空返回成功空值；image factory 空/错型返回 RESOURCE_EXHAUSTED。
-  //   bytes/summary 队列逐项复制，不把仿真器自身内存耗尽描述为可捕获的 status。
+  //   不检测 factory alias，返回 source 时会清空源队列；仿真器内存耗尽不转为 status。
   static function automatic rdma_status clone_image_value_nonfatal(
     rdma_hw_image source, output rdma_hw_image copy
   );
@@ -126,16 +127,7 @@ class rdma_queue_runtime_projector;
     if (raw_candidate == null || !$cast(candidate, raw_candidate))
       return make_runtime_status(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "image copy allocation failed");
-    candidate.length = source.length;
-    candidate.alignment = source.alignment;
-    candidate.endian = source.endian;
-    candidate.image_kind = source.image_kind;
-    candidate.hardware_version = source.hardware_version;
-    candidate.function_generation = source.function_generation;
-    candidate.write_target_kind = source.write_target_kind;
-    candidate.backing_target = source.backing_target;
-    candidate.hmc_target = source.hmc_target;
-    candidate.bar_target = source.bar_target;
+    rdma_hw_image::copy_metadata_noalloc(source, candidate);
     candidate.bytes.delete();
     foreach (source.bytes[i]) candidate.bytes.push_back(source.bytes[i]);
     candidate.field_summary.delete();

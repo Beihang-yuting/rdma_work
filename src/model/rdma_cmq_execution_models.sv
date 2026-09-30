@@ -323,7 +323,8 @@ function automatic bit rdma_cmq_image_shape_valid(input rdma_hw_image image);
 endfunction
 
 // 功能：直接复制 hardware image 的元数据、byte queue 与 field summary。
-// 输入/输出及副作用：source/allow_null 为输入，snapshot 为输出；发布新 image。
+// 输入/输出及副作用：source/allow_null 输入、snapshot 输出；direct new 后先复制 bytes，
+//   再复用模型元数据复制，最后复制 summary；不经过 factory 或 source.clone/copy。
 // 失败/边界：输出先清空；null 仅在 allow_null 时成功，非法 image 原子失败。
 function automatic bit rdma_cmq_try_snapshot_image_direct(
   input rdma_hw_image source,
@@ -339,16 +340,7 @@ function automatic bit rdma_cmq_try_snapshot_image_direct(
     return 1'b0;
   candidate = new("direct_hardware_image_snapshot");
   candidate.bytes = source.bytes;
-  candidate.length = source.length;
-  candidate.alignment = source.alignment;
-  candidate.endian = source.endian;
-  candidate.image_kind = source.image_kind;
-  candidate.hardware_version = source.hardware_version;
-  candidate.function_generation = source.function_generation;
-  candidate.write_target_kind = source.write_target_kind;
-  candidate.backing_target = source.backing_target;
-  candidate.hmc_target = source.hmc_target;
-  candidate.bar_target = source.bar_target;
+  rdma_hw_image::copy_metadata_noalloc(source, candidate);
   candidate.field_summary = source.field_summary;
   snapshot = candidate;
   return 1'b1;

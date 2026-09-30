@@ -76,7 +76,8 @@ class rdma_queue_data_projector;
   endfunction
 
   // 功能：物化 poll 镜像的 metadata、bytes 和 field_summary，供 consumer pending 保存重放值。
-  // 输入/输出及副作用：source 输入，copy 先清空；复制标量并向 factory 镜像追加两组队列，不调用 clone。
+  // 输入/输出及副作用：source 输入，copy 先清空；复用模型元数据复制，再向 factory 镜像
+  //   追加两组队列，不调用 clone，也不检测 hostile factory 的 source alias。
   // 失败/边界：空 source、零 length、bytes 数不符、null/错型工厂拒绝；不清空 override 预填队列，
   //   保留既有创建契约；最终状态创建失败时 copy 可非空，调用方仍必须检查 status。
   static function automatic rdma_status clone_poll_image_nonfatal(
@@ -96,16 +97,7 @@ class rdma_queue_data_projector;
     if (raw_candidate == null || !$cast(candidate, raw_candidate))
       return make_status_nonfatal(RDMA_SC_RESOURCE_EXHAUSTED,
                                          "CQ poll image allocation failed");
-    candidate.length = source.length;
-    candidate.alignment = source.alignment;
-    candidate.endian = source.endian;
-    candidate.image_kind = source.image_kind;
-    candidate.hardware_version = source.hardware_version;
-    candidate.function_generation = source.function_generation;
-    candidate.write_target_kind = source.write_target_kind;
-    candidate.backing_target = source.backing_target;
-    candidate.hmc_target = source.hmc_target;
-    candidate.bar_target = source.bar_target;
+    rdma_hw_image::copy_metadata_noalloc(source, candidate);
     foreach (source.bytes[i]) candidate.bytes.push_back(source.bytes[i]);
     foreach (source.field_summary[i])
       candidate.field_summary.push_back(source.field_summary[i]);
