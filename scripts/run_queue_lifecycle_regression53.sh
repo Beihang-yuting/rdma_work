@@ -22,6 +22,7 @@ readonly CORE_TESTS=(
   rdma_aeqe_route_test
   rdma_resource_local_lookup_test
   rdma_queue_runtime_test
+  rdma_unclaimed_recovery_handoff_test
   rdma_runtime_commit_gate_test
   rdma_runtime_recovery_retirement_test
   rdma_queue_runtime_projector_test

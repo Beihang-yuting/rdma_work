@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch246 基于 `b3d84de` 沿用 `feature/rdma-structural-batch226`：queue-data 未接管
+device evidence 的移交/中止成为同类 protected 同步阶段，恢复入口 201→126 行；
+含说明生产净增 28 行，不称为总代码收缩。保留 139 个已有声明、27 public 与字段，
+不新增 owner/锁/账本。旧版/重构版/注释终版各 104 次专项、core 115/98、CMQ
+28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+421/421、驱动及整方法展开/静态对照全部通过；UVM 0/0/0，E2E 保留既有编译告警。
+送测后只修正四处注释，code/string tokens 一致，终版专项与哈希通过。不合并、不推送，main 保持
+`083e0d7`，见 `task-rdma-batch246-unclaimed-recovery-handoff-report.md`；项目仍 active。
+
 Batch245 基于 `9bcce51` 沿用 `feature/rdma-structural-batch226`：八入口九处镜像
 元数据复制归入 model 的 static automatic 无分配操作；分配、队列追加/替换、
 clone 后源恢复与错误策略留在入口。生产净减 55 行、tokens 减 555；470 个已有

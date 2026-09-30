@@ -19,6 +19,8 @@
 // Resize 提交：发布前失败共享一个 rollback 出口；发布后只保留新 authority 与旧资源
 //   cleanup evidence，不回滚 manager swap，也不新增候选 owner 或延迟字段快照。
 // Resize 重试：记录内失败统一保存原位置物化的诊断并解锁；两个成功出口仍先解锁后分配状态。
+// Recovery 编排：控制面校验后先处理未接管证据，再定位 claimed/reservation-only，
+//   最后中止或授权重放；移交沿用现有索引与 runtime 提交，不新增 owner、锁或恢复账本。
 
 // 设计说明：本层是 host 侧 queue-data facade。queue 的生命周期仍归 lifecycle
 // resource 所有；engine 仅在 attachment 存活期间保存 detached runtime cursor 和
@@ -370,7 +372,7 @@ class rdma_queue_data_engine extends uvm_object;
 
   // 功能：collect_reservation_only_candidates 按当前 queue 的完整 incarnation 从
   //   engine attachment 索引收集 reservation-only recovery 的候选 runtime，供
-  //   recover_queue 逐个执行原有 reservation evidence 查询。
+  //   恢复流程逐个执行原有 reservation evidence 查询。
   // 输入/输出及副作用：queue_h 为只读目标句柄，candidates 为输出队列；函数按
   //   attachments 的 foreach 顺序保存通过 attachment_matches_queue_identity 且
   //   runtime 非空的非拥有 attachment 引用，不查询 runtime 状态或 reservation，
@@ -408,7 +410,7 @@ class rdma_queue_data_engine extends uvm_object;
   //   也不访问 Host-memory、MMIO 或外部 mapping。
   // 失败/边界：queue_h 为空时返回 INVALID_ARGUMENT；identity 不匹配、candidate 或
   //   runtime 为空、runtime 非 RECOVERY_REQUIRED 均跳过；没有命中返回成功且 found=null，
-  //   由 caller 继续 reservation-only 扫描；同一完整 identity 命中不同 runtime 时返回
+  //   由 caller 继续 reservation-only 扫描；同一完整 identity 命中不同 attachment 对象时返回
   //   INVALID_STATE，调用方必须保留 unclaimed handoff 的原有 authority 和错误优先级。
   protected function rdma_status find_claimed_recovery_attachment(
     rdma_handle queue_h,
@@ -9640,31 +9642,127 @@ class rdma_queue_data_engine extends uvm_object;
       return;
   endtask
 
-  // 功能：recover_queue 定位 queue 的 claimed/unclaimed recovery，执行 abort，
-  //   或把 caller-confirmed retry 先交给 runtime 授权，再重放尚未完成的事务阶段。
+  // 设计说明：engine 暂存的 evidence 必须先移交原 runtime，后续才有 claimed 对象可重放。
+  // 将此完整业务阶段留在同类，避免主入口混合 pair 校验、admission 与 fallback abort；
+  // 不另建事务对象，也不把尚未成功移交的 pair 视为 runtime-owned。
+  // 功能：handoff_unclaimed_device_recovery 尝试移交未接管的 device evidence；
+  //   admission 失败时，仅允许 abort 取消完全匹配且仍 ACTIVE 的 reservation 并 detach。
+  // 输入/输出及副作用：queue_h/action 已经 caller 校验；found/status 为 ref 槽，保留
+  //   原 attachment 和状态对象身份。无 pair 或成功移交返回 1，caller 继续 claimed 扫描；
+  //   失败或 fallback abort 完成返回 0，caller 立即交付 status。成功才成对删除两表。
+  // 失败/边界：任一表有记录但 pair 不完整/null，或 attachment runtime/identity stale，均拒绝；
+  //   admission 失败的 retry、reservation 缺失/cursor 不同/非 ACTIVE 不可中止并保留证据；
+  //   reservation/state 查询及 detach 的非 OK 原样传播，null 转为原阶段诊断。
+  //   无 pair 时不改 found/status、不分配成功状态；本函数不获取新锁或释放外部 mapping。
+  protected function bit handoff_unclaimed_device_recovery(
+    rdma_handle queue_h,
+    rdma_queue_recovery_action_e action,
+    ref rdma_queue_data_attachment found,
+    ref rdma_status status
+  );
+    rdma_queue_pending_operation unclaimed_pending;
+    rdma_queue_cursor_snapshot reservation;
+    rdma_queue_runtime_state_e runtime_state;
+    bit reservation_valid;
+    string key;
+
+    unclaimed_pending = null;
+    reservation = null;
+    reservation_valid = 1'b0;
+    runtime_state = RDMA_QUEUE_RUNTIME_DETACHED;
+    key = value_ops::identity_key(queue_h);
+    // 设计说明：runtime admission 失败时 evidence 由 engine 的 unclaimed 表保留。
+    // retry/abort 必须先尝试把同一 detached pending 安装回原 attachment runtime；
+    // 安装成功后 runtime 接管生命周期，表项才可成对删除，安装失败则保持证据不丢失。
+    if (key != "" && (unclaimed_device_recoveries.exists(key) ||
+                       unclaimed_recovery_attachments.exists(key))) begin
+      if (!unclaimed_device_recoveries.exists(key) ||
+          unclaimed_device_recoveries[key] == null ||
+          !unclaimed_recovery_attachments.exists(key) ||
+          unclaimed_recovery_attachments[key] == null) begin
+        status = bad("unclaimed recovery evidence pair is incomplete",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return 1'b0;
+      end
+      found = unclaimed_recovery_attachments[key];
+      unclaimed_pending = unclaimed_device_recoveries[key];
+      // 设计：unclaimed attachment 是 engine-owned recovery authority；map
+      // pair 与 found 的 runtime/handle 空值门禁先完成，身份失配必须硬失败
+      // 为 RECOVERY_REQUIRED，保留 evidence，不能继续 admission 或 detach。
+      if (found.runtime == null ||
+          !value_ops::attachment_matches_queue_identity(found, queue_h)) begin
+        status = bad("unclaimed recovery attachment is stale",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return 1'b0;
+      end
+      status = admit_device_publish_recovery(found, unclaimed_pending);
+      if (status == null || !status.ok()) begin
+        // admission 仍失败时，retry 必须保留 engine-owned evidence。abort 可以
+        // 仅在 runtime 仍 ACTIVE 且 reservation 与该 evidence 完全匹配时取消
+        // reservation，然后 detach；这样不会遗留一个不可见的活动 attachment。
+        if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
+          status = found.runtime.query_device_reservation(reservation_valid,
+                                                           reservation);
+          if (status == null || !status.ok()) begin
+            status = status == null ?
+              bad("unclaimed recovery reservation query returned null status",
+                  RDMA_SC_RECOVERY_REQUIRED) : status;
+            return 1'b0;
+          end
+          status = found.runtime.query_state(runtime_state);
+          if (status == null || !status.ok()) begin
+            status = status == null ?
+              bad("unclaimed recovery state query returned null status",
+                  RDMA_SC_RECOVERY_REQUIRED) : status;
+            return 1'b0;
+          end
+          if (reservation_valid && reservation != null &&
+              runtime_state == RDMA_QUEUE_RUNTIME_ACTIVE &&
+              unclaimed_pending.cursor != null &&
+              value_ops::same_cursor_value(reservation, unclaimed_pending.cursor)) begin
+            status = detach_recovery_transaction(
+              queue_h, found, reservation);
+            if (status == null) begin
+              status = bad("unclaimed recovery abort returned null status",
+                           RDMA_SC_RECOVERY_REQUIRED);
+              return 1'b0;
+            end
+            if (!status.ok()) return 1'b0;
+            unclaimed_device_recoveries.delete(key);
+            unclaimed_recovery_attachments.delete(key);
+            return 1'b0;
+          end
+        end
+        status = bad("unclaimed recovery admission is still unavailable",
+                     RDMA_SC_RECOVERY_REQUIRED);
+        return 1'b0;
+      end
+      unclaimed_device_recoveries.delete(key);
+      unclaimed_recovery_attachments.delete(key);
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：recover_queue 按控制面校验、unclaimed 移交、claimed/reservation-only 定位、
+  //   abort 或授权重放四个阶段恢复 queue，避免把移交失败当作可以重放的 pending。
   // 输入/输出及副作用：queue_h、action、caller_confirmed_no_submit（输入）选择
   //   recovery 对象与动作，status（输出）返回最终阶段结果；retry 可能访问 backing、
   //   doorbell 和 runtime ledger，abort 可能删除 attachment，但不接管外部 mapping。
-  // 失败/边界：句柄/证据不完整、非法 action、未确认 retry、reservation-only 多匹配、
-  //   无 image 的 reservation-only retry、AMBIGUOUS MMIO、runtime 的 reservation/state/
-  //   pending 查询或一次性授权返回 null/非成功，以及 replay 任一阶段失败时保留可恢复
-  //   evidence；所有 reservation candidate query 完成前不得 detach，只有 runtime enum
-  //   gate 可以记录一次性 confirmation。
+  // 失败/边界：句柄失效、非法 action、未确认 retry 在移交前拒绝；unclaimed pair 或
+  //   authority 不完整、移交失败、多 runtime/reservation、无 image 的 reservation-only
+  //   retry、无 pending、AMBIGUOUS MMIO、查询/授权/重放失败均停止后续阶段。移交成功
+  //   后证据留在 runtime，不回填 engine 表；失败查询不记录一次性 confirmation，
+  //   所有 reservation candidate query 完成前不得 detach，runtime enum gate 最终授权。
   task recover_queue(
     rdma_handle queue_h,
     rdma_queue_recovery_action_e action,
     bit caller_confirmed_no_submit,
     output rdma_status status
   );
-    rdma_queue_data_attachment candidate;
     rdma_queue_data_attachment claimed_found;
     rdma_queue_data_attachment found;
-    rdma_queue_pending_operation unclaimed_pending;
-    rdma_queue_cursor_snapshot reservation;
-    rdma_queue_runtime_state_e runtime_state;
-    bit reservation_valid;
     bit reservation_only_handled;
-    string key;
+
     status = ensure_handle(queue_h, queue_h == null ? RDMA_RESOURCE_QP :
                            queue_h.kind);
     if (status == null || !status.ok()) begin
@@ -9690,81 +9788,11 @@ class rdma_queue_data_engine extends uvm_object;
     end
     found = null;
     claimed_found = null;
-    unclaimed_pending = null;
-    reservation = null;
-    reservation_valid = 1'b0;
     reservation_only_handled = 1'b0;
-    runtime_state = RDMA_QUEUE_RUNTIME_DETACHED;
-    key = value_ops::identity_key(queue_h);
-    // 设计说明：runtime admission 失败时 evidence 由 engine 的 unclaimed 表保留。
-    // retry/abort 必须先尝试把同一 detached pending 安装回原 attachment runtime；
-    // 安装成功后 runtime 接管生命周期，表项才可成对删除，安装失败则保持证据不丢失。
-    if (key != "" && (unclaimed_device_recoveries.exists(key) ||
-                       unclaimed_recovery_attachments.exists(key))) begin
-      if (!unclaimed_device_recoveries.exists(key) ||
-          unclaimed_device_recoveries[key] == null ||
-          !unclaimed_recovery_attachments.exists(key) ||
-          unclaimed_recovery_attachments[key] == null) begin
-        status = bad("unclaimed recovery evidence pair is incomplete",
-                     RDMA_SC_RECOVERY_REQUIRED);
-        return;
-      end
-      found = unclaimed_recovery_attachments[key];
-      unclaimed_pending = unclaimed_device_recoveries[key];
-      // 设计：unclaimed attachment 是 engine-owned recovery authority；map
-      // pair 与 found 的 runtime/handle 空值门禁先完成，身份失配必须硬失败
-      // 为 RECOVERY_REQUIRED，保留 evidence，不能继续 admission 或 detach。
-      if (found.runtime == null ||
-          !value_ops::attachment_matches_queue_identity(found, queue_h)) begin
-        status = bad("unclaimed recovery attachment is stale",
-                     RDMA_SC_RECOVERY_REQUIRED);
-        return;
-      end
-      status = admit_device_publish_recovery(found, unclaimed_pending);
-      if (status == null || !status.ok()) begin
-        // admission 仍失败时，retry 必须保留 engine-owned evidence。abort 可以
-        // 仅在 runtime 仍 ACTIVE 且 reservation 与该 evidence 完全匹配时取消
-        // reservation，然后 detach；这样不会遗留一个不可见的活动 attachment。
-        if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
-          status = found.runtime.query_device_reservation(reservation_valid,
-                                                           reservation);
-          if (status == null || !status.ok()) begin
-            status = status == null ?
-              bad("unclaimed recovery reservation query returned null status",
-                  RDMA_SC_RECOVERY_REQUIRED) : status;
-            return;
-          end
-          status = found.runtime.query_state(runtime_state);
-          if (status == null || !status.ok()) begin
-            status = status == null ?
-              bad("unclaimed recovery state query returned null status",
-                  RDMA_SC_RECOVERY_REQUIRED) : status;
-            return;
-          end
-          if (reservation_valid && reservation != null &&
-              runtime_state == RDMA_QUEUE_RUNTIME_ACTIVE &&
-              unclaimed_pending.cursor != null &&
-              value_ops::same_cursor_value(reservation, unclaimed_pending.cursor)) begin
-            status = detach_recovery_transaction(
-              queue_h, found, reservation);
-            if (status == null) begin
-              status = bad("unclaimed recovery abort returned null status",
-                           RDMA_SC_RECOVERY_REQUIRED);
-              return;
-            end
-            if (!status.ok()) return;
-            unclaimed_device_recoveries.delete(key);
-            unclaimed_recovery_attachments.delete(key);
-            return;
-          end
-        end
-        status = bad("unclaimed recovery admission is still unavailable",
-                     RDMA_SC_RECOVERY_REQUIRED);
-        return;
-      end
-      unclaimed_device_recoveries.delete(key);
-      unclaimed_recovery_attachments.delete(key);
-    end
+
+    if (!handoff_unclaimed_device_recovery(queue_h, action, found, status))
+      return;
+
     // 设计：unclaimed admission 成功后仍以 engine-owned found 作为第一 authority；
     // helper 只收集 claimed attachment，再由 caller 比较对象身份。这样同一 attachment
     // 的 handoff 只接管一次，而另一个 matching runtime 仍明确返回 INVALID_STATE。
