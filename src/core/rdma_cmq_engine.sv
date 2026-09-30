@@ -4,7 +4,8 @@
 //   各阶段只在同一次 engine_lock 调用内借用候选；恢复入口统一拒绝出口，并把
 //   RETRY 提交/发布/证据交付交给同类持锁业务阶段；execute 按 retained 状态选择
 //   观测策略后统一交付 detached 结果；reconcile 共用非终态状态投影和锁出口，
-//   wait 共用结束解锁但保留轮询让锁窗口，不增加持久 authority。
+//   wait 共用结束解锁但保留轮询让锁窗口；shutdown 共用释放失败保留与最终
+//   解锁，仍在原锁内释放 backing，不增加持久 authority。
 // 依赖：依赖 CMQ model/profile、Host-memory adapter、doorbell scheduler、
 //   rdma_cmq_transport 与共享 submission evidence。
 // 所有权与生命周期：engine 拥有本地锁、快照、账本和每次 prepare 新建的
@@ -7623,9 +7624,12 @@ class rdma_cmq_engine extends uvm_object;
     reset_release_in_progress = 1'b0;
   endfunction
 
-  // 功能：执行 retain_release_authority 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：retained_mapping（输入）、retained_host_mem（输入）；retain_release_authority 读取 retained_mapping、retained_host_mem 并使用字段 retained_last_poison、last_poison、backing_mapping、host_mem、engine_state；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：retain_release_authority 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+  // 功能：释放失败后清理短生命周期 runtime，保留原释放 authority、last_poison
+  //   和 terminal FIFO，将 engine 留在 POISONED，供后续显式重试或诊断。
+  // 输入/输出及副作用：retained_mapping/retained_host_mem 为原引用，use_opaque
+  //   指定下次释放方式；不调用 adapter、不修改 retained journal，不返回状态。
+  // 失败/边界：不验证代际或补齐缺失 authority；mapping=null 时不保留 adapter，
+  //   mapping 非空而 adapter=null 时只保留 mapping。调用方负责持锁与释放策略。
   protected function void retain_release_authority(
     rdma_dma_mapping retained_mapping,
     rdma_host_mem_api retained_host_mem,
@@ -7635,9 +7639,9 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_completion retained_terminal_fifo[$];
 
     retained_last_poison = last_poison;
-    // reset() 可能已经把已发布事务转换为 RESET_CANCELLED，并暂存到
-    // terminal_fifo；此时 backing release 失败，重试仍必须能够交付这些
-    // completion。先保留 FIFO，再清掉其余运行账本，避免清理失败丢失交付权。
+    // 先保留调用方尚未消费的 terminal FIFO，再清其余运行账本；本 helper
+    // 不决定交付策略。shutdown 已明确丢弃 FIFO，rollback 则保留原有内容；
+    // observed reset 使用候选事务，不通过此路径处理 release 失败。
     foreach (terminal_fifo[i])
       retained_terminal_fifo.push_back(terminal_fifo[i]);
     clear_configuration();
@@ -13343,9 +13347,11 @@ class rdma_cmq_engine extends uvm_object;
   // 功能：执行 failure-atomic observed reset：先校验 release capability，再
   //   staging、backing release 和 allocation-free commit，最后发布 detached outputs。
   // 输入/输出及副作用：completions/proofs/status 为输出；成功释放旧 backing、隔离
-  //   retained rows 并返回取消 completion/proof 快照，失败清空 outputs 且不改 engine。
+  //   retained rows 并返回取消 completion/proof 快照；失败清空 outputs。
   // 失败/边界：UNCONFIGURED 幂等成功；validator/release 返回 null 或 non-OK 时不
   //   调用 destructive cancel/clear，保留 runtime/journal/fence/counter/handles 原值。
+  //   release 成功后若 runtime CAS 失配，则清掉已释放 backing 的别名并 POISONED，
+  //   不提交候选或发布 proof；此分支不能按“失败保留原 runtime”处理。
   task reset_observed(
     output rdma_cmq_completion completions[$],
     output rdma_cmq_reset_isolation_proof proofs[],
@@ -13680,82 +13686,73 @@ class rdma_cmq_engine extends uvm_object;
     return snapshot;
   endfunction
 
-  // 功能：在 rdma_cmq_engine 中，shutdown 停止接收新 CMQ 事务，清理本地队列和非拥有引用，并把 engine 切换到关闭状态。
-  // 输入/输出及副作用：status（输出）；shutdown 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：shutdown 失败或超时通过 status 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：按准入、best-effort 取消、丢弃交付、释放 backing 和清配置的顺序关闭 CMQ。
+  // 输入/输出及副作用：status 输出关闭结果；全程持 engine_lock，释放成功进入
+  //   UNCONFIGURED；释放失败仅保留重试 authority/原诊断，不删除 retained journal。
+  // 失败/边界：reset gate/非法状态立即拒绝，UNCONFIGURED 幂等清配置；取消失败
+  //   原码透传，null 转 INVALID_STATE；缺释放 authority 或 release null 时返回
+  //   INVALID_STATE 并 POISONED，release 非 OK 原对象透传且保留原释放方式。
   task shutdown(output rdma_status status);
     rdma_status cancel_status;
-    rdma_status release_status;
 
     status = invalid_state("CMQ shutdown did not complete");
     engine_lock.get(1);
-    status = reset_release_gate_status();
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
-    if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
-      clear_configuration();
-      status = rdma_status::success();
-      engine_lock.put(1);
-      return;
-    end
-    if (!(engine_state inside {RDMA_CMQ_ENGINE_PREPARED,
-                               RDMA_CMQ_ENGINE_ACTIVE,
-                               RDMA_CMQ_ENGINE_QUIESCED,
-                               RDMA_CMQ_ENGINE_POISONED})) begin
-      status = invalid_state("CMQ engine state cannot be shut down");
-      engine_lock.put(1);
-      return;
-    end
-    if (engine_state != RDMA_CMQ_ENGINE_POISONED &&
-        prepared_binding != null) begin
-      // shutdown has no completion output and intentionally does not report
-      // strict ledger-audit failures. It must retain only release authority on
-      // failure, so use the same best-effort cleanup as poison recovery.
-      cancel_status = cancel_generation_locked(
-        prepared_binding.generation, 1'b1
-      );
-      if (cancel_status == null || !cancel_status.ok()) begin
-        status = (cancel_status == null) ?
-          invalid_state("CMQ shutdown cancellation returned null") :
-          cancel_status;
-        engine_lock.put(1);
-        return;
+    // 单次业务段的退出只汇合解锁；release 仍在锁内，不能套用 reset 的让锁窗口。
+    do begin : shutdown_transaction
+      status = reset_release_gate_status();
+      if (!status.ok())
+        break;
+      if (engine_state == RDMA_CMQ_ENGINE_UNCONFIGURED) begin
+        clear_configuration();
+        status = rdma_status::success();
+        break;
       end
-    end
-    // shutdown has no completion output; cancellation and any older
-    // undelivered results are deliberately discarded after ledger cleanup.
-    terminal_fifo.delete();
-    diagnostic_fifo.delete();
-    late_final_fifo.delete();
-    if (backing_mapping == null || host_mem == null) begin
-      retain_release_authority(backing_mapping, host_mem);
-      status = invalid_state("CMQ shutdown release authority is missing");
-      engine_lock.put(1);
-      return;
-    end
-    if (backing_release_opaque)
-      release_status = host_mem.release_opaque(backing_mapping);
-    else
-      release_status = host_mem.\release (backing_mapping);
-    if (release_status == null) begin
-      retain_release_authority(backing_mapping, host_mem,
-                               backing_release_opaque);
-      status = invalid_state("CMQ shutdown release returned null status");
-      engine_lock.put(1);
-      return;
-    end
-    if (!release_status.ok()) begin
-      retain_release_authority(backing_mapping, host_mem,
-                               backing_release_opaque);
-      status = release_status;
-      engine_lock.put(1);
-      return;
-    end
-    clear_configuration();
-    engine_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
-    status = rdma_status::success();
+      if (!(engine_state inside {RDMA_CMQ_ENGINE_PREPARED,
+                                 RDMA_CMQ_ENGINE_ACTIVE,
+                                 RDMA_CMQ_ENGINE_QUIESCED,
+                                 RDMA_CMQ_ENGINE_POISONED})) begin
+        status = invalid_state("CMQ engine state cannot be shut down");
+        break;
+      end
+      if (engine_state != RDMA_CMQ_ENGINE_POISONED &&
+          prepared_binding != null) begin
+        // shutdown 没有 completion 输出，不报告严格 ledger 审计失败；先尽力
+        // 清除运行账本，避免 release 失败后的重试继续使用旧 slot/token。
+        cancel_status = cancel_generation_locked(
+          prepared_binding.generation, 1'b1
+        );
+        if (cancel_status == null || !cancel_status.ok()) begin
+          status = (cancel_status == null) ?
+            invalid_state("CMQ shutdown cancellation returned null") :
+            cancel_status;
+          break;
+        end
+      end
+      // 取消产生的 completion 与旧的未交付结果都明确丢弃；保留 journal 诊断，
+      // 但不把关闭伪造成 observed reset，也不生成 isolation proof。
+      terminal_fifo.delete();
+      diagnostic_fifo.delete();
+      late_final_fifo.delete();
+      if (backing_mapping == null || host_mem == null) begin
+        retain_release_authority(backing_mapping, host_mem);
+        status = invalid_state("CMQ shutdown release authority is missing");
+        break;
+      end
+      if (backing_release_opaque)
+        status = host_mem.release_opaque(backing_mapping);
+      else
+        status = host_mem.\release (backing_mapping);
+      if (status == null || !status.ok()) begin
+        retain_release_authority(backing_mapping, host_mem,
+                                 backing_release_opaque);
+        if (status == null)
+          status = invalid_state("CMQ shutdown release returned null status");
+        break;
+      end
+      clear_configuration();
+      engine_state = RDMA_CMQ_ENGINE_UNCONFIGURED;
+      status = rdma_status::success();
+    end while (1'b0);
     engine_lock.put(1);
   endtask
 endclass

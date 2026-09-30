@@ -24,7 +24,17 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch242：基于 `9d069b9`，wait 的 32 处结束解锁合为一个出口；准入与轮询
+当前 Batch243：基于 `40e6c52`，shutdown 合并 null/非 OK 的释放失败保留路径，
+移除释放状态临时变量，七处提前解锁/返回收为单次段的六处退出与唯一最终解锁。
+保留锁内释放、best-effort cancel、FIFO 丢弃、原错误对象和 journal 生命周期；
+方法 75→63 行、tokens 362→309，含补正注释后生产净减 3 行，不新增方法/字段/API。
+旧版/重构版/注释版 30 场景、90 调用专项、core 112/95、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+409/409、驱动和静态对照全部通过；UVM 0/0/0，E2E 保留既有编译告警。
+送测后仅修订新测试说明及参数换行，完整 token 等价与最终哈希已核对。
+详见 `task-rdma-batch243-cmq-shutdown-delivery-report.md`；不合并、不推送，计划仍 active。
+
+前批 Batch242：基于 `9d069b9`，wait 的 32 处结束解锁合为一个出口；准入与轮询
 两层 break 都通向最终解锁，中途 put/delay/get、重验和 FIFO 消费策略不变。
 方法 358→331 行、tokens 1,742→1,539，生产净减 19 行；213 声明/字段不变，
 不新增 owner/API。旧版/重构版/最终注释版 31 场景、65 调用专项、core 111/94、

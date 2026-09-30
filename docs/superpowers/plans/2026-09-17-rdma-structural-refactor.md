@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch243 基于 `40e6c52` 沿用 `feature/rdma-structural-batch226`：shutdown 的
+null/非 OK 释放失败共用 authority 保留，去掉状态临时变量，结束清理统一解锁。
+方法 75→63 行、tokens 362→309，含准确化注释后生产净减 3 行；锁窗口、错误
+身份、journal 及 213 方法声明/字段不变。旧版/重构版/注释版 30 场景、90 调用专项、
+core 112/95、CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、
+PCIe 1、E2E 3、Python 409/409、驱动与静态对照全部通过；UVM 0/0/0，E2E
+保留既有编译告警。最终测试注释/格式与送测版 token 等价，哈希已核对。不合并、不推送，见
+`task-rdma-batch243-cmq-shutdown-delivery-report.md`；项目仍 active。
+
 Batch242 基于 `9d069b9` 沿用 `feature/rdma-structural-batch226`：wait 的 32 处
 结束解锁收为一个出口，保留轮询让锁、重验、retained/legacy 的不同消费策略。
 方法 358→331 行、tokens 1,742→1,539，生产净减 19 行；无新增方法/字段/owner/API。

@@ -72,6 +72,7 @@ readonly CORE_TESTS=(
   rdma_cmq_execute_observation_test
   rdma_cmq_reconcile_delivery_test
   rdma_cmq_wait_delivery_test
+  rdma_cmq_shutdown_delivery_test
   rdma_cmq_port_test
   rdma_control_plane_test
   rdma_control_plane_cmq_engine_test
