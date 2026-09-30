@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch244 基于 `4718484` 沿用 `feature/rdma-structural-batch226`：runtime 四个
+完成/中止入口共用无分配恢复清理，各入口保留证据校验、最终状态、锁与 status
+交付。四个方法各少 6 行，含注释后生产净减 2 行；75 个已有声明、58 public 与
+字段不变，仅新增一个 protected 操作。旧版/重构版 241 次结束调用专项、core
+113/96、CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、
+E2E 3、Python 413/413、驱动与静态对照全部通过；UVM 0/0/0，E2E 保留既有
+编译告警；最终输入与送测字节相同。不合并、不推送，main 保持 `083e0d7`，见
+`task-rdma-batch244-runtime-recovery-retirement-report.md`；项目仍 active。
+
 Batch243 基于 `40e6c52` 沿用 `feature/rdma-structural-batch226`：shutdown 的
 null/非 OK 释放失败共用 authority 保留，去掉状态临时变量，结束清理统一解锁。
 方法 75→63 行、tokens 362→309，含准确化注释后生产净减 3 行；锁窗口、错误

@@ -100,6 +100,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_queue_host_mem_submitter_test.sv"
   `include "unit/rdma_queue_runtime_test.sv"
   `include "unit/rdma_runtime_commit_gate_test.sv"
+  `include "unit/rdma_runtime_recovery_retirement_test.sv"
   `include "unit/rdma_queue_runtime_projector_test.sv"
   `include "unit/rdma_queue_backing_access_test.sv"
   `include "unit/rdma_queue_data_engine_post_test.sv"

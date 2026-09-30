@@ -24,7 +24,16 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch243：基于 `40e6c52`，shutdown 合并 null/非 OK 的释放失败保留路径，
+当前 Batch244：基于 `4718484`，runtime 完成/无分配完成/两个中止入口共用结束
+清理；保留不同证据校验、ACTIVE/DETACHED、CQ 最终 marker、锁和 factory 时序。
+四入口各减 6 行，含注释后生产净减 2 行、tokens 减 78；仅新增同类 protected
+操作，58 public 与字段不变。旧版/重构版 241 次专项、core 113/96、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+413/413、驱动和静态对照全部通过；UVM 0/0/0，E2E 保留既有编译告警，生产/
+测试/注册输入与送测字节相同。见 `task-rdma-batch244-runtime-recovery-retirement-report.md`。
+不合并、不推送，main 保持 `083e0d7`；整体编排与项目组合验收仍 active。
+
+前批 Batch243：基于 `40e6c52`，shutdown 合并 null/非 OK 的释放失败保留路径，
 移除释放状态临时变量，七处提前解锁/返回收为单次段的六处退出与唯一最终解锁。
 保留锁内释放、best-effort cancel、FIFO 丢弃、原错误对象和 journal 生命周期；
 方法 75→63 行、tokens 362→309，含补正注释后生产净减 3 行，不新增方法/字段/API。

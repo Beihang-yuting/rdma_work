@@ -10,6 +10,7 @@
 // 值快照：request/slot/pending 深拷贝与比较由无状态 projector 承担；所有调用保留原锁窗口，
 //   factory 重入、失败输出与无分配提交边界不因职责迁移而改变。
 // 恢复授权：普通/noalloc 入口共用持锁规则；锁与 status 交付留在入口，规则不创建对象。
+// 恢复结束：完成/中止共用无分配清理；方向证据、最终状态和锁交付仍由各入口决定。
 
 // Queue value models are defined in rdma_queue_runtime_transaction_models.sv.
 // This file keeps the mutable lock, ledger, attachment and publication owner.
@@ -3188,11 +3189,29 @@ class rdma_queue_runtime extends uvm_object;
     return value_ops::make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
+  // 设计说明：完成与中止的准入不同，但结束后都不能残留可重放的 pending、reservation
+  // 或授权位；集中清理这组状态，避免某一入口遗留旧授权。不能复用 configure/admission
+  // 的初始化或回滚：这些路径尚未结束一笔恢复，且需要保留不同的 reservation/authority。
+  // 功能：retire_recovery_locked 结束已获准完成或中止的恢复，清除证据引用与三个 gate。
+  // 输入/输出及副作用：final_state 由入口选择 ACTIVE 或 DETACHED；不分配对象，先清
+  //   pending/reservation/授权，再发布 state；不改写旧 pending 对象、游标、ledger 或 authority。
+  // 失败/边界：调用方必须已持 runtime lock 且完成全部证据校验；本函数不再拒绝、不解锁，
+  //   不构造 status，不回滚已提交 CI，也不释放外部 backing；CQ 末次 release marker 须先发布。
+  protected function void retire_recovery_locked(rdma_queue_runtime_state_e final_state);
+    pending_operation_state = null;
+    device_reservation_valid = 1'b0;
+    device_reservation = null;
+    recovery_commit_allowed = 1'b0;
+    consumer_release_gate_active = 1'b0;
+    recovery_retry_confirmed = 1'b0;
+    state = final_state;
+  endfunction
+
   // 功能：complete_recovery_retry 在 data engine 已完成 replay 的各外部阶段后，
   //   按 producer/consumer 方向验证最终证据并清除 pending、恢复 ACTIVE。
   // 输入/输出及副作用：无显式输入；成功清除 pending/reservation、commit/retry/
   //   release gate 并更新 state，PI/CI/used 必须已由对应 commit API 完成，本函数
-  //   不重复推进。
+  //   不重复推进；全部校验通过后才委托无分配清理，解锁后构造返回 status。
   // 失败/边界：无 pending、identity stale、device PI 未到 next_cursor、host slot
   //   未 posted，或 consumer doorbell/CI/CQ release 阶段不全时返回错误并保留证据。
   function rdma_status complete_recovery_retry();
@@ -3284,13 +3303,7 @@ class rdma_queue_runtime extends uvm_object;
                                    "CQ completion release is incomplete");
       end
     end
-    pending_operation_state = null;
-    device_reservation_valid = 1'b0;
-    device_reservation = null;
-    recovery_commit_allowed = 1'b0;
-    consumer_release_gate_active = 1'b0;
-    recovery_retry_confirmed = 1'b0;
-    state = RDMA_QUEUE_RUNTIME_ACTIVE;
+    retire_recovery_locked(RDMA_QUEUE_RUNTIME_ACTIVE);
     lock.put(1);
     return value_ops::make_runtime_status(RDMA_SC_OK, "");
   endfunction
@@ -3354,7 +3367,8 @@ class rdma_queue_runtime extends uvm_object;
   // 功能：abort_recovery 放弃当前 pending 并把 attachment 隔离为 DETACHED，
   //   防止不确定 transaction 继续对旧 queue 可见。
   // 输入/输出及副作用：无显式输入；成功清除 pending、device reservation、
-  //   commit/retry/release gate 并更新 state；不回滚已经成功的 CI，也不释放外部 mapping。
+  //   commit/retry/release gate 并更新 state；委托无分配清理后解锁并构造返回 status，
+  //   不回滚已经成功的 CI，也不释放外部 mapping。
   // 失败/边界：仅 RECOVERY_REQUIRED 且 pending 非空时允许；其它状态返回
   //   INVALID_STATE，失败不改变 recovery evidence。
   function rdma_status abort_recovery();
@@ -3367,13 +3381,7 @@ class rdma_queue_runtime extends uvm_object;
       return value_ops::make_runtime_status(RDMA_SC_INVALID_STATE,
                                  "queue runtime has no pending recovery");
     end
-    pending_operation_state = null;
-    device_reservation_valid = 1'b0;
-    device_reservation = null;
-    recovery_commit_allowed = 1'b0;
-    consumer_release_gate_active = 1'b0;
-    recovery_retry_confirmed = 1'b0;
-    state = RDMA_QUEUE_RUNTIME_DETACHED;
+    retire_recovery_locked(RDMA_QUEUE_RUNTIME_DETACHED);
     lock.put(1);
     return value_ops::make_runtime_status(RDMA_SC_OK, "");
   endfunction
@@ -3501,7 +3509,8 @@ class rdma_queue_runtime extends uvm_object;
   //   SUCCESS 后仅本地续做记录一次 caller confirmation，实际阶段由 data engine 完成。
   // 输入/输出及副作用：action、caller_confirmed_no_submit（输入）；授权成功仅置
   //   recovery_retry_confirmed 并保持 RECOVERY_REQUIRED/pending，abort 清除 pending
-  //   及 commit/retry/release gate 等全部恢复状态。
+  //   及 commit/retry/release gate 等全部恢复状态；中止与 abort_recovery 共用持锁清理，
+  //   保留本入口原有校验优先级和解锁后 status 构造。
   // 失败/边界：无 pending、NONE/AMBIGUOUS、未确认或 action 非法时返回对应错误；
   //   AMBIGUOUS 始终不可 retry，SUCCESS 授权也不得重新提交 MMIO。
   function rdma_status recover(rdma_queue_recovery_action_e action, bit caller_confirmed_no_submit=1'b0);
@@ -3542,13 +3551,7 @@ class rdma_queue_runtime extends uvm_object;
       return value_ops::make_runtime_status(RDMA_SC_OK, "");
     end
     if (action == RDMA_QUEUE_RECOVERY_ABORT_AND_DETACH) begin
-      pending_operation_state = null;
-      device_reservation_valid = 1'b0;
-      device_reservation = null;
-      recovery_commit_allowed = 1'b0;
-      consumer_release_gate_active = 1'b0;
-      recovery_retry_confirmed = 1'b0;
-      state = RDMA_QUEUE_RUNTIME_DETACHED;
+      retire_recovery_locked(RDMA_QUEUE_RUNTIME_DETACHED);
       lock.put(1);
       return value_ops::make_runtime_status(RDMA_SC_OK, "");
     end
@@ -3717,7 +3720,8 @@ class rdma_queue_runtime extends uvm_object;
   //   release 均完成后，单调合并 release marker 并一次性恢复 ACTIVE。
   // 输入/输出及副作用：completion_released_now 表示本次外部 release 已成功，
   //   status_slot 由 caller 预建；成功清除 pending/reservation 及 commit/retry/
-  //   release gate 并更新 state。
+  //   release gate 并更新 state；先合并旧 pending 的 release marker，再无分配清理，
+  //   解锁后原位写入 status_slot，整个入口不构造对象。
   // 失败/边界：slot/null lock、identity/CI/doorbell/commit marker 不完整、event 携带
   //   CQ release 或 CQ target 未释放时返回 0；拒绝保持 pending 和所有阶段位原样。
   function bit complete_consumer_recovery_noalloc(
@@ -3783,13 +3787,7 @@ class rdma_queue_runtime extends uvm_object;
     if (kind == RDMA_QUEUE_RUNTIME_CQ &&
         pending_operation_state.completion_target_valid && release_complete)
       pending_operation_state.completion_released = 1'b1;
-    pending_operation_state = null;
-    device_reservation_valid = 1'b0;
-    device_reservation = null;
-    recovery_commit_allowed = 1'b0;
-    consumer_release_gate_active = 1'b0;
-    recovery_retry_confirmed = 1'b0;
-    state = RDMA_QUEUE_RUNTIME_ACTIVE;
+    retire_recovery_locked(RDMA_QUEUE_RUNTIME_ACTIVE);
     lock.put(1);
     void'(rdma_status::set_fields_noalloc(status_slot, RDMA_SC_OK, ""));
     return 1'b1;
