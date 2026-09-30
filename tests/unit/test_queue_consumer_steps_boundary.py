@@ -106,31 +106,40 @@ class QueueConsumerStepsBoundaryTest(unittest.TestCase):
             self.assertIn(bound, source)
 
     def test_event_callers_delegate_only_after_route_and_next(self):
-        """功能：锁定 CEQ/AEQ 路由之后只调用一个消费事务，不重复物化候选或 continuation。
-        输入输出及副作用：读取两个 poll_once，检查 route/next/consume 顺序及委托次数；只读。
-        失败边界：路由被迁入共同 task、任一 caller 再复制结果/准备/提交链或漏掉委托即失败。
+        """功能：锁定 CEQ/AEQ 共享准备后仍在 route/next 之后只调用一个消费事务。
+        输入输出及副作用：读取两个 poll_once，检查 preparation/route/next/consume 顺序及委托次数；只读。
+        失败边界：路由被迁入共同 task、任一 caller 重复复制准备/结果/提交链或漏掉委托即失败。
         """
         declared = methods(read_code(CORE / "rdma_queue_data_engine.sv"))
         for name, route in (("poll_ceqe_once", "lookup_event_cq_route_for_poll"),
                             ("poll_aeqe_once", "resolve_aeqe_routes")):
             body = declared[name][2]
+            self.assertEqual(body.count("prepare_event_poll_entry("), 1)
+            self.assertLess(body.index("prepare_event_poll_entry("), body.index(route + "("))
             self.assertLess(body.index(route + "("), body.index("make_next_poll_cursor_nonfatal("))
             self.assertLess(body.index("make_next_poll_cursor_nonfatal("),
                             body.index("consume_routed_event("))
             self.assertEqual(body.count("consume_routed_event("), 1)
-            self.assertNotRegex(body, r"\b(?:completion_status_from_ecode|prepare_event_\w+|"
+            self.assertNotRegex(body, r"\b(?:completion_status_from_ecode|prepare_event_result_candidate_ex|"
                                 r"enter_recovery_prepared|submit_consumer_doorbell_recorded)\s*\(")
         self.assertNotIn("commit_event_poll_candidate", declared)
 
     def test_event_route_policy_stays_in_each_caller(self):
         """功能：保留 AEQ 专有读前 epoch gate 和 CQ flush 任一路命中的交付规则。
-        输入输出及副作用：只读 CEQ/AEQ 和共同业务 task，核对门禁位置及 route 参数。
+        输入输出及副作用：只读共享 preparation 与 CEQ/AEQ caller，核对门禁策略及 route 参数。
         失败边界：向 CEQ 添加 epoch 检查、AEQ gate 后移、flush OR 改为 primary 或公共层重查 route 均失败。
         """
         declared = methods(read_code(CORE / "rdma_queue_data_engine.sv"))
         ceq, aeq = declared["poll_ceqe_once"][2], declared["poll_aeqe_once"][2]
         self.assertNotIn("validate_attachment_route_epoch(", ceq)
-        self.assertLess(aeq.index("validate_attachment_route_epoch("), aeq.index("peek_consumer("))
+        preparation = declared["prepare_event_poll_entry"][2]
+        self.assertIn("input bit check_route_epoch", preparation)
+        self.assertRegex(preparation, r"if \(check_route_epoch\) begin\s*"
+                         r"status = validate_attachment_route_epoch\(attachment\);")
+        self.assertIn("RDMA_QUEUE_RUNTIME_AEQ", aeq)
+        self.assertIn("1'b1", aeq)
+        self.assertIn("RDMA_QUEUE_RUNTIME_CEQ", ceq)
+        self.assertIn("1'b0", ceq)
         self.assertIn("is_cq_flush ? (primary_found || secondary_found)", aeq)
         self.assertRegex(ceq, r"RDMA_ENGINE_CEQ,\s*routed_cq_h,\s*null,\s*route_found")
         self.assertRegex(aeq, r"RDMA_ENGINE_AEQ,\s*primary_route_h,\s*secondary_route_h,\s*deliver_found")

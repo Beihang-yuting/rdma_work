@@ -7973,6 +7973,60 @@ class rdma_queue_data_engine extends uvm_object;
     end
   endtask
 
+  // 设计说明：CEQ/AEQ 的 consumer 事务虽然拥有不同 route policy，但在任何
+  // consumer mutation 前都必须先完成相同的“读槽 → 封装 image → codec decode”准备。
+  // next cursor 刻意留在 route policy 之后，因为原流程要求 route resolver 的
+  // allocation/错误优先级先于 cursor snapshot；结果物化、doorbell 和 recovery
+  // 也仍由各 caller 保留。
+  // 功能：prepare_event_poll_entry 读取当前 event cursor 的 backing 槽并完成
+  //   CEQE/AEQE image 解码，供后续类型化 owner/route policy 消费。
+  // 输入/输出及副作用：event_h、runtime_kind、image_kind、label、check_route_epoch 为输入；
+  //   attachment/cursor/entry_image/decoded_model/offset/status 为输出并先清空。
+  //   函数只查询 runtime、读取 backing、创建 detached image/model/cursor，不推进
+  //   CI/used、不发送 doorbell、不写 pending，也不取得队列或外部 mapping 所有权。
+  // 失败/边界：attachment 查找、peek、read、image 封装或 codec decode 失败时保留
+  //   ring entry 并原样返回阶段 status；null status 由 caller 按原
+  //   event-specific 诊断处理。image_kind 只接受 decode_event_image 支持的 CEQE/AEQE。
+  protected task prepare_event_poll_entry(
+    input rdma_handle event_h,
+    input rdma_queue_runtime_kind_e runtime_kind,
+    input rdma_image_kind_e image_kind,
+    input string label,
+    input bit check_route_epoch,
+    output rdma_queue_data_attachment attachment,
+    output rdma_queue_cursor_snapshot cursor,
+    output rdma_hw_image entry_image,
+    output rdma_hw_model decoded_model,
+    output longint unsigned offset,
+    output rdma_status status
+  );
+    byte data[];
+
+    attachment = null;
+    cursor = null;
+    entry_image = null;
+    decoded_model = null;
+    offset = 0;
+    status = null;
+    status = lookup_attachment(event_h, runtime_kind, attachment);
+    if (!status.ok()) return;
+    if (check_route_epoch) begin
+      status = validate_attachment_route_epoch(attachment);
+      if (status == null || !status.ok()) return;
+    end
+    status = attachment.runtime.peek_consumer(cursor);
+    if (!status.ok()) return;
+    offset = longint'(cursor.index) * attachment.entry_size;
+    status = attachment.access.read(offset, attachment.entry_size, data);
+    if (!status.ok()) return;
+    status = make_entry_image(data, image_kind, attachment.entry_size,
+                              entry_image);
+    if (!status.ok()) return;
+    decode_event_image(entry_image, image_kind, label,
+                       decoded_model, status);
+    if (status == null || !status.ok()) return;
+  endtask
+
   // 功能：poll_ceqe_once 在 scheduler 前冻结 CEQE、可选 CQ route 与 prepared
   //   pending，再按 doorbell→consumer commit→result 消费一条 CEQ event。
   // 输入/输出及副作用：ceq_h 为输入，result/status 为输出；合法 image 命中 CQ
@@ -7994,23 +8048,13 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_hw_ceqe_model ceqe;
     rdma_handle routed_cq_h;
     bit route_found;
-    byte data[];
     longint unsigned offset;
 
     result = null;
     status = null;
-    status = lookup_attachment(ceq_h, RDMA_QUEUE_RUNTIME_CEQ, attachment);
-    if (!status.ok()) return;
-    status = attachment.runtime.peek_consumer(cursor);
-    if (!status.ok()) return;
-    offset = longint'(cursor.index) * attachment.entry_size;
-    status = attachment.access.read(offset, attachment.entry_size, data);
-    if (!status.ok()) return;
-    status = make_entry_image(data, RDMA_IMAGE_CEQE, attachment.entry_size,
-                              entry_image);
-    if (!status.ok()) return;
-    decode_event_image(entry_image, RDMA_IMAGE_CEQE, "CEQE",
-                       decoded_model, status);
+    prepare_event_poll_entry(
+      ceq_h, RDMA_QUEUE_RUNTIME_CEQ, RDMA_IMAGE_CEQE, "CEQE", 1'b0,
+      attachment, cursor, entry_image, decoded_model, offset, status);
     if (status == null || !status.ok()) return;
     if (!$cast(ceqe, decoded_model) || ceqe == null) begin
       status = bad("CEQE codec returned the wrong model type", RDMA_SC_CODEC_ERROR);
@@ -8132,29 +8176,13 @@ class rdma_queue_data_engine extends uvm_object;
     bit secondary_found;
     bit is_cq_flush;
     bit deliver_found;
-    byte data[];
     longint unsigned offset;
 
     result = null;
     status = null;
-    status = lookup_attachment(aeq_h, RDMA_QUEUE_RUNTIME_AEQ, attachment);
-    if (!status.ok()) return;
-    // 设计说明：AEQ attachment 冻结的是 attach 时的 Function route/reset epoch。
-    // 必须在 peek_consumer 与 backing read 前对比当前 binding；这样旧 Function
-    // 事件不会经新 binding 解析后被错误确认，而存活 carrier 下的 stale owner
-    // route 仍由后续 resolve 作为可确认的普通 route miss 处理。
-    status = validate_attachment_route_epoch(attachment);
-    if (!status.ok()) return;
-    status = attachment.runtime.peek_consumer(cursor);
-    if (!status.ok()) return;
-    offset = longint'(cursor.index) * attachment.entry_size;
-    status = attachment.access.read(offset, attachment.entry_size, data);
-    if (!status.ok()) return;
-    status = make_entry_image(data, RDMA_IMAGE_AEQE, attachment.entry_size,
-                              entry_image);
-    if (!status.ok()) return;
-    decode_event_image(entry_image, RDMA_IMAGE_AEQE, "AEQE",
-                       decoded_model, status);
+    prepare_event_poll_entry(
+      aeq_h, RDMA_QUEUE_RUNTIME_AEQ, RDMA_IMAGE_AEQE, "AEQE", 1'b1,
+      attachment, cursor, entry_image, decoded_model, offset, status);
     if (status == null || !status.ok()) return;
     if (!$cast(aeqe, decoded_model) || aeqe == null) begin
       status = bad("AEQE codec returned the wrong model type", RDMA_SC_CODEC_ERROR);

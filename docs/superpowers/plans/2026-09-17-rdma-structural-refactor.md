@@ -22,6 +22,15 @@
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
 
+Batch247 基于 `85f67bd` 沿用 `feature/rdma-structural-batch226`：CEQ/AEQ `poll_*_once`
+的 attachment lookup、peek、backing read、image/decode 收为同类 protected preparation
+task；AEQ route/epoch 以显式策略参数保留，route→next cursor 顺序、owner/route、
+doorbell、commit、recovery 仍在 caller。两个入口各减 10/16 行，含说明生产净增
+28 行，不称为总代码收缩；不新增 owner/锁/账本/API。旧版/重构版各 44-case 专项、
+core 115/98、CMQ 28/11、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+424/424、驱动及静态审计全部通过；UVM 0/0/0，E2E 保留既有编译告警。不合并、不推送，
+main 保持 `083e0d7`，见 `task-rdma-batch247-event-poll-prepare-report.md`；项目仍 active。
+
 Batch246 基于 `b3d84de` 沿用 `feature/rdma-structural-batch226`：queue-data 未接管
 device evidence 的移交/中止成为同类 protected 同步阶段，恢复入口 201→126 行；
 含说明生产净增 28 行，不称为总代码收缩。保留 139 个已有声明、27 public 与字段，

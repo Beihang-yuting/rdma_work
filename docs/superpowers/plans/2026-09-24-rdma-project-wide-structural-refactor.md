@@ -24,6 +24,15 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
+当前 Batch247：基于 `85f67bd`，CEQ/AEQ `poll_*_once` 的 attachment lookup、peek、
+backing read、image 封装和 decode 收为同类 protected preparation task；AEQ route/epoch
+以显式策略参数保留，route resolver 后的 next-cursor 顺序、owner/route、doorbell、
+commit 和 recovery 仍在 caller。两个入口各减 10/16 行；engine 含说明生产净增 28 行，
+不称为总代码收缩，不新增 owner/锁/账本/API。旧版/重构版专项各 44 cases、core
+115/98、CMQ 28/11、integration 10、Host-memory 3、PCIe 1、E2E 3、Python 424/424、
+驱动及静态审计全部通过；UVM 0/0/0，E2E 保留既有编译告警。见
+`task-rdma-batch247-event-poll-prepare-report.md`；不合并、不推送，计划仍 active。
+
 当前 Batch246：基于 `b3d84de`，queue-data 的未接管 device evidence 移交/中止收为
 同类 protected 同步阶段，恢复入口按校验、移交、定位、中止或重放组织。入口
 201→126 行，含注释生产净增 28 行，明确是业务可读性整理，不称为整体收缩；
@@ -301,7 +310,7 @@ L6 只协调外部生命周期并在边界验证完整 route、authority 和 res
 
 | 优先级 | 组件 | 当前规模 | 目标 | 首个可迁移职责 |
 | --- | --- | ---: | --- | --- |
-| P0 | `rdma_queue_data_engine.sv` | 9,883 行/140 methods | 继续收束统一 transaction seam | 值 projector、consumer 步骤、event 路由后事务、resize 回滚/retry 出口、设备发布准备/取消/写后出口、host-producer 失败出口和 unclaimed 移交阶段已分层；继续完整业务编排与组合边界 |
+| P0 | `rdma_queue_data_engine.sv` | 9,911 行/141 methods | 继续收束统一 transaction seam | 值 projector、event poll preparation、consumer 步骤、event 路由后事务、resize 回滚/retry 出口、设备发布准备/取消/写后出口、host-producer 失败出口和 unclaimed 移交阶段已分层；继续完整业务编排与组合边界 |
 | P1 | `rdma_resource_manager.sv` | 7,936 行/139 methods | 继续收束 allocator、registry、rollback transaction | projector 已分离；继续检查 publication 后更新，不改变 resource owner |
 | P1 | `rdma_queue_runtime.sv` | 3,795 行/76 methods | runtime snapshot/predicate 与 mutation owner 分界 | 深复制/值比较已迁入 projector，双入口恢复授权规则与四入口结束清理已同源；继续 snapshot/commit 业务组合与重复状态处理 |
 | P2 | `rdma_queue_lifecycle_policy.sv` + queue/QP executors | 2,118 / 2,819 / 4,338 行 | policy、执行副作用、状态迁移表分离 | operation envelope 与 transition candidate |
@@ -312,7 +321,7 @@ SQ/RQ/CQ/EQ facade 当前已经较薄，不单独继续拆分；它们应成为 
 公共复杂度回收到 queue-data/runtime transaction 层。Host-memory、PCIe、网络和
 dpu_common 外部对象继续由外部环境拥有，本项目只维护显式 adapter/router。
 
-上表 queue-data/manager/runtime 已分别按 Batch246/221/244 源码重测，doorbell 按 Batch235，
+上表 queue-data/manager/runtime 已分别按 Batch247/221/244 源码重测，doorbell 按 Batch235，
 其余维持 Batch218；
 独立 queue-data projector 为 823 行/23 methods，resource projector 为 2,217 行/47 methods，
 runtime projector 为 822 行/20 methods；公共 rdma_status 为 280 行/10 methods。
