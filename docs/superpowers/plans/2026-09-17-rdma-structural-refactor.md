@@ -14,13 +14,22 @@
 `00b8ff6`（`feature/rdma-cmq-contract-foundation`），当时存在大量未提交改动。该历史
 现场及已有验证证据仍须保留。
 
-## 当前执行状态（2026-09-29）
+## 当前执行状态（2026-09-30）
 
 最新本地合并：Batch222–225 的四个提交已从 `feature/rdma-structural-batch222`
 快进进入 `main`，源码基线为 `93012a3`；原工作树与已有改动保留，不推送远端。
 本轮只补合并记录，生产/测试/构建输入与已完整验证的 Batch225 一致。
 以下批次中的“不合并／尚未合回 main／主线为 5f8dfe9”保留为提交时的历史记录，
 不再代表当前主线状态；项目级 Phase B–E 与组合验收仍未全部完成。
+
+Batch242 基于 `9d069b9` 沿用 `feature/rdma-structural-batch226`：wait 的 32 处
+结束解锁收为一个出口，保留轮询让锁、重验、retained/legacy 的不同消费策略。
+方法 358→331 行、tokens 1,742→1,539，生产净减 19 行；无新增方法/字段/owner/API。
+旧版/重构版/最终注释版 31 场景、65 调用专项、core 111/94、CMQ 28/11
+（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、Python
+405/405、驱动及静态对照全部通过；UVM 0/0/0，E2E 保留既有编译告警。
+初次送测与最终注释版代码 token 相同，最终输入哈希一致。不合并、不推送，见
+`task-rdma-batch242-cmq-wait-delivery-report.md`；项目仍 active。
 
 Batch241 基于 `4c5b76a` 沿用 `feature/rdma-structural-batch226`：reconcile 的十处
 解锁/返回统一为一个出口，Host-visible/current pending 共用状态快照；保留

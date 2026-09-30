@@ -81,6 +81,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_cmq_recovery_publish_test.sv"
   `include "unit/rdma_cmq_execute_observation_test.sv"
   `include "unit/rdma_cmq_reconcile_delivery_test.sv"
+  `include "unit/rdma_cmq_wait_delivery_test.sv"
   `include "unit/rdma_cmq_port_test.sv"
   `include "unit/rdma_control_plane_test.sv"
   `include "unit/rdma_control_plane_cmq_engine_test.sv"

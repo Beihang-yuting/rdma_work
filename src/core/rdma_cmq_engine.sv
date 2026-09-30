@@ -4,7 +4,7 @@
 //   各阶段只在同一次 engine_lock 调用内借用候选；恢复入口统一拒绝出口，并把
 //   RETRY 提交/发布/证据交付交给同类持锁业务阶段；execute 按 retained 状态选择
 //   观测策略后统一交付 detached 结果；reconcile 共用非终态状态投影和锁出口，
-//   不增加持久 authority。
+//   wait 共用结束解锁但保留轮询让锁窗口，不增加持久 authority。
 // 依赖：依赖 CMQ model/profile、Host-memory adapter、doorbell scheduler、
 //   rdma_cmq_transport 与共享 submission evidence。
 // 所有权与生命周期：engine 拥有本地锁、快照、账本和每次 prepare 新建的
@@ -11965,9 +11965,10 @@ class rdma_cmq_engine extends uvm_object;
   //   canonical 输入；completion、projected_status 为 detached 输出；函数只
   //   读取 retained row，最多修改 engine-owned terminal_fifo，不取放锁、不
   //   推进 journal/cursor，也不取得外部资源所有权。
-  // 失败/边界：定位输入为空、completion snapshot 非 OK/null 或 status copy
-  //   返回 null 时返回明确 INVALID_STATE；FIFO 中没有匹配行不构成失败，调用方
-  //   仍可交付 retained completion。status_label 只用于区分既有诊断上下文。
+  // 失败/边界：定位输入为空、snapshot status 或 status copy 为 null 时返回
+  //   INVALID_STATE；snapshot 的非 OK 原码透传。按原序先消费 FIFO 再复制 status，
+  //   copy 失败不回滚 FIFO；无匹配行仍可交付 retained completion。
+  //   status_label/copy_failure_message 保留各调用路径的对象名和失败诊断。
   protected function rdma_status
   project_wait_retained_completion_locked(
     input rdma_cmq_batch_submission_record batch_record,
@@ -12010,9 +12011,16 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：控制 wait_for 对应的等待、异常或同步边界，按超时/捕获结果返回状态，不吞掉原始错误。
-  // 输入/输出及副作用：ticket（输入）、completion（输出）、status（输出）；wait_for 驱动下游事务，并写入 completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：wait_for 超时或异常必须返回原始错误证据；不得无限等待或跳过同步边界。
+  // 功能：冻结 ticket 后等待其 retained completion；仅当前 ACTIVE pending 可驱动
+  //   expire/poll，已有终态立即复制，legacy 无 journal 路径保持 FIFO 单次转移。
+  // 输入/输出及副作用：ticket 为只读 caller 输入，completion/status 为输出；普通
+  //   retained 交付删除匹配 FIFO 行，reset authority 竞争分支只复制。等待以至多
+  //   1ns 步长让锁，重取锁后重验 gate/identity；所有结束共用一个最终解锁出口，
+  //   不改变轮询期间的 put/delay/get，也不拥有外部 adapter 或新建运行账本。
+  // 失败/边界：null/坏 ticket、未发布/未决行、旧 pending、缺少 legacy authority、
+  //   快照或 expiry/poll 失败、让锁后身份变化均按原优先级拒绝；超时必须由真实
+  //   expiry retained completion 交付，不能凭 deadline 伪造。普通 retained 终态可
+  //   重复观察；legacy FIFO 只消费一次，status 非 OK 不等于没有 completion。
   task wait_for(
     rdma_cmq_ticket ticket,
     output rdma_cmq_completion completion,
@@ -12040,336 +12048,309 @@ class rdma_cmq_engine extends uvm_object;
     completion = null;
     status = invalid_state("CMQ wait did not complete");
     engine_lock.get(1);
-    status = reset_release_gate_status();
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
-    if (ticket == null) begin
-      status = invalid_argument("CMQ wait ticket is null");
-      engine_lock.put(1);
-      return;
-    end
-    validation_status = ticket_trust_status(ticket);
-    if (validation_status == null || !validation_status.ok()) begin
-      status = invalid_argument("CMQ wait ticket is invalid");
-      engine_lock.put(1);
-      return;
-    end
-    validation_status = checked_completion_ticket_snapshot(
-      ticket, ticket_snapshot
-    );
-    if (validation_status == null || !validation_status.ok()) begin
-      status = (validation_status == null) ?
-        invalid_state("CMQ wait ticket snapshot returned null status") :
-        validation_status;
-      engine_lock.put(1);
-      return;
-    end
+    // 外层只做一次准入，内层沿用真实轮询；两层 break 都只通向段后的最终解锁。
+    // 轮询等待的 put/delay/get 是唯一中途让锁点，continue 仍仅重读当前 ticket。
+    do begin : wait_session
+      status = reset_release_gate_status();
+      if (!status.ok()) begin
+        break;
+      end
+      if (ticket == null) begin
+        status = invalid_argument("CMQ wait ticket is null");
+        break;
+      end
+      validation_status = ticket_trust_status(ticket);
+      if (validation_status == null || !validation_status.ok()) begin
+        status = invalid_argument("CMQ wait ticket is invalid");
+        break;
+      end
+      validation_status = checked_completion_ticket_snapshot(
+        ticket, ticket_snapshot
+      );
+      if (validation_status == null || !validation_status.ok()) begin
+        status = (validation_status == null) ?
+          invalid_state("CMQ wait ticket snapshot returned null status") :
+          validation_status;
+        break;
+      end
 
-    // 首次锁内定位必须先冻结 retained row；ticket handle 后续可被 caller
-    // 改写，waiter 只使用此 canonical snapshot。
-    validation_status = locate_journal_item_by_ticket_locked(
-      ticket_snapshot, frozen_batch, frozen_item, frozen_item_index
-    );
-    journal_located = validation_status != null && validation_status.ok();
-    fallback_outstanding = 1'b0;
-    if (journal_located) begin
-      if (frozen_batch.function_identity == null ||
-          !rdma_cmq_try_snapshot_identity_direct(
-            frozen_batch.function_identity, frozen_identity
-          )) begin
-        status = invalid_state("CMQ wait retained Function snapshot failed");
-        engine_lock.put(1);
-        return;
-      end
-      if (frozen_item == null || frozen_item.ticket == null) begin
-        status = invalid_state("CMQ wait retained item is incomplete");
-        engine_lock.put(1);
-        return;
-      end
-      if (frozen_item.state inside {
-            RDMA_CMQ_SUBMISSION_STAGED,
-            RDMA_CMQ_SUBMISSION_PENDING_EFFECT
-          }) begin
-        status = invalid_state("CMQ wait ticket is not observable yet");
-        engine_lock.put(1);
-        return;
-      end
-      if (frozen_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
-        status = invalid_state("CMQ wait ticket was not published");
-        engine_lock.put(1);
-        return;
-      end
-      if (frozen_item.completion != null &&
-          rdma_cmq_completion_phase_has_terminal_evidence(
-            frozen_item.completion_phase
-          )) begin
-        // A FIFO row is delivery order only.  Snapshot from journal first, then
-        // consume the matching FIFO row so another ticket remains untouched.
-        projection_status = project_wait_retained_completion_locked(
-          frozen_batch, frozen_item, ticket_snapshot, 1'b1,
-          "cmq_wait_terminal_status",
-          "CMQ wait terminal status snapshot failed",
-          completion, status
-        );
-        if (projection_status == null || !projection_status.ok()) begin
-          status = (projection_status == null) ? invalid_state(
-            "CMQ wait completion projection returned null status"
-          ) : projection_status;
-          engine_lock.put(1);
-          return;
-        end
-        engine_lock.put(1);
-        return;
-      end
-      if (!(frozen_item.state inside {
-            RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
-            RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
-          }) || frozen_item.completion_phase !=
-            RDMA_CMQ_COMPLETION_PENDING) begin
-        status = invalid_state("CMQ wait retained lifecycle is not pending");
-        engine_lock.put(1);
-        return;
-      end
-      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
-          engine_incarnation != frozen_batch.engine_incarnation) begin
-        status = invalid_state("CMQ wait pending ticket belongs to old engine");
-        engine_lock.put(1);
-        return;
-      end
-    end
-    else begin
-      // Compatibility for pre-journal test/facade completions.  This fallback
-      // is intentionally limited to the current active runtime and never lets
-      // a post-reset ticket inspect a newly prepared backing.
-      if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
-        status = invalid_state("CMQ wait requires an ACTIVE engine");
-        engine_lock.put(1);
-        return;
-      end
-      fallback_outstanding = ticket_is_outstanding(ticket_snapshot);
-      if (!fallback_outstanding && terminal_index(ticket_snapshot) < 0) begin
-        status = invalid_argument("CMQ wait ticket is unknown or delivered");
-        engine_lock.put(1);
-        return;
-      end
-      if (prepared_binding == null ||
-          !rdma_cmq_try_snapshot_identity_direct(
-            prepared_binding.function_identity_snapshot(), frozen_identity
-          )) begin
-        status = invalid_state("CMQ wait Function snapshot failed");
-        engine_lock.put(1);
-        return;
-      end
-    end
-
-    forever begin
+      // 首次锁内定位必须先冻结 retained row；ticket handle 后续可被 caller
+      // 改写，waiter 只使用此 canonical snapshot。
+      validation_status = locate_journal_item_by_ticket_locked(
+        ticket_snapshot, frozen_batch, frozen_item, frozen_item_index
+      );
+      journal_located = validation_status != null && validation_status.ok();
+      fallback_outstanding = 1'b0;
       if (journal_located) begin
-        // Re-read the exact retained row before every delivery/side effect.
-        validation_status = locate_journal_item_by_ticket_locked(
-          ticket_snapshot, current_batch, current_item, current_item_index
-        );
-        if (validation_status == null || !validation_status.ok() ||
-            current_batch == null || current_item == null ||
-            current_item_index != frozen_item_index ||
-            current_batch.batch_key != frozen_batch.batch_key ||
-            current_batch.engine_incarnation != frozen_batch.engine_incarnation ||
-            current_batch.function_identity == null ||
-            !current_batch.function_identity.same_incarnation(frozen_identity)) begin
-          // A reset may have won between iterations.  Only a retained reset
-          // completion is allowed to cross that boundary.
-          if (validation_status != null && validation_status.ok() &&
-              current_item != null &&
-              current_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
-            projection_status = project_wait_retained_completion_locked(
-              current_batch, current_item, ticket_snapshot, 1'b0,
-              "cmq_wait_reset_status",
-              "CMQ wait reset status snapshot failed",
-              completion, status
-            );
-            if (projection_status != null && projection_status.ok()) begin
-              engine_lock.put(1);
-              return;
-            end
-          end
-          status = invalid_state("CMQ wait retained authority changed");
-          engine_lock.put(1);
-          return;
-        end
-        frozen_batch = current_batch;
-        frozen_item = current_item;
-        if (current_item.completion != null &&
-            rdma_cmq_completion_phase_has_terminal_evidence(
-              current_item.completion_phase
+        if (frozen_batch.function_identity == null ||
+            !rdma_cmq_try_snapshot_identity_direct(
+              frozen_batch.function_identity, frozen_identity
             )) begin
+          status = invalid_state("CMQ wait retained Function snapshot failed");
+          break;
+        end
+        if (frozen_item == null || frozen_item.ticket == null) begin
+          status = invalid_state("CMQ wait retained item is incomplete");
+          break;
+        end
+        if (frozen_item.state inside {
+              RDMA_CMQ_SUBMISSION_STAGED,
+              RDMA_CMQ_SUBMISSION_PENDING_EFFECT
+            }) begin
+          status = invalid_state("CMQ wait ticket is not observable yet");
+          break;
+        end
+        if (frozen_item.state == RDMA_CMQ_SUBMISSION_HOST_VISIBLE_NOT_PUBLISHED) begin
+          status = invalid_state("CMQ wait ticket was not published");
+          break;
+        end
+        if (frozen_item.completion != null &&
+            rdma_cmq_completion_phase_has_terminal_evidence(
+              frozen_item.completion_phase
+            )) begin
+          // FIFO 只维护交付次序；先从 journal 复制终态，再删除匹配 FIFO 行，
+          // 其它 ticket 的交付顺序和证据不受影响。
           projection_status = project_wait_retained_completion_locked(
-            current_batch, current_item, ticket_snapshot, 1'b1,
-            "cmq_wait_completion_status",
-            "CMQ wait completion status snapshot failed",
+            frozen_batch, frozen_item, ticket_snapshot, 1'b1,
+            "cmq_wait_terminal_status",
+            "CMQ wait terminal status snapshot failed",
             completion, status
           );
           if (projection_status == null || !projection_status.ok()) begin
             status = (projection_status == null) ? invalid_state(
               "CMQ wait completion projection returned null status"
             ) : projection_status;
-            engine_lock.put(1);
-            return;
+            break;
           end
-          engine_lock.put(1);
-          return;
+          break;
         end
-        if (current_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
-          status = invalid_state("CMQ reset item has no retained completion");
-          engine_lock.put(1);
-          return;
-        end
-        if (!(current_item.state inside {
+        if (!(frozen_item.state inside {
               RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
               RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
-            }) || current_item.completion_phase !=
+            }) || frozen_item.completion_phase !=
               RDMA_CMQ_COMPLETION_PENDING) begin
-          status = invalid_state("CMQ wait pending lifecycle is invalid");
-          engine_lock.put(1);
-          return;
+          status = invalid_state("CMQ wait retained lifecycle is not pending");
+          break;
         end
-        // Revalidate current runtime Function identity and incarnation before
-        // invoking expiry/poll, which may read CQ backing or mutate journal.
-        current_identity = null;
         if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
-            engine_incarnation != frozen_batch.engine_incarnation ||
-            prepared_binding == null ||
-            !rdma_cmq_try_snapshot_identity_direct(
-              prepared_binding.function_identity_snapshot(), current_identity
-            ) || current_identity == null ||
-            !current_identity.same_incarnation(frozen_identity) ||
-            !ticket_has_engine_authority(ticket_snapshot)) begin
-          status = invalid_state("CMQ wait current runtime authority changed");
-          engine_lock.put(1);
-          return;
+            engine_incarnation != frozen_batch.engine_incarnation) begin
+          status = invalid_state("CMQ wait pending ticket belongs to old engine");
+          break;
         end
       end
-      else if (terminal_index(ticket_snapshot) >= 0) begin
-        // Legacy FIFO fallback has no retained graph; consume only its exact
-        // row and preserve the historical one-shot delivery semantics.
-        fifo_index = terminal_index(ticket_snapshot);
-        completion = terminal_fifo[fifo_index];
-        terminal_fifo.delete(fifo_index);
-        if (completion == null || completion.status == null) begin
-          completion = null;
-          status = invalid_state("CMQ wait legacy completion is incomplete");
+      else begin
+        // legacy 测试/facade 没有 retained journal，只能回退到当前 ACTIVE
+        // runtime 的精确 FIFO/在途项；不能让复位前 ticket 借新 prepare 的
+        // backing 获得访问权。
+        if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+          status = invalid_state("CMQ wait requires an ACTIVE engine");
+          break;
         end
-        else
-          status = copy_submit_status_direct(
-            completion.status, "cmq_wait_legacy_status"
-          );
-        engine_lock.put(1);
-        return;
-      end
-
-      expiry_status = expire_locked();
-      if (expiry_status == null || !expiry_status.ok()) begin
-        status = (expiry_status == null) ? invalid_state(
-          "CMQ wait expiry helper returned null status"
-        ) : expiry_status;
-        engine_lock.put(1);
-        return;
-      end
-      poll_status = rdma_status::success();
-      poll_locked(poll_status);
-      if (poll_status == null || !poll_status.ok()) begin
-        status = (poll_status == null) ? invalid_state(
-          "CMQ wait poll helper returned null status"
-        ) : poll_status;
-        engine_lock.put(1);
-        return;
-      end
-
-      // The next loop rereads journal/FIFO.  A deadline transition is thus
-      // delivered as the retained non-null RDMA_SC_TIMEOUT completion.
-      if ($time >= ticket_snapshot.absolute_deadline &&
-          journal_located) begin
-        validation_status = locate_journal_item_by_ticket_locked(
-          ticket_snapshot, current_batch, current_item, current_item_index
-        );
-        if (validation_status != null && validation_status.ok() &&
-            current_item != null && current_item.completion != null &&
-            current_item.completion_phase == RDMA_CMQ_COMPLETION_TIMEOUT)
-          continue;
-        if (current_item != null &&
-            current_item.state inside {
-              RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
-              RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
-            }) begin
-          // expire_locked should have transitioned an owned slot; if it did
-          // not, fail closed rather than manufacturing a status without evidence.
-          status = invalid_state("CMQ wait deadline transition is missing");
-          engine_lock.put(1);
-          return;
-        end
-      end
-
-      if (journal_located && !ticket_is_outstanding(ticket_snapshot) &&
-          terminal_index(ticket_snapshot) < 0) begin
-        // A reset/terminal transition will be observed at the top of the next
-        // iteration; absent both evidence and runtime authority is delivery loss.
-        validation_status = locate_journal_item_by_ticket_locked(
-          ticket_snapshot, current_batch, current_item, current_item_index
-        );
-        if (validation_status == null || !validation_status.ok() ||
-            current_item == null || current_item.completion == null) begin
+        fallback_outstanding = ticket_is_outstanding(ticket_snapshot);
+        if (!fallback_outstanding && terminal_index(ticket_snapshot) < 0) begin
           status = invalid_argument("CMQ wait ticket is unknown or delivered");
-          engine_lock.put(1);
-          return;
+          break;
+        end
+        if (prepared_binding == null ||
+            !rdma_cmq_try_snapshot_identity_direct(
+              prepared_binding.function_identity_snapshot(), frozen_identity
+            )) begin
+          status = invalid_state("CMQ wait Function snapshot failed");
+          break;
         end
       end
-      if ($isunknown(ticket_snapshot.absolute_deadline) ||
-          ticket_snapshot.absolute_deadline == 0) begin
-        status = invalid_argument("CMQ wait ticket deadline is invalid");
-        engine_lock.put(1);
-        return;
-      end
-      if ($time >= ticket_snapshot.absolute_deadline) begin
-        // Top-of-loop expiry should have installed a completion.  Keep the
-        // invariant explicit and never return INVALID_STATE as a timeout.
-        status = invalid_state("CMQ wait deadline transition is unavailable");
-        engine_lock.put(1);
-        return;
-      end
-      remaining = ticket_snapshot.absolute_deadline - $time;
-      wait_time = (remaining < 1ns) ? remaining : 1ns;
-      engine_lock.put(1);
-      #(wait_time);
-      engine_lock.get(1);
-      status = reset_release_gate_status();
-      if (!status.ok()) begin
-        engine_lock.put(1);
-        return;
-      end
-      if (journal_located) begin
-        validation_status = locate_journal_item_by_ticket_locked(
-          ticket_snapshot, current_batch, current_item, current_item_index
-        );
-        if (validation_status == null || !validation_status.ok() ||
-            current_batch == null || current_item == null ||
-            current_item_index != frozen_item_index ||
-            current_batch.batch_key != frozen_batch.batch_key ||
-            current_batch.engine_incarnation != frozen_batch.engine_incarnation ||
-            current_batch.function_identity == null ||
-            !current_batch.function_identity.same_incarnation(frozen_identity)) begin
-          status = invalid_state("CMQ wait retained authority changed after unlock");
-          engine_lock.put(1);
-          return;
+
+      forever begin : wait_iteration
+        if (journal_located) begin
+          // 每次交付或执行副作用之前，都重读同一 ticket 的 retained 行。
+          validation_status = locate_journal_item_by_ticket_locked(
+            ticket_snapshot, current_batch, current_item, current_item_index
+          );
+          if (validation_status == null || !validation_status.ok() ||
+              current_batch == null || current_item == null ||
+              current_item_index != frozen_item_index ||
+              current_batch.batch_key != frozen_batch.batch_key ||
+              current_batch.engine_incarnation != frozen_batch.engine_incarnation ||
+              current_batch.function_identity == null ||
+              !current_batch.function_identity.same_incarnation(frozen_identity)) begin
+            // 两轮之间可能已发生复位；authority 不一致时，仅允许 retained
+            // reset completion 跨越该边界，不消费普通交付 FIFO。
+            if (validation_status != null && validation_status.ok() &&
+                current_item != null &&
+                current_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
+              projection_status = project_wait_retained_completion_locked(
+                current_batch, current_item, ticket_snapshot, 1'b0,
+                "cmq_wait_reset_status",
+                "CMQ wait reset status snapshot failed",
+                completion, status
+              );
+              if (projection_status != null && projection_status.ok()) begin
+                break;
+              end
+            end
+            status = invalid_state("CMQ wait retained authority changed");
+            break;
+          end
+          frozen_batch = current_batch;
+          frozen_item = current_item;
+          if (current_item.completion != null &&
+              rdma_cmq_completion_phase_has_terminal_evidence(
+                current_item.completion_phase
+              )) begin
+            projection_status = project_wait_retained_completion_locked(
+              current_batch, current_item, ticket_snapshot, 1'b1,
+              "cmq_wait_completion_status",
+              "CMQ wait completion status snapshot failed",
+              completion, status
+            );
+            if (projection_status == null || !projection_status.ok()) begin
+              status = (projection_status == null) ? invalid_state(
+                "CMQ wait completion projection returned null status"
+              ) : projection_status;
+              break;
+            end
+            break;
+          end
+          if (current_item.state == RDMA_CMQ_SUBMISSION_RESET_QUARANTINED) begin
+            status = invalid_state("CMQ reset item has no retained completion");
+            break;
+          end
+          if (!(current_item.state inside {
+                RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+                RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+              }) || current_item.completion_phase !=
+                RDMA_CMQ_COMPLETION_PENDING) begin
+            status = invalid_state("CMQ wait pending lifecycle is invalid");
+            break;
+          end
+          // expiry/poll 会读取 CQ backing 或提交 journal 迁移；必须先重验
+          // 当前 runtime 的 Function identity、incarnation 与 ticket 授权。
+          current_identity = null;
+          if (engine_state != RDMA_CMQ_ENGINE_ACTIVE ||
+              engine_incarnation != frozen_batch.engine_incarnation ||
+              prepared_binding == null ||
+              !rdma_cmq_try_snapshot_identity_direct(
+                prepared_binding.function_identity_snapshot(), current_identity
+              ) || current_identity == null ||
+              !current_identity.same_incarnation(frozen_identity) ||
+              !ticket_has_engine_authority(ticket_snapshot)) begin
+            status = invalid_state("CMQ wait current runtime authority changed");
+            break;
+          end
         end
-        // Revalidation before the next loop's CQ access is intentional; the
-        // loop will additionally check current ACTIVE runtime identity.
-      end
-      else if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
-        status = invalid_state("CMQ engine changed state during wait");
+        else if (terminal_index(ticket_snapshot) >= 0) begin
+          // legacy 没有 retained 图；只转移精确匹配的 FIFO 原对象，保持
+          // 历史单次消费语义，不能改成 retained 的可重复快照交付。
+          fifo_index = terminal_index(ticket_snapshot);
+          completion = terminal_fifo[fifo_index];
+          terminal_fifo.delete(fifo_index);
+          if (completion == null || completion.status == null) begin
+            completion = null;
+            status = invalid_state("CMQ wait legacy completion is incomplete");
+          end
+          else
+            status = copy_submit_status_direct(
+              completion.status, "cmq_wait_legacy_status"
+            );
+          break;
+        end
+
+        expiry_status = expire_locked();
+        if (expiry_status == null || !expiry_status.ok()) begin
+          status = (expiry_status == null) ? invalid_state(
+            "CMQ wait expiry helper returned null status"
+          ) : expiry_status;
+          break;
+        end
+        poll_status = rdma_status::success();
+        poll_locked(poll_status);
+        if (poll_status == null || !poll_status.ok()) begin
+          status = (poll_status == null) ? invalid_state(
+            "CMQ wait poll helper returned null status"
+          ) : poll_status;
+          break;
+        end
+
+        // 下一轮重读 journal/FIFO，因此真实到期迁移通过非空 retained
+        // RDMA_SC_TIMEOUT completion 交付，而不是只返回一个超时状态。
+        if ($time >= ticket_snapshot.absolute_deadline &&
+            journal_located) begin
+          validation_status = locate_journal_item_by_ticket_locked(
+            ticket_snapshot, current_batch, current_item, current_item_index
+          );
+          if (validation_status != null && validation_status.ok() &&
+              current_item != null && current_item.completion != null &&
+              current_item.completion_phase == RDMA_CMQ_COMPLETION_TIMEOUT)
+            continue;
+          if (current_item != null &&
+              current_item.state inside {
+                RDMA_CMQ_SUBMISSION_PUBLISH_AMBIGUOUS,
+                RDMA_CMQ_SUBMISSION_PUBLISH_CONFIRMED
+              }) begin
+            // owned slot 到期本应由 expire_locked 完成迁移；仍 pending
+            // 意味着证据缺失，必须拒绝，不能制造没有 completion 的超时。
+            status = invalid_state("CMQ wait deadline transition is missing");
+            break;
+          end
+        end
+
+        if (journal_located && !ticket_is_outstanding(ticket_snapshot) &&
+            terminal_index(ticket_snapshot) < 0) begin
+          // 下一轮会观察 reset/terminal 迁移；若 retained 证据与 runtime
+          // authority 都不存在，则按原契约报告未知或已经交付。
+          validation_status = locate_journal_item_by_ticket_locked(
+            ticket_snapshot, current_batch, current_item, current_item_index
+          );
+          if (validation_status == null || !validation_status.ok() ||
+              current_item == null || current_item.completion == null) begin
+            status = invalid_argument("CMQ wait ticket is unknown or delivered");
+            break;
+          end
+        end
+        if ($isunknown(ticket_snapshot.absolute_deadline) ||
+            ticket_snapshot.absolute_deadline == 0) begin
+          status = invalid_argument("CMQ wait ticket deadline is invalid");
+          break;
+        end
+        if ($time >= ticket_snapshot.absolute_deadline) begin
+          // 本轮 expiry 应已安装到期 completion；此处缺少迁移证据是状态
+          // 错误，不能把 INVALID_STATE 冒充正常 timeout 交付。
+          status = invalid_state("CMQ wait deadline transition is unavailable");
+          break;
+        end
+        remaining = ticket_snapshot.absolute_deadline - $time;
+        wait_time = (remaining < 1ns) ? remaining : 1ns;
         engine_lock.put(1);
-        return;
+        #(wait_time);
+        engine_lock.get(1);
+        status = reset_release_gate_status();
+        if (!status.ok()) begin
+          break;
+        end
+        if (journal_located) begin
+          validation_status = locate_journal_item_by_ticket_locked(
+            ticket_snapshot, current_batch, current_item, current_item_index
+          );
+          if (validation_status == null || !validation_status.ok() ||
+              current_batch == null || current_item == null ||
+              current_item_index != frozen_item_index ||
+              current_batch.batch_key != frozen_batch.batch_key ||
+              current_batch.engine_incarnation != frozen_batch.engine_incarnation ||
+              current_batch.function_identity == null ||
+              !current_batch.function_identity.same_incarnation(frozen_identity)) begin
+            status = invalid_state("CMQ wait retained authority changed after unlock");
+            break;
+          end
+          // 让锁后先重验 retained 身份，再进入下一轮 CQ 访问；下一轮还会
+          // 独立核对当前 ACTIVE runtime，两个授权门禁不能互相替代。
+        end
+        else if (engine_state != RDMA_CMQ_ENGINE_ACTIVE) begin
+          status = invalid_state("CMQ engine changed state during wait");
+          break;
+        end
       end
-    end
+    end while (1'b0);
+    engine_lock.put(1);
   endtask
 
   // 设计说明：reconcile_ticket 的 pending 处理可能驱动当前 runtime；其后的

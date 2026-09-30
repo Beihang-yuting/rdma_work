@@ -24,7 +24,16 @@ staging、可变账本和 facade policy 压在同一批大文件中。继续只�
 
 ## 目标分层
 
-当前 Batch241：基于 `4c5b76a`，reconcile 的十处解锁/返回合为一个锁出口，
+当前 Batch242：基于 `9d069b9`，wait 的 32 处结束解锁合为一个出口；准入与轮询
+两层 break 都通向最终解锁，中途 put/delay/get、重验和 FIFO 消费策略不变。
+方法 358→331 行、tokens 1,742→1,539，生产净减 19 行；213 声明/字段不变，
+不新增 owner/API。旧版/重构版/最终注释版 31 场景、65 调用专项、core 111/94、
+CMQ 28/11（PROCESS/LOGICAL）、integration 10、Host-memory 3、PCIe 1、E2E 3、
+Python 405/405、驱动及静态对照全部通过；UVM 0/0/0，E2E 保留既有编译告警。
+初次送测与最终注释版代码 token 相同，最终输入哈希一致。见
+`task-rdma-batch242-cmq-wait-delivery-report.md`；不合并、不推送，计划仍 active。
+
+前批 Batch241：基于 `4c5b76a`，reconcile 的十处解锁/返回合为一个锁出口，
 Host-visible/current pending 共用状态快照；保留 retained-first、live-only
 expire/poll/reread、终态独立快照及 FIFO 不消费。入口 146→140 行，projector
 91→88 行，相关 tokens 1,081→988，生产净减 6 行；不新增方法、字段、owner/API。
