@@ -1329,17 +1329,9 @@ class rdma_control_plane extends uvm_object;
     reserve_transaction_id(transaction_id, status);
     result.transaction_id = transaction_id;
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue transaction ID allocation returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue transaction ID allocation returned null")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue control-plane configuration check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue control-plane configuration check returned null")
       if (queue_executor == null) begin
         status = invalid_state("queue lifecycle executor is unavailable");
         break;
@@ -1355,39 +1347,19 @@ class rdma_control_plane extends uvm_object;
         break;
       end
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue Function binding check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue Function binding check returned null")
       status = queue_request_status(request, owner, "queue create request");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue create request check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue create request check returned null")
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock queue Function check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock queue Function check returned null")
       status = same_owner_status(locked_owner, owner,
                                  "post-lock queue Function");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock queue Function identity returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock queue Function identity returned null")
       status = queue_request_status(request, locked_owner,
                                     "post-lock queue create request");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock queue request check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock queue request check returned null")
       queue_executor.create_locked(binding, owner, request, transaction_id,
                                    queue, result);
       if (result != null && result.ok() &&
@@ -1435,29 +1407,13 @@ class rdma_control_plane extends uvm_object;
     reserve_transaction_id(transaction_id, status);
     result.transaction_id = transaction_id;
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue destroy transaction ID returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue destroy transaction ID returned null")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue destroy configuration check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue destroy configuration check returned null")
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue destroy Function check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue destroy Function check returned null")
       status = queue_request_status(request, owner, "queue destroy request");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "queue destroy request check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "queue destroy request check returned null")
       if (request.target_h.kind != expected_kind) begin
         status = invalid_argument("queue destroy target kind is invalid");
         break;
@@ -1468,11 +1424,7 @@ class rdma_control_plane extends uvm_object;
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock queue destroy Function returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock queue destroy Function returned null")
       status = same_owner_status(locked_owner, owner,
                                  "post-lock queue destroy Function");
       if (status == null || !status.ok()) break;
@@ -1600,17 +1552,9 @@ class rdma_control_plane extends uvm_object;
     reserve_transaction_id(transaction_id, status);
     result.transaction_id = transaction_id;
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "QP transaction ID allocation returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP transaction ID allocation returned null")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "QP control-plane configuration returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP control-plane configuration returned null")
       if (host_mem == null || context_backing == null) begin
         status = invalid_state(
           "QP create requires host-memory and context-backing adapters"
@@ -1622,37 +1566,19 @@ class rdma_control_plane extends uvm_object;
         break;
       end
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status, "QP Function binding returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP Function binding returned null")
       status = queue_request_status(request, owner, "QP create request");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status, "QP create request returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP create request returned null")
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock QP Function returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock QP Function returned null")
       status = same_owner_status(locked_owner, owner,
                                  "post-lock QP Function");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock QP identity returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock QP identity returned null")
       status = queue_request_status(request, locked_owner,
                                     "post-lock QP create request");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock QP request returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock QP request returned null")
 
       executor_called = 1'b1;
       qp_executor.create_locked(binding, owner, request, transaction_id,
@@ -1718,51 +1644,30 @@ class rdma_control_plane extends uvm_object;
     reserve_transaction_id(transaction_id, status);
     result.transaction_id = transaction_id;
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "QP modify transaction ID allocation returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP modify transaction ID allocation returned null")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "QP modify control-plane configuration returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP modify control-plane configuration returned null")
       if (host_mem == null || context_backing == null || qp_executor == null) begin
         status = invalid_state("QP modify requires a configured QP executor");
         break;
       end
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status, "QP modify Function binding returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP modify Function binding returned null")
       status = queue_request_status(request, owner, "QP modify request");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status, "QP modify request returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "QP modify request returned null")
       status = queue_target_owner_status(request.qp_h, owner,
                                          "QP modify target");
       if (status == null || !status.ok()) break;
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "post-lock QP modify Function returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock QP modify Function returned null")
       status = same_owner_status(locked_owner, owner,
                                  "post-lock QP modify Function");
       if (status == null || !status.ok()) break;
       status = queue_request_status(request, locked_owner,
                                     "post-lock QP modify request");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status, "post-lock QP modify request returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock QP modify request returned null")
       status = queue_target_owner_status(request.qp_h, locked_owner,
                                          "post-lock QP modify target");
       if (status == null || !status.ok()) break;
@@ -1918,62 +1823,25 @@ class rdma_control_plane extends uvm_object;
     result.transaction_id = transaction_id;
 
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "transaction ID allocation returned null status"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "transaction ID allocation returned null status")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "control-plane configuration check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "control-plane configuration check returned null")
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "Function binding check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "Function binding check returned null")
       status = request_status(request, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "create PD request check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "create PD request check returned null")
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock Function binding check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock Function binding check returned null")
       status = same_owner_status(
         locked_owner, owner, "post-lock create PD binding"
       );
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock Function identity check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock Function identity check returned null")
       status = request_status(request, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock create PD request check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock create PD request check returned null")
       status = manager.create_pd(binding, reserved_pd);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "resource manager create PD returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "resource manager create PD returned null")
       if (reserved_pd == null || reserved_pd.handle == null ||
           reserved_pd.state != RDMA_RESOURCE_ALLOCATED) begin
         status = invalid_state(
@@ -2072,39 +1940,17 @@ class rdma_control_plane extends uvm_object;
     result.transaction_id = transaction_id;
 
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "transaction ID allocation returned null status"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "transaction ID allocation returned null status")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "control-plane configuration check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "control-plane configuration check returned null")
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "Function binding check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "Function binding check returned null")
       status = pd_handle_owner_status(pd_h, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "destroy PD handle check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "destroy PD handle check returned null")
 
       acquire_function_lock(owner, function_lock);
       status = manager.lookup(pd_h, resource);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "resource manager PD lookup returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "resource manager PD lookup returned null")
       if (!$cast(pd_snapshot, resource) || pd_snapshot == null ||
           pd_snapshot.handle == null || pd_snapshot.owner == null) begin
         status = invalid_state("resource manager PD snapshot is invalid");
@@ -2114,11 +1960,7 @@ class rdma_control_plane extends uvm_object;
       result.final_resource_state = pd_snapshot.state;
       result.final_resource_state_known = 1'b1;
       status = same_owner_status(pd_snapshot.owner, owner, "destroy PD");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "destroy PD owner check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "destroy PD owner check returned null")
       if (pd_snapshot.state != RDMA_RESOURCE_ACTIVE) begin
         status = invalid_state("destroy PD requires an ACTIVE PD");
         break;
@@ -2135,12 +1977,7 @@ class rdma_control_plane extends uvm_object;
       result.final_resource_state = RDMA_RESOURCE_QUIESCING;
 
       status = manager.finalize_release(pd_snapshot.handle);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "resource manager PD release returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "resource manager PD release returned null")
       result.final_resource_state = RDMA_RESOURCE_RELEASED;
       result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
       status = rdma_status::success();
@@ -2181,70 +2018,25 @@ class rdma_control_plane extends uvm_object;
     result.transaction_id = transaction_id;
 
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "deregister MR transaction ID allocation returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "deregister MR transaction ID allocation returned null")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "deregister MR configuration check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "deregister MR configuration check returned null")
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "deregister MR Function check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "deregister MR Function check returned null")
       status = generation_fence(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "initial deregister MR generation fence returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "initial deregister MR generation fence returned null")
       status = mr_handle_owner_status(mr_h, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "deregister MR handle check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "deregister MR handle check returned null")
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock deregister MR Function check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock deregister MR Function check returned null")
       status = generation_fence(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock deregister MR generation fence returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock deregister MR generation fence returned null")
       status = mr_handle_owner_status(mr_h, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock deregister MR handle check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock deregister MR handle check returned null")
       status = manager.lookup(mr_h, resource);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "resource manager deregister MR lookup returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "resource manager deregister MR lookup returned null")
       if (!$cast(mr_snapshot, resource) || mr_snapshot == null ||
           mr_snapshot.handle == null || mr_snapshot.owner == null) begin
         status = invalid_state(
@@ -2258,12 +2050,7 @@ class rdma_control_plane extends uvm_object;
       status = same_owner_status(
         mr_snapshot.owner, locked_owner, "deregister MR"
       );
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "deregister MR owner check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "deregister MR owner check returned null")
       if (mr_snapshot.state != RDMA_RESOURCE_ACTIVE) begin
         status = invalid_state("deregister MR requires an ACTIVE MR");
         break;
@@ -2592,25 +2379,11 @@ class rdma_control_plane extends uvm_object;
     result.transaction_id = transaction_id;
 
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "transaction ID allocation returned null status"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "transaction ID allocation returned null status")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "control-plane configuration check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "control-plane configuration check returned null")
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "Function binding check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "Function binding check returned null")
       status = register_mr_input_status(binding, request, backing, owner,
                                         owner, required_ownership, "");
       if (!status.ok())
@@ -2621,12 +2394,7 @@ class rdma_control_plane extends uvm_object;
         function_lock_acquired_here = 1'b1;
       end
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock Function binding check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock Function binding check returned null")
       status = register_mr_input_status(binding, request, backing, owner,
                                         locked_owner, required_ownership,
                                         "post-lock ");
@@ -2646,11 +2414,7 @@ class rdma_control_plane extends uvm_object;
         break;
 
       status = manager.lookup(frozen_request.pd_h, pd_resource);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "resource manager PD lookup returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "resource manager PD lookup returned null")
       if (!$cast(pd_snapshot, pd_resource) || pd_snapshot == null ||
           pd_snapshot.handle == null || pd_snapshot.owner == null ||
           pd_snapshot.state != RDMA_RESOURCE_ACTIVE) begin
@@ -2659,18 +2423,10 @@ class rdma_control_plane extends uvm_object;
       end
       status = same_owner_status(pd_snapshot.owner, locked_owner,
                                  "register MR PD");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "register MR PD owner check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "register MR PD owner check returned null")
 
       status = manager.create_mr(binding, frozen_request.pd_h, reserved_mr);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "resource manager create MR returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "resource manager create MR returned null")
       if (reserved_mr == null || reserved_mr.handle == null ||
           reserved_mr.state != RDMA_RESOURCE_ALLOCATED) begin
         status = invalid_state(
@@ -2854,12 +2610,7 @@ class rdma_control_plane extends uvm_object;
       result.completed_steps.push_back(RDMA_CTRL_STEP_REGISTRY_ACTIVE);
 
       status = manager.lookup(reserved_mr.handle, active_resource);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "resource manager active MR lookup returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "resource manager active MR lookup returned null")
       if (!$cast(mr, active_resource) || mr == null || mr.handle == null ||
           mr.state != RDMA_RESOURCE_ACTIVE) begin
         mr = null;
@@ -2930,25 +2681,11 @@ class rdma_control_plane extends uvm_object;
     result.transaction_id = transaction_id;
 
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "transaction ID allocation returned null status"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "transaction ID allocation returned null status")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "control-plane configuration check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "control-plane configuration check returned null")
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "Function binding check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "Function binding check returned null")
       if (alignment < 4096 ||
           (alignment & (alignment - 1'b1)) != 0) begin
         status = invalid_argument(
@@ -2968,21 +2705,11 @@ class rdma_control_plane extends uvm_object;
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock owned MR Function binding check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock owned MR Function binding check returned null")
       status = same_owner_status(
         locked_owner, owner, "post-lock owned MR Function binding"
       );
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock owned MR Function identity check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock owned MR Function identity check returned null")
       status = owned_mr_input_status(binding, request, dma_context,
                                      locked_owner, "post-lock ");
       if (!status.ok())
@@ -3471,25 +3198,11 @@ class rdma_control_plane extends uvm_object;
     result.resource_h = snapshot_handle(resource_h);
 
     do begin
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "recovery transaction ID allocation returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "recovery transaction ID allocation returned null")
       status = configured_status();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "recovery configuration check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "recovery configuration check returned null")
       status = binding_owner_status(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(status,
-                                "recovery Function check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "recovery Function check returned null")
       if (resource_h == null ||
           !(resource_h.kind inside {RDMA_RESOURCE_MR, RDMA_RESOURCE_QP,
                                     RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
@@ -3504,20 +3217,10 @@ class rdma_control_plane extends uvm_object;
 
       acquire_function_lock(owner, function_lock);
       status = binding_owner_status(binding, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock recovery Function check returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock recovery Function check returned null")
       status = same_owner_status(locked_owner, owner,
                                  "post-lock recovery Function");
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock recovery Function identity returned null"
-        );
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "post-lock recovery Function identity returned null")
       status = manager.lookup(resource_h, resource);
       status = checked_status(status, "recovery lookup returned null");
       if (!status.ok())
@@ -3591,10 +3294,7 @@ class rdma_control_plane extends uvm_object;
       end
       result.resource_h = snapshot_handle(error_mr.handle);
       status = same_owner_status(error_mr.owner, locked_owner, "recovery MR");
-      if (status == null || !status.ok()) begin
-        status = checked_status(status, "recovery owner check returned null");
-        break;
-      end
+      `RDMA_BREAK_IF_FAILED(status, "recovery owner check returned null")
       status = manager.lookup_recovery(resource_h, recovery);
       status = checked_status(
         status, "recovery record lookup returned null"

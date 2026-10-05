@@ -678,11 +678,10 @@ package rdma_net_packet_adapter_pkg;
         // 只保存 BTH 之后的扩展字段，不重复携带 BTH 和尾部 ICRC。这样
         // decode→encode 可以直接复用 RETH/AETH/AtomicETH/DETH 等字段。
         value.header_bytes.delete();
-        index = rdma_offset + 12;
         frame_end = payload_offset;
         if (roce.icrc_enable && frame_end >= 4)
           frame_end -= 4;
-        for (; index < frame_end; index++)
+        for (index = rdma_offset + 12; index < frame_end; index++)
           value.header_bytes.push_back(frame_bytes[index]);
         value.payload.delete();
         for (index = payload_offset; index < payload_end; index++)
@@ -714,8 +713,8 @@ package rdma_net_packet_adapter_pkg;
                                    "unknown iWARP RDMAP opcode");
       endcase
       value.header_bytes.delete();
-      index = iwarp_offset + iwarp.get_header_length();
-      for (; index < payload_offset; index++)
+      for (index = iwarp_offset + iwarp.get_header_length();
+           index < payload_offset; index++)
         value.header_bytes.push_back(frame_bytes[index]);
       value.payload.delete();
       for (index = payload_offset; index < payload_end; index++)
