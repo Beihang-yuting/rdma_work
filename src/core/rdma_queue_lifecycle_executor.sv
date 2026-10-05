@@ -4,8 +4,23 @@
 // 所有权与生命周期：manager/cmq/host_mem 为非拥有引用；policy/planner 由 executor 创建并持有；
 //   事务结果与恢复记录由调用方消费。
 
+// 队列恢复一次调用内各步骤共享的上下文：authority、目标队列、policy、恢复记录与结果。
+class rdma_queue_recovery_context;
+  rdma_function_binding binding;
+  rdma_function_handle expected_owner;
+  rdma_handle resource_h;
+  rdma_queue_resource queue;
+  rdma_queue_lifecycle_policy policy;
+  rdma_recovery_record recovery;
+  rdma_control_result result;
+  bit creation_origin;
+endclass
+
 class rdma_queue_lifecycle_executor extends uvm_object;
   `rdma_object_utils(rdma_queue_lifecycle_executor)
+
+  // 恢复记录的持久化方式：不持久化 / 持久化但忽略失败 / 持久化并把失败追加到 result。
+  typedef enum bit [1:0] {QR_NO_PERSIST, QR_PERSIST, QR_PERSIST_REPORT} queue_recovery_persist_e;
 
   protected rdma_resource_manager manager;
   protected rdma_cmq_port cmq;
@@ -1271,10 +1286,11 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   // the control-plane facade; this task only advances the durable queue
   // recipe and never publishes an ACTIVE object itself.
   // 功能：在调用方已持有 per-Function lifecycle 信号量时恢复 ERROR 队列，推进持久化的 recipe。
-  // 输入/输出及副作用：result 为输出；依次对账歧义命令、QUERY 判定存在性、OCC flush、delete、本地清理与最终释放，每步经 manager 持久化；事务 ID
-  //   分配与加锁在 facade，本 task 不发布 ACTIVE 对象。
-  // 失败/边界：事务 ID 为零、executor 未配置、资源非 ERROR/记录不完整或 owner 不符、binding fence 失败、证据不可信时返回错误或保留恢复，不推进状态；
-  //   可恢复时保持 RECOVERY_REQUIRED。
+  // 输入/输出及副作用：result 为输出；依次对账歧义命令、QUERY 判定存在性、OCC flush、delete、本地清理与最终释放，
+  //   每步经 manager 持久化；事务 ID 分配与加锁在 facade，本 task 不发布 ACTIVE 对象（delete/OCC 确定失败时的
+  //   restore_active 例外由对账步骤处理）。
+  // 失败/边界：事务 ID 为零、executor 未配置、资源非 ERROR/记录不完整或 owner 不符、binding fence 失败、证据不可信时
+  //   返回错误或保留恢复，不推进状态；可恢复时保持 RECOVERY_REQUIRED。
   task recover_locked(
     rdma_function_binding binding,
     rdma_function_handle expected_owner,
@@ -1282,785 +1298,40 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     longint unsigned transaction_id,
     output rdma_control_result result
   );
-    rdma_resource snapshot;
-    rdma_queue_resource queue;
-    rdma_queue_lifecycle_policy policy;
-    rdma_recovery_record recovery;
-    rdma_recovery_record refreshed;
-    rdma_cmq_command_desc command;
-    rdma_cmq_ticket ticket;
-    rdma_cmq_completion completion;
+    rdma_queue_recovery_context ctx;
     rdma_status status;
-    rdma_status completion_status;
-    rdma_status classify_status;
-    rdma_status persist_status;
-    rdma_status reconcile_status;
-    rdma_hw_presence_e query_presence;
-    bit query_conclusive;
-    bit terminal_known;
-    bit ambiguous;
     bit done;
-    bit creation_origin;
-    bit local_done;
-    bit predelete_target;
-    bit execute_failed;
-    bit progress_failed;
-    int target_index;
-    int unsigned i;
-    rdma_queue_backing_role_e target_role;
-    rdma_queue_flush_phase_e target_phase;
 
     result = make_result(transaction_id);
     done = 1'b0;
-    status = rdma_status::success();
-
+    status = open_queue_recovery(binding, expected_owner, resource_h, transaction_id, result, ctx);
     do begin
-      if (transaction_id == 0) begin
-        status = invalid_argument("queue recovery transaction ID is zero");
+      if (!status.ok())
         break;
-      end
-      if (manager == null || cmq == null || command_timeout == 0) begin
-        status = invalid_state("queue recovery executor is not configured");
-        break;
-      end
-      if (binding == null || expected_owner == null || resource_h == null) begin
-        status = invalid_argument("queue recovery authority is incomplete");
-        break;
-      end
-      status = live_binding_fence(binding, expected_owner);
-      if (!status.ok()) break;
-      status = queue_policy_for_kind(resource_h.kind, policy);
-      if (!status.ok()) break;
-
-      status = normalize_status(manager.lookup(resource_h, snapshot),
-                                "queue recovery lookup returned null");
-      if (!status.ok()) break;
-      if (!$cast(queue, snapshot) || queue == null ||
-          queue.state != RDMA_RESOURCE_ERROR) begin
-        status = invalid_state("queue recovery requires an ERROR queue");
-        break;
-      end
-      if (!same_owner(queue.owner, expected_owner)) begin
-        status = invalid_argument("queue recovery owner mismatch");
-        break;
-      end
-      result.resource_h = rdma_clone_handle_value(queue.handle,
-                                                   "queue recovery result");
-      status = normalize_status(manager.lookup_recovery(resource_h, recovery),
-                                "queue recovery record lookup returned null");
-      if (!status.ok()) break;
-      if (recovery == null || !recovery.queue_recovery_valid ||
-          recovery.queue_plan == null || recovery.primary_status == null) begin
-        status = invalid_state("queue recovery record is incomplete");
-        break;
-      end
-      if (recovery.resource_h == null ||
-          !recovery.resource_h.same_instance(queue.handle) ||
-          recovery.queue_plan.resource_kind != queue.resource_kind()) begin
-        status = invalid_state("queue recovery record identity is inconsistent");
-        break;
-      end
-      status = normalize_status(recovery.validate(),
-                                "queue recovery record validation returned null");
-      if (!status.ok()) break;
-      creation_origin = recovery.queue_intent == RDMA_QUEUE_RECOVER_CREATE_ROLLBACK;
-      rdma_recovery_project_history(recovery, result);
-
-      // Reconcile any earlier ambiguous command before issuing another CMQ
-      // command for this queue.
-      if (recovery.ambiguous_ticket != null) begin
-        ticket = recovery.ambiguous_ticket;
-        terminal_known = 1'b0;
-        completion = null;
-        reconcile_status = null;
-        cmq.reconcile(ticket, terminal_known, completion, reconcile_status);
-        status = live_binding_fence(binding, expected_owner);
-        if (!status.ok()) begin
-          rdma_recovery_publish_required(recovery, result,
-            "queue reconciliation fenced by stale generation");
-          done = 1'b1;
-          break;
-        end
-        reconcile_status = normalize_status(reconcile_status,
-          "queue CMQ reconciliation returned null");
-        if (!terminal_known) begin
-          rdma_recovery_publish_required(recovery, result,
-            "ambiguous queue command has no terminal result");
-          if (!reconcile_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(reconcile_status));
-          done = 1'b1;
-          break;
-        end
-        if (completion == null || completion.status == null) begin
-          recovery.rollback_statuses.push_back(
-            invalid_state("queue reconciliation completion is incomplete"));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue reconciliation still requires recovery");
-          done = 1'b1;
-          break;
-        end
-        completion_status = normalize_status(completion.status,
-          "queue reconciliation status returned null");
-        if (completion_status.code inside {RDMA_SC_TIMEOUT,
-                                          RDMA_SC_RESET_CANCELLED}) begin
-          rdma_recovery_publish_required(recovery, result,
-            "queue reconciliation has no trustworthy terminal evidence");
-          done = 1'b1;
-          break;
-        end
-        if (ticket.opcode_key == null) begin
-          recovery.rollback_statuses.push_back(
-            invalid_state("queue reconciliation ticket has no opcode"));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue reconciliation ticket is invalid");
-          done = 1'b1;
-          break;
-        end
-
-        // A QUERY can itself be ambiguous.  Its terminal result is handled
-        // through the same ticket field, but is classified rather than
-        // projected as a create/delete completion.
-        if (ticket.opcode_key.opcode == query_opcode(queue.resource_kind())) begin
-          query_presence = RDMA_HW_PRESENCE_UNKNOWN;
-          query_conclusive = 1'b0;
-          classify_status = policy.classify_query_completion(
-            queue, completion, query_presence, query_conclusive);
-          classify_status = normalize_status(classify_status,
-            "queue QUERY classification returned null");
-          recovery.ambiguous_ticket = null;
-          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
-          if (classify_status.ok() && query_conclusive) begin
-            recovery.hardware_presence = query_presence;
-            if (query_presence == RDMA_HW_PRESENCE_ABSENT)
-              rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-            else
-              rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-            if (!persist_status.ok()) begin
-              rdma_recovery_publish_required(recovery, result,
-                "reconciled queue QUERY progress could not be persisted");
-              done = 1'b1;
-              break;
-            end
-          end
-          else begin
-            if (!classify_status.ok())
-              recovery.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(classify_status));
-            recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-            rdma_recovery_publish_required(recovery, result,
-              "reconciled queue QUERY was inconclusive");
-            if (!persist_status.ok())
-              result.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(persist_status));
-            done = 1'b1;
-            break;
-          end
-        end
-        else if (ticket.opcode_key.opcode == create_opcode(queue.resource_kind())) begin
-          recovery.ambiguous_ticket = null;
-          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
-          if (completion_status.ok()) begin
-            recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
-            rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-          end
-          else begin
-            // Definitive create failure proves no queue object was installed.
-            recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-            recovery.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(completion_status));
-          end
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          if (!persist_status.ok()) begin
-            rdma_recovery_publish_required(recovery, result,
-              "reconciled queue create progress could not be persisted");
-            done = 1'b1;
-            break;
-          end
-        end
-        else if (ticket.opcode_key.opcode == delete_opcode(queue.resource_kind())) begin
-          recovery.ambiguous_ticket = null;
-          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
-          if (completion_status.ok()) begin
-            recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-          end
-          else begin
-            recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-            recovery.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(completion_status));
-          end
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          if (!persist_status.ok()) begin
-            rdma_recovery_publish_required(recovery, result,
-              "reconciled queue delete progress could not be persisted");
-            done = 1'b1;
-            break;
-          end
-          if (!completion_status.ok()) begin
-            // A normal destroy has not started any local cleanup at this
-            // point.  A definitive terminal delete failure therefore proves
-            // that the queue is still PRESENT and is safe to restore to its
-            // pre-destroy ACTIVE publication.  Keep create-rollback recovery
-            // on the destructive retry path: a failed create must still be
-            // unwound, never resurrected.
-            if (!creation_origin && recovery.hardware_presence ==
-                  RDMA_HW_PRESENCE_PRESENT) begin
-              status = live_binding_fence(binding, expected_owner);
-              if (status.ok()) status = normalize_status(manager.restore_active(resource_h),
-                "queue delete failure restore ACTIVE returned null");
-              if (status.ok()) begin
-                rdma_recovery_project_history(recovery, result);
-                // The terminal failure is the operation's observable result;
-                // the durable primary timeout remains in the recovery history
-                // and rollback list for callers that inspect it.
-                result.status = rdma_cmq_clone_status_value(completion_status);
-                result.final_resource_state = RDMA_RESOURCE_ACTIVE;
-                result.final_resource_state_known = 1'b1;
-                result.recovery_required = 1'b0;
-                done = 1'b1;
-                break;
-              end
-              recovery.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(status));
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-              rdma_recovery_publish_required(recovery, result,
-                "queue delete failure ACTIVE restore still requires recovery");
-              if (!persist_status.ok())
-                result.rollback_statuses.push_back(
-                  rdma_cmq_clone_status_value(persist_status));
-              done = 1'b1;
-              break;
-            end
-            rdma_recovery_publish_required(recovery, result,
-              "queue delete terminal failure requires a retry");
-            done = 1'b1;
-            break;
-          end
-        end
-        else if (ticket.opcode_key.opcode == RDMA_OP_OCC_FLUSH) begin
-          recovery.ambiguous_ticket = null;
-          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
-          predelete_target = 1'b0;
-          foreach (recovery.queue_plan.flush_targets[i]) begin
-            if (recovery.queue_plan.flush_targets[i] != null &&
-                recovery.queue_plan.flush_targets[i].role ==
-                  recovery.ambiguous_role &&
-                recovery.queue_plan.flush_targets[i].phase ==
-                  RDMA_QUEUE_FLUSH_PRE_DELETE)
-              predelete_target = 1'b1;
-          end
-          if (completion_status.ok()) begin
-            target_index = -1;
-            foreach (recovery.queue_plan.flush_targets[i]) begin
-              if (recovery.queue_plan.flush_targets[i] != null &&
-                  recovery.queue_plan.flush_targets[i].role ==
-                    recovery.ambiguous_role) begin
-                target_index = int'(i);
-                break;
-              end
-            end
-            if (target_index < 0) begin
-              recovery.rollback_statuses.push_back(
-                invalid_state("reconciled OCC target is missing"));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-              rdma_recovery_publish_required(recovery, result,
-                "queue OCC target cannot be identified");
-              done = 1'b1;
-              break;
-            end
-            if (!recovery.queue_plan.flush_targets[target_index].flush_complete) begin
-              status = live_binding_fence(binding, expected_owner);
-              if (status.ok()) status = normalize_status(
-                manager.record_queue_flush_complete(
-                  resource_h, recovery.ambiguous_role),
-                "reconciled queue OCC progress returned null");
-              if (!status.ok()) begin
-                recovery.rollback_statuses.push_back(
-                  rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-                rdma_recovery_publish_required(recovery, result,
-                  "reconciled queue OCC progress failed");
-                done = 1'b1;
-                break;
-              end
-            end
-            recovery.queue_plan.flush_targets[target_index].flush_complete = 1'b1;
-            rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
-          end
-          else begin
-            // Keep this role incomplete and stop at the barrier.  A later
-            // recovery invocation may retry the exact target.
-            if (!creation_origin && predelete_target)
-              recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            recovery.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(completion_status));
-            if (!creation_origin && predelete_target) begin
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-              if (persist_status.ok()) begin
-                status = live_binding_fence(binding, expected_owner);
-                if (status.ok()) status = normalize_status(manager.restore_active(resource_h),
-                  "queue OCC failure restore ACTIVE returned null");
-                if (status.ok()) begin
-                  rdma_recovery_project_history(recovery, result);
-                  result.status = rdma_cmq_clone_status_value(
-                    completion_status);
-                  result.final_resource_state = RDMA_RESOURCE_ACTIVE;
-                  result.final_resource_state_known = 1'b1;
-                  result.recovery_required = 1'b0;
-                  done = 1'b1;
-                  break;
-                end
-                recovery.rollback_statuses.push_back(
-                  rdma_cmq_clone_status_value(status));
-              end
-              else
-                recovery.rollback_statuses.push_back(
-                  rdma_cmq_clone_status_value(persist_status));
-              // If either persistence or the atomic restore failed, retain
-              // the PRESENT recovery record for a later retry.
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-              rdma_recovery_publish_required(recovery, result,
-                "queue OCC failure ACTIVE restore still requires recovery");
-              if (!persist_status.ok())
-                result.rollback_statuses.push_back(
-                  rdma_cmq_clone_status_value(persist_status));
-              done = 1'b1;
-              break;
-            end
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-            rdma_recovery_publish_required(recovery, result,
-              "queue OCC target still requires recovery");
-            if (!persist_status.ok())
-              result.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(persist_status));
-            done = 1'b1;
-            break;
-          end
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          if (!persist_status.ok()) begin
-            rdma_recovery_publish_required(recovery, result,
-              "reconciled queue OCC progress could not be persisted");
-            done = 1'b1;
-            break;
-          end
-        end
-        else begin
-          recovery.rollback_statuses.push_back(
-            rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                              "queue recovery ticket opcode is unsupported"));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue recovery ticket opcode is unsupported");
-          done = 1'b1;
-          break;
-        end
-      end
-
-      // If presence remains unknown, issue exactly one typed QUERY.  QUERY
-      // establishes only object presence, never OCC completion.
-      if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN &&
-          recovery.ambiguous_ticket == null) begin
-        status = normalize_status(policy.build_object_command(
-          query_opcode(queue.resource_kind()), expected_owner, queue,
-          command_timeout, command),
-          "queue recovery QUERY descriptor returned null");
-        if (!status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue QUERY descriptor could not be built");
-          done = 1'b1;
-          break;
-        end
-        execute_queue_command(command, ticket, completion, status, ambiguous,
-                              binding, expected_owner);
-        if (ambiguous) begin
-          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-            ticket, "queue QUERY recovery");
-          recovery.ambiguous_queue_operation =
-            (creation_origin && !rdma_recovery_step_completed(
-              recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED)) ?
-              RDMA_QUEUE_AMBIG_CREATE : RDMA_QUEUE_AMBIG_DELETE;
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          rdma_recovery_publish_required(recovery, result,
-            "queue QUERY has no terminal result");
-          if (!persist_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        if (!status.ok() || completion == null || completion.status == null) begin
-          if (status == null) status = invalid_state("queue QUERY result is null");
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue QUERY failed to establish presence");
-          done = 1'b1;
-          break;
-        end
-        query_presence = RDMA_HW_PRESENCE_UNKNOWN;
-        query_conclusive = 1'b0;
-        classify_status = policy.classify_query_completion(
-          queue, completion, query_presence, query_conclusive);
-        classify_status = normalize_status(classify_status,
-          "queue QUERY classification returned null");
-        if (!classify_status.ok() || !query_conclusive) begin
-          if (!classify_status.ok())
-            recovery.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(classify_status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue QUERY response is inconclusive");
-          done = 1'b1;
-          break;
-        end
-        recovery.hardware_presence = query_presence;
-        if (query_presence == RDMA_HW_PRESENCE_ABSENT)
-          rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-        else
-          rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(recovery, result,
-            "queue QUERY progress could not be persisted");
-          done = 1'b1;
-          break;
-        end
-      end
-
-      if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
-        rdma_recovery_publish_required(recovery, result,
-          "queue hardware presence remains unknown");
-        done = 1'b1;
-        break;
-      end
-
-      // Execute persisted OCC targets in order.  This enforces the SRQ
-      // pre-delete barrier and defers CQ post-delete flushes until absence.
-      for (i = 0; i < recovery.queue_plan.flush_targets.size(); i++) begin
-        if (recovery.queue_plan.flush_targets[i] == null) begin
-          recovery.rollback_statuses.push_back(
-            invalid_state("queue recovery flush target is null"));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue OCC recipe is invalid");
-          done = 1'b1;
-          break;
-        end
-        if (recovery.queue_plan.flush_targets[i].flush_complete)
-          continue;
-        target_phase = recovery.queue_plan.flush_targets[i].phase;
-        if (target_phase == RDMA_QUEUE_FLUSH_POST_DELETE &&
-            recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT)
-          continue;
-        target_role = recovery.queue_plan.flush_targets[i].role;
-        execute_recovery_flush_step(
-          binding, expected_owner, policy,
-          recovery.queue_plan.flush_targets[i], resource_h,
-          "queue recovery OCC descriptor returned null",
-          "queue OCC progress returned null",
-          status, ticket, completion, ambiguous, execute_failed,
-          progress_failed
-        );
-        if (!status.ok() && !execute_failed && !progress_failed) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue OCC descriptor could not be built");
-          done = 1'b1;
-          break;
-        end
-        if (ambiguous) begin
-          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-            ticket, "queue OCC recovery");
-          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
-          recovery.ambiguous_role = target_role;
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          rdma_recovery_publish_required(recovery, result,
-            "queue OCC target has no terminal result");
-          if (!persist_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        if (!status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          rdma_recovery_publish_required(recovery, result,
-            progress_failed ?
-              "queue OCC progress could not be persisted" :
-              "queue OCC target failed");
-          if (!persist_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        recovery.queue_plan.flush_targets[i].flush_complete = 1'b1;
-        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(recovery, result,
-            "queue OCC progress could not be persisted");
-          done = 1'b1;
-          break;
-        end
-      end
-      if (done) break;
-
-      // A PRESENT queue still needs delete.  For SRQ this is reached only
-      // after all pre-delete OCC targets above are complete.
-      if (recovery.hardware_presence == RDMA_HW_PRESENCE_PRESENT &&
-          !rdma_recovery_step_completed(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED)) begin
-        for (i = 0; i < recovery.queue_plan.flush_targets.size(); i++) begin
-          if (recovery.queue_plan.flush_targets[i] != null &&
-              recovery.queue_plan.flush_targets[i].phase ==
-                RDMA_QUEUE_FLUSH_PRE_DELETE &&
-              !recovery.queue_plan.flush_targets[i].flush_complete) begin
-            rdma_recovery_publish_required(recovery, result,
-              "queue pre-delete OCC barrier is incomplete");
-            done = 1'b1;
-            break;
-          end
-        end
+      if (ctx.recovery.ambiguous_ticket != null) begin
+        reconcile_queue_ambiguity(ctx, done);
         if (done) break;
-        status = normalize_status(policy.build_object_command(
-          delete_opcode(queue.resource_kind()), expected_owner, queue,
-          command_timeout, command),
-          "queue recovery delete descriptor returned null");
-        if (!status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue delete descriptor could not be built");
-          done = 1'b1;
-          break;
-        end
-        execute_queue_command(command, ticket, completion, status, ambiguous,
-                              binding, expected_owner);
-        if (ambiguous) begin
-          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-            ticket, "queue delete recovery");
-          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_DELETE;
-          recovery.ambiguous_role = recovery.queue_plan.refs.size() == 0 ?
-            RDMA_QUEUE_ROLE_CQ_RING : recovery.queue_plan.refs[0].role;
-          recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          rdma_recovery_publish_required(recovery, result,
-            "queue delete has no terminal result");
-          if (!persist_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        if (!status.ok()) begin
-          recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-          rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          rdma_recovery_publish_required(recovery, result,
-            "queue delete failed");
-          if (!persist_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(recovery, result,
-            "queue delete progress could not be persisted");
-          done = 1'b1;
-          break;
-        end
       end
-
-      if (recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
-        rdma_recovery_publish_required(recovery, result,
-          "queue hardware absence is not proven");
-        done = 1'b1;
-        break;
-      end
-
-      // The first OCC loop intentionally skipped post-delete targets while
-      // PRESENT.  Revisit those targets after delete/QUERY absence.
-      for (i = 0; i < recovery.queue_plan.flush_targets.size(); i++) begin
-        if (recovery.queue_plan.flush_targets[i] == null ||
-            recovery.queue_plan.flush_targets[i].flush_complete ||
-            recovery.queue_plan.flush_targets[i].phase !=
-              RDMA_QUEUE_FLUSH_POST_DELETE)
-          continue;
-        target_role = recovery.queue_plan.flush_targets[i].role;
-        execute_recovery_flush_step(
-          binding, expected_owner, policy,
-          recovery.queue_plan.flush_targets[i], resource_h,
-          "queue post-delete OCC descriptor returned null",
-          "queue post-delete OCC progress returned null",
-          status, ticket, completion, ambiguous, execute_failed,
-          progress_failed
-        );
-        if (!status.ok() && !execute_failed && !progress_failed) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue post-delete OCC descriptor failed");
-          done = 1'b1;
-          break;
-        end
-        if (ambiguous) begin
-          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-            ticket, "queue post-delete OCC recovery");
-          recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
-          recovery.ambiguous_role = target_role;
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          rdma_recovery_publish_required(recovery, result,
-            "queue post-delete OCC has no terminal result");
-          if (!persist_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        if (!status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          rdma_recovery_publish_required(recovery, result,
-            progress_failed ?
-              "queue post-delete OCC progress failed" :
-              "queue post-delete OCC failed");
-          if (!persist_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(persist_status));
-          done = 1'b1;
-          break;
-        end
-        recovery.queue_plan.flush_targets[i].flush_complete = 1'b1;
-        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(recovery, result,
-            "queue post-delete OCC progress failed");
-          done = 1'b1;
-          break;
-        end
-      end
+      establish_queue_presence(ctx, done);
       if (done) break;
-      if (!queue_flushes_complete(recovery.queue_plan)) begin
-        rdma_recovery_publish_required(recovery, result,
-          "queue OCC recipe remains incomplete");
+      run_queue_recovery_flushes(ctx, 1'b0, done);
+      if (done) break;
+      delete_present_queue(ctx, done);
+      if (done) break;
+      if (ctx.recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
+        require_queue_recovery(ctx, null, "queue hardware absence is not proven", QR_NO_PERSIST);
         done = 1'b1;
         break;
       end
-
-      local_done = queue_local_cleanup_complete(recovery.queue_plan);
-      if (!local_done) begin
-        status = live_binding_fence(binding, expected_owner);
-        if (status.ok())
-          status = cleanup_local(recovery.queue_plan, result, 1'b1, resource_h,
-                                 binding, expected_owner);
-        status = normalize_status(status,
-          "queue local recovery cleanup returned null");
-        refreshed = null;
-        persist_status = manager.lookup_recovery(resource_h, refreshed);
-        persist_status = normalize_status(persist_status,
-          "queue local recovery refresh returned null");
-        if (persist_status.ok() && refreshed != null)
-          recovery = refreshed;
-        if (!status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          rdma_recovery_publish_required(recovery, result,
-            "queue local cleanup still requires recovery");
-          done = 1'b1;
-          break;
-        end
-        if (!persist_status.ok()) begin
-          recovery.rollback_statuses.push_back(
-            rdma_cmq_clone_status_value(persist_status));
-          rdma_recovery_publish_required(recovery, result,
-            "queue local cleanup progress is unavailable");
-          done = 1'b1;
-          break;
-        end
-      end
-      local_done = queue_local_cleanup_complete(recovery.queue_plan);
-      if (!local_done) begin
-        rdma_recovery_publish_required(recovery, result,
-          "queue local cleanup remains incomplete");
+      // 第一轮在 PRESENT 时跳过 post-delete target；delete/QUERY 证明 absence 后再执行。
+      run_queue_recovery_flushes(ctx, 1'b1, done);
+      if (done) break;
+      if (!queue_flushes_complete(ctx.recovery.queue_plan)) begin
+        require_queue_recovery(ctx, null, "queue OCC recipe remains incomplete", QR_NO_PERSIST);
         done = 1'b1;
         break;
       end
-
-      rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
-      // A normal destroy is an unstaged, already-published queue.  Its ERROR
-      // recovery schema must not advertise RESOURCE_RELEASED while the
-      // registry entry is still present: manager.mark_error() reserves that
-      // pending step for the canonical create-rollback reservation shape.
-      // Create-rollback recovery is the one exception; release_reserved()
-      // consumes that canonical pending step after the recovery is persisted.
-      if (creation_origin)
-        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
-            persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-      if (!persist_status.ok()) begin
-        rdma_recovery_publish_required(recovery, result,
-          "queue backing progress could not be persisted");
-        done = 1'b1;
-        break;
-      end
-
-      // The recovery intent, not the partial step history, selects the
-      // registry transition.  A normal destroy starts with an ACTIVE queue
-      // whose recovery result deliberately contains only destroy progress;
-      // using the absence of create steps here would misclassify it as an
-      // ALLOCATED reservation and route it through release_reserved().
-      if (creation_origin)
-        status = live_binding_fence(binding, expected_owner);
-      else
-        status = live_binding_fence(binding, expected_owner);
-      if (status.ok() && creation_origin)
-        status = manager.release_reserved(resource_h);
-      else if (status.ok())
-        status = manager.finalize_release(resource_h);
-      status = normalize_status(status,
-        "queue recovery final release returned null");
-      if (!status.ok()) begin
-        recovery.rollback_statuses.push_back(
-          rdma_cmq_clone_status_value(status));
-          void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-        rdma_recovery_publish_required(recovery, result,
-          "queue resource finalization still requires recovery");
-        done = 1'b1;
-        break;
-      end
-      rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
-      rdma_recovery_project_history(recovery, result);
-      result.status = rdma_status::success();
-      result.final_resource_state = RDMA_RESOURCE_RELEASED;
-      result.final_resource_state_known = 1'b1;
-      result.recovery_required = 1'b0;
-      done = 1'b1;
+      finish_queue_recovery(ctx, done);
     end while (1'b0);
 
     if (!done) begin
@@ -2068,6 +1339,609 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         status = invalid_state("queue recovery returned null");
       publish_failure(status, result, RDMA_RESOURCE_NEW, 1'b0, 1'b0);
     end
+  endtask
+
+  // 功能：校验恢复入口的事务 ID、executor 配置、authority、ERROR 队列与恢复记录，建立恢复上下文。
+  // 输入/输出及副作用：成功时写 result.resource_h 与恢复历史，ctx 输出。
+  // 失败/边界：任一校验失败返回错误，ctx 可能不完整，调用方不得继续。
+  protected function rdma_status open_queue_recovery(
+    rdma_function_binding binding,
+    rdma_function_handle expected_owner,
+    rdma_handle resource_h,
+    longint unsigned transaction_id,
+    rdma_control_result result,
+    output rdma_queue_recovery_context ctx
+  );
+    rdma_resource snapshot;
+    rdma_queue_resource queue;
+    rdma_recovery_record recovery;
+    rdma_status status;
+
+    ctx = new();
+    ctx.binding = binding;
+    ctx.expected_owner = expected_owner;
+    ctx.resource_h = resource_h;
+    ctx.result = result;
+    if (transaction_id == 0)
+      return invalid_argument("queue recovery transaction ID is zero");
+    if (manager == null || cmq == null || command_timeout == 0)
+      return invalid_state("queue recovery executor is not configured");
+    if (binding == null || expected_owner == null || resource_h == null)
+      return invalid_argument("queue recovery authority is incomplete");
+    status = live_binding_fence(binding, expected_owner);
+    if (!status.ok()) return status;
+    status = queue_policy_for_kind(resource_h.kind, ctx.policy);
+    if (!status.ok()) return status;
+    status = normalize_status(manager.lookup(resource_h, snapshot),
+                              "queue recovery lookup returned null");
+    if (!status.ok()) return status;
+    if (!$cast(queue, snapshot) || queue == null || queue.state != RDMA_RESOURCE_ERROR)
+      return invalid_state("queue recovery requires an ERROR queue");
+    if (!same_owner(queue.owner, expected_owner))
+      return invalid_argument("queue recovery owner mismatch");
+    ctx.queue = queue;
+    result.resource_h = rdma_clone_handle_value(queue.handle, "queue recovery result");
+    status = normalize_status(manager.lookup_recovery(resource_h, recovery),
+                              "queue recovery record lookup returned null");
+    if (!status.ok()) return status;
+    if (recovery == null || !recovery.queue_recovery_valid ||
+        recovery.queue_plan == null || recovery.primary_status == null)
+      return invalid_state("queue recovery record is incomplete");
+    if (recovery.resource_h == null || !recovery.resource_h.same_instance(queue.handle) ||
+        recovery.queue_plan.resource_kind != queue.resource_kind())
+      return invalid_state("queue recovery record identity is inconsistent");
+    status = normalize_status(recovery.validate(),
+                              "queue recovery record validation returned null");
+    if (!status.ok()) return status;
+    ctx.recovery = recovery;
+    ctx.creation_origin = recovery.queue_intent == RDMA_QUEUE_RECOVER_CREATE_ROLLBACK;
+    rdma_recovery_project_history(recovery, result);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：记录可选原因、按 mode 持久化恢复记录，并把结果发布为 RECOVERY_REQUIRED。
+  // 输入/输出及副作用：cause 非空时追加到 recovery.rollback_statuses；QR_PERSIST_REPORT 时持久化失败追加到
+  //   result.rollback_statuses。
+  // 失败/边界：持久化失败不改变发布语义，只按 mode 报告。
+  protected function void require_queue_recovery(
+    rdma_queue_recovery_context ctx,
+    rdma_status cause,
+    string message,
+    queue_recovery_persist_e mode
+  );
+    rdma_status persist_status;
+
+    if (cause != null)
+      ctx.recovery.rollback_statuses.push_back(rdma_cmq_clone_status_value(cause));
+    persist_status = rdma_status::success();
+    if (mode != QR_NO_PERSIST)
+      persist_status = persist_queue_recovery(ctx.resource_h, ctx.recovery, ctx.binding,
+                                              ctx.expected_owner);
+    rdma_recovery_publish_required(ctx.recovery, ctx.result, message);
+    if (mode == QR_PERSIST_REPORT && !persist_status.ok())
+      ctx.result.rollback_statuses.push_back(rdma_cmq_clone_status_value(persist_status));
+  endfunction
+
+  // 功能：持久化已推进的恢复进度；失败时以 message 发布 RECOVERY_REQUIRED。
+  // 输入/输出及副作用：写 manager 恢复记录。
+  // 失败/边界：返回 0 表示调用方须停止。
+  protected function bit persist_queue_progress(rdma_queue_recovery_context ctx, string message);
+    rdma_status persist_status;
+
+    persist_status = persist_queue_recovery(ctx.resource_h, ctx.recovery, ctx.binding,
+                                            ctx.expected_owner);
+    if (persist_status.ok())
+      return 1'b1;
+    rdma_recovery_publish_required(ctx.recovery, ctx.result, message);
+    return 1'b0;
+  endfunction
+
+  // 功能：清除恢复记录中的歧义 ticket 与操作类型。
+  // 输入/输出及副作用：修改 ctx.recovery。
+  // 失败/边界：无。
+  protected function void clear_queue_ambiguity(rdma_queue_recovery_context ctx);
+    ctx.recovery.ambiguous_ticket = null;
+    ctx.recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
+  endfunction
+
+  // 功能：在发出新 CMQ 命令前对账此前的歧义命令，按 opcode 交给 QUERY/create/delete/OCC 处理。
+  // 输入/输出及副作用：可能 reconcile CMQ、修改并持久化恢复记录、restore ACTIVE；done=1 表示恢复已结束本次调用。
+  // 失败/边界：缺终态、证据不可信或 ticket 无效时发布 RECOVERY_REQUIRED 并 done=1。
+  protected task reconcile_queue_ambiguity(rdma_queue_recovery_context ctx, output bit done);
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status reconcile_status;
+    rdma_status completion_status;
+    rdma_status status;
+    rdma_resource_kind_e kind;
+    bit terminal_known;
+
+    done = 1'b1;
+    ticket = ctx.recovery.ambiguous_ticket;
+    terminal_known = 1'b0;
+    completion = null;
+    reconcile_status = null;
+    cmq.reconcile(ticket, terminal_known, completion, reconcile_status);
+    status = live_binding_fence(ctx.binding, ctx.expected_owner);
+    if (!status.ok()) begin
+      require_queue_recovery(ctx, null, "queue reconciliation fenced by stale generation",
+                             QR_NO_PERSIST);
+      return;
+    end
+    reconcile_status = normalize_status(reconcile_status,
+      "queue CMQ reconciliation returned null");
+    if (!terminal_known) begin
+      require_queue_recovery(ctx, null, "ambiguous queue command has no terminal result",
+                             QR_NO_PERSIST);
+      if (!reconcile_status.ok())
+        ctx.result.rollback_statuses.push_back(rdma_cmq_clone_status_value(reconcile_status));
+      return;
+    end
+    if (completion == null || completion.status == null) begin
+      require_queue_recovery(ctx, invalid_state("queue reconciliation completion is incomplete"),
+                             "queue reconciliation still requires recovery", QR_PERSIST);
+      return;
+    end
+    completion_status = normalize_status(completion.status,
+      "queue reconciliation status returned null");
+    if (completion_status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED}) begin
+      require_queue_recovery(ctx, null,
+        "queue reconciliation has no trustworthy terminal evidence", QR_NO_PERSIST);
+      return;
+    end
+    if (ticket.opcode_key == null) begin
+      require_queue_recovery(ctx, invalid_state("queue reconciliation ticket has no opcode"),
+                             "queue reconciliation ticket is invalid", QR_PERSIST);
+      return;
+    end
+    kind = ctx.queue.resource_kind();
+    // QUERY 自身也可能歧义；其终态经同一 ticket 字段返回，但按存在性分类而非 create/delete 完成。
+    if (ticket.opcode_key.opcode == query_opcode(kind))
+      reconcile_queue_query(ctx, completion, done);
+    else if (ticket.opcode_key.opcode == create_opcode(kind))
+      reconcile_queue_create(ctx, completion_status, done);
+    else if (ticket.opcode_key.opcode == delete_opcode(kind))
+      reconcile_queue_delete(ctx, completion_status, done);
+    else if (ticket.opcode_key.opcode == RDMA_OP_OCC_FLUSH)
+      reconcile_queue_occ(ctx, completion_status, done);
+    else
+      require_queue_recovery(ctx, rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                               "queue recovery ticket opcode is unsupported"),
+                             "queue recovery ticket opcode is unsupported", QR_PERSIST);
+  endtask
+
+  // 功能：按 QUERY 判定结果更新硬件存在性：ABSENT 撤销 delete 步骤，PRESENT 排入 delete。
+  // 输入/输出及副作用：presence/conclusive 输出；修改 ctx.recovery。
+  // 失败/边界：返回分类 status；不持久化。
+  protected function rdma_status classify_queue_presence(
+    rdma_queue_recovery_context ctx,
+    rdma_cmq_completion completion,
+    output bit conclusive
+  );
+    rdma_hw_presence_e presence;
+    rdma_status status;
+
+    presence = RDMA_HW_PRESENCE_UNKNOWN;
+    conclusive = 1'b0;
+    status = normalize_status(ctx.policy.classify_query_completion(
+      ctx.queue, completion, presence, conclusive), "queue QUERY classification returned null");
+    if (!status.ok() || !conclusive)
+      return status;
+    ctx.recovery.hardware_presence = presence;
+    if (presence == RDMA_HW_PRESENCE_ABSENT)
+      rdma_recovery_remove_pending(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+    else
+      rdma_recovery_queue_step(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+    return status;
+  endfunction
+
+  // 功能：对账歧义 QUERY：结论性时更新存在性并持久化，否则存在性置 UNKNOWN 并保留恢复。
+  // 输入/输出及副作用：done=1 表示停止。
+  // 失败/边界：持久化失败或不确定时发布 RECOVERY_REQUIRED。
+  protected task reconcile_queue_query(rdma_queue_recovery_context ctx,
+                                       rdma_cmq_completion completion, output bit done);
+    rdma_status status;
+    bit conclusive;
+
+    done = 1'b1;
+    status = classify_queue_presence(ctx, completion, conclusive);
+    clear_queue_ambiguity(ctx);
+    if (status.ok() && conclusive) begin
+      done = !persist_queue_progress(ctx,
+        "reconciled queue QUERY progress could not be persisted");
+      return;
+    end
+    ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
+    require_queue_recovery(ctx, status.ok() ? null : status,
+                           "reconciled queue QUERY was inconclusive", QR_PERSIST_REPORT);
+  endtask
+
+  // 功能：对账歧义 create：成功则 PRESENT 并排入 delete；确定失败证明未安装对象（ABSENT）。
+  // 输入/输出及副作用：done=1 表示停止。
+  // 失败/边界：持久化失败时发布 RECOVERY_REQUIRED。
+  protected task reconcile_queue_create(rdma_queue_recovery_context ctx,
+                                        rdma_status completion_status, output bit done);
+    clear_queue_ambiguity(ctx);
+    if (completion_status.ok()) begin
+      ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+      rdma_recovery_complete_step(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
+      rdma_recovery_queue_step(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+    end
+    else begin
+      ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+      rdma_recovery_remove_pending(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+      ctx.recovery.rollback_statuses.push_back(rdma_cmq_clone_status_value(completion_status));
+    end
+    done = !persist_queue_progress(ctx, "reconciled queue create progress could not be persisted");
+  endtask
+
+  // 功能：对账歧义 delete：成功则 ABSENT；确定失败则对象仍 PRESENT，普通 destroy 恢复为 ACTIVE，
+  //   create 回滚保持破坏性重试路径（失败的 create 只能撤销，不能复活）。
+  // 输入/输出及副作用：done=1 表示停止；可能 restore_active 并写 result。
+  // 失败/边界：持久化/restore 失败时发布 RECOVERY_REQUIRED。
+  protected task reconcile_queue_delete(rdma_queue_recovery_context ctx,
+                                        rdma_status completion_status, output bit done);
+    clear_queue_ambiguity(ctx);
+    if (completion_status.ok()) begin
+      ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+      rdma_recovery_complete_step(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+    end
+    else begin
+      ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+      rdma_recovery_queue_step(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+      ctx.recovery.rollback_statuses.push_back(rdma_cmq_clone_status_value(completion_status));
+    end
+    done = 1'b1;
+    if (!persist_queue_progress(ctx, "reconciled queue delete progress could not be persisted"))
+      return;
+    if (completion_status.ok()) begin
+      done = 1'b0;
+      return;
+    end
+    if (ctx.creation_origin) begin
+      require_queue_recovery(ctx, null, "queue delete terminal failure requires a retry",
+                             QR_NO_PERSIST);
+      return;
+    end
+    // 普通 destroy 此时尚未开始本地清理，确定的 delete 失败证明队列仍 PRESENT，可安全恢复为 ACTIVE。
+    restore_active_after_failure(ctx, completion_status,
+      "queue delete failure restore ACTIVE returned null",
+      "queue delete failure ACTIVE restore still requires recovery");
+  endtask
+
+  // 功能：在确定失败的 delete/OCC 之后把普通 destroy 的队列恢复为 ACTIVE；结果 status 取终态失败。
+  // 输入/输出及副作用：成功时写 result 为 ACTIVE；失败时记录原因、持久化并发布 RECOVERY_REQUIRED。
+  // 失败/边界：fence 或 restore 失败保留 PRESENT 恢复记录供重试。
+  protected function void restore_active_after_failure(
+    rdma_queue_recovery_context ctx,
+    rdma_status completion_status,
+    string null_message,
+    string retain_message
+  );
+    rdma_status status;
+
+    status = live_binding_fence(ctx.binding, ctx.expected_owner);
+    if (status.ok())
+      status = normalize_status(manager.restore_active(ctx.resource_h), null_message);
+    if (status.ok()) begin
+      // 终态失败是本操作可观测结果；持久的 primary 超时仍保留在恢复历史与 rollback 列表中。
+      rdma_recovery_project_history(ctx.recovery, ctx.result);
+      ctx.result.status = rdma_cmq_clone_status_value(completion_status);
+      ctx.result.final_resource_state = RDMA_RESOURCE_ACTIVE;
+      ctx.result.final_resource_state_known = 1'b1;
+      ctx.result.recovery_required = 1'b0;
+      return;
+    end
+    require_queue_recovery(ctx, status, retain_message, QR_PERSIST_REPORT);
+  endfunction
+
+  // 功能：对账歧义 OCC flush：成功则记录该 role 完成；确定失败时保持 barrier，普通 destroy 的 pre-delete
+  //   target 失败证明对象仍 PRESENT，尝试恢复为 ACTIVE。
+  // 输入/输出及副作用：done=1 表示停止。
+  // 失败/边界：target 缺失、progress/持久化/restore 失败时发布 RECOVERY_REQUIRED。
+  protected task reconcile_queue_occ(rdma_queue_recovery_context ctx,
+                                     rdma_status completion_status, output bit done);
+    rdma_queue_backing_plan plan;
+    rdma_status status;
+    rdma_status persist_status;
+    int target_index;
+    bit predelete_target;
+
+    done = 1'b1;
+    plan = ctx.recovery.queue_plan;
+    clear_queue_ambiguity(ctx);
+    predelete_target = 1'b0;
+    target_index = -1;
+    foreach (plan.flush_targets[i]) begin
+      if (plan.flush_targets[i] == null ||
+          plan.flush_targets[i].role != ctx.recovery.ambiguous_role)
+        continue;
+      if (target_index < 0)
+        target_index = int'(i);
+      if (plan.flush_targets[i].phase == RDMA_QUEUE_FLUSH_PRE_DELETE)
+        predelete_target = 1'b1;
+    end
+    if (!completion_status.ok()) begin
+      // 保持该 role 未完成并停在 barrier；之后的恢复调用可重试同一 target。
+      if (ctx.creation_origin || !predelete_target) begin
+        require_queue_recovery(ctx, completion_status, "queue OCC target still requires recovery",
+                               QR_PERSIST_REPORT);
+        return;
+      end
+      ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+      ctx.recovery.rollback_statuses.push_back(rdma_cmq_clone_status_value(completion_status));
+      persist_status = persist_queue_recovery(ctx.resource_h, ctx.recovery, ctx.binding,
+                                              ctx.expected_owner);
+      if (persist_status.ok())
+        restore_active_after_failure(ctx, completion_status,
+          "queue OCC failure restore ACTIVE returned null",
+          "queue OCC failure ACTIVE restore still requires recovery");
+      else
+        require_queue_recovery(ctx, persist_status,
+          "queue OCC failure ACTIVE restore still requires recovery", QR_PERSIST_REPORT);
+      return;
+    end
+    if (target_index < 0) begin
+      require_queue_recovery(ctx, invalid_state("reconciled OCC target is missing"),
+                             "queue OCC target cannot be identified", QR_PERSIST);
+      return;
+    end
+    if (!plan.flush_targets[target_index].flush_complete) begin
+      status = live_binding_fence(ctx.binding, ctx.expected_owner);
+      if (status.ok())
+        status = normalize_status(
+          manager.record_queue_flush_complete(ctx.resource_h, ctx.recovery.ambiguous_role),
+          "reconciled queue OCC progress returned null");
+      if (!status.ok()) begin
+        require_queue_recovery(ctx, status, "reconciled queue OCC progress failed", QR_PERSIST);
+        return;
+      end
+    end
+    plan.flush_targets[target_index].flush_complete = 1'b1;
+    rdma_recovery_complete_step(ctx.recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+    done = !persist_queue_progress(ctx, "reconciled queue OCC progress could not be persisted");
+  endtask
+
+  // 功能：存在性未知且无歧义 ticket 时发出恰好一次 typed QUERY（只判定对象存在性，不代表 OCC 完成）。
+  // 输入/输出及副作用：done=1 表示停止；可能保存新的歧义 ticket。
+  // 失败/边界：descriptor/执行失败、结果不确定或存在性仍未知时发布 RECOVERY_REQUIRED。
+  protected task establish_queue_presence(rdma_queue_recovery_context ctx, output bit done);
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    bit ambiguous;
+    bit conclusive;
+
+    done = 1'b1;
+    if (ctx.recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN &&
+        ctx.recovery.ambiguous_ticket == null) begin
+      status = normalize_status(ctx.policy.build_object_command(
+        query_opcode(ctx.queue.resource_kind()), ctx.expected_owner, ctx.queue,
+        command_timeout, command), "queue recovery QUERY descriptor returned null");
+      if (!status.ok()) begin
+        require_queue_recovery(ctx, status, "queue QUERY descriptor could not be built",
+                               QR_PERSIST);
+        return;
+      end
+      execute_queue_command(command, ticket, completion, status, ambiguous,
+                            ctx.binding, ctx.expected_owner);
+      if (ambiguous) begin
+        ctx.recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(ticket, "queue QUERY recovery");
+        ctx.recovery.ambiguous_queue_operation =
+          (ctx.creation_origin && !rdma_recovery_step_completed(
+            ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED)) ?
+            RDMA_QUEUE_AMBIG_CREATE : RDMA_QUEUE_AMBIG_DELETE;
+        require_queue_recovery(ctx, null, "queue QUERY has no terminal result", QR_PERSIST_REPORT);
+        return;
+      end
+      if (status == null || !status.ok() || completion == null || completion.status == null) begin
+        if (status == null)
+          status = invalid_state("queue QUERY result is null");
+        require_queue_recovery(ctx, status, "queue QUERY failed to establish presence", QR_PERSIST);
+        return;
+      end
+      status = classify_queue_presence(ctx, completion, conclusive);
+      if (!status.ok() || !conclusive) begin
+        require_queue_recovery(ctx, status.ok() ? null : status,
+                               "queue QUERY response is inconclusive", QR_PERSIST);
+        return;
+      end
+      if (!persist_queue_progress(ctx, "queue QUERY progress could not be persisted"))
+        return;
+    end
+    if (ctx.recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
+      require_queue_recovery(ctx, null, "queue hardware presence remains unknown", QR_NO_PERSIST);
+      return;
+    end
+    done = 1'b0;
+  endtask
+
+  // 功能：按持久化顺序执行 OCC flush target。post_delete=0：执行全部未完成 target，但对象未证明 ABSENT 时
+  //   跳过 post-delete target（含 SRQ pre-delete barrier）；post_delete=1：只补做 post-delete target。
+  // 输入/输出及副作用：done=1 表示停止；成功 target 置 flush_complete 并持久化。
+  // 失败/边界：recipe 无效、descriptor/执行/progress 失败或歧义时发布 RECOVERY_REQUIRED（文案按轮次区分）。
+  protected task run_queue_recovery_flushes(rdma_queue_recovery_context ctx, bit post_delete,
+                                            output bit done);
+    rdma_queue_flush_target target;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    string label;
+    string message;
+    bit ambiguous;
+    bit execute_failed;
+    bit progress_failed;
+
+    done = 1'b1;
+    label = post_delete ? "queue post-delete OCC" : "queue OCC";
+    for (int unsigned i = 0; i < ctx.recovery.queue_plan.flush_targets.size(); i++) begin
+      target = ctx.recovery.queue_plan.flush_targets[i];
+      if (target == null && !post_delete) begin
+        require_queue_recovery(ctx, invalid_state("queue recovery flush target is null"),
+                               "queue OCC recipe is invalid", QR_PERSIST);
+        return;
+      end
+      if (target == null || target.flush_complete)
+        continue;
+      if (post_delete ? target.phase != RDMA_QUEUE_FLUSH_POST_DELETE :
+          (target.phase == RDMA_QUEUE_FLUSH_POST_DELETE &&
+           ctx.recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT))
+        continue;
+      execute_recovery_flush_step(
+        ctx.binding, ctx.expected_owner, ctx.policy, target, ctx.resource_h,
+        post_delete ? "queue post-delete OCC descriptor returned null" :
+                      "queue recovery OCC descriptor returned null",
+        {label, " progress returned null"},
+        status, ticket, completion, ambiguous, execute_failed, progress_failed);
+      if (!status.ok() && !execute_failed && !progress_failed) begin
+        require_queue_recovery(ctx, status,
+          post_delete ? "queue post-delete OCC descriptor failed" :
+                        "queue OCC descriptor could not be built", QR_PERSIST);
+        return;
+      end
+      if (ambiguous) begin
+        ctx.recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(ticket, {label, " recovery"});
+        ctx.recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
+        ctx.recovery.ambiguous_role = target.role;
+        require_queue_recovery(ctx, null,
+          post_delete ? "queue post-delete OCC has no terminal result" :
+                        "queue OCC target has no terminal result", QR_PERSIST_REPORT);
+        return;
+      end
+      if (!status.ok()) begin
+        if (post_delete)
+          message = progress_failed ? "queue post-delete OCC progress failed" :
+                                      "queue post-delete OCC failed";
+        else
+          message = progress_failed ? "queue OCC progress could not be persisted" :
+                                      "queue OCC target failed";
+        require_queue_recovery(ctx, status, message, QR_PERSIST_REPORT);
+        return;
+      end
+      target.flush_complete = 1'b1;
+      rdma_recovery_complete_step(ctx.recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+      if (!persist_queue_progress(ctx, post_delete ? "queue post-delete OCC progress failed" :
+                                  "queue OCC progress could not be persisted"))
+        return;
+    end
+    done = 1'b0;
+  endtask
+
+  // 功能：PRESENT 且尚未 delete 时，在 pre-delete OCC barrier 全部完成后发出 delete。
+  // 输入/输出及副作用：done=1 表示停止；成功置 ABSENT 并持久化，歧义保存 ticket。
+  // 失败/边界：barrier 未完成、descriptor/执行失败或持久化失败时发布 RECOVERY_REQUIRED。
+  protected task delete_present_queue(rdma_queue_recovery_context ctx, output bit done);
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    bit ambiguous;
+
+    done = 1'b0;
+    if (ctx.recovery.hardware_presence != RDMA_HW_PRESENCE_PRESENT ||
+        rdma_recovery_step_completed(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED))
+      return;
+    done = 1'b1;
+    foreach (ctx.recovery.queue_plan.flush_targets[i]) begin
+      if (ctx.recovery.queue_plan.flush_targets[i] != null &&
+          ctx.recovery.queue_plan.flush_targets[i].phase == RDMA_QUEUE_FLUSH_PRE_DELETE &&
+          !ctx.recovery.queue_plan.flush_targets[i].flush_complete) begin
+        require_queue_recovery(ctx, null, "queue pre-delete OCC barrier is incomplete",
+                               QR_NO_PERSIST);
+        return;
+      end
+    end
+    status = normalize_status(ctx.policy.build_object_command(
+      delete_opcode(ctx.queue.resource_kind()), ctx.expected_owner, ctx.queue,
+      command_timeout, command), "queue recovery delete descriptor returned null");
+    if (!status.ok()) begin
+      require_queue_recovery(ctx, status, "queue delete descriptor could not be built", QR_PERSIST);
+      return;
+    end
+    execute_queue_command(command, ticket, completion, status, ambiguous,
+                          ctx.binding, ctx.expected_owner);
+    if (ambiguous) begin
+      ctx.recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(ticket, "queue delete recovery");
+      ctx.recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_DELETE;
+      ctx.recovery.ambiguous_role = ctx.recovery.queue_plan.refs.size() == 0 ?
+        RDMA_QUEUE_ROLE_CQ_RING : ctx.recovery.queue_plan.refs[0].role;
+      ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
+      require_queue_recovery(ctx, null, "queue delete has no terminal result", QR_PERSIST_REPORT);
+      return;
+    end
+    if (!status.ok()) begin
+      ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+      rdma_recovery_queue_step(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+      require_queue_recovery(ctx, status, "queue delete failed", QR_PERSIST_REPORT);
+      return;
+    end
+    ctx.recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+    rdma_recovery_complete_step(ctx.recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+    done = !persist_queue_progress(ctx, "queue delete progress could not be persisted");
+  endtask
+
+  // 功能：OCC 与 delete 完成后执行本地 backing 清理并最终释放资源（create 回滚走 release_reserved，
+  //   普通 destroy 走 finalize_release），成功时 result 为 RELEASED。
+  // 输入/输出及副作用：done 恒为 1；清理后按 manager 最新恢复记录刷新 ctx.recovery。
+  // 失败/边界：清理/刷新/持久化/最终释放失败时发布 RECOVERY_REQUIRED。
+  protected task finish_queue_recovery(rdma_queue_recovery_context ctx, output bit done);
+    rdma_recovery_record refreshed;
+    rdma_status status;
+    rdma_status refresh_status;
+
+    done = 1'b1;
+    if (!queue_local_cleanup_complete(ctx.recovery.queue_plan)) begin
+      status = live_binding_fence(ctx.binding, ctx.expected_owner);
+      if (status.ok())
+        status = cleanup_local(ctx.recovery.queue_plan, ctx.result, 1'b1, ctx.resource_h,
+                               ctx.binding, ctx.expected_owner);
+      status = normalize_status(status, "queue local recovery cleanup returned null");
+      refreshed = null;
+      refresh_status = normalize_status(manager.lookup_recovery(ctx.resource_h, refreshed),
+                                        "queue local recovery refresh returned null");
+      if (refresh_status.ok() && refreshed != null)
+        ctx.recovery = refreshed;
+      if (!status.ok()) begin
+        require_queue_recovery(ctx, status, "queue local cleanup still requires recovery",
+                               QR_PERSIST);
+        return;
+      end
+      if (!refresh_status.ok()) begin
+        require_queue_recovery(ctx, refresh_status, "queue local cleanup progress is unavailable",
+                               QR_NO_PERSIST);
+        return;
+      end
+    end
+    if (!queue_local_cleanup_complete(ctx.recovery.queue_plan)) begin
+      require_queue_recovery(ctx, null, "queue local cleanup remains incomplete", QR_NO_PERSIST);
+      return;
+    end
+    rdma_recovery_complete_step(ctx.recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+    // 普通 destroy 是已发布的队列，其 ERROR 恢复记录在 registry 仍存在时不得宣告 RESOURCE_RELEASED；
+    // 只有 create 回滚沿用 mark_error 预留的规范 pending 步骤，由 release_reserved() 消费。
+    if (ctx.creation_origin)
+      rdma_recovery_queue_step(ctx.recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+    if (!persist_queue_progress(ctx, "queue backing progress could not be persisted"))
+      return;
+    // 由恢复意图而非步骤历史选择 registry 迁移：普通 destroy 的结果只含 destroy 进度，按缺少 create
+    // 步骤判断会误当 ALLOCATED 预留走 release_reserved()。
+    status = live_binding_fence(ctx.binding, ctx.expected_owner);
+    if (status.ok())
+      status = ctx.creation_origin ? manager.release_reserved(ctx.resource_h) :
+                                     manager.finalize_release(ctx.resource_h);
+    status = normalize_status(status, "queue recovery final release returned null");
+    if (!status.ok()) begin
+      require_queue_recovery(ctx, status, "queue resource finalization still requires recovery",
+                             QR_PERSIST);
+      return;
+    end
+    rdma_recovery_complete_step(ctx.recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+    rdma_recovery_project_history(ctx.recovery, ctx.result);
+    ctx.result.status = rdma_status::success();
+    ctx.result.final_resource_state = RDMA_RESOURCE_RELEASED;
+    ctx.result.final_resource_state_known = 1'b1;
+    ctx.result.recovery_required = 1'b0;
   endtask
 
   // 功能：在调用方持锁下创建 CQ/SRQ/CEQ/AEQ：校验请求、预留、规划 backing、写 context、提交 create 并激活。
