@@ -15,12 +15,15 @@ class rdma_tb_flow_test extends uvm_test;
 
   rdma_tb_env env;
   rdma_host_mem_api mems[2];
+  // QP 的 SQ/RQ 深度（子类可调小以覆盖环满与回绕）。
+  int unsigned qp_depth;
 
   // 功能：构造测试。
   // 输入/输出及副作用：name/parent 为 UVM 层级。
   // 失败/边界：无。
   function new(string name = "rdma_tb_flow_test", uvm_component parent = null);
     super.new(name, parent);
+    qp_depth = 256;
   endfunction
 
   // 功能：创建两节点环境。
@@ -36,7 +39,6 @@ class rdma_tb_flow_test extends uvm_test;
   // 失败/边界：资源建立失败报 UVM_FATAL；数据错误由记分板报告。
   task run_phase(uvm_phase phase);
     rdma_tb_node_cfg nodes[int unsigned];
-    rdma_tb_traffic_vseq vseq;
 
     phase.raise_objection(this);
     for (int unsigned n = 0; n < 2; n++)
@@ -45,9 +47,7 @@ class rdma_tb_flow_test extends uvm_test;
       connect_node(nodes[n], nodes[1 - n]);
     attach_fabric();
     env.configure(nodes);
-    vseq = rdma_tb_traffic_vseq::type_id::create("vseq");
-    vseq.env = env;
-    vseq.start(null);
+    run_traffic();
     env.wait_idle(500us);
     if (env.sb.checked == 0)
       `uvm_error("TB_FLOW", "scoreboard checked nothing")
@@ -56,6 +56,17 @@ class rdma_tb_flow_test extends uvm_test;
         `uvm_error("TB_FLOW", $sformatf("node %0d device errors: %p", n,
                                         nodes[n].dev.nic.errors))
     phase.drop_objection(this);
+  endtask
+
+  // 功能：运行流量序列（子类可替换）。
+  // 输入/输出及副作用：经 env 各节点 sequencer 下发 verb。
+  // 失败/边界：结果由记分板判定。
+  virtual task run_traffic();
+    rdma_tb_traffic_vseq vseq;
+
+    vseq = rdma_tb_traffic_vseq::type_id::create("vseq");
+    vseq.env = env;
+    vseq.start(null);
   endtask
 
   // 功能：建立一个节点：主机内存、设备、BAR、probe、PD、CQ、RC/UD QP、数据缓冲与覆盖它的 MR。
@@ -118,6 +129,8 @@ class rdma_tb_flow_test extends uvm_test;
     attr.recv_cq = cfg.cq;
     attr.max_send_sge = 4;
     attr.max_recv_sge = 4;
+    attr.max_send_wr = qp_depth;
+    attr.max_recv_wr = qp_depth;
     link = rdma_tb_qp_link::type_id::create("link");
     rdma_drv_qp::create_qp(cfg.drv, attr, link.qp, status);
     expect_ok($sformatf("create %s QP", qp_type.name()), status);

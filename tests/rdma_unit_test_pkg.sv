@@ -188,5 +188,6 @@ endpackage
   `include "integration/rdma_end_to_end_transport_test.sv"
   `include "integration/rdma_end_to_end_high_traffic_test.sv"
   `include "integration/rdma_tb_e2e_test.sv"
+  `include "integration/rdma_tb_e2e_high_traffic_test.sv"
 `endif
 `endif
