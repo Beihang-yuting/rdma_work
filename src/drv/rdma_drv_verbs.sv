@@ -279,7 +279,9 @@ class rdma_drv_cq extends uvm_object;
     if (!status.ok()) begin
       void'(cq.mem_kbuf.free(dev.hw));
       dev.cq_ids.free(cq.cqn);
+      return;
     end
+    dev.cq_table[cq.cqn] = cq;
   endtask
 
   // 功能：xtrdma_ib_destroy_cq：CQC_DELETE（携带 HMC 中的 56B CQC）失败只记录；HUGE 缓冲无 PD flush；
@@ -300,6 +302,7 @@ class rdma_drv_cq extends uvm_object;
       dev.cmq.exec(sqe, cqe_bytes, status);
     void'(mem_kbuf.free(dev.hw));
     dev.cq_ids.free(cqn);
+    dev.cq_table.delete(cqn);
   endtask
 
   // 功能：xtrdma_uk_cq_request_notification：比较 shadow 中硬件记录的 ARM_SN 与本地 arm_sn，

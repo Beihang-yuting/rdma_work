@@ -16,10 +16,14 @@ package rdma_drv_pkg;
   `define RDMA_DRV_SET(BYTES, STEM, VALUE) \
     rdma_be::set_field(BYTES, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, STEM``_WIDTH, VALUE);
 
+  typedef class rdma_drv_qp;
+  typedef class rdma_drv_cq;
+
   `include "rdma_drv_hw.sv"
   `include "rdma_drv_cmq.sv"
   `include "rdma_drv_mem.sv"
   `include "rdma_drv_dev.sv"
   `include "rdma_drv_verbs.sv"
   `include "rdma_drv_qp.sv"
+  `include "rdma_drv_wr.sv"
 endpackage

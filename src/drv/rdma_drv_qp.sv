@@ -239,6 +239,7 @@ class rdma_drv_qp extends uvm_object;
     qp.sq_ring_head = new[qp.sq_depth];
     qp.rq_wr_id = new[qp.rq_depth];
     qp.rq_ring_head = new[qp.rq_depth];
+    dev.qp_table[qp.qpn] = qp;
   endtask
 
   // 功能：xtrdma_set_qp_param：clamp(wr, 256, 32768) 后取 2 的幂。
@@ -581,6 +582,7 @@ class rdma_drv_qp extends uvm_object;
       return;
     free_buffers(dev);
     dev.qp_ids.free(qpn);
+    dev.qp_table.delete(qpn);
     cur_state = RDMA_DRV_QPS_RESET;
   endtask
 endclass

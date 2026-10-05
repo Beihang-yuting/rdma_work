@@ -53,6 +53,9 @@ class rdma_dev_cmq extends uvm_object;
   protected longint unsigned sq_seq;
   protected longint unsigned cq_seq;
   protected rdma_dev_object objects[rdma_dev_kind_e][int unsigned];
+  // HMC：IFA_UPDATE 的每类对象 data 字（FVM_SOA 等），SD_UPDATE 的 SD 号 → PD 表（或页）地址。
+  protected bit [63:0] ifa_data[4];
+  protected bit [63:0] sd_pa[int unsigned];
   // 观测：按序执行过的 opcode 与对应 ecode。
   bit [7:0] executed_opcodes[$];
   bit [7:0] executed_ecodes[$];
@@ -83,6 +86,9 @@ class rdma_dev_cmq extends uvm_object;
     sq_seq = 0;
     cq_seq = 0;
     objects.delete();
+    foreach (ifa_data[t])
+      ifa_data[t] = '0;
+    sd_pa.delete();
     executed_opcodes.delete();
     executed_ecodes.delete();
   endfunction
@@ -240,12 +246,111 @@ class rdma_dev_cmq extends uvm_object;
         return execute_srq(opcode, sqe, cqe, ecode);
       end
       RDMA_OP_SD_UPDATE: begin
-        return check_sd_signature(sqe);
+        return update_sds(sqe);
+      end
+      RDMA_OP_IFA_UPDATE: begin
+        ifa_data[(rdma_be::qword(sqe, 0) >> 60) & 2'b11] = rdma_be::qword(sqe, 8);
       end
       default: begin
         // OCC/TQ flush、IFA/GID/MAC 等表项：设备侧无可观测状态，按成功完成。
       end
     endcase
+    return rdma_status::success();
+  endfunction
+
+  // 功能：SD_UPDATE：校验签名后记录每个 SD 表项（前 2 项在 SQE 字节 32 起，其余在 sd_buf_addr）；
+  //   VF_VALID=0 的表项表示清除。
+  // 输入/输出及副作用：更新 sd_pa；DMA 读扩展表。
+  // 失败/边界：签名不符或 DMA 失败返回错误。
+  protected function rdma_status update_sds(byte unsigned sqe[]);
+    int unsigned n;
+    byte unsigned entries[];
+    byte unsigned extra[];
+    int unsigned idx;
+    rdma_status status;
+
+    status = check_sd_signature(sqe);
+    if (!status.ok())
+      return status;
+    n = rdma_be::qword(sqe, 0) & 8'hff;
+    entries = rdma_be::slice(sqe, 32, RDMA_SD_CARRIED_IN_SQE * RDMA_SD_ENTRY_BYTES);
+    if (n > RDMA_SD_CARRIED_IN_SQE) begin
+      status = read_bytes(rdma_be::qword(sqe, 24),
+                          (n - RDMA_SD_CARRIED_IN_SQE) * RDMA_SD_ENTRY_BYTES, extra);
+      if (!status.ok())
+        return status;
+      entries = {entries, extra};
+    end
+    for (int unsigned i = 0; i < n; i++) begin
+      idx = rdma_be::field(entries, i * RDMA_SD_ENTRY_BYTES + RDMA_SD_ENTRY_IDX_WORD_BYTE_OFFSET,
+                           RDMA_SD_ENTRY_IDX_LSB, RDMA_SD_ENTRY_IDX_WIDTH);
+      if (rdma_be::field(entries, i * RDMA_SD_ENTRY_BYTES + RDMA_SD_ENTRY_VF_VALID_WORD_BYTE_OFFSET,
+                         RDMA_SD_ENTRY_VF_VALID_LSB, RDMA_SD_ENTRY_VF_VALID_WIDTH))
+        sd_pa[idx] = rdma_be::field(entries, i * RDMA_SD_ENTRY_BYTES +
+                                    RDMA_SD_ENTRY_PA_WORD_BYTE_OFFSET, RDMA_SD_ENTRY_PA_LSB,
+                                    RDMA_SD_ENTRY_PA_WIDTH) << RDMA_SD_ENTRY_PA_LSB;
+      else
+        sd_pa.delete(idx);
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：HMC 对象地址：obj_type 类对象区内 offset 处 → FVM 地址（FVM_SOA<<9 + offset）→ SD →
+  //   PD 表项 → 页 + 页内偏移（4K INDIRECT）。
+  // 输入/输出及副作用：iova 输出；DMA 读 PD 表项。
+  // 失败/边界：对象类未配置、SD 未建立或 PD 表项无效返回 DMA_TRANSLATION。
+  function rdma_status hmc_addr(int unsigned obj_type, longint unsigned offset,
+                                output bit [63:0] iova);
+    bit [63:0] fvm;
+    bit [63:0] entry;
+    int unsigned sd;
+    byte unsigned bytes[];
+    rdma_status status;
+
+    iova = '0;
+    if (!ifa_data[obj_type][RDMA_IFA_DATA_VALID_LSB])
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC object class is not configured");
+    fvm = (ifa_data[obj_type][RDMA_IFA_DATA_FVM_SOA_LSB +: RDMA_IFA_DATA_FVM_SOA_WIDTH]
+           << RDMA_HMC_FVM_SOA_SHIFT) + offset;
+    sd = fvm / (RDMA_HMC_PAGE_BYTES * RDMA_HMC_PD_PER_SD);
+    if (!sd_pa.exists(sd))
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC SD is not mapped");
+    status = read_bytes(sd_pa[sd] + ((fvm / RDMA_HMC_PAGE_BYTES) % RDMA_HMC_PD_PER_SD) * 8, 8,
+                        bytes);
+    if (!status.ok())
+      return status;
+    entry = rdma_be::qword(bytes, 0);
+    if (!entry[RDMA_PD_ENTRY_VLD_LSB])
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC PD entry is not valid");
+    iova = ((entry >> RDMA_PD_ENTRY_PBA_LSB) << RDMA_PD_ENTRY_PBA_LSB) +
+           fvm % RDMA_HMC_PAGE_BYTES;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：队列缓冲地址：HUGE/DIRECT 为 (pba<<12)+offset；INDIRECT 先读 PD 表 (pba<<12) 的第
+  //   offset/4K 项，再加页内偏移。
+  // 输入/输出及副作用：iova 输出；可能 DMA 读 PD 表。
+  // 失败/边界：PD 表项无效或 L3 模式返回 DMA_TRANSLATION。
+  function rdma_status buffer_addr(int unsigned om, bit [63:0] pba, longint unsigned offset,
+                                   output bit [63:0] iova);
+    byte unsigned bytes[];
+    bit [63:0] entry;
+    rdma_status status;
+
+    iova = (pba << 12) + offset;
+    if (om != RDMA_ALLOC_TYPE_INDIRECT) begin
+      if (om == RDMA_ALLOC_TYPE_L3_INDIRECT)
+        return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "L3 indirect buffers are not modeled");
+      return rdma_status::success();
+    end
+    status = read_bytes((pba << 12) + (offset / RDMA_HMC_PAGE_BYTES) * 8, 8, bytes);
+    if (!status.ok())
+      return status;
+    entry = rdma_be::qword(bytes, 0);
+    if (!entry[RDMA_PD_ENTRY_VLD_LSB])
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "buffer PD entry is not valid");
+    iova = ((entry >> RDMA_PD_ENTRY_PBA_LSB) << RDMA_PD_ENTRY_PBA_LSB) +
+           offset % RDMA_HMC_PAGE_BYTES;
     return rdma_status::success();
   endfunction
 

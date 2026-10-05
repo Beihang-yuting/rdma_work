@@ -73,6 +73,7 @@ class rdma_drv_dev_test extends uvm_test;
     rdma_drv_dma page;
     int unsigned offset;
     rdma_bytes_t qpc;
+    bit [63:0] iova;
 
     expected = '{RDMA_OP_IFA_UPDATE, RDMA_OP_IFA_UPDATE, RDMA_OP_IFA_UPDATE, RDMA_OP_IFA_UPDATE,
                  RDMA_OP_SD_UPDATE, RDMA_OP_CEQC_CREATE, RDMA_OP_CEQC_CREATE,
@@ -91,6 +92,16 @@ class rdma_drv_dev_test extends uvm_test;
                        RDMA_EQC_BODY_CUR_EQ_PBA_LSB, RDMA_EQC_BODY_CUR_EQ_PBA_WIDTH) !=
         drv.ceqs[1].mem_kbuf.base_iova() >> 12)
       `uvm_error("PROBE", "CEQ 5 context does not carry its PD table address")
+    expect_ok("HMC QPC 5", dev.cmq.hmc_addr(0, 5 * RDMA_QPC_BYTES, iova));
+    if (iova != drv.hmc[0].pages[0].iova + 5 * RDMA_QPC_BYTES)
+      `uvm_error("PROBE", "device HMC translation of QPC 5 does not match the driver page")
+    expect_ok("HMC PBL 600", dev.cmq.hmc_addr(3, 600 * 8, iova));
+    if (iova != drv.hmc[3].pages[1].iova + (600 - 512) * 8)
+      `uvm_error("PROBE", "device HMC translation of PBLE 600 does not match the driver page")
+    expect_ok("CEQ buffer", dev.cmq.buffer_addr(RDMA_ALLOC_TYPE_INDIRECT,
+                                                drv.ceqs[0].mem_kbuf.base_iova() >> 12, 48, iova));
+    if (iova != drv.ceqs[0].mem_kbuf.pages[0].iova + 48)
+      `uvm_error("PROBE", "device INDIRECT translation of the CEQ buffer is wrong")
     void'(drv.hmc[0].locate(0, page, offset));
     expect_ok("read QP0", drv.hw.read(page, offset, RDMA_QPC_BYTES, qpc));
     if (rdma_be::field(qpc, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,

@@ -127,6 +127,9 @@ class rdma_drv_dev extends uvm_object;
   // rf->qp_sn[qpn]：每次分配该 QPN 时后增（u8）。
   bit [7:0] qp_sn[int unsigned];
   rdma_drv_eq ceqs[$];
+  // xa_store 的 qp_table/cq_table：poll 与 EQ 处理按号查找对象。
+  rdma_drv_qp qp_table[int unsigned];
+  rdma_drv_cq cq_table[int unsigned];
   rdma_drv_eq aeq;
   bit probed;
 

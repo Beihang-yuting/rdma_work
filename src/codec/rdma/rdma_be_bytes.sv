@@ -6,6 +6,15 @@
 
 typedef byte unsigned rdma_bytes_t[];
 
+// 按 rdma_defs.svh 字段三元组读写（驱动 FIELD_GET/FIELD_PREP + get/set_64bit_val）。
+// _AT 用于只保存了 context 区的字节数组：BASE 为该区在 SQE 中的起始字节。
+`define RDMA_BE_GET(BYTES, STEM) \
+  rdma_be::field(BYTES, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, STEM``_WIDTH)
+`define RDMA_BE_GET_AT(BYTES, STEM, BASE) \
+  rdma_be::field(BYTES, STEM``_WORD_BYTE_OFFSET - (BASE), STEM``_LSB, STEM``_WIDTH)
+`define RDMA_BE_SET(BYTES, STEM, VALUE) \
+  rdma_be::set_field(BYTES, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, STEM``_WIDTH, VALUE);
+
 virtual class rdma_be;
   // 功能：读取 offset 处的大端 qword。
   // 输入/输出及副作用：纯函数。
