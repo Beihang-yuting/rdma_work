@@ -239,10 +239,35 @@ class rdma_dev_cmq extends uvm_object;
       RDMA_OP_SRFQC_QUERY: begin
         return execute_srq(opcode, sqe, cqe, ecode);
       end
+      RDMA_OP_SD_UPDATE: begin
+        return check_sd_signature(sqe);
+      end
       default: begin
-        // OCC/TQ flush、SD/IFA/GID/MAC 等表项：设备侧无可观测状态，按成功完成。
+        // OCC/TQ flush、IFA/GID/MAC 等表项：设备侧无可观测状态，按成功完成。
       end
     endcase
+    return rdma_status::success();
+  endfunction
+
+  // 功能：SD_UPDATE：sd_num>2 时（SIGN_EN），签名覆盖整条 SQE 与 sd_buf_addr 处的扩展 SD 表
+  //   （cmq.c xtrdma_sc_update_sd），含签名的全体异或恒为 0xff。
+  // 输入/输出及副作用：DMA 读扩展表。
+  // 失败/边界：签名不符或 DMA 失败返回错误。
+  protected function rdma_status check_sd_signature(byte unsigned sqe[]);
+    int unsigned n;
+    byte unsigned extra[];
+    rdma_status status;
+
+    if (!rdma_be::field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB,
+                        RDMA_CMQ_SIGN_EN_WIDTH))
+      return rdma_status::success();
+    n = rdma_be::qword(sqe, 0) & 8'hff;
+    status = read_bytes(rdma_be::qword(sqe, 24), (n - RDMA_SD_CARRIED_IN_SQE) * RDMA_SD_ENTRY_BYTES,
+                        extra);
+    if (!status.ok())
+      return status;
+    if ((rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(extra)) != 8'hff)
+      return rdma_status::make(RDMA_SC_CODEC_ERROR, "SD_UPDATE signature mismatch");
     return rdma_status::success();
   endfunction
 

@@ -521,6 +521,28 @@ localparam int unsigned RDMA_CQC_RUNTIME_SHADOW_WRAP_BIT = 23;
 `RDMA_FIELD(RDMA_CMQ_COMPLETION_RETURN_OCC_IDX, 0, 46, 12)
 `RDMA_FIELD(RDMA_CMQ_COMPLETION_IFA_INFO, 8, 0, 59)
 
+// cmq.h:59-81 / defs.h:307-309: HMC configuration values. IFA data is the 64-bit
+// IFA_UPDATE "data" word; SD entries are {sd_idx qword, data qword} 16-byte chunks;
+// PD/PBLE entries are big-endian page descriptors.
+`RDMA_FIELD(RDMA_IFA_DATA_VALID, 0, 0, 1)
+`RDMA_FIELD(RDMA_IFA_DATA_OBJ_MODE, 0, 1, 2)
+`RDMA_FIELD(RDMA_IFA_DATA_OBJ_SIZE, 0, 3, 4)
+`RDMA_FIELD(RDMA_IFA_DATA_OBJ_MOUNT, 0, 7, 28)
+`RDMA_FIELD(RDMA_IFA_DATA_FVM_SOA, 0, 35, 23)
+`RDMA_FIELD(RDMA_SD_ENTRY_IDX, 0, 0, 12)
+`RDMA_FIELD(RDMA_SD_ENTRY_PA, 8, 12, 52)
+`RDMA_FIELD(RDMA_SD_ENTRY_VF_ID, 8, 4, 8)
+`RDMA_FIELD(RDMA_SD_ENTRY_VF_VALID, 8, 0, 1)
+`RDMA_FIELD(RDMA_PD_ENTRY_PBA, 0, 12, 52)
+`RDMA_FIELD(RDMA_PD_ENTRY_VF_ID, 0, 4, 8)
+`RDMA_FIELD(RDMA_PD_ENTRY_VLD, 0, 0, 1)
+localparam int unsigned RDMA_SD_ENTRY_BYTES = 16;
+localparam int unsigned RDMA_SD_CARRIED_IN_SQE = 2;
+localparam int unsigned RDMA_SD_MAX_PER_UPDATE = 34;
+localparam int unsigned RDMA_HMC_FVM_SOA_SHIFT = 9;
+localparam int unsigned RDMA_HMC_PAGE_BYTES = 4096;
+localparam int unsigned RDMA_HMC_PD_PER_SD = 512;
+
 // MRT sparse register/key-allocate body in final WQE coordinates.
 `RDMA_FIELD(RDMA_MRT_BODY_STAG_IDX, 0, 0, 24)
 `RDMA_FIELD(RDMA_MRT_BODY_NXT_ST, 0, 61, 2)

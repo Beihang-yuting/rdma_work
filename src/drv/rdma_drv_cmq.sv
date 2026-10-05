@@ -76,6 +76,36 @@ class rdma_drv_cmq extends uvm_object;
     return sqe;
   endfunction
 
+  // 功能：执行表驱动 opcode：字段表（由驱动填充函数生成）编码 body 后提交；SD_UPDATE 在
+  //   sd_num>2 时按 xtrdma_sc_update_sd 对整条 SQE 与扩展 SD 表签名。
+  // 输入/输出及副作用：同 exec_signed。
+  // 失败/边界：字段编码失败返回其 status；其余同 exec_signed。
+  task exec_fields(bit [7:0] opcode, rdma_hw_cmq_field_body body, output rdma_bytes_t cqe,
+                   output rdma_status status);
+    rdma_hw_cmq_field_codec codec;
+    rdma_hw_image image;
+    rdma_bytes_t sqe;
+    rdma_bytes_t extra;
+    bit sign;
+
+    cqe = new[0];
+    codec = rdma_hw_cmq_field_codec::type_id::create("drv_field_codec");
+    status = codec.encode(opcode, body, image);
+    if (!status.ok())
+      return;
+    sqe = new[RDMA_CMQE_BYTES];
+    foreach (sqe[i])
+      sqe[i] = image.bytes[i];
+    rdma_be::set_field(sqe, RDMA_CMQ_OPCODE_WORD_BYTE_OFFSET, RDMA_CMQ_OPCODE_LSB,
+                       RDMA_CMQ_OPCODE_WIDTH, opcode);
+    sign = rdma_be::field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB,
+                          RDMA_CMQ_SIGN_EN_WIDTH);
+    extra = new[0];
+    if (body.blobs.exists("sd_extra_data"))
+      extra = body.blobs["sd_extra_data"];
+    exec_signed(sqe, sign, extra, cqe, status);
+  endtask
+
   // 功能：执行一条命令（不带签名）。
   // 输入/输出及副作用：同 exec_signed。
   // 失败/边界：同 exec_signed。

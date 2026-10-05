@@ -72,6 +72,7 @@ readonly CORE_TESTS=(
   rdma_cmq_request_golden_test
   rdma_dev_cmq_test
   rdma_drv_cmq_test
+  rdma_drv_dev_test
   rdma_control_plane_test
   rdma_control_plane_cmq_engine_test
   rdma_codec_registry_test

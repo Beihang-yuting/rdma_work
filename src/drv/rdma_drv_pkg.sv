@@ -12,6 +12,12 @@ package rdma_drv_pkg;
   import rdma_codec_pkg::*;
   import rdma_adapter_pkg::*;
 
+  // 按 rdma_defs.svh 字段三元组写字段（驱动 FIELD_PREP + set_64bit_val）。
+  `define RDMA_DRV_SET(BYTES, STEM, VALUE) \
+    rdma_be::set_field(BYTES, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, STEM``_WIDTH, VALUE);
+
   `include "rdma_drv_hw.sv"
   `include "rdma_drv_cmq.sv"
+  `include "rdma_drv_mem.sv"
+  `include "rdma_drv_dev.sv"
 endpackage
