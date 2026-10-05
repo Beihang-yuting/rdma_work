@@ -8,16 +8,9 @@
 
 // 设计说明：独立 CQ facade 提供稳定 typed API，唯一 queue-data engine 保持 mutation
 // 权威；单一非拥有 delegate 和冻结 Function 坐标阻断 reset/rebind 后的旧 facade。
-class rdma_cq_engine extends uvm_object;
+class rdma_cq_engine extends rdma_queue_facade;
   `uvm_object_utils(rdma_cq_engine)
 
-  protected rdma_queue_data_engine delegate;
-  protected rdma_function_binding authority_binding;
-  protected longint unsigned authority_function_uid;
-  protected int unsigned authority_generation;
-  protected rdma_reset_epoch_t authority_reset_epoch;
-  protected time operation_timeout;
-  protected bit configured;
   protected bit shared_configured;
   protected rdma_handle shared_cq_h;
   protected rdma_handle shared_completion_qp_h;
@@ -82,14 +75,7 @@ class rdma_cq_engine extends uvm_object;
   // 失败/边界：configure 前 poll/publish/resize 均返回 INVALID_STATE；configure_shared
   //   可独立启用 flush_shadow，但不能授权三个普通入口。
   function new(string name = "rdma_cq_engine");
-    super.new(name);
-    delegate = null;
-    authority_binding = null;
-    authority_function_uid = 0;
-    authority_generation = 0;
-    authority_reset_epoch = 0;
-    operation_timeout = 0;
-    configured = 1'b0;
+    super.new(name, "CQ");
     shared_configured = 1'b0;
     shared_cq_h = null;
     shared_completion_qp_h = null;
@@ -104,24 +90,6 @@ class rdma_cq_engine extends uvm_object;
     shadow_flushed = 1'b0;
     flushed_shadow = null;
     shadow_flush_count = 0;
-  endfunction
-
-  // 功能：校验 CQ facade 冻结的 Function UID/generation/reset epoch 与借用 binding
-  //   仍一致，且 binding 仍为 ACTIVE 并通过自身 validate()。
-  // 输入/输出及副作用：label 仅用于诊断；函数只读配置、binding 和快照并返回
-  //   rdma_status，不修改 delegate、shadow、runtime 或队列游标。
-  // 失败/边界：未配置、delegate/binding 缺失或 binding 非 ACTIVE 返回 INVALID_STATE；
-  //   UID/generation/reset epoch 漂移返回 STALE_GENERATION；validate() 的 null/失败
-  //   分别归一化为 INVALID_STATE 或原样返回。
-  protected function rdma_status validate_live_authority(string label);
-    return rdma_validate_live_authority(
-      configured,
-      delegate != null,
-      authority_binding,
-      authority_function_uid,
-      authority_generation,
-      authority_reset_epoch,
-      label);
   endfunction
 
   // 功能：绕过 typed registry cast，按 requested_type 从 UVM raw factory 创建对象，
@@ -489,97 +457,17 @@ class rdma_cq_engine extends uvm_object;
     return prepared_success;
   endfunction
 
-  // 功能：绑定共享 queue-data engine，校验 CQ 的 manager、binding、Host-memory、
-  //   doorbell 和 codec 引用一致。
-  // 输入/输出及副作用：resource_manager、function_binding、memory、scheduler、codecs、
-  //   timeout/shared_engine 为输入；成功保存非拥有 delegate/binding、冻结 authority、
-  //   timeout 和 configured 状态，并返回 rdma_status。
-  // 失败/边界：任一依赖/shared_engine 为空、timeout 为零、engine 的 manager/binding/
-  //   memory/scheduler/codecs 不一致返回 INVALID_ARGUMENT；binding validate 为 null、
-  //   非 ACTIVE 或重复 configure 返回 INVALID_STATE，非空 validation 失败原样返回；
-  //   configure_shared 已绑定另一 delegate 时返回 INVALID_ARGUMENT；admission 先于
-  //   one-shot 门禁，所有失败均发生在 delegate/authority 写入前。
-  function rdma_status configure(
-    rdma_resource_manager resource_manager,
-    rdma_function_binding function_binding,
-    rdma_host_mem_api memory,
-    rdma_doorbell_scheduler scheduler,
-    rdma_codec_registry codecs,
-    time timeout,
-    rdma_queue_data_engine shared_engine = null
+  // 功能：CQ 额外配置准入：若 shared-shadow 已绑定 delegate，普通 configure 必须使用同一 engine。
+  // 输入/输出及副作用：shared_engine 为待保存 delegate；只读 shared_configured/delegate。
+  // 失败/边界：delegate 不一致返回 INVALID_ARGUMENT，基类 configure 随即不写任何字段。
+  protected virtual function rdma_status configure_admission(
+    rdma_queue_data_engine shared_engine
   );
-    rdma_status status;
-    status = rdma_validate_queue_facade_configuration(
-      resource_manager,
-      function_binding,
-      memory,
-      scheduler,
-      codecs,
-      timeout,
-      shared_engine,
-      "CQ");
-    if (status == null || !status.ok())
-      return status;
-    // 配置成功后 facade 的 delegate 与 authority 是不可替换的；否则第二次
-    // configure 会覆盖冻结坐标，使正在执行的 poll/resize 失去生命周期边界。
-    if (configured)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "CQ facade is already configured");
-
     if (shared_configured && delegate != null && delegate != shared_engine)
       return rdma_status::make(
         RDMA_SC_INVALID_ARGUMENT,
         "CQ facade delegate differs from shared evidence engine");
-
-    delegate = shared_engine;
-    authority_binding = function_binding;
-    authority_function_uid = function_binding.function_uid;
-    authority_generation = function_binding.generation;
-    authority_reset_epoch = function_binding.function_reset_epoch();
-    operation_timeout = timeout;
-    configured = 1'b1;
     return rdma_status::success();
-  endfunction
-
-  // 设计说明：CQ poll、publish 与 resize 的 typed delegate seam 不同，但进入 seam
-  // 之前共享同一配置/Function authority 顺序，返回后也共享 null-status 边界。
-  // 这里仅提取无 I/O helper；flush_shadow 的 shared-config/replay 契约保持独立。
-
-  // 功能：validate_operation_authority 按 CQ facade 原有顺序执行配置门禁和 live
-  //   Function authority 校验，并保证三个普通业务入口获得非 null status。
-  // 输入/输出及副作用：label 为 poll/publish/resize 的诊断前缀；函数只读
-  //   configured、delegate 与冻结 authority，不修改 runtime、backing、cursor 或 shadow。
-  // 失败/边界：未配置或 delegate 缺失返回固定 INVALID_STATE；binding 缺失/非 ACTIVE
-  //   返回 INVALID_STATE，UID、generation 或 reset epoch 漂移返回 STALE_GENERATION，
-  //   binding.validate() 的非空失败原样返回；authority 返回 null 时按 label 归一化。
-  protected function rdma_status validate_operation_authority(string label);
-    rdma_status status;
-
-    if (!configured || delegate == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "CQ facade is not configured");
-
-    status = validate_live_authority(label);
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               {label, " authority validation returned null"});
-    return status;
-  endfunction
-
-  // 功能：normalize_delegate_status 将 CQ delegate 的 null status 转换为带 seam 名的
-  //   INVALID_STATE，同时保留任意非 null 成功或失败对象。
-  // 输入/输出及副作用：candidate 为 delegate 输出，operation_name 为固定 seam 名；
-  //   函数返回归一化 status，不修改 result、delegate、ring geometry 或 shadow 状态。
-  // 失败/边界：candidate 为 null 时新建 INVALID_STATE；非 null 时保持同一对象、code
-  //   和 message。poll/publish 的 result 清理由各 typed wrapper 显式负责。
-  protected function rdma_status normalize_delegate_status(
-    rdma_status candidate,
-    string operation_name
-  );
-    if (candidate == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-        {"CQ delegate ", operation_name, " returned null status"});
-    return candidate;
   endfunction
 
   // 功能：轮询一个 CQE，并由共享 engine 完成读/解码/route、CI doorbell、

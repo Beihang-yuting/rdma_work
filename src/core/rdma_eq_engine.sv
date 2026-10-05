@@ -5,139 +5,14 @@
 // 依赖：rdma_queue_data_engine、rdma_queue_event_result 及 CEQ/AEQ codec/adapter 契约。
 // 所有权与生命周期：facade 借用共享 runtime 和 router；不拥有事件 ring、mapping 或外部后端。
 
-class rdma_eq_engine extends uvm_object;
+class rdma_eq_engine extends rdma_queue_facade;
   `uvm_object_utils(rdma_eq_engine)
 
-  protected rdma_queue_data_engine delegate;
-  // Facade 借用 binding，并冻结配置时的 Function incarnation；不持有或释放
-  // binding 的生命周期，轮询前只用它检测 reset/代际漂移。
-  protected rdma_function_binding authority_binding;
-  protected longint unsigned authority_function_uid;
-  protected int unsigned authority_generation;
-  protected rdma_reset_epoch_t authority_reset_epoch;
-  protected time operation_timeout;
-  protected bit configured;
-
   // 功能：创建未配置的 EQ facade，不分配 CEQ/AEQ ring 或中断资源。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回
-  //   void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：configure 前调用任一 poll/publish 入口都返回 INVALID_STATE，
-  //   且不消费或发布 event。
+  // 输入/输出及副作用：name（输入）；默认字段由基类写入。
+  // 失败/边界：configure 前调用任一 poll/publish 入口都返回 INVALID_STATE。
   function new(string name = "rdma_eq_engine");
-    super.new(name);
-    delegate = null;
-    authority_binding = null;
-    authority_function_uid = 0;
-    authority_generation = 0;
-    authority_reset_epoch = 0;
-    operation_timeout = 0;
-    configured = 1'b0;
-  endfunction
-
-  // 功能：validate_live_authority 检查 EQ facade 配置时冻结的 Function UID、generation
-  //   和 reset epoch 仍与借用 binding 一致，阻止 reset 后继续消费或发布事件。
-  // 输入/输出及副作用：label 仅用于诊断消息；函数只读 binding 与快照字段，不修改
-  //   delegate、event runtime、cursor 或 backing，返回 rdma_status。
-  // 失败/边界：未配置、delegate 或 binding 缺失、binding 失活或校验失败返回 INVALID_STATE/原错误；
-  //   UID、generation 或 reset epoch 漂移返回 STALE_GENERATION，调用方不得继续 doorbell。
-  protected function rdma_status validate_live_authority(string label);
-    return rdma_validate_live_authority(
-      configured,
-      delegate != null,
-      authority_binding,
-      authority_function_uid,
-      authority_generation,
-      authority_reset_epoch,
-      label);
-  endfunction
-
-  // 功能：绑定共享 queue-data engine，并校验 EQ facade 与 delegate 使用同一组
-  //   Function/后端依赖。
-  // 输入/输出及副作用：resource_manager、function_binding、memory、scheduler、
-  //   codecs、timeout 和 shared_engine 为输入；函数先通过共用 admission helper
-  //   完成依赖、authority 和 ACTIVE 校验，成功时更新本对象配置/状态并保存非拥有引用，
-  //   返回 rdma_status。
-  // 失败/边界：空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；
-  //   失败时保留旧配置。
-  function rdma_status configure(
-    rdma_resource_manager resource_manager,
-    rdma_function_binding function_binding,
-    rdma_host_mem_api memory,
-    rdma_doorbell_scheduler scheduler,
-    rdma_codec_registry codecs,
-    time timeout,
-    rdma_queue_data_engine shared_engine = null
-  );
-    rdma_status status;
-    status = rdma_validate_queue_facade_configuration(
-      resource_manager,
-      function_binding,
-      memory,
-      scheduler,
-      codecs,
-      timeout,
-      shared_engine,
-      "EQ");
-    if (status == null || !status.ok())
-      return status;
-    // 中文设计：配置是 one-shot。完整依赖与 authority 校验必须先于该门禁，
-    // 这样非法重配保留具体错误，合法重配也不会覆盖正在使用的 delegate/timeout。
-    if (configured)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "EQ facade is already configured");
-    delegate = shared_engine;
-    authority_binding = function_binding;
-    authority_function_uid = function_binding.function_uid;
-    authority_generation = function_binding.generation;
-    authority_reset_epoch = function_binding.function_reset_epoch();
-    operation_timeout = timeout;
-    configured = 1'b1;
-    return rdma_status::success();
-  endfunction
-
-  // 设计说明：五个 EQ facade 入口的 delegate 签名和业务副作用不同，但共享同一
-  // 配置/Function authority 拒绝顺序以及 null-status 边界。这里仅提取两个无 I/O
-  // helper；public task 仍显式调用各自 delegate，使 CEQ/AEQ consumer、legacy
-  // producer 和 secondary-authority producer 的差异在入口处直接可见。
-
-  // 功能：validate_operation_authority 按 EQ facade 原有顺序执行配置门禁和 live
-  //   Function authority 校验，并保证调用方总能获得非 null status。
-  // 输入/输出及副作用：label 为当前 poll/publish 入口的诊断前缀；函数只读
-  //   configured、delegate 与冻结 authority，不修改 runtime、backing、cursor 或结果。
-  // 失败/边界：未配置或 delegate 缺失返回固定 INVALID_STATE；binding 缺失/非 ACTIVE
-  //   返回 INVALID_STATE，UID、generation 或 reset epoch 漂移返回 STALE_GENERATION，
-  //   binding.validate() 的非空失败原样返回；authority 校验异常返回 null 时按 label
-  //   归一化为 INVALID_STATE，其他非空成功/失败 status 对象原样返回。
-  protected function rdma_status validate_operation_authority(string label);
-    rdma_status status;
-
-    if (!configured || delegate == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "EQ facade is not configured");
-
-    status = validate_live_authority(label);
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        {label, " authority validation returned null"});
-    return status;
-  endfunction
-
-  // 功能：normalize_delegate_status 将 EQ delegate 的 null status 转换为带入口名的
-  //   INVALID_STATE，同时保留所有非 null 成功或失败对象。
-  // 输入/输出及副作用：candidate 是 delegate 输出 status，operation_name 是固定的
-  //   delegate task 名；函数返回归一化 status，不修改 result、delegate 或队列状态。
-  // 失败/边界：candidate 为 null 时新建 INVALID_STATE；非 null 时保持对象、code 和
-  //   message 不变。result 是否清空由 typed public wrapper 根据返回状态显式决定。
-  protected function rdma_status normalize_delegate_status(
-    rdma_status candidate,
-    string operation_name
-  );
-    if (candidate == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        {"EQ delegate ", operation_name, " returned null status"});
-    return candidate;
+    super.new(name, "EQ");
   endfunction
 
   // 功能：轮询 CEQ，将事件解码、CQ route 和 CI commit 交给共享 engine，并按

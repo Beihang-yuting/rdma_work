@@ -59,3 +59,119 @@ function automatic rdma_status rdma_validate_queue_facade_configuration(
       {label, " Function binding is not ACTIVE"});
   return rdma_status::success();
 endfunction
+
+// 设计说明：SQ/RQ/EQ/CQ facade 共享同一份“借用 delegate + 冻结 Function incarnation”
+//   状态与 one-shot configure 契约；集中到基类后，各 facade 只保留自己的业务入口。
+//   基类不注册 UVM factory，具体 facade 仍各自 `uvm_object_utils。
+class rdma_queue_facade extends uvm_object;
+  protected rdma_queue_data_engine delegate;
+  // facade 借用 binding，并冻结配置时的 Function UID/generation/reset epoch；不持有
+  //   binding 生命周期，业务入口前只用它检测 reset 或重绑。
+  protected rdma_function_binding authority_binding;
+  protected longint unsigned authority_function_uid;
+  protected int unsigned authority_generation;
+  protected rdma_reset_epoch_t authority_reset_epoch;
+  protected time operation_timeout;
+  protected bit configured;
+  protected string facade_label;
+
+  // 功能：构造未配置的 facade；label（SQ/RQ/EQ/CQ）用作全部诊断消息前缀。
+  // 输入/输出及副作用：只写默认字段，不分配队列或接管外部资源。
+  // 失败/边界：configure 前所有业务入口都返回 INVALID_STATE。
+  function new(string name = "rdma_queue_facade", string label = "queue");
+    super.new(name);
+    facade_label = label;
+    delegate = null;
+    authority_binding = null;
+    authority_function_uid = 0;
+    authority_generation = 0;
+    authority_reset_epoch = 0;
+    operation_timeout = 0;
+    configured = 1'b0;
+  endfunction
+
+  // 功能：校验冻结的 Function UID/generation/reset epoch 与借用 binding 仍一致，
+  //   且 binding 仍为 ACTIVE 并通过自身 validate()。
+  // 输入/输出及副作用：label 仅用于诊断；只读配置与 binding，返回 rdma_status。
+  // 失败/边界：未配置/缺依赖/binding 非 ACTIVE 返回 INVALID_STATE；任一冻结坐标漂移
+  //   返回 STALE_GENERATION。
+  protected function rdma_status validate_live_authority(string label);
+    return rdma_validate_live_authority(
+      configured,
+      delegate != null,
+      authority_binding,
+      authority_function_uid,
+      authority_generation,
+      authority_reset_epoch,
+      label);
+  endfunction
+
+  // 功能：子类在 one-shot 门禁之后、保存引用之前追加的配置准入钩子。
+  // 输入/输出及副作用：shared_engine 为待保存的 delegate；默认无额外条件。
+  // 失败/边界：返回非 OK 时 configure 原样返回且不写任何字段。
+  protected virtual function rdma_status configure_admission(
+    rdma_queue_data_engine shared_engine
+  );
+    return rdma_status::success();
+  endfunction
+
+  // 功能：一次性绑定共享 queue-data engine，并冻结 binding 的 Function incarnation。
+  // 输入/输出及副作用：依赖须与 shared_engine 持有的完全一致；成功时保存 delegate、
+  //   binding 与 timeout 的非拥有引用并置 configured。
+  // 失败/边界：依赖不一致/binding 非 ACTIVE 等沿用共用 admission 错误；已配置返回
+  //   INVALID_STATE（在完整校验之后判定，非法重配仍报具体错误）；失败不改旧配置。
+  function rdma_status configure(
+    rdma_resource_manager resource_manager,
+    rdma_function_binding function_binding,
+    rdma_host_mem_api memory,
+    rdma_doorbell_scheduler scheduler,
+    rdma_codec_registry codecs,
+    time timeout,
+    rdma_queue_data_engine shared_engine = null
+  );
+    rdma_status status;
+
+    status = rdma_validate_queue_facade_configuration(
+      resource_manager, function_binding, memory, scheduler, codecs, timeout,
+      shared_engine, facade_label);
+    if (status == null || !status.ok())
+      return status;
+    if (configured)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               {facade_label, " facade is already configured"});
+    status = configure_admission(shared_engine);
+    if (!status.ok())
+      return status;
+    delegate = shared_engine;
+    authority_binding = function_binding;
+    authority_function_uid = function_binding.function_uid;
+    authority_generation = function_binding.generation;
+    authority_reset_epoch = function_binding.function_reset_epoch();
+    operation_timeout = timeout;
+    configured = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：业务入口统一前置门禁：已配置且 delegate 存在，并通过 live authority 校验。
+  // 输入/输出及副作用：label 为入口诊断前缀；只读，返回非 null status。
+  // 失败/边界：未配置返回 INVALID_STATE；authority 校验返回 null 时按 label 归一化。
+  protected function rdma_status validate_operation_authority(string label);
+    if (!configured || delegate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               {facade_label, " facade is not configured"});
+    return rdma_status::nonnull(validate_live_authority(label),
+                                {label, " authority validation returned null"});
+  endfunction
+
+  // 功能：把 delegate 返回的 null status 归一化为带 facade/入口名的 INVALID_STATE。
+  // 输入/输出及副作用：非 null 时原样返回同一对象；不修改 result 或队列状态。
+  // 失败/边界：result 是否清空由调用方按返回状态决定。
+  protected function rdma_status normalize_delegate_status(
+    rdma_status candidate,
+    string operation_name
+  );
+    return rdma_status::nonnull(
+      candidate,
+      {facade_label, " delegate ", operation_name, " returned null status"});
+  endfunction
+endclass
