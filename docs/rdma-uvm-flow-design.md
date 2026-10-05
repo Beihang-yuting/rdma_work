@@ -38,7 +38,10 @@ test
   节点资源仍由测试/fixture 创建（Function/PD/CQ/QP/MR），tb 组件只借用句柄。
 - **WQE 读取**：SQE/RQE 均为 64B，地址 = `qp_plan.sq_ref/rq_ref.mapping` +
   `mapping_offset + index*64`；用 codec registry 解码（SQE variant rc/ud/urc，RQE default）。
-  首轮只支持 WQE 内联 SGE（≤2 个）；外部 SGB 留作后续。
+  SQ 超过 2 个 SGE 或 UD 非零 payload 走外部 SGB：driver 把 `sgb_iova` 设为当前 SQ PI × 512B 槽，
+  NIC 读该槽并按 16B 大端描述符（length/lkey/iova）解析。UD/URC SQE codec 不支持仅凭 64B 镜像
+  解码：URC 与 RC 同布局，用 RC codec；UD 由 `rdma_tb_dma` 按 `rdma_defs.svh` 字段直接解析。
+  RQ 外部 SGB 目前 engine 本身不支持（post_recv 无 SGB backing，>2 SGE 的 RQE 无法编码），RECV 限 2 个 SGE。
 - **地址转换**：key 高 24 位为 MR local ID，经 `lookup_local_resource(owner, MR, id)`
   取 MR，校验低 8 位 key、范围与访问权限，DMA 偏移 = va − backing mapping.iova。
 - **报文**：`rdma_packet` 增加 segment（ONLY/FIRST/MIDDLE/LAST）和结构化扩展头
@@ -57,8 +60,11 @@ test
   记分板零错误且内存逐字节一致。
 - e2e suite 新增 `rdma_tb_e2e_test`：真实 host_mem + net_packet 帧编解码 wire，同一组 sequence。
 
-状态：两项均已通过（18 项检查零错误）。
+- 传输矩阵：每节点 RC/UD/URC 三个 QP（qp_index 0/1/2）。URC 发出即完成，UD 单包且 RQ CQE 用 RQ/SRFQ
+  overlay（engine 约束，不携带源 QPN），接收 buffer 不预留 GRH。
+
+状态：两项均已通过（31 项检查零错误）。
 
 ## 5. 后续
 
-外部 SGB、UD/URC 的完整矩阵、PSN 乱序重传、AEQE 错误上报、接入 DUT（NIC 模型退为预测器）。
+RQ 外部 SGB（需先补 engine）、UD GRH/Q_Key 校验、PSN 乱序重传、RNR 重试、AEQE 错误上报、接入 DUT（NIC 模型退为预测器）。

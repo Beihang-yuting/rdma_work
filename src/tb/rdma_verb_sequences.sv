@@ -1,9 +1,10 @@
 // 目录：验证组件层 tb/rdma_verb_sequences.sv。
 // 职责：verb 序列：单 item 序列与两节点虚拟流量序列（SEND/RECV 跨 MTU、SEND_IMM、WRITE(+IMM)、
-//   unsignaled WRITE、READ、CMP_SWAP/FETCH_ADD、双向流量与越界访问错误）。
+//   unsignaled WRITE、READ、CMP_SWAP/FETCH_ADD、多 SGE/外部 SGB、UD、URC、双向流量与越界访问错误）。
 // 依赖：rdma_tb_env（各节点 sequencer）。
 // 所有权与生命周期：序列只借用 env；每个 item 新建后交给 driver。
 // 约定：数据 MR 内按区域划分偏移；signaled SQ 请求在 driver 内同步等待完成，RECV 不阻塞。
+//   qp_index 0/1/2 分别为 RC/UD/URC（后两者存在时才运行对应场景）。
 
 class rdma_verb_one_seq extends uvm_sequence #(rdma_verb_item);
   `uvm_object_utils(rdma_verb_one_seq)
@@ -46,6 +47,11 @@ class rdma_tb_traffic_vseq extends uvm_sequence;
     write_read();
     atomics();
     reverse_write();
+    multi_sge();
+    if (env.nodes[0].qps.size() > 2) begin
+      ud_send();
+      urc_traffic();
+    end
     access_error();
   endtask
 
@@ -65,11 +71,14 @@ class rdma_tb_traffic_vseq extends uvm_sequence;
   // 失败/边界：无。
   function rdma_verb_item make(rdma_verb_op_e op, int unsigned local_offset,
                                int unsigned length, int unsigned remote_offset = 0,
-                               int unsigned seed = 0);
+                               int unsigned seed = 0, int unsigned qp_index = 0,
+                               int unsigned sge_count = 1);
     rdma_verb_item item;
 
     item = rdma_verb_item::type_id::create("verb");
     item.op = op;
+    item.qp_index = qp_index;
+    item.sge_count = sge_count;
     item.local_offset = local_offset;
     item.length = length;
     item.remote_offset = remote_offset;
@@ -139,6 +148,45 @@ class rdma_tb_traffic_vseq extends uvm_sequence;
     post(1, make(RDMA_VERB_WRITE, 'h0000, 1024, 'h8000, 6));
     post(0, make(RDMA_VERB_RECV, 'h9000, 'h800));
     post(1, make(RDMA_VERB_SEND, 'h0400, 1025, 0, 7));
+  endtask
+
+  // 功能：多 SGE：4-SGE SEND（外部 SGB）进 2-SGE RECV、3-SGE WRITE、READ 散写到 3 个 SGE。
+  // 输入/输出及副作用：node1 0xa000/0xb000、node0 0xc000 区域写入。
+  // 失败/边界：无。
+  task multi_sge();
+    post(1, make(RDMA_VERB_RECV, 'ha000, 'h1000, 0, 0, 0, 2));
+    post(0, make(RDMA_VERB_SEND, 'h2000, 3000, 0, 9, 0, 4));
+    post(0, make(RDMA_VERB_WRITE, 'h3000, 2000, 'hb000, 10, 0, 3));
+    post(0, make(RDMA_VERB_READ, 'hc000, 1800, 'hb100, 0, 0, 3));
+  endtask
+
+  // 功能：UD SEND（3 个 SGE 经 SGB，单包 ≤ MTU）与 UD SEND_IMM。
+  // 输入/输出及副作用：node1 0xd000/0xd400 区域写入。
+  // 失败/边界：无。
+  task ud_send();
+    rdma_verb_item item;
+
+    post(1, make(RDMA_VERB_RECV, 'hd000, 'h400, 0, 0, 1));
+    post(1, make(RDMA_VERB_RECV, 'hd400, 'h100, 0, 0, 1));
+    post(0, make(RDMA_VERB_SEND, 'h4000, 700, 0, 11, 1, 3));
+    item = make(RDMA_VERB_SEND_IMM, 'h4400, 64, 0, 12, 1);
+    item.imm = 32'hcafe_0003;
+    post(0, item);
+  endtask
+
+  // 功能：URC SEND（3 包）、WRITE 与 WRITE_IMM（不等 ACK 即完成）。
+  // 输入/输出及副作用：node1 0xe000/0xf000/0xf800 区域写入。
+  // 失败/边界：无。
+  task urc_traffic();
+    rdma_verb_item item;
+
+    post(1, make(RDMA_VERB_RECV, 'he000, 'h900, 0, 0, 2));
+    post(1, make(RDMA_VERB_RECV, 'he900, 'h10, 0, 0, 2));
+    post(0, make(RDMA_VERB_SEND, 'h4800, 2100, 0, 13, 2));
+    post(0, make(RDMA_VERB_WRITE, 'h5000, 1500, 'hf000, 14, 2));
+    item = make(RDMA_VERB_WRITE_IMM, 'h5800, 40, 'hf800, 15, 2);
+    item.imm = 32'hcafe_0004;
+    post(0, item);
   endtask
 
   // 功能：WRITE 超出对端数据 MR 范围，预期 NAK 并以错误完成，对端内存不变。

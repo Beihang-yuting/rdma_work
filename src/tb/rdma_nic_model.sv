@@ -4,6 +4,8 @@
 //       RC 等待 ACK/NAK、READ 响应或 ATOMIC ACK 后发布 SQ CQE；
 //   RX：按目的 QPN 分发；SEND 消费 RQE 并散写数据，WRITE 按 RETH 写入，READ 读出并分段回包，
 //       ATOMIC 读改写并回原值；按需发布 RQ CQE 并回 ACK/NAK。
+//   传输：RC 全部操作并等 ACK；URC 仅 SEND/WRITE(+IMM)，发出即完成、不回 ACK；UD 仅单包 SEND，
+//       目的 QPN 取自 WQE。SGE 来自 WQE 内联或 SQ 外部 SGB（rdma_tb_dma.sqe_sges）。
 // 依赖：rdma_tb_node_cfg、rdma_tb_dma、rdma_wire、queue_data_engine 的设备侧 CQE 发布接口。
 // 所有权与生命周期：模型只拥有每 QP 的设备侧游标/PSN 状态；队列、MR、内存归 engine/manager/host_mem。
 
@@ -170,6 +172,8 @@ class rdma_nic_model extends uvm_component;
     rdma_nic_qp_state st;
     rdma_hw_model model;
     rdma_hw_sqe_model sqe;
+    rdma_sge sges[$];
+    bit [23:0] dst_qpn;
     rdma_packet stale;
     rdma_status status;
     byte unsigned payload[$];
@@ -195,22 +199,33 @@ class rdma_nic_model extends uvm_component;
     end
     ecode = RDMA_CMQ_SUCCESS_ECODE;
     byte_len = 0;
+    dst_qpn = (qp.transport == RDMA_TRANSPORT_UD) ? sqe.destination_qpn : '0;
+    status = dma.sqe_sges(qp, sqe, sges);
+    if (!status.ok()) begin
+      `uvm_error("RDMA_NIC", $sformatf("node %0d SQE %0d SGE list: %s", cfg.node_id,
+                 wqe_index, status.convert2string()))
+      publish_cqe(i, wqe_index, wqe_wrap, 1'b0, RDMA_ECODE_EC_TPE_SQ_KEY_ERR, 0, '0);
+      return;
+    end
     case (sqe.opcode)
       RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
       RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM: begin
-        if (!gather(sqe, payload))
+        if (!gather(sges, payload))
           ecode = RDMA_ECODE_EC_TPE_SQ_KEY_ERR;
+        else if (qp.transport == RDMA_TRANSPORT_UD && payload.size() > cfg.mtu)
+          ecode = RDMA_ECODE_EC_TPE_SQ_PAYLOAD_LEN_ABOVE;
         else begin
           byte_len = payload.size();
           send_message(i, net_opcode(sqe.opcode), payload, sqe.immediate_data,
-                       sqe.remote_va.value, sqe.rkey);
+                       sqe.remote_va.value, sqe.rkey, dst_qpn);
+          // 仅 RC 可靠传输等待 ACK；UD/URC 发出即完成。
           if (qp.transport == RDMA_TRANSPORT_RC)
             wait_ack(i, ecode);
         end
       end
       RDMA_WR_RDMA_READ: begin
-        byte_len = sge_total(sqe);
-        do_read(i, sqe, byte_len, ecode);
+        byte_len = sge_total(sges);
+        do_read(i, sqe, sges, byte_len, ecode);
       end
       RDMA_WR_ATOMIC_CMP_SWAP, RDMA_WR_ATOMIC_FETCH_ADD: begin
         byte_len = 8;
@@ -237,31 +252,28 @@ class rdma_nic_model extends uvm_component;
     endcase
   endfunction
 
-  // 功能：SQE 全部 SGE 长度之和。
-  // 输入/输出及副作用：只读 sqe。
+  // 功能：SGE 列表长度之和。
+  // 输入/输出及副作用：纯函数。
   // 失败/边界：无。
-  protected function int unsigned sge_total(rdma_hw_sqe_model sqe);
+  protected function int unsigned sge_total(rdma_sge sges[$]);
     int unsigned total;
 
     total = 0;
-    foreach (sqe.sges[k])
-      if (sqe.sges[k] != null)
-        total += sqe.sges[k].length;
+    foreach (sges[k])
+      total += sges[k].length;
     return total;
   endfunction
 
-  // 功能：按 lkey 依次读取 SQE 各 SGE 的数据并拼接。
+  // 功能：按 lkey 依次读取各 SGE 的数据并拼接。
   // 输入/输出及副作用：payload 输出；只读本地内存。
   // 失败/边界：任一 SGE 校验/读取失败返回 0。
-  protected function bit gather(rdma_hw_sqe_model sqe, output byte unsigned payload[$]);
+  protected function bit gather(rdma_sge sges[$], output byte unsigned payload[$]);
     byte unsigned part[$];
 
     payload.delete();
-    foreach (sqe.sges[k]) begin
-      if (sqe.sges[k] == null)
-        continue;
-      if (dma.read(sqe.sges[k].lkey, 1'b0, sqe.sges[k].iova.value,
-                   sqe.sges[k].length, part) != RDMA_TB_DMA_OK)
+    foreach (sges[k]) begin
+      if (dma.read(sges[k].lkey, 1'b0, sges[k].iova.value, sges[k].length, part) !=
+          RDMA_TB_DMA_OK)
         return 1'b0;
       payload = {payload, part};
     end
@@ -303,11 +315,11 @@ class rdma_nic_model extends uvm_component;
   endfunction
 
   // 功能：把一条消息按 MTU 分段发送到对端 QP；WRITE 首/单包携带 RETH，带立即数时尾/单包携带 ImmDt。
-  // 输入/输出及副作用：推进 send_psn，经 wire 发包。
+  // 输入/输出及副作用：推进 send_psn，经 wire 发包；dst_qpn 非零时覆盖目的 QPN（UD 取自 WQE）。
   // 失败/边界：空 payload 发送一个零长度单包。
   protected task send_message(int unsigned i, rdma_network_opcode_e op,
                               byte unsigned payload[$], bit [31:0] imm,
-                              bit [63:0] va, bit [31:0] rkey);
+                              bit [63:0] va, bit [31:0] rkey, bit [23:0] dst_qpn);
     int unsigned count;
     int unsigned start;
     int unsigned take;
@@ -318,6 +330,8 @@ class rdma_nic_model extends uvm_component;
       count = 1;
     for (int unsigned k = 0; k < count; k++) begin
       pkt = new_packet(i, op, segment_of(k, count), qps[i].send_psn);
+      if (dst_qpn != 0)
+        pkt.destination_qpn = dst_qpn;
       qps[i].send_psn++;
       start = k * cfg.mtu;
       take = (payload.size() > start + cfg.mtu) ? cfg.mtu : payload.size() - start;
@@ -408,8 +422,8 @@ class rdma_nic_model extends uvm_component;
   // 输入/输出及副作用：推进 send_psn（按响应包数）；写本地内存；ecode 输出。
   // 失败/边界：NAK/超时/响应长度不符返回 EC_RPE_RC_URC_ACCESS_INVLD；本地写失败返回
   //   EC_TPE_SQ_KEY_ERR。
-  protected task do_read(int unsigned i, rdma_hw_sqe_model sqe, int unsigned total,
-                         output bit [7:0] ecode);
+  protected task do_read(int unsigned i, rdma_hw_sqe_model sqe, rdma_sge sges[$],
+                         int unsigned total, output bit [7:0] ecode);
     rdma_packet pkt;
     int unsigned offset;
     int unsigned count;
@@ -433,7 +447,7 @@ class rdma_nic_model extends uvm_component;
                      cfg.node_id, i))
         return;
       end
-      if (ecode == RDMA_CMQ_SUCCESS_ECODE && !scatter(sqe.sges, offset, pkt.payload))
+      if (ecode == RDMA_CMQ_SUCCESS_ECODE && !scatter(sges, offset, pkt.payload))
         ecode = RDMA_ECODE_EC_TPE_SQ_KEY_ERR;
       offset += pkt.payload.size();
       if (pkt.segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY})
@@ -518,7 +532,8 @@ class rdma_nic_model extends uvm_component;
     st = qps[i];
     rc = cfg.qps[i].qp.transport == RDMA_TRANSPORT_RC;
     last = pkt.segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY};
-    if (pkt.psn != st.expected_psn)
+    // UD 无连接，PSN 由各发送方独立维护，不做顺序检查。
+    if (cfg.qps[i].qp.transport != RDMA_TRANSPORT_UD && pkt.psn != st.expected_psn)
       `uvm_error("RDMA_NIC", $sformatf("node %0d QP%0d PSN %0h != expected %0h",
                  cfg.node_id, i, pkt.psn, st.expected_psn))
     st.expected_psn = pkt.psn + 1;
@@ -688,6 +703,7 @@ class rdma_nic_model extends uvm_component;
       cqe.wqe_wrap = wqe_wrap;
       cqe.rq_cqe = rq;
       cqe.srfq = 1'b0;
+      // engine 规定 RQ CQE 一律用 RQ/SRFQ overlay（含 UD，不携带源 QPN）。
       cqe.variant = rq ? RDMA_CQE_VARIANT_RQ_SRFQ :
                     qp.transport == RDMA_TRANSPORT_UD ? RDMA_CQE_VARIANT_UD :
                                                         RDMA_CQE_VARIANT_RC;

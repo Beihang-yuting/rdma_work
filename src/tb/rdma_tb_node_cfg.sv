@@ -34,6 +34,8 @@ class rdma_tb_node_cfg extends uvm_object;
   rdma_mr data_mr;
   rdma_dma_mapping data_mapping;
   int unsigned mtu;
+  // UD 发送使用的 Q_Key（须与对端 UD QP 的 QPC qkey 一致）。
+  bit [31:0] ud_qkey;
   time poll_interval;
   // NIC 等待对端响应或 RQE 的最长时间。
   time response_timeout;
@@ -51,6 +53,7 @@ class rdma_tb_node_cfg extends uvm_object;
     data_mr = null;
     data_mapping = null;
     mtu = 1024;
+    ud_qkey = 32'h8001_0000;
     poll_interval = 10ns;
     response_timeout = 100us;
     cq_lock = new(1);
@@ -89,6 +92,13 @@ class rdma_tb_node_cfg extends uvm_object;
         data_mr == null || data_mapping == null || mtu == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                $sformatf("tb node %0d config is incomplete", node_id));
+    // 报文按目的 QPN 分发，节点内 QPN 必须唯一。
+    foreach (qps[i])
+      for (int unsigned j = i + 1; j < qps.size(); j++)
+        if (qps[i].qp.local_qp_id == qps[j].qp.local_qp_id)
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   $sformatf("tb node %0d has duplicate QPN %0h", node_id,
+                                             qps[i].qp.local_qp_id));
     return rdma_status::success();
   endfunction
 endclass

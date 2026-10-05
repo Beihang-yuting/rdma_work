@@ -65,7 +65,9 @@ Python 门禁另删除约 4.8k 行（结构冻结类）。
    记分板用影子内存预测并逐字节比对。`rdma_packet` 增加 segment 与结构化扩展头
    （RETH/AETH/AtomicETH/AtomicAckETH/ImmDt），net_packet adapter 按 IBTA 表做分段 opcode 映射。
    测试：core `rdma_tb_flow_test`（mock host_mem + loopback wire）、e2e `rdma_tb_e2e_test`
-   （真实 host_mem + net_packet 帧编解码 wire），均为 18 项检查零错误；注入 NIC 缺陷可被记分板捕获。
+   （真实 host_mem + net_packet 帧编解码 wire），覆盖 RC/UD/URC 与 SQ 外部 SGB，均为 31 项检查零错误；
+   注入 NIC 缺陷可被记分板捕获。顺带修复 net_packet adapter decode 把 UD DETH 留在 header_bytes 中、
+   导致 UD SEND_WITH_IMM 立即数被读成 Q_Key 的问题。
 
 ## 验证
 
@@ -79,6 +81,7 @@ host_mem、PCIe、E2E（dual env / multi-VF / high traffic）。
 | v2 | 60082eb | 同上全部通过，E2E 编译告警 2 |
 | v4 | d898006 | 同上全部通过 |
 | v5 | 303730e | 同上全部通过 |
+| v6 | 914203a | 同上全部通过，另含 core `rdma_tb_flow_test`、e2e `rdma_tb_e2e_test` |
 
 后续轮次结果见对应提交说明。注释改写由脚本逐文件校验：去除注释与空白后的代码 token
 与改写前完全一致。

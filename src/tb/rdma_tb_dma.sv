@@ -159,12 +159,12 @@ class rdma_tb_dma extends uvm_object;
     image.hardware_version = RDMA_HW_VERSION;
     image.function_generation = cfg.engine.binding.generation;
     image.write_target_kind = RDMA_HW_TARGET_NONE;
+    // UD/URC codec 不支持仅凭 64B 镜像解码：UD 由 decode_ud_sqe 直接取字段，URC 与 RC 同布局。
+    if (send && qp.transport == RDMA_TRANSPORT_UD)
+      return decode_ud_sqe(image, model);
     key = '{hw_version:"rdma", image_kind:image.image_kind,
             object_type:send ? "sqe" : "rqe",
-            variant:!send ? "default" :
-                    qp.transport == RDMA_TRANSPORT_UD ? "ud" :
-                    qp.transport == RDMA_TRANSPORT_URC ? "urc" : "rc",
-            opcode:8'h00};
+            variant:send ? "rc" : "default", opcode:8'h00};
     status = cfg.engine.registry.lookup(key, codec);
     if (status == null || !status.ok() || codec == null)
       return rdma_status::nonnull(status, "tb WQE codec lookup failed",
@@ -174,6 +174,116 @@ class rdma_tb_dma extends uvm_object;
       model = null;
       return rdma_status::nonnull(status, "tb WQE decode returned null",
                                   RDMA_SC_CODEC_ERROR);
+    end
+    if (send && qp.transport == RDMA_TRANSPORT_URC) begin
+      rdma_hw_sqe_model sqe;
+
+      if ($cast(sqe, model))
+        sqe.transport = RDMA_TRANSPORT_URC;
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：按 rdma_defs 的 UD SQE 字段从 64B 镜像取出设备需要的语义（opcode、CE、立即数、
+  //   payload 长度、SGE 数、SGB 地址、目的 QPN/Q_Key）。
+  // 输入/输出及副作用：model 输出 rdma_hw_sqe_model（payload_mode=SGE_SGB 或 NONE）。
+  // 失败/边界：镜像无法解析或 opcode 非 SEND/SEND_WITH_IMM 时返回错误。
+  protected function rdma_status decode_ud_sqe(rdma_hw_image image, output rdma_hw_model model);
+    rdma_hw_qword_builder b;
+    rdma_hw_sqe_model x;
+    rdma_status status;
+    byte unsigned raw[];
+    bit [63:0] w[];
+
+    model = null;
+    raw = new[image.bytes.size()];
+    foreach (raw[i])
+      raw[i] = image.bytes[i];
+    b = new("tb_ud_sqe");
+    status = b.deserialize(raw);
+    if (status == null || !status.ok())
+      return rdma_status::nonnull(status, "tb UD SQE deserialize returned null");
+    b.get_words(w);
+    x = rdma_hw_sqe_model::type_id::create("tb_ud_sqe");
+    x.transport = RDMA_TRANSPORT_UD;
+    x.hw_opcode = field(w, RDMA_SQ_WQE_OPCODE_WORD_BYTE_OFFSET, RDMA_SQ_WQE_OPCODE_LSB,
+                        RDMA_SQ_WQE_OPCODE_WIDTH);
+    if (x.hw_opcode == RDMA_SQ_OPCODE_SEND)
+      x.opcode = RDMA_WR_SEND;
+    else if (x.hw_opcode == RDMA_SQ_OPCODE_SEND_WITH_IMM)
+      x.opcode = RDMA_WR_SEND_WITH_IMM;
+    else
+      return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                               $sformatf("tb UD SQE opcode %0h is not SEND", x.hw_opcode));
+    x.ce = field(w, RDMA_SQ_WQE_CE_WORD_BYTE_OFFSET, RDMA_SQ_WQE_CE_LSB, RDMA_SQ_WQE_CE_WIDTH);
+    x.signaled = x.ce != 0;
+    x.immediate_data = field(w, RDMA_SQ_WQE_RC_IMMEDIATE_WORD_BYTE_OFFSET,
+                             RDMA_SQ_WQE_RC_IMMEDIATE_LSB, RDMA_SQ_WQE_RC_IMMEDIATE_WIDTH);
+    x.total_payload_len = field(w, RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_WORD_BYTE_OFFSET,
+                                RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_LSB,
+                                RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN_WIDTH);
+    x.sge_num = field(w, RDMA_SQ_WQE_UD_SGE_NUM_WORD_BYTE_OFFSET, RDMA_SQ_WQE_UD_SGE_NUM_LSB,
+                      RDMA_SQ_WQE_UD_SGE_NUM_WIDTH);
+    x.sgb_iova.value = field(w, RDMA_SQ_WQE_SGB_PA_WORD_BYTE_OFFSET, RDMA_SQ_WQE_SGB_PA_LSB,
+                             RDMA_SQ_WQE_SGB_PA_WIDTH) << 9;
+    x.destination_qpn = field(w, RDMA_SQ_WQE_UD_DST_QPN_WORD_BYTE_OFFSET,
+                              RDMA_SQ_WQE_UD_DST_QPN_LSB, RDMA_SQ_WQE_UD_DST_QPN_WIDTH);
+    x.qkey = field(w, RDMA_SQ_WQE_UD_DST_Q_KEY_WORD_BYTE_OFFSET, RDMA_SQ_WQE_UD_DST_Q_KEY_LSB,
+                   RDMA_SQ_WQE_UD_DST_Q_KEY_WIDTH);
+    x.payload_mode = x.sge_num == 0 ? RDMA_SQ_PAYLOAD_NONE : RDMA_SQ_PAYLOAD_SGE_SGB;
+    model = x;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：从 qword 数组取 (字节偏移, lsb, 宽度) 描述的字段。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：越界 qword 返回 0。
+  protected function bit [63:0] field(bit [63:0] w[], int unsigned word_byte, int unsigned lsb,
+                                      int unsigned width);
+    bit [63:0] mask;
+
+    if (word_byte / 8 >= w.size())
+      return '0;
+    mask = (width >= 64) ? '1 : ((64'd1 << width) - 1);
+    return (w[word_byte / 8] >> lsb) & mask;
+  endfunction
+
+  // 功能：取 SQE 的有效 SGE 列表：WQE 内联 SGE 直接返回；外部 SGB 时读取 sgb_iova 指向的 512B 槽，
+  //   按 16B 大端描述符（length/lkey/iova，length=0 表示 2GiB）解析 sge_num 项。
+  // 输入/输出及副作用：sges 输出新建对象；只读 host 内存。
+  // 失败/边界：inline payload、SGB backing 缺失、地址不在 SQ SGB backing 内或读失败返回错误。
+  function rdma_status sqe_sges(rdma_qp qp, rdma_hw_sqe_model sqe, output rdma_sge sges[$]);
+    rdma_qp_backing_ref sgb;
+    rdma_status status;
+    longint unsigned offset;
+    byte raw[];
+    bit [31:0] len;
+    rdma_sge sge;
+
+    sges.delete();
+    if (sqe.payload_mode inside {RDMA_SQ_PAYLOAD_INLINE_WQE, RDMA_SQ_PAYLOAD_INLINE_SGB})
+      return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, "tb NIC does not model inline payload");
+    if (sqe.payload_mode != RDMA_SQ_PAYLOAD_SGE_SGB) begin
+      foreach (sqe.sges[k])
+        if (sqe.sges[k] != null)
+          sges.push_back(sqe.sges[k]);
+      return rdma_status::success();
+    end
+    sgb = (qp.qp_plan == null) ? null : qp.qp_plan.sq_sgb_ref;
+    if (sgb == null || sgb.mapping == null || sqe.sgb_iova.value < sgb.mapping.iova.value)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "tb SQE SGB address has no backing");
+    offset = sqe.sgb_iova.value - sgb.mapping.iova.value;
+    status = cfg.engine.host_mem.read(sgb.mapping, offset, 512, raw);
+    if (status == null || !status.ok())
+      return rdma_status::nonnull(status, "tb SGB read returned null");
+    for (int unsigned k = 0; k < sqe.sge_num && k < 32; k++) begin
+      sge = rdma_sge::type_id::create("tb_sgb_sge");
+      len = {raw[k * 16], raw[k * 16 + 1], raw[k * 16 + 2], raw[k * 16 + 3]};
+      sge.length = len == 0 ? 32'h8000_0000 : len;
+      sge.lkey = {raw[k * 16 + 4], raw[k * 16 + 5], raw[k * 16 + 6], raw[k * 16 + 7]};
+      for (int unsigned j = 0; j < 8; j++)
+        sge.iova.value = {sge.iova.value[55:0], raw[k * 16 + 8 + j]};
+      sges.push_back(sge);
     end
     return rdma_status::success();
   endfunction

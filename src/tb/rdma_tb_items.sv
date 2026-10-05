@@ -31,6 +31,8 @@ class rdma_verb_item extends uvm_sequence_item;
   int unsigned qp_index;
   int unsigned local_offset;
   int unsigned length;
+  // 本地 buffer 均分为 sge_count 个连续 SGE（>2 时 SQ 走外部 SGB；RECV 至多 2 个）。
+  int unsigned sge_count;
   int unsigned remote_offset;
   bit [31:0] imm;
   bit [63:0] compare_value;
@@ -52,6 +54,7 @@ class rdma_verb_item extends uvm_sequence_item;
     qp_index = 0;
     local_offset = 0;
     length = 0;
+    sge_count = 1;
     remote_offset = 0;
     imm = '0;
     compare_value = '0;
@@ -75,6 +78,7 @@ class rdma_verb_item extends uvm_sequence_item;
     qp_index = r.qp_index;
     local_offset = r.local_offset;
     length = r.length;
+    sge_count = r.sge_count;
     remote_offset = r.remote_offset;
     imm = r.imm;
     compare_value = r.compare_value;
@@ -90,8 +94,8 @@ class rdma_verb_item extends uvm_sequence_item;
   // 输入/输出及副作用：只读。
   // 失败/边界：无。
   virtual function string convert2string();
-    return $sformatf("node=%0d qp=%0d %s wr_id=%0h local=+%0h len=%0d remote=+%0h",
-                     node_id, qp_index, op.name(), wr_id, local_offset, length,
+    return $sformatf("node=%0d qp=%0d %s wr_id=%0h local=+%0h len=%0d sges=%0d remote=+%0h",
+                     node_id, qp_index, op.name(), wr_id, local_offset, length, sge_count,
                      remote_offset);
   endfunction
 endclass

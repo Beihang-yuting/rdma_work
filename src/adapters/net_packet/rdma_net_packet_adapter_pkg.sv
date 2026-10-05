@@ -708,12 +708,12 @@ package rdma_net_packet_adapter_pkg;
         if (status == null || !status.ok())
           return status;
         // header_bytes 与 encode_packet 输入契约一致：只存 BTH 之后的扩展字段，
-        // 不含 BTH 和尾部 ICRC，使 decode→encode 可直接复用。
+        // 不含 BTH、DETH（encode 由 source_qpn 等字段生成）和尾部 ICRC，使 decode→encode 可直接复用。
         value.header_bytes.delete();
         frame_end = payload_offset;
         if (roce.icrc_enable && frame_end >= 4)
           frame_end -= 4;
-        for (index = rdma_offset + 12; index < frame_end; index++)
+        for (index = rdma_offset + 12 + (roce.has_deth() ? 8 : 0); index < frame_end; index++)
           value.header_bytes.push_back(frame_bytes[index]);
         value.payload.delete();
         for (index = payload_offset; index < payload_end; index++)

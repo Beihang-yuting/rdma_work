@@ -1,6 +1,6 @@
 // 目录：单元测试层 unit/rdma_tb_flow_test.sv。
-// 职责：两节点 seq → 报文 → 内存全流程：每节点一个 queue-data engine fixture（mock host_mem），
-//   注册数据 MR 后由 rdma_tb_env（verb agent + NIC 行为模型 + loopback wire + 记分板）
+// 职责：两节点 seq → 报文 → 内存全流程：每节点一个 queue-data engine fixture（mock host_mem，
+//   RC/UD/URC 三个 QP），注册数据 MR 后由 rdma_tb_env（verb agent + NIC 行为模型 + loopback wire + 记分板）
 //   运行 rdma_tb_traffic_vseq，记分板判定完成与内存逐字节一致。
 // 依赖：rdma_queue_data_engine_fixture、rdma_tb_pkg。
 // 所有权与生命周期：fixture 与数据 MR 在仿真期间常驻（不做 cleanup），env 组件只借用。
@@ -54,7 +54,6 @@ class rdma_tb_flow_test extends uvm_test;
   // 失败/边界：任一步失败报 UVM_FATAL。
   task automatic make_node(int unsigned n, output rdma_tb_node_cfg cfg);
     rdma_queue_data_engine_fixture fx;
-    rdma_tb_qp_link link;
     rdma_status status;
 
     fx = rdma_queue_data_engine_fixture::type_id::create($sformatf("tb_node%0d", n));
@@ -68,13 +67,29 @@ class rdma_tb_flow_test extends uvm_test;
     cfg.node_id = n;
     cfg.engine = fx.engine;
     cfg.cq = fx.cq;
-    link = rdma_tb_qp_link::type_id::create("link");
-    link.qp = fx.qp;
-    link.peer_node = 1 - n;
-    link.peer_qp_index = 0;
-    cfg.qps.push_back(link);
+    fx.setup_transport_qps(status);
+    expect_ok("setup_transport_qps", status);
+    expect_ok("attach UD QP", fx.engine.attach_qp(fx.ud_qp.handle));
+    expect_ok("attach URC QP", fx.engine.attach_qp(fx.urc_qp.handle));
+    // qp_index 0/1/2 = RC/UD/URC，与对端同索引 QP 互连。
+    add_link(cfg, fx.qp, n);
+    add_link(cfg, fx.ud_qp, n);
+    add_link(cfg, fx.urc_qp, n);
     register_data_mr(fx, cfg);
   endtask
+
+  // 功能：登记一个与对端节点同索引 QP 互连的本地 QP。
+  // 输入/输出及副作用：追加 cfg.qps。
+  // 失败/边界：无。
+  function void add_link(rdma_tb_node_cfg cfg, rdma_qp qp, int unsigned n);
+    rdma_tb_qp_link link;
+
+    link = rdma_tb_qp_link::type_id::create("link");
+    link.qp = qp;
+    link.peer_node = 1 - n;
+    link.peer_qp_index = cfg.qps.size();
+    cfg.qps.push_back(link);
+  endfunction
 
   // 功能：分配 DATA_MR_BYTES 的 host 内存并经 resource manager 注册为全权限 ACTIVE MR。
   // 输入/输出及副作用：写 cfg.data_mr/data_mapping；manager 新增 MR。

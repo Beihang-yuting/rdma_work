@@ -49,8 +49,9 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
   protected task automatic drive(rdma_verb_item item, output bit posted_ok);
     rdma_qp qp;
     rdma_tb_node_cfg peer;
-    rdma_sge sge;
+    rdma_sge sges[$];
     rdma_queue_post_result posted;
+    bit [23:0] peer_qpn;
     rdma_status status;
     byte raw[];
     longint unsigned va;
@@ -73,10 +74,7 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
         return;
       end
     end
-    sge = rdma_sge::type_id::create("drv_sge");
-    sge.iova.value = va;
-    sge.length = item.length;
-    sge.lkey = cfg.data_mr.lkey;
+    split_sges(item, va, sges);
     if (item.op == RDMA_VERB_RECV) begin
       rdma_post_recv_req req;
 
@@ -84,7 +82,7 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
       req.owner = cfg.owner();
       req.target_h = rdma_clone_handle_value(qp.handle, "driver RECV QP");
       req.wr_id = item.wr_id;
-      req.sges.push_back(sge);
+      req.sges = sges;
       cfg.engine.post_recv(req, posted, status);
     end
     else begin
@@ -98,13 +96,30 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
       req.opcode = work_opcode(item.op);
       req.signaled = item.signaled;
       req.immediate_data = item.imm;
-      req.remote_addr.value = peer.data_mr.iova.value + item.remote_offset;
-      req.rkey = peer.data_mr.rkey;
-      req.remote_access_valid = 1'b1;
-      req.rkey_valid = 1'b1;
+      if (!(item.op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM})) begin
+        req.remote_addr.value = peer.data_mr.iova.value + item.remote_offset;
+        req.rkey = peer.data_mr.rkey;
+        req.remote_access_valid = 1'b1;
+        req.rkey_valid = 1'b1;
+      end
       req.compare_value = item.compare_value;
       req.swap_add_value = item.swap_add_value;
-      req.sges.push_back(sge);
+      req.sges = sges;
+      peer_qpn = peer.qps[cfg.qps[item.qp_index].peer_qp_index].qp.local_qp_id;
+      if (qp.transport == RDMA_TRANSPORT_UD) begin
+        req.destination_qpn = peer_qpn;
+        req.qkey = cfg.ud_qkey;
+        req.address_vector_valid = 1'b1;
+        req.address_vector_id = item.qp_index;
+        req.address_vector = rdma_address_vector::type_id::create("drv_av");
+      end
+      if (qp.transport == RDMA_TRANSPORT_URC) begin
+        req.destination_qpn = peer_qpn;
+        req.completion_qp_h = rdma_clone_handle_value(qp.handle, "driver URC completion QP");
+      end
+      // UD 非零 payload 与超过 2 个 SGE 的请求使用 SQ 外部 SGB：槽位为当前 SQ PI × 512B。
+      if ((qp.transport == RDMA_TRANSPORT_UD && item.length != 0) || sges.size() > 2)
+        req.sgb_iova.value = sgb_slot(qp);
       cfg.engine.post_send(req, posted, status);
     end
     if (status == null || !status.ok()) begin
@@ -115,6 +130,47 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
     posted_ok = 1'b1;
     posted_ap.write(item);
   endtask
+
+  // 功能：把 [va, va+length) 均分为 sge_count 个连续 SGE（末项含余数），lkey 取数据 MR。
+  // 输入/输出及副作用：sges 输出新建对象。
+  // 失败/边界：sge_count 为 0 按 1 处理。
+  protected function void split_sges(rdma_verb_item item, longint unsigned va,
+                                     output rdma_sge sges[$]);
+    rdma_sge sge;
+    int unsigned count;
+    int unsigned chunk;
+
+    count = item.sge_count == 0 ? 1 : item.sge_count;
+    chunk = item.length / count;
+    sges.delete();
+    for (int unsigned k = 0; k < count; k++) begin
+      sge = rdma_sge::type_id::create("drv_sge");
+      sge.iova.value = va + k * chunk;
+      sge.length = (k == count - 1) ? item.length - k * chunk : chunk;
+      sge.lkey = cfg.data_mr.lkey;
+      sges.push_back(sge);
+    end
+  endfunction
+
+  // 功能：当前 SQ PI 对应的 SQ SGB 512B 槽 IOVA（engine 要求 sgb_iova 与 PI 槽一致）。
+  // 输入/输出及副作用：只读 runtime 游标与 qp_plan。
+  // 失败/边界：游标查询失败或无 SGB backing 返回 0，由 engine 拒绝投递。
+  protected function longint unsigned sgb_slot(rdma_qp qp);
+    rdma_status status;
+    int unsigned pi;
+    int unsigned ci;
+    bit pw;
+    bit cw;
+
+    if (qp.qp_plan == null || qp.qp_plan.sq_sgb_ref == null ||
+        qp.qp_plan.sq_sgb_ref.mapping == null)
+      return 0;
+    status = cfg.engine.query_runtime_cursors(qp.handle, RDMA_QUEUE_RUNTIME_SQ, pi, pw, ci, cw);
+    if (status == null || !status.ok())
+      return 0;
+    return qp.qp_plan.sq_sgb_ref.mapping.iova.value + qp.qp_plan.sq_sgb_ref.mapping_offset +
+           longint'(pi) * 512;
+  endfunction
 
   // 功能：verb 操作映射为 WQE opcode。
   // 输入/输出及副作用：纯函数。
