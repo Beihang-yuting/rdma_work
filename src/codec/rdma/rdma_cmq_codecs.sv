@@ -1922,26 +1922,6 @@ class rdma_hw_cmq_body_encoder extends uvm_object;
       `uvm_fatal("RDMA_CMQ_REGISTRY", status.convert2string())
   endfunction
 
-  // 功能：在 rdma_hw_cmq_body_encoder 中，context_key 保留原 protected 入口，并转发到
-  //       package-scope 的 canonical CMQ context key helper，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_context_codec_key 生成的
-  //       rdma_codec_key，不访问 registry、不取得调用方资源所有权。
-  // 失败/边界：未知 opcode 由共享 helper 返回 RDMA_IMAGE_NONE/invalid key；该转发层
-  //       不补选默认 codec，也不改变既有 protected 扩展点的可见性。
-  protected function rdma_codec_key context_key(bit [7:0] opcode);
-    return rdma_cmq_context_codec_key(opcode);
-  endfunction
-
-  // 功能：在 rdma_hw_cmq_body_encoder 中，is_context_opcode 保留原 protected 判定入口，
-  //       转发到与 context_key 相同的 canonical opcode 集合。
-  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_is_context_opcode 的 bit 结果，
-  //       不访问 registry、不修改 encoder、model 或外部资源。
-  // 失败/边界：未知或保留 opcode 返回 0；该转发层不能把无效 key 解释为 light/context
-  //       codec，也不绕过共享 helper 的 fail-closed 默认分支。
-  protected function bit is_context_opcode(bit [7:0] opcode);
-    return rdma_cmq_is_context_opcode(opcode);
-  endfunction
-
   // 功能：在 rdma_hw_cmq_body_encoder 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
   // 输入/输出及副作用：opcode（输入）、model（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
   // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
@@ -1954,8 +1934,8 @@ class rdma_hw_cmq_body_encoder extends uvm_object;
     rdma_status status;
 
     image = null;
-    if (is_context_opcode(opcode)) begin
-      status = context_codecs.lookup(context_key(opcode), codec);
+    if (rdma_cmq_is_context_opcode(opcode)) begin
+      status = context_codecs.lookup(rdma_cmq_context_codec_key(opcode), codec);
       if (!status.ok() || codec == null)
         return rdma_status::make(RDMA_SC_CODEC_ERROR,
                                  "CMQ exact context-body lookup failed");
@@ -2159,27 +2139,6 @@ class rdma_cmq_codec_registry extends uvm_object;
       RDMA_OP_OCC_PD_KICKOUT: return "OCC_PD_KICKOUT";
       default: return "";
     endcase
-  endfunction
-
-  // 功能：判断某 opcode 是否返回对象/统计 payload，而非仅返回公共状态头。
-  // 输入/输出及副作用：opcode 为输入；返回 bit，不修改表或 ring。
-  // 失败/边界：未知 opcode 返回 0。
-  static function bit has_completion_payload(bit [7:0] opcode);
-    return opcode inside {
-      RDMA_OP_KEY_QUERY, RDMA_OP_CQC_QUERY,
-      RDMA_OP_CEQC_QUERY, RDMA_OP_AEQC_QUERY,
-      RDMA_OP_SRC_ADDR_QUERY, RDMA_OP_IFA_QUERY,
-      RDMA_OP_OCC_PD_SEARCH, RDMA_OP_OCC_PD_IDX_SEARCH,
-      RDMA_OP_SRFQC_QUERY,
-      RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
-      RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
-      RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
-      RDMA_OP_OCC_UAQE,
-      RDMA_OP_IDX_OCC_QPC, RDMA_OP_IDX_OCC_CQC, RDMA_OP_IDX_OCC_MRT,
-      RDMA_OP_IDX_OCC_PBLE, RDMA_OP_IDX_OCC_SQRQE, RDMA_OP_IDX_OCC_SGB,
-      RDMA_OP_IDX_OCC_IRQE, RDMA_OP_IDX_OCC_EIRQE, RDMA_OP_IDX_OCC_ORQE,
-      RDMA_OP_IDX_OCC_UAQE
-    };
   endfunction
 
   // 功能：判断指定 opcode 是否已有本模型中的完整 request body encoder。
@@ -3062,26 +3021,6 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     return word;
   endfunction
 
-  // 功能：在 rdma_hw_cmq_request_composer 中，context_key 保留原 protected 入口，并转发到
-  //       package-scope 的 canonical CMQ context key helper，供请求校验和 registry lookup 使用。
-  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_context_codec_key 生成的
-  //       rdma_codec_key，不访问 registry、不取得调用方资源所有权。
-  // 失败/边界：未知 opcode 由共享 helper 返回 RDMA_IMAGE_NONE/invalid key；该转发层
-  //       不补选默认 codec，也不改变既有 protected 扩展点的可见性。
-  protected function rdma_codec_key context_key(bit [7:0] opcode);
-    return rdma_cmq_context_codec_key(opcode);
-  endfunction
-
-  // 功能：在 rdma_hw_cmq_request_composer 中，is_context_opcode 保留原 protected 判定入口，
-  //       转发到与 context_key 相同的 canonical opcode 集合。
-  // 输入/输出及副作用：opcode（输入）；函数返回 rdma_cmq_is_context_opcode 的 bit 结果，
-  //       不访问 registry、不修改 composer、model 或外部资源。
-  // 失败/边界：未知或保留 opcode 返回 0；该转发层不能把无效 key 解释为 context codec，
-  //       也不绕过共享 helper 的 fail-closed 默认分支。
-  protected function bit is_context_opcode(bit [7:0] opcode);
-    return rdma_cmq_is_context_opcode(opcode);
-  endfunction
-
   // 功能：validate_context_identity 按 opcode 查找唯一 context-body codec，解码 body 并以
   //   精确类型校验请求的 context identity。
   // 输入/输出及副作用：opcode、body（输入）；只读 registry 和 body，临时创建 decoded model，
@@ -3095,7 +3034,7 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     rdma_codec_base codec;
     rdma_hw_model decoded;
     rdma_status status;
-    status = context_codecs.lookup(context_key(opcode), codec);
+    status = context_codecs.lookup(rdma_cmq_context_codec_key(opcode), codec);
     if (!status.ok() || codec == null)
       return codec_error("CMQ exact context-body codec lookup failed");
     decoded = null;
@@ -3363,7 +3302,7 @@ class rdma_hw_cmq_request_composer extends uvm_object;
         return codec_error($sformatf(
           "CMQ envelope/body ownership overlaps in qword %0d", q));
     end
-    if (is_context_opcode(envelope_snapshot.opcode)) begin
+    if (rdma_cmq_is_context_opcode(envelope_snapshot.opcode)) begin
       status = validate_context_identity(envelope_snapshot.opcode, body);
       if (!status.ok()) return status;
     end

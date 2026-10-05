@@ -800,14 +800,14 @@ class rdma_cmq_engine extends uvm_object;
         submitted.batch_id != batch_record.batch_id ||
         submitted.attempt_id != batch_record.attempt_id ||
         batch_record.engine_instance_id != engine_instance_id ||
-        !same_ticket_detached_value(submitted.ticket, journal_item.ticket) ||
+        !rdma_cmq_same_ticket_detached_value(submitted.ticket, journal_item.ticket) ||
         !same_handle_value(batch_record.cmq_h, journal_item.ticket.cmq_h) ||
         (journal_item.completion != null &&
          (journal_item.completion.ticket == null ||
           journal_item.completion.status == null ||
           !rdma_cmq_ticket_shape_valid(journal_item.completion.ticket) ||
           !rdma_cmq_status_shape_valid(journal_item.completion.status) ||
-          !same_ticket_detached_value(journal_item.completion.ticket,
+          !rdma_cmq_same_ticket_detached_value(journal_item.completion.ticket,
                                       journal_item.ticket) ||
           !same_status_value(journal_item.completion.status,
                              journal_item.status) ||
@@ -882,7 +882,7 @@ class rdma_cmq_engine extends uvm_object;
         (submitted.completion.ticket == null || submitted.completion.status == null ||
          !rdma_cmq_ticket_shape_valid(submitted.completion.ticket) ||
          !rdma_cmq_status_shape_valid(submitted.completion.status) ||
-         !same_ticket_detached_value(submitted.completion.ticket,
+         !rdma_cmq_same_ticket_detached_value(submitted.completion.ticket,
                                      submitted.ticket) ||
          !same_status_value(submitted.completion.status, submitted.status) ||
          submitted.completion.ticket != submitted.ticket ||
@@ -915,10 +915,10 @@ class rdma_cmq_engine extends uvm_object;
           batch_record.function_identity.generation ||
         journal_item.dma_context.reset_epoch !=
           batch_record.function_identity.reset_epoch ||
-        !same_journal_dma_context_detached_value(
+        !rdma_cmq_same_journal_dma_context_detached_value(
           submitted.dma_context, journal_item.dma_context
         ) ||
-        !same_journal_owner_detached_value(
+        !rdma_cmq_same_journal_owner_detached_value(
           submitted.recovery_owner, journal_item.recovery_owner
         ))
       return journal_status(
@@ -946,7 +946,7 @@ class rdma_cmq_engine extends uvm_object;
     if (!expected_command_identity.capture_from(
           journal_item.command, identity_failure
         ) || submitted.command_identity == null ||
-        !same_journal_command_identity_value(
+        !rdma_cmq_same_journal_command_identity_value(
           submitted.command_identity, expected_command_identity
         ))
       return journal_status(
@@ -1064,7 +1064,7 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ retained completion snapshot returned null status"
       ) : journal_status(status.code, status.message);
     if (completion.ticket == null || completion.status == null ||
-        !same_ticket_detached_value(completion.ticket, journal_item.ticket)) begin
+        !rdma_cmq_same_ticket_detached_value(completion.ticket, journal_item.ticket)) begin
       completion = null;
       return journal_status(
         RDMA_SC_INVALID_STATE,
@@ -1982,13 +1982,6 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_cmq_direct_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：保留 engine 的 protected BDF 比较入口，转发到共享结构值契约。
-  // 输入/输出及副作用：lhs/rhs 为 rdma_bdf_t 值；返回共享 helper 的 `==` 结果，不修改 route 或 engine。
-  // 失败/边界：转发不验证 BDF 是否可路由，也不把原有比较改为 case equality。
-  protected function bit same_bdf(rdma_bdf_t lhs, rdma_bdf_t rhs);
-    return rdma_cmq_same_bdf_value(lhs, rhs);
-  endfunction
-
   // 功能：在 rdma_cmq_engine 中，clone_binding_snapshot 将 rhs 中 rdma_cmq_engine 的值字段复制到当前对象，建立与源对象隔离的快照。
   // 输入/输出及副作用：source（输入）、snapshot（输出）；clone_binding_snapshot 读取 source、snapshot 并使用字段 snapshot、cloned_object，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：clone_binding_snapshot 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“CMQ Function binding is null”“CMQ Function binding snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
@@ -2215,7 +2208,7 @@ class rdma_cmq_engine extends uvm_object;
         RDMA_SC_STALE_GENERATION,
         "CMQ mapping Function generation does not match request"
       );
-    if (!same_bdf(mapping.requester_bdf,
+    if (!rdma_cmq_same_bdf_value(mapping.requester_bdf,
                   request_context.requester_bdf))
       return rdma_status::make(
         RDMA_SC_DMA_TRANSLATION,
@@ -2327,26 +2320,6 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_status::make(failure_code, message);
   endfunction
 
-  // 功能：保留 engine 的 protected byte-queue 比较 seam，转发到共享 cardinality/元素契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 byte queue；返回长度与全部元素的比较结果，不修改 queue 或 engine。
-  // 失败/边界：长度或任一元素不同时返回 0；两个空 queue 仍返回 1。
-  protected function bit same_byte_queue(
-    byte unsigned lhs[$],
-    byte unsigned rhs[$]
-  );
-    return rdma_cmq_same_byte_queue_value(lhs, rhs);
-  endfunction
-
-  // 功能：保留 engine 的 protected string-queue 比较 seam，转发到共享 cardinality/元素契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 string queue；返回长度与全部文本的比较结果，不修改 queue 或 engine。
-  // 失败/边界：长度或任一文本不同时返回 0；两个空 queue 仍返回 1。
-  protected function bit same_string_queue(
-    string lhs[$],
-    string rhs[$]
-  );
-    return rdma_cmq_same_string_queue_value(lhs, rhs);
-  endfunction
-
   // 功能：保留 engine 的 protected image 比较 seam，并委托共享契约比较 bytes、metadata、targets 与 summary。
   // 输入/输出及副作用：lhs/rhs 为只读 image；返回完整现有值比较结果，不复制 image 或读写 engine 状态。
   // 失败/边界：null 或任一已列入字段不同时返回 0；转发不新增 image shape gate。
@@ -2398,16 +2371,6 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_cmq_same_ticket_instance_value(lhs, rhs);
   endfunction
 
-  // 功能：保留 engine 的 protected detached-ticket 比较 seam，委托共享公开 immutable-value 契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 ticket；返回 detached handle、command、slot、opcode 与 deadline 比较结果，不修改账本。
-  // 失败/边界：ticket/句柄/key 为 null、handle 含 X/Z 或任一值不同时返回 0；本转发不授予 alias authority。
-  protected function bit same_ticket_detached_value(
-    input rdma_cmq_ticket lhs,
-    input rdma_cmq_ticket rhs
-  );
-    return rdma_cmq_same_ticket_detached_value(lhs, rhs);
-  endfunction
-
   // 功能：在 rdma_cmq_engine 中由 same_dependency_value 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
   // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
   // 失败/边界：same_dependency_value 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
@@ -2423,49 +2386,6 @@ class rdma_cmq_engine extends uvm_object;
            lhs.relative_offset == rhs.relative_offset &&
            same_image_value(lhs.image, rhs.image) &&
            lhs.ready == rhs.ready;
-  endfunction
-
-  // 功能：保留 engine 的 protected handle 值键 seam，转发到共享 model contract。
-  // 输入/输出及副作用：handle 原样传入；返回 package helper 的 string，不修改 engine 或 handle。
-  // 失败/边界：null sentinel 与字段格式完全由 package helper 决定；本层不增加校验或回退。
-  protected function automatic string handle_value_key(rdma_handle handle);
-    return rdma_cmq_handle_value_key(handle);
-  endfunction
-
-  // 功能：保留 engine 的 protected exact-type seam，转发到共享 model contract。
-  // 输入/输出及副作用：value/expected_type 原样传入；返回 wrapper identity 比较结果，不改状态。
-  // 失败/边界：null 与 subtype 拒绝语义由 package helper 决定；本层不改用 cast 或 type name。
-  protected function automatic bit has_exact_object_type(
-    uvm_object value,
-    uvm_object_wrapper expected_type
-  );
-    return rdma_cmq_has_exact_object_type(value, expected_type);
-  endfunction
-
-  // 功能：保留 engine 的 protected optional exact-type seam，转发到共享 model contract。
-  // 输入/输出及副作用：value/expected_type 原样传入；返回 optional wrapper 检查结果，不改状态。
-  // 失败/边界：null value 优先成功及非空 exact-type 拒绝由 package helper 保持。
-  protected function automatic bit has_optional_exact_object_type(
-    uvm_object value,
-    uvm_object_wrapper expected_type
-  );
-    return rdma_cmq_has_optional_exact_object_type(value, expected_type);
-  endfunction
-
-  // 功能：保留 engine 的 protected core-body shape seam，转发到共享 model contract。
-  // 输入/输出及副作用：body 原样传入；返回七类 body 的 exact shell 检查结果，不改状态。
-  // 失败/边界：null、unsupported、required/optional nested 与 transport 分支由 package helper 决定。
-  protected function automatic bit core_body_shell_is_exact(
-    rdma_hw_model body
-  );
-    return rdma_cmq_core_body_shell_is_exact(body);
-  endfunction
-
-  // 功能：保留 engine 的 protected nested 值键 seam，转发到共享 model contract。
-  // 输入/输出及副作用：value 原样传入；返回 package helper 的稳定 string，不改对象或 engine。
-  // 失败/边界：null/unsupported sentinel、字段格式与 URC queues 递归由 package helper 保持。
-  protected function automatic string nested_value_key(uvm_object value);
-    return rdma_cmq_nested_value_key(value);
   endfunction
 
   // 功能：保留 engine 的 protected body 值键 seam，转发到共享 model contract。
@@ -2495,8 +2415,8 @@ class rdma_cmq_engine extends uvm_object;
     rhs_type = rhs.get_object_type();
     if (lhs_type == null || rhs_type == null || lhs_type != rhs_type)
       return 1'b0;
-    if (!core_body_shell_is_exact(lhs) ||
-        !core_body_shell_is_exact(rhs)) begin
+    if (!rdma_cmq_core_body_shell_is_exact(lhs) ||
+        !rdma_cmq_core_body_shell_is_exact(rhs)) begin
       if (profile == null)
         return 1'b0;
       return profile.same_command_body_value(lhs, rhs);
@@ -2507,10 +2427,10 @@ class rdma_cmq_engine extends uvm_object;
       if (lhs_sqe.opcode != rhs_sqe.opcode ||
           lhs_sqe.command_id != rhs_sqe.command_id ||
           lhs_sqe.flags != rhs_sqe.flags ||
-          handle_value_key(lhs_sqe.function_h) !=
-            handle_value_key(rhs_sqe.function_h) ||
-          handle_value_key(lhs_sqe.target_h) !=
-            handle_value_key(rhs_sqe.target_h) ||
+          rdma_cmq_handle_value_key(lhs_sqe.function_h) !=
+            rdma_cmq_handle_value_key(rhs_sqe.function_h) ||
+          rdma_cmq_handle_value_key(lhs_sqe.target_h) !=
+            rdma_cmq_handle_value_key(rhs_sqe.target_h) ||
           ((lhs_sqe.context_model == null) !=
            (rhs_sqe.context_model == null)))
         return 1'b0;
@@ -2556,8 +2476,8 @@ class rdma_cmq_engine extends uvm_object;
     if (source_type == null || snapshot_type == null ||
         source_type != snapshot_type)
       return 1'b0;
-    if (!core_body_shell_is_exact(source) ||
-        !core_body_shell_is_exact(snapshot)) begin
+    if (!rdma_cmq_core_body_shell_is_exact(source) ||
+        !rdma_cmq_core_body_shell_is_exact(snapshot)) begin
       if (profile == null)
         return 1'b0;
       return profile.command_body_graph_detached(source, snapshot);
@@ -2585,40 +2505,6 @@ class rdma_cmq_engine extends uvm_object;
         if (source_nodes[i] == snapshot_nodes[j])
           return 1'b0;
     return 1'b1;
-  endfunction
-
-  // 功能：保留 engine 的 protected Function snapshot seam，
-  // 转发到共享有类型快照契约。
-  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
-  // helper 先清空并在成功时接收独立 Function handle；engine 不保存引用。
-  // 失败/边界：null、clone/type/self 契约失败或四个身份字段漂移时，
-  // 原样返回 package helper 按 failure_code 构造的状态，不发布 partial snapshot。
-  protected function rdma_status checked_function_snapshot(
-    rdma_function_handle source,
-    string label,
-    rdma_status_code_e failure_code,
-    output rdma_function_handle snapshot
-  );
-    return rdma_cmq_checked_function_snapshot(
-      source, label, failure_code, snapshot
-    );
-  endfunction
-
-  // 功能：保留 engine 的 protected handle snapshot seam，
-  // 转发到共享有类型快照契约。
-  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
-  // helper 先清空并在成功时接收独立 handle；engine 不保存引用。
-  // 失败/边界：null、clone/type/self 契约失败或四个身份字段漂移时，
-  // 原样返回 package helper 按 failure_code 构造的状态，不发布 partial snapshot。
-  protected function rdma_status checked_handle_snapshot(
-    rdma_handle source,
-    string label,
-    rdma_status_code_e failure_code,
-    output rdma_handle snapshot
-  );
-    return rdma_cmq_checked_handle_snapshot(
-      source, label, failure_code, snapshot
-    );
   endfunction
 
   // 功能：nested_object_status 校验 source、label、failure_code 与当前对象状态的一致性，并显式处理“is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -2689,7 +2575,7 @@ class rdma_cmq_engine extends uvm_object;
     if (!status.ok())
       return status;
     source_type_name = source.get_type_name();
-    saved_value = nested_value_key(source);
+    saved_value = rdma_cmq_nested_value_key(source);
     if (saved_value == "")
       return snapshot_failure(
         failure_code, {label, " has no checked value representation"}
@@ -2710,8 +2596,8 @@ class rdma_cmq_engine extends uvm_object;
         failure_code, {label, " snapshot clone contract failed"}
       );
     end
-    if (nested_value_key(source) != saved_value ||
-        nested_value_key(cloned_object) != saved_value) begin
+    if (rdma_cmq_nested_value_key(source) != saved_value ||
+        rdma_cmq_nested_value_key(cloned_object) != saved_value) begin
       return snapshot_failure(
         failure_code, {label, " snapshot changed its source value"}
       );
@@ -2781,7 +2667,7 @@ class rdma_cmq_engine extends uvm_object;
       return snapshot_failure(failure_code,
                               {label, " URC queue snapshot is invalid"});
     source_type_name = source.get_type_name();
-    saved_value = nested_value_key(source);
+    saved_value = rdma_cmq_nested_value_key(source);
     saved_queues = source_urc.queues;
     source_urc.queues = null;
     source_wrapper = source.get_object_type();
@@ -2794,7 +2680,7 @@ class rdma_cmq_engine extends uvm_object;
       );
     end
     saved_object.copy(source);
-    saved_shell_value = nested_value_key(saved_object);
+    saved_shell_value = rdma_cmq_nested_value_key(saved_object);
     cloned_object = source.clone();
     source.copy(saved_object);
     source_urc.queues = saved_queues;
@@ -2806,8 +2692,8 @@ class rdma_cmq_engine extends uvm_object;
         failure_code, {label, " transport snapshot clone contract failed"}
       );
     end
-    if (nested_value_key(source) != saved_value ||
-        nested_value_key(snapshot) != saved_shell_value ||
+    if (rdma_cmq_nested_value_key(source) != saved_value ||
+        rdma_cmq_nested_value_key(snapshot) != saved_shell_value ||
         snapshot_urc.queues != null) begin
       snapshot = null;
       return snapshot_failure(
@@ -3163,25 +3049,25 @@ class rdma_cmq_engine extends uvm_object;
 
     snapshot = null;
     saved_value = body_value_key(source);
-    status = checked_handle_snapshot(source.qp_h, {label, " QPC QP"},
+    status = rdma_cmq_checked_handle_snapshot(source.qp_h, {label, " QPC QP"},
                                      failure_code, qp_snapshot);
     if (!status.ok()) return status;
-    status = checked_handle_snapshot(source.pd_h, {label, " QPC PD"},
+    status = rdma_cmq_checked_handle_snapshot(source.pd_h, {label, " QPC PD"},
                                      failure_code, pd_snapshot);
     if (!status.ok()) return status;
-    status = checked_handle_snapshot(
+    status = rdma_cmq_checked_handle_snapshot(
       source.send_cq_h, {label, " QPC send CQ"}, failure_code,
       send_cq_snapshot
     );
     if (!status.ok()) return status;
-    status = checked_handle_snapshot(
+    status = rdma_cmq_checked_handle_snapshot(
       source.recv_cq_h, {label, " QPC receive CQ"}, failure_code,
       recv_cq_snapshot
     );
     if (!status.ok()) return status;
     srq_snapshot = null;
     if (source.srq_h != null) begin
-      status = checked_handle_snapshot(source.srq_h, {label, " QPC SRQ"},
+      status = rdma_cmq_checked_handle_snapshot(source.srq_h, {label, " QPC SRQ"},
                                        failure_code, srq_snapshot);
       if (!status.ok()) return status;
     end
@@ -3276,12 +3162,12 @@ class rdma_cmq_engine extends uvm_object;
     nested2_snapshot = null;
     saved_value = body_value_key(source);
     if ($cast(source_cqc, source)) begin
-      status = checked_handle_snapshot(source_cqc.cq_h,
+      status = rdma_cmq_checked_handle_snapshot(source_cqc.cq_h,
                                        {label, " CQC CQ"}, failure_code,
                                        handle0_snapshot);
       if (!status.ok()) return status;
       if (source_cqc.ceq_h != null) begin
-        status = checked_handle_snapshot(source_cqc.ceq_h,
+        status = rdma_cmq_checked_handle_snapshot(source_cqc.ceq_h,
                                          {label, " CQC CEQ"}, failure_code,
                                          handle1_snapshot);
         if (!status.ok()) return status;
@@ -3300,11 +3186,11 @@ class rdma_cmq_engine extends uvm_object;
       if (!status.ok()) return status;
     end
     else if ($cast(source_mrt, source)) begin
-      status = checked_handle_snapshot(source_mrt.mr_h,
+      status = rdma_cmq_checked_handle_snapshot(source_mrt.mr_h,
                                        {label, " MRT MR"}, failure_code,
                                        handle0_snapshot);
       if (!status.ok()) return status;
-      status = checked_handle_snapshot(source_mrt.pd_h,
+      status = rdma_cmq_checked_handle_snapshot(source_mrt.pd_h,
                                        {label, " MRT PD"}, failure_code,
                                        handle1_snapshot);
       if (!status.ok()) return status;
@@ -3314,11 +3200,11 @@ class rdma_cmq_engine extends uvm_object;
       if (!status.ok()) return status;
     end
     else if ($cast(source_srqc, source)) begin
-      status = checked_handle_snapshot(source_srqc.srq_h,
+      status = rdma_cmq_checked_handle_snapshot(source_srqc.srq_h,
                                        {label, " SRQC SRQ"}, failure_code,
                                        handle0_snapshot);
       if (!status.ok()) return status;
-      status = checked_handle_snapshot(source_srqc.pd_h,
+      status = rdma_cmq_checked_handle_snapshot(source_srqc.pd_h,
                                        {label, " SRQC PD"}, failure_code,
                                        handle1_snapshot);
       if (!status.ok()) return status;
@@ -3328,7 +3214,7 @@ class rdma_cmq_engine extends uvm_object;
       if (!status.ok()) return status;
     end
     else if ($cast(source_ceqc, source)) begin
-      status = checked_handle_snapshot(source_ceqc.ceq_h,
+      status = rdma_cmq_checked_handle_snapshot(source_ceqc.ceq_h,
                                        {label, " CEQC CEQ"}, failure_code,
                                        handle0_snapshot);
       if (!status.ok()) return status;
@@ -3346,7 +3232,7 @@ class rdma_cmq_engine extends uvm_object;
       if (!status.ok()) return status;
     end
     else if ($cast(source_aeqc, source)) begin
-      status = checked_handle_snapshot(source_aeqc.aeq_h,
+      status = rdma_cmq_checked_handle_snapshot(source_aeqc.aeq_h,
                                        {label, " AEQC AEQ"}, failure_code,
                                        handle0_snapshot);
       if (!status.ok()) return status;
@@ -3439,24 +3325,6 @@ class rdma_cmq_engine extends uvm_object;
     end
     if (!status.ok()) snapshot = null;
     return status;
-  endfunction
-
-  // 功能：保留 engine 的 protected opcode snapshot seam，
-  // 转发到共享有类型快照契约。
-  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
-  // helper 先清空并在成功时接收独立 opcode key；engine 不保存引用。
-  // 失败/边界：source validate 状态的 code/message 优先原样传播；其余 null、
-  // clone/self/cast、字段漂移或 snapshot validate 失败也由 helper 保持原错误顺序，
-  // 不发布 partial snapshot。
-  protected function rdma_status checked_opcode_snapshot(
-    rdma_cmq_opcode_key source,
-    string label,
-    rdma_status_code_e failure_code,
-    output rdma_cmq_opcode_key snapshot
-  );
-    return rdma_cmq_checked_opcode_snapshot(
-      source, label, failure_code, snapshot
-    );
   endfunction
 
   // 功能：checked_profile_body_snapshot 复制 source、label、snapshot、staging_invariant_failed 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
@@ -3554,26 +3422,26 @@ class rdma_cmq_engine extends uvm_object;
       );
     if (!status.ok())
       return status;
-    if (!core_body_shell_is_exact(source))
+    if (!rdma_cmq_core_body_shell_is_exact(source))
       return checked_profile_body_snapshot(
         source, label, snapshot, staging_invariant_failed
       );
-    if (!has_exact_object_type(source,
+    if (!rdma_cmq_has_exact_object_type(source,
                                rdma_cmq_sqe_model::get_type())) begin
-      if (has_exact_object_type(source, rdma_qpc_model::get_type()) &&
+      if (rdma_cmq_has_exact_object_type(source, rdma_qpc_model::get_type()) &&
           $cast(source_qpc, source))
         return checked_qpc_snapshot(
           source_qpc, label, failure_code, snapshot
         );
-      if ((has_exact_object_type(source, rdma_cqc_model::get_type()) &&
+      if ((rdma_cmq_has_exact_object_type(source, rdma_cqc_model::get_type()) &&
            $cast(source_cqc, source)) ||
-          (has_exact_object_type(source, rdma_mrt_model::get_type()) &&
+          (rdma_cmq_has_exact_object_type(source, rdma_mrt_model::get_type()) &&
            $cast(source_mrt, source)) ||
-          (has_exact_object_type(source, rdma_srqc_model::get_type()) &&
+          (rdma_cmq_has_exact_object_type(source, rdma_srqc_model::get_type()) &&
            $cast(source_srqc, source)) ||
-          (has_exact_object_type(source, rdma_ceqc_model::get_type()) &&
+          (rdma_cmq_has_exact_object_type(source, rdma_ceqc_model::get_type()) &&
            $cast(source_ceqc, source)) ||
-          (has_exact_object_type(source, rdma_aeqc_model::get_type()) &&
+          (rdma_cmq_has_exact_object_type(source, rdma_aeqc_model::get_type()) &&
            $cast(source_aeqc, source)))
         return checked_context_snapshot(
           source, label, failure_code, snapshot
@@ -3587,7 +3455,7 @@ class rdma_cmq_engine extends uvm_object;
       saved_opcode = source_sqe.opcode;
       saved_command_id = source_sqe.command_id;
       saved_flags = source_sqe.flags;
-      status = checked_function_snapshot(
+      status = rdma_cmq_checked_function_snapshot(
         source_sqe.function_h, {label, " body"}, failure_code,
         function_snapshot
       );
@@ -3595,7 +3463,7 @@ class rdma_cmq_engine extends uvm_object;
         return status;
       target_snapshot = null;
       if (source_sqe.target_h != null) begin
-        status = checked_handle_snapshot(
+        status = rdma_cmq_checked_handle_snapshot(
           source_sqe.target_h, {label, " body target"}, failure_code,
           target_snapshot
         );
@@ -3648,41 +3516,6 @@ class rdma_cmq_engine extends uvm_object;
     if (!status.ok())
       snapshot = null;
     return status;
-  endfunction
-
-  // 功能：保留 engine 的 protected image snapshot seam，
-  // 转发到共享有类型 factory/clone 契约。
-  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package
-  // helper 先清空并在成功时接收可转换的等值非自别名 image，
-  // 不要求保留 source runtime subtype；engine 不保存引用。
-  // 失败/边界：null、saved-value factory 失败、clone/cast/self 契约失败或公开值漂移时
-  // 原样返回 helper 状态；本 seam 不额外执行 image shape 校验。
-  protected function rdma_status checked_image_snapshot(
-    rdma_hw_image source,
-    string label,
-    rdma_status_code_e failure_code,
-    output rdma_hw_image snapshot
-  );
-    return rdma_cmq_checked_image_snapshot(
-      source, label, failure_code, snapshot
-    );
-  endfunction
-
-  // 功能：保留 engine 的 protected canonical image seam，
-  // 转发到先 clone、后重建 exact base image 的共享契约。
-  // 输入/输出及副作用：source/label/failure_code 原样传入；snapshot 由 package helper
-  // 先清空并在成功时接收与 source/factory candidate 无别名的 exact rdma_hw_image。
-  // 失败/边界：底层 image factory/clone 失败时原样传播；shape 或重建值失配仅在
-  // 消费 clone 契约后拒绝，不改变可观测 factory/clone 次数。
-  protected function rdma_status checked_canonical_image_snapshot(
-    rdma_hw_image source,
-    string label,
-    rdma_status_code_e failure_code,
-    output rdma_hw_image snapshot
-  );
-    return rdma_cmq_checked_canonical_image_snapshot(
-      source, label, failure_code, snapshot
-    );
   endfunction
 
   // 功能：checked_completion_payload_snapshot 复制 source、snapshot 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
@@ -3772,7 +3605,7 @@ class rdma_cmq_engine extends uvm_object;
     if (factory_snapshot == null)
       return invalid_state("CMQ completion ticket construction failed");
     factory_snapshot.command_id = saved_command_id;
-    status = checked_function_snapshot(
+    status = rdma_cmq_checked_function_snapshot(
       source.function_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
       factory_snapshot.function_h
     );
@@ -3780,7 +3613,7 @@ class rdma_cmq_engine extends uvm_object;
       snapshot = null;
       return status;
     end
-    status = checked_handle_snapshot(
+    status = rdma_cmq_checked_handle_snapshot(
       source.cmq_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
       factory_snapshot.cmq_h
     );
@@ -3791,7 +3624,7 @@ class rdma_cmq_engine extends uvm_object;
     factory_snapshot.slot_sequence = saved_slot_sequence;
     factory_snapshot.sq_index = saved_sq_index;
     factory_snapshot.sq_wrap = saved_sq_wrap;
-    status = checked_opcode_snapshot(
+    status = rdma_cmq_checked_opcode_snapshot(
       source.opcode_key, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
       factory_snapshot.opcode_key
     );
@@ -3896,13 +3729,13 @@ class rdma_cmq_engine extends uvm_object;
     saved_vfid_override = source.vfid_override;
     saved_use_vfid = source.use_vfid;
     saved_timeout = source.timeout;
-    status = checked_function_snapshot(
+    status = rdma_cmq_checked_function_snapshot(
       source.function_h, "CMQ command", RDMA_SC_INVALID_ARGUMENT,
       function_snapshot
     );
     if (!status.ok())
       return status;
-    status = checked_opcode_snapshot(
+    status = rdma_cmq_checked_opcode_snapshot(
       source.opcode_key, "CMQ command", RDMA_SC_INVALID_ARGUMENT,
       opcode_snapshot
     );
@@ -3916,7 +3749,7 @@ class rdma_cmq_engine extends uvm_object;
       return status;
     signature_snapshot = null;
     if (source.qpc_signature_source != null) begin
-      status = checked_canonical_image_snapshot(
+      status = rdma_cmq_checked_canonical_image_snapshot(
         source.qpc_signature_source, "CMQ command signature",
         RDMA_SC_INVALID_ARGUMENT, signature_snapshot
       );
@@ -4005,14 +3838,14 @@ class rdma_cmq_engine extends uvm_object;
     saved_value = rdma_dma_mapping::type_id::create({name, "_saved"});
     if (saved_value == null)
       return invalid_state("CMQ dependency mapping value capture failed");
-    status = checked_function_snapshot(
+    status = rdma_cmq_checked_function_snapshot(
       source.function_h, "CMQ dependency mapping", RDMA_SC_INVALID_STATE,
       saved_value.function_h
     );
     if (!status.ok()) begin
       return status;
     end
-    status = checked_handle_snapshot(
+    status = rdma_cmq_checked_handle_snapshot(
       source.owner_h, "CMQ dependency mapping owner", RDMA_SC_INVALID_STATE,
       saved_value.owner_h
     );
@@ -4080,14 +3913,14 @@ class rdma_cmq_engine extends uvm_object;
     if (ticket == null)
       return invalid_state("CMQ ticket construction failed");
     ticket.command_id = command_id;
-    status = checked_function_snapshot(
+    status = rdma_cmq_checked_function_snapshot(
       function_h, "CMQ ticket", RDMA_SC_INVALID_STATE, ticket.function_h
     );
     if (!status.ok()) begin
       ticket = null;
       return status;
     end
-    status = checked_handle_snapshot(
+    status = rdma_cmq_checked_handle_snapshot(
       cmq_h, "CMQ ticket", RDMA_SC_INVALID_STATE, ticket.cmq_h
     );
     if (!status.ok()) begin
@@ -4097,7 +3930,7 @@ class rdma_cmq_engine extends uvm_object;
     ticket.slot_sequence = slot_sequence;
     ticket.sq_index = sq_index;
     ticket.sq_wrap = sq_wrap;
-    status = checked_opcode_snapshot(
+    status = rdma_cmq_checked_opcode_snapshot(
       opcode_key, "CMQ ticket", RDMA_SC_INVALID_STATE, ticket.opcode_key
     );
     if (!status.ok()) begin
@@ -4557,30 +4390,6 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_cmq_direct_status(code, message);
   endfunction
 
-  // 功能：保留 engine 的 protected retained-owner 比较 seam，并转发共享 journal 值契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 owner；返回公开字段与资源 incarnation 比较结果，
-  //   不修改 engine、owner 或 journal。
-  // 失败/边界：shape 非法、required handle/identity 缺失或字段漂移时共享契约返回 0；
-  //   same_instance() 比较 incarnation 值，不证明两个 handle 是同一对象 alias。
-  protected function bit same_journal_owner_value(
-    rdma_cmq_recovery_owner lhs,
-    rdma_cmq_recovery_owner rhs
-  );
-    return rdma_cmq_same_journal_owner_value(lhs, rhs);
-  endfunction
-
-  // 功能：保留 engine 的 protected detached-owner 比较 seam，并转发共享 journal 值契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 owner；返回完整 immutable 公开值比较结果，
-  //   不恢复 resource handle alias 或修改 engine。
-  // 失败/边界：shape 非法、required handle/identity 缺失或字段漂移时共享契约返回 0；
-  //   同一结果图内应保留的 owner 节点 alias 仍由调用方验证。
-  protected function bit same_journal_owner_detached_value(
-    input rdma_cmq_recovery_owner lhs,
-    input rdma_cmq_recovery_owner rhs
-  );
-    return rdma_cmq_same_journal_owner_detached_value(lhs, rhs);
-  endfunction
-
   // 功能：保留 engine 的 protected DMA-context instance 比较 seam，并转发共享契约。
   // 输入/输出及副作用：lhs/rhs 为只读 context；返回 Function/owner incarnation 与
   //   requester、route、epoch、queue-role 等公开投影比较结果，不执行 DMA。
@@ -4593,18 +4402,6 @@ class rdma_cmq_engine extends uvm_object;
     return rdma_cmq_same_journal_dma_context_value(lhs, rhs);
   endfunction
 
-  // 功能：保留 engine 的 protected detached DMA-context 比较 seam，并转发共享契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 context；返回 Function/owner handle 值与
-  //   requester、route、epoch、queue-role 等公开投影比较结果，不修改 context。
-  // 失败/边界：null、Function 缺失、optional owner 形状不一致或字段漂移时共享契约
-  //   返回 0；不做 validation、outer exact-type gate 或嵌套 handle alias 恢复。
-  protected function bit same_journal_dma_context_detached_value(
-    input rdma_dma_request_context lhs,
-    input rdma_dma_request_context rhs
-  );
-    return rdma_cmq_same_journal_dma_context_detached_value(lhs, rhs);
-  endfunction
-
   // 功能：保留 engine 的 protected mapping-public 比较 seam，并转发共享 journal 契约。
   // 输入/输出及副作用：lhs/rhs 为只读 mapping；返回公开 authority/range/state、
   //   外部 UMEM/PBL/MW 引用与 page metadata 比较结果，不修改 mapping 或 engine。
@@ -4615,18 +4412,6 @@ class rdma_cmq_engine extends uvm_object;
     rdma_dma_mapping rhs
   );
     return rdma_cmq_same_journal_mapping_public_value(lhs, rhs);
-  endfunction
-
-  // 功能：保留 engine 的 protected command-identity 比较 seam，并转发共享契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 identity；返回七个既有标量/文本字段比较结果，
-  //   不修改 execution result、journal 或 engine。
-  // 失败/边界：null、非 Function kind、零 UID/generation、空 profile/variant 或字段漂移
-  //   时共享契约返回 0；不做 outer exact-type gate 或额外 canonicalization。
-  protected function bit same_journal_command_identity_value(
-    rdma_cmq_command_identity lhs,
-    rdma_cmq_command_identity rhs
-  );
-    return rdma_cmq_same_journal_command_identity_value(lhs, rhs);
   endfunction
 
   // 功能：直接复制 DMA request context 及两个嵌套 handle，供 journal 图拥有 detached 值。
@@ -4814,15 +4599,15 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ journal command source/context/profile is invalid"
       );
 
-    context_body = has_exact_object_type(source.body,
+    context_body = rdma_cmq_has_exact_object_type(source.body,
                                          rdma_cqc_model::get_type()) ||
-                   has_exact_object_type(source.body,
+                   rdma_cmq_has_exact_object_type(source.body,
                                          rdma_mrt_model::get_type()) ||
-                   has_exact_object_type(source.body,
+                   rdma_cmq_has_exact_object_type(source.body,
                                          rdma_srqc_model::get_type()) ||
-                   has_exact_object_type(source.body,
+                   rdma_cmq_has_exact_object_type(source.body,
                                          rdma_ceqc_model::get_type()) ||
-                   has_exact_object_type(source.body,
+                   rdma_cmq_has_exact_object_type(source.body,
                                          rdma_aeqc_model::get_type());
     if (context_body)
       status = checked_context_snapshot(
@@ -4866,7 +4651,7 @@ class rdma_cmq_engine extends uvm_object;
         "CMQ journal command shell nested snapshot failed"
       );
     if (detached_owner == null || detached_owner == source.recovery_owner ||
-        !same_journal_owner_value(source.recovery_owner, detached_owner) ||
+        !rdma_cmq_same_journal_owner_value(source.recovery_owner, detached_owner) ||
         source.timeout == 0)
       return journal_status(
         RDMA_SC_INVALID_ARGUMENT,
@@ -5042,19 +4827,6 @@ class rdma_cmq_engine extends uvm_object;
       );
     snapshot = candidate;
     return journal_status(RDMA_SC_OK);
-  endfunction
-
-  // 功能：用当前 engine profile 委托 completion result snapshot 的固定公开 seam。
-  // 输入/输出及副作用：source/context 为输入，snapshot 为输出；不取锁或修改 profile。
-  // 失败/边界：profile 缺失、未知 payload 或 shell 非法时输出 null 与非空错误。
-  protected function rdma_status snapshot_completion_for_result_locked(
-    input rdma_cmq_completion source,
-    input rdma_cmq_nonfatal_snapshot_context ctx_snapshot,
-    output rdma_cmq_completion snapshot
-  );
-    return snapshot_completion_with_profile_locked(
-      source, ctx_snapshot, profile, snapshot
-    );
   endfunction
 
   // 功能：为一次 runtime completion/timeout/late transition 只读定位唯一
@@ -5416,7 +5188,7 @@ class rdma_cmq_engine extends uvm_object;
     candidate.profile_name = source.profile_name;
     candidate.opcode = source.opcode;
     candidate.variant = source.variant;
-    if (!same_journal_command_identity_value(source, candidate))
+    if (!rdma_cmq_same_journal_command_identity_value(source, candidate))
       return journal_status(
         RDMA_SC_INVALID_ARGUMENT,
         "CMQ command identity source is incomplete or changed"
@@ -5796,18 +5568,6 @@ class rdma_cmq_engine extends uvm_object;
     return journal_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：用当前 profile 建立 journal record detached snapshot 的固定公开 seam。
-  // 输入/输出及副作用：source 为只读输入，snapshot 为输出；本函数不取锁。
-  // 失败/边界：当前 profile 缺失或任一完整图门禁失败时保持 output null。
-  protected function rdma_status snapshot_journal_record_locked(
-    input rdma_cmq_batch_submission_record source,
-    output rdma_cmq_batch_submission_record snapshot
-  );
-    return snapshot_journal_record_with_profile_locked(
-      source, profile, snapshot
-    );
-  endfunction
-
   // 功能：直接复制 recovery request，并以当前 profile 重算每项与批次 digest 后发布。
   // 输入/输出及副作用：source 为只读输入，snapshot 入口清空；一个 direct-new
   //   context 保留 items/proof 中重复 ticket/owner，mapping 保留 opaque authority。
@@ -6101,20 +5861,6 @@ class rdma_cmq_engine extends uvm_object;
     return journal_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：保留 engine protected seam，并将完整 Function binding journal 投影比较
-  // 转发给 model 层唯一实现，维持两个 recovery caller 的既有扩展边界。
-  // 输入/输出及副作用：lhs/rhs 为只读 binding；package helper 会创建短生命周期
-  // identity/status，返回比较结果，不修改 binding、journal、锁或 engine 状态。
-  // 失败/边界：null、非 exact base wrapper、identity/BAR 缺失、owner null parity/
-  // runtime wrapper/incarnation 或任一字段漂移返回 0；本转发不增加 validate、digest、
-  // I/O 或新的错误映射；两侧 owner 同为 null 仍按既有契约接受。
-  protected function bit same_journal_binding_value(
-    input rdma_function_binding lhs,
-    input rdma_function_binding rhs
-  );
-    return rdma_cmq_same_journal_binding_value(lhs, rhs);
-  endfunction
-
   // 功能：比较 recovery request 与 journal item 的四个独立重算 digest，并在
   //   digest 全部可信后逐字段复验 command/body/owner/ticket/DMA/image/mapping。
   // 输入/输出及副作用：request_item、journal_item 与四个 recomputed digest
@@ -6182,7 +5928,7 @@ class rdma_cmq_engine extends uvm_object;
           journal_item.command.vfid_override ||
         request_item.command.use_vfid != journal_item.command.use_vfid ||
         request_item.command.timeout != journal_item.command.timeout ||
-        !same_journal_owner_value(request_item.recovery_owner,
+        !rdma_cmq_same_journal_owner_value(request_item.recovery_owner,
                                   journal_item.recovery_owner) ||
         !same_ticket_value(request_item.ticket, journal_item.ticket) ||
         !same_journal_dma_context_value(request_item.dma_context,
@@ -6247,7 +5993,7 @@ class rdma_cmq_engine extends uvm_object;
         request.batch_id != journal_record.batch_id ||
         !request.expected_function_identity.same_incarnation(
           journal_record.function_identity
-        ) || !same_journal_binding_value(request.binding,
+        ) || !rdma_cmq_same_journal_binding_value(request.binding,
                                           journal_record.binding) ||
         !same_handle(request.cmq_h, journal_record.cmq_h) ||
         !same_image_value(request.doorbell_image,
@@ -8000,7 +7746,7 @@ class rdma_cmq_engine extends uvm_object;
       engine_lock.put(1);
       return;
     end
-    if (!same_bdf(binding_candidate.pcie.bdf,
+    if (!rdma_cmq_same_bdf_value(binding_candidate.pcie.bdf,
                   prepared_binding.pcie.bdf)) begin
       status = rdma_status::make(
         RDMA_SC_DMA_TRANSLATION,
@@ -8525,19 +8271,6 @@ class rdma_cmq_engine extends uvm_object;
     end
   endfunction
 
-  // 功能：通过 model contract 比较 request-carried 与 authoritative retained reset
-  //   proof，保留 engine protected seam 供既有调用与测试扩展点使用。
-  // 输入/输出及副作用：lhs/rhs 为只读输入；只转发并返回完整公开值 equality，
-  //   不 mint、推进或登记 proof，也不访问 retry mapping/fence/observer。
-  // 失败/边界：null、tuple cardinality、identity/owner 或任一固定/排除字段漂移
-  //   返回 0；package comparator 不额外 validate 或重算 digest。
-  protected function bit same_reset_isolation_proof_value(
-    input rdma_cmq_reset_isolation_proof lhs,
-    input rdma_cmq_reset_isolation_proof rhs
-  );
-    return rdma_cmq_same_reset_isolation_proof_value(lhs, rhs);
-  endfunction
-
   // 功能：把 authoritative retained READY reset proof 重新绑定到当前 journal
   //   batch identity、engine/Function incarnation 与完整 ordered item authority tuple。
   // 输入/输出及副作用：proof/record 为锁内只读输入；逐项比较 request index、
@@ -8640,7 +8373,7 @@ class rdma_cmq_engine extends uvm_object;
                 record.items[i].image_digest ||
               proof.isolated_authority_digests[p] !==
                 record.items[i].authority_digest ||
-              !same_journal_owner_value(
+              !rdma_cmq_same_journal_owner_value(
                 proof.isolated_recovery_owners[p],
                 record.items[i].recovery_owner
               ))
@@ -8996,7 +8729,7 @@ class rdma_cmq_engine extends uvm_object;
         stage.transaction_failed = 1'b1;
         break;
       end
-      status = checked_function_snapshot(
+      status = rdma_cmq_checked_function_snapshot(
         active_function, "CMQ submission slot", RDMA_SC_INVALID_STATE,
         slot_context.function_h
       );
@@ -9007,7 +8740,7 @@ class rdma_cmq_engine extends uvm_object;
         stage.transaction_failed = 1'b1;
         break;
       end
-      status = checked_handle_snapshot(
+      status = rdma_cmq_checked_handle_snapshot(
         cmq_snapshot.handle, "CMQ submission slot",
         RDMA_SC_INVALID_STATE, slot_context.cmq_h
       );
@@ -9068,7 +8801,7 @@ class rdma_cmq_engine extends uvm_object;
         stage.transaction_failed = 1'b1;
         break;
       end
-      status = checked_canonical_image_snapshot(
+      status = rdma_cmq_checked_canonical_image_snapshot(
         profile_sqe, "CMQ SQE", RDMA_SC_INVALID_STATE, sqe_snapshot
       );
       if (status == null || !status.ok()) begin
@@ -9275,7 +9008,7 @@ class rdma_cmq_engine extends uvm_object;
       end
     end
     if (!transaction_failed) begin
-      status = checked_handle_snapshot(
+      status = rdma_cmq_checked_handle_snapshot(
         cmq_snapshot.handle, "CMQ doorbell encoder",
         RDMA_SC_INVALID_STATE, doorbell_encode_target
       );
@@ -9318,7 +9051,7 @@ class rdma_cmq_engine extends uvm_object;
       end
     end
     if (!transaction_failed) begin
-      status = checked_canonical_image_snapshot(
+      status = rdma_cmq_checked_canonical_image_snapshot(
         doorbell_image, "CMQ doorbell", RDMA_SC_INVALID_STATE,
         doorbell_snapshot
       );
@@ -9405,7 +9138,7 @@ class rdma_cmq_engine extends uvm_object;
     end
     if (!transaction_failed) begin
       doorbell_candidate.kind = RDMA_DOORBELL_CMQ_SQ;
-      status = checked_function_snapshot(
+      status = rdma_cmq_checked_function_snapshot(
         active_function, "CMQ doorbell descriptor", RDMA_SC_INVALID_STATE,
         doorbell_candidate.function_h
       );
@@ -9417,7 +9150,7 @@ class rdma_cmq_engine extends uvm_object;
       end
     end
     if (!transaction_failed) begin
-      status = checked_handle_snapshot(
+      status = rdma_cmq_checked_handle_snapshot(
         cmq_snapshot.handle, "CMQ doorbell descriptor",
         RDMA_SC_INVALID_STATE, doorbell_candidate.target_h
       );
@@ -10342,7 +10075,7 @@ class rdma_cmq_engine extends uvm_object;
         request_proof_digest !== journal_proof_digest ||
         request.reset_isolation_proof.batch_digest !==
           request.batch_digest ||
-        !same_reset_isolation_proof_value(
+        !rdma_cmq_same_reset_isolation_proof_value(
           request.reset_isolation_proof,
           record.reset_isolation_proof
         )) begin
@@ -10398,7 +10131,7 @@ class rdma_cmq_engine extends uvm_object;
     if (engine_state != RDMA_CMQ_ENGINE_ACTIVE || prepared_binding == null ||
         dma_context == null || cmq_snapshot == null ||
         backing_mapping == null || transport == null || profile == null ||
-        !same_journal_binding_value(prepared_binding, record.binding) ||
+        !rdma_cmq_same_journal_binding_value(prepared_binding, record.binding) ||
         !same_handle(cmq_snapshot.handle, record.cmq_h)) begin
       status = journal_status(
         RDMA_SC_INVALID_STATE,
@@ -10635,12 +10368,12 @@ class rdma_cmq_engine extends uvm_object;
       );
       return 1'b0;
     end
-    nested_status = checked_function_snapshot(
+    nested_status = rdma_cmq_checked_function_snapshot(
       descriptor_function_source, "CMQ recovery doorbell descriptor",
       RDMA_SC_INVALID_STATE, doorbell_candidate.function_h
     );
     if (nested_status != null && nested_status.ok())
-      nested_status = checked_handle_snapshot(
+      nested_status = rdma_cmq_checked_handle_snapshot(
         record.cmq_h, "CMQ recovery doorbell descriptor",
         RDMA_SC_INVALID_STATE, descriptor_target
       );
@@ -11654,7 +11387,7 @@ class rdma_cmq_engine extends uvm_object;
     status = make_raw_cqe_image(data, raw_cqe);
     if (!status.ok())
       return;
-    status = checked_image_snapshot(
+    status = rdma_cmq_checked_image_snapshot(
       raw_cqe, "CMQ CQE inspection", RDMA_SC_INVALID_STATE,
       raw_snapshot
     );

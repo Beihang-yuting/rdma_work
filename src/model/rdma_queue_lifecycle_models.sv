@@ -1252,21 +1252,6 @@ function automatic bit rdma_qp_needs_sq_sgb(
           (max_send_sge > 2 || max_recv_sge > 2));
 endfunction
 
-// 功能：在 rdma_qp_ring_layout 中，rdma_qp_sgb_layout 根据 QP transport/depth/stride 计算 SQ SGB 页布局、长度和对齐约束。
-// 输入/输出及副作用：depth（输入）；rdma_qp_sgb_layout 读取 depth 并使用字段 layout、layout.role、layout.entry_size_bytes、layout.depth、layout.logical_bytes、layout.storage_bytes、layout.object_mode；函数返回 rdma_qp_ring_layout，不取得调用方资源所有权。
-// 失败/边界：rdma_qp_sgb_layout 的结果直接由 return layout 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-function automatic rdma_qp_ring_layout rdma_qp_sgb_layout(int unsigned depth);
-  rdma_qp_ring_layout layout;
-  layout = rdma_qp_ring_layout::type_id::create("sq_sgb_layout");
-  layout.role = RDMA_QUEUE_ROLE_QP_SQ_SGB;
-  layout.entry_size_bytes = 512;
-  layout.depth = depth;
-  layout.logical_bytes = longint'(depth) * 512;
-  layout.storage_bytes = ((layout.logical_bytes + 4095) / 4096) * 4096;
-  layout.object_mode = RDMA_OBJECT_INDIRECT_4K;
-  return layout;
-endfunction
-
 class rdma_qp_backing_ref extends uvm_object;
   // backing_ref 是 QP 资源持有的 mapping authority；borrowed 只保留 detached 引用。
   `uvm_object_utils(rdma_qp_backing_ref)

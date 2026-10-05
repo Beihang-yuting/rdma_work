@@ -1568,35 +1568,6 @@ class rdma_umem extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：增加 UMEM 的共享引用，供 PBL/MW 绑定在异步生命周期中保持页有效。
-  // 输入/输出及副作用：成功时 refcount 加一；不改变 pin_count 或外部资源。
-  // 失败/边界：未 pin、已 detached 或 refcount 溢出返回 INVALID_STATE/RESOURCE_EXHAUSTED。
-  function rdma_status retain();
-    if (!pinned || detached)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "cannot retain an unpinned UMEM");
-    if (refcount == 32'hffff_ffff)
-      return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
-                               "UMEM reference count exhausted");
-    refcount++;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：释放一个 UMEM 引用，并在引用归零时 exactly-once unpin 所有页。
-  // 输入/输出及副作用：成功归零时更新 pinned/unpin_count 和页状态；不释放 borrowed backing。
-  // 失败/边界：已 unpin 调用幂等返回成功；引用计数异常返回 INVALID_STATE。
-  function rdma_status release_ref();
-    if (!pinned)
-      return rdma_status::success("UMEM pages were already unpinned");
-    if (refcount == 0)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "UMEM reference count is zero while pinned");
-    refcount--;
-    if (refcount != 0)
-      return rdma_status::success();
-    return unpin_pages();
-  endfunction
-
   // 功能：撤销页 pin 并将 UMEM 置为终态，保证 unpin_count 只增加一次。
   // 输入/输出及副作用：成功时清除 pages 的 pinned/refcount 并更新 pinned/unpin_count；borrowed 由调用方决定是否调用此函数。
   // 失败/边界：重复调用幂等；detached borrowed UMEM 保持外部页不变。

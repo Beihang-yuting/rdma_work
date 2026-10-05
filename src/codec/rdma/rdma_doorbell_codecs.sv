@@ -858,20 +858,6 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，expected_target_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_target_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_resource_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_target_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
-  protected function rdma_resource_kind_e expected_target_kind();
-    case (variant_name)
-      "cmq_sq": return RDMA_RESOURCE_CMQ;
-      "srq_pi", "srq_limit": return RDMA_RESOURCE_SRQ;
-      "cq_rc_ud", "cq_urc": return RDMA_RESOURCE_CQ;
-      "ceq": return RDMA_RESOURCE_CEQ;
-      "aeq": return RDMA_RESOURCE_AEQ;
-      default: return RDMA_RESOURCE_QP;
-    endcase
-  endfunction
-
   // 功能：在 rdma_hw_doorbell_codec 中，expected_doorbell_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
   // 输入/输出及副作用：无显式参数；expected_doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
   // 失败/边界：测试函数 expected_doorbell_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。

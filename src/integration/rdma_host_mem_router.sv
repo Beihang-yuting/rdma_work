@@ -1104,22 +1104,6 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return original_status;
   endfunction
 
-  // 功能：保留旧版四维 epoch 聚合 helper 的兼容形状，供仓库外仍编译该 protected seam 的
-  //       adapter/测试使用；当前 allocation、mapping ledger 和 stale 校验均不调用它。
-  // 输入/输出及副作用：四个独立 epoch（输入）；只读返回定宽算术和，不修改 router ledger，
-  //   也不参与 request_context.reset_epoch 或 mapping.reset_epoch 的 authority 生产。
-  // 失败/边界：结果允许定宽回绕且可能与另一组维度碰撞；新代码不得用它生成 canonical
-  //   request epoch。确认所有外部 protected consumers 消失后，后续批次才可删除该兼容 helper。
-  protected function rdma_reset_epoch_t epoch_sum(
-    rdma_reset_epoch_t local_host_epoch,
-    rdma_reset_epoch_t coordinator_host_epoch,
-    rdma_reset_epoch_t function_epoch_value,
-    rdma_reset_epoch_t device_epoch_value
-  );
-    return local_host_epoch + coordinator_host_epoch +
-           function_epoch_value + device_epoch_value;
-  endfunction
-
   // 功能：按对象或 opaque release authority 在 router 自有 mapping 列表中定位 ledger 下标。
   // 输入/输出及副作用：mapping（输入）；优先按原对象身份查找，随后调用各 manager mapping
   //       的 authority 等价校验以支持 planner 产生的 detached 快照；不修改数组。

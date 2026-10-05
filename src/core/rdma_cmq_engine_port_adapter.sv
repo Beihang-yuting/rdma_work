@@ -68,7 +68,7 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
   // 输入/输出及副作用：lhs/rhs 为只读 ticket；比较 command、Function/CMQ handle、
   //   slot、opcode key 和 deadline，不执行 I/O 或修改对象。
   // 失败/边界：任一 ticket shape 非法、嵌套值不一致或字段未知时返回 0；本函数
-  //   不要求对象别名，别名关系由 observed_result_shape_valid 单独验证。
+  //   不要求对象别名，别名关系由 observed_result_semantics_valid 单独验证。
   protected function bit same_ticket_value(
     input rdma_cmq_ticket lhs,
     input rdma_cmq_ticket rhs
@@ -333,17 +333,6 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     endcase
   endfunction
 
-  // 功能：检查 observed execution result 的 effect/phase/completion 形状，阻止
-  //   adapter 把不可能 envelope 当作可靠 lifecycle 证据继续发布。
-  // 输入/输出及副作用：value 为只读 engine 输出；返回布尔形状判定，不修改 value。
-  // 失败/边界：未知枚举、pending/terminal 与 completion nullness 矛盾均拒绝；
-  //   operation status 与 effects 不被该检查改写。
-  protected function bit observed_result_shape_valid(
-    input rdma_cmq_execution_result value
-  );
-    return observed_result_semantics_valid(value);
-  endfunction
-
   // 功能：在 rdma_cmq_engine_port_adapter 中，bind_engine 把 bind_engine 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
   // 输入/输出及副作用：owner（输入）、engine（输入）；bind_engine 先依据 owner == null || owner.kind != RDMA_RESOURCE_FUNCTION || engine == null；$isunknown(owner.function_uid；engines.exists(key 校验 owner、engine；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
   // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
@@ -442,7 +431,7 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
       result.observation_status = invalid_state(
         "CMQ engine observed result observation status is null"
       );
-    if (!observed_result_shape_valid(result))
+    if (!observed_result_semantics_valid(result))
       result.observation_status = invalid_state(
         "CMQ engine observed result envelope is malformed"
       );

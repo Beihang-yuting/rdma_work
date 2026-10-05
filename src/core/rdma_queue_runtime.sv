@@ -3160,35 +3160,6 @@ class rdma_queue_runtime extends uvm_object;
     return value_ops::make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：mark_pending_completion_released 标记 CQ 对应 WQE 已释放，保证恢复路径幂等。
-  // 输入/输出及副作用：无显式输入；更新 completion_released。
-  // 失败/边界：无 pending、CI 未提交或目标不是有效 CQ completion 时返回 INVALID_STATE。
-  function rdma_status mark_pending_completion_released();
-    rdma_status lock_status;
-
-    lock_status = acquire_lock();
-    if (!value_ops::status_is_ok(lock_status)) return lock_status;
-    if (pending_operation_state == null || state != RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED ||
-        pending_operation_state.kind != RDMA_QUEUE_RUNTIME_CQ ||
-        !pending_operation_state.consumer_committed ||
-        !pending_operation_state.completion_target_valid ||
-        pending_operation_state.committed_consumer_cursor == null ||
-        !consumer_recovery_invariant_locked(
-          pending_operation_state, pending_operation_state.mmio_evidence,
-          pending_operation_state.consumer_committed,
-          pending_operation_state.committed_consumer_cursor) ||
-        !cursor_equal(consumer_index, consumer_wrap,
-                      pending_operation_state.committed_consumer_cursor.index,
-                      pending_operation_state.committed_consumer_cursor.wrap)) begin
-      lock.put(1);
-      return value_ops::make_runtime_status(RDMA_SC_INVALID_STATE,
-                                 "completion release ordering is invalid");
-    end
-    pending_operation_state.completion_released = 1'b1;
-    lock.put(1);
-    return value_ops::make_runtime_status(RDMA_SC_OK, "");
-  endfunction
-
   // 设计说明：完成与中止的准入不同，但结束后都不能残留可重放的 pending、reservation
   // 或授权位；集中清理这组状态，避免某一入口遗留旧授权。不能复用 configure/admission
   // 的初始化或回滚：这些路径尚未结束一笔恢复，且需要保留不同的 reservation/authority。
@@ -3345,23 +3316,6 @@ class rdma_queue_runtime extends uvm_object;
     if (consume_confirmation)
       recovery_retry_confirmed = 1'b0;
     return value_ops::make_runtime_status(RDMA_SC_OK, "");
-  endfunction
-
-  // 功能：project_mmio_evidence 对外提供带锁的 MMIO evidence 投影入口。
-  // 输入/输出及副作用：evidence（输入）；成功时更新当前 pending 的唯一 evidence authority 及兼容位。
-  // 失败/边界：无 pending、runtime 非 recovery、非法枚举或方向不匹配返回非成功状态，且输出阶段保持原值。
-  protected function rdma_status project_mmio_evidence(
-    rdma_queue_mmio_evidence_e evidence
-  );
-    rdma_status lock_status;
-    rdma_status status;
-
-    lock_status = acquire_lock();
-    if (!lock_status.ok()) return lock_status;
-
-    status = project_mmio_evidence_locked(evidence);
-    lock.put(1);
-    return status;
   endfunction
 
   // 功能：abort_recovery 放弃当前 pending 并把 attachment 隔离为 DETACHED，

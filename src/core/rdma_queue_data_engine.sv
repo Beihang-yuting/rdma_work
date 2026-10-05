@@ -5256,30 +5256,6 @@ class rdma_queue_data_engine extends uvm_object;
     end
   endfunction
 
-  // 功能：lookup_event_qp_route_for_poll 在 AEQ poll 阶段按 wire QPN 查找当前
-  //   Function 的 QP route，并把“没有对应对象”与“拓扑不唯一”分开报告。
-  // 输入/输出及副作用：qpn 为 CEQ/AEQ image 解码出的 18-bit local ID；link 与
-  //   route_found 为输出，成功唯一命中时返回 engine-owned link 非拥有引用，零命中
-  //   时保持 link=null、route_found=0；函数只读 qp_links，不修改 runtime 或资源。
-  // 失败/边界：同一 QPN 命中多个 attached link 返回 INVALID_STATE 且不允许消费；
-  //   零命中是驱动允许的 stale/unknown event，返回 OK 让 caller 继续 CI/doorbell；
-  //   函数不做低位投影、默认 QP 回退或跨 Function 猜测。
-  protected function rdma_status lookup_event_qp_route_for_poll(
-    int unsigned qpn,
-    output rdma_queue_data_qp_link link,
-    output bit route_found
-  );
-    int unsigned match_count;
-
-    scan_qp_link_by_local_id(qpn, link, match_count);
-    route_found = match_count != 0;
-    if (match_count > 1)
-      return bad("event QPN routes to multiple attached QPs",
-                 RDMA_SC_INVALID_STATE);
-
-    return rdma_status::success();
-  endfunction
-
   // 功能：find_cq_handle_for_local_id 按 CEQE CQN 在 CQ attachments 中选择唯一
   //   route，并尽量返回 detached CQ handle 值。
   // 输入/输出及副作用：cqn 为输入，cq_h 先置 null；只读 attachments，成功结果
@@ -5492,47 +5468,6 @@ class rdma_queue_data_engine extends uvm_object;
 
     // CQ flush 的两个 found bit 独立冻结；publish 要求二者同时为真，poll 则可用
     // OR 交付 partial result。任一路 miss 都不能覆盖另一条 live route 的存在性。
-    return rdma_status::success();
-  endfunction
-
-  // 功能：clone_slot_result 为 legacy 调用方复制一个 released WQE slot 的标量、
-  //   request/image 和 completion status。
-  // 输入/输出及副作用：source 为输入，result 先置 null；成功返回 detached slot，
-  //   不修改 source 或 runtime ledger，也不取得 source nested 对象所有权。
-  // 失败/边界：source=null 或 request/image clone 类型错误时返回错误并清空 result；
-  //   CQ prepared poll 不使用此 fatal-prone 兼容 helper，而使用 runtime non-fatal range snapshot。
-  protected function rdma_status clone_slot_result(
-    rdma_queue_slot_ledger_entry source,
-    output rdma_queue_slot_ledger_entry result
-  );
-    uvm_object cloned;
-    result = null;
-    if (source == null)
-      return bad("released slot ledger entry is null", RDMA_SC_INVALID_STATE);
-    result = rdma_queue_slot_ledger_entry::type_id::create("released_slot");
-    result.posted = source.posted;
-    result.consumed = source.consumed;
-    result.signaled = source.signaled;
-    result.wr_id = source.wr_id;
-    result.index = source.index;
-    result.wrap = source.wrap;
-    if (source.request_snapshot != null) begin
-      cloned = source.request_snapshot.clone();
-      if (cloned == null || !$cast(result.request_snapshot, cloned)) begin
-        result = null;
-        return bad("released request snapshot clone failed",
-                   RDMA_SC_RESOURCE_EXHAUSTED);
-      end
-    end
-    if (source.image != null) begin
-      cloned = source.image.clone();
-      if (cloned == null || !$cast(result.image, cloned)) begin
-        result = null;
-        return bad("released image snapshot clone failed",
-                   RDMA_SC_RESOURCE_EXHAUSTED);
-      end
-    end
-    result.completion_status = rdma_clone_status_value(source.completion_status);
     return rdma_status::success();
   endfunction
 

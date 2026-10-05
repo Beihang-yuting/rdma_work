@@ -211,24 +211,6 @@ class rdma_queue_backing_access extends uvm_object;
     qp_ref = null;
   endfunction
 
-  // 功能：为 CQ resize 建立独立的 backing-access 视图，复制 owner snapshot 并复用
-  //   当前 host_mem 与 backing 引用，但不共享本 access 的 queue/QP 指针状态容器。
-  // 输入/输出及副作用：无显式输入；成功返回新 access 对象，host_mem、queue_ref、
-  //   qp_ref 仍是非拥有引用，不释放或复制外部 backing。
-  // 失败/边界：owner/host_mem/queue_ref 任一缺失时返回 null；沿用 typed factory，
-  //   copy 的 null 无防御，owner clone 为空也不拒绝，调用方须再校验所得视图的可用性。
-  function rdma_queue_backing_access clone_for_resize();
-    rdma_queue_backing_access copy;
-    if (owner == null || host_mem == null || queue_ref == null)
-      return null;
-    copy = rdma_queue_backing_access::type_id::create("resize_backing_access");
-    copy.owner = rdma_clone_function_handle_value(owner, "resize backing owner");
-    copy.host_mem = host_mem;
-    copy.queue_ref = queue_ref;
-    copy.qp_ref = qp_ref;
-    return copy;
-  endfunction
-
   // 功能：计算 queue backing primary segment 与 additional segments 的连续 logical
   //   coverage 总长度，供 resolve_ref 判断请求是否落在完整 backing 内。
   // 输入/输出及副作用：backing_ref 为输入，total 为输出；函数只读 segment 元数据，

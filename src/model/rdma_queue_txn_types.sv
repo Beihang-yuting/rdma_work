@@ -39,13 +39,6 @@ class rdma_queue_cq_release_plan extends uvm_object;
   function new(string name = "rdma_queue_cq_release_plan");
     super.new(name); index = 0; wrap = 0; released = 0;
   endfunction
-  // 功能：执行 mark_released 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：无显式参数；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-  // 失败/边界：mark_released 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
-  function rdma_status mark_released();
-    released = 1'b1;
-    return rdma_status::success();
-  endfunction
   // 功能：将 rhs 中 rdma_queue_cq_release_plan 的值字段复制到当前对象，建立与源对象隔离的快照。
   // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（release plan copy mismatch），不保留部分有效快照。
@@ -224,14 +217,6 @@ class rdma_queue_txn_evidence extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 中文：所有阶段变更统一经过 advance，禁止恢复/释放路径绕过转换表。
-  // 功能：在 rdma_queue_txn_evidence 中，transition_to 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：next_phase（输入）；transition_to 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：transition_to 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
-  function rdma_status transition_to(rdma_queue_txn_phase_e next_phase);
-    return advance(next_phase);
-  endfunction
-
   // Capture mutable producer objects as detached value snapshots.
   // 功能：在 rdma_queue_txn_evidence 中，capture_function_identity 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：source（输入）；capture_function_identity 读取 source 并使用字段 cloned、route；函数返回 rdma_status，不取得调用方资源所有权。
@@ -289,13 +274,6 @@ class rdma_queue_txn_evidence extends uvm_object;
     return capture_queue_handle(source);
   endfunction
 
-  // 功能：执行 set_queue_handle 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：source（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：set_queue_handle 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
-  function rdma_status set_queue_handle(rdma_handle source);
-    return capture_queue_handle(source);
-  endfunction
-
   // 功能：在 rdma_queue_txn_evidence 中，capture_request 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：source（输入）；capture_request 读取 source 并使用字段
   //   status、cloned；函数返回 rdma_status，不取得调用方资源所有权。
@@ -334,13 +312,6 @@ class rdma_queue_txn_evidence extends uvm_object;
     return capture_request(source);
   endfunction
 
-  // 功能：执行 set_request_snapshot 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：source（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：set_request_snapshot 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
-  function rdma_status set_request_snapshot(rdma_semantic_request source);
-    return capture_request(source);
-  endfunction
-
   // 功能：在 rdma_queue_txn_evidence 中，capture_cqe 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：source（输入）；capture_cqe 读取 source 并使用字段 cqe_snapshot；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：capture_cqe 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“CQE is null”“CQE snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
@@ -361,13 +332,6 @@ class rdma_queue_txn_evidence extends uvm_object;
   // 输入/输出及副作用：source（输入）；capture_cqe_snapshot 读取 source 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：capture_cqe_snapshot 的结果直接由 return capture_cqe(source) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
   function rdma_status capture_cqe_snapshot(uvm_object source);
-    return capture_cqe(source);
-  endfunction
-
-  // 功能：执行 set_cqe_snapshot 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：source（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：set_cqe_snapshot 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
-  function rdma_status set_cqe_snapshot(uvm_object source);
     return capture_cqe(source);
   endfunction
 
@@ -399,13 +363,6 @@ class rdma_queue_txn_evidence extends uvm_object;
     return set_failure(source);
   endfunction
 
-  // 功能：在 rdma_queue_txn_evidence 中，capture_failure_status 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：source（输入）；capture_failure_status 读取 source 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：capture_failure_status 的结果直接由 return set_failure(source) 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-  function rdma_status capture_failure_status(rdma_status source);
-    return set_failure(source);
-  endfunction
-
   // 功能：在 rdma_queue_txn_evidence 中，capture_image 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
   // 输入/输出及副作用：source（输入）；capture_image 读取 source 并使用字段 cloned；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：capture_image 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_RESOURCE_EXHAUSTED；典型拒绝条件为“hardware image is null”“hardware image snapshot clone failed”；失败路径不提交部分状态或转移未声明资源。
@@ -434,7 +391,7 @@ class rdma_queue_txn_evidence extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "MMIO submission requires payload evidence");
     transition_status =
-      transition_to(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED);
+      advance(RDMA_QUEUE_TXN_DOORBELL_MAYBE_SUBMITTED);
     if (transition_status == null || !transition_status.ok())
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "MMIO phase transition failed");
@@ -483,7 +440,7 @@ class rdma_queue_txn_evidence extends uvm_object;
         release_plan[i].released = 1'b1;
         if (phase == RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL)
           return rdma_status::success();
-        return transition_to(RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL);
+        return advance(RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL);
       end
     end
     plan = rdma_queue_cq_release_plan::type_id::create("release_plan");
@@ -494,7 +451,7 @@ class rdma_queue_txn_evidence extends uvm_object;
     // behind on an INVALID_STATE result).
     if (phase == RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL)
       return rdma_status::success();
-    return transition_to(RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL);
+    return advance(RDMA_QUEUE_TXN_WQE_RELEASE_PARTIAL);
   endfunction
 
   // 功能：在 rdma_queue_txn_evidence 中，complete 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
@@ -508,21 +465,10 @@ class rdma_queue_txn_evidence extends uvm_object;
                                "transaction completion requires WQE release plan");
     foreach (release_plan[i]) begin
       if (release_plan[i] != null && release_plan[i].released)
-        return transition_to(RDMA_QUEUE_TXN_COMPLETED);
+        return advance(RDMA_QUEUE_TXN_COMPLETED);
     end
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "transaction completion requires released WQE");
   endfunction
 
-  // 中文：abort 是不可逆终态标记；调用者仍拥有 evidence，释放动作必须
-  // 由上层按资源所有权顺序执行，任何后续阶段修改都会被拒绝。
-  // 功能：在 rdma_queue_txn_evidence 中，abort 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  function rdma_status abort();
-    if (aborted || phase == RDMA_QUEUE_TXN_COMPLETED)
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "transaction is terminal");
-    aborted = 1'b1;
-    return rdma_status::success();
-  endfunction
 endclass

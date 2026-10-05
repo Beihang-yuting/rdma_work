@@ -329,25 +329,6 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
     endcase
   endfunction
 
-  // 功能：derive_payload_mode 为既有调用方返回共享 payload authority 的 mode。
-  // 输入/输出及副作用：无显式参数；只读当前模型并返回 mode，不修改模型；其余
-  //   authority output 仅为兼容 wrapper 的局部临时值。
-  // 失败/边界：未知显式 mode 原样返回供 validate 拒绝；null SGE 不在此函数放行，
-  //   后续 shape gate 仍返回 INVALID_ARGUMENT。
-  function automatic rdma_sq_payload_mode_e derive_payload_mode();
-    rdma_sq_payload_mode_e mode;
-    int unsigned valid_sge_count;
-    int unsigned inline_payload_bytes;
-    int unsigned canonical_sge_num;
-    bit inline_bytes_are_authority;
-    longint unsigned canonical_sge_payload_len;
-
-    derive_payload_authority(mode, valid_sge_count, inline_payload_bytes,
-                             inline_bytes_are_authority,
-                             canonical_sge_num);
-    return mode;
-  endfunction
-
   // 功能：derive_sge_num 为既有调用方返回共享 payload authority 的 canonical
   //   SGE_NUM：empty=0、inline=ceil(bytes/16)、SGE=有效项数、atomic=1。
   // 输入/输出及副作用：无显式参数；只读当前模型，返回未截断计数，不写 sge_num
@@ -619,16 +600,6 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
 
     decoded_raw_sgb_provenance_valid = 1'b1;
     return rdma_status::success();
-  endfunction
-
-  // 功能：clear_decoded_raw_sgb_provenance 放弃 detached raw 来源证明，使模型
-  //   必须重新通过 typed SGE 或显式 provenance API 建立 external authority。
-  // 输入/输出及副作用：无输入；清除内部 marker，不修改 sge_num、payload_len、
-  //   SGB_PA 或已安装 descriptor bytes。
-  // 失败/边界：清除后若 sges 为空且仍要编码 external RQE，必须重新调用
-  //   mark_decoded_raw_sgb_provenance 并安装 descriptor authority，否则 fail-closed。
-  function void clear_decoded_raw_sgb_provenance();
-    decoded_raw_sgb_provenance_valid = 1'b0;
   endfunction
 
   // 功能：has_decoded_raw_sgb_provenance 返回模型是否持有 codec 建立的 detached
@@ -1217,18 +1188,6 @@ class rdma_hw_ceqe_model extends rdma_ceqe_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：clear_profile_transport_authority 清除 canonical CEQE 的 routed profile，
-  //       用于丢弃一个不再属于当前 CQ attachment 的 detached 候选。
-  // 输入/输出及副作用：无输入；清除 profile_transport_valid 与 raw replay 授权，
-  //       不修改物理字段、CQ handle 或外部 runtime/backing。
-  // 失败/边界：清除不可恢复此前的 authority；清除后普通 encode 必须重新获得
-  //       当前 route 的 transport，不能回退到 RC 默认值。
-  function void clear_profile_transport_authority();
-    profile_transport = RDMA_TRANSPORT_RESERVED;
-    profile_transport_valid = 1'b0;
-    raw_qword1_replay_authorized = 1'b0;
-  endfunction
-
   // 功能：authorize_raw_qword1_replay 显式允许把 decode 保存的 qword1 原字节
   //       原样重放，保留驱动同时暴露的 inactive physical overlay。
   // 输入/输出及副作用：无输入；成功时只设置 raw_qword1_replay_authorized，不复制
@@ -1242,18 +1201,6 @@ class rdma_hw_ceqe_model extends rdma_ceqe_model;
           "CEQE raw qword1 replay requires decoded authority");
     raw_qword1_replay_authorized = 1'b1;
     return rdma_status::success();
-  endfunction
-
-  // 功能：clear_raw_qword1_authority 放弃 decode 保存的 CEQE qword1 原始权威，
-  //       允许调用方在确认 alias 一致后按模型字段重新编码。
-  // 输入/输出及副作用：无显式输入；清除 raw_qword1_valid，不修改业务字段、
-  //       CQ handle 或外部 CEQ backing 的所有权。
-  // 失败/边界：该操作不可恢复原始字节；调用方若随后同时设置冲突的 RC/URC
-  //       alias，codec 会 fail-closed 而不会自动合并。
-  function void clear_raw_qword1_authority();
-    raw_qword1_valid = 1'b0;
-    raw_qword1 = '0;
-    raw_qword1_replay_authorized = 1'b0;
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CEQE requires CQ handle”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -1419,20 +1366,6 @@ class rdma_hw_aeqe_model extends rdma_aeqe_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：clear_profile_owner_authority 丢弃 canonical AEQE 的 route 绑定，供
-  //   detached candidate 在跨代际或重新路由时回到未认证状态。
-  // 输入/输出及副作用：无输入；清除 class/kind valid 位及 raw replay 授权，
-  //   保留所有物理字段和 target_h 值，不触碰 manager 或 AEQ runtime。
-  // 失败/边界：清除后任何普通 encode 都必须重新绑定 authority；该操作不可恢复
-  //   已丢弃的 route 证明，调用方不得把旧 target 当成隐式 authority。
-  function void clear_profile_owner_authority();
-    profile_class = RDMA_AEQE_EVENT_QP;
-    profile_owner_kind = RDMA_RESOURCE_QP;
-    profile_class_valid = 1'b0;
-    profile_owner_valid = 1'b0;
-    raw_replay_authorized = 1'b0;
-  endfunction
-
   // 功能：authorize_raw_replay 显式允许将 decode 保存的两个 AEQE qword 原样
   //   重放，保留驱动在 inactive overlay 中提供的物理证据。
   // 输入/输出及副作用：无输入；成功只置 raw_replay_authorized，不复制数组或
@@ -1446,18 +1379,6 @@ class rdma_hw_aeqe_model extends rdma_aeqe_model;
           "AEQE raw replay requires decoded qword authority");
     raw_replay_authorized = 1'b1;
     return rdma_status::success();
-  endfunction
-
-  // 功能：clear_raw_authority 放弃 decode 保留的 qword image，使调用方可以在
-  //  重新绑定 owner 后重新进行 canonical authoring。
-  // 输入/输出及副作用：无输入；清除 raw qword 值、valid/replay 位，不修改 typed
-  //   fields、target_h、manager 或 AEQ backing。
-  // 失败/边界：原始 qword 证据清除后不可恢复；后续 encode 不得再声称是 raw replay。
-  function void clear_raw_authority();
-    raw_qwords_valid = 1'b0;
-    raw_qword0 = '0;
-    raw_qword1 = '0;
-    raw_replay_authorized = 1'b0;
   endfunction
 
   // 功能：validate_wire_fields 校验 AEQE 中独立于 owner route 的驱动字段约束，
@@ -2492,55 +2413,6 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
       rdma_sq_payload_mode_e raw_mode,
       bit [3:0] raw_opcode);
     return 1'b0;
-  endfunction
-
-  // 功能：rc_qword1_allowed_mask 返回 RC/URC SQE qword1 在当前硬件 opcode
-  //   下真正由驱动写入的位；payload length 始终占低 32 位，immediate 或
-  //   invalidate key 只对驱动明确支持的 opcode 占高 32 位。
-  // 输入/输出及副作用：无显式输入；函数只读取 last_hw_opcode，不修改 codec
-  //   状态、builder 或模型，返回用于 reserved-bit 检查的 64-bit mask。
-  // 失败/边界：未知 opcode 不获得 immediate 位；调用方仍须对 NONE 模式的
-  //   payload length 和 LOCAL_INV 的低 32 位执行额外零值检查。
-  protected function bit [63:0] rc_qword1_allowed_mask();
-    bit [63:0] allowed;
-
-    allowed = 64'h0000_0000_ffff_ffff;
-    if (last_hw_opcode inside {RDMA_SQ_OPCODE_SEND_WITH_IMM,
-                               RDMA_SQ_OPCODE_SEND_WITH_INV,
-                               RDMA_SQ_OPCODE_WRITE_WITH_IMM,
-                               RDMA_SQ_OPCODE_LOCAL_INV})
-      allowed |= 64'hffff_ffff_0000_0000;
-    return allowed;
-  endfunction
-
-  // 功能：rc_opcode_has_remote_address 判断当前 RC/URC hardware opcode 是否
-  //   拥有 qword2 的 remote-key 与 qword3 的 remote-VA 坐标。
-  // 输入/输出及副作用：无显式输入；只读取 last_hw_opcode，返回驱动
-  //   xtrdma_set_rc_read_write_wqe() 是否会写入 remote address，不修改 codec。
-  // 失败/边界：SEND、LOCAL_INV 和未知 opcode 返回 false；atomic 使用独立
-  //   payload layout，不通过本函数扩大普通 RC body mask。
-  protected function bit rc_opcode_has_remote_address();
-    return last_hw_opcode inside {
-      RDMA_SQ_OPCODE_WRITE,
-      RDMA_SQ_OPCODE_WRITE_WITH_IMM,
-      RDMA_SQ_OPCODE_READ
-    };
-  endfunction
-
-  // 功能：rc_qword2_allowed_mask 按 opcode 返回 RC/URC qword2 的字段所有权；
-  //   signature 与 SGE_NUM 始终存在，remote-key 只属于 READ/WRITE。
-  // 输入/输出及副作用：无显式输入；读取 last_hw_opcode 并返回 64-bit mask，
-  //   不修改 builder、模型或 payload mode。
-  // 失败/边界：SEND/LOCAL_INV/未知 opcode 不放行低 32 位，防止跨 opcode
-  //   复用同一物理 qword 时把驱动固定为零的区域误当作有效字段。
-  protected function bit [63:0] rc_qword2_allowed_mask();
-    bit [63:0] allowed;
-
-    allowed = 64'hffff_0000_0000_0000;
-    if (rc_opcode_has_remote_address())
-      allowed |= 64'h0000_0000_ffff_ffff;
-
-    return allowed;
   endfunction
 
   // 功能：check_reserved 校验 b 与当前对象状态的一致性，并显式处理“RC SQE
@@ -4002,17 +3874,6 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
           RDMA_SC_INVALID_ARGUMENT, "CQE variant is invalid");
 
     active_variant = variant;
-    variant_is_explicit = 1'b1;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：set_ud_qword3_enabled 保留历史测试/adapter seam，并将其映射到
-  //       显式 UD variant；它不放宽其他 qword 的 reserved 检查。
-  // 输入/输出及副作用：enabled 为输入；更新 active_variant，不修改 profile
-  //       长度、已编码 image 或外部资源所有权。
-  // 失败/边界：关闭时回到 RC authority；未显式启用 UD 时 qword3 非零仍被拒绝。
-  function rdma_status set_ud_qword3_enabled(bit enabled);
-    active_variant = enabled ? RDMA_CQE_VARIANT_UD : RDMA_CQE_VARIANT_RC;
     variant_is_explicit = 1'b1;
     return rdma_status::success();
   endfunction
