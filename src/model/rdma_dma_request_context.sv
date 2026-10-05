@@ -115,21 +115,13 @@ class rdma_dma_request_context extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（rdma_dma_request_context copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_dma_request_context rhs_context;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_context, rhs))
       `uvm_fatal("RDMA_COPY_TYPE",
                  "rdma_dma_request_context copy type mismatch")
-    if (rhs_context.function_h == null) begin
-      function_h = null;
-    end
-    else begin
-      cloned_object = rhs_context.function_h.clone();
-      if (cloned_object == null || !$cast(function_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "DMA request Function clone type mismatch")
-    end
+    function_h = rdma_deep_copy#(rdma_function_handle)::of(
+      rhs_context.function_h, "DMA request Function clone type mismatch");
     requester_bdf = rhs_context.requester_bdf;
     pasid_valid = rhs_context.pasid_valid;
     pasid = rhs_context.pasid;
@@ -141,14 +133,7 @@ class rdma_dma_request_context extends uvm_object;
     epoch_valid = rhs_context.epoch_valid;
     queue_role_valid = rhs_context.queue_role_valid;
     queue_role = rhs_context.queue_role;
-    if (rhs_context.owner_h == null) begin
-      owner_h = null;
-    end
-    else begin
-      cloned_object = rhs_context.owner_h.clone();
-      if (cloned_object == null || !$cast(owner_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "DMA request owner clone type mismatch")
-    end
+    owner_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_context.owner_h, "DMA request owner clone type mismatch");
   endfunction
 endclass

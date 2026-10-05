@@ -65,21 +65,14 @@ class rdma_backing_ref extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（backing reference copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_backing_ref rhs_ref;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_ref, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "backing reference copy mismatch")
     ownership = rhs_ref.ownership;
     release_complete = rhs_ref.release_complete;
-    if (rhs_ref.mapping == null) begin
-      mapping = null;
-    end
-    else begin
-      cloned_object = rhs_ref.mapping.clone();
-      if (cloned_object == null || !$cast(mapping, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "backing mapping clone mismatch")
-    end
+    mapping = rdma_deep_copy#(rdma_dma_mapping)::of(
+      rhs_ref.mapping, "backing mapping clone mismatch");
   endfunction
 endclass
 
@@ -142,19 +135,12 @@ class rdma_hmc_ref extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（HMC reference copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_hmc_ref rhs_ref;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_ref, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "HMC reference copy mismatch")
-    if (rhs_ref.owner == null) begin
-      owner = null;
-    end
-    else begin
-      cloned_object = rhs_ref.owner.clone();
-      if (cloned_object == null || !$cast(owner, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "HMC owner clone mismatch")
-    end
+    owner = rdma_deep_copy#(rdma_function_handle)::of(
+      rhs_ref.owner, "HMC owner clone mismatch");
     object_kind = rhs_ref.object_kind;
     address = rhs_ref.address;
     size = rhs_ref.size;

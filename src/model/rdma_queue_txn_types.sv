@@ -92,38 +92,21 @@ class rdma_queue_txn_evidence extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（queue transaction evidence copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_txn_evidence source;
-    uvm_object cloned;
     rdma_queue_cq_release_plan plan_copy;
 
     super.do_copy(rhs);
     if (!$cast(source, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "queue transaction evidence copy mismatch")
-    if (source.function_identity == null) function_identity = null;
-    else begin
-      cloned = source.function_identity.clone();
-      if (cloned == null || !$cast(function_identity, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "transaction identity clone mismatch")
-    end
-    if (source.queue_h == null) queue_h = null;
-    else begin
-      cloned = source.queue_h.clone();
-      if (cloned == null || !$cast(queue_h, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "transaction queue handle clone mismatch")
-    end
+    function_identity = rdma_deep_copy#(rdma_function_identity)::of(
+      source.function_identity, "transaction identity clone mismatch");
+    queue_h = rdma_deep_copy#(rdma_handle)::of(
+      source.queue_h, "transaction queue handle clone mismatch");
     cursor = source.cursor;
     next_cursor = source.next_cursor;
-    if (source.image == null) image = null;
-    else begin
-      cloned = source.image.clone();
-      if (cloned == null || !$cast(image, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "transaction image clone mismatch")
-    end
-    if (source.request_snapshot == null) request_snapshot = null;
-    else begin
-      cloned = source.request_snapshot.clone();
-      if (cloned == null || !$cast(request_snapshot, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "transaction request clone mismatch")
-    end
+    image = rdma_deep_copy#(rdma_hw_image)::of(
+      source.image, "transaction image clone mismatch");
+    request_snapshot = rdma_deep_copy#(rdma_semantic_request)::of(
+      source.request_snapshot, "transaction request clone mismatch");
     if (source.cqe_snapshot == null) cqe_snapshot = null;
     else begin
       cqe_snapshot = source.cqe_snapshot.clone();
@@ -131,12 +114,8 @@ class rdma_queue_txn_evidence extends uvm_object;
         `uvm_fatal("RDMA_COPY_TYPE", "transaction CQE clone mismatch")
     end
     route = source.route;
-    if (source.failure_status == null) failure_status = null;
-    else begin
-      cloned = source.failure_status.clone();
-      if (cloned == null || !$cast(failure_status, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "transaction failure clone mismatch")
-    end
+    failure_status = rdma_deep_copy#(rdma_status)::of(
+      source.failure_status, "transaction failure clone mismatch");
     phase = source.phase;
     mmio_maybe_submitted = source.mmio_maybe_submitted;
     aborted = source.aborted;
@@ -151,9 +130,8 @@ class rdma_queue_txn_evidence extends uvm_object;
         release_plan.push_back(null);
       end
       else begin
-        cloned = source.release_plan[i].clone();
-        if (cloned == null || !$cast(plan_copy, cloned))
-          `uvm_fatal("RDMA_COPY_TYPE", "transaction release plan clone mismatch")
+        plan_copy = rdma_deep_copy#(rdma_queue_cq_release_plan)::of(
+          source.release_plan[i], "transaction release plan clone mismatch");
         release_plan.push_back(plan_copy);
       end
     end

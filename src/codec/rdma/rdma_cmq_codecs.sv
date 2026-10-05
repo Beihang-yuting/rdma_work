@@ -637,7 +637,6 @@ class rdma_hw_cqc_delete_body extends rdma_hw_model;
   //   context 为空时目标保持为空，不伪造默认 CQC。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_cqc_delete_body source;
-    uvm_object cloned_object;
     rdma_cqc_model cloned_context;
 
     super.do_copy(rhs);
@@ -648,9 +647,8 @@ class rdma_hw_cqc_delete_body extends rdma_hw_model;
     if (source.cqc_context == null)
       return;
 
-    cloned_object = source.cqc_context.clone();
-    if (cloned_object == null || !$cast(cloned_context, cloned_object))
-      `uvm_fatal("RDMA_COPY_TYPE", "CQC delete context clone mismatch")
+    cloned_context = rdma_deep_copy#(rdma_cqc_model)::of(
+      source.cqc_context, "CQC delete context clone mismatch");
     cqc_context = cloned_context;
   endfunction
 

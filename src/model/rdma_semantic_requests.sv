@@ -169,7 +169,6 @@ class rdma_semantic_request extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（semantic request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_semantic_request rhs_req;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
@@ -179,14 +178,8 @@ class rdma_semantic_request extends uvm_object;
     expected_status_code = rhs_req.expected_status_code;
     timeout_policy = rhs_req.timeout_policy;
     timeout_value = rhs_req.timeout_value;
-    if (rhs_req.owner == null) begin
-      owner = null;
-    end
-    else begin
-      cloned_object = rhs_req.owner.clone();
-      if (cloned_object == null || !$cast(owner, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "function handle clone type mismatch")
-    end
+    owner = rdma_deep_copy#(rdma_function_handle)::of(
+      rhs_req.owner, "function handle clone type mismatch");
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“timeout policy is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -239,7 +232,6 @@ class rdma_qp_context_attributes extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QP attributes copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_qp_context_attributes r;
-    uvm_object c;
 
     super.do_copy(rhs);
     if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP attributes copy mismatch")
@@ -249,12 +241,12 @@ class rdma_qp_context_attributes extends uvm_object;
     signature_enable = r.signature_enable;
     tx_flow_control = r.tx_flow_control;
     rx_flow_control = r.rx_flow_control;
-    if (r.address_vector == null) address_vector = null;
-    else begin c = r.address_vector.clone(); if (c == null || !$cast(address_vector, c) || address_vector == r.address_vector) `uvm_fatal("RDMA_COPY_TYPE", "QP AV clone failure") end
-    if (r.behavior == null) behavior = null;
-    else begin c = r.behavior.clone(); if (c == null || !$cast(behavior, c) || behavior == r.behavior) `uvm_fatal("RDMA_COPY_TYPE", "QP behavior clone failure") end
-    if (r.transport_ext == null) transport_ext = null;
-    else begin c = r.transport_ext.clone(); if (c == null || !$cast(transport_ext, c) || transport_ext == r.transport_ext) `uvm_fatal("RDMA_COPY_TYPE", "QP extension clone failure") end
+    address_vector = rdma_deep_copy#(rdma_address_vector)::of(
+      r.address_vector, "QP AV clone failure");
+    behavior = rdma_deep_copy#(rdma_qpc_behavior)::of(
+      r.behavior, "QP behavior clone failure");
+    transport_ext = rdma_deep_copy#(rdma_qpc_transport_ext)::of(
+      r.transport_ext, "QP extension clone failure");
   endfunction
 
   // 功能：validate 校验 transport 与当前对象状态的一致性，并显式处理“QP context attributes are incomplete”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -336,19 +328,12 @@ class rdma_register_mr_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（register MR request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_register_mr_req rhs_req;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "register MR request copy type mismatch")
-    if (rhs_req.pd_h == null) begin
-      pd_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.pd_h.clone();
-      if (cloned_object == null || !$cast(pd_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "PD handle clone type mismatch")
-    end
+    pd_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.pd_h, "PD handle clone type mismatch");
     iova = rhs_req.iova;
     length = rhs_req.length;
     access = rhs_req.access;
@@ -400,7 +385,6 @@ class rdma_create_cq_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（create CQ request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_create_cq_req rhs_req;
-    uvm_object cloned_object;
     rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
@@ -408,23 +392,14 @@ class rdma_create_cq_req extends rdma_semantic_request;
       `uvm_fatal("RDMA_COPY_TYPE", "create CQ request copy type mismatch")
     depth = rhs_req.depth;
     cqe_size_bytes = rhs_req.cqe_size_bytes;
-    if (rhs_req.ceq_h == null) begin
-      ceq_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.ceq_h.clone();
-      if (cloned_object == null || !$cast(ceq_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "CEQ handle clone type mismatch")
-    end
+    ceq_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.ceq_h, "CEQ handle clone type mismatch");
     if (rhs_req.ring_backing == null) begin
       ring_backing = null;
     end
     else begin
-      cloned_object = rhs_req.ring_backing.clone();
-      if (cloned_object == null ||
-          !$cast(cloned_backing, cloned_object) ||
-          cloned_backing == rhs_req.ring_backing)
-        `uvm_fatal("RDMA_COPY_TYPE", "CQ ring backing clone mismatch")
+      cloned_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+        rhs_req.ring_backing, "CQ ring backing clone mismatch");
       ring_backing = cloned_backing;
     end
   endfunction
@@ -552,7 +527,6 @@ class rdma_create_qp_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（create QP request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_create_qp_req rhs_req;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
@@ -563,57 +537,22 @@ class rdma_create_qp_req extends rdma_semantic_request;
     max_send_sge = rhs_req.max_send_sge;
     max_recv_sge = rhs_req.max_recv_sge;
     max_inline_data = rhs_req.max_inline_data;
-    if (rhs_req.pd_h == null) pd_h = null;
-    else begin
-      cloned_object = rhs_req.pd_h.clone();
-      if (cloned_object == null || !$cast(pd_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "PD handle clone type mismatch")
-    end
-    if (rhs_req.send_cq_h == null) send_cq_h = null;
-    else begin
-      cloned_object = rhs_req.send_cq_h.clone();
-      if (cloned_object == null || !$cast(send_cq_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "send CQ handle clone type mismatch")
-    end
-    if (rhs_req.recv_cq_h == null) recv_cq_h = null;
-    else begin
-      cloned_object = rhs_req.recv_cq_h.clone();
-      if (cloned_object == null || !$cast(recv_cq_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "receive CQ handle clone type mismatch")
-    end
-    if (rhs_req.srq_h == null) srq_h = null;
-    else begin
-      cloned_object = rhs_req.srq_h.clone();
-      if (cloned_object == null || !$cast(srq_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "SRQ handle clone type mismatch")
-    end
-    if (rhs_req.sq_backing == null) sq_backing = null;
-    else begin
-      cloned_object = rhs_req.sq_backing.clone();
-      if (cloned_object == null || !$cast(sq_backing, cloned_object) ||
-          sq_backing == rhs_req.sq_backing)
-        `uvm_fatal("RDMA_COPY_TYPE", "SQ backing clone type mismatch")
-    end
-    if (rhs_req.rq_backing == null) rq_backing = null;
-    else begin
-      cloned_object = rhs_req.rq_backing.clone();
-      if (cloned_object == null || !$cast(rq_backing, cloned_object) ||
-          rq_backing == rhs_req.rq_backing)
-        `uvm_fatal("RDMA_COPY_TYPE", "RQ backing clone type mismatch")
-    end
-    if (rhs_req.sq_sgb_backing == null) sq_sgb_backing = null;
-    else begin
-      cloned_object = rhs_req.sq_sgb_backing.clone();
-      if (cloned_object == null || !$cast(sq_sgb_backing, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "SQ SGB backing clone type mismatch")
-    end
-    if (rhs_req.context_attrs == null) context_attrs = null;
-    else begin
-      cloned_object = rhs_req.context_attrs.clone();
-      if (cloned_object == null || !$cast(context_attrs, cloned_object) ||
-          context_attrs == rhs_req.context_attrs)
-        `uvm_fatal("RDMA_COPY_TYPE", "QP context attributes clone mismatch")
-    end
+    pd_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.pd_h, "PD handle clone type mismatch");
+    send_cq_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.send_cq_h, "send CQ handle clone type mismatch");
+    recv_cq_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.recv_cq_h, "receive CQ handle clone type mismatch");
+    srq_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.srq_h, "SRQ handle clone type mismatch");
+    sq_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+      rhs_req.sq_backing, "SQ backing clone type mismatch");
+    rq_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+      rhs_req.rq_backing, "RQ backing clone type mismatch");
+    sq_sgb_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+      rhs_req.sq_sgb_backing, "SQ SGB backing clone type mismatch");
+    context_attrs = rdma_deep_copy#(rdma_qp_context_attributes)::of(
+      rhs_req.context_attrs, "QP context attributes clone mismatch");
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“QP transport is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -805,7 +744,6 @@ class rdma_create_srq_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（create SRQ request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_create_srq_req rhs_req;
-    uvm_object cloned_object;
     rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
@@ -814,23 +752,14 @@ class rdma_create_srq_req extends rdma_semantic_request;
     depth = rhs_req.depth;
     max_sge = rhs_req.max_sge;
     limit_threshold = rhs_req.limit_threshold;
-    if (rhs_req.pd_h == null) begin
-      pd_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.pd_h.clone();
-      if (cloned_object == null || !$cast(pd_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "PD handle clone type mismatch")
-    end
+    pd_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.pd_h, "PD handle clone type mismatch");
     if (rhs_req.payload_backing == null) begin
       payload_backing = null;
     end
     else begin
-      cloned_object = rhs_req.payload_backing.clone();
-      if (cloned_object == null ||
-          !$cast(cloned_backing, cloned_object) ||
-          cloned_backing == rhs_req.payload_backing)
-        `uvm_fatal("RDMA_COPY_TYPE", "SRQ payload backing clone mismatch")
+      cloned_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+        rhs_req.payload_backing, "SRQ payload backing clone mismatch");
       payload_backing = cloned_backing;
     end
   endfunction
@@ -889,7 +818,6 @@ class rdma_create_ceq_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（create CEQ request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_create_ceq_req rhs_req;
-    uvm_object cloned_object;
     rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
@@ -901,11 +829,8 @@ class rdma_create_ceq_req extends rdma_semantic_request;
       ring_backing = null;
     end
     else begin
-      cloned_object = rhs_req.ring_backing.clone();
-      if (cloned_object == null ||
-          !$cast(cloned_backing, cloned_object) ||
-          cloned_backing == rhs_req.ring_backing)
-        `uvm_fatal("RDMA_COPY_TYPE", "CEQ ring backing clone mismatch")
+      cloned_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+        rhs_req.ring_backing, "CEQ ring backing clone mismatch");
       ring_backing = cloned_backing;
     end
   endfunction
@@ -957,7 +882,6 @@ class rdma_create_aeq_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（create AEQ request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_create_aeq_req rhs_req;
-    uvm_object cloned_object;
     rdma_queue_backing_spec cloned_backing;
 
     super.do_copy(rhs);
@@ -969,11 +893,8 @@ class rdma_create_aeq_req extends rdma_semantic_request;
       ring_backing = null;
     end
     else begin
-      cloned_object = rhs_req.ring_backing.clone();
-      if (cloned_object == null ||
-          !$cast(cloned_backing, cloned_object) ||
-          cloned_backing == rhs_req.ring_backing)
-        `uvm_fatal("RDMA_COPY_TYPE", "AEQ ring backing clone mismatch")
+      cloned_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+        rhs_req.ring_backing, "AEQ ring backing clone mismatch");
       ring_backing = cloned_backing;
     end
   endfunction
@@ -1022,19 +943,12 @@ class rdma_destroy_resource_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（destroy request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_destroy_resource_req rhs_req;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "destroy request copy type mismatch")
-    if (rhs_req.target_h == null) begin
-      target_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.target_h.clone();
-      if (cloned_object == null || !$cast(target_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "target handle clone type mismatch")
-    end
+    target_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.target_h, "target handle clone type mismatch");
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“destroy target handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -1085,19 +999,12 @@ class rdma_modify_qp_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（modify QP request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_modify_qp_req rhs_req;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "modify QP request copy type mismatch")
-    if (rhs_req.qp_h == null) begin
-      qp_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.qp_h.clone();
-      if (cloned_object == null || !$cast(qp_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "QP handle clone type mismatch")
-    end
+    qp_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.qp_h, "QP handle clone type mismatch");
     new_state = rhs_req.new_state;
     destination_qpn = rhs_req.destination_qpn;
     send_psn = rhs_req.send_psn;
@@ -1225,20 +1132,13 @@ class rdma_post_send_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（post-send request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_post_send_req rhs_req;
-    uvm_object cloned_object;
     rdma_sge cloned_sge;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "post-send request copy type mismatch")
-    if (rhs_req.qp_h == null) begin
-      qp_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.qp_h.clone();
-      if (cloned_object == null || !$cast(qp_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "QP handle clone type mismatch")
-    end
+    qp_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.qp_h, "QP handle clone type mismatch");
     wr_id = rhs_req.wr_id;
     transport = rhs_req.transport;
     opcode = rhs_req.opcode;
@@ -1254,18 +1154,16 @@ class rdma_post_send_req extends rdma_semantic_request;
     destination_qpn = rhs_req.destination_qpn;
     qkey = rhs_req.qkey;
     invalidate_rkey = rhs_req.invalidate_rkey;
-    if (rhs_req.completion_qp_h == null) completion_qp_h = null;
-    else begin cloned_object = rhs_req.completion_qp_h.clone(); if (cloned_object == null || !$cast(completion_qp_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "completion QP clone failure"); end
-    if (rhs_req.mr_h == null) mr_h = null;
-    else begin cloned_object = rhs_req.mr_h.clone(); if (cloned_object == null || !$cast(mr_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "MR clone failure"); end
-    if (rhs_req.mw_h == null) mw_h = null;
-    else begin cloned_object = rhs_req.mw_h.clone(); if (cloned_object == null || !$cast(mw_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "MW clone failure"); end
-    if (rhs_req.authority_h == null) authority_h = null;
-    else begin cloned_object = rhs_req.authority_h.clone(); if (cloned_object == null || !$cast(authority_h, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "authority clone failure"); end
+    completion_qp_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.completion_qp_h, "completion QP clone failure");
+    mr_h = rdma_deep_copy#(rdma_handle)::of(rhs_req.mr_h, "MR clone failure");
+    mw_h = rdma_deep_copy#(rdma_handle)::of(rhs_req.mw_h, "MW clone failure");
+    authority_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.authority_h, "authority clone failure");
     address_vector_id = rhs_req.address_vector_id;
     fence = rhs_req.fence;
-    if (rhs_req.address_vector == null) address_vector = null;
-    else begin cloned_object = rhs_req.address_vector.clone(); if (cloned_object == null || !$cast(address_vector, cloned_object)) `uvm_fatal("RDMA_COPY_TYPE", "AV clone failure"); end
+    address_vector = rdma_deep_copy#(rdma_address_vector)::of(
+      rhs_req.address_vector, "AV clone failure");
     address_vector_valid = rhs_req.address_vector_valid;
     sgb_iova = rhs_req.sgb_iova;
     compare_value = rhs_req.compare_value;
@@ -1276,9 +1174,8 @@ class rdma_post_send_req extends rdma_semantic_request;
         sges.push_back(null);
       end
       else begin
-        cloned_object = rhs_req.sges[i].clone();
-        if (cloned_object == null || !$cast(cloned_sge, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "SGE clone type mismatch")
+        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
+          rhs_req.sges[i], "SGE clone type mismatch");
         sges.push_back(cloned_sge);
       end
     end
@@ -1446,29 +1343,15 @@ class rdma_post_recv_req extends rdma_semantic_request;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（post-receive request copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_post_recv_req rhs_req;
-    uvm_object cloned_object;
     rdma_sge cloned_sge;
 
     super.do_copy(rhs);
     if (!$cast(rhs_req, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "post-receive request copy type mismatch")
-    if (rhs_req.target_h == null) begin
-      target_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.target_h.clone();
-      if (cloned_object == null || !$cast(target_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "receive target clone type mismatch")
-    end
-    if (rhs_req.completion_qp_h == null) begin
-      completion_qp_h = null;
-    end
-    else begin
-      cloned_object = rhs_req.completion_qp_h.clone();
-      if (cloned_object == null || !$cast(completion_qp_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "receive completion QP clone type mismatch")
-    end
+    target_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.target_h, "receive target clone type mismatch");
+    completion_qp_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_req.completion_qp_h, "receive completion QP clone type mismatch");
     wr_id = rhs_req.wr_id;
     sges.delete();
     foreach (rhs_req.sges[i]) begin
@@ -1476,9 +1359,8 @@ class rdma_post_recv_req extends rdma_semantic_request;
         sges.push_back(null);
       end
       else begin
-        cloned_object = rhs_req.sges[i].clone();
-        if (cloned_object == null || !$cast(cloned_sge, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "SGE clone type mismatch")
+        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
+          rhs_req.sges[i], "SGE clone type mismatch");
         sges.push_back(cloned_sge);
       end
     end

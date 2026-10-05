@@ -313,7 +313,6 @@ class rdma_queue_backing_slice extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（slice copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_backing_slice r;
-    uvm_object c;
     rdma_dma_mapping m;
 
     super.do_copy(rhs);
@@ -326,9 +325,8 @@ class rdma_queue_backing_slice extends uvm_object;
     if (r.mapping == null) begin
       mapping = null;
     end else begin
-      c = r.mapping.clone();
-      if (c == null || !$cast(m, c) || m == r.mapping)
-        `uvm_fatal("RDMA_COPY_TYPE", "slice mapping clone failure");
+      m = rdma_deep_copy#(rdma_dma_mapping)::of(
+        r.mapping, "slice mapping clone failure");
       mapping = m;
     end
   endfunction
@@ -441,7 +439,6 @@ class rdma_queue_dma_page_ref extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（page copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_dma_page_ref r;
-    uvm_object c;
     rdma_dma_mapping m;
 
     super.do_copy(rhs);
@@ -454,9 +451,8 @@ class rdma_queue_dma_page_ref extends uvm_object;
     if (r.mapping == null) begin
       mapping = null;
     end else begin
-      c = r.mapping.clone();
-      if (c == null || !$cast(m, c) || m == r.mapping)
-        `uvm_fatal("RDMA_COPY_TYPE", "page mapping clone failure");
+      m = rdma_deep_copy#(rdma_dma_mapping)::of(
+        r.mapping, "page mapping clone failure");
       // Preserve mapping value fields explicitly; some simulators leave
       // fields at constructor defaults on repeated object clones.
       m.requester_bdf = r.mapping.requester_bdf;
@@ -523,7 +519,6 @@ class rdma_queue_ring_layout extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（ring copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_ring_layout r;
-    uvm_object c;
     rdma_queue_dma_page_ref p;
 
     super.do_copy(rhs);
@@ -538,9 +533,8 @@ class rdma_queue_ring_layout extends uvm_object;
     initial_polarity = r.initial_polarity;
     pages.delete();
     foreach (r.pages[i]) begin
-      c = r.pages[i].clone();
-      if (c == null || !$cast(p, c) || p == r.pages[i])
-        `uvm_fatal("RDMA_COPY_TYPE", "page clone failure");
+      p = rdma_deep_copy#(rdma_queue_dma_page_ref)::of(
+        r.pages[i], "page clone failure");
       pages.push_back(p);
     end
   endfunction
@@ -631,7 +625,6 @@ class rdma_queue_backing_segment extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（backing segment copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_backing_segment r;
-    uvm_object cloned_object;
     rdma_dma_mapping cloned_mapping;
 
     super.do_copy(rhs);
@@ -645,11 +638,8 @@ class rdma_queue_backing_segment extends uvm_object;
     if (r.mapping == null) begin
       mapping = null;
     end else begin
-      cloned_object = r.mapping.clone();
-      if (cloned_object == null ||
-          !$cast(cloned_mapping, cloned_object) ||
-          cloned_mapping == r.mapping)
-        `uvm_fatal("RDMA_COPY_TYPE", "backing segment mapping clone failure");
+      cloned_mapping = rdma_deep_copy#(rdma_dma_mapping)::of(
+        r.mapping, "backing segment mapping clone failure");
       mapping = cloned_mapping;
     end
   endfunction
@@ -708,7 +698,6 @@ class rdma_queue_backing_ref extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（backing ref copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_backing_ref r;
-    uvm_object c;
     rdma_dma_mapping m;
     rdma_queue_backing_segment segment;
 
@@ -725,18 +714,15 @@ class rdma_queue_backing_ref extends uvm_object;
     if (r.mapping == null) begin
       mapping = null;
     end else begin
-      c = r.mapping.clone();
-      if (c == null || !$cast(m, c) || m == r.mapping)
-        `uvm_fatal("RDMA_COPY_TYPE", "backing mapping clone failure");
+      m = rdma_deep_copy#(rdma_dma_mapping)::of(
+        r.mapping, "backing mapping clone failure");
       mapping = m;
     end
     foreach (r.additional_segments[i]) begin
       if (r.additional_segments[i] == null)
         `uvm_fatal("RDMA_COPY_TYPE", "null additional backing segment");
-      c = r.additional_segments[i].clone();
-      if (c == null || !$cast(segment, c) ||
-          segment == r.additional_segments[i])
-        `uvm_fatal("RDMA_COPY_TYPE", "additional backing segment clone failure");
+      segment = rdma_deep_copy#(rdma_queue_backing_segment)::of(
+        r.additional_segments[i], "additional backing segment clone failure");
       additional_segments.push_back(segment);
     end
   endfunction
@@ -858,9 +844,8 @@ class rdma_context_backing_ref extends uvm_object;
     if (r.owner == null) begin
       owner = null;
     end else begin
-      c = r.owner.clone();
-      if (c == null || !$cast(f, c) || f == r.owner)
-        `uvm_fatal("RDMA_COPY_TYPE", "owner clone failure");
+      f = rdma_deep_copy#(rdma_function_handle)::of(
+        r.owner, "owner clone failure");
       owner = f;
     end
     if (r.slot_token == null) begin
@@ -879,9 +864,7 @@ class rdma_context_backing_ref extends uvm_object;
     if (r.hmc_ref == null) begin
       hmc_ref = null;
     end else begin
-      c = r.hmc_ref.clone();
-      if (c == null || !$cast(h, c) || h == r.hmc_ref)
-        `uvm_fatal("RDMA_COPY_TYPE", "HMC clone failure");
+      h = rdma_deep_copy#(rdma_hmc_ref)::of(r.hmc_ref, "HMC clone failure");
       hmc_ref = h;
     end
   endfunction
@@ -959,7 +942,6 @@ class rdma_queue_flush_target extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（flush copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_flush_target r;
-    uvm_object c;
     rdma_queue_backing_ref p;
 
     super.do_copy(rhs);
@@ -971,9 +953,8 @@ class rdma_queue_flush_target extends uvm_object;
     if (r.pd_ref == null) begin
       pd_ref = null;
     end else begin
-      c = r.pd_ref.clone();
-      if (c == null || !$cast(p, c) || p == r.pd_ref)
-        `uvm_fatal("RDMA_COPY_TYPE", "flush ref clone failure");
+      p = rdma_deep_copy#(rdma_queue_backing_ref)::of(
+        r.pd_ref, "flush ref clone failure");
       pd_ref = p;
     end
   endfunction
@@ -1021,7 +1002,6 @@ class rdma_queue_backing_plan extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（plan copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_backing_plan r;
-    uvm_object c;
     rdma_queue_ring_layout l;
     rdma_queue_backing_ref b;
     rdma_context_backing_ref x;
@@ -1035,29 +1015,25 @@ class rdma_queue_backing_plan extends uvm_object;
     refs.delete();
     flush_targets.delete();
     foreach (r.rings[i]) begin
-      c = r.rings[i].clone();
-      if (c == null || !$cast(l, c))
-        `uvm_fatal("RDMA_COPY_TYPE", "ring clone failure");
+      l = rdma_deep_copy#(rdma_queue_ring_layout)::of(
+        r.rings[i], "ring clone failure");
       rings.push_back(l);
     end
     foreach (r.refs[i]) begin
-      c = r.refs[i].clone();
-      if (c == null || !$cast(b, c))
-        `uvm_fatal("RDMA_COPY_TYPE", "ref clone failure");
+      b = rdma_deep_copy#(rdma_queue_backing_ref)::of(
+        r.refs[i], "ref clone failure");
       refs.push_back(b);
     end
     foreach (r.flush_targets[i]) begin
-      c = r.flush_targets[i].clone();
-      if (c == null || !$cast(f, c))
-        `uvm_fatal("RDMA_COPY_TYPE", "flush clone failure");
+      f = rdma_deep_copy#(rdma_queue_flush_target)::of(
+        r.flush_targets[i], "flush clone failure");
       flush_targets.push_back(f);
     end
     if (r.context_ref == null) begin
       context_ref = null;
     end else begin
-      c = r.context_ref.clone();
-      if (c == null || !$cast(x, c))
-        `uvm_fatal("RDMA_COPY_TYPE", "context clone failure");
+      x = rdma_deep_copy#(rdma_context_backing_ref)::of(
+        r.context_ref, "context clone failure");
       context_ref = x;
     end
   endfunction
@@ -1287,7 +1263,6 @@ class rdma_qp_backing_ref extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QP backing copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_qp_backing_ref r;
-    uvm_object c;
 
     super.do_copy(rhs);
     if (!$cast(r, rhs)) `uvm_fatal("RDMA_COPY_TYPE", "QP backing copy mismatch")
@@ -1297,18 +1272,13 @@ class rdma_qp_backing_ref extends uvm_object;
     length = r.length;
     cleanup_complete = r.cleanup_complete;
     recovery_only = r.recovery_only;
-    if (r.mapping == null) mapping = null;
-    else begin
-      c = r.mapping.clone();
-      if (c == null || !$cast(mapping, c) || mapping == r.mapping)
-        `uvm_fatal("RDMA_COPY_TYPE", "QP backing mapping clone failure")
-    end
+    mapping = rdma_deep_copy#(rdma_dma_mapping)::of(
+      r.mapping, "QP backing mapping clone failure");
     additional_segments.delete();
     foreach (r.additional_segments[i]) begin
       rdma_queue_backing_segment segment;
-      c = r.additional_segments[i].clone();
-      if (c == null || !$cast(segment, c) || segment == r.additional_segments[i])
-        `uvm_fatal("RDMA_COPY_TYPE", "QP additional backing segment clone failure")
+      segment = rdma_deep_copy#(rdma_queue_backing_segment)::of(
+        r.additional_segments[i], "QP additional backing segment clone failure");
       additional_segments.push_back(segment);
     end
   endfunction
@@ -1465,19 +1435,14 @@ class rdma_qp_backing_plan extends uvm_object;
     if (r.rq_ref != null) begin c = r.rq_ref.clone(); if (!$cast(rq_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ ref clone failure") end
     if (r.sq_pd_ref != null) begin c = r.sq_pd_ref.clone(); if (!$cast(sq_pd_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ PD clone failure") end
     if (r.rq_pd_ref != null) begin c = r.rq_pd_ref.clone(); if (!$cast(rq_pd_ref, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ PD clone failure") end
-    if (r.rq_source_h == null) rq_source_h = null;
-    else begin
-      c = r.rq_source_h.clone();
-      if (c == null || !$cast(rq_source_h, c) || rq_source_h == r.rq_source_h)
-        `uvm_fatal("RDMA_COPY_TYPE", "QP RQ source clone failure")
-    end
+    rq_source_h = rdma_deep_copy#(rdma_handle)::of(
+      r.rq_source_h, "QP RQ source clone failure");
     urc_refs.delete();
     foreach (r.urc_refs[i]) begin
       if (r.urc_refs[i] == null) urc_refs.push_back(null);
       else begin
-        c = r.urc_refs[i].clone();
-        if (c == null || !$cast(cloned_ref, c) || cloned_ref == r.urc_refs[i])
-          `uvm_fatal("RDMA_COPY_TYPE", "URC ref clone failure")
+        cloned_ref = rdma_deep_copy#(rdma_qp_backing_ref)::of(
+          r.urc_refs[i], "URC ref clone failure");
         urc_refs.push_back(cloned_ref);
       end
     end
@@ -1651,7 +1616,6 @@ class rdma_queue_preflight extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（preflight copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_preflight r;
-    uvm_object c;
     rdma_queue_backing_spec b;
     rdma_queue_ring_layout l;
 
@@ -1668,17 +1632,15 @@ class rdma_queue_preflight extends uvm_object;
     msix_table_index = r.msix_table_index;
     required_rings.delete();
     foreach (r.required_rings[i]) begin
-      c = r.required_rings[i].clone();
-      if (c == null || !$cast(l, c))
-        `uvm_fatal("RDMA_COPY_TYPE", "required ring clone failure");
+      l = rdma_deep_copy#(rdma_queue_ring_layout)::of(
+        r.required_rings[i], "required ring clone failure");
       required_rings.push_back(l);
     end
     if (r.backing_spec == null) begin
       backing_spec = null;
     end else begin
-      c = r.backing_spec.clone();
-      if (c == null || !$cast(b, c))
-        `uvm_fatal("RDMA_COPY_TYPE", "spec clone failure");
+      b = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+        r.backing_spec, "spec clone failure");
       backing_spec = b;
     end
   endfunction

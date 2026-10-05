@@ -118,19 +118,12 @@ class rdma_dma_mapping extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（rdma_dma_mapping copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_dma_mapping rhs_mapping;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_mapping, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "rdma_dma_mapping copy type mismatch")
-    if (rhs_mapping.function_h == null) begin
-      function_h = null;
-    end
-    else begin
-      cloned_object = rhs_mapping.function_h.clone();
-      if (cloned_object == null || !$cast(function_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "rdma_function_handle clone type mismatch")
-    end
+    function_h = rdma_deep_copy#(rdma_function_handle)::of(
+      rhs_mapping.function_h, "rdma_function_handle clone type mismatch");
     requester_bdf = rhs_mapping.requester_bdf;
     pasid_valid = rhs_mapping.pasid_valid;
     pasid = rhs_mapping.pasid;
@@ -151,14 +144,8 @@ class rdma_dma_mapping extends uvm_object;
     mw_ref = rhs_mapping.mw_ref;
     umem_backed = rhs_mapping.umem_backed;
     umem_page_count = rhs_mapping.umem_page_count;
-    if (rhs_mapping.owner_h == null) begin
-      owner_h = null;
-    end
-    else begin
-      cloned_object = rhs_mapping.owner_h.clone();
-      if (cloned_object == null || !$cast(owner_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "rdma_handle clone type mismatch")
-    end
+    owner_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_mapping.owner_h, "rdma_handle clone type mismatch");
   endfunction
 
   // 功能：check_access 校验 requested_function、requested_requester_bdf、requested_pasid_valid、requested_pasid、requested_dma_domain_valid 等参数 与当前对象状态的一致性，并显式处理“DMA mapping is not ACTIVE”等拒绝条件，返回 rdma_status 供上层决定是否提交。

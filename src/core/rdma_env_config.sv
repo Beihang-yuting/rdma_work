@@ -131,7 +131,6 @@ class rdma_env_config extends uvm_object;
   //   factory 失败时触发 UVM fatal；本函数不返回 status，fatal 前的部分写入不应被发布。
   virtual function void do_copy(uvm_object rhs);
     rdma_env_config source;
-    uvm_object clone_obj;
     rdma_responder_region region_copy;
     super.do_copy(rhs);
     if (!$cast(source, rhs))
@@ -163,15 +162,13 @@ class rdma_env_config extends uvm_object;
     end
     function_identity = null;
     if (source.function_identity != null) begin
-      clone_obj = source.function_identity.clone();
-      if (clone_obj == null || !$cast(function_identity, clone_obj))
-        `uvm_fatal("RDMA_COPY_TYPE", "Function identity clone failed")
+      function_identity = rdma_deep_copy#(rdma_function_identity)::of(
+        source.function_identity, "Function identity clone failed");
     end
     function_binding = null;
     if (source.function_binding != null) begin
-      clone_obj = source.function_binding.clone();
-      if (clone_obj == null || !$cast(function_binding, clone_obj))
-        `uvm_fatal("RDMA_COPY_TYPE", "Function binding clone failed")
+      function_binding = rdma_deep_copy#(rdma_function_binding)::of(
+        source.function_binding, "Function binding clone failed");
     end
   endfunction
 endclass

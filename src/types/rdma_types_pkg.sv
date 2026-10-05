@@ -14,4 +14,5 @@ package rdma_types_pkg;
   `include "rdma_address_types.sv"
   `include "rdma_identity_types.sv"
   `include "rdma_status.sv"
+  `include "rdma_deep_copy.sv"
 endpackage

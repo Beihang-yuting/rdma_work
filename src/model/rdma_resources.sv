@@ -453,7 +453,6 @@ class rdma_resource extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_resource rhs_resource;
-    uvm_object cloned_object;
     rdma_backing_ref cloned_backing_ref;
     rdma_hmc_ref cloned_hmc_ref;
     rdma_handle cloned_handle;
@@ -472,10 +471,8 @@ class rdma_resource extends uvm_object;
         backing_refs.push_back(null);
       end
       else begin
-        cloned_object = rhs_resource.backing_refs[i].clone();
-        if (cloned_object == null ||
-            !$cast(cloned_backing_ref, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "backing reference clone mismatch")
+        cloned_backing_ref = rdma_deep_copy#(rdma_backing_ref)::of(
+          rhs_resource.backing_refs[i], "backing reference clone mismatch");
         backing_refs.push_back(cloned_backing_ref);
       end
     end
@@ -485,9 +482,8 @@ class rdma_resource extends uvm_object;
         hmc_refs.push_back(null);
       end
       else begin
-        cloned_object = rhs_resource.hmc_refs[i].clone();
-        if (cloned_object == null || !$cast(cloned_hmc_ref, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "HMC reference clone mismatch")
+        cloned_hmc_ref = rdma_deep_copy#(rdma_hmc_ref)::of(
+          rhs_resource.hmc_refs[i], "HMC reference clone mismatch");
         hmc_refs.push_back(cloned_hmc_ref);
       end
     end
@@ -559,7 +555,6 @@ class rdma_queue_resource extends rdma_resource;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（queue resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_resource rhs_queue;
-    uvm_object cloned_object;
     rdma_queue_backing_plan cloned_plan;
 
     super.do_copy(rhs);
@@ -575,10 +570,8 @@ class rdma_queue_resource extends rdma_resource;
       queue_plan = null;
     end
     else begin
-      cloned_object = rhs_queue.queue_plan.clone();
-      if (cloned_object == null || !$cast(cloned_plan, cloned_object) ||
-          cloned_plan == rhs_queue.queue_plan)
-        `uvm_fatal("RDMA_COPY_TYPE", "queue plan clone mismatch")
+      cloned_plan = rdma_deep_copy#(rdma_queue_backing_plan)::of(
+        rhs_queue.queue_plan, "queue plan clone mismatch");
       queue_plan = cloned_plan;
     end
   endfunction
@@ -687,7 +680,6 @@ class rdma_function extends rdma_resource;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（function resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_function rhs_function;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_function, rhs))
@@ -697,14 +689,8 @@ class rdma_function extends rdma_resource;
     rdma_vf_id = rhs_function.rdma_vf_id;
     vsi_id = rhs_function.vsi_id;
     pfvf_id = rhs_function.pfvf_id;
-    if (rhs_function.binding == null) begin
-      binding = null;
-    end
-    else begin
-      cloned_object = rhs_function.binding.clone();
-      if (cloned_object == null || !$cast(binding, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "function binding clone mismatch")
-    end
+    binding = rdma_deep_copy#(rdma_function_binding)::of(
+      rhs_function.binding, "function binding clone mismatch");
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“function handle does not match its owner”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -885,7 +871,6 @@ class rdma_cq extends rdma_queue_resource;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CQ resource copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cq rhs_cq;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_cq, rhs))
@@ -894,15 +879,8 @@ class rdma_cq extends rdma_queue_resource;
     global_cq_id = rhs_cq.global_cq_id;
     cqe_size_bytes = rhs_cq.cqe_size_bytes;
     ceq_h = rdma_clone_handle_value(rhs_cq.ceq_h, "CQ CEQ");
-    if (rhs_cq.programmed_cqc == null) begin
-      programmed_cqc = null;
-    end
-    else begin
-      cloned_object = rhs_cq.programmed_cqc.clone();
-      if (cloned_object == null || !$cast(programmed_cqc, cloned_object) ||
-          programmed_cqc == rhs_cq.programmed_cqc)
-        `uvm_fatal("RDMA_COPY_TYPE", "CQ programmed CQC clone mismatch")
-    end
+    programmed_cqc = rdma_deep_copy#(rdma_cqc_model)::of(
+      rhs_cq.programmed_cqc, "CQ programmed CQC clone mismatch");
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CQ entry size is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -1050,18 +1028,14 @@ class rdma_qp extends rdma_resource;
     if (rhs_qp.qp_plan == null) qp_plan = null;
     else begin
       uvm_object cloned_object;
-      cloned_object = rhs_qp.qp_plan.clone();
-      if (cloned_object == null || !$cast(qp_plan, cloned_object) ||
-          qp_plan == rhs_qp.qp_plan)
-        `uvm_fatal("RDMA_COPY_TYPE", "QP backing plan clone mismatch")
+      qp_plan = rdma_deep_copy#(rdma_qp_backing_plan)::of(
+        rhs_qp.qp_plan, "QP backing plan clone mismatch");
     end
     if (rhs_qp.programmed_qpc == null) programmed_qpc = null;
     else begin
       uvm_object cloned_object;
-      cloned_object = rhs_qp.programmed_qpc.clone();
-      if (cloned_object == null || !$cast(programmed_qpc, cloned_object) ||
-          programmed_qpc == rhs_qp.programmed_qpc)
-        `uvm_fatal("RDMA_COPY_TYPE", "QP programmed QPC clone mismatch")
+      programmed_qpc = rdma_deep_copy#(rdma_qpc_model)::of(
+        rhs_qp.programmed_qpc, "QP programmed QPC clone mismatch");
     end
   endfunction
 

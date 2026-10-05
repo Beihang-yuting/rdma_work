@@ -473,7 +473,6 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（URC QPC extension copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_urc_ext rhs_ext;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_ext, rhs))
@@ -483,14 +482,8 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     dbsn = rhs_ext.dbsn;
     rpsn = rhs_ext.rpsn;
     dpsn = rhs_ext.dpsn;
-    if (rhs_ext.queues == null) begin
-      queues = null;
-    end
-    else begin
-      cloned_object = rhs_ext.queues.clone();
-      if (cloned_object == null || !$cast(queues, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "URC queue configuration clone mismatch")
-    end
+    queues = rdma_deep_copy#(rdma_urc_queue_config)::of(
+      rhs_ext.queues, "URC queue configuration clone mismatch");
   endfunction
 
   // 功能：transport_kind 使用 当前对象字段 计算并返回 rdma_transport_e 结果；不修改对象字段或外部资源。
@@ -602,7 +595,6 @@ class rdma_qpc_model extends rdma_hw_model;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QPC model copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_model rhs_qpc;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_qpc, rhs))
@@ -634,22 +626,10 @@ class rdma_qpc_model extends rdma_hw_model;
     signature_enable = rhs_qpc.signature_enable;
     tx_flow_control = rhs_qpc.tx_flow_control;
     rx_flow_control = rhs_qpc.rx_flow_control;
-    if (rhs_qpc.behavior == null) begin
-      behavior = null;
-    end
-    else begin
-      cloned_object = rhs_qpc.behavior.clone();
-      if (cloned_object == null || !$cast(behavior, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "QPC behavior clone mismatch")
-    end
-    if (rhs_qpc.transport_ext == null) begin
-      transport_ext = null;
-    end
-    else begin
-      cloned_object = rhs_qpc.transport_ext.clone();
-      if (cloned_object == null || !$cast(transport_ext, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "QPC extension clone mismatch")
-    end
+    behavior = rdma_deep_copy#(rdma_qpc_behavior)::of(
+      rhs_qpc.behavior, "QPC behavior clone mismatch");
+    transport_ext = rdma_deep_copy#(rdma_qpc_transport_ext)::of(
+      rhs_qpc.transport_ext, "QPC extension clone mismatch");
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“QPC behavior is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。

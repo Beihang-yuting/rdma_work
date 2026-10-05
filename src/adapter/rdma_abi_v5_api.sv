@@ -53,7 +53,6 @@ class rdma_abi_v5_request extends uvm_object;
   // 失败/边界：rhs 类型不符或 Function clone 失败时触发 UVM fatal，不发布半成品请求。
   virtual function void do_copy(uvm_object rhs);
     rdma_abi_v5_request source;
-    uvm_object cloned;
 
     super.do_copy(rhs);
     if (!$cast(source, rhs))
@@ -63,13 +62,8 @@ class rdma_abi_v5_request extends uvm_object;
     length = source.length;
     user_va = source.user_va;
     ownership = source.ownership;
-    if (source.function_h == null)
-      function_h = null;
-    else begin
-      cloned = source.function_h.clone();
-      if (cloned == null || !$cast(function_h, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "ABI v5 request Function clone mismatch")
-    end
+    function_h = rdma_deep_copy#(rdma_function_handle)::of(
+      source.function_h, "ABI v5 request Function clone mismatch");
     borrowed_mapping = source.borrowed_mapping;
     borrowed_context = source.borrowed_context;
   endfunction
@@ -124,7 +118,6 @@ class rdma_abi_v5_response extends uvm_object;
   // 失败/边界：类型不符或嵌套对象 clone 失败时触发 UVM fatal，避免返回不完整响应。
   virtual function void do_copy(uvm_object rhs);
     rdma_abi_v5_response source;
-    uvm_object cloned;
 
     super.do_copy(rhs);
     if (!$cast(source, rhs))
@@ -142,20 +135,10 @@ class rdma_abi_v5_response extends uvm_object;
     refcount = source.refcount;
     mapped = source.mapped;
     released = source.released;
-    if (source.context_ref == null)
-      context_ref = null;
-    else begin
-      cloned = source.context_ref.clone();
-      if (cloned == null || !$cast(context_ref, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "ABI v5 context clone mismatch")
-    end
-    if (source.dma_mapping == null)
-      dma_mapping = null;
-    else begin
-      cloned = source.dma_mapping.clone();
-      if (cloned == null || !$cast(dma_mapping, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "ABI v5 DMA mapping clone mismatch")
-    end
+    context_ref = rdma_deep_copy#(rdma_context_backing_ref)::of(
+      source.context_ref, "ABI v5 context clone mismatch");
+    dma_mapping = rdma_deep_copy#(rdma_dma_mapping)::of(
+      source.dma_mapping, "ABI v5 DMA mapping clone mismatch");
   endfunction
 endclass
 

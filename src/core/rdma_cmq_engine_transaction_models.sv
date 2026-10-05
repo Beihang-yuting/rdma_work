@@ -133,11 +133,8 @@ class rdma_cmq_slot_record extends uvm_object;
     if (rhs_record.expected == null)
       expected = null;
     else begin
-      uvm_object cloned_object;
-      cloned_object = rhs_record.expected.clone();
-      if (cloned_object == null || !$cast(expected, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "CMQ slot expected response clone mismatch")
+      expected = rdma_deep_copy#(rdma_cmq_expected_response)::of(
+        rhs_record.expected, "CMQ slot expected response clone mismatch");
     end
     command_token = rhs_record.command_token;
     batch_key = rhs_record.batch_key;

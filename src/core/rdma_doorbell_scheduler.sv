@@ -61,7 +61,6 @@ class rdma_doorbell_dependency extends uvm_object;
   // 失败/边界：rhs 类型不匹配，或 mapping/image clone 返回 null/错误类型时触发 UVM fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_doorbell_dependency rhs_dependency;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_dependency, rhs))
@@ -69,25 +68,11 @@ class rdma_doorbell_dependency extends uvm_object;
                  "rdma_doorbell_dependency copy type mismatch")
     dependency_id = rhs_dependency.dependency_id;
     stage = rhs_dependency.stage;
-    if (rhs_dependency.mapping == null) begin
-      mapping = null;
-    end
-    else begin
-      cloned_object = rhs_dependency.mapping.clone();
-      if (cloned_object == null || !$cast(mapping, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "doorbell dependency mapping clone type mismatch")
-    end
+    mapping = rdma_deep_copy#(rdma_dma_mapping)::of(
+      rhs_dependency.mapping, "doorbell dependency mapping clone type mismatch");
     relative_offset = rhs_dependency.relative_offset;
-    if (rhs_dependency.image == null) begin
-      image = null;
-    end
-    else begin
-      cloned_object = rhs_dependency.image.clone();
-      if (cloned_object == null || !$cast(image, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "doorbell dependency image clone type mismatch")
-    end
+    image = rdma_deep_copy#(rdma_hw_image)::of(
+      rhs_dependency.image, "doorbell dependency image clone type mismatch");
     ready = rhs_dependency.ready;
   endfunction
 endclass
@@ -146,30 +131,15 @@ class rdma_doorbell_desc extends uvm_object;
     rdma_doorbell_dependency dependency_clones[rdma_doorbell_dependency];
     rdma_dma_mapping mapping_clones[rdma_dma_mapping];
     rdma_hw_image image_clones[rdma_hw_image];
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_desc, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "rdma_doorbell_desc copy type mismatch")
     kind = rhs_desc.kind;
-    if (rhs_desc.function_h == null) begin
-      function_h = null;
-    end
-    else begin
-      cloned_object = rhs_desc.function_h.clone();
-      if (cloned_object == null || !$cast(function_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "doorbell descriptor Function clone type mismatch")
-    end
-    if (rhs_desc.target_h == null) begin
-      target_h = null;
-    end
-    else begin
-      cloned_object = rhs_desc.target_h.clone();
-      if (cloned_object == null || !$cast(target_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "doorbell descriptor target clone type mismatch")
-    end
+    function_h = rdma_deep_copy#(rdma_function_handle)::of(
+      rhs_desc.function_h, "doorbell descriptor Function clone type mismatch");
+    target_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_desc.target_h, "doorbell descriptor target clone type mismatch");
     notify_bar_id = rhs_desc.notify_bar_id;
     relative_offset = rhs_desc.relative_offset;
     width = rhs_desc.width;
@@ -178,10 +148,8 @@ class rdma_doorbell_desc extends uvm_object;
       payload_image = null;
     end
     else begin
-      cloned_object = rhs_desc.payload_image.clone();
-      if (cloned_object == null || !$cast(payload_image, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "doorbell payload image clone type mismatch")
+      payload_image = rdma_deep_copy#(rdma_hw_image)::of(
+        rhs_desc.payload_image, "doorbell payload image clone type mismatch");
       image_clones[rhs_desc.payload_image] = payload_image;
     end
     barrier_policy = rhs_desc.barrier_policy;
@@ -197,11 +165,8 @@ class rdma_doorbell_desc extends uvm_object;
         dependencies.push_back(dependency_clones[rhs_desc.dependencies[i]]);
       end
       else begin
-        cloned_object = rhs_desc.dependencies[i].clone();
-        if (cloned_object == null ||
-            !$cast(cloned_dependency, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE",
-                     "doorbell dependency clone type mismatch")
+        cloned_dependency = rdma_deep_copy#(rdma_doorbell_dependency)::of(
+          rhs_desc.dependencies[i], "doorbell dependency clone type mismatch");
         // 由于 UVM 1.2 在外层 copy 活跃时会抑制重复嵌套 copy，这里显式缓存源图
         //   identity，使共享 mapping/image 的多个 dependency 仍指向同一 detached 值，
         // 避免第二个 clone 只留下默认字段。
@@ -260,30 +225,15 @@ class rdma_doorbell_result extends uvm_object;
   // 失败/边界：rhs 类型不匹配，或任一 handle clone 返回 null/错误类型时触发 UVM fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_doorbell_result rhs_result;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_result, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "rdma_doorbell_result copy type mismatch")
     kind = rhs_result.kind;
-    if (rhs_result.function_h == null) begin
-      function_h = null;
-    end
-    else begin
-      cloned_object = rhs_result.function_h.clone();
-      if (cloned_object == null || !$cast(function_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "doorbell result Function clone type mismatch")
-    end
-    if (rhs_result.target_h == null) begin
-      target_h = null;
-    end
-    else begin
-      cloned_object = rhs_result.target_h.clone();
-      if (cloned_object == null || !$cast(target_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "doorbell result target clone type mismatch")
-    end
+    function_h = rdma_deep_copy#(rdma_function_handle)::of(
+      rhs_result.function_h, "doorbell result Function clone type mismatch");
+    target_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_result.target_h, "doorbell result target clone type mismatch");
     absolute_address = rhs_result.absolute_address;
     width = rhs_result.width;
     dependency_count = rhs_result.dependency_count;
@@ -392,31 +342,16 @@ class rdma_doorbell_submission_result extends uvm_object;
   // 失败/边界：rhs 类型不匹配，或嵌套 clone 返回 null/错误类型时触发 UVM fatal，不发布部分有效副本。
   virtual function void do_copy(uvm_object rhs);
     rdma_doorbell_submission_result source;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(source, rhs))
       `uvm_fatal("RDMA_COPY_TYPE",
                  "rdma_doorbell_submission_result copy type mismatch")
 
-    if (source.doorbell_result == null) begin
-      doorbell_result = null;
-    end
-    else begin
-      cloned_object = source.doorbell_result.clone();
-      if (cloned_object == null || !$cast(doorbell_result, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "observed doorbell result clone type mismatch")
-    end
-    if (source.status == null) begin
-      status = null;
-    end
-    else begin
-      cloned_object = source.status.clone();
-      if (cloned_object == null || !$cast(status, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE",
-                   "observed doorbell status clone type mismatch")
-    end
+    doorbell_result = rdma_deep_copy#(rdma_doorbell_result)::of(
+      source.doorbell_result, "observed doorbell result clone type mismatch");
+    status = rdma_deep_copy#(rdma_status)::of(
+      source.status, "observed doorbell status clone type mismatch");
     submission_effect = source.submission_effect;
     dependency_count = source.dependency_count;
     before_mmio_maybe_visible_called =

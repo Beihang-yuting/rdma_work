@@ -57,7 +57,6 @@ class rdma_sq_payload_write_receipt extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（payload receipt copy type mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_sq_payload_write_receipt source;
-    uvm_object cloned;
     rdma_sge sge_copy;
     rdma_dma_mapping mapping_copy;
 
@@ -76,9 +75,8 @@ class rdma_sq_payload_write_receipt extends uvm_object;
     function_h = null;
 
     if (source.function_h != null) begin
-      cloned = source.function_h.clone();
-      if (cloned == null || !$cast(function_h, cloned))
-        `uvm_fatal("RDMA_COPY_TYPE", "payload receipt function copy mismatch")
+      function_h = rdma_deep_copy#(rdma_function_handle)::of(
+        source.function_h, "payload receipt function copy mismatch");
     end
     foreach (source.sges[i]) begin
       if (source.sges[i] == null) begin
@@ -95,9 +93,8 @@ class rdma_sq_payload_write_receipt extends uvm_object;
         mappings.push_back(null);
       end
       else begin
-        cloned = source.mappings[i].clone();
-        if (cloned == null || !$cast(mapping_copy, cloned))
-          `uvm_fatal("RDMA_COPY_TYPE", "payload receipt mapping copy mismatch")
+        mapping_copy = rdma_deep_copy#(rdma_dma_mapping)::of(
+          source.mappings[i], "payload receipt mapping copy mismatch");
         mappings.push_back(mapping_copy);
       end
     end

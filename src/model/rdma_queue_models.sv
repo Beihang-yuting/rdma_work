@@ -68,7 +68,6 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ SQE model copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_sqe_model rhs_sqe;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_sqe, rhs))
@@ -79,14 +78,8 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
                                                   "CMQ SQE");
     target_h = rdma_clone_handle_value(rhs_sqe.target_h, "CMQ SQE target");
     flags = rhs_sqe.flags;
-    if (rhs_sqe.context_model == null) begin
-      context_model = null;
-    end
-    else begin
-      cloned_object = rhs_sqe.context_model.clone();
-      if (cloned_object == null || !$cast(context_model, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "CMQ context clone mismatch")
-    end
+    context_model = rdma_deep_copy#(rdma_hw_model)::of(
+      rhs_sqe.context_model, "CMQ context clone mismatch");
   endfunction
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ opcode is unsupported”等拒绝条件，返回 rdma_status 供上层决定是否提交。
@@ -384,10 +377,8 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
     if (rhs_ext.address_vector == null)
       address_vector = null;
     else begin
-      uvm_object cloned_object;
-      cloned_object = rhs_ext.address_vector.clone();
-      if (cloned_object == null || !$cast(address_vector, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "UD SQE address vector clone mismatch")
+      address_vector = rdma_deep_copy#(rdma_address_vector)::of(
+        rhs_ext.address_vector, "UD SQE address vector clone mismatch");
     end
     address_vector_valid = rhs_ext.address_vector_valid;
   endfunction
@@ -457,10 +448,8 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
     destination_qpn = rhs_ext.destination_qpn;
     if (rhs_ext.completion_qp_h == null) completion_qp_h = null;
     else begin
-      uvm_object cloned_object;
-      cloned_object = rhs_ext.completion_qp_h.clone();
-      if (cloned_object == null || !$cast(completion_qp_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "URC completion QP clone mismatch")
+      completion_qp_h = rdma_deep_copy#(rdma_handle)::of(
+        rhs_ext.completion_qp_h, "URC completion QP clone mismatch");
     end
     remote_addr = rhs_ext.remote_addr;
     rkey = rhs_ext.rkey;
@@ -547,7 +536,6 @@ class rdma_sqe_model extends rdma_hw_model;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（data SQE model copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_sqe_model rhs_sqe;
-    uvm_object cloned_object;
     rdma_sge cloned_sge;
 
     super.do_copy(rhs);
@@ -569,20 +557,13 @@ class rdma_sqe_model extends rdma_hw_model;
         sges.push_back(null);
       end
       else begin
-        cloned_object = rhs_sqe.sges[i].clone();
-        if (cloned_object == null || !$cast(cloned_sge, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "SQE SGE clone mismatch")
+        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
+          rhs_sqe.sges[i], "SQE SGE clone mismatch");
         sges.push_back(cloned_sge);
       end
     end
-    if (rhs_sqe.transport_ext == null) begin
-      transport_ext = null;
-    end
-    else begin
-      cloned_object = rhs_sqe.transport_ext.clone();
-      if (cloned_object == null || !$cast(transport_ext, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "SQE transport extension clone mismatch")
-    end
+    transport_ext = rdma_deep_copy#(rdma_sqe_transport_ext)::of(
+      rhs_sqe.transport_ext, "SQE transport extension clone mismatch");
   endfunction
 
   // 功能：validate_payload_shape 根据 wr.c 的发包规则校验本地 payload
@@ -718,7 +699,6 @@ class rdma_rqe_model extends rdma_hw_model;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（RQE model copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_rqe_model rhs_rqe;
-    uvm_object cloned_object;
     rdma_sge cloned_sge;
 
     super.do_copy(rhs);
@@ -732,9 +712,8 @@ class rdma_rqe_model extends rdma_hw_model;
         sges.push_back(null);
       end
       else begin
-        cloned_object = rhs_rqe.sges[i].clone();
-        if (cloned_object == null || !$cast(cloned_sge, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "RQE SGE clone mismatch")
+        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
+          rhs_rqe.sges[i], "RQE SGE clone mismatch");
         sges.push_back(cloned_sge);
       end
     end

@@ -394,27 +394,15 @@ class rdma_function_binding extends uvm_object;
   // 且可能已覆盖前置字段；需要原子 nonfatal 发布时必须用 snapshot_complete_nonfatal()。
   virtual function void do_copy(uvm_object rhs);
     rdma_function_binding rhs_binding;
-    uvm_object cloned_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_binding, rhs))
       `uvm_fatal("RDMA_COPY_TYPE", "rdma_function_binding copy type mismatch")
     function_uid = rhs_binding.function_uid;
-    if (rhs_binding.identity == null)
-      identity = null;
-    else begin
-      cloned_object = rhs_binding.identity.clone();
-      if (cloned_object == null || !$cast(identity, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "rdma_function_identity clone type mismatch")
-    end
-    if (rhs_binding.pcie == null) begin
-      pcie = null;
-    end
-    else begin
-      cloned_object = rhs_binding.pcie.clone();
-      if (cloned_object == null || !$cast(pcie, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "rdma_pcie_identity clone type mismatch")
-    end
+    identity = rdma_deep_copy#(rdma_function_identity)::of(
+      rhs_binding.identity, "rdma_function_identity clone type mismatch");
+    pcie = rdma_deep_copy#(rdma_pcie_identity)::of(
+      rhs_binding.pcie, "rdma_pcie_identity clone type mismatch");
     notify_bar_id = rhs_binding.notify_bar_id;
     notify_base = rhs_binding.notify_base;
     notify_size = rhs_binding.notify_size;
@@ -430,14 +418,8 @@ class rdma_function_binding extends uvm_object;
     interrupt_vectors = rhs_binding.interrupt_vectors;
     state = rhs_binding.state;
     generation = rhs_binding.generation;
-    if (rhs_binding.owner_h == null) begin
-      owner_h = null;
-    end
-    else begin
-      cloned_object = rhs_binding.owner_h.clone();
-      if (cloned_object == null || !$cast(owner_h, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "rdma_handle clone type mismatch")
-    end
+    owner_h = rdma_deep_copy#(rdma_handle)::of(
+      rhs_binding.owner_h, "rdma_handle clone type mismatch");
     notify_valid = rhs_binding.notify_valid;
     notify_ready = rhs_binding.notify_ready;
     dmi_valid = rhs_binding.dmi_valid;

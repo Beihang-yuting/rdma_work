@@ -169,7 +169,6 @@ class rdma_mr_backing_desc extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（MR backing descriptor copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_mr_backing_desc rhs_desc;
-    uvm_object cloned_object;
     rdma_backing_ref cloned_backing_ref;
     rdma_hmc_ref cloned_hmc_ref;
 
@@ -187,11 +186,8 @@ class rdma_mr_backing_desc extends uvm_object;
         backing_refs.push_back(null);
       end
       else begin
-        cloned_object = rhs_desc.backing_refs[i].clone();
-        if (cloned_object == null ||
-            !$cast(cloned_backing_ref, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE",
-                     "MR backing reference clone mismatch")
+        cloned_backing_ref = rdma_deep_copy#(rdma_backing_ref)::of(
+          rhs_desc.backing_refs[i], "MR backing reference clone mismatch");
         backing_refs.push_back(cloned_backing_ref);
       end
     end
@@ -201,20 +197,13 @@ class rdma_mr_backing_desc extends uvm_object;
         hmc_refs.push_back(null);
       end
       else begin
-        cloned_object = rhs_desc.hmc_refs[i].clone();
-        if (cloned_object == null || !$cast(cloned_hmc_ref, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE", "MR HMC reference clone mismatch")
+        cloned_hmc_ref = rdma_deep_copy#(rdma_hmc_ref)::of(
+          rhs_desc.hmc_refs[i], "MR HMC reference clone mismatch");
         hmc_refs.push_back(cloned_hmc_ref);
       end
     end
-    if (rhs_desc.page_layout == null) begin
-      page_layout = null;
-    end
-    else begin
-      cloned_object = rhs_desc.page_layout.clone();
-      if (cloned_object == null || !$cast(page_layout, cloned_object))
-        `uvm_fatal("RDMA_COPY_TYPE", "MR page layout clone mismatch")
-    end
+    page_layout = rdma_deep_copy#(rdma_mr_page_layout)::of(
+      rhs_desc.page_layout, "MR page layout clone mismatch");
   endfunction
 endclass
 
@@ -1306,10 +1295,8 @@ class rdma_recovery_record extends uvm_object;
   // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（recovery record copy mismatch），不保留部分有效快照。
   virtual function void do_copy(uvm_object rhs);
     rdma_recovery_record rhs_record;
-    uvm_object cloned_object;
     rdma_backing_ref cloned_backing_ref;
     rdma_hmc_ref cloned_hmc_ref;
-    uvm_object cloned_plan_object;
 
     super.do_copy(rhs);
     if (!$cast(rhs_record, rhs))
@@ -1325,11 +1312,8 @@ class rdma_recovery_record extends uvm_object;
         backing_refs.push_back(null);
       end
       else begin
-        cloned_object = rhs_record.backing_refs[i].clone();
-        if (cloned_object == null ||
-            !$cast(cloned_backing_ref, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE",
-                     "recovery backing reference clone mismatch")
+        cloned_backing_ref = rdma_deep_copy#(rdma_backing_ref)::of(
+          rhs_record.backing_refs[i], "recovery backing reference clone mismatch");
         backing_refs.push_back(cloned_backing_ref);
       end
     end
@@ -1339,10 +1323,8 @@ class rdma_recovery_record extends uvm_object;
         hmc_refs.push_back(null);
       end
       else begin
-        cloned_object = rhs_record.hmc_refs[i].clone();
-        if (cloned_object == null || !$cast(cloned_hmc_ref, cloned_object))
-          `uvm_fatal("RDMA_COPY_TYPE",
-                     "recovery HMC reference clone mismatch")
+        cloned_hmc_ref = rdma_deep_copy#(rdma_hmc_ref)::of(
+          rhs_record.hmc_refs[i], "recovery HMC reference clone mismatch");
         hmc_refs.push_back(cloned_hmc_ref);
       end
     end
@@ -1368,24 +1350,11 @@ class rdma_recovery_record extends uvm_object;
     queue_query_opcode = rdma_cmq_clone_opcode_key_value(
       rhs_record.queue_query_opcode, "recovery queue query"
     );
-    if (rhs_record.queue_plan == null) begin
-      queue_plan = null;
-    end
-    else begin
-      cloned_plan_object = rhs_record.queue_plan.clone();
-      if (cloned_plan_object == null ||
-          !$cast(queue_plan, cloned_plan_object) ||
-          queue_plan == rhs_record.queue_plan)
-        `uvm_fatal("RDMA_COPY_TYPE", "recovery queue plan clone mismatch")
-    end
+    queue_plan = rdma_deep_copy#(rdma_queue_backing_plan)::of(
+      rhs_record.queue_plan, "recovery queue plan clone mismatch");
     qp_recovery_valid = rhs_record.qp_recovery_valid;
-    if (rhs_record.qp_recovery == null) qp_recovery = null;
-    else begin
-      cloned_plan_object = rhs_record.qp_recovery.clone();
-      if (cloned_plan_object == null || !$cast(qp_recovery, cloned_plan_object) ||
-          qp_recovery == rhs_record.qp_recovery)
-        `uvm_fatal("RDMA_COPY_TYPE", "recovery QP state clone mismatch")
-    end
+    qp_recovery = rdma_deep_copy#(rdma_qp_recovery_state)::of(
+      rhs_record.qp_recovery, "recovery QP state clone mismatch");
   endfunction
 endclass
 
