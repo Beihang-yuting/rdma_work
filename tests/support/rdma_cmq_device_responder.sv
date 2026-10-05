@@ -28,6 +28,7 @@ class rdma_cmq_device_responder extends rdma_mock_pcie;
   bit flip_next_wrap;
 
   bit [7:0] observed_opcodes[$];
+  bit [63:0] observed_qword1[$];
   bit [4:0] observed_wqe_indices[$];
   bit observed_wqe_wraps[$];
   bit observed_cq_owners[$];
@@ -65,6 +66,7 @@ class rdma_cmq_device_responder extends rdma_mock_pcie;
     expected_function = binding.make_handle();
     expected_doorbell_address.value = binding.notify_base.value + RDMA_DB_CMQ_OFFSET;
     observed_opcodes.delete();
+    observed_qword1.delete();
     observed_wqe_indices.delete();
     observed_wqe_wraps.delete();
     observed_cq_owners.delete();
@@ -190,6 +192,7 @@ class rdma_cmq_device_responder extends rdma_mock_pcie;
       return;
     end
     observed_opcodes.push_back(sqe[39:32]);
+    observed_qword1.push_back(be_qword(sqe_data, 8));
     observed_wqe_indices.push_back(sqe[44:40]);
     observed_wqe_wraps.push_back(sqe[45]);
     observed_doorbell_pis.push_back(doorbell[36:32]);

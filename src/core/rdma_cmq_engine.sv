@@ -8,6 +8,7 @@
 //   reset/shutdown 释放；profile/host_mem/scheduler 为非拥有引用。
 // 设计说明：驱动没有超时、重试与歧义处理。模型保留 command.timeout 作为 TB 看门狗：超时以 TIMEOUT 结束
 //   该命令并让 engine 进入 POISONED（须 reset），不产生可对账的歧义；reconcile_ticket 恒报告无终态。
+//   看门狗从命令入队起计时（含 pending 等待）；POISONED 后不再收割，其余在途命令各自到期以 TIMEOUT 结束。
 
 // 一个在途或排队的 CMQ 请求（对应驱动 struct xtrdma_cmq_request）。
 class rdma_cmq_request;
@@ -15,6 +16,7 @@ class rdma_cmq_request;
   rdma_cmq_expected_response expected;
   rdma_cmq_ticket ticket;
   rdma_cmq_completion completion;
+  rdma_submission_effect_e submit_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
   time deadline;
   bit done;
 endclass
@@ -185,10 +187,16 @@ class rdma_cmq_engine extends uvm_object;
   // 功能：取消全部在途与 pending 请求（驱动 clean_pending_cmq_requests），释放 backing 并回到 UNCONFIGURED，
   //   之后可重新 prepare。
   // 输入/输出及副作用：completions 输出被取消请求的 RESET_CANCELLED completion。
-  // 失败/边界：未配置时直接成功；backing 释放失败返回其 status（状态仍回到 UNCONFIGURED）。
+  // 失败/边界：未配置时直接成功；已 shutdown（QUIESCED）时返回 INVALID_STATE 且保持关闭；backing 释放
+  //   失败返回其 status（状态仍回到 UNCONFIGURED）；已因看门狗结束的请求不再重复报告。
   task reset(output rdma_cmq_completion completions[$], output rdma_status status);
     engine_lock.get(1);
-    status = teardown(completions, RDMA_CMQ_ENGINE_UNCONFIGURED);
+    if (engine_state == RDMA_CMQ_ENGINE_QUIESCED) begin
+      completions.delete();
+      status = invalid_state("CMQ engine is shut down; reset cannot reopen it");
+    end
+    else
+      status = teardown(completions, RDMA_CMQ_ENGINE_UNCONFIGURED);
     engine_lock.put(1);
   endtask
 
@@ -359,6 +367,7 @@ class rdma_cmq_engine extends uvm_object;
       status = submitted.status;
       effect = submitted.submission_effect;
     end
+    request.submit_effect = effect;
     if (!status.ok()) begin
       // PI 已推进而设备未必看到 doorbell：环游标不再可信，须 reset。
       request_array[slot.sq_index] = null;
@@ -446,6 +455,11 @@ class rdma_cmq_engine extends uvm_object;
         engine_state = RDMA_CMQ_ENGINE_POISONED;
         finish_request(request, rdma_status::make(RDMA_SC_TIMEOUT,
                        "CMQ command has no completion before the watchdog deadline"), null, null);
+        foreach (pending[i])
+          if (pending[i] == request) begin
+            pending.delete(i);
+            break;
+          end
       end
       engine_lock.put(1);
       if (request.done)
@@ -470,7 +484,9 @@ class rdma_cmq_engine extends uvm_object;
       status = read_cqe(raw_cqe, ready, decoded);
       if (status.ok() && !ready)
         break;
-      if (!status.ok() || decoded == null || decoded.wqe_index >= CMQ_DEPTH ||
+      // 驱动按 CQE 的 wqe_idx 找请求，并假定完成按 CI 顺序到达；模型把乱序视为设备错误，避免
+      // 后续提交覆盖仍在途的槽位。
+      if (!status.ok() || decoded == null || decoded.wqe_index != ring_index(cq_consume_seq) ||
           request_array[decoded.wqe_index] == null) begin
         engine_state = RDMA_CMQ_ENGINE_POISONED;
         `uvm_error("RDMA_CMQ", status.ok() ? "CMQ CQE does not match an outstanding request" :
@@ -592,18 +608,24 @@ class rdma_cmq_engine extends uvm_object;
     result.completion = request.completion;
     result.status = status;
     result.recovery_required = 1'b0;
-    if (request.ticket == null) begin
-      reject(result, status);
-      return;
-    end
-    result.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
-    result.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
-    if (request.completion.raw_cqe != null)
+    if (request.completion.raw_cqe != null) begin
+      result.submission_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_MMIO_VISIBLE;
       result.completion_phase = RDMA_CMQ_COMPLETION_TERMINAL;
-    else if (status.code == RDMA_SC_TIMEOUT)
-      result.completion_phase = RDMA_CMQ_COMPLETION_TIMEOUT;
-    else
-      result.completion_phase = RDMA_CMQ_COMPLETION_RESET_CANCELLED;
+    end
+    else if (request.ticket != null &&
+             status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED}) begin
+      result.submission_effect = request.submit_effect;
+      result.attempt_effect = request.submit_effect;
+      result.completion_phase = status.code == RDMA_SC_TIMEOUT ?
+                                RDMA_CMQ_COMPLETION_TIMEOUT : RDMA_CMQ_COMPLETION_RESET_CANCELLED;
+    end
+    else begin
+      // 未发布（pending 中被拒）或 doorbell 失败：与直接提交路径相同，效果取自提交阶段。
+      reject(result, status);
+      result.submission_effect = request.submit_effect;
+      result.attempt_effect = request.submit_effect;
+    end
   endfunction
 
   // 功能：把 result 置为未提交拒绝。
@@ -631,12 +653,14 @@ class rdma_cmq_engine extends uvm_object;
     status = rdma_status::success();
     cancelled = rdma_status::make(RDMA_SC_RESET_CANCELLED, "CMQ request was cancelled by reset");
     foreach (request_array[i]) begin
-      if (request_array[i] == null)
+      if (request_array[i] == null || request_array[i].done)
         continue;
       finish_request(request_array[i], cancelled, null, null);
       completions.push_back(request_array[i].completion);
     end
     foreach (pending[i]) begin
+      if (pending[i].done)
+        continue;
       finish_request(pending[i], cancelled, null, null);
       completions.push_back(pending[i].completion);
     end

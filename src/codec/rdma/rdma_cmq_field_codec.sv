@@ -91,7 +91,7 @@ class rdma_hw_cmq_field_codec extends uvm_object;
       return unsupported(opcode);
     if (!$cast(body, model) || body == null)
       return invalid_argument("CMQ field codec requires rdma_hw_cmq_field_body");
-    status = check_members(body, specs);
+    status = check_members(opcode, body, specs);
     if (!status.ok())
       return status;
     foreach (words[q])
@@ -117,7 +117,7 @@ class rdma_hw_cmq_field_codec extends uvm_object;
   // 功能：body 只能出现表内成员（常量与计算字段不接受输入）。
   // 输入/输出及副作用：纯检查。
   // 失败/边界：未知成员或标量/数组放错位置时返回 INVALID_ARGUMENT。
-  protected function rdma_status check_members(rdma_hw_cmq_field_body body,
+  protected function rdma_status check_members(bit [7:0] opcode, rdma_hw_cmq_field_body body,
                                                rdma_cmq_field_spec_t specs[$]);
     bit scalar[string];
     bit blob[string];
@@ -134,7 +134,7 @@ class rdma_hw_cmq_field_codec extends uvm_object;
       if (!scalar.exists(name))
         return invalid_argument({"CMQ field body has unknown scalar member ", name});
     foreach (body.blobs[name])
-      if (!blob.exists(name) && name != "sd_extra_data")
+      if (!blob.exists(name) && !(opcode == RDMA_OP_SD_UPDATE && name == "sd_extra_data"))
         return invalid_argument({"CMQ field body has unknown array member ", name});
     return rdma_status::success();
   endfunction

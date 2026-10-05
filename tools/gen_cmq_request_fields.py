@@ -129,6 +129,23 @@ def classify_value(expr: str) -> tuple[str, str]:
     raise GenError(f"unsupported field value expression: {expr}")
 
 
+# 信封字段由 envelope codec 按 slot 填写；驱动这里只能是 opcode/index/polarity 或常量 0。
+ENVELOPE_VALUES = {
+    "XTRDMA_CMQCQ_OPCODE": {"opcode", "XTRDMA_OP_SRC_ADDR_UPDATE", "XTRDMA_OP_SRC_ADDR_QUERY"},
+    "XTRDMA_CMQSQ_WQE_INDEX": {"wqe_idx"},
+    "XTRDMA_CMQSQ_WQE_WRAP": {"polarity ? 0 : 1", "cmq->sq_polarity ? 0 : 1"},
+    "XTRDMA_CMQSQ_WQE_VALID": {"polarity", "cmq->sq_polarity"},
+    "XTRDMA_CMQSQ_USE_VFID": {"0"},
+    "XTRDMA_CMQSQ_VFID_OVERRIDE": {"0"},
+}
+
+
+def check_envelope_value(function: str, macro: str, value: str) -> None:
+    """信封字段取值超出预期时报错，避免驱动改动被静默丢弃。"""
+    if value.strip() not in ENVELOPE_VALUES[macro]:
+        raise GenError(f"{function}: unexpected envelope value {macro}={value}")
+
+
 def assignments(body: str) -> dict[str, str]:
     """收集 `var = <FIELD_PREP chain>;` 赋值（后出现者覆盖先出现者）。"""
     out: dict[str, str] = {}
@@ -150,6 +167,7 @@ def qword_rows(macros, body: str, function: str) -> list[dict]:
         if "FIELD_PREP" in expr:
             for macro, value in split_field_preps(expr):
                 if macro in ENVELOPE_MACROS:
+                    check_envelope_value(function, macro, value)
                     continue
                 lsb, width = mask_bits(macros, macro)
                 param, transform = classify_value(value)
@@ -190,6 +208,7 @@ def sd_update_rows(macros, body: str) -> list[dict]:
     rows = []
     for macro, value in split_field_preps(assignments(body)["ctrl_data"]):
         if macro in ENVELOPE_MACROS:
+            check_envelope_value(function, macro, value)
             continue
         lsb, width = mask_bits(macros, macro)
         param, transform = classify_value(value)

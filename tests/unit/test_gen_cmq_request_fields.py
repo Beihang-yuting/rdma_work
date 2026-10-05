@@ -69,6 +69,14 @@ static void f(__be64 *wqe)
         self.assertEqual(got, [("first", 8, 0, 24, "value"), ("", 8, 48, 1, "const:1"),
                                ("second", 0, 52, 12, "value"), ("whole", 24, 0, 64, "value")])
 
+    def test_nonzero_vfid_is_rejected(self):
+        body = """
+	set_64bit_val(wqe, 0, FIELD_PREP(XTRDMA_A, info->x) | FIELD_PREP(XTRDMA_CMQSQ_USE_VFID, info->vf));
+"""
+        macros = dict(MACROS, XTRDMA_CMQSQ_USE_VFID="GENMASK(58, 48)")
+        with self.assertRaises(gen.GenError):
+            gen.qword_rows(macros, body, "f")
+
     def test_memcpy_offsets(self):
         body = """
 	memcpy(wqe + 2, info->ip, sizeof(u8)*XTRDMA_LEN);

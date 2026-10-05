@@ -145,6 +145,8 @@ VALUE_MASKS = {
     ("xtrdma_sc_update_ifa_info", "data"): 0x03ff_ffff_ffff_ffff,
     ("xtrdma_sc_query_key", "stag_idx"): 0xffff,
 }
+# 额外边界用例：驱动对 IDX_OCC 只 WARN_ON(num != 1)，仍按 num - 1 编码。
+EXTRA_CASES = {"IDX_OCC_QPC": [("num3", {"num": 3})]}
 # SD 数据块（16B = sd_idx qword + data_info qword）的允许位，见 request_mask(SD_UPDATE)。
 SD_CHUNK_MASKS = (0x0000_0000_0000_0fff, 0xffff_ffff_ffff_fff1)
 
@@ -192,14 +194,22 @@ def build_cases(root: Path) -> list[dict]:
             if name not in opcodes:
                 raise OracleError(f"driver enum lacks XTRDMA_OP_{name}")
             for sd_num in ([2, 4] if name == "SD_UPDATE" else [None]):
-                number = len(cases) + 1
-                case = dict(name=name.lower() + (f"_sd{sd_num}" if sd_num else ""),
-                            opcode=opcodes[name], function=group[0]["function"],
-                            index=number % 32, polarity=number & 1, values={}, blobs={})
-                for row in group:
-                    fill_case_value(case, row, sd_num)
+                cases.append(new_case(name.lower() + (f"_sd{sd_num}" if sd_num else ""),
+                                      opcodes[name], group, len(cases) + 1, sd_num))
+            for suffix, overrides in EXTRA_CASES.get(name, []):
+                case = new_case(f"{name.lower()}_{suffix}", opcodes[name], group,
+                                len(cases) + 1, None)
+                case["values"].update(overrides)
                 cases.append(case)
     return cases
+
+
+def new_case(name: str, opcode: int, group: list[dict], number: int, sd_num) -> dict:
+    case = dict(name=name, opcode=opcode, function=group[0]["function"],
+                index=number % 32, polarity=number & 1, values={}, blobs={})
+    for row in group:
+        fill_case_value(case, row, sd_num)
+    return case
 
 
 def fill_case_value(case: dict, row: dict, sd_num: int | None) -> None:

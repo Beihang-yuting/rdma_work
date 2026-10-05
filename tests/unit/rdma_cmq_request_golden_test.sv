@@ -126,8 +126,8 @@ class rdma_cmq_request_golden_test extends rdma_cmq_engine_test;
       `uvm_error("REQUEST_GOLDEN", error)
       return;
     end
-    if (cases.size() != 50)
-      `uvm_error("REQUEST_GOLDEN", $sformatf("expected 50 golden cases, got %0d", cases.size()))
+    if (cases.size() != 51)
+      `uvm_error("REQUEST_GOLDEN", $sformatf("expected 51 golden cases, got %0d", cases.size()))
     compared = 0;
     foreach (cases[c]) begin
       if (!parse_inputs(cases[c].name, cases[c].inputs, opcode, index, polarity, body))
@@ -182,6 +182,17 @@ class rdma_cmq_request_golden_test extends rdma_cmq_engine_test;
     body.values["sd_num"] = 3;
     body.blobs["sd_data"] = new[32];
     expect_status("FIELD_SD_EXTRA", compose("sd", RDMA_OP_SD_UPDATE, 0, 1, body, sqe),
+                  RDMA_SC_INVALID_ARGUMENT);
+    body = rdma_hw_cmq_field_body::type_id::create("sd_addr_mask");
+    body.values["sd_num"] = 3;
+    body.values["sd_buf_addr"] = 64'h1000_0001;
+    body.blobs["sd_data"] = new[32];
+    body.blobs["sd_extra_data"] = new[16];
+    expect_status("FIELD_SD_ADDR_OWNERSHIP", compose("sdaddr", RDMA_OP_SD_UPDATE, 0, 1, body, sqe),
+                  RDMA_SC_CODEC_ERROR);
+    body = rdma_hw_cmq_field_body::type_id::create("extra_on_other");
+    body.blobs["sd_extra_data"] = new[16];
+    expect_status("FIELD_EXTRA_NON_SD", compose("extra", RDMA_OP_KEY_QUERY, 0, 1, body, sqe),
                   RDMA_SC_INVALID_ARGUMENT);
     body = rdma_hw_cmq_field_body::type_id::create("ifa_mask");
     body.values["data"] = 64'hffff_ffff_ffff_ffff;

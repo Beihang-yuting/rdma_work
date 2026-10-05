@@ -159,7 +159,8 @@ class rdma_cmq_engine_test extends uvm_test;
   function automatic rdma_cmq_command_desc make_hw_command(string name,
                                                            rdma_function_binding binding,
                                                            bit [7:0] opcode,
-                                                           time timeout_value = 1us);
+                                                           time timeout_value = 1us,
+                                                           bit [11:0] serial = 12'h123);
     rdma_hw_occ_flush_body occ_body;
     rdma_hw_mr_deregister_body mr_body;
     rdma_hw_model body;
@@ -169,7 +170,7 @@ class rdma_cmq_engine_test extends uvm_test;
       occ_body = rdma_hw_occ_flush_body::type_id::create({name, "_body"});
       occ_body.mr_serial_flush = 1'b1;
       occ_body.pble = 1'b1;
-      occ_body.mr_serial = 12'h123;
+      occ_body.mr_serial = serial;
       body = occ_body;
       variant = "occ_flush";
     end
@@ -371,7 +372,8 @@ class rdma_cmq_engine_test extends uvm_test;
       fork
         automatic int unsigned index = i;
         fx.engine.execute_observed(
-          make_hw_command($sformatf("FULL_%0d", index), fx.active, RDMA_OP_TQ_FLUSH, 10us),
+          make_hw_command($sformatf("FULL_%0d", index), fx.active, RDMA_OP_OCC_FLUSH, 10us,
+                          12'(index)),
           results[index]);
       join_none
     end
@@ -401,6 +403,11 @@ class rdma_cmq_engine_test extends uvm_test;
         fx.device.observed_wqe_indices[CMQ_DEPTH] != 0 ||
         fx.device.observed_wqe_wraps[CMQ_DEPTH] != 1'b1)
       `uvm_error("FULL_DRAIN", "pending commands were not submitted after the ring drained")
+    // fork 按序启动；驱动 pending 链表为 FIFO，设备看到的 mr_serial 必须与提交顺序一致。
+    foreach (fx.device.observed_qword1[i])
+      if (fx.device.observed_qword1[i][RDMA_CMQ_OCC_MR_SERIAL_LSB +: 12] != i)
+        `uvm_error("FULL_ORDER", $sformatf("SQE %0d carries mr_serial %0d", i,
+                   fx.device.observed_qword1[i][RDMA_CMQ_OCC_MR_SERIAL_LSB +: 12]))
     stop_fixture("FULL", fx);
   endtask
 
@@ -570,6 +577,85 @@ class rdma_cmq_engine_test extends uvm_test;
     stop_fixture("POISON", fx);
   endtask
 
+  // 功能：在 32 条在途 + pending 时 reset：全部以 RESET_CANCELLED 结束且只报告一次；shutdown 后 reset
+  //   不得重开 engine；pending 请求在补发时 doorbell 失败按提交效果报告。
+  // 输入/输出及副作用：设备扣留完成；两套 fixture。
+  // 失败/边界：取消计数、阶段、效果或状态迁移不符时报告 UVM_ERROR。
+  task automatic check_reset_and_pending_failures();
+    rdma_cmq_engine_fixture fx;
+    rdma_cmq_execution_result results[];
+    rdma_cmq_completion completions[$];
+    rdma_status status;
+
+    results = new[CMQ_DEPTH + 2];
+    build_fixture("reset_live", fx);
+    start_fixture("RESET_LIVE", fx);
+    fx.device.hold = 1'b1;
+    for (int unsigned i = 0; i < results.size(); i++) begin
+      fork
+        automatic int unsigned index = i;
+        fx.engine.execute_observed(
+          make_hw_command($sformatf("RESET_LIVE_%0d", index), fx.active, RDMA_OP_TQ_FLUSH, 10us),
+          results[index]);
+      join_none
+    end
+    #20ns;
+    fx.engine.reset(completions, status);
+    expect_status("RESET_LIVE", status, RDMA_SC_OK);
+    wait fork;
+    if (completions.size() != results.size())
+      `uvm_error("RESET_LIVE", $sformatf("reset reported %0d cancellations, expected %0d",
+                                         completions.size(), results.size()))
+    foreach (results[i]) begin
+      if (results[i] == null) begin
+        `uvm_error("RESET_LIVE", $sformatf("command %0d returned no result", i))
+        continue;
+      end
+      expect_status($sformatf("RESET_LIVE_%0d", i), results[i].status, RDMA_SC_RESET_CANCELLED);
+      if (results[i].completion_phase !=
+          (i < CMQ_DEPTH ? RDMA_CMQ_COMPLETION_RESET_CANCELLED : RDMA_CMQ_COMPLETION_NONE))
+        `uvm_error("RESET_LIVE", $sformatf("command %0d phase %s", i,
+                                           results[i].completion_phase.name()))
+    end
+    if (fx.engine.state() != RDMA_CMQ_ENGINE_UNCONFIGURED || fx.mem.live_allocations() != 0)
+      `uvm_error("RESET_LIVE", "reset did not release the backing")
+    fx.engine.shutdown(status);
+    expect_status("RESET_AFTER_SHUTDOWN_PREP", status, RDMA_SC_OK);
+    fx.engine.reset(completions, status);
+    expect_status("RESET_AFTER_SHUTDOWN", status, RDMA_SC_INVALID_STATE);
+    if (fx.engine.state() != RDMA_CMQ_ENGINE_QUIESCED)
+      `uvm_error("RESET_AFTER_SHUTDOWN", "reset reopened a shut-down engine")
+
+    results = new[CMQ_DEPTH + 1];
+    build_fixture("pending_doorbell", fx);
+    start_fixture("PENDING_DOORBELL", fx);
+    fx.device.hold = 1'b1;
+    for (int unsigned i = 0; i < results.size(); i++) begin
+      fork
+        automatic int unsigned index = i;
+        fx.engine.execute_observed(
+          make_hw_command($sformatf("PENDING_DB_%0d", index), fx.active, RDMA_OP_TQ_FLUSH, 10us),
+          results[index]);
+      join_none
+    end
+    #20ns;
+    status = rdma_status::make(RDMA_SC_PCIE_COMPLETION, "injected pending doorbell failure");
+    expect_status("PENDING_DB_INJECT", fx.device.fail_next("mmio_write", status), RDMA_SC_OK);
+    expect_status("PENDING_DB_RELEASE", fx.device.release_held(), RDMA_SC_OK);
+    wait fork;
+    if (results[CMQ_DEPTH] == null || results[CMQ_DEPTH].status == null ||
+        results[CMQ_DEPTH].status.code != RDMA_SC_PCIE_COMPLETION ||
+        results[CMQ_DEPTH].submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
+        results[CMQ_DEPTH].completion_phase != RDMA_CMQ_COMPLETION_NONE)
+      `uvm_error("PENDING_DB", "pending doorbell failure was not reported with its submit effect")
+    if (fx.engine.state() != RDMA_CMQ_ENGINE_POISONED)
+      `uvm_error("PENDING_DB", "pending doorbell failure did not poison the engine")
+    for (int unsigned i = 0; i < CMQ_DEPTH; i++)
+      if (results[i] == null || results[i].status == null || !results[i].status.ok())
+        `uvm_error("PENDING_DB", $sformatf("in-ring command %0d did not complete", i))
+    stop_fixture("PENDING_DOORBELL", fx);
+  endtask
+
   // 功能：reconcile_ticket 恒报告无终态：驱动语义下没有歧义 ticket。
   // 输入/输出及副作用：无参数；使用未配置 engine。
   // 失败/边界：报告终态时报告 UVM_ERROR。
@@ -597,6 +683,7 @@ class rdma_cmq_engine_test extends uvm_test;
     check_cqe_errors();
     check_watchdog_and_reset();
     check_poison_paths();
+    check_reset_and_pending_failures();
     check_pre_submit_rejection();
     check_reconcile_has_no_terminal();
     phase.drop_objection(this);
