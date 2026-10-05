@@ -128,7 +128,7 @@ class rdma_control_plane extends uvm_object;
     return null;
   endfunction
 
-  // 功能：派发一次 legacy CMQ 命令，原样保留 backend 的 status 引用。
+  // 功能：派发一次 CMQ 命令，原样保留 backend 的 status 引用。
   // 输入/输出及副作用：command 为输入；ticket、completion、status 为输出；恰调用 cmq.execute 一次。
   // 失败/边界：cmq 为空返回 INVALID_STATE，command 为空返回 INVALID_ARGUMENT；backend 返回 null status 时保留 null，
   //   由调用方归一化；不重试、不推断 timeout，不推进 generation 或资源状态。
@@ -138,12 +138,10 @@ class rdma_control_plane extends uvm_object;
     output rdma_cmq_completion completion,
     output rdma_status status
   );
-    rdma_cmq_dispatch_legacy_raw(
-      cmq,
-      command,
-      ticket,
-      completion,
-      status,
+    bit no_submit;
+
+    rdma_cmq_dispatch(
+      cmq, command, ticket, completion, status, no_submit,
       "control-plane CMQ is unavailable",
       "control-plane CMQ command is null"
     );

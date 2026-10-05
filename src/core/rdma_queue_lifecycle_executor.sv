@@ -9,6 +9,9 @@ class rdma_queue_lifecycle_executor extends uvm_object;
 
   protected rdma_resource_manager manager;
   protected rdma_cmq_port cmq;
+  // 最近一次经 rdma_cmq_dispatch 执行的命令是否被证明在提交前即被拒绝；仅供紧随其后的
+  //   cmq_outcome_ambiguous 分类使用。
+  protected bit last_cmq_no_submit;
   protected rdma_host_mem_api host_mem;
   protected rdma_context_backing_api context_backing;
   protected time command_timeout;
@@ -24,6 +27,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   // 失败/边界：未 configure 前不可执行事务。
   function new(string name = "rdma_queue_lifecycle_executor");
     super.new(name);
+    last_cmq_no_submit = 1'b0;
     manager = null;
     cmq = null;
     host_mem = null;
@@ -74,7 +78,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       status,
       ticket,
       completion,
-      cmq != null && cmq.last_execute_definitive_no_submit(),
+      last_cmq_no_submit,
       1'b0,
       1'b1,
       1'b0
@@ -917,7 +921,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
   endfunction
 
   // 功能：执行一条队列 CMQ 命令，并判定结果是否歧义。
-  // 输入/输出及副作用：ticket/completion/status/ambiguous 为输出；经 legacy raw dispatch 调用 cmq；提交后做 live
+  // 输入/输出及副作用：ticket/completion/status/ambiguous 为输出；经 rdma_cmq_dispatch 调用 cmq；提交后做 live
   //   binding fence。
   // 失败/边界：cmq 或 command 为空返回 INVALID_ARGUMENT；fence 失败返回其 status；成功但缺 completion 返回
   //   INVALID_STATE（completion_lost_message）。
@@ -942,12 +946,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       return;
     end
     ambiguous = 1'b0;
-    rdma_cmq_dispatch_legacy_raw(
+    rdma_cmq_dispatch(
       cmq,
       command,
       ticket,
       completion,
       execute_status,
+      last_cmq_no_submit,
       "queue CMQ is unavailable",
       "queue CMQ command is incomplete"
     );
@@ -1003,7 +1008,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       ), "queue rollback pre-delete flush descriptor returned null");
       if (status.ok()) begin
         // 设计说明：rollback_created 保留 fence checkpoint 的原位置和“失败即返回”
-        // 语义，因此故意让 helper 不接管 binding/owner；helper 只负责 legacy CMQ
+        // 语义，因此故意让 helper 不接管 binding/owner；helper 只负责 CMQ
         // 输出、ambiguity 与 null-result 归一化。
         execute_queue_command(
           command, ticket, completion, status, ambiguous, null, null,
@@ -2305,7 +2310,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       ticket = null;
       completion = null;
       // 设计说明：create_locked 保留 fence checkpoint 在 helper 之后，和原始
-      // 提交顺序一致；helper 只收束 legacy 输出归一化，不改变 create 失败时
+      // 提交顺序一致；helper 只收束 CMQ 输出归一化，不改变 create 失败时
       // 进入 retain_recovery/rollback_local 的判定。
       execute_queue_command(
         create_command, ticket, completion, status, cmq_ambiguous,

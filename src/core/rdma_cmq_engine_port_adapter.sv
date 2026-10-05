@@ -7,25 +7,12 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
   `uvm_object_utils(rdma_cmq_engine_port_adapter)
 
   protected rdma_cmq_engine engines[string];
-  // Set only when this adapter returns from a validation guard that runs
-  // before handing a command to the CMQ engine.  Engine submit/wait failures
-  // intentionally remain unclassified because they may have crossed the
-  // hardware boundary.
-  protected bit last_execute_no_submit_proven;
 
-  // 功能：构造 adapter，清除 no-submit 证明标志。
+  // 功能：构造 adapter，engine 绑定表为空。
   // 输入/输出及副作用：name 为对象名。
   // 失败/边界：无。
   function new(string name = "rdma_cmq_engine_port_adapter");
     super.new(name);
-    last_execute_no_submit_proven = 1'b0;
-  endfunction
-
-  // 功能：返回最近一次 execute 是否确定未提交。
-  // 输入/输出及副作用：只读 last_execute_no_submit_proven。
-  // 失败/边界：无。
-  virtual function bit last_execute_definitive_no_submit();
-    return last_execute_no_submit_proven;
   endfunction
 
   // 功能：由 Function handle 生成绑定表 key（UID:object_id:generation）。
@@ -130,20 +117,6 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
            identity.variant == ticket.opcode_key.variant;
   endfunction
 
-  // 功能：判断 observed result 是否完全没有提交身份图。
-  // 输入/输出及副作用：value 只读；返回 bit。
-  // 失败/边界：value 为 null 返回 0；ticket/identity/owner/DMA/completion 任一存在或 batch/attempt 非零即非空。
-  protected function bit observed_identity_graph_empty(
-    input rdma_cmq_execution_result value
-  );
-    if (value == null)
-      return 1'b0;
-    return value.ticket == null && value.completion == null &&
-           value.command_identity == null && value.recovery_owner == null &&
-           value.dma_context == null && value.batch_key.len() == 0 &&
-           value.batch_id == 0 && value.attempt_id == 0;
-  endfunction
-
   // 功能：校验 observed result 的身份图完整且 ticket、identity、owner、DMA context 互相一致。
   // 输入/输出及副作用：value 只读；调用 dma_context.validate()，不复制或提交 authority。
   // 失败/边界：半成品图、零 batch/attempt、ticket/identity 漂移、非 legacy owner 的 generation/reset epoch 不一致或 DMA
@@ -189,26 +162,6 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
              value.recovery_owner.function_identity.reset_epoch;
   endfunction
 
-  // 功能：确认结果是 adapter 在 engine 之前确定拒绝的 PRE_SUBMIT_REJECTED envelope。
-  // 输入/输出及副作用：value 只读；返回 bit。
-  // 失败/边界：status/observation 缺失或失败、effect 非 PRE、身份图非空、有 completion 或 recovery 标志均返回 0。
-  protected function bit legacy_no_submit_result_valid(
-    input rdma_cmq_execution_result value
-  );
-    if (value == null || value.status == null || value.observation_status == null ||
-        !rdma_cmq_status_shape_valid(value.status) ||
-        !rdma_cmq_status_shape_valid(value.observation_status) ||
-        value.status.code == RDMA_SC_OK ||
-        value.observation_status.code != RDMA_SC_OK ||
-        value.submission_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
-        value.attempt_effect != RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
-        value.completion_phase != RDMA_CMQ_COMPLETION_NONE ||
-        value.recovery_required != 1'b0 ||
-        !observed_identity_graph_empty(value))
-      return 1'b0;
-    return 1'b1;
-  endfunction
-
   // 功能：对 observed result 做 effect/phase/recovery 语义交叉校验，并检查 completion 的别名拓扑。
   // 输入/输出及副作用：value 只读；返回 bit。
   // 失败/边界：枚举未知、phase 与 effect 组合非法、completion 缺失/多余或未别名 result 的 ticket/status、身份图漂移均返回 0。
@@ -229,7 +182,7 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
         !rdma_cmq_completion_phase_valid(value.completion_phase))
       return 1'b0;
 
-    identity_graph_empty = observed_identity_graph_empty(value);
+    identity_graph_empty = rdma_cmq_result_identity_graph_empty(value);
     identity_graph_complete = observed_identity_graph_complete(value);
     if (!identity_graph_empty && !identity_graph_complete)
       return 1'b0;
@@ -265,7 +218,7 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     );
     if (value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED ||
         value.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED)
-      return legacy_no_submit_result_valid(value);
+      return rdma_cmq_result_no_submit_proven(value);
 
     case (value.completion_phase)
       RDMA_CMQ_COMPLETION_UNOBSERVED:
@@ -330,36 +283,6 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     engines[key] = engine;
     return rdma_status::success();
   endfunction
-
-  // 功能：legacy execute 入口，包装 execute_observed 并回填 ticket/completion/status。
-  // 输入/输出及副作用：先清空输出和 no-submit 标志；仅当结果通过 legacy_no_submit_result_valid 才置标志。
-  // 失败/边界：observed result 为 null 时 status 为 INVALID_STATE。
-  virtual task execute(
-    rdma_cmq_command_desc command,
-    output rdma_cmq_ticket ticket,
-    output rdma_cmq_completion completion,
-    output rdma_status status
-  );
-    rdma_cmq_execution_result observed_result;
-
-    last_execute_no_submit_proven = 1'b0;
-    ticket = null;
-    completion = null;
-    status = invalid_state("CMQ port execute did not complete");
-    execute_observed(command, observed_result);
-    if (observed_result == null) begin
-      status = invalid_state("CMQ observed execute returned null result");
-      return;
-    end
-    if (observed_result.status != null)
-      status = observed_result.status;
-    if (observed_result.ticket != null)
-      ticket = observed_result.ticket;
-    if (observed_result.completion != null)
-      completion = observed_result.completion;
-    if (legacy_no_submit_result_valid(observed_result))
-      last_execute_no_submit_proven = 1'b1;
-  endtask
 
   // 功能：按 command 的 Function 找到 engine 并执行 observed 路径，返回 detached result。
   // 输入/输出及副作用：result 为调用方持有输出；成功绑定时恰好调用一次 engine.execute_observed。

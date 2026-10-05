@@ -2274,3 +2274,37 @@ function automatic rdma_status rdma_cmq_classify_recovery_required(
   recovery_required = candidate;
   return rdma_cmq_direct_status(RDMA_SC_OK);
 endfunction
+
+// 功能：判断 observed result 是否完全没有提交身份图。
+// 输入/输出及副作用：value 只读；返回 bit。
+// 失败/边界：null 返回 0；ticket/completion/identity/owner/DMA 任一存在或 batch/attempt 非零即非空。
+function automatic bit rdma_cmq_result_identity_graph_empty(
+  input rdma_cmq_execution_result value
+);
+  if (value == null)
+    return 1'b0;
+  return value.ticket == null && value.completion == null &&
+         value.command_identity == null && value.recovery_owner == null &&
+         value.dma_context == null && value.batch_key.len() == 0 &&
+         value.batch_id == 0 && value.attempt_id == 0;
+endfunction
+
+// 功能：判断 observed result 能否证明命令在提交前就被拒绝（确定未提交）。
+// 输入/输出及副作用：value 只读；返回 bit，供 caller 做歧义分类。
+// 失败/边界：status 为 OK 或 shape 非法、observation 失败、任一 effect 非 PRE_SUBMIT_REJECTED、
+//   completion phase 非 NONE、要求恢复或身份图非空时返回 0。
+function automatic bit rdma_cmq_result_no_submit_proven(
+  input rdma_cmq_execution_result value
+);
+  return value != null && value.status != null &&
+         value.observation_status != null &&
+         rdma_cmq_status_shape_valid(value.status) &&
+         rdma_cmq_status_shape_valid(value.observation_status) &&
+         value.status.code != RDMA_SC_OK &&
+         value.observation_status.code == RDMA_SC_OK &&
+         value.submission_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+         value.attempt_effect == RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED &&
+         value.completion_phase == RDMA_CMQ_COMPLETION_NONE &&
+         value.recovery_required == 1'b0 &&
+         rdma_cmq_result_identity_graph_empty(value);
+endfunction

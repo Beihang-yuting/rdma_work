@@ -85,8 +85,8 @@ capability、generation 和 reset epoch。`PRE_SUBMIT_REJECTED`、`HOST_VISIBLE`
 
 CMQ wire gate 以真实的
 `dpu_kernel_rdma-version_0.1.34.tar(1).gz` 归档、source manifest 和 C oracle
-为唯一 ABI 来源；固定清单、执行命令和日志摘要记录在上述验证文档中。未迁移的
-三个 Phase 1B consumer（`rdma_control_plane.sv`、
-`rdma_queue_lifecycle_executor.sv`、`rdma_qp_lifecycle_executor.sv`）暂时只能通过
-legacy `execute()` 读取 `last_execute_no_submit_proven`；三者全部迁移后才会移除该
-兼容 seam。
+为唯一 ABI 来源；固定清单、执行命令和日志摘要记录在上述验证文档中。
+`rdma_cmq_port` 只暴露 `execute_observed()`/`reconcile()`；控制面、queue 与 QP
+lifecycle executor 统一经 `rdma_cmq_dispatch()` 调用，并以
+`rdma_cmq_result_no_submit_proven()` 判定“确定未提交”。legacy `execute()` 与
+`last_execute_no_submit_proven` 兼容 seam 已移除。

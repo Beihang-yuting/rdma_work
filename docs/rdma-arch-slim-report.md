@@ -52,6 +52,12 @@ Python 门禁另删除约 4.8k 行（结构冻结类）。
 8. **小修**：net_packet adapter 两处无初始化 for 循环（消除 VCS FLWI 告警，E2E 编译告警 4→2，
    余下 2 条来自外部 net_packet 仓库）。
 
+9. **legacy execute 迁移**：`rdma_cmq_port` 只保留 `execute_observed()/reconcile()`；删除 legacy
+   `execute()`、端口上的“最近一次未提交”可变标志及 base 端口的 legacy→observed 快照回退。
+   控制面、queue/QP lifecycle executor 统一经 `rdma_cmq_dispatch()` 调用并拆包，“确定未提交”
+   由 `rdma_cmq_result_no_submit_proven(result)` 按结果判定（与原 adapter 判据相同），后端 status
+   对象 identity 不变。测试 mock 的 `execute()` 退化为 mock 内部实现，由其 `execute_observed()` 包装。
+
 ## 验证
 
 每轮均为全量：Python 门禁、changed-SV style、驱动契约（rdma_defs）、core、CMQ gate、integration、
@@ -68,8 +74,6 @@ host_mem、PCIe、E2E（dual env / multi-VF / high traffic）。
 
 ## 未做与遗留
 
-- legacy `execute()` 兼容 seam（control plane、queue/QP lifecycle executor）未迁移：迁移会改变
-  测试 mock 依赖的 no-submit 证明与后端 status 对象 identity，需要连同测试一起设计。
 - CEQ/AEQ 的 request/resource/context model 与 lifecycle policy 仍为平行实现；字段名不同，
   用钩子合并反而增加行数，需先统一模型基类才值得做。
 - cmq engine 的类型化快照（按类型逐字段克隆并校验）保持原设计，以保留对异常 do_copy 子类的修复语义。

@@ -9,6 +9,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
   protected rdma_resource_manager manager;
   protected rdma_cmq_port cmq;
+  // 最近一次经 rdma_cmq_dispatch 执行的命令是否被证明在提交前即被拒绝；仅供紧随其后的
+  //   cmq_outcome_ambiguous 分类使用。
+  protected bit last_cmq_no_submit;
   protected rdma_host_mem_api host_mem;
   protected rdma_context_backing_api context_backing;
   protected time command_timeout;
@@ -20,6 +23,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
   // 失败/边界：无。
   function new(string name = "rdma_qp_lifecycle_executor");
     super.new(name);
+    last_cmq_no_submit = 1'b0;
     manager = null;
     cmq = null;
     host_mem = null;
@@ -1111,28 +1115,30 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       status,
       ticket,
       completion,
-      cmq != null && cmq.last_execute_definitive_no_submit(),
+      last_cmq_no_submit,
       1'b1,
       1'b0,
       1'b1
     );
   endfunction
 
-  // 功能：QP 各阶段共用的 legacy CMQ 原始 dispatch，只调用一次 cmq.execute。
-  // 输入/输出及副作用：清空并输出 ticket/completion/status，保留后端原始 status（可为 null）；不做 fence、歧义分类或状态提交。
+  // 功能：QP 各阶段共用的 CMQ 调用，经 rdma_cmq_dispatch 执行一次 execute_observed。
+  // 输入/输出及副作用：输出 ticket/completion/status（后端 status 原样，可为 null）并更新
+  //   last_cmq_no_submit；不做 fence、歧义分类或状态提交。
   // 失败/边界：cmq 为空返回 INVALID_STATE；command 为空返回 INVALID_ARGUMENT；不重试。
-  protected task execute_qp_legacy_command(
+  protected task execute_qp_command(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
     output rdma_cmq_completion completion,
     output rdma_status status
   );
-    rdma_cmq_dispatch_legacy_raw(
+    rdma_cmq_dispatch(
       cmq,
       command,
       ticket,
       completion,
       status,
+      last_cmq_no_submit,
       "QP CMQ is unavailable",
       "QP CMQ command is null"
     );
@@ -1351,7 +1357,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       completion = null;
       status = live_binding_fence(binding, expected_owner);
       if (status.ok())
-        execute_qp_legacy_command(
+        execute_qp_command(
           query_command, ticket, completion, status
         );
       else begin
@@ -1861,7 +1867,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (!status.ok())
       return;
     status = null;
-    execute_qp_legacy_command(command, ticket, completion, status);
+    execute_qp_command(command, ticket, completion, status);
     ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
     recovery_ticket = ticket;
     if (recovery_ticket == null && completion != null)
@@ -2452,7 +2458,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     ticket = null;
     completion = null;
     status = null;
-    execute_qp_legacy_command(command, ticket, completion, status);
+    execute_qp_command(command, ticket, completion, status);
     ambiguous = cmq_outcome_ambiguous(status, ticket, completion);
     recovery_ticket = ticket;
     if (recovery_ticket == null && completion != null)
@@ -2734,7 +2740,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                  RDMA_OP_QPC_MODIFY, command);
     if (status.ok()) begin
       ticket = null; completion = null; ambiguous = 1'b0; status = null;
-      execute_qp_legacy_command(command, ticket, completion, status);
+      execute_qp_command(command, ticket, completion, status);
       // 部分 CMQ adapter 只通过 completion 暴露权威 ticket；先取回再分类，
       // 使确定的 completion 保持确定，歧义的仍保留可对账 ticket。
       if (ticket == null && completion != null && completion.ticket != null)
@@ -3992,7 +3998,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
           ticket = null; completion = null;
           status = live_binding_fence(binding, expected_owner);
           if (status.ok())
-            execute_qp_legacy_command(
+            execute_qp_command(
               query_command, ticket, completion, status
             );
           else begin

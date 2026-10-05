@@ -406,11 +406,8 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected bit [7:0] gated_opcode;
   protected int unsigned gate_target_count;
   protected int unsigned gate_entered_count;
-  // 中文设计：该 shared seam 仅描述最近一次 legacy execute() 在 mock 内部是否
-  // 可证明地未写入 call ledger；Phase 1A observed fallback 不读取它，避免把
-  // mock 专属证据误提升为通用 lifecycle observation，1B consumer 迁移前保留。
-  // Evidence is scoped to the most recent execute() call.  It is asserted
-  // only on mock adapter paths that return before recording a CMQ call.
+  // 最近一次 execute() 是否在写入 call ledger 前返回（可证明未提交）；
+  //   execute_observed 据此把结果标为 PRE_SUBMIT_REJECTED。
   protected bit last_execute_no_submit_proven;
   protected rdma_status role_failures[string];
   protected int unsigned method_ordinals[string];
@@ -438,13 +435,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
       {name, "_snapshot_engine"}
     );
-  endfunction
-
-  // 功能：在 rdma_mock_cmq_port 中，last_execute_definitive_no_submit 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
-  // 输入/输出及副作用：无显式参数；last_execute_definitive_no_submit 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：last_execute_definitive_no_submit 的结果直接由 return last_execute_no_submit_proven 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-  virtual function bit last_execute_definitive_no_submit();
-    return last_execute_no_submit_proven;
   endfunction
 
   // 功能：在 rdma_mock_cmq_port 中，set_call_trace 记录 set_call_trace 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
@@ -933,9 +923,9 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endfunction
 
-  // 功能：在 rdma_mock_cmq_port 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：mock 内部执行一条 CMQ 命令：快照命令、建 ticket、记录调用并按脚本生成 completion。
+  // 输入/输出及副作用：ticket/completion/status 输出；写 calls 账本，提交前失败时置 last_execute_no_submit_proven。
+  // 失败/边界：仅供 execute_observed 与测试子类覆盖使用，不是 rdma_cmq_port 的 API。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -955,7 +945,7 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     string method_name;
 
     last_execute_no_submit_proven = 1'b0;
-    method_ordinals["legacy_execute"]++;
+    method_ordinals["execute"]++;
     ticket = null;
     completion = null;
     status = invalid_state("mock CMQ execute did not complete");
@@ -1086,18 +1076,37 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     end
   endtask
 
-  // 功能：在 legacy-only mock 中记录 observed fallback 的一次调用并委托基类
-  //   wrapper，验证 base 方向为 observed→legacy 且不会递归回 observed。
-  // 输入/输出及副作用：command 为非拥有输入，result 为 detached 输出；更新
-  //   method_ordinals 计数并调用一次 super.execute_observed。
-  // 失败/边界：基类快照失败仍按其 observation_status 返回；本 mock 不伪造
-  //   ticket/effect，也不写 production adapter 的 shared seam。
+  // 功能：mock 的端口入口：调用一次 mock execute()，把其原样输出（保持对象 identity）
+  //   装入 observed result；execute 证明未提交时标 PRE_SUBMIT_REJECTED，否则标 UNOBSERVED。
+  // 输入/输出及副作用：command 为非拥有输入；result 输出新结果；计数 observed_execute。
+  // 失败/边界：execute 返回的 null status 原样保留，由调用方归一化。
   virtual task execute_observed(
     input rdma_cmq_command_desc command,
     output rdma_cmq_execution_result result
   );
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+
     method_ordinals["observed_execute"]++;
-    super.execute_observed(command, result);
+    execute(command, ticket, completion, status);
+    result = new("mock_cmq_observed_result");
+    result.status = status;
+    result.ticket = ticket;
+    result.completion = completion;
+    result.observation_status = rdma_status::success();
+    if (last_execute_no_submit_proven) begin
+      result.submission_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_PRE_SUBMIT_REJECTED;
+      result.completion_phase = RDMA_CMQ_COMPLETION_NONE;
+      result.recovery_required = 1'b0;
+    end
+    else begin
+      result.submission_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.attempt_effect = RDMA_SUBMIT_EFFECT_UNOBSERVED;
+      result.completion_phase = RDMA_CMQ_COMPLETION_UNOBSERVED;
+      result.recovery_required = 1'b1;
+    end
   endtask
 
   // 功能：在 rdma_mock_cmq_port 中，reconcile 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。

@@ -52,7 +52,7 @@ package rdma_core_pkg;
   `include "rdma_eq_engine.sv"
   `include "rdma_cmq_port.sv"
   `include "rdma_cmq_ambiguity_policy.sv"
-  `include "rdma_cmq_legacy_dispatch.sv"
+  `include "rdma_cmq_dispatch.sv"
   `include "rdma_queue_lifecycle_executor.sv"
   `include "rdma_qp_transition_policy.sv"
   `include "rdma_qp_urc_backing_policy.sv"
