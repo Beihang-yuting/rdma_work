@@ -515,12 +515,13 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     return ring.validate();
   endfunction
 
-  // 功能：为 SQ SGB 队列准备 backing_ref（每 slot 512B，存储按 4KiB 取整）。
+  // 功能：为 SQ/RQ SGB 准备 backing_ref（每 slot 512B，存储按 4KiB 取整）。
   // 输入/输出及副作用：owned 模式经 allocate_ref_aligned 分配，否则 clone_borrowed_ref 克隆；ref_out 输出。
   // 失败/边界：几何计算失败原样返回；spec 为空返回 INVALID_ARGUMENT。
-  protected function rdma_status make_sq_sgb_ref(
+  protected function rdma_status make_sgb_ref(
     rdma_function_binding binding,
     rdma_handle qp_h,
+    rdma_queue_backing_role_e role,
     int unsigned depth,
     rdma_queue_backing_spec spec,
     output rdma_qp_backing_ref ref_out
@@ -532,16 +533,42 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     status = rdma_qp_sq_sgb_geometry(depth, logical_bytes, storage_bytes);
     ref_out = null;
     if (!status.ok()) return status;
-    if (spec == null) return invalid_argument("SQ SGB backing spec is null");
+    if (spec == null)
+      return invalid_argument("SGB backing spec is null");
     if (spec.mode == RDMA_QUEUE_BACKING_OWNED)
       return allocate_ref_aligned(binding, binding.make_handle(), qp_h,
-        RDMA_QUEUE_ROLE_QP_SQ_SGB, storage_bytes, RDMA_DMA_DEVICE_READ,
-        512, ref_out);
-    return clone_borrowed_ref(spec, qp_h, RDMA_QUEUE_ROLE_QP_SQ_SGB,
-                              storage_bytes, ref_out);
+        role, storage_bytes, RDMA_DMA_DEVICE_READ, 512, ref_out);
+    return clone_borrowed_ref(spec, qp_h, role, storage_bytes, ref_out);
   endfunction
 
-  // 功能：逐 slot（512B）把 SQ SGB backing 写零。
+  // 功能：分配/借用一个 SGB backing、逐 slot 清零，借用模式下绑定 QP owner。
+  // 输入/输出及副作用：ref_out 输出；可能分配并写 host 内存。
+  // 失败/边界：任一步失败返回错误；已产生的 ref 留在 ref_out 供上层 partial-plan 回滚。
+  protected function rdma_status materialize_sgb(
+    rdma_function_binding binding,
+    rdma_handle qp_h,
+    rdma_queue_backing_role_e role,
+    int unsigned depth,
+    rdma_queue_backing_spec spec,
+    output rdma_qp_backing_ref ref_out
+  );
+    rdma_dma_request_context sgb_context;
+    longint unsigned logical_bytes;
+    longint unsigned storage_bytes;
+    rdma_status status;
+
+    status = make_sgb_ref(binding, qp_h, role, depth, spec, ref_out);
+    if (!status.ok()) return status;
+    void'(rdma_qp_sq_sgb_geometry(depth, logical_bytes, storage_bytes));
+    status = make_dma_context(binding, qp_h, role, sgb_context);
+    if (status.ok())
+      status = zero_sq_sgb_ref(sgb_context, ref_out, storage_bytes);
+    if (status.ok() && spec.mode == RDMA_QUEUE_BACKING_BORROWED)
+      status = bind_borrowed_owner(ref_out, qp_h);
+    return status;
+  endfunction
+
+  // 功能：逐 slot（512B）把 SQ/RQ SGB backing 写零。
   // 输入/输出及副作用：request_context/backing_ref 只读；经 host_mem 写 mapping，可跨 segment 定位 slot。
   // 失败/边界：入参无效或 backing 过短返回 INVALID_ARGUMENT；某个 slot 跨 segment 边界时立即拒绝，不拆分写入。
   protected function rdma_status zero_sq_sgb_ref(
@@ -745,25 +772,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     // SGB 物化必须先于 PD 编码，保证失败时能按 plan 顺序回滚。
     if (rdma_qp_needs_sq_sgb(request.transport, request.max_send_sge,
                              request.max_recv_sge)) begin
-      status = make_sq_sgb_ref(binding, qp_snapshot.handle, request.sq_depth,
-                               request.sq_sgb_backing, plan.sq_sgb_ref);
+      status = materialize_sgb(binding, qp_snapshot.handle, RDMA_QUEUE_ROLE_QP_SQ_SGB,
+                               request.sq_depth, request.sq_sgb_backing, plan.sq_sgb_ref);
       if (!status.ok()) return status;
-      begin
-        rdma_dma_request_context sgb_context;
-        longint unsigned sgb_logical_bytes;
-        longint unsigned sgb_storage_bytes;
-        status = rdma_qp_sq_sgb_geometry(request.sq_depth, sgb_logical_bytes,
-                                         sgb_storage_bytes);
-        status = make_dma_context(binding, qp_snapshot.handle,
-                                  RDMA_QUEUE_ROLE_QP_SQ_SGB, sgb_context);
-        if (status.ok())
-          status = zero_sq_sgb_ref(sgb_context, plan.sq_sgb_ref,
-                                   sgb_storage_bytes);
-        if (status.ok() &&
-            request.sq_sgb_backing.mode == RDMA_QUEUE_BACKING_BORROWED)
-          status = bind_borrowed_owner(plan.sq_sgb_ref, qp_snapshot.handle);
-        if (!status.ok()) return status;
-      end
     end
     status = allocate_ref(binding, expected_owner, qp_snapshot.handle,
                           RDMA_QUEUE_ROLE_QP_SQ_PD, 4096,
@@ -807,6 +818,11 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       if (!status.ok()) return status;
       if (request.rq_backing.mode == RDMA_QUEUE_BACKING_BORROWED) begin
         status = bind_borrowed_owner(plan.rq_ref, qp_snapshot.handle);
+        if (!status.ok()) return status;
+      end
+      if (request.rq_sgb_backing != null) begin
+        status = materialize_sgb(binding, qp_snapshot.handle, RDMA_QUEUE_ROLE_QP_RQ_SGB,
+                                 request.rq_depth, request.rq_sgb_backing, plan.rq_sgb_ref);
         if (!status.ok()) return status;
       end
     end
@@ -1704,6 +1720,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     if (!step_status.ok()) return status;
     step_status = release_ref_local(plan.sq_ref, result);
     if (status.ok() && !step_status.ok()) status = step_status;
+    if (!step_status.ok()) return status;
+    step_status = release_ref_local(plan.rq_sgb_ref, result);
+    if (status.ok() && !step_status.ok()) status = step_status;
     return status;
   endfunction
 
@@ -2044,6 +2063,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     refs.push_back(plan.rq_ref);
     refs.push_back(plan.sq_ref);
     refs.push_back(plan.sq_sgb_ref);
+    refs.push_back(plan.rq_sgb_ref);
     foreach (refs[i]) begin
       if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED)
         continue;
@@ -3060,6 +3080,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       refs.push_back(qp.qp_plan.rq_pd_ref); refs.push_back(qp.qp_plan.sq_pd_ref);
       refs.push_back(qp.qp_plan.rq_ref); refs.push_back(qp.qp_plan.sq_ref);
       refs.push_back(qp.qp_plan.sq_sgb_ref);
+      refs.push_back(qp.qp_plan.rq_sgb_ref);
       foreach (refs[i]) begin
         if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED) continue;
         status = live_binding_fence(binding, expected_owner);
@@ -3739,6 +3760,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       refs.push_back(recovery.qp_plan.rq_ref);
     refs.push_back(recovery.qp_plan.sq_ref);
     refs.push_back(recovery.qp_plan.sq_sgb_ref);
+    if (recovery.qp_plan.rq_source_h == null)
+      refs.push_back(recovery.qp_plan.rq_sgb_ref);
     foreach (refs[i]) begin
       if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED ||
           refs[i].cleanup_complete)

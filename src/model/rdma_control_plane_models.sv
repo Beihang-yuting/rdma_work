@@ -506,7 +506,7 @@ class rdma_qp_recovery_state extends uvm_object;
   rdma_cmq_opcode_key query_opcode;
   rdma_cmq_opcode_key occ_opcode;
   rdma_cmq_ticket ambiguous_ticket;
-  bit role_complete[21];
+  bit role_complete[22];
 
   // 功能：构造默认 QP 恢复状态（CREATE_ROLLBACK、无歧义、进度位全清）。
   // 输入/输出及副作用：name 为对象名；handle/opcode 置 null。
@@ -609,7 +609,8 @@ class rdma_qp_recovery_state extends uvm_object;
       end
       if (qp_plan.rq_source_h != null &&
           (role_complete[RDMA_QUEUE_ROLE_QP_RQ_RING] ||
-           role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD]))
+           role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD] ||
+           role_complete[RDMA_QUEUE_ROLE_QP_RQ_SGB]))
         return rdma_status::make(
           RDMA_SC_INVALID_STATE,
           "partial SRQ-backed QP recovery has private RQ progress"
@@ -692,7 +693,8 @@ class rdma_qp_recovery_state extends uvm_object;
     end
     if (qp_plan.rq_source_h != null &&
         (role_complete[RDMA_QUEUE_ROLE_QP_RQ_RING] ||
-         role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD]))
+         role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD] ||
+         role_complete[RDMA_QUEUE_ROLE_QP_RQ_SGB]))
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "SRQ-backed QP recovery has private RQ progress"
@@ -740,6 +742,16 @@ class rdma_qp_recovery_state extends uvm_object;
         role_complete[RDMA_QUEUE_ROLE_QP_RQ_PD], "QP recovery RQ PD"
       );
       if (!status.ok()) return status;
+    end
+    if (validation_plan.rq_sgb_ref != null) begin
+      status = rdma_qp_recovery_ref_status(
+        validation_plan.rq_sgb_ref,
+        role_complete[RDMA_QUEUE_ROLE_QP_RQ_SGB], "QP recovery RQ SGB"
+      );
+      if (!status.ok()) return status;
+    end else if (role_complete[RDMA_QUEUE_ROLE_QP_RQ_SGB]) begin
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "QP recovery RQ SGB progress has no authority");
     end
     foreach (validation_plan.urc_refs[i]) begin
       status = rdma_qp_recovery_ref_status(
@@ -789,6 +801,13 @@ class rdma_qp_recovery_state extends uvm_object;
         "QP recovery RQ PD"
       );
       if (!status.ok()) return status;
+      if (validation_plan.rq_sgb_ref != null) begin
+        status = rdma_qp_mapping_authority_status(
+          validation_plan.rq_sgb_ref, context_ref.owner, recovery_qp_h,
+          "QP recovery RQ SGB"
+        );
+        if (!status.ok()) return status;
+      end
     end
     else begin
       status = rdma_handle_owner_status(validation_plan.rq_source_h,

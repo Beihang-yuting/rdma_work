@@ -5,7 +5,7 @@
 //   RX：按目的 QPN 分发；SEND 消费 RQE 并散写数据，WRITE 按 RETH 写入，READ 读出并分段回包，
 //       ATOMIC 读改写并回原值；按需发布 RQ CQE 并回 ACK/NAK。
 //   传输：RC 全部操作并等 ACK；URC 仅 SEND/WRITE(+IMM)，发出即完成、不回 ACK；UD 仅单包 SEND，
-//       目的 QPN 取自 WQE。SGE 来自 WQE 内联或 SQ 外部 SGB（rdma_tb_dma.sqe_sges）。
+//       目的 QPN 取自 WQE。SGE 来自 WQE 内联或 SQ/RQ 外部 SGB（rdma_tb_dma.sqe_sges/rqe_sges）。
 // 依赖：rdma_tb_node_cfg、rdma_tb_dma、rdma_wire、queue_data_engine 的设备侧 CQE 发布接口。
 // 所有权与生命周期：模型只拥有每 QP 的设备侧游标/PSN 状态；队列、MR、内存归 engine/manager/host_mem。
 
@@ -22,6 +22,7 @@ class rdma_nic_qp_state extends uvm_object;
   bit [23:0] msn;
   // 正在接收的 SEND 消息。
   rdma_hw_rqe_model rx_rqe;
+  rdma_sge rx_sges[$];
   int unsigned rx_index;
   bit rx_wrap;
   int unsigned rx_offset;
@@ -518,7 +519,12 @@ class rdma_nic_model extends uvm_component;
       return 1'b0;
     status = dma.read_wqe(cfg.qps[i].qp, 1'b0, qps[i].rq_index, model);
     advance(qps[i].rq_index, qps[i].rq_wrap, cfg.qps[i].qp.rq_depth);
-    return status != null && status.ok() && $cast(rqe, model);
+    if (status == null || !status.ok() || !$cast(rqe, model)) begin
+      `uvm_error("RDMA_NIC", $sformatf("node %0d QP%0d RQE %0d decode failed: %s", cfg.node_id, i,
+                 index, status == null ? "null" : status.convert2string()))
+      return 1'b0;
+    end
+    return 1'b1;
   endfunction
 
   // 功能：响应方处理一个请求报文（SEND/WRITE/READ 请求/ATOMIC），按 PSN 顺序推进 expected_psn。
@@ -542,8 +548,18 @@ class rdma_nic_model extends uvm_component;
         if (pkt.segment inside {RDMA_SEG_FIRST, RDMA_SEG_ONLY}) begin
           st.rx_offset = 0;
           st.rx_failed = !fetch_rqe(i, st.rx_rqe, st.rx_index, st.rx_wrap);
+          if (!st.rx_failed) begin
+            rdma_status sge_status;
+
+            sge_status = dma.rqe_sges(cfg.qps[i].qp, st.rx_rqe, st.rx_sges);
+            if (!sge_status.ok()) begin
+              `uvm_error("RDMA_NIC", $sformatf("node %0d QP%0d RQE SGE list: %s", cfg.node_id, i,
+                         sge_status.convert2string()))
+              st.rx_failed = 1'b1;
+            end
+          end
         end
-        if (!st.rx_failed && !scatter(st.rx_rqe.sges, st.rx_offset, pkt.payload))
+        if (!st.rx_failed && !scatter(st.rx_sges, st.rx_offset, pkt.payload))
           st.rx_failed = 1'b1;
         st.rx_offset += pkt.payload.size();
         if (last) begin

@@ -150,12 +150,15 @@ class rdma_tb_traffic_vseq extends uvm_sequence;
     post(1, make(RDMA_VERB_SEND, 'h0400, 1025, 0, 7));
   endtask
 
-  // 功能：多 SGE：4-SGE SEND（外部 SGB）进 2-SGE RECV、3-SGE WRITE、READ 散写到 3 个 SGE。
+  // 功能：多 SGE：4-SGE SEND（SQ 外部 SGB）进 4-SGE RECV（RQ 外部 SGB）、3-SGE SEND 进 2-SGE RECV、
+  //   3-SGE WRITE、READ 散写到 3 个 SGE。
   // 输入/输出及副作用：node1 0xa000/0xb000、node0 0xc000 区域写入。
   // 失败/边界：无。
   task multi_sge();
-    post(1, make(RDMA_VERB_RECV, 'ha000, 'h1000, 0, 0, 0, 2));
+    post(1, make(RDMA_VERB_RECV, 'ha000, 'hc00, 0, 0, 0, 4));
+    post(1, make(RDMA_VERB_RECV, 'hac00, 'h400, 0, 0, 0, 2));
     post(0, make(RDMA_VERB_SEND, 'h2000, 3000, 0, 9, 0, 4));
+    post(0, make(RDMA_VERB_SEND, 'h2c00, 1000, 0, 16, 0, 3));
     post(0, make(RDMA_VERB_WRITE, 'h3000, 2000, 'hb000, 10, 0, 3));
     post(0, make(RDMA_VERB_READ, 'hc000, 1800, 'hb100, 0, 0, 3));
   endtask

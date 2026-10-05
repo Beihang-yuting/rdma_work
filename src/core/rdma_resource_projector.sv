@@ -1280,6 +1280,10 @@ class rdma_resource_projector;
       );
     if (status.ok())
       status = project_qp_backing_ref_value(
+        source.rq_sgb_ref, {copy_label, "_rq_sgb"}, result.rq_sgb_ref
+      );
+    if (status.ok())
+      status = project_qp_backing_ref_value(
         source.rq_ref, {copy_label, "_rq"}, result.rq_ref
       );
     if (status.ok())

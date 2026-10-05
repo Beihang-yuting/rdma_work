@@ -1066,6 +1066,7 @@ class rdma_resource_manager extends uvm_object;
         !same_qp_ring_value(lhs.rq_ring, rhs.rq_ring) ||
         !same_qp_backing_ref_value(lhs.sq_ref, rhs.sq_ref) ||
         !same_qp_backing_ref_value(lhs.sq_sgb_ref, rhs.sq_sgb_ref) ||
+        !same_qp_backing_ref_value(lhs.rq_sgb_ref, rhs.rq_sgb_ref) ||
         !same_qp_backing_ref_value(lhs.rq_ref, rhs.rq_ref) ||
         !same_qp_backing_ref_value(lhs.sq_pd_ref, rhs.sq_pd_ref) ||
         !same_qp_backing_ref_value(lhs.rq_pd_ref, rhs.rq_pd_ref) ||
@@ -4753,6 +4754,7 @@ class rdma_resource_manager extends uvm_object;
     case (role)
       RDMA_QUEUE_ROLE_QP_SQ_RING: return plan.sq_ref;
       RDMA_QUEUE_ROLE_QP_SQ_SGB: return plan.sq_sgb_ref;
+      RDMA_QUEUE_ROLE_QP_RQ_SGB: return plan.rq_sgb_ref;
       RDMA_QUEUE_ROLE_QP_RQ_RING: return plan.rq_ref;
       RDMA_QUEUE_ROLE_QP_SQ_PD: return plan.sq_pd_ref;
       RDMA_QUEUE_ROLE_QP_RQ_PD: return plan.rq_pd_ref;
@@ -4839,6 +4841,12 @@ class rdma_resource_manager extends uvm_object;
       RDMA_QUEUE_ROLE_QP_SQ_SGB:
         return urc_dsq_complete && urc_rdsq_complete && urc_rsq_complete &&
                rq_pd_complete && sq_pd_complete && rq_ring_complete;
+      // 可选 RQ-SGB 最后释放，不改变既有角色之间的顺序约束。
+      RDMA_QUEUE_ROLE_QP_RQ_SGB:
+        return urc_dsq_complete && urc_rdsq_complete && urc_rsq_complete &&
+               rq_pd_complete && sq_pd_complete && rq_ring_complete &&
+               qp_owned_cleanup_role_complete(plan, RDMA_QUEUE_ROLE_QP_SQ_RING) &&
+               qp_owned_cleanup_role_complete(plan, RDMA_QUEUE_ROLE_QP_SQ_SGB);
       default:
         return 1'b0;
     endcase
@@ -5484,6 +5492,7 @@ class rdma_resource_manager extends uvm_object;
     if (plan.rq_source_h == null) begin
       if (plan.rq_ref != null) refs.push_back(plan.rq_ref);
       if (plan.rq_pd_ref != null) refs.push_back(plan.rq_pd_ref);
+      if (plan.rq_sgb_ref != null) refs.push_back(plan.rq_sgb_ref);
     end
     foreach (plan.urc_refs[i])
       refs.push_back(plan.urc_refs[i]);

@@ -31,7 +31,7 @@ class rdma_verb_item extends uvm_sequence_item;
   int unsigned qp_index;
   int unsigned local_offset;
   int unsigned length;
-  // 本地 buffer 均分为 sge_count 个连续 SGE（>2 时 SQ 走外部 SGB；RECV 至多 2 个）。
+  // 本地 buffer 均分为 sge_count 个连续 SGE（>2 时走 SQ/RQ 外部 SGB，RQ 需 QP 启用 RQ SGB）。
   int unsigned sge_count;
   int unsigned remote_offset;
   bit [31:0] imm;

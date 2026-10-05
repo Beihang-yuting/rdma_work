@@ -58,6 +58,7 @@ class rdma_tb_flow_test extends uvm_test;
 
     fx = rdma_queue_data_engine_fixture::type_id::create($sformatf("tb_node%0d", n));
     fixtures[n] = fx;
+    fx.enable_rq_sgb = 1'b1;
     prepare_fixture(n, fx);
     fx.setup(status, 32, RDMA_CQE_BYTES, 16, 16, 1'b1);
     if (status == null || !status.ok())

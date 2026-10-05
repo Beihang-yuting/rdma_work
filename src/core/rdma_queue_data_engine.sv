@@ -3382,6 +3382,14 @@ class rdma_queue_data_engine extends uvm_object;
       status = link.sq_sgb_access.attach_qp(qp.qp_plan.sq_sgb_ref);
       if (!status.ok()) return status;
     end
+    if (qp.qp_plan.rq_sgb_ref != null) begin
+      link.rq_sgb_access = rdma_queue_backing_access::type_id::create("rq_sgb_access");
+      link.rq_sgb_ref = qp.qp_plan.rq_sgb_ref;
+      status = link.rq_sgb_access.configure(binding.make_handle(), host_mem);
+      if (!status.ok()) return status;
+      status = link.rq_sgb_access.attach_qp(qp.qp_plan.rq_sgb_ref);
+      if (!status.ok()) return status;
+    end
     qp_links[value_ops::identity_key(qp_h)] = link;
     return rdma_status::success();
   endfunction
@@ -3936,6 +3944,17 @@ class rdma_queue_data_engine extends uvm_object;
         status;
     candidate.sge_num = valid_sge_count;
     candidate.payload_len = valid_payload_len[31:0];
+    // 超过 2 个有效 SGE 时使用私有 RQ 的外部 SGB：SGB_PA 指向 index*512 槽（与 SQ 一致使用设备 DMA 地址）。
+    if (valid_sge_count > 2 && link.rq_sgb_ref != null) begin
+      longint unsigned slot_iova;
+
+      status = sgb_slot_iova(link.rq_sgb_ref, cursor.index, "RQE", slot_iova);
+      if (!status.ok())
+        return status;
+      status = candidate.set_sgb_pa_from_physical(slot_iova);
+      if (status == null || !status.ok())
+        return rdma_status::nonnull(status, "RQE SGB pointer install returned null status");
+    end
     status = candidate.validate();
     if (status == null || !status.ok())
       return status == null ?
@@ -4019,6 +4038,86 @@ class rdma_queue_data_engine extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：解析 SGB backing 中第 index 个 512B 逻辑槽的 IOVA（主 segment 或 additional segment）。
+  // 输入/输出及副作用：sgb_ref/index 输入，iova 输出；纯查询。
+  // 失败/边界：backing 缺失、槽超出逻辑覆盖或无法落在单一 segment 内返回 DMA_TRANSLATION。
+  protected function rdma_status sgb_slot_iova(rdma_qp_backing_ref sgb_ref, int unsigned index,
+                                               string label, output longint unsigned iova);
+    longint unsigned logical_offset;
+    longint unsigned covered;
+    longint unsigned base;
+
+    iova = 0;
+    if (sgb_ref == null || sgb_ref.mapping == null)
+      return bad({label, " SGB IOVA is outside backing authority"}, RDMA_SC_DMA_TRANSLATION);
+    logical_offset = longint'(index) * 512;
+    covered = sgb_ref.length;
+    foreach (sgb_ref.additional_segments[k])
+      covered += sgb_ref.additional_segments[k].length;
+    if (logical_offset + 512 > covered)
+      return bad({label, " SGB slot exceeds logical coverage"}, RDMA_SC_DMA_TRANSLATION);
+    if (logical_offset < sgb_ref.length) begin
+      iova = sgb_ref.mapping.iova.value + sgb_ref.mapping_offset + logical_offset;
+      return rdma_status::success();
+    end
+    base = sgb_ref.length;
+    foreach (sgb_ref.additional_segments[k]) begin
+      if (logical_offset >= base &&
+          logical_offset < base + sgb_ref.additional_segments[k].length) begin
+        iova = sgb_ref.additional_segments[k].mapping.iova.value +
+               sgb_ref.additional_segments[k].mapping_offset + (logical_offset - base);
+        return rdma_status::success();
+      end
+      base += sgb_ref.additional_segments[k].length;
+    end
+    return bad({label, " SGB IOVA does not resolve to backing slot"}, RDMA_SC_DMA_TRANSLATION);
+  endfunction
+
+  // 功能：把 RQE 的有效 SGE 按 16B 大端描述符（length/lkey/iova）写入 RQ SGB 的 index*512 槽并回读校验。
+  // 输入/输出及副作用：link/model/cursor 输入；只写 link.rq_sgb_access 指向的 backing。
+  // 失败/边界：缺 RQ SGB authority、descriptor 构造失败或超过 512B、model.sgb_pa 与槽位不符、写/回读失败返回错误，
+  //   调用方不得推进 PI。
+  protected function rdma_status write_rq_sgb_and_verify(
+      rdma_queue_data_qp_link link, rdma_hw_rqe_model model,
+      rdma_queue_cursor_snapshot cursor);
+    byte unsigned descriptors[];
+    byte data[];
+    byte readback[];
+    longint unsigned slot_iova;
+    rdma_status status;
+
+    if (link == null || model == null || cursor == null || link.rq_sgb_access == null)
+      return bad("RQE SGB backing authority is unavailable", RDMA_SC_INVALID_STATE);
+    status = sgb_slot_iova(link.rq_sgb_ref, cursor.index, "RQE", slot_iova);
+    if (!status.ok())
+      return status;
+    if (model.sgb_pa_as_physical() != slot_iova)
+      return bad("RQE SGB pointer does not resolve to backing slot", RDMA_SC_DMA_TRANSLATION);
+    status = rdma_status::nonnull(model.build_typed_sgb_descriptor_bytes(descriptors),
+                                  "RQE SGB descriptor build returned null status");
+    if (!status.ok())
+      return status;
+    if (descriptors.size() > 512 || descriptors.size() != int'(model.sge_num) * 16)
+      return bad("RQE SGB descriptor list does not match SGE_NUM", RDMA_SC_INVALID_STATE);
+    data = new[512];
+    foreach (data[i])
+      data[i] = (i < descriptors.size()) ? descriptors[i] : 8'h00;
+    status = link.rq_sgb_access.write(longint'(cursor.index) * 512, data);
+    if (status == null || !status.ok())
+      return rdma_status::nonnull(status, "RQE SGB write returned null status",
+                                  RDMA_SC_DMA_TRANSLATION);
+    status = link.rq_sgb_access.readback(longint'(cursor.index) * 512, 512, readback);
+    if (status == null || !status.ok())
+      return rdma_status::nonnull(status, "RQE SGB readback returned null status",
+                                  RDMA_SC_DMA_TRANSLATION);
+    if (readback.size() != 512)
+      return bad("RQE SGB readback is short", RDMA_SC_DMA_TRANSLATION);
+    foreach (data[i])
+      if (readback[i] !== data[i])
+        return bad("RQE SGB readback mismatch", RDMA_SC_DMA_TRANSLATION);
+    return rdma_status::success();
+  endfunction
+
   // 功能：为 SQE 的外置 SGB 构造 512B 大端槽位并写入 host-memory、回读校验；写前重新解析共享 payload authority（与rdma_hw_sqe_model
   //   的 resolver 共用），以 canonical mode/count 拦截 encode 后的 model mutation，避免 image与 backing 分叉。
   // 输入/输出及副作用：link/model/cursor/image 输入；image 是已编码并签名的 64B SQE 快照；只写 link.sq_sgb_access指向的借用
@@ -4082,40 +4181,12 @@ class rdma_queue_data_engine extends uvm_object;
     foreach (data[i])
       data[i] = 0;
     begin
-      longint unsigned logical_offset, covered, effective_iova;
-      bit resolved;
-      logical_offset = cursor.index * 512;
-      covered = link.sq_sgb_ref.length;
-      resolved = 1'b0;
-      if (logical_offset + 512 > covered) begin
-        foreach (link.sq_sgb_ref.additional_segments[k])
-          covered += link.sq_sgb_ref.additional_segments[k].length;
-      end
-      if (logical_offset + 512 > covered)
-        return bad("SQE SGB slot exceeds logical coverage",
-                   RDMA_SC_DMA_TRANSLATION);
-      if (logical_offset < link.sq_sgb_ref.length)
-        effective_iova = link.sq_sgb_ref.mapping.iova.value +
-                        link.sq_sgb_ref.mapping_offset + logical_offset;
-      else begin
-        longint unsigned base;
-        base = link.sq_sgb_ref.length;
-        foreach (link.sq_sgb_ref.additional_segments[k]) begin
-          if (!resolved && logical_offset >= base &&
-              logical_offset < base +
-                link.sq_sgb_ref.additional_segments[k].length) begin
-            effective_iova =
-              link.sq_sgb_ref.additional_segments[k].mapping.iova.value +
-              link.sq_sgb_ref.additional_segments[k].mapping_offset +
-              (logical_offset - base);
-            resolved = 1'b1;
-          end
-          base += link.sq_sgb_ref.additional_segments[k].length;
-        end
-      end
-      if (!resolved && logical_offset < link.sq_sgb_ref.length)
-        resolved = 1'b1;
-      if (!resolved || model.sgb_iova.value != effective_iova)
+      longint unsigned effective_iova;
+
+      status = sgb_slot_iova(link.sq_sgb_ref, cursor.index, "SQE", effective_iova);
+      if (!status.ok())
+        return status;
+      if (model.sgb_iova.value != effective_iova)
         return bad("SQE SGB IOVA does not resolve to backing slot",
                    RDMA_SC_DMA_TRANSLATION);
     end
@@ -8110,6 +8181,27 @@ class rdma_queue_data_engine extends uvm_object;
     status = encode_queue_model(model, RDMA_IMAGE_RQE, "rqe", "default", image);
     if (!status.ok())
       return;
+    if (model.sge_num > 2) begin
+      // 与 SQ external-SGB 相同：SGB 是 RQE 前的独立 Host-memory 写入，写前复核 reservation 窗口，
+      // 失败时以 admission 冻结的 route/epoch 安装 recovery 证据。
+      status = validate_host_producer_reservation_window(attachment, cursor);
+      if (status == null || !status.ok()) begin
+        if (status == null)
+          status = bad("RQ SGB reservation window validation returned null status",
+                       RDMA_SC_INVALID_STATE);
+        cursor = null;
+        return;
+      end
+      status = write_rq_sgb_and_verify(link, model, cursor);
+      if (!status.ok()) begin
+        install_host_producer_recovery(
+          attachment, snapshot.target_h, runtime_kind, cursor,
+          longint'(cursor.index) * 64, image, snapshot, 1'b1,
+          reservation_route, reservation_epoch, reservation_route_valid,
+          reservation_epoch_valid, 1'b0, "RQ SGB write", status);
+        return;
+      end
+    end
     offset = longint'(cursor.index) * 64;
     complete_host_producer_tail(
       attachment, snapshot.target_h, runtime_kind, cursor, offset, image,
@@ -8119,7 +8211,7 @@ class rdma_queue_data_engine extends uvm_object;
       "next_rq_cursor", "RQ entry write", "RQ producer doorbell",
       "RQ ledger commit", "recv_result", "receive result queue", result,
       status, reservation_route, reservation_epoch, reservation_route_valid,
-      reservation_epoch_valid, 1'b0);
+      reservation_epoch_valid, model.sge_num > 2);
   endtask
 
   // 功能：校验 pending 中 admission 前冻结的 old/next cursor，并返回该 detached next evidence，禁止 recovery 按当前环境重新推
@@ -8207,7 +8299,8 @@ class rdma_queue_data_engine extends uvm_object;
   //   commit，每个失败点记录原 recovery evidence。
   // 输入/输出及副作用：attachment、pending、next 为已通过 authority/cursor 校验的借用输入；status 输出；成功时访问 Host-memory、发一次
   //   doorbell、提交同一 producer cursor 并完成 recovery；失败保留 runtime pending。
-  // 失败/边界：image 缺失、SQ SGB route/link 无法解析或 SGB/WQE 写回、doorbell、commit、完成阶段出错时立即停止；模型构造失败不触碰backing；
+  // 失败/边界：image 缺失、SQ SGB route/link 无法解析或 SQ/RQ SGB、WQE 写回、doorbell、commit、
+  //   完成阶段出错时立即停止；模型构造失败不触碰backing；
   //   SGB/WQE 写失败记录 NO_SUBMIT，doorbell 失败记录 AMBIGUOUS，commit 失败记录 SUCCESS；不自动重发 ambiguous MMIO；只处理
   //   host producer pending。
   protected task replay_host_producer_pending(
@@ -8219,6 +8312,8 @@ class rdma_queue_data_engine extends uvm_object;
     rdma_queue_data_qp_link link;
     rdma_hw_sqe_model sgb_model;
     rdma_post_send_req pending_send;
+    rdma_post_recv_req pending_recv;
+    rdma_hw_rqe_model rqe_model;
     rdma_doorbell_result db_result;
 
     status = null;
@@ -8276,6 +8371,25 @@ class rdma_queue_data_engine extends uvm_object;
         void'(attachment.runtime.record_recovery_failure(
           RDMA_QUEUE_MMIO_NO_SUBMIT));
         return;
+      end
+    end
+    if (pending.kind == RDMA_QUEUE_RUNTIME_RQ &&
+        pending.request_snapshot != null &&
+        $cast(pending_recv, pending.request_snapshot)) begin
+      link = null;
+      if (pending.queue_h != null &&
+          qp_links.exists(value_ops::identity_key(pending.queue_h)))
+        link = qp_links[value_ops::identity_key(pending.queue_h)];
+      if (link != null && link.rq_sgb_ref != null) begin
+        status = make_rqe(pending_recv, link, pending.cursor, rqe_model);
+        if (status != null && status.ok() && rqe_model.sge_num > 2)
+          status = write_rq_sgb_and_verify(link, rqe_model, pending.cursor);
+        if (status == null)
+          status = bad("RQ SGB recovery returned null status", RDMA_SC_RECOVERY_REQUIRED);
+        if (!status.ok()) begin
+          void'(attachment.runtime.record_recovery_failure(RDMA_QUEUE_MMIO_NO_SUBMIT));
+          return;
+        end
       end
     end
     status = write_and_verify(attachment, pending.entry_offset,

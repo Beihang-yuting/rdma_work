@@ -169,7 +169,10 @@ class rdma_tb_dma extends uvm_object;
     if (status == null || !status.ok() || codec == null)
       return rdma_status::nonnull(status, "tb WQE codec lookup failed",
                                   RDMA_SC_CODEC_ERROR);
-    status = codec.decode(image, model);
+    if (send)
+      status = codec.decode(image, model);
+    else
+      status = decode_rqe(qp, codec, image, model);
     if (status == null || !status.ok() || model == null) begin
       model = null;
       return rdma_status::nonnull(status, "tb WQE decode returned null",
@@ -182,6 +185,55 @@ class rdma_tb_dma extends uvm_object;
         sqe.transport = RDMA_TRANSPORT_URC;
     end
     return rdma_status::success();
+  endfunction
+
+  // 功能：解码 RQE；SGE_NUM>2 的外部布局先按 SGB_PA 从 RQ SGB 读取 SGE_NUM*16 字节描述符，
+  //   交给 codec 一并验签（签名覆盖 SGB 内容）。
+  // 输入/输出及副作用：model 输出；只读 host 内存。
+  // 失败/边界：镜像解析失败、SGB 越界/读失败或 codec 拒绝时返回错误。
+  protected function rdma_status decode_rqe(rdma_qp qp, rdma_codec_base codec, rdma_hw_image image,
+                                            output rdma_hw_model model);
+    rdma_hw_qword_builder b;
+    rdma_hw_rqe_codec rqe_codec;
+    rdma_qp_backing_ref sgb;
+    rdma_status status;
+    byte unsigned raw[];
+    byte unsigned descriptors[];
+    byte data[];
+    bit [63:0] w[];
+    longint unsigned iova;
+    int unsigned count;
+
+    model = null;
+    raw = new[image.bytes.size()];
+    foreach (raw[i])
+      raw[i] = image.bytes[i];
+    b = new("tb_rqe");
+    status = b.deserialize(raw);
+    if (status == null || !status.ok())
+      return rdma_status::nonnull(status, "tb RQE deserialize returned null");
+    b.get_words(w);
+    count = field(w, RDMA_RQE_SGE_NUM_WORD_BYTE_OFFSET, RDMA_RQE_SGE_NUM_LSB,
+                  RDMA_RQE_SGE_NUM_WIDTH);
+    if (count <= 2)
+      return codec.decode(image, model);
+    iova = field(w, RDMA_RQE_SGB_PA_WORD_BYTE_OFFSET, RDMA_RQE_SGB_PA_LSB,
+                 RDMA_RQE_SGB_PA_WIDTH) << 9;
+    sgb = (qp.qp_plan == null) ? null : qp.qp_plan.rq_sgb_ref;
+    if (sgb == null || sgb.mapping == null || count > 32 ||
+        iova < sgb.mapping.iova.value + sgb.mapping_offset ||
+        iova + 512 > sgb.mapping.iova.value + sgb.mapping_offset + sgb.length)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "tb RQE SGB address has no backing");
+    status = cfg.engine.host_mem.read(sgb.mapping, iova - sgb.mapping.iova.value, count * 16,
+                                      data);
+    if (status == null || !status.ok())
+      return rdma_status::nonnull(status, "tb RQE SGB read returned null");
+    descriptors = new[data.size()];
+    foreach (data[i])
+      descriptors[i] = data[i];
+    if (!$cast(rqe_codec, codec))
+      return rdma_status::make(RDMA_SC_CODEC_ERROR, "tb RQE codec type mismatch");
+    return rqe_codec.decode_with_sgb_descriptor_bytes(image, descriptors, model);
   endfunction
 
   // 功能：按 rdma_defs 的 UD SQE 字段从 64B 镜像取出设备需要的语义（opcode、CE、立即数、
@@ -248,18 +300,10 @@ class rdma_tb_dma extends uvm_object;
     return (w[word_byte / 8] >> lsb) & mask;
   endfunction
 
-  // 功能：取 SQE 的有效 SGE 列表：WQE 内联 SGE 直接返回；外部 SGB 时读取 sgb_iova 指向的 512B 槽，
-  //   按 16B 大端描述符（length/lkey/iova，length=0 表示 2GiB）解析 sge_num 项。
-  // 输入/输出及副作用：sges 输出新建对象；只读 host 内存。
-  // 失败/边界：inline payload、SGB backing 缺失、地址不在 SQ SGB backing 内或读失败返回错误。
+  // 功能：取 SQE 的有效 SGE 列表：WQE 内联 SGE 直接返回；外部 SGB 时解析 sgb_iova 指向的 SQ SGB 槽。
+  // 输入/输出及副作用：sges 输出；只读 host 内存。
+  // 失败/边界：inline payload 不支持；SGB 解析失败返回错误。
   function rdma_status sqe_sges(rdma_qp qp, rdma_hw_sqe_model sqe, output rdma_sge sges[$]);
-    rdma_qp_backing_ref sgb;
-    rdma_status status;
-    longint unsigned offset;
-    byte raw[];
-    bit [31:0] len;
-    rdma_sge sge;
-
     sges.delete();
     if (sqe.payload_mode inside {RDMA_SQ_PAYLOAD_INLINE_WQE, RDMA_SQ_PAYLOAD_INLINE_SGB})
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, "tb NIC does not model inline payload");
@@ -269,14 +313,45 @@ class rdma_tb_dma extends uvm_object;
           sges.push_back(sqe.sges[k]);
       return rdma_status::success();
     end
-    sgb = (qp.qp_plan == null) ? null : qp.qp_plan.sq_sgb_ref;
-    if (sgb == null || sgb.mapping == null || sqe.sgb_iova.value < sgb.mapping.iova.value)
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "tb SQE SGB address has no backing");
-    offset = sqe.sgb_iova.value - sgb.mapping.iova.value;
-    status = cfg.engine.host_mem.read(sgb.mapping, offset, 512, raw);
+    return read_sgb(qp.qp_plan == null ? null : qp.qp_plan.sq_sgb_ref, sqe.sgb_iova.value,
+                    sqe.sge_num, sges);
+  endfunction
+
+  // 功能：取 RQE 的有效 SGE 列表：≤2 个时为 RQE 内联，否则解析 SGB_PA 指向的 RQ SGB 槽。
+  // 输入/输出及副作用：sges 输出；只读 host 内存。
+  // 失败/边界：SGB 解析失败返回错误。
+  function rdma_status rqe_sges(rdma_qp qp, rdma_hw_rqe_model rqe, output rdma_sge sges[$]);
+    sges.delete();
+    if (rqe.sge_num <= 2) begin
+      foreach (rqe.sges[k])
+        if (rqe.sges[k] != null && rqe.sges[k].length != 0)
+          sges.push_back(rqe.sges[k]);
+      return rdma_status::success();
+    end
+    return read_sgb(qp.qp_plan == null ? null : qp.qp_plan.rq_sgb_ref, rqe.sgb_pa_as_physical(),
+                    rqe.sge_num, sges);
+  endfunction
+
+  // 功能：读取 SGB backing 中 iova 处的 512B 槽，按 16B 大端描述符（length/lkey/iova，length=0 表示
+  //   2GiB）解析 count 项。
+  // 输入/输出及副作用：sges 输出新建对象；只读 host 内存。
+  // 失败/边界：backing 缺失、地址不在主 segment 内、count 超过 32 或读失败返回错误。
+  protected function rdma_status read_sgb(rdma_qp_backing_ref sgb, longint unsigned iova,
+                                          int unsigned count, output rdma_sge sges[$]);
+    rdma_status status;
+    byte raw[];
+    bit [31:0] len;
+    rdma_sge sge;
+
+    sges.delete();
+    if (sgb == null || sgb.mapping == null || count > 32 ||
+        iova < sgb.mapping.iova.value + sgb.mapping_offset ||
+        iova + 512 > sgb.mapping.iova.value + sgb.mapping_offset + sgb.length)
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "tb SGB address has no backing");
+    status = cfg.engine.host_mem.read(sgb.mapping, iova - sgb.mapping.iova.value, 512, raw);
     if (status == null || !status.ok())
       return rdma_status::nonnull(status, "tb SGB read returned null");
-    for (int unsigned k = 0; k < sqe.sge_num && k < 32; k++) begin
+    for (int unsigned k = 0; k < count; k++) begin
       sge = rdma_sge::type_id::create("tb_sgb_sge");
       len = {raw[k * 16], raw[k * 16 + 1], raw[k * 16 + 2], raw[k * 16 + 3]};
       sge.length = len == 0 ? 32'h8000_0000 : len;

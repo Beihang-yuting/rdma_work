@@ -29,6 +29,7 @@ typedef enum bit [4:0] {
   RDMA_QUEUE_ROLE_QP_URC_RDSQ = 5'd18,
   RDMA_QUEUE_ROLE_QP_URC_DSQ = 5'd19
   ,RDMA_QUEUE_ROLE_QP_SQ_SGB = 5'd20
+  ,RDMA_QUEUE_ROLE_QP_RQ_SGB = 5'd21
 } rdma_queue_backing_role_e;
 
 typedef enum bit { RDMA_QUEUE_FLUSH_PRE_DELETE, RDMA_QUEUE_FLUSH_POST_DELETE }
@@ -120,6 +121,14 @@ function automatic bit rdma_queue_role_is_pd(rdma_queue_backing_role_e role);
                       RDMA_QUEUE_ROLE_SRFQ_PD, RDMA_QUEUE_ROLE_CEQ_PD,
                       RDMA_QUEUE_ROLE_AEQ_PD};
 endfunction
+// 功能：backing 角色的 slot/slice 对齐：SGB 类角色 512B，其余 4KiB。
+// 输入/输出及副作用：纯函数。
+// 失败/边界：无。
+function automatic int unsigned rdma_queue_role_alignment(rdma_queue_backing_role_e role);
+  return (role inside {RDMA_QUEUE_ROLE_SRQ_SGB, RDMA_QUEUE_ROLE_QP_SQ_SGB,
+                       RDMA_QUEUE_ROLE_QP_RQ_SGB}) ? 512 : 4096;
+endfunction
+
 // Deliberately distinct from the legacy queue predicates above.  QP backing
 // must never become valid input to a legacy queue plan just by widening the
 // role enum.
@@ -129,6 +138,7 @@ endfunction
 function automatic bit rdma_qp_role_is_payload(rdma_queue_backing_role_e role);
   return role inside {RDMA_QUEUE_ROLE_QP_SQ_RING,
                       RDMA_QUEUE_ROLE_QP_SQ_SGB,
+                      RDMA_QUEUE_ROLE_QP_RQ_SGB,
                       RDMA_QUEUE_ROLE_QP_RQ_RING,
                       RDMA_QUEUE_ROLE_QP_URC_RSQ,
                       RDMA_QUEUE_ROLE_QP_URC_RDSQ,
@@ -329,14 +339,12 @@ class rdma_queue_backing_slice extends uvm_object;
   virtual function rdma_status validate();
     if (!rdma_queue_role_is_payload(role) && !rdma_qp_role_is_payload(role))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "slice role is not payload");
-    if (!rdma_queue_aligned(logical_queue_offset,
-                            (role inside {RDMA_QUEUE_ROLE_SRQ_SGB,
-                                          RDMA_QUEUE_ROLE_QP_SQ_SGB}) ? 512 : 4096))
+    if (!rdma_queue_aligned(logical_queue_offset, rdma_queue_role_alignment(role)))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "logical offset is unaligned");
     if (!rdma_queue_add_ok(logical_queue_offset, length))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "logical range overflows");
     return rdma_queue_queue_range_status(mapping, mapping_offset, length,
-      (role inside {RDMA_QUEUE_ROLE_SRQ_SGB, RDMA_QUEUE_ROLE_QP_SQ_SGB}) ? 512 : 4096);
+      rdma_queue_role_alignment(role));
   endfunction
 endclass
 
@@ -650,8 +658,7 @@ class rdma_queue_backing_segment extends uvm_object;
                             RDMA_OWNERSHIP_CONTROL_PLANE}))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "backing segment ownership invalid");
-    alignment = (role inside {RDMA_QUEUE_ROLE_SRQ_SGB,
-                              RDMA_QUEUE_ROLE_QP_SQ_SGB}) ? 512 : 4096;
+    alignment = rdma_queue_role_alignment(role);
     if (!rdma_queue_aligned(logical_queue_offset, alignment))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "backing segment logical offset unaligned");
@@ -1210,6 +1217,13 @@ function automatic rdma_status rdma_qp_sq_sgb_geometry(
   return rdma_status::success();
 endfunction
 
+// 功能：RQ SGB 的 storage 字节数（每个 RQE 一个 512B slot，按 4KiB 向上取整）。
+// 输入/输出及副作用：纯函数。
+// 失败/边界：无（depth 合法性由 QP plan/request 校验）。
+function automatic longint unsigned rdma_qp_rq_sgb_storage_bytes(int unsigned depth);
+  return ((longint'(depth) * 512 + 4095) / 4096) * 4096;
+endfunction
+
 // 功能：判断 QP 是否需要 SQ SGB：UD 总是需要，RC 在任一方向 SGE>2 时需要。
 // 输入/输出及副作用：transport/max_send_sge/max_recv_sge 为输入；返回 bit，无副作用。
 // 失败/边界：其他 transport 返回 0。
@@ -1305,7 +1319,7 @@ class rdma_qp_backing_ref extends uvm_object;
     if (cleanup_complete && ownership == RDMA_OWNERSHIP_BORROWED)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "borrowed QP backing cleaned");
     status = rdma_queue_queue_range_status(mapping, mapping_offset, length,
-      role == RDMA_QUEUE_ROLE_QP_SQ_SGB ? 512 : 4096);
+      rdma_queue_role_alignment(role));
     if (!status.ok()) return status;
     if (rdma_qp_role_is_pd(role) && additional_segments.size() != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -1374,6 +1388,8 @@ class rdma_qp_backing_plan extends uvm_object;
   rdma_qp_backing_ref sq_ref;
   rdma_qp_backing_ref sq_sgb_ref;
   rdma_qp_backing_ref rq_ref;
+  // 可选：私有 RQ 的外部 SGB（RQE 超过 2 个 SGE 时，descriptor 写入 index*512 slot）。
+  rdma_qp_backing_ref rq_sgb_ref;
   rdma_qp_backing_ref sq_pd_ref;
   rdma_qp_backing_ref rq_pd_ref;
   rdma_handle rq_source_h;
@@ -1396,6 +1412,7 @@ class rdma_qp_backing_plan extends uvm_object;
     sq_ref = null;
     sq_sgb_ref = null;
     rq_ref = null;
+    rq_sgb_ref = null;
     sq_pd_ref = null;
     rq_pd_ref = null;
     rq_source_h = null;
@@ -1422,6 +1439,8 @@ class rdma_qp_backing_plan extends uvm_object;
     rq_pd_flush_complete = r.rq_pd_flush_complete;
     cleanup_complete = r.cleanup_complete;
     sq_ring = null; rq_ring = null; sq_ref = null; sq_sgb_ref = null; rq_ref = null;
+    rq_sgb_ref = rdma_deep_copy#(rdma_qp_backing_ref)::of(
+      r.rq_sgb_ref, "QP RQ SGB ref clone failure");
     sq_pd_ref = null; rq_pd_ref = null; context_ref = null;
     if (r.sq_ring != null) begin c = r.sq_ring.clone(); if (!$cast(sq_ring, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP SQ ring clone failure") end
     if (r.rq_ring != null) begin c = r.rq_ring.clone(); if (!$cast(rq_ring, c)) `uvm_fatal("RDMA_COPY_TYPE", "QP RQ ring clone failure") end
@@ -1538,8 +1557,18 @@ class rdma_qp_backing_plan extends uvm_object;
         return rdma_status::make(RDMA_SC_INVALID_STATE, "QP private RQ references invalid");
     end
     else if (transport != RDMA_TRANSPORT_RC || rq_source_h.kind != RDMA_RESOURCE_SRQ ||
-             rq_ring != null || rq_ref != null || rq_pd_ref != null)
+             rq_ring != null || rq_ref != null || rq_pd_ref != null || rq_sgb_ref != null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP SRQ RQ authority invalid");
+    if (rq_sgb_ref != null) begin
+      status = rdma_queue_nested_status(rq_sgb_ref.validate(), "QP RQ SGB reference");
+      if (!status.ok())
+        return status;
+      status = rdma_qp_backing_total_length(rq_sgb_ref, total_length);
+      if (!status.ok()) return status;
+      if (rq_sgb_ref.role != RDMA_QUEUE_ROLE_QP_RQ_SGB ||
+          total_length != rdma_qp_rq_sgb_storage_bytes(rq_depth))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP RQ SGB geometry invalid");
+    end
     if (context_ref == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP context authority missing");
     status = rdma_queue_nested_status(

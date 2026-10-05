@@ -41,7 +41,10 @@ test
   SQ 超过 2 个 SGE 或 UD 非零 payload 走外部 SGB：driver 把 `sgb_iova` 设为当前 SQ PI × 512B 槽，
   NIC 读该槽并按 16B 大端描述符（length/lkey/iova）解析。UD/URC SQE codec 不支持仅凭 64B 镜像
   解码：URC 与 RC 同布局，用 RC codec；UD 由 `rdma_tb_dma` 按 `rdma_defs.svh` 字段直接解析。
-  RQ 外部 SGB 目前 engine 本身不支持（post_recv 无 SGB backing，>2 SGE 的 RQE 无法编码），RECV 限 2 个 SGE。
+  RQ 外部 SGB：`rdma_create_qp_req.rq_sgb_backing`（默认 null 不启用，要求私有 RQ 且 max_recv_sge>2）
+  分配角色 `QP_RQ_SGB`（rq_depth×512，4KiB 取整）；post_recv 有效 SGE>2 时把描述符写入 index×512 槽，
+  RQE 的 SGB_PA 指向该槽（与 SQ 一致使用设备 DMA 地址），recovery 重放时重写该槽。NIC 读 SGB 后用
+  `decode_with_sgb_descriptor_bytes` 解码（RQE 签名覆盖 SGB 内容）。
 - **地址转换**：key 高 24 位为 MR local ID，经 `lookup_local_resource(owner, MR, id)`
   取 MR，校验低 8 位 key、范围与访问权限，DMA 偏移 = va − backing mapping.iova。
 - **报文**：`rdma_packet` 增加 segment（ONLY/FIRST/MIDDLE/LAST）和结构化扩展头
@@ -63,8 +66,8 @@ test
 - 传输矩阵：每节点 RC/UD/URC 三个 QP（qp_index 0/1/2）。URC 发出即完成，UD 单包且 RQ CQE 用 RQ/SRFQ
   overlay（engine 约束，不携带源 QPN），接收 buffer 不预留 GRH。
 
-状态：两项均已通过（31 项检查零错误）。
+状态：两项均已通过（33 项检查零错误）。
 
 ## 5. 后续
 
-RQ 外部 SGB（需先补 engine）、UD GRH/Q_Key 校验、PSN 乱序重传、RNR 重试、AEQE 错误上报、接入 DUT（NIC 模型退为预测器）。
+UD GRH/Q_Key 校验、PSN 乱序重传、RNR 重试、AEQE 错误上报、接入 DUT（NIC 模型退为预测器）。

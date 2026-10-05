@@ -816,6 +816,8 @@ class rdma_queue_data_engine_fixture extends uvm_object;
   // QP。它们共享 CQ 依赖但拥有各自的 SQ/RQ backing 与 transport context。
   rdma_qp ud_qp;
   rdma_qp urc_qp;
+  // 为基础 RC QP 申请私有 RQ 外部 SGB（RECV 可超过 2 个 SGE）；须在 setup 前设置，默认 0。
+  bit enable_rq_sgb;
 
   // 功能：构造 rdma_queue_data_engine_fixture，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：binding=null；manager=null；mem=null；pcie=null；contexts=null；cmq=null；queue_executor=null；qp_executor=null；其余字段按实现默认值初始化。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
@@ -1180,6 +1182,9 @@ class rdma_queue_data_engine_fixture extends uvm_object;
       qp_request.max_recv_sge = 4;
       qp_request.max_inline_data = 512;
       qp_request.sq_sgb_backing.mode = RDMA_QUEUE_BACKING_OWNED;
+      if (enable_rq_sgb)
+        qp_request.rq_sgb_backing = rdma_queue_backing_spec::type_id::create(
+          {get_name(), "_rq_sgb"});
       qp_request.pd_h = rdma_clone_handle_value(pd.handle, "fixture QP PD");
       qp_request.send_cq_h = rdma_clone_handle_value(cq.handle,
                                                      "fixture QP send CQ");
@@ -3330,6 +3335,152 @@ class rdma_queue_data_engine_post_test extends uvm_test;
     end
   endtask
 
+  // 功能：check_rq_external_sgb 验证私有 RQ 外部 SGB：启用 RQ SGB 的 QP 投递 4/3 个 SGE 的 RECV 时，
+  //   RQE 的 SGE_NUM/SGB_PA 指向 index*512 槽、槽内为 16B 大端描述符且其余补零、带描述符可验签解码；
+  //   未启用时 >2 SGE 的 RECV 被拒且不推进 PI；request 在 max_recv_sge<=2 时拒绝 RQ SGB。
+  // 输入/输出及副作用：建立两个独立 fixture 并在结束时 cleanup。
+  // 失败/边界：任一观测与预期不符报告 RQ_SGB_* UVM_ERROR。
+  task automatic check_rq_external_sgb();
+    rdma_queue_data_engine_fixture fixture;
+    rdma_queue_data_engine_fixture plain;
+    rdma_post_recv_req request;
+    rdma_queue_post_result result;
+    rdma_create_qp_req qp_request;
+    rdma_qp_backing_ref sgb;
+    rdma_hw_qword_builder builder;
+    rdma_codec_base codec;
+    rdma_hw_rqe_codec rqe_codec;
+    rdma_hw_model decoded;
+    rdma_sge sge;
+    rdma_status status;
+    rdma_status cleanup_status;
+    bit [63:0] words[];
+    byte slot[];
+    byte unsigned descriptors[];
+    int unsigned pi;
+    int unsigned ci;
+    bit pw;
+    bit cw;
+
+    fixture = rdma_queue_data_engine_fixture::type_id::create("rq_sgb_fixture");
+    plain = rdma_queue_data_engine_fixture::type_id::create("rq_sgb_plain_fixture");
+    begin : rq_sgb_flow
+      fixture.enable_rq_sgb = 1'b1;
+      fixture.setup(status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("RQ_SGB_FIXTURE", status == null ? "null setup status" :
+                   status.convert2string())
+        disable rq_sgb_flow;
+      end
+      sgb = fixture.qp.qp_plan.rq_sgb_ref;
+      if (sgb == null || sgb.mapping == null || sgb.role != RDMA_QUEUE_ROLE_QP_RQ_SGB ||
+          sgb.length != 16 * 512) begin
+        `uvm_error("RQ_SGB_PLAN", "QP plan lacks a canonical RQ SGB reference")
+        disable rq_sgb_flow;
+      end
+      for (int unsigned n = 0; n < 2; n++) begin
+        request = fixture.make_recv(64'h5eb0_0000 + n);
+        request.sges.delete();
+        for (int unsigned k = 0; k < 4 - n; k++) begin
+          sge = rdma_sge::type_id::create($sformatf("rq_sgb_sge%0d", k));
+          sge.iova.value = 64'h0000_3000_0000_0000 + n * 64'h1000 + k * 64'h100;
+          sge.length = 16 * (k + 1);
+          sge.lkey = 32'h0a0b_0c00 + k;
+          request.sges.push_back(sge);
+        end
+        fixture.engine.post_recv(request, result, status);
+        if (status == null || !status.ok() || result == null || result.image == null) begin
+          `uvm_error("RQ_SGB_POST", status == null ? "null status" : status.convert2string())
+          disable rq_sgb_flow;
+        end
+        builder = new("rq_sgb_builder");
+        void'(builder.deserialize(result.image.bytes));
+        builder.get_words(words);
+        if (words[2][55:48] != 4 - n ||
+            {words[4][63:9], 9'b0} != sgb.mapping.iova.value + sgb.mapping_offset + n * 512)
+          `uvm_error("RQ_SGB_RQE", $sformatf("RQE %0d SGE_NUM/SGB_PA mismatch", n))
+        status = fixture.mem.read(sgb.mapping, sgb.mapping_offset + n * 512, 512, slot);
+        if (status == null || !status.ok() || slot.size() != 512) begin
+          `uvm_error("RQ_SGB_SLOT", "RQ SGB slot readback failed")
+          disable rq_sgb_flow;
+        end
+        foreach (request.sges[k]) begin
+          if ({slot[k * 16], slot[k * 16 + 1], slot[k * 16 + 2], slot[k * 16 + 3]} !=
+                request.sges[k].length ||
+              {slot[k * 16 + 4], slot[k * 16 + 5], slot[k * 16 + 6], slot[k * 16 + 7]} !=
+                request.sges[k].lkey ||
+              {slot[k * 16 + 8], slot[k * 16 + 9], slot[k * 16 + 10], slot[k * 16 + 11],
+               slot[k * 16 + 12], slot[k * 16 + 13], slot[k * 16 + 14], slot[k * 16 + 15]} !=
+                request.sges[k].iova.value)
+            `uvm_error("RQ_SGB_SLOT", $sformatf("RQE %0d descriptor %0d mismatch", n, k))
+        end
+        for (int unsigned i = request.sges.size() * 16; i < 512; i++)
+          if (slot[i] != 0)
+            `uvm_error("RQ_SGB_SLOT", $sformatf("RQE %0d SGB byte %0d is not zero", n, i))
+        descriptors = new[request.sges.size() * 16];
+        foreach (descriptors[i])
+          descriptors[i] = slot[i];
+        status = fixture.registry.lookup('{hw_version:"rdma", image_kind:RDMA_IMAGE_RQE,
+          object_type:"rqe", variant:"default", opcode:8'h00}, codec);
+        if (status == null || !status.ok() || !$cast(rqe_codec, codec))
+          `uvm_error("RQ_SGB_DECODE", "RQE codec lookup failed")
+        else begin
+          status = rqe_codec.decode_with_sgb_descriptor_bytes(result.image, descriptors, decoded);
+          if (status == null || !status.ok())
+            `uvm_error("RQ_SGB_DECODE", status == null ? "null decode status" :
+                       status.convert2string())
+        end
+      end
+
+      plain.setup(status);
+      if (status == null || !status.ok()) begin
+        `uvm_error("RQ_SGB_PLAIN", "plain fixture setup failed")
+        disable rq_sgb_flow;
+      end
+      request = fixture.make_recv(64'h5eb0_0100);
+      request.target_h = rdma_clone_handle_value(plain.qp.handle, "plain RQ");
+      request.owner = plain.binding.make_handle();
+      for (int unsigned k = 0; k < 2; k++) begin
+        sge = rdma_sge::type_id::create($sformatf("rq_sgb_plain_sge%0d", k));
+        sge.iova.value = 64'h0000_3000_0000_8000 + k * 64'h100;
+        sge.length = 32;
+        sge.lkey = 32'h0a0b_0d00 + k;
+        request.sges.push_back(sge);
+      end
+      plain.engine.post_recv(request, result, status);
+      void'(plain.engine.query_runtime_cursors(plain.qp.handle, RDMA_QUEUE_RUNTIME_RQ,
+                                               pi, pw, ci, cw));
+      if (status == null || status.ok() || pi != 0)
+        `uvm_error("RQ_SGB_ABSENT", $sformatf("RECV with 3 SGEs without RQ SGB: pi=%0d %s", pi,
+                   status == null ? "null" : status.convert2string()))
+
+      qp_request = rdma_create_qp_req::type_id::create("rq_sgb_qp_request");
+      qp_request.owner = fixture.binding.make_handle();
+      qp_request.sq_depth = 16;
+      qp_request.rq_depth = 16;
+      qp_request.max_send_sge = 2;
+      qp_request.max_recv_sge = 2;
+      qp_request.rq_sgb_backing = rdma_queue_backing_spec::type_id::create("rq_sgb_spec");
+      status = qp_request.validate();
+      if (status == null || status.ok() ||
+          status.message != "RQ SGB requires a private RQ with max_recv_sge > 2")
+        `uvm_error("RQ_SGB_VALIDATE", status == null ? "null validate status" :
+                   status.convert2string())
+    end
+    if (fixture.needs_cleanup()) begin
+      fixture.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("RQ_SGB_CLEANUP", cleanup_status == null ? "null cleanup status" :
+                   cleanup_status.convert2string())
+    end
+    if (plain.needs_cleanup()) begin
+      plain.cleanup(cleanup_status);
+      if (cleanup_status == null || !cleanup_status.ok())
+        `uvm_error("RQ_SGB_CLEANUP", cleanup_status == null ? "null cleanup status" :
+                   cleanup_status.convert2string())
+    end
+  endtask
+
   // 功能：check_cursor_policy 验证 detached cursor policy 的普通递增、ring 末项回零
   //   与 wrap 翻转，并锁定 depth=0/越界 index 的兼容算术结果仍由 caller 负责拒绝。
   // 输入/输出及副作用：task 只调用 rdma_queue_cursor_policy::advance() 并比较输出值，
@@ -3693,6 +3844,7 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       check_send_route_epoch_authority();
       check_send_reservation_route_epoch_window();
       check_empty_receive_rqe();
+      check_rq_external_sgb();
       check_cursor_policy();
       check_wq_target_policy();
     end

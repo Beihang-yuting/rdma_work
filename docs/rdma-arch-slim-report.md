@@ -65,9 +65,13 @@ Python 门禁另删除约 4.8k 行（结构冻结类）。
    记分板用影子内存预测并逐字节比对。`rdma_packet` 增加 segment 与结构化扩展头
    （RETH/AETH/AtomicETH/AtomicAckETH/ImmDt），net_packet adapter 按 IBTA 表做分段 opcode 映射。
    测试：core `rdma_tb_flow_test`（mock host_mem + loopback wire）、e2e `rdma_tb_e2e_test`
-   （真实 host_mem + net_packet 帧编解码 wire），覆盖 RC/UD/URC 与 SQ 外部 SGB，均为 31 项检查零错误；
+   （真实 host_mem + net_packet 帧编解码 wire），覆盖 RC/UD/URC 与 SQ/RQ 外部 SGB，均为 33 项检查零错误；
    注入 NIC 缺陷可被记分板捕获。顺带修复 net_packet adapter decode 把 UD DETH 留在 header_bytes 中、
    导致 UD SEND_WITH_IMM 立即数被读成 Q_Key 的问题。
+11. **RQ 外部 SGB（engine）**：新增 backing 角色 `QP_RQ_SGB` 与 `rdma_create_qp_req.rq_sgb_backing`（可选），
+   QP lifecycle executor 分配/清零/释放（释放顺序排在最后，不改变既有角色顺序），resource manager/projector/
+   recovery 校验同步覆盖；queue-data engine 在 post_recv 有效 SGE>2 时写 SGB 槽并在 RQE 填 SGB_PA，host-producer
+   recovery 重放时重写该槽。SQ/RQ 共用 `sgb_slot_iova` 槽位解析。新增 `check_rq_external_sgb` 单元检查。
 
 ## 验证
 
@@ -82,6 +86,7 @@ host_mem、PCIe、E2E（dual env / multi-VF / high traffic）。
 | v4 | d898006 | 同上全部通过 |
 | v5 | 303730e | 同上全部通过 |
 | v6 | 914203a | 同上全部通过，另含 core `rdma_tb_flow_test`、e2e `rdma_tb_e2e_test` |
+| v7 | f6d47f9 | 同上全部通过，另含 net_packet suite |
 
 后续轮次结果见对应提交说明。注释改写由脚本逐文件校验：去除注释与空白后的代码 token
 与改写前完全一致。

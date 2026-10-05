@@ -472,7 +472,7 @@ function automatic rdma_status rdma_qp_backing_spec_status(
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP borrowed backing role invalid");
     if (!rdma_queue_aligned(spec.slices[i].logical_queue_offset,
-                            required_role == RDMA_QUEUE_ROLE_QP_SQ_SGB ? 512 : 4096) ||
+                            rdma_queue_role_alignment(required_role)) ||
         spec.slices[i].logical_queue_offset != next_logical_offset ||
         next_logical_offset > required_storage_bytes ||
         spec.slices[i].length >
@@ -481,7 +481,7 @@ function automatic rdma_status rdma_qp_backing_spec_status(
                                "QP borrowed backing coverage is not canonical");
     status = rdma_queue_queue_range_status(spec.slices[i].mapping,
       spec.slices[i].mapping_offset, spec.slices[i].length,
-      required_role == RDMA_QUEUE_ROLE_QP_SQ_SGB ? 512 : 4096);
+      rdma_queue_role_alignment(required_role));
     if (!status.ok()) return status;
     next_logical_offset += spec.slices[i].length;
   end
@@ -507,9 +507,11 @@ class rdma_create_qp_req extends rdma_semantic_request;
   rdma_queue_backing_spec sq_backing;
   rdma_queue_backing_spec sq_sgb_backing;
   rdma_queue_backing_spec rq_backing;
+  // 可选（默认 null 不分配）：私有 RQ 外部 SGB，使 RECV 可携带超过 2 个 SGE；要求 max_recv_sge > 2。
+  rdma_queue_backing_spec rq_sgb_backing;
   rdma_qp_context_attributes context_attrs;
 
-  // 功能：构造create QP 请求，默认 RC、max_recv_sge=1，并创建 SQ/RQ/SQ-SGB backing 规格。
+  // 功能：构造create QP 请求，默认 RC、max_recv_sge=1，并创建 SQ/RQ/SQ-SGB backing 规格（RQ-SGB 默认不启用）。
   // 输入/输出及副作用：name 为 UVM 实例名；仅初始化本地字段为默认值。
   // 失败/边界：无。
   function new(string name = "rdma_create_qp_req");
@@ -527,6 +529,7 @@ class rdma_create_qp_req extends rdma_semantic_request;
     sq_backing = rdma_queue_backing_spec::type_id::create("sq_backing");
     rq_backing = rdma_queue_backing_spec::type_id::create("rq_backing");
     sq_sgb_backing = rdma_queue_backing_spec::type_id::create("sq_sgb_backing");
+    rq_sgb_backing = null;
     context_attrs = null;
   endfunction
 
@@ -559,6 +562,8 @@ class rdma_create_qp_req extends rdma_semantic_request;
       rhs_req.rq_backing, "RQ backing clone type mismatch");
     sq_sgb_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
       rhs_req.sq_sgb_backing, "SQ SGB backing clone type mismatch");
+    rq_sgb_backing = rdma_deep_copy#(rdma_queue_backing_spec)::of(
+      rhs_req.rq_sgb_backing, "RQ SGB backing clone type mismatch");
     context_attrs = rdma_deep_copy#(rdma_qp_context_attributes)::of(
       rhs_req.context_attrs, "QP context attributes clone mismatch");
   endfunction
@@ -607,6 +612,14 @@ class rdma_create_qp_req extends rdma_semantic_request;
                                          RDMA_QUEUE_ROLE_QP_RQ_RING,
                                          rq_storage_bytes);
     if (!status.ok()) return status;
+    if (rq_sgb_backing != null) begin
+      if (srq_h != null || max_recv_sge <= 2)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "RQ SGB requires a private RQ with max_recv_sge > 2");
+      status = rdma_qp_backing_spec_status(rq_sgb_backing, RDMA_QUEUE_ROLE_QP_RQ_SGB,
+                                           rdma_qp_rq_sgb_storage_bytes(rq_depth));
+      if (!status.ok()) return status;
+    end
     if (context_attrs == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP context attributes are null");
