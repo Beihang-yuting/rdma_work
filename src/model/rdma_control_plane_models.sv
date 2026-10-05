@@ -1388,3 +1388,130 @@ class rdma_recovery_record extends uvm_object;
     end
   endfunction
 endclass
+
+// 设计说明：control plane 与 queue lifecycle executor 共用同一组恢复阶段账本操作；
+//   集中在 model 层的无状态函数里，避免两个 owner 各维护一份扫描/去重规则。
+//   所有函数对 null recovery/result 安全，只修改传入记录本身。
+
+// 功能：判断 step 是否已记入 recovery.completed_steps。
+// 输入/输出及副作用：recovery、step 只读；返回命中位，不修改记录。
+// 失败/边界：recovery 为 null 返回 0。
+function automatic bit rdma_recovery_step_completed(
+  rdma_recovery_record recovery,
+  rdma_control_step_e step
+);
+  if (recovery == null)
+    return 1'b0;
+  foreach (recovery.completed_steps[i])
+    if (recovery.completed_steps[i] == step)
+      return 1'b1;
+  return 1'b0;
+endfunction
+
+// 功能：判断 step 是否仍在 recovery.pending_steps 中等待执行。
+// 输入/输出及副作用：recovery、step 只读；返回命中位，不修改记录。
+// 失败/边界：recovery 为 null 返回 0。
+function automatic bit rdma_recovery_step_pending(
+  rdma_recovery_record recovery,
+  rdma_control_step_e step
+);
+  if (recovery == null)
+    return 1'b0;
+  foreach (recovery.pending_steps[i])
+    if (recovery.pending_steps[i] == step)
+      return 1'b1;
+  return 1'b0;
+endfunction
+
+// 功能：从 pending_steps 删除 step 的全部出现。
+// 输入/输出及副作用：原地修改 recovery.pending_steps，其余字段不变。
+// 失败/边界：recovery 为 null 或 step 不存在时为空操作。
+function automatic void rdma_recovery_remove_pending(
+  rdma_recovery_record recovery,
+  rdma_control_step_e step
+);
+  if (recovery == null)
+    return;
+  for (int i = int'(recovery.pending_steps.size()) - 1; i >= 0; i--)
+    if (recovery.pending_steps[i] == step)
+      recovery.pending_steps.delete(i);
+endfunction
+
+// 功能：从 completed_steps 删除 step 的第一次出现，用于恢复回退已完成阶段。
+// 输入/输出及副作用：原地修改 recovery.completed_steps，其余字段不变。
+// 失败/边界：recovery 为 null 或 step 不存在时为空操作。
+function automatic void rdma_recovery_remove_completed(
+  rdma_recovery_record recovery,
+  rdma_control_step_e step
+);
+  if (recovery == null)
+    return;
+  foreach (recovery.completed_steps[i]) begin
+    if (recovery.completed_steps[i] == step) begin
+      recovery.completed_steps.delete(i);
+      return;
+    end
+  end
+endfunction
+
+// 功能：把尚未完成且未排队的 step 追加到 pending_steps 末尾。
+// 输入/输出及副作用：可能向 recovery.pending_steps 追加一项。
+// 失败/边界：recovery 为 null、step 已完成或已排队时为空操作（幂等）。
+function automatic void rdma_recovery_queue_step(
+  rdma_recovery_record recovery,
+  rdma_control_step_e step
+);
+  if (recovery == null || rdma_recovery_step_completed(recovery, step) ||
+      rdma_recovery_step_pending(recovery, step))
+    return;
+  recovery.pending_steps.push_back(step);
+endfunction
+
+// 功能：把 step 从 pending 移到 completed。
+// 输入/输出及副作用：删除 pending 中的 step，completed 中不存在时追加。
+// 失败/边界：recovery 为 null 时为空操作；重复调用幂等。
+function automatic void rdma_recovery_complete_step(
+  rdma_recovery_record recovery,
+  rdma_control_step_e step
+);
+  if (recovery == null)
+    return;
+  rdma_recovery_remove_pending(recovery, step);
+  if (!rdma_recovery_step_completed(recovery, step))
+    recovery.completed_steps.push_back(step);
+endfunction
+
+// 功能：把恢复账本的阶段历史、primary/rollback status 投影到 caller 可见结果。
+// 输入/输出及副作用：覆盖 result.completed_steps/primary_status/rollback_statuses，
+//   status 均为 detached clone，recovery 只读。
+// 失败/边界：recovery 或 result 为 null 时为空操作。
+function automatic void rdma_recovery_project_history(
+  rdma_recovery_record recovery,
+  rdma_control_result result
+);
+  if (recovery == null || result == null)
+    return;
+  result.completed_steps = recovery.completed_steps;
+  result.primary_status = rdma_cmq_clone_status_value(recovery.primary_status);
+  result.rollback_statuses.delete();
+  foreach (recovery.rollback_statuses[i])
+    result.rollback_statuses.push_back(
+      rdma_cmq_clone_status_value(recovery.rollback_statuses[i])
+    );
+endfunction
+
+// 功能：以 RECOVERY_REQUIRED 发布结果，并把资源终态标记为已知 ERROR。
+// 输入/输出及副作用：先投影恢复历史，再写 result.status、final_resource_state、
+//   final_resource_state_known 与 recovery_required。
+// 失败/边界：result 不得为 null（调用方总是传入已构造结果）；recovery 可为 null。
+function automatic void rdma_recovery_publish_required(
+  rdma_recovery_record recovery,
+  rdma_control_result result,
+  string message
+);
+  rdma_recovery_project_history(recovery, result);
+  result.status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED, message);
+  result.final_resource_state = RDMA_RESOURCE_ERROR;
+  result.final_resource_state_known = 1'b1;
+  result.recovery_required = 1'b1;
+endfunction

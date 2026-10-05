@@ -870,82 +870,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     publish_failure(primary, result, RDMA_RESOURCE_ERROR, status.ok(), 1'b1);
   endfunction
 
-  // Recovery metadata is intentionally manipulated through small, local
-  // helpers rather than relying on queue ordering in pending_steps.  The
-  // latter is a coarse transaction history; the authoritative per-role
-  // completion bits live in queue_plan and are updated atomically by the
-  // resource manager.
-  // 功能：recovery_step_completed 比较 recovery、step 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  protected function bit recovery_step_completed(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return 1'b0;
-    foreach (recovery.completed_steps[i])
-      if (recovery.completed_steps[i] == step)
-        return 1'b1;
-    return 1'b0;
-  endfunction
-
-  // 功能：在 rdma_queue_lifecycle_executor 中，recovery_step_pending 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  protected function bit recovery_step_pending(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return 1'b0;
-    foreach (recovery.pending_steps[i])
-      if (recovery.pending_steps[i] == step)
-        return 1'b1;
-    return 1'b0;
-  endfunction
-
-  // 功能：在 rdma_queue_lifecycle_executor 中，recovery_remove_step 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  protected function void recovery_remove_step(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return;
-    for (int i = int'(recovery.pending_steps.size()) - 1; i >= 0; i--)
-      if (recovery.pending_steps[i] == step)
-        recovery.pending_steps.delete(i);
-  endfunction
-
-  // 功能：recovery_complete_step 使用 recovery、step 执行对应状态/生命周期操作，只更新函数体明确拥有的账本、游标或输出。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  protected function void recovery_complete_step(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return;
-    recovery_remove_step(recovery, step);
-    if (!recovery_step_completed(recovery, step))
-      recovery.completed_steps.push_back(step);
-  endfunction
-
-  // 功能：在 rdma_queue_lifecycle_executor 中，recovery_queue_step 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  protected function void recovery_queue_step(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null || recovery_step_completed(recovery, step) ||
-        recovery_step_pending(recovery, step))
-      return;
-    recovery.pending_steps.push_back(step);
-  endfunction
-
   // 功能：queue_policy_for_kind 根据 kind、policy 执行 rdma_status 结果转换，具体更新字段 policy；失败时返回 RDMA_SC_UNSUPPORTED_OPCODE、RDMA_SC_INVALID_STATE，保持已登记资源和输出不变。
   // 输入/输出及副作用：kind（输入）、policy（输出）；queue_policy_for_kind 读取 kind、policy 并使用字段 policy，并写入 policy；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：queue_policy_for_kind 返回 RDMA_SC_UNSUPPORTED_OPCODE、RDMA_SC_INVALID_STATE；典型拒绝条件为“queue recovery kind is unsupported”“queue recovery policy is unavailable”；失败路径不提交部分状态或转移未声明资源。
@@ -966,42 +890,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     if (policy == null)
       return invalid_state("queue recovery policy is unavailable");
     return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_queue_lifecycle_executor 中，project_queue_recovery_result 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：recovery（输入）、result（输入）；project_queue_recovery_result 读取 recovery、result 并使用字段 result.completed_steps、result.primary_status；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：project_queue_recovery_result 无返回值，仅执行 result.completed_steps=recovery.completed_steps、result.primary_status=rdma_cmq_clone_status_value(；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  protected function void project_queue_recovery_result(
-    rdma_recovery_record recovery,
-    rdma_control_result result
-  );
-    if (recovery == null || result == null)
-      return;
-    result.completed_steps = recovery.completed_steps;
-    result.primary_status = rdma_cmq_clone_status_value(
-      recovery.primary_status
-    );
-    result.rollback_statuses.delete();
-    foreach (recovery.rollback_statuses[i])
-      result.rollback_statuses.push_back(
-        rdma_cmq_clone_status_value(recovery.rollback_statuses[i])
-      );
-  endfunction
-
-  // 功能：在 rdma_queue_lifecycle_executor 中，publish_queue_recovery_required 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
-  // 输入/输出及副作用：recovery（输入）、result（输入）、message（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
-  //   journal，并通过 output 返回结果。
-  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
-  protected function void publish_queue_recovery_required(
-    rdma_recovery_record recovery,
-    rdma_control_result result,
-    string message
-  );
-    project_queue_recovery_result(recovery, result);
-    result.status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED, message);
-    result.final_resource_state = RDMA_RESOURCE_ERROR;
-    result.final_resource_state_known = 1'b1;
-    result.recovery_required = 1'b1;
   endfunction
 
   // 功能：在 rdma_queue_lifecycle_executor 中，persist_queue_recovery 记录或执行队列恢复步骤，依据提交证据选择重试、提交或回滚并保持操作幂等。
@@ -1517,7 +1405,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                                 "queue recovery record validation returned null");
       if (!status.ok()) break;
       creation_origin = recovery.queue_intent == RDMA_QUEUE_RECOVER_CREATE_ROLLBACK;
-      project_queue_recovery_result(recovery, result);
+      rdma_recovery_project_history(recovery, result);
 
       // Reconcile any earlier ambiguous command before issuing another CMQ
       // command for this queue.
@@ -1529,7 +1417,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         cmq.reconcile(ticket, terminal_known, completion, reconcile_status);
         status = live_binding_fence(binding, expected_owner);
         if (!status.ok()) begin
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue reconciliation fenced by stale generation");
           done = 1'b1;
           break;
@@ -1537,7 +1425,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         reconcile_status = normalize_status(reconcile_status,
           "queue CMQ reconciliation returned null");
         if (!terminal_known) begin
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "ambiguous queue command has no terminal result");
           if (!reconcile_status.ok())
             result.rollback_statuses.push_back(
@@ -1549,7 +1437,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             invalid_state("queue reconciliation completion is incomplete"));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue reconciliation still requires recovery");
           done = 1'b1;
           break;
@@ -1558,7 +1446,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           "queue reconciliation status returned null");
         if (completion_status.code inside {RDMA_SC_TIMEOUT,
                                           RDMA_SC_RESET_CANCELLED}) begin
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue reconciliation has no trustworthy terminal evidence");
           done = 1'b1;
           break;
@@ -1567,7 +1455,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             invalid_state("queue reconciliation ticket has no opcode"));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue reconciliation ticket is invalid");
           done = 1'b1;
           break;
@@ -1588,12 +1476,12 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           if (classify_status.ok() && query_conclusive) begin
             recovery.hardware_presence = query_presence;
             if (query_presence == RDMA_HW_PRESENCE_ABSENT)
-              recovery_remove_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+              rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
             else
-              recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+              rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
             if (!persist_status.ok()) begin
-              publish_queue_recovery_required(recovery, result,
+              rdma_recovery_publish_required(recovery, result,
                 "reconciled queue QUERY progress could not be persisted");
               done = 1'b1;
               break;
@@ -1605,7 +1493,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                 rdma_cmq_clone_status_value(classify_status));
             recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-            publish_queue_recovery_required(recovery, result,
+            rdma_recovery_publish_required(recovery, result,
               "reconciled queue QUERY was inconclusive");
             if (!persist_status.ok())
               result.rollback_statuses.push_back(
@@ -1619,19 +1507,19 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
           if (completion_status.ok()) begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
-            recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
+            rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
           end
           else begin
             // Definitive create failure proves no queue object was installed.
             recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            recovery_remove_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
             recovery.rollback_statuses.push_back(
               rdma_cmq_clone_status_value(completion_status));
           end
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
           if (!persist_status.ok()) begin
-            publish_queue_recovery_required(recovery, result,
+            rdma_recovery_publish_required(recovery, result,
               "reconciled queue create progress could not be persisted");
             done = 1'b1;
             break;
@@ -1642,17 +1530,17 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_NONE;
           if (completion_status.ok()) begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
           end
           else begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+            rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
             recovery.rollback_statuses.push_back(
               rdma_cmq_clone_status_value(completion_status));
           end
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
           if (!persist_status.ok()) begin
-            publish_queue_recovery_required(recovery, result,
+            rdma_recovery_publish_required(recovery, result,
               "reconciled queue delete progress could not be persisted");
             done = 1'b1;
             break;
@@ -1670,7 +1558,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
               if (status.ok()) status = normalize_status(manager.restore_active(resource_h),
                 "queue delete failure restore ACTIVE returned null");
               if (status.ok()) begin
-                project_queue_recovery_result(recovery, result);
+                rdma_recovery_project_history(recovery, result);
                 // The terminal failure is the operation's observable result;
                 // the durable primary timeout remains in the recovery history
                 // and rollback list for callers that inspect it.
@@ -1684,7 +1572,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
               recovery.rollback_statuses.push_back(
                 rdma_cmq_clone_status_value(status));
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-              publish_queue_recovery_required(recovery, result,
+              rdma_recovery_publish_required(recovery, result,
                 "queue delete failure ACTIVE restore still requires recovery");
               if (!persist_status.ok())
                 result.rollback_statuses.push_back(
@@ -1692,7 +1580,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
               done = 1'b1;
               break;
             end
-            publish_queue_recovery_required(recovery, result,
+            rdma_recovery_publish_required(recovery, result,
               "queue delete terminal failure requires a retry");
             done = 1'b1;
             break;
@@ -1724,7 +1612,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
               recovery.rollback_statuses.push_back(
                 invalid_state("reconciled OCC target is missing"));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-              publish_queue_recovery_required(recovery, result,
+              rdma_recovery_publish_required(recovery, result,
                 "queue OCC target cannot be identified");
               done = 1'b1;
               break;
@@ -1739,14 +1627,14 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                 recovery.rollback_statuses.push_back(
                   rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-                publish_queue_recovery_required(recovery, result,
+                rdma_recovery_publish_required(recovery, result,
                   "reconciled queue OCC progress failed");
                 done = 1'b1;
                 break;
               end
             end
             recovery.queue_plan.flush_targets[target_index].flush_complete = 1'b1;
-            recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+            rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
           end
           else begin
             // Keep this role incomplete and stop at the barrier.  A later
@@ -1762,7 +1650,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
                 if (status.ok()) status = normalize_status(manager.restore_active(resource_h),
                   "queue OCC failure restore ACTIVE returned null");
                 if (status.ok()) begin
-                  project_queue_recovery_result(recovery, result);
+                  rdma_recovery_project_history(recovery, result);
                   result.status = rdma_cmq_clone_status_value(
                     completion_status);
                   result.final_resource_state = RDMA_RESOURCE_ACTIVE;
@@ -1780,7 +1668,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
               // If either persistence or the atomic restore failed, retain
               // the PRESENT recovery record for a later retry.
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-              publish_queue_recovery_required(recovery, result,
+              rdma_recovery_publish_required(recovery, result,
                 "queue OCC failure ACTIVE restore still requires recovery");
               if (!persist_status.ok())
                 result.rollback_statuses.push_back(
@@ -1789,7 +1677,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
               break;
             end
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-            publish_queue_recovery_required(recovery, result,
+            rdma_recovery_publish_required(recovery, result,
               "queue OCC target still requires recovery");
             if (!persist_status.ok())
               result.rollback_statuses.push_back(
@@ -1799,7 +1687,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           end
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
           if (!persist_status.ok()) begin
-            publish_queue_recovery_required(recovery, result,
+            rdma_recovery_publish_required(recovery, result,
               "reconciled queue OCC progress could not be persisted");
             done = 1'b1;
             break;
@@ -1810,7 +1698,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                               "queue recovery ticket opcode is unsupported"));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue recovery ticket opcode is unsupported");
           done = 1'b1;
           break;
@@ -1829,7 +1717,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue QUERY descriptor could not be built");
           done = 1'b1;
           break;
@@ -1840,11 +1728,11 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
             ticket, "queue QUERY recovery");
           recovery.ambiguous_queue_operation =
-            (creation_origin && !recovery_step_completed(
+            (creation_origin && !rdma_recovery_step_completed(
               recovery, RDMA_CTRL_STEP_HW_CONTEXT_CREATED)) ?
               RDMA_QUEUE_AMBIG_CREATE : RDMA_QUEUE_AMBIG_DELETE;
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue QUERY has no terminal result");
           if (!persist_status.ok())
             result.rollback_statuses.push_back(
@@ -1857,7 +1745,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue QUERY failed to establish presence");
           done = 1'b1;
           break;
@@ -1873,19 +1761,19 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             recovery.rollback_statuses.push_back(
               rdma_cmq_clone_status_value(classify_status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue QUERY response is inconclusive");
           done = 1'b1;
           break;
         end
         recovery.hardware_presence = query_presence;
         if (query_presence == RDMA_HW_PRESENCE_ABSENT)
-          recovery_remove_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+          rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
         else
-          recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+          rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
         if (!persist_status.ok()) begin
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue QUERY progress could not be persisted");
           done = 1'b1;
           break;
@@ -1893,7 +1781,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
 
       if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
-        publish_queue_recovery_required(recovery, result,
+        rdma_recovery_publish_required(recovery, result,
           "queue hardware presence remains unknown");
         done = 1'b1;
         break;
@@ -1906,7 +1794,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             invalid_state("queue recovery flush target is null"));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue OCC recipe is invalid");
           done = 1'b1;
           break;
@@ -1930,7 +1818,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue OCC descriptor could not be built");
           done = 1'b1;
           break;
@@ -1941,7 +1829,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
           recovery.ambiguous_role = target_role;
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue OCC target has no terminal result");
           if (!persist_status.ok())
             result.rollback_statuses.push_back(
@@ -1953,7 +1841,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             progress_failed ?
               "queue OCC progress could not be persisted" :
               "queue OCC target failed");
@@ -1964,10 +1852,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           break;
         end
         recovery.queue_plan.flush_targets[i].flush_complete = 1'b1;
-        recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
         if (!persist_status.ok()) begin
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue OCC progress could not be persisted");
           done = 1'b1;
           break;
@@ -1978,13 +1866,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       // A PRESENT queue still needs delete.  For SRQ this is reached only
       // after all pre-delete OCC targets above are complete.
       if (recovery.hardware_presence == RDMA_HW_PRESENCE_PRESENT &&
-          !recovery_step_completed(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED)) begin
+          !rdma_recovery_step_completed(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED)) begin
         for (i = 0; i < recovery.queue_plan.flush_targets.size(); i++) begin
           if (recovery.queue_plan.flush_targets[i] != null &&
               recovery.queue_plan.flush_targets[i].phase ==
                 RDMA_QUEUE_FLUSH_PRE_DELETE &&
               !recovery.queue_plan.flush_targets[i].flush_complete) begin
-            publish_queue_recovery_required(recovery, result,
+            rdma_recovery_publish_required(recovery, result,
               "queue pre-delete OCC barrier is incomplete");
             done = 1'b1;
             break;
@@ -1999,7 +1887,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue delete descriptor could not be built");
           done = 1'b1;
           break;
@@ -2014,7 +1902,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
             RDMA_QUEUE_ROLE_CQ_RING : recovery.queue_plan.refs[0].role;
           recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue delete has no terminal result");
           if (!persist_status.ok())
             result.rollback_statuses.push_back(
@@ -2024,11 +1912,11 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         end
         if (!status.ok()) begin
           recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-          recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+          rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue delete failed");
           if (!persist_status.ok())
             result.rollback_statuses.push_back(
@@ -2037,10 +1925,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           break;
         end
         recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-        recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
+        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_CONTEXT_DELETED);
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
         if (!persist_status.ok()) begin
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue delete progress could not be persisted");
           done = 1'b1;
           break;
@@ -2048,7 +1936,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
 
       if (recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
-        publish_queue_recovery_required(recovery, result,
+        rdma_recovery_publish_required(recovery, result,
           "queue hardware absence is not proven");
         done = 1'b1;
         break;
@@ -2075,7 +1963,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue post-delete OCC descriptor failed");
           done = 1'b1;
           break;
@@ -2086,7 +1974,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.ambiguous_queue_operation = RDMA_QUEUE_AMBIG_OCC_FLUSH;
           recovery.ambiguous_role = target_role;
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue post-delete OCC has no terminal result");
           if (!persist_status.ok())
             result.rollback_statuses.push_back(
@@ -2098,7 +1986,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             progress_failed ?
               "queue post-delete OCC progress failed" :
               "queue post-delete OCC failed");
@@ -2109,10 +1997,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           break;
         end
         recovery.queue_plan.flush_targets[i].flush_complete = 1'b1;
-        recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
         if (!persist_status.ok()) begin
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue post-delete OCC progress failed");
           done = 1'b1;
           break;
@@ -2120,7 +2008,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
       if (done) break;
       if (!queue_flushes_complete(recovery.queue_plan)) begin
-        publish_queue_recovery_required(recovery, result,
+        rdma_recovery_publish_required(recovery, result,
           "queue OCC recipe remains incomplete");
         done = 1'b1;
         break;
@@ -2144,7 +2032,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue local cleanup still requires recovery");
           done = 1'b1;
           break;
@@ -2152,7 +2040,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         if (!persist_status.ok()) begin
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(persist_status));
-          publish_queue_recovery_required(recovery, result,
+          rdma_recovery_publish_required(recovery, result,
             "queue local cleanup progress is unavailable");
           done = 1'b1;
           break;
@@ -2160,13 +2048,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
       local_done = queue_local_cleanup_complete(recovery.queue_plan);
       if (!local_done) begin
-        publish_queue_recovery_required(recovery, result,
+        rdma_recovery_publish_required(recovery, result,
           "queue local cleanup remains incomplete");
         done = 1'b1;
         break;
       end
 
-      recovery_complete_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+      rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
       // A normal destroy is an unstaged, already-published queue.  Its ERROR
       // recovery schema must not advertise RESOURCE_RELEASED while the
       // registry entry is still present: manager.mark_error() reserves that
@@ -2174,10 +2062,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       // Create-rollback recovery is the one exception; release_reserved()
       // consumes that canonical pending step after the recovery is persisted.
       if (creation_origin)
-        recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
             persist_status = persist_queue_recovery(resource_h, recovery, binding, expected_owner);
       if (!persist_status.ok()) begin
-        publish_queue_recovery_required(recovery, result,
+        rdma_recovery_publish_required(recovery, result,
           "queue backing progress could not be persisted");
         done = 1'b1;
         break;
@@ -2202,13 +2090,13 @@ class rdma_queue_lifecycle_executor extends uvm_object;
         recovery.rollback_statuses.push_back(
           rdma_cmq_clone_status_value(status));
           void'(persist_queue_recovery(resource_h, recovery, binding, expected_owner));
-        publish_queue_recovery_required(recovery, result,
+        rdma_recovery_publish_required(recovery, result,
           "queue resource finalization still requires recovery");
         done = 1'b1;
         break;
       end
-      recovery_complete_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
-      project_queue_recovery_result(recovery, result);
+      rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      rdma_recovery_project_history(recovery, result);
       result.status = rdma_status::success();
       result.final_resource_state = RDMA_RESOURCE_RELEASED;
       result.final_resource_state_known = 1'b1;

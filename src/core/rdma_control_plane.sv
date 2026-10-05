@@ -3214,36 +3214,6 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：recovery_step_completed 比较 recovery、step 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  protected function bit recovery_step_completed(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return 1'b0;
-    foreach (recovery.completed_steps[i])
-      if (recovery.completed_steps[i] == step)
-        return 1'b1;
-    return 1'b0;
-  endfunction
-
-  // 功能：在 rdma_control_plane 中，recovery_step_pending 根据当前证据转换事务或恢复状态，并保持重试、复位和所有权边界一致。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：当前状态不允许、epoch/generation 过期或恢复证据不完整时返回错误；不得跳过隔离步骤。
-  protected function bit recovery_step_pending(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return 1'b0;
-    foreach (recovery.pending_steps[i])
-      if (recovery.pending_steps[i] == step)
-        return 1'b1;
-    return 1'b0;
-  endfunction
-
   // 功能：first_pending_hardware_step 按 recovery.pending_steps 的持久化顺序选择
   //   本轮应先处理的第一个硬件阶段，供 recover_resource 的硬件恢复循环建立稳定
   //   的执行候选；该 helper 只抽离扫描职责，不改变后续 CMQ 调用或状态迁移。
@@ -3326,103 +3296,6 @@ class rdma_control_plane extends uvm_object;
     return !recovery_has_hardware_step(recovery, 1'b1);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，remove_recovery_pending_step remove_recovery_pending_step 解除指定资源绑定并隔离 runtime/映射，避免旧句柄在删除后访问后端。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；remove_recovery_pending_step 读取 recovery、step 并使用字段 i；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：remove_recovery_pending_step 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
-  protected function void remove_recovery_pending_step(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return;
-    foreach (recovery.pending_steps[i]) begin
-      if (recovery.pending_steps[i] == step) begin
-        recovery.pending_steps.delete(i);
-        return;
-      end
-    end
-  endfunction
-
-  // 功能：在 rdma_control_plane 中，remove_recovery_completed_step remove_recovery_completed_step 解除指定资源绑定并隔离 runtime/映射，避免旧句柄在删除后访问后端。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；remove_recovery_completed_step 读取 recovery、step 并使用字段 i；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：remove_recovery_completed_step 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
-  protected function void remove_recovery_completed_step(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return;
-    foreach (recovery.completed_steps[i]) begin
-      if (recovery.completed_steps[i] == step) begin
-        recovery.completed_steps.delete(i);
-        return;
-      end
-    end
-  endfunction
-
-  // 功能：在 rdma_control_plane 中，queue_recovery_step 记录或执行队列恢复步骤，依据提交证据选择重试、提交或回滚并保持操作幂等。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；queue_recovery_step 读取 recovery、step 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：queue_recovery_step 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  protected function void queue_recovery_step(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null || recovery_step_completed(recovery, step) ||
-        recovery_step_pending(recovery, step))
-      return;
-    recovery.pending_steps.push_back(step);
-  endfunction
-
-  // 功能：在 rdma_control_plane 中，complete_recovery_step 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
-  // 输入/输出及副作用：recovery（输入）、step（输入）；complete_recovery_step 读取 recovery、step 并使用输入参数和固定枚举/常量；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：complete_recovery_step 无返回值，仅执行 函数体中的顺序操作；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  protected function void complete_recovery_step(
-    rdma_recovery_record recovery,
-    rdma_control_step_e step
-  );
-    if (recovery == null)
-      return;
-    remove_recovery_pending_step(recovery, step);
-    if (!recovery_step_completed(recovery, step))
-      recovery.completed_steps.push_back(step);
-  endfunction
-
-  // 功能：在 rdma_control_plane 中，project_recovery_result_history 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：recovery（输入）、result（输入）；project_recovery_result_history 读取 recovery、result 并使用字段 result.completed_steps、result.primary_status；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：project_recovery_result_history 无返回值，仅执行 result.completed_steps=recovery.completed_steps、result.primary_status=rdma_cmq_clone_status_value(；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
-  protected function void project_recovery_result_history(
-    rdma_recovery_record recovery,
-    rdma_control_result result
-  );
-    if (recovery == null || result == null)
-      return;
-    result.completed_steps = recovery.completed_steps;
-    result.primary_status = rdma_cmq_clone_status_value(
-      recovery.primary_status
-    );
-    result.rollback_statuses.delete();
-    foreach (recovery.rollback_statuses[i])
-      result.rollback_statuses.push_back(
-        rdma_cmq_clone_status_value(recovery.rollback_statuses[i])
-      );
-  endfunction
-
-  // 功能：在 rdma_control_plane 中，publish_recovery_required 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
-  // 输入/输出及副作用：recovery（输入）、result（输入）、message（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
-  //   journal，并通过 output 返回结果。
-  // 失败/边界：队列未激活、credit 不足、请求身份过期或后端写入失败时返回错误；不得提前推进游标或重复提交。
-  protected function void publish_recovery_required(
-    rdma_recovery_record recovery,
-    rdma_control_result result,
-    string message
-  );
-    project_recovery_result_history(recovery, result);
-    result.status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED, message);
-    result.final_resource_state = RDMA_RESOURCE_ERROR;
-    result.final_resource_state_known = 1'b1;
-    result.recovery_required = 1'b1;
-  endfunction
-
   // 功能：在 rdma_control_plane 中，persist_recovery_record 记录或执行队列恢复步骤，依据提交证据选择重试、提交或回滚并保持操作幂等。
   // 输入/输出及副作用：resource_h（输入）、recovery（输入）；persist_recovery_record 读取 resource_h、recovery 并使用字段 first_status、retry_status；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：persist_recovery_record 先检查 first_status.ok(；!retry_status.ok(，再返回 first_status；拒绝分支不提交部分状态，也不隐式重试。
@@ -3474,7 +3347,7 @@ class rdma_control_plane extends uvm_object;
       recovery.rollback_statuses.push_back(
         rdma_cmq_clone_status_value(persist_status)
       );
-    publish_recovery_required(recovery, result, message);
+    rdma_recovery_publish_required(recovery, result, message);
   endfunction
 
   // 功能：在 rdma_control_plane 中，destroy_recovery_restore_ready 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
@@ -3514,7 +3387,7 @@ class rdma_control_plane extends uvm_object;
       );
       return;
     end
-    project_recovery_result_history(recovery, result);
+    rdma_recovery_project_history(recovery, result);
     result.status = rdma_status::success();
     result.final_resource_state = RDMA_RESOURCE_ACTIVE;
     result.final_resource_state_known = 1'b1;
@@ -3620,7 +3493,7 @@ class rdma_control_plane extends uvm_object;
           recovery.rollback_statuses.push_back(
             rdma_cmq_clone_status_value(lookup_status)
           );
-        publish_recovery_required(
+        rdma_recovery_publish_required(
           recovery, result, "reserved MR still requires recovery"
         );
         return;
@@ -3636,20 +3509,20 @@ class rdma_control_plane extends uvm_object;
         durable_recovery.rollback_statuses.push_back(
           rdma_cmq_clone_status_value(persist_status)
         );
-      publish_recovery_required(
+      rdma_recovery_publish_required(
         durable_recovery, result, "reserved MR still requires recovery"
       );
       return;
     end
 
     if (backing_release_pending)
-      complete_recovery_step(
+      rdma_recovery_complete_step(
         recovery, RDMA_CTRL_STEP_BACKING_RELEASED
       );
-    complete_recovery_step(
+    rdma_recovery_complete_step(
       recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
     );
-    project_recovery_result_history(recovery, result);
+    rdma_recovery_project_history(recovery, result);
     result.status = rdma_status::success();
     result.final_resource_state = RDMA_RESOURCE_RELEASED;
     result.final_resource_state_known = 1'b1;
@@ -3918,8 +3791,8 @@ class rdma_control_plane extends uvm_object;
         status = invalid_state("ERROR MR recovery record is incomplete");
         break;
       end
-      project_recovery_result_history(recovery, result);
-      creation_origin = recovery_step_completed(
+      rdma_recovery_project_history(recovery, result);
+      creation_origin = rdma_recovery_step_completed(
         recovery, RDMA_CTRL_STEP_RESOURCE_RESERVED
       );
       reserved_only = recovery_is_reserved_only(recovery);
@@ -3946,7 +3819,7 @@ class rdma_control_plane extends uvm_object;
           reconcile_status, "CMQ reconciliation returned null"
         );
         if (!terminal_known) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "ambiguous CMQ command has no terminal result"
           );
@@ -3970,7 +3843,7 @@ class rdma_control_plane extends uvm_object;
           completion.status, "CMQ reconciliation status returned null"
         );
         if (completion_status.code == RDMA_SC_RESET_CANCELLED) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "reset cancellation does not prove hardware absence"
           );
@@ -3990,7 +3863,7 @@ class rdma_control_plane extends uvm_object;
         defer_terminal_retry = 1'b0;
         case (ticket.opcode_key.opcode)
           RDMA_OP_KEY_ALLOC: begin
-            if (!recovery_step_pending(
+            if (!rdma_recovery_step_pending(
                   recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED)) begin
               retain_recovery_failure(
                 resource_h, recovery,
@@ -4003,22 +3876,22 @@ class rdma_control_plane extends uvm_object;
             recovery.ambiguous_ticket = null;
             if (completion_status.ok()) begin
               recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-              complete_recovery_step(
+              rdma_recovery_complete_step(
                 recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED
               );
-              queue_recovery_step(
+              rdma_recovery_queue_step(
                 recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
               );
             end
             else begin
               recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-              remove_recovery_pending_step(
+              rdma_recovery_remove_pending(
                 recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED
               );
               recovery.rollback_statuses.push_back(
                 rdma_cmq_clone_status_value(completion_status)
               );
-              queue_recovery_step(
+              rdma_recovery_queue_step(
                 recovery, RDMA_CTRL_STEP_BACKING_RELEASED
               );
             end
@@ -4027,16 +3900,16 @@ class rdma_control_plane extends uvm_object;
             recovery.ambiguous_ticket = null;
             recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
             if (completion_status.ok()) begin
-              complete_recovery_step(
+              rdma_recovery_complete_step(
                 recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED
               );
-              queue_recovery_step(
+              rdma_recovery_queue_step(
                 recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
               );
             end
             else begin
               if (!creation_origin)
-                remove_recovery_pending_step(
+                rdma_recovery_remove_pending(
                   recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED
                 );
               recovery.rollback_statuses.push_back(
@@ -4048,22 +3921,22 @@ class rdma_control_plane extends uvm_object;
             recovery.ambiguous_ticket = null;
             if (completion_status.ok()) begin
               recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-              complete_recovery_step(
+              rdma_recovery_complete_step(
                 recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
               );
               if (creation_origin)
-                queue_recovery_step(
+                rdma_recovery_queue_step(
                   recovery, RDMA_CTRL_STEP_BACKING_RELEASED
                 );
               else
-                queue_recovery_step(
+                rdma_recovery_queue_step(
                   recovery, RDMA_CTRL_STEP_HW_DRAINED
                 );
             end
             else begin
               recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
               if (!creation_origin)
-                remove_recovery_pending_step(
+                rdma_recovery_remove_pending(
                   recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
                 );
               else
@@ -4077,10 +3950,10 @@ class rdma_control_plane extends uvm_object;
             recovery.ambiguous_ticket = null;
             recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
             if (completion_status.ok()) begin
-              complete_recovery_step(
+              rdma_recovery_complete_step(
                 recovery, RDMA_CTRL_STEP_HW_DRAINED
               );
-              queue_recovery_step(
+              rdma_recovery_queue_step(
                 recovery, RDMA_CTRL_STEP_BACKING_RELEASED
               );
             end
@@ -4106,7 +3979,7 @@ class rdma_control_plane extends uvm_object;
           break;
         persist_status = persist_recovery_record(resource_h, recovery);
         if (!persist_status.ok()) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "reconciled CMQ progress could not be persisted"
           );
@@ -4114,7 +3987,7 @@ class rdma_control_plane extends uvm_object;
           break;
         end
         if (defer_terminal_retry) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "terminal hardware failure was retained for a later retry"
           );
@@ -4136,7 +4009,7 @@ class rdma_control_plane extends uvm_object;
         if (!has_hardware_pending)
           break;
         if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "unknown hardware state lacks terminal reconciliation"
           );
@@ -4144,7 +4017,7 @@ class rdma_control_plane extends uvm_object;
           break;
         end
         if (pending_hardware_step == RDMA_CTRL_STEP_HW_KEY_ALLOCATED) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "KEY_ALLOC ambiguity requires its original terminal result"
           );
@@ -4184,25 +4057,25 @@ class rdma_control_plane extends uvm_object;
         case (pending_hardware_step)
           RDMA_CTRL_STEP_HW_OCC_FLUSHED: begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            complete_recovery_step(recovery, pending_hardware_step);
-            queue_recovery_step(
+            rdma_recovery_complete_step(recovery, pending_hardware_step);
+            rdma_recovery_queue_step(
               recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
             );
           end
           RDMA_CTRL_STEP_HW_MR_DEREGISTERED: begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            complete_recovery_step(recovery, pending_hardware_step);
+            rdma_recovery_complete_step(recovery, pending_hardware_step);
             if (creation_origin)
-              queue_recovery_step(
+              rdma_recovery_queue_step(
                 recovery, RDMA_CTRL_STEP_BACKING_RELEASED
               );
             else
-              queue_recovery_step(recovery, RDMA_CTRL_STEP_HW_DRAINED);
+              rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_DRAINED);
           end
           RDMA_CTRL_STEP_HW_DRAINED: begin
             recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            complete_recovery_step(recovery, pending_hardware_step);
-            queue_recovery_step(
+            rdma_recovery_complete_step(recovery, pending_hardware_step);
+            rdma_recovery_queue_step(
               recovery, RDMA_CTRL_STEP_BACKING_RELEASED
             );
           end
@@ -4211,7 +4084,7 @@ class rdma_control_plane extends uvm_object;
         endcase
         persist_status = persist_recovery_record(resource_h, recovery);
         if (!persist_status.ok()) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "hardware recovery progress could not be persisted"
           );
@@ -4227,7 +4100,7 @@ class rdma_control_plane extends uvm_object;
       );
       if (has_hardware_pending ||
           recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
-        publish_recovery_required(
+        rdma_recovery_publish_required(
           recovery, result,
           "hardware absence is not yet proven"
         );
@@ -4235,16 +4108,16 @@ class rdma_control_plane extends uvm_object;
         break;
       end
 
-      if (!recovery_step_pending(
+      if (!rdma_recovery_step_pending(
             recovery, RDMA_CTRL_STEP_BACKING_RELEASED) &&
-          !recovery_step_completed(
+          !rdma_recovery_step_completed(
             recovery, RDMA_CTRL_STEP_BACKING_RELEASED) &&
-          !recovery_step_pending(
+          !rdma_recovery_step_pending(
             recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
-        queue_recovery_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
         persist_status = persist_recovery_record(resource_h, recovery);
         if (!persist_status.ok()) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "local recovery plan could not be persisted"
           );
@@ -4253,7 +4126,7 @@ class rdma_control_plane extends uvm_object;
         end
       end
 
-      if (recovery_step_pending(
+      if (rdma_recovery_step_pending(
             recovery, RDMA_CTRL_STEP_BACKING_RELEASED)) begin
         for (int i = int'(recovery.hmc_refs.size()) - 1; i >= 0; i--) begin
           if (recovery.hmc_refs[i] == null) begin
@@ -4309,7 +4182,7 @@ class rdma_control_plane extends uvm_object;
           recovery.hmc_refs[i].release_complete = 1'b1;
           persist_status = persist_recovery_record(resource_h, recovery);
           if (!persist_status.ok()) begin
-            publish_recovery_required(
+            rdma_recovery_publish_required(
               recovery, result,
               "HMC cleanup progress could not be persisted"
             );
@@ -4391,7 +4264,7 @@ class rdma_control_plane extends uvm_object;
           recovery.backing_refs[i].release_complete = 1'b1;
           persist_status = persist_recovery_record(resource_h, recovery);
           if (!persist_status.ok()) begin
-            publish_recovery_required(
+            rdma_recovery_publish_required(
               recovery, result,
               "backing cleanup progress could not be persisted"
             );
@@ -4402,13 +4275,13 @@ class rdma_control_plane extends uvm_object;
         if (result_finalized)
           break;
 
-        complete_recovery_step(
+        rdma_recovery_complete_step(
           recovery, RDMA_CTRL_STEP_BACKING_RELEASED
         );
-        queue_recovery_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
         persist_status = persist_recovery_record(resource_h, recovery);
         if (!persist_status.ok()) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "backing cleanup completion could not be persisted"
           );
@@ -4418,7 +4291,7 @@ class rdma_control_plane extends uvm_object;
       end
 
       if (recovery.pending_steps.size() != 0 &&
-          !recovery_step_pending(
+          !rdma_recovery_step_pending(
             recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
         retain_recovery_failure(
           resource_h, recovery,
@@ -4429,17 +4302,17 @@ class rdma_control_plane extends uvm_object;
         break;
       end
 
-      if (!recovery_step_completed(
+      if (!rdma_recovery_step_completed(
             recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
-        queue_recovery_step(
+        rdma_recovery_queue_step(
           recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
         );
-        complete_recovery_step(
+        rdma_recovery_complete_step(
           recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
         );
         persist_status = persist_recovery_record(resource_h, recovery);
         if (!persist_status.ok()) begin
-          publish_recovery_required(
+          rdma_recovery_publish_required(
             recovery, result,
             "resource-release progress could not be persisted"
           );
@@ -4448,7 +4321,7 @@ class rdma_control_plane extends uvm_object;
         end
       end
       if (recovery.pending_steps.size() != 0) begin
-        publish_recovery_required(
+        rdma_recovery_publish_required(
           recovery, result,
           "resource still has pending recovery work"
         );
@@ -4460,10 +4333,10 @@ class rdma_control_plane extends uvm_object;
         status, "recovered ERROR final release returned null"
       );
       if (!status.ok()) begin
-        remove_recovery_completed_step(
+        rdma_recovery_remove_completed(
           recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
         );
-        queue_recovery_step(
+        rdma_recovery_queue_step(
           recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
         );
         retain_recovery_failure(
@@ -4474,7 +4347,7 @@ class rdma_control_plane extends uvm_object;
         break;
       end
 
-      project_recovery_result_history(recovery, result);
+      rdma_recovery_project_history(recovery, result);
       result.status = rdma_status::success();
       result.final_resource_state = RDMA_RESOURCE_RELEASED;
       result.final_resource_state_known = 1'b1;
