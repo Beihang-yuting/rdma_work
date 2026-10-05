@@ -1576,10 +1576,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
       `uvm_error("CMQ_DOORBELL_COUNT", "doorbell count is not 64")
   endtask
 
-  // 功能：check_cqc_embed_blocker 读取 CQC C-oracle field 与 capability 行，确认
-  //   payload target base=8 且 request 仍显式阻塞。
-  // 输入/输出及副作用：无参数；只读两个 TSV，并检查当前 mutation rows 中没有 CQC case，不执行或平移错误 composer。
-  // 失败/边界：文件缺失、字段/能力行不唯一、request_encodable 非零、blocker 改名或出现 CQC mutation 时报告错误。
+  // 功能：check_cqc_embed_blocker 读取 CQC C-oracle field 与 capability 行，确认 payload target base=8，
+  //   且 CQC_CREATE request 已由驱动 golden（cmq_requests_dedicated.hex 的 cqc_create）闭环。
+  // 输入/输出及副作用：无参数；只读两个 TSV，并检查当前 mutation rows 中没有 CQC case。
+  // 失败/边界：文件缺失、字段/能力行不唯一、request 未闭环或出现 CQC mutation 时报告错误。
   task automatic check_cqc_embed_blocker();
     int fields_fd;
     int capabilities_fd;
@@ -1643,10 +1643,10 @@ class rdma_cmq_driver_field_mutation_test extends uvm_test;
       if (matched == 10 && opcode == "CQC_CREATE" &&
           direction == "REQUEST") begin
         capability_matches++;
-        if (request_encodable != "0" ||
-            blocker != "CONTEXT_EMBED_BASE_MISMATCH")
+        if (request_encodable != "1" || blocker != "-" ||
+            oracle_case_id != "cqc_create")
           `uvm_error("CMQ_CQC_BLOCKER",
-                     "CQC_CREATE request blocker was incorrectly enabled")
+                     "CQC_CREATE request is not closed by the driver golden")
       end
     end
     $fclose(capabilities_fd);

@@ -1,0 +1,355 @@
+# xtr_v1-golden-v1
+# case: qpc_create_response
+# inputs: opcode=0x00,index=0x01,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 21 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_modify_response
+# inputs: opcode=0x01,index=0x02,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 02 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_delete_response
+# inputs: opcode=0x02,index=0x03,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 23 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_query_response
+# inputs: opcode=0x03,index=0x04,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 04 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: key_alloc_response
+# inputs: opcode=0x04,index=0x05,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 25 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: mr_register_response
+# inputs: opcode=0x05,index=0x06,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 06 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: mr_deregister_response
+# inputs: opcode=0x06,index=0x07,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 27 06 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: mw_alloc_response
+# inputs: opcode=0x07,index=0x08,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 08 07 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: mw_dealloc_response
+# inputs: opcode=0x08,index=0x09,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 29 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: key_query_response
+# inputs: opcode=0x09,index=0x0a,wrap=0x0,extractor=xtrdma_sc_mrt_query_cqe_info,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0xffffffffffffffff,consumed3=0xffffffffffffffff,consumed4=0xffffffffffffffff,consumed5=0xffffffffffffffff,consumed6=0xffffffffffffffff,consumed7=0xffffffffffffffff,overread=0x10
+# bytes: 64
+80 00 0a 09 00 00 00 00 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+
+# case: occ_flush_response
+# inputs: opcode=0x0a,index=0x0b,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 2b 0a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: cqc_resize_response
+# inputs: opcode=0x0b,index=0x0c,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 0c 0b 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: cqc_create_response
+# inputs: opcode=0x0c,index=0x0d,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 2d 0c 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: cqc_modify_response
+# inputs: opcode=0x0d,index=0x0e,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 0e 0d 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: cqc_delete_response
+# inputs: opcode=0x0e,index=0x0f,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 2f 0e 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: cqc_query_response
+# inputs: opcode=0x0f,index=0x10,wrap=0x0,extractor=xtrdma_sc_cqc_query_cqe_info,consumed0=0x80003fffff000000,consumed1=0xffffffffffffffff,consumed2=0xffffffffffffffff,consumed3=0xffffffffffffffff,consumed4=0xffffffffffffffff,consumed5=0xffffffffffffffff,consumed6=0xffffffffffffffff,consumed7=0xffffffffffffffff,overread=0x8
+# bytes: 64
+80 00 10 0f 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+
+# case: ceqc_create_response
+# inputs: opcode=0x10,index=0x11,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 31 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ceqc_modify_response
+# inputs: opcode=0x11,index=0x12,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 12 11 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ceqc_delete_response
+# inputs: opcode=0x12,index=0x13,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 33 12 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ceqc_query_response
+# inputs: opcode=0x13,index=0x14,wrap=0x0,extractor=xtrdma_sc_eq_ctx_query_cqe_info,consumed0=0x80003fffff000fff,consumed1=0x0,consumed2=0xffffffffffffffff,consumed3=0xffffffffffffffff,consumed4=0xffffffffffffffff,consumed5=0xffffffffffffffff,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 14 13 00 00 0f ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: aeqc_create_response
+# inputs: opcode=0x14,index=0x15,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 35 14 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: aeqc_modify_response
+# inputs: opcode=0x15,index=0x16,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 16 15 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: aeqc_delete_response
+# inputs: opcode=0x16,index=0x17,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 37 16 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: aeqc_query_response
+# inputs: opcode=0x17,index=0x18,wrap=0x0,extractor=xtrdma_sc_eq_ctx_query_cqe_info,consumed0=0x80003fffff000fff,consumed1=0x0,consumed2=0xffffffffffffffff,consumed3=0xffffffffffffffff,consumed4=0xffffffffffffffff,consumed5=0xffffffffffffffff,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 18 17 00 00 0f ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: sd_update_response
+# inputs: opcode=0x18,index=0x19,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 39 18 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: sd_query_response
+# inputs: opcode=0x19,index=0x1a,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 1a 19 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qp_flush_response
+# inputs: opcode=0x1a,index=0x1b,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 3b 1a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: src_addr_update_response
+# inputs: opcode=0x1b,index=0x1c,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 1c 1b 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: src_addr_query_response
+# inputs: opcode=0x1c,index=0x1d,wrap=0x1,extractor=xtrdma_sc_src_addr_query_cqe_info,consumed0=0x80003fffff000000,consumed1=0xfff0ffffffffffff,consumed2=0xffffffffffffffff,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 3d 1c 00 00 00 00 ff f0 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: stat_query_response
+# inputs: opcode=0x1d,index=0x1e,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 1e 1d 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_force_delete_response
+# inputs: opcode=0x1e,index=0x1f,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 3f 1e 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: cqc_force_delete_response
+# inputs: opcode=0x1f,index=0x00,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 00 1f 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: tq_flush_response
+# inputs: opcode=0x20,index=0x01,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 21 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_qpc_response
+# inputs: opcode=0x21,index=0x02,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff c2 21 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_cqc_response
+# inputs: opcode=0x22,index=0x03,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff e3 22 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_mrt_response
+# inputs: opcode=0x23,index=0x04,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff c4 23 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_pble_response
+# inputs: opcode=0x24,index=0x05,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff e5 24 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_sqrqe_response
+# inputs: opcode=0x25,index=0x06,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff c6 25 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_sgb_response
+# inputs: opcode=0x26,index=0x07,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff e7 26 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_irqe_response
+# inputs: opcode=0x27,index=0x08,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff c8 27 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_eirqe_response
+# inputs: opcode=0x28,index=0x09,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff e9 28 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_orqe_response
+# inputs: opcode=0x29,index=0x0a,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff ca 29 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_uaqe_response
+# inputs: opcode=0x2a,index=0x0b,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff eb 2a 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_qpc_response
+# inputs: opcode=0x2b,index=0x0c,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff cc 2b 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_cqc_response
+# inputs: opcode=0x2c,index=0x0d,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff ed 2c 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_mrt_response
+# inputs: opcode=0x2d,index=0x0e,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff ce 2d 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_pble_response
+# inputs: opcode=0x2e,index=0x0f,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff ef 2e 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_sqrqe_response
+# inputs: opcode=0x2f,index=0x10,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff d0 2f 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_sgb_response
+# inputs: opcode=0x30,index=0x11,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff f1 30 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_irqe_response
+# inputs: opcode=0x31,index=0x12,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff d2 31 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_eirqe_response
+# inputs: opcode=0x32,index=0x13,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff f3 32 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_orqe_response
+# inputs: opcode=0x33,index=0x14,wrap=0x0,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff d4 33 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: idx_occ_uaqe_response
+# inputs: opcode=0x34,index=0x15,wrap=0x1,extractor=xtrdma_sc_occ_search_cqe_info,consumed0=0x83ffffffffff0fff,consumed1=0xffffffffff,consumed2=0x0,consumed3=0xffffffffffffffff,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+83 ff f5 34 00 ff 0f ff 00 00 00 ff ff ff ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: srfqc_create_response
+# inputs: opcode=0x35,index=0x16,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 16 35 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: srfqc_modify_response
+# inputs: opcode=0x36,index=0x17,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 37 36 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: srfqc_delete_response
+# inputs: opcode=0x37,index=0x18,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 18 37 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: srfqc_query_response
+# inputs: opcode=0x38,index=0x19,wrap=0x1,extractor=xtrdma_sc_srfq_ctx_query_cqe_info,consumed0=0x80003fffff00ffff,consumed1=0x0,consumed2=0xffffffffffffffff,consumed3=0xffffffffffffffff,consumed4=0xffffffffffffffff,consumed5=0xffffffffffffffff,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 39 38 00 00 ff ff 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ifa_update_response
+# inputs: opcode=0x39,index=0x1a,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 1a 39 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ifa_query_response
+# inputs: opcode=0x3a,index=0x1b,wrap=0x1,extractor=xtrdma_sc_ifa_query_cqe_info,consumed0=0xb0003fffff000000,consumed1=0x7ffffffffffffff,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+b0 00 3b 3a 00 00 00 00 07 ff ff ff ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_qpc_kickout_response
+# inputs: opcode=0x3b,index=0x1c,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 1c 3b 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_cqc_kickout_response
+# inputs: opcode=0x3c,index=0x1d,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 3d 3c 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_mrt_kickout_response
+# inputs: opcode=0x3d,index=0x1e,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 1e 3d 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_pble_kickout_response
+# inputs: opcode=0x3e,index=0x1f,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 3f 3e 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_sqrqe_kickout_response
+# inputs: opcode=0x3f,index=0x00,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 00 3f 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_sgb_kickout_response
+# inputs: opcode=0x40,index=0x01,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 21 40 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_irqe_kickout_response
+# inputs: opcode=0x41,index=0x02,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 02 41 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_eirqe_kickout_response
+# inputs: opcode=0x42,index=0x03,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 23 42 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_orqe_kickout_response
+# inputs: opcode=0x43,index=0x04,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 04 43 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_uaqe_kickout_response
+# inputs: opcode=0x44,index=0x05,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 25 44 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_pd_kickout_response
+# inputs: opcode=0x48,index=0x06,wrap=0x0,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 06 48 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: nop_response
+# inputs: opcode=0x45,index=0x07,wrap=0x1,extractor=none,consumed0=0x80003fffff000000,consumed1=0x0,consumed2=0x0,consumed3=0x0,consumed4=0x0,consumed5=0x0,consumed6=0x0,consumed7=0x0,overread=0x0
+# bytes: 64
+80 00 27 45 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

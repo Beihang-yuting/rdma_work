@@ -202,7 +202,7 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
     return value;
   endfunction
 
-  // 完成接收须独立于可注入的 request registry；这里只接受已定义公共 CQE 头或返回 payload 语义的 0.1.34 opcode。
+  // 完成接收须独立于可注入的 request registry；支持集合与驱动 xtrdma_exec_cmq_cq_cmd 的分派一致。
   // 功能：判断 completion codec 是否拥有指定 opcode 的解码契约。
   // 输入/输出及副作用：opcode 为输入；只读固定支持集合，返回 bit。
   // 失败/边界：未知 opcode 或仅有 request body 而无 CQE payload 定义的命令返回 0。
@@ -226,8 +226,7 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
       RDMA_OP_SRFQC_QUERY,
       RDMA_OP_SRC_ADDR_QUERY,
       RDMA_OP_IFA_QUERY,
-      RDMA_OP_OCC_PD_SEARCH,
-      RDMA_OP_OCC_PD_IDX_SEARCH,
+      RDMA_OP_QP_FLUSH,
       RDMA_OP_OCC_QPC, RDMA_OP_OCC_CQC, RDMA_OP_OCC_MRT,
       RDMA_OP_OCC_PBLE, RDMA_OP_OCC_SQRQE, RDMA_OP_OCC_SGB,
       RDMA_OP_OCC_IRQE, RDMA_OP_OCC_EIRQE, RDMA_OP_OCC_ORQE,
@@ -3185,6 +3184,8 @@ class rdma_hw_cmq_request_composer extends uvm_object;
     bit [63:0] envelope_word;
     bit [63:0] body_word;
     bit [63:0] merged_word;
+    bit [63:0] sd_sign_word;
+    bit sd_signed;
     bit needs_signature;
     byte unsigned signature;
     int unsigned signature_byte;
@@ -3274,25 +3275,23 @@ class rdma_hw_cmq_request_composer extends uvm_object;
       for (int unsigned i = 0; i < 8; i++)
         candidate.bytes.push_back(merged_word[63 - (i * 8) -: 8]);
     end
-    if (needs_signature) begin
+    sd_sign_word = image_word(candidate, 1);
+    sd_signed = envelope_snapshot.opcode == RDMA_OP_SD_UPDATE &&
+                sd_sign_word[RDMA_CMQ_SIGN_EN_LSB];
+    if (needs_signature || sd_signed) begin
       signature_byte = RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET +
                        (7 - (RDMA_CMQ_SIGNATURE_LSB >> 3));
-      if (candidate.bytes[signature_byte] != 0)
+      if (!sd_signed && candidate.bytes[signature_byte] != 0)
         return codec_error("CMQ unsigned signature field is not zero");
-      signature = 8'h00;
-      foreach (candidate.bytes[i]) signature ^= candidate.bytes[i];
-      foreach (qpc_signature_source.bytes[i])
-        signature ^= qpc_signature_source.bytes[i];
-      candidate.bytes[signature_byte] = ~signature;
-    end
-    merged_word = image_word(candidate, 1);
-    if (envelope_snapshot.opcode == RDMA_OP_SD_UPDATE &&
-        merged_word[RDMA_CMQ_SIGN_EN_LSB]) begin
       // 驱动 update_sd 的签名覆盖整条 WQE；field codec 已给出不含信封的部分签名。
-      signature_byte = RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET +
-                       (7 - (RDMA_CMQ_SIGNATURE_LSB >> 3));
-      foreach (envelope_image.bytes[i])
-        candidate.bytes[signature_byte] ^= envelope_image.bytes[i];
+      signature = sd_signed ? ~candidate.bytes[signature_byte] : 8'h00;
+      if (!sd_signed) begin
+        foreach (candidate.bytes[i]) signature ^= candidate.bytes[i];
+        foreach (qpc_signature_source.bytes[i])
+          signature ^= qpc_signature_source.bytes[i];
+      end else
+        foreach (envelope_image.bytes[i]) signature ^= envelope_image.bytes[i];
+      candidate.bytes[signature_byte] = ~signature;
     end
 
     for (int unsigned q = 0; q < 8; q++) begin

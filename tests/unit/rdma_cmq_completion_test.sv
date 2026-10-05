@@ -463,9 +463,10 @@ class rdma_cmq_completion_test extends uvm_test;
       8'h00, 8'h01, 8'h02, 8'h03, 8'h04, 8'h05, 8'h06,
       8'h0a, 8'h0c, 8'h0e, 8'h0f, 8'h10, 8'h12, 8'h13,
       8'h14, 8'h16, 8'h17, 8'h20, 8'h35, 8'h37, 8'h38,
-      8'h09, 8'h07
+      8'h09, 8'h07, 8'h1a
     };
-    bit [7:0] unsupported[$] = '{8'h1a, 8'hfe};
+    // 驱动 CQ 分派（xtrdma_exec_cmq_cq_cmd）不处理 OCC_PD_SEARCH/IDX_SEARCH（0x46/0x47）。
+    bit [7:0] unsupported[$] = '{8'h46, 8'h47, 8'hfe};
     rdma_hw_image image;
     int unsigned first_byte;
     int unsigned byte_count;

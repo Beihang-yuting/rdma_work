@@ -43,11 +43,6 @@ EXCLUSION_HEADER = (
     "archive_id\tsource_path\tsource_selector\tsource_sha256\tmacro_name\t"
     "exclusion_reason"
 )
-CAPABILITY_HEADER = (
-    "driver_symbol\topcode\topcode_value\tdirection\tregistered\t"
-    "request_encodable\tresponse_decodable\toracle_case_id\towning_codec\t"
-    "blocker"
-)
 MUTATION_HEADER = (
     "case_id\tentry\topcode\tdirection\tbyte_offset\tqword_index\tbit_index\t"
     "expected_class\texpected_field\tevidence_mode\tcorrelation_group\t"
@@ -57,7 +52,6 @@ MUTATION_HEADER = (
 
 OWNERSHIP_COLUMNS = tuple(OWNERSHIP_HEADER.split("\t"))
 EXCLUSION_COLUMNS = tuple(EXCLUSION_HEADER.split("\t"))
-CAPABILITY_COLUMNS = tuple(CAPABILITY_HEADER.split("\t"))
 MUTATION_COLUMNS = tuple(MUTATION_HEADER.split("\t"))
 
 OWNERSHIP_VALUES = {
@@ -744,16 +738,6 @@ def load_exclusions(path: Path) -> list[dict[str, str]]:
     return rows
 
 
-def load_capabilities(path: Path) -> list[dict[str, str]]:
-    """功能：加载 CMQ capability 候选表并返回精确 driver symbol 行。
-    输入输出及副作用：返回逐行字典；不按 XTRDMA 前缀筛选或改写 typo。
-    失败边界：缺表、错误表头/列数或空值均抛 ContractError。"""
-    rows = _load_table(path, CAPABILITY_HEADER, CAPABILITY_COLUMNS)
-    if not rows:
-        raise ContractError(f"{path}: capability table is empty")
-    return rows
-
-
 def load_mutations(path: Path) -> list[dict[str, str]]:
     """功能：加载逐 bit CMQ mutation evidence 报告。
     输入输出及副作用：返回逐行字典；不推导坐标、不生成缺失行。
@@ -1060,188 +1044,6 @@ def validate_oracle_case_references(
         case_id = row.get("oracle_case_id", "")
         if case_id != "-" and case_id not in known:
             raise ContractError(f"missing oracle case: {case_id}")
-
-
-def _opcode_name(symbol: str) -> str:
-    """功能：把驱动 enum symbol 映射为 capability 表中的短 opcode 名。
-    输入输出及副作用：返回去掉 XTRDMA_OP_/TRDMA_OP_ 前缀的名称，不改写 typo 本体。
-    失败边界：非驱动 opcode symbol 返回原字符串，调用方仍须校验 enum 成员身份。"""
-    for prefix in ("XTRDMA_OP_", "TRDMA_OP_"):
-        if symbol.startswith(prefix):
-            return symbol[len(prefix):]
-    return symbol
-
-
-def _as_flag(value: str, label: str) -> int:
-    """功能：解析 capability/mutation 中的二值标志。
-    输入输出及副作用：返回 0 或 1；只读字符串。
-    失败边界：任何非 0/1 文本、空值或额外位均抛 ContractError。"""
-    if value not in {"0", "1"}:
-        raise ContractError(f"{label} must be 0 or 1")
-    return int(value)
-
-
-def validate_capability_rows(
-    rows: Sequence[Mapping[str, str]],
-    enum_members: Sequence[tuple[str, int]] | None = None,
-    *,
-    proven_cases: Iterable[str] | None = None,
-    mutation_rows: Sequence[Mapping[str, str]] | None = None,
-    expected_mutations: Sequence[Mapping[str, str]] | None = None,
-) -> list[Mapping[str, str]]:
-    """功能：校验 enum capability 的完整双向记录、生产证据闭合和阻断原因。
-    输入输出及副作用：返回 rows 的独立列表；可选 mutation_rows 与
-    expected_mutations 用于把已启用方向绑定到 C-derived candidate，不注册 opcode。
-    失败边界：缺失/重复成员、MAX 被执行、拼写过滤、未闭合方向置位、synthetic
-    doorbell 缺失或 blocker 漂移均拒绝；仅传 ``proven_cases`` 只适合已由调用方
-    完成 source-walk 的内部闭合步骤，正式 verify 必须同时传两份 mutation report。"""
-    if not rows:
-        raise ContractError("capability table has no rows")
-
-    # Build the proof set before inspecting capability rows.  A caller that
-    # supplies both reports must prove byte-for-byte equality against the
-    # C-derived candidate; otherwise a hand-edited mutation table could turn
-    # an unsupported direction into an apparently supported one.
-    proof_cases = set(proven_cases or ())
-    unknown_proofs = proof_cases - PROVEN_CAPABILITY_CASES
-    if unknown_proofs:
-        raise ContractError(
-            f"unknown proven capability cases: {sorted(unknown_proofs)}"
-        )
-    if mutation_rows is not None:
-        validate_mutation_report(mutation_rows)
-        if expected_mutations is not None:
-            compare_mutation_report(mutation_rows, expected_mutations)
-            proof_cases.update(PROVEN_CAPABILITY_CASES)
-        else:
-            # Without the generated candidate, only complete per-case counts
-            # can be checked here.  The full verify path always supplies the
-            # candidate, while direct users still receive a conservative
-            # fail-closed result for malformed/incomplete reports.
-            case_counts = Counter(row["case_id"] for row in mutation_rows)
-            for case_id in PROVEN_CAPABILITY_CASES:
-                expected_count = int(CASE_LAYOUTS[case_id]["length"]) * 8
-                if case_counts.get(case_id, 0) == expected_count:
-                    proof_cases.add(case_id)
-
-    members = list(enum_members or [])
-    executable = [(symbol, value) for symbol, value in members
-                  if symbol != "XTRDMA_OP_MAX"]
-    expected_keys = {
-        (symbol, direction)
-        for symbol, _ in executable
-        for direction in VALID_DIRECTIONS
-    }
-    seen: set[tuple[str, str]] = set()
-    synthetic_seen = False
-    for row in rows:
-        missing = [column for column in CAPABILITY_COLUMNS if column not in row]
-        if missing:
-            raise ContractError(f"capability row missing columns: {missing}")
-        direction = row["direction"]
-        if direction not in VALID_DIRECTIONS:
-            raise ContractError(f"invalid capability direction {direction}")
-        _as_flag(row["registered"], "registered")
-        request = _as_flag(row["request_encodable"], "request_encodable")
-        response = _as_flag(row["response_decodable"], "response_decodable")
-        symbol = row["driver_symbol"]
-        if symbol == "-":
-            if row["opcode"] != "CMQ_SQ_DOORBELL" or row["opcode_value"] != "-":
-                raise ContractError("synthetic capability has invalid driver columns")
-            key = ("CMQ_SQ_DOORBELL", direction)
-            if key in seen:
-                raise ContractError("duplicate synthetic capability")
-            seen.add(key)
-            if direction != "REQUEST" or row["registered"] != "1":
-                raise ContractError("CMQ doorbell capability must be registered request")
-            case_id = "cmq_sq_doorbell"
-            if case_id in proof_cases:
-                if request != 1 or response != 0 or row["blocker"] != "-":
-                    raise ContractError(
-                        "closed CMQ doorbell capability flags or blocker drift"
-                    )
-            elif request or response:
-                raise ContractError(
-                    "CMQ doorbell capability lacks closed production evidence"
-                )
-            if row["oracle_case_id"] != "cmq_sq_doorbell":
-                raise ContractError("CMQ doorbell oracle case drift")
-            if row["owning_codec"] != "rdma_hw_cmq_hw_profile":
-                raise ContractError("CMQ doorbell owning codec drift")
-            expected_blocker = (
-                "-" if case_id in proof_cases
-                else "MISSING_PRODUCTION_PATH_EVIDENCE"
-            )
-            if row["blocker"] != expected_blocker:
-                raise ContractError("CMQ doorbell blocker drift")
-            synthetic_seen = True
-            continue
-        member = next((item for item in executable if item[0] == symbol), None)
-        if member is None:
-            raise ContractError(f"capability symbol is not an enum member: {symbol}")
-        key = (symbol, direction)
-        if key in seen:
-            raise ContractError(f"duplicate capability row: {symbol}/{direction}")
-        seen.add(key)
-        expected_name = _opcode_name(symbol)
-        if row["opcode"] != expected_name:
-            raise ContractError(f"capability opcode spelling drift: {symbol}")
-        if _parse_int(row["opcode_value"], "opcode value") != member[1]:
-            raise ContractError(f"capability opcode value drift: {symbol}")
-        if row["registered"] != "1":
-            raise ContractError(f"registered enum member marked unregistered: {symbol}")
-        expected_case = "-"
-        if symbol == "XTRDMA_OP_QPC_CREATE" and direction == "REQUEST":
-            expected_case = "cmq_sqe_qpc_create_request"
-        elif symbol == "XTRDMA_OP_QPC_CREATE" and direction == "RESPONSE":
-            expected_case = "cmq_cqe_qpc_create_response"
-        elif symbol == "XTRDMA_OP_CQC_CREATE" and direction == "REQUEST":
-            expected_case = "cmq_sqe_cqc_create_request"
-        if row["oracle_case_id"] != expected_case:
-            raise ContractError(f"capability oracle case drift: {symbol}/{direction}")
-        if symbol == "XTRDMA_OP_CQC_CREATE" and direction == "REQUEST":
-            expected_blocker = "CONTEXT_EMBED_BASE_MISMATCH"
-        elif symbol == "XTRDMA_OP_QPC_CREATE" and direction in VALID_DIRECTIONS:
-            expected_blocker = "MISSING_PRODUCTION_PATH_EVIDENCE"
-        else:
-            expected_blocker = "MISSING_CLOSED_EVIDENCE"
-
-        case_id = CAPABILITY_CASE_BY_KEY.get((symbol, direction))
-        if case_id in proof_cases:
-            if case_id is None:
-                raise ContractError(
-                    f"proof case has no capability mapping: {symbol}/{direction}"
-                )
-            expected_request = int(
-                symbol == "XTRDMA_OP_QPC_CREATE" and direction == "REQUEST"
-            )
-            expected_response = int(
-                symbol == "XTRDMA_OP_QPC_CREATE" and direction == "RESPONSE"
-            )
-            if (request, response) != (expected_request, expected_response):
-                raise ContractError(
-                    f"closed capability flags drift: {symbol}/{direction}"
-                )
-            expected_blocker = "-"
-        elif request or response:
-            raise ContractError(
-                f"capability enables unproven production path: {symbol}/{direction}"
-            )
-        if row["blocker"] != expected_blocker:
-            raise ContractError(f"capability blocker drift: {symbol}/{direction}")
-        codec = row["owning_codec"]
-        if not codec or codec == "-":
-            raise ContractError(f"capability owning codec missing: {symbol}/{direction}")
-    if enum_members:
-        synthetic = {("CMQ_SQ_DOORBELL", "REQUEST")}
-        expected_with_synthetic = expected_keys | synthetic
-        if seen != expected_with_synthetic or not synthetic_seen:
-            missing = expected_with_synthetic - seen
-            extra = seen - expected_with_synthetic
-            raise ContractError(
-                f"capability coverage mismatch: missing={missing} extra={extra}"
-            )
-    return list(rows)
 
 
 def cqe_driver_result(
@@ -2064,12 +1866,16 @@ def parse_supported_opcode_values(
         body = _sv_function_body(joined, "supported_opcode")
     except ContractError as exc:
         raise ContractError(f"completion supported_opcode source is invalid: {exc}") from exc
+    # 表驱动 opcode 经 rdma_cmq_request_field_specs 的 case 标签进入支持集合。
+    if "rdma_cmq_request_field_specs(" in body:
+        body += _sv_function_body(joined, "rdma_cmq_request_field_specs")
     by_symbol = {symbol: value for symbol, value in enum_members}
     values: set[int] = set()
     for token in SUPPORTED_OPCODE_NAME_RE.findall(body):
         candidates = [token]
         if token.startswith("RDMA_OP_"):
             candidates.append("XTRDMA_" + token[len("RDMA_"):])
+            candidates.append("TRDMA_" + token[len("RDMA_"):])
         if token.startswith("TRDMA_OP_"):
             candidates.append("XTRDMA_" + token[len("TRDMA_"):])
         symbol = next((candidate for candidate in candidates if candidate in by_symbol), None)
@@ -4207,85 +4013,6 @@ def _compare_rows(
                 )
 
 
-def build_expected_capabilities(
-    enum_members: Sequence[tuple[str, int]],
-    proven_cases: Iterable[str] | None = None,
-) -> list[dict[str, str]]:
-    """功能：为每个 executable enum 成员生成 REQUEST/RESPONSE 候选及 doorbell 行。
-    输入输出及副作用：返回新列表；保留 driver symbol/value，并只为已闭合
-    ``proven_cases`` 设置 capability 位，不注册或启用未证明 production path。
-    失败边界：MAX 只作为边界排除；未知 proven case、重复 enum 或方向映射漂移由
-    调用方拒绝。"""
-    proven = set(proven_cases or ())
-    unknown = proven - PROVEN_CAPABILITY_CASES
-    if unknown:
-        raise ContractError(
-            f"unknown proven capability cases: {sorted(unknown)}"
-        )
-    rows: list[dict[str, str]] = []
-    for symbol, value in enum_members:
-        if symbol == "XTRDMA_OP_MAX":
-            continue
-        for direction in ("REQUEST", "RESPONSE"):
-            case_id = "-"
-            if symbol == "XTRDMA_OP_QPC_CREATE" and direction == "REQUEST":
-                case_id = "cmq_sqe_qpc_create_request"
-            elif symbol == "XTRDMA_OP_QPC_CREATE" and direction == "RESPONSE":
-                case_id = "cmq_cqe_qpc_create_response"
-            elif symbol == "XTRDMA_OP_CQC_CREATE" and direction == "REQUEST":
-                case_id = "cmq_sqe_cqc_create_request"
-            if symbol == "XTRDMA_OP_CQC_CREATE" and direction == "REQUEST":
-                blocker = "CONTEXT_EMBED_BASE_MISMATCH"
-            elif symbol == "XTRDMA_OP_QPC_CREATE":
-                blocker = "MISSING_PRODUCTION_PATH_EVIDENCE"
-            else:
-                blocker = "MISSING_CLOSED_EVIDENCE"
-            codec = (
-                "rdma_hw_cmq_request_composer"
-                if direction == "REQUEST"
-                else "rdma_hw_cmq_completion_codec"
-            )
-            case_proven = case_id in proven
-            request_encodable = int(
-                case_proven and symbol == "XTRDMA_OP_QPC_CREATE"
-                and direction == "REQUEST"
-            )
-            response_decodable = int(
-                case_proven and symbol == "XTRDMA_OP_QPC_CREATE"
-                and direction == "RESPONSE"
-            )
-            if case_proven:
-                blocker = "-"
-            rows.append({
-                "driver_symbol": symbol,
-                "opcode": _opcode_name(symbol),
-                "opcode_value": f"0x{value:02x}",
-                "direction": direction,
-                "registered": "1",
-                "request_encodable": str(request_encodable),
-                "response_decodable": str(response_decodable),
-                "oracle_case_id": case_id,
-                "owning_codec": codec,
-                "blocker": blocker,
-            })
-    rows.append({
-        "driver_symbol": "-",
-        "opcode": "CMQ_SQ_DOORBELL",
-        "opcode_value": "-",
-        "direction": "REQUEST",
-        "registered": "1",
-        "request_encodable": str(int("cmq_sq_doorbell" in proven)),
-        "response_decodable": "0",
-        "oracle_case_id": "cmq_sq_doorbell",
-        "owning_codec": "rdma_hw_cmq_hw_profile",
-        "blocker": (
-            "-" if "cmq_sq_doorbell" in proven
-            else "MISSING_PRODUCTION_PATH_EVIDENCE"
-        ),
-    })
-    return rows
-
-
 def _load_oracle_contract(
     oracle_root: Path,
     kernel_root: Path,
@@ -4448,7 +4175,6 @@ def verify(args) -> dict[str, int]:
     )
     ownership = load_ownership(Path(args.ownership))
     exclusions = load_exclusions(Path(args.exclusions))
-    capabilities = load_capabilities(Path(args.capabilities))
     mutations = load_mutations(Path(args.mutation_manifest))
     _validate_identity_rows(ownership, records, lock.archive_id)
     _validate_identity_rows(exclusions, records, lock.archive_id)
@@ -4478,7 +4204,7 @@ def verify(args) -> dict[str, int]:
     cmq_header = (kernel_root / "cmq.h").read_text(encoding="utf-8")
     enum_members = parse_opcode_enum(cmq_header)
     validate_oracle_case_references(
-        [*ownership, *capabilities, *mutations],
+        [*ownership, *mutations],
         cases,
     )
     _validate_artifact_field_values(oracle_root)
@@ -4528,23 +4254,6 @@ def verify(args) -> dict[str, int]:
         {row["macro_name"] for row in ownership},
         {row["macro_name"]: row["exclusion_reason"] for row in exclusions},
     )
-    validate_capability_rows(
-        capabilities,
-        enum_members,
-        mutation_rows=mutations,
-        expected_mutations=expected_mutations,
-        proven_cases=proven_cases,
-    )
-    expected_capabilities = build_expected_capabilities(
-        enum_members, proven_cases
-    )
-    _compare_rows(
-        capabilities,
-        expected_capabilities,
-        CAPABILITY_COLUMNS,
-        ("driver_symbol", "opcode", "direction"),
-        "capability",
-    )
     return summary
 
 
@@ -4558,7 +4267,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-manifest", required=True, type=Path)
     parser.add_argument("--ownership", required=True, type=Path)
     parser.add_argument("--exclusions", required=True, type=Path)
-    parser.add_argument("--capabilities", required=True, type=Path)
     parser.add_argument("--oracle-root", required=True, type=Path)
     parser.add_argument("--mutation-manifest", required=True, type=Path)
     parser.add_argument("--sv-root", required=True, type=Path)

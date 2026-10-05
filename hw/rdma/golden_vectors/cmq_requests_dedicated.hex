@@ -1,0 +1,155 @@
+# xtr_v1-golden-v1
+# case: qpc_create
+# inputs: opcode=0x00,index=0x01,polarity=0x1,qpn=0x15555,sq_cqn=0x1cd7d,rq_cqn=0x56cfa,qpc_buffer=0xaee4e1ba1400,qpc_source=qpc_rc_boundary
+# bytes: 64
+80 00 01 00 00 01 55 55 0e 6b e8 01 21 05 6c fa 00 00 00 00 00 00 00 00 00 00 ae e4 e1 ba 14 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_modify_full
+# inputs: opcode=0x01,index=0x02,polarity=0x0,qpn=0x15555,sq_cqn=0x162835,rq_cqn=0x72898,qpc_buffer=0x3abd5f3eba00,modify_mode=0x1,next_state=0x3,wbe_tpl_num=0x0,qpc_source=qpc_rc_boundary
+# bytes: 64
+30 00 22 01 00 01 55 55 b1 41 a8 01 5b 07 28 98 40 00 00 00 00 00 00 00 00 00 3a bd 5f 3e ba 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_modify_state
+# inputs: opcode=0x01,index=0x03,polarity=0x1,qpn=0x15555,sq_cqn=0x1ee37b,rq_cqn=0x19c503,qpc_buffer=0x0,modify_mode=0x0,next_state=0x1,wbe_tpl_num=0x0
+# bytes: 64
+90 00 03 01 00 01 55 55 f7 1b d8 00 00 19 c5 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_modify_partial
+# inputs: opcode=0x01,index=0x04,polarity=0x0,qpn=0x15555,sq_cqn=0x616dd,rq_cqn=0xa26b,qpc_buffer=0x0,modify_mode=0x2,next_state=0x2,wbe_tpl_num=0x0,start_qword0=0x5,wbe0=0x85,data0=0xa0ed9451580c6661,start_qword1=0x14,wbe1=0x95,data1=0x4e2fcc045f6f7945,start_qword2=0x19,wbe2=0x97,data2=0x525f3210a3ad032,start_qword3=0x3e,wbe3=0x3,data3=0x3a45dfb186208538
+# bytes: 64
+20 00 24 01 00 01 55 55 30 b6 e8 00 00 00 a2 6b 85 85 14 95 19 97 3e 03 00 00 00 00 00 00 00 00 a0 ed 94 51 58 0c 66 61 4e 2f cc 04 5f 6f 79 45 05 25 f3 21 0a 3a d0 32 3a 45 df b1 86 20 85 38
+
+# case: qpc_delete
+# inputs: opcode=0x02,index=0x05,polarity=0x1,qpn=0x182227,sq_cqn=0xee73b,rq_cqn=0x5f056
+# bytes: 64
+80 00 05 02 00 18 22 27 77 39 d8 00 00 05 f0 56 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: qpc_query
+# inputs: opcode=0x03,index=0x06,polarity=0x0,qpn=0xaa4b6,qpc_buffer=0xaf665d534400
+# bytes: 64
+00 00 26 03 00 0a a4 b6 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 af 66 5d 53 44 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: key_alloc_pbl0
+# inputs: opcode=0x04,index=0x07,polarity=0x1,stag_index=0x78651f,states=0x2,stag_key=0xe5,pd_idx=0x5943,pld_vf_id=0xa3,pld_vf_en=0x0,right=0x1f,type=0x0,host_pg_size=0x0,pbl_mode=0x0,addr_mode=0x0,invalidate_en=0x1,len=0x1d7281e95b04,odp=0x0,start_va=0x6b7af95897823500,mr_sn=0x63a,payload_pba_0=0x78a9af2aab9ea000
+# bytes: 64
+c0 00 07 04 00 78 65 1f 00 00 00 00 e5 00 00 00 a0 3e a3 59 43 78 65 1f e5 00 1d 72 81 e9 5b 04 6b 7a f9 58 97 82 35 00 78 a9 af 2a ab 9e a0 00 00 00 00 00 00 00 06 3a 00 00 00 00 00 00 00 00
+
+# case: key_alloc_pbl1
+# inputs: opcode=0x04,index=0x08,polarity=0x0,stag_index=0x18575,states=0x2,stag_key=0x37,pd_idx=0xcb0c,pld_vf_id=0x72,pld_vf_en=0x1,right=0x1f,type=0x0,host_pg_size=0x1,pbl_mode=0x1,addr_mode=0x0,invalidate_en=0x0,len=0x3e027062924f,odp=0x0,start_va=0xea6b01eab39f62f2,mr_sn=0xd58,payload_pba_0=0x35d0e6a93b47e000,payload_pba_1=0xee9386bccd349000
+# bytes: 64
+40 00 28 04 00 01 85 75 00 00 00 00 37 00 00 00 85 3f 72 cb 0c 01 85 75 37 00 3e 02 70 62 92 4f ea 6b 01 ea b3 9f 62 f2 35 d0 e6 a9 3b 47 e0 00 ee 93 86 bc cd 34 9d 58 00 00 00 00 00 00 00 00
+
+# case: key_alloc_pbl2
+# inputs: opcode=0x04,index=0x09,polarity=0x1,stag_index=0x718fb7,states=0x2,stag_key=0x29,pd_idx=0xa42,pld_vf_id=0x31,pld_vf_en=0x1,right=0x1f,type=0x2,host_pg_size=0x0,pbl_mode=0x2,addr_mode=0x0,invalidate_en=0x1,len=0x5bd83ccbfab,odp=0x0,start_va=0xacf6b7a55e9b2e34,mr_sn=0x123,first_pbl_idx=0x74bb14a
+# bytes: 64
+c0 00 09 04 00 71 8f b7 00 00 00 00 29 00 00 00 a8 bf 31 0a 42 71 8f b7 29 00 05 bd 83 cc bf ab ac f6 b7 a5 5e 9b 2e 34 74 bb 14 a0 00 00 00 00 00 00 00 00 00 00 01 23 00 00 00 00 00 00 00 00
+
+# case: mr_register_pbl0
+# inputs: opcode=0x05,index=0x0a,polarity=0x0,stag_index=0x72a08c,states=0x2,stag_key=0x51,pd_idx=0xc087,pld_vf_id=0x6a,pld_vf_en=0x1,right=0x1f,type=0x2,host_pg_size=0x1,pbl_mode=0x0,addr_mode=0x1,invalidate_en=0x1,len=0x239ae8ecd955,odp=0x0,start_va=0xd93632951fc4baff,mr_sn=0x65,payload_pba_0=0x8f6bf8c30105f000
+# bytes: 64
+40 00 2a 05 00 72 a0 8c 00 00 00 00 51 00 00 00 b1 bf 6a c0 87 00 00 00 51 00 23 9a e8 ec d9 55 d9 36 32 95 1f c4 ba ff 8f 6b f8 c3 01 05 f0 00 00 00 00 00 00 00 00 65 00 00 00 00 00 00 00 00
+
+# case: mr_register_pbl1
+# inputs: opcode=0x05,index=0x0b,polarity=0x1,stag_index=0x11e882,states=0x2,stag_key=0x6f,pd_idx=0xd63b,pld_vf_id=0xa2,pld_vf_en=0x1,right=0x1f,type=0x0,host_pg_size=0x0,pbl_mode=0x1,addr_mode=0x0,invalidate_en=0x1,len=0x25657630b086,odp=0x1,start_va=0x2c10a46b6716304e,mr_sn=0x7ab,payload_pba_0=0x510f55ec1131d000,payload_pba_1=0xb840afc9316c5000
+# bytes: 64
+c0 00 0b 05 00 11 e8 82 00 00 00 00 6f 00 00 00 a4 3f a2 d6 3b 00 00 00 6f 00 a5 65 76 30 b0 86 2c 10 a4 6b 67 16 30 4e 51 0f 55 ec 11 31 d0 00 b8 40 af c9 31 6c 57 ab 00 00 00 00 00 00 00 00
+
+# case: mr_register_pbl2
+# inputs: opcode=0x05,index=0x0c,polarity=0x0,stag_index=0x3cf33a,states=0x2,stag_key=0x43,pd_idx=0xe70c,pld_vf_id=0x70,pld_vf_en=0x0,right=0x1f,type=0x2,host_pg_size=0x1,pbl_mode=0x2,addr_mode=0x1,invalidate_en=0x0,len=0x2794d24b1404,odp=0x1,start_va=0x7ecd6c752052f9ba,mr_sn=0xc17,first_pbl_idx=0x4f19253
+# bytes: 64
+40 00 2c 05 00 3c f3 3a 00 00 00 00 43 00 00 00 99 be 70 e7 0c 00 00 00 43 00 a7 94 d2 4b 14 04 7e cd 6c 75 20 52 f9 ba 4f 19 25 30 00 00 00 00 00 00 00 00 00 00 0c 17 00 00 00 00 00 00 00 00
+
+# case: mr_deregister
+# inputs: opcode=0x06,index=0x0d,polarity=0x1,stag_index=0x4f0680,stag_key=0x32,states=0x0
+# bytes: 64
+80 00 0d 06 00 4f 06 80 00 00 00 00 32 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_flush_vf
+# inputs: opcode=0x0a,index=0x0e,polarity=0x0,qpc_flag=0x1,cqc_flag=0x1,mrt_flag=0x1,pble_flag=0x1,sqrqe_flag=0x1,sgb_irqe_flag=0x1,eirqe_flag=0x1,orqe_flag=0x1,uaqe_flag=0x1,pd_flag=0x0,flush_qpn=0x0,flush_mr_sn=0x0,flush_pd_pba=0x0,vf_flush=0x1,mr_sn_flush=0x0
+# bytes: 64
+20 00 2e 0a 00 00 00 00 ff 80 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_flush_serial
+# inputs: opcode=0x0a,index=0x0f,polarity=0x1,qpc_flag=0x0,cqc_flag=0x0,mrt_flag=0x0,pble_flag=0x1,sqrqe_flag=0x0,sgb_irqe_flag=0x0,eirqe_flag=0x0,orqe_flag=0x0,uaqe_flag=0x0,pd_flag=0x0,flush_qpn=0x0,flush_mr_sn=0x2,flush_pd_pba=0x0,vf_flush=0x0,mr_sn_flush=0x1
+# bytes: 64
+90 00 0f 0a 00 00 00 00 10 00 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_flush_qpn
+# inputs: opcode=0x0a,index=0x10,polarity=0x0,qpc_flag=0x0,cqc_flag=0x0,mrt_flag=0x0,pble_flag=0x0,sqrqe_flag=0x0,sgb_irqe_flag=0x0,eirqe_flag=0x1,orqe_flag=0x1,uaqe_flag=0x1,pd_flag=0x0,flush_qpn=0x1bbd0e,flush_mr_sn=0x0,flush_pd_pba=0x0,vf_flush=0x0,mr_sn_flush=0x0
+# bytes: 64
+00 00 30 0a 00 1b bd 0e 03 80 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_flush_qpn_pd
+# inputs: opcode=0x0a,index=0x11,polarity=0x1,qpc_flag=0x0,cqc_flag=0x0,mrt_flag=0x0,pble_flag=0x0,sqrqe_flag=0x0,sgb_irqe_flag=0x0,eirqe_flag=0x0,orqe_flag=0x0,uaqe_flag=0x0,pd_flag=0x1,flush_qpn=0x814ac,flush_mr_sn=0x0,flush_pd_pba=0xff1b1969be000,vf_flush=0x0,mr_sn_flush=0x0
+# bytes: 64
+80 00 11 0a 00 08 14 ac 00 40 00 00 00 00 00 00 00 0f f1 b1 96 9b e0 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: occ_flush_pd
+# inputs: opcode=0x0a,index=0x12,polarity=0x0,qpc_flag=0x0,cqc_flag=0x0,mrt_flag=0x0,pble_flag=0x0,sqrqe_flag=0x0,sgb_irqe_flag=0x0,eirqe_flag=0x0,orqe_flag=0x0,uaqe_flag=0x0,pd_flag=0x1,flush_qpn=0x0,flush_mr_sn=0x0,flush_pd_pba=0x1bf0ea6b7a000,vf_flush=0x0,mr_sn_flush=0x0
+# bytes: 64
+00 00 32 0a 00 00 00 00 00 40 00 00 00 00 00 00 00 01 bf 0e a6 b7 a0 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: cqc_create
+# inputs: opcode=0x0c,index=0x13,polarity=0x1,cqn=0x1b24ec,context=cqc_create_body_boundary
+# bytes: 64
+80 00 13 0c 00 1b 24 ec bf 0f ff ff ff ff ff ff ff ff ff ff ff ff f8 ff ff ff ff ff ff f8 c7 01 b0 00 00 00 00 ff ff ff 00 00 00 00 00 00 0f ff ff ff ff ff ff ff ff c0 00 00 00 0b 00 ff ff ff
+
+# case: cqc_delete
+# inputs: opcode=0x0e,index=0x14,polarity=0x0,cqn=0x12d857,context=cqc_create_body_boundary
+# bytes: 64
+00 00 34 0e 00 12 d8 57 bf 0f ff ff ff ff ff ff ff ff ff ff ff ff f8 ff ff ff ff ff ff f8 c7 01 b0 00 00 00 00 ff ff ff 00 00 00 00 00 00 0f ff ff ff ff ff ff ff ff c0 00 00 00 0b 00 ff ff ff
+
+# case: cqc_query
+# inputs: opcode=0x0f,index=0x15,polarity=0x1,cqn=0x163473
+# bytes: 64
+80 00 15 0f 00 16 34 73 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ceqc_create
+# inputs: opcode=0x10,index=0x16,polarity=0x0,eqn=0x63e,context=ceqc_create_body_boundary
+# bytes: 64
+00 00 36 10 00 00 06 3e 00 00 00 00 00 00 00 00 81 ff ff ff ff ff ff ff ff ff ff ff ff ff f8 00 00 00 00 7f ff f0 c0 00 ff ff 00 00 00 07 ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ceqc_delete
+# inputs: opcode=0x12,index=0x17,polarity=0x1,eqn=0x4b9
+# bytes: 64
+80 00 17 12 00 00 04 b9 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: ceqc_query
+# inputs: opcode=0x13,index=0x18,polarity=0x0,eqn=0x778
+# bytes: 64
+00 00 38 13 00 00 07 78 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: aeqc_create
+# inputs: opcode=0x14,index=0x19,polarity=0x1,eqn=0x3bb,context=aeqc_create_body_boundary
+# bytes: 64
+80 00 19 14 00 00 03 bb 00 00 00 00 00 00 00 00 81 ff ff ff ff ff ff ff ff ff ff ff ff ff f8 00 00 00 00 7f ff f0 c0 00 ff ff 00 00 00 07 ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: aeqc_delete
+# inputs: opcode=0x16,index=0x1a,polarity=0x0,eqn=0xa6
+# bytes: 64
+00 00 3a 16 00 00 00 a6 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: aeqc_query
+# inputs: opcode=0x17,index=0x1b,polarity=0x1,eqn=0x841
+# bytes: 64
+80 00 1b 17 00 00 08 41 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: srfqc_create
+# inputs: opcode=0x35,index=0x1c,polarity=0x0,srfqn=0x4333,context=srqc_create_body_boundary
+# bytes: 64
+00 00 3c 35 00 00 43 33 00 00 00 00 00 00 00 00 8f ff ff ff ff ff ff ff ff ff 00 00 00 00 00 00 ff ff ff ff ff ff f0 fc 00 00 00 00 ff ff ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: srfqc_delete
+# inputs: opcode=0x37,index=0x1d,polarity=0x1,srfqn=0x18ad
+# bytes: 64
+80 00 1d 37 00 00 18 ad 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: srfqc_query
+# inputs: opcode=0x38,index=0x1e,polarity=0x0,srfqn=0x25aa
+# bytes: 64
+00 00 3e 38 00 00 25 aa 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+# case: tq_flush
+# inputs: opcode=0x20,index=0x1f,polarity=0x1
+# bytes: 64
+80 00 1f 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

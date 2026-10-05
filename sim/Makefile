@@ -154,7 +154,6 @@ rdma_defs:
 		--source-manifest ../hw/rdma/source_manifest.txt \
 		--ownership ../hw/rdma/field_ownership.tsv \
 		--exclusions ../hw/rdma/field_exclusions.tsv \
-		--capabilities ../hw/rdma/cmq_capabilities.tsv \
 		--oracle-root ../hw/rdma/c_oracle/cases \
 		--mutation-manifest ../hw/rdma/cmq_field_mutation.tsv \
 		--sv-root ../src; \
@@ -162,7 +161,13 @@ rdma_defs:
 		--tsv ../hw/rdma/cmq_request_fields.tsv \
 		--svh ../src/codec/rdma/rdma_cmq_request_fields.svh; \
 	python3 ../tools/cmq_request_oracle.py --driver-root "$$kernel_root" --check \
-		--golden ../hw/rdma/golden_vectors/cmq_requests.hex --cc /usr/bin/gcc
+		--golden ../hw/rdma/golden_vectors/cmq_requests.hex --cc /usr/bin/gcc; \
+	python3 ../tools/cmq_dedicated_oracle.py --driver-root "$$kernel_root" --check \
+		--golden ../hw/rdma/golden_vectors/cmq_requests_dedicated.hex \
+		--context ../hw/rdma/golden_vectors/context.hex --cc /usr/bin/gcc; \
+	python3 ../tools/cmq_response_oracle.py --driver-root "$$kernel_root" --check \
+		--golden ../hw/rdma/golden_vectors/cmq_responses.hex --cc /usr/bin/gcc; \
+	python3 ../tools/check_cmq_capabilities.py --driver-root "$$kernel_root" --check --repo ..
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \

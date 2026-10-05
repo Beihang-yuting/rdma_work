@@ -36,7 +36,10 @@
 驱动 `exec_cmq_cmd` 分派 70 个 opcode。覆盖方式：
 
 - 21 个 opcode 沿用专用 body 编码器（QPC×4、KEY_ALLOC、MR_REGISTER/DEREGISTER、OCC_FLUSH、
-  CQC/CEQC/AEQC/SRFQC 的 CREATE/DELETE/QUERY、TQ_FLUSH），由 profile/codec/driver-field-mutation 测试覆盖。
+  CQC/CEQC/AEQC/SRFQC 的 CREATE/DELETE/QUERY、TQ_FLUSH）。`tools/cmq_dedicated_oracle.py` 调用驱动 18 个
+  填充函数生成 `hw/rdma/golden_vectors/cmq_requests_dedicated.hex`（31 例：QPC 各状态与模式、KEY_ALLOC/
+  MR_REGISTER 的 pbl 0–2 级、OCC_FLUSH 的 5 种驱动组合等，上下文字节取自 `context.hex` 边界用例）；
+  golden 测试按输入构造专用 body 逐字节比对，上下文类 opcode 另用 SV context codec 解码驱动 SQE 并独立核对关键字段。
 - 其余 49 个 opcode 由表驱动字段 codec（`rdma_cmq_field_codec.sv`）编码。字段表
   `hw/rdma/cmq_request_fields.tsv` 与 `rdma_cmq_request_fields.svh` 由 `tools/gen_cmq_request_fields.py`
   从驱动 15 个填充函数与 `cmq.h/gid.h/defs.h` 字段宏生成；body（`rdma_hw_cmq_field_body`）按驱动 info
@@ -46,12 +49,19 @@
   数据字节异或)；field codec 给出不含信封字节的部分签名，request composer 合并信封后补入。
 - 驱动不调用填充函数的 7 个 opcode（CEQC/AEQC/SRFQC_MODIFY、SD_QUERY、QPC/CQC_FORCE_DELETE、NOP）
   在驱动中提交的是全零 WQE（无 valid/opcode）；模型发出仅含信封的 SQE，body 全零。这是唯一有意的偏离。
-- 完成侧：查询类 opcode 沿用既有 payload 解码；其余 opcode 解码公共 CQE 头。
+- 完成侧：支持集合与驱动 `xtrdma_exec_cmq_cq_cmd` 的分派一致（70 个，含 QP_FLUSH；OCC_PD_SEARCH/
+  OCC_PD_IDX_SEARCH 驱动不分派，已移出）。查询类 opcode 沿用既有 payload 解码，其余解码公共 CQE 头。
+  `tools/cmq_response_oracle.py` 把驱动各 `*_cqe_info` 原文编译进 harness，逐位翻转 CQE 测出驱动实际读取的
+  位，生成 `cmq_responses.hex`（71 例）；golden 测试核对模型接受、头字段一致、驱动读取字节落在 payload
+  切片内且内容一致。发现：驱动 KEY_QUERY 读到 CQE 之后 16 字节、CQC_QUERY 读到之后 8 字节（越界读，
+  记为 overread，模型不跟随）。
 - 验收：`tools/cmq_request_oracle.py` 把驱动原文填充函数编译进用户态 harness，为 49 个 opcode（SD_UPDATE
   另含签名用例，共 50 例）生成 `hw/rdma/golden_vectors/cmq_requests.hex`；`rdma_cmq_request_golden_test`
   经生产 profile 组装后逐字节比对。驱动门禁（`make rdma_defs`）对锁定归档重跑生成器与 oracle 的 `--check`。
-- 未完成：`cmq_capabilities.tsv` 的闭环标记仍由 `check_rdma_field_ownership.py` 只认 QPC/CQC_CREATE 的
-  旧 oracle 证据；把 `cmq_requests.hex` 接入该门禁后可把 49 个请求方向行转为闭环。
+- 能力表闭环：`tools/check_cmq_capabilities.py` 由驱动 opcode 枚举、提交/完成两个 switch 与三份 golden
+  重建 `cmq_capabilities.tsv`；驱动分派的方向必须有 golden 用例（oracle_case_id 取首个用例），否则门禁失败；
+  驱动不分派的方向标 `DRIVER_NOT_DISPATCHED`（QP_FLUSH 请求、OCC_PD_SEARCH/IDX 请求与响应等 5 行）。
+  原 `check_rdma_field_ownership.py` 中的能力表逻辑移除；其 completion 支持集合解析补入字段表 opcode。
 
 ## 4. 阶段
 
@@ -60,4 +70,4 @@
 | P1 | 新引擎：驱动流程（环/PI/polarity/doorbell/CQE 校验/pending 链表/clean_pending/看门狗），保留 port 契约 | 新引擎测试（含 ring 满排队、wrap/polarity 翻转、wrap/opcode/ecode 失败、reset 排空、看门狗）+ 全量回归 |
 | P2 | 旧引擎与旧测试（`rdma_cmq_engine_test` 2.6 万行、CMQ gate 分片、相关 Python 门禁）下线，port/control-plane 测试按新语义改写；删除只服务旧引擎的 journal/digest/typed-snapshot/body-value 模型与 profile 快照/canonicalization 接口 | 全量回归 |
 | P3 | 其余 49 个 opcode 的表驱动字段 codec 与公共 CQE 解码（完成） | golden 逐字节比对 + 拒绝路径单测 |
-| P4 | 驱动原文 harness 生成 golden（完成）；能力表闭环（未完成，见 §3） | oracle `--check` 与 SV 比对全通过 |
+| P4 | 驱动原文 harness 生成 golden：表驱动 49 个 + 专用 21 个请求、71 个响应；能力表闭环（完成） | oracle `--check` 与 SV 比对全通过 |

@@ -33,11 +33,6 @@ EXCLUSION_HEADER = (
     "archive_id\tsource_path\tsource_selector\tsource_sha256\tmacro_name\t"
     "exclusion_reason"
 )
-CAPABILITY_HEADER = (
-    "driver_symbol\topcode\topcode_value\tdirection\tregistered\t"
-    "request_encodable\tresponse_decodable\toracle_case_id\towning_codec\t"
-    "blocker"
-)
 MUTATION_HEADER = (
     "case_id\tentry\topcode\tdirection\tbyte_offset\tqword_index\tbit_index\t"
     "expected_class\texpected_field\tevidence_mode\tcorrelation_group\t"
@@ -446,98 +441,6 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         with self.assertRaisesRegex(module.ContractError, "static mutation"):
             module.validate_mutation_rows([row])
 
-    def test_rejects_unsupported_direction_marked_encodable(self):
-        """功能：拒绝 unsupported direction 的 request/response capability 位为 1。
-        输入输出及副作用：传入 CQC_CREATE RESPONSE 的 encodable 标志；不写仓库。
-        失败边界：decoder-only 或未闭合方向不得反向启用 encoder。"""
-        row = {
-            "driver_symbol": "XTRDMA_OP_CQC_CREATE",
-            "opcode": "CQC_CREATE",
-            "opcode_value": "0x0c",
-            "direction": "RESPONSE",
-            "registered": "1",
-            "request_encodable": "1",
-            "response_decodable": "0",
-            "oracle_case_id": "-",
-            "owning_codec": "rdma_hw_cmq_request_composer",
-            "blocker": "MISSING_CLOSED_EVIDENCE",
-        }
-        self.assert_rejected(lambda module: module.validate_capability_rows([row]))
-
-    def test_accepts_only_capability_with_explicit_closed_case_proof(self):
-        """功能：允许已由完整 mutation case 闭合证明的 QPC request capability。
-        输入输出及副作用：传入一个 QPC_CREATE request 行和显式 proven case 集合；验证只读 row。
-        失败边界：blocker 为 ``-`` 但没有闭合证明时必须拒绝；提供精确 case 证明后才可通过。"""
-        module = self.require_checker()
-        row = {
-            "driver_symbol": "XTRDMA_OP_QPC_CREATE",
-            "opcode": "QPC_CREATE",
-            "opcode_value": "0x00",
-            "direction": "REQUEST",
-            "registered": "1",
-            "request_encodable": "1",
-            "response_decodable": "0",
-            "oracle_case_id": "cmq_sqe_qpc_create_request",
-            "owning_codec": "rdma_hw_cmq_request_composer",
-            "blocker": "-",
-        }
-        with self.assertRaises(module.ContractError):
-            module.validate_capability_rows([row])
-        response = dict(row)
-        response["direction"] = "RESPONSE"
-        response["request_encodable"] = "0"
-        response["response_decodable"] = "1"
-        response["oracle_case_id"] = "cmq_cqe_qpc_create_response"
-        response["owning_codec"] = "rdma_hw_cmq_completion_codec"
-        doorbell = {
-            "driver_symbol": "-",
-            "opcode": "CMQ_SQ_DOORBELL",
-            "opcode_value": "-",
-            "direction": "REQUEST",
-            "registered": "1",
-            "request_encodable": "1",
-            "response_decodable": "0",
-            "oracle_case_id": "cmq_sq_doorbell",
-            "owning_codec": "rdma_hw_cmq_hw_profile",
-            "blocker": "-",
-        }
-        self.assertEqual(
-            module.validate_capability_rows(
-                [row, response, doorbell],
-                enum_members=[("XTRDMA_OP_QPC_CREATE", 0)],
-                proven_cases={
-                    "cmq_sqe_qpc_create_request",
-                    "cmq_cqe_qpc_create_response",
-                    "cmq_sq_doorbell",
-                },
-            ),
-            [row, response, doorbell],
-        )
-
-    def test_requires_synthetic_doorbell_in_enum_coverage(self):
-        """功能：要求 capability 完整覆盖 enum 双向行及独立 CMQ doorbell 行。
-        输入输出及副作用：传入一个完整 enum 的两条方向记录但省略 doorbell；不写入表。
-        失败边界：仅依赖 enum keys 的覆盖不能隐藏 register writer capability 的缺失。"""
-        module = self.require_checker()
-        rows = []
-        for direction in ("REQUEST", "RESPONSE"):
-            rows.append({
-                "driver_symbol": "XTRDMA_OP_QPC_CREATE",
-                "opcode": "QPC_CREATE",
-                "opcode_value": "0x00",
-                "direction": direction,
-                "registered": "1",
-                "request_encodable": "0",
-                "response_decodable": "0",
-                "oracle_case_id": "-",
-                "owning_codec": "rdma_hw_cmq_request_composer",
-                "blocker": "MISSING_CLOSED_EVIDENCE",
-            })
-        with self.assertRaises(module.ContractError):
-            module.validate_capability_rows(
-                rows, enum_members=[("XTRDMA_OP_QPC_CREATE", 0)]
-            )
-
     def test_rejects_missing_oracle_case(self):
         """功能：拒绝 ownership/mutation row 引用不存在的 oracle_case_id。
         输入输出及副作用：传入 unknown case；验证不得自行创建或推断 artifact。
@@ -687,24 +590,6 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         module = self.require_checker()
         with self.assertRaisesRegex(module.ContractError, "exactly VALID/WRAP pair"):
             module.validate_mutation_rows([row])
-
-    def test_rejects_decoder_only_request_encoder(self):
-        """功能：拒绝 decoder-only evidence 把 request_encodable 置一。
-        输入输出及副作用：能力 row 标为 RESPONSE-only 却启用 request；不写仓库。
-        失败边界：没有真实 typed encoder 的方向始终保持 0。"""
-        row = {
-            "driver_symbol": "XTRDMA_OP_QPC_CREATE",
-            "opcode": "QPC_CREATE",
-            "opcode_value": "0x00",
-            "direction": "RESPONSE",
-            "registered": "1",
-            "request_encodable": "1",
-            "response_decodable": "0",
-            "oracle_case_id": "cmq_cqe_qpc_create_response",
-            "owning_codec": "rdma_hw_cmq_completion_codec",
-            "blocker": "MISSING_PRODUCTION_PATH_EVIDENCE",
-        }
-        self.assert_rejected(lambda module: module.validate_capability_rows([row]))
 
     def test_cqe_driver_result_order_is_locked(self):
         """功能：验证 CQE driver-result 严格遵循 owner→lookup→wrap→opcode→ecode 顺序。
@@ -1331,6 +1216,30 @@ class FieldOwnershipFixtureTest(unittest.TestCase):
         失败边界：硬编码集合漏项会把合法 opcode 错误标成 UNSUPPORTED_OPCODE。"""
         module = self.require_checker()
         self.assertEqual(module.model_outcome(1, 1, 0x20), ("OK", 1))
+
+    def test_supported_set_includes_table_driven_opcodes(self):
+        """功能：确认 supported_opcode 调用字段表时，字段表 case 标签也计入支持集合。
+        输入输出及副作用：fixture 含一个显式 opcode 与一个驱动 TRDMA_ 拼写的表驱动 opcode。
+        失败边界：漏掉字段表会把表驱动 opcode 的 CQE 变异错标为 REJECT。"""
+        module = self.require_checker()
+        sources = {
+            "codec.sv": (
+                "function bit supported_opcode(bit [7:0] opcode);\n"
+                "  if (rdma_cmq_request_field_specs(opcode, specs)) return 1;\n"
+                "  return opcode inside {RDMA_OP_QPC_CREATE};\n"
+                "endfunction\n"
+            ),
+            "fields.svh": (
+                "function automatic bit rdma_cmq_request_field_specs(\n"
+                "  input bit [7:0] opcode, output spec_t specs[$]);\n"
+                "  case (opcode)\n"
+                "    RDMA_OP_SRFQC_MODIFY: return 1;\n"
+                "  endcase\n"
+                "endfunction\n"
+            ),
+        }
+        enum = [("XTRDMA_OP_QPC_CREATE", 0x00), ("TRDMA_OP_SRFQC_MODIFY", 0x36)]
+        self.assertEqual(module.parse_supported_opcode_values(sources, enum), {0x00, 0x36})
 
     def test_derive_memcpy_and_offset_evidence(self):
         """功能：从 memcpy/offsetof 调用推导目标 buffer 的 byte base。
