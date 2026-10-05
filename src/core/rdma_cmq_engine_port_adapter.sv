@@ -4,7 +4,7 @@
 // 所有权与生命周期：engines 只保存非拥有引用；result/ticket/completion 由调用方持有。
 
 class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
-  `uvm_object_utils(rdma_cmq_engine_port_adapter)
+  `rdma_object_utils(rdma_cmq_engine_port_adapter)
 
   protected rdma_cmq_engine engines[string];
 

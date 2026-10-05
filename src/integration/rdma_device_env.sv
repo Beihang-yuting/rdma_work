@@ -22,7 +22,7 @@ typedef enum bit [1:0] {
 // 暴露给 context subclass，也不参与 epoch 后的分配路径。所有 compare 都是本类
 // non-virtual、无回调的值检查，因而能在唯一 epoch side effect 前捕获跨 candidate 漂移。
 class rdma_reset_candidate_fingerprint extends uvm_object;
-  `uvm_object_utils(rdma_reset_candidate_fingerprint)
+  `rdma_object_utils(rdma_reset_candidate_fingerprint)
 
   rdma_function_identity expected_identity;
   rdma_function_identity expected_binding_identity;
@@ -608,7 +608,7 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
 endclass
 
 class rdma_device_env extends uvm_object;
-  `uvm_object_utils(rdma_device_env)
+  `rdma_object_utils(rdma_device_env)
   dpu_device_snapshot device_snapshot;
   dpu_resource_snapshot resources;
   dpu_resource_manager resource_manager;

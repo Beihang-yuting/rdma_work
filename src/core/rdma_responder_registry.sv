@@ -13,7 +13,7 @@ typedef enum bit [1:0] {
 } rdma_responder_domain_e;
 
 class rdma_responder_region extends uvm_object;
-  `uvm_object_utils(rdma_responder_region)
+  `rdma_object_utils(rdma_responder_region)
 
   rdma_responder_domain_e domain;
   rdma_responder_mode_e mode;
@@ -41,7 +41,7 @@ class rdma_responder_region extends uvm_object;
 endclass
 
 class rdma_responder_registry extends uvm_object;
-  `uvm_object_utils(rdma_responder_registry)
+  `rdma_object_utils(rdma_responder_registry)
 
   protected rdma_responder_region m_regions[$];
   // m_region_lease_ids 与 m_regions 同步，记录句柄首次登记时的不可变 lease 绑定。

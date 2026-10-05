@@ -14,7 +14,7 @@
 //   binding 投影在锁外准备，首次登记与 ID/serial 消费在同一短提交完成，不留半登记 authority。
 
 class rdma_resource_manager extends uvm_object;
-  `uvm_object_utils(rdma_resource_manager)
+  `rdma_object_utils(rdma_resource_manager)
 
   // Registry keys are exactly function_uid:generation:kind:object_id.
   protected rdma_resource registry[string];

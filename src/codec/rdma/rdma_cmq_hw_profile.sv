@@ -9,7 +9,7 @@
 // 设计说明：production profile 固定 X722/0.1.34 的五种 body schema 与 codec 组合；
 // 显式类型 dispatch 和直接构造保证 nonfatal snapshot 不受 UVM factory override 影响。
 class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
-  `uvm_object_utils(rdma_hw_cmq_hw_profile)
+  `rdma_object_utils(rdma_hw_cmq_hw_profile)
 
   protected rdma_hw_cmq_request_composer request_composer;
   protected rdma_hw_cmq_completion_codec completion_codec;

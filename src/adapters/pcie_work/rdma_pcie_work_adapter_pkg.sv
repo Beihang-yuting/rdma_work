@@ -14,7 +14,7 @@ package rdma_pcie_work_adapter_pkg;
   `include "uvm_macros.svh"
 
   class rdma_pcie_work_adapter extends rdma_pcie_api;
-    `uvm_object_utils(rdma_pcie_work_adapter)
+    `rdma_object_utils(rdma_pcie_work_adapter)
 
     // 外部 PCIe 对象：adapter 只保存引用，不负责 new/delete。
     pcie_tl_func_manager func_mgr;

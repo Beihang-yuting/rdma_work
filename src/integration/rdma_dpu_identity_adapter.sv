@@ -5,7 +5,7 @@
 // 所有权与生命周期：输入快照由 dpu_common 环境拥有；返回 identity/binding 由调用方
 //       拥有并可在本环境生命周期内保存，适配器本身不持有底层资源。
 class rdma_dpu_identity_adapter extends uvm_object;
-  `uvm_object_utils(rdma_dpu_identity_adapter)
+  `rdma_object_utils(rdma_dpu_identity_adapter)
 
   // 功能：构造无状态适配器；实际工作由静态投影函数完成。
   // 输入/输出及副作用：name 为 UVM 对象名。

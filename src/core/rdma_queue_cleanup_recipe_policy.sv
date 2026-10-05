@@ -10,7 +10,7 @@
 // caller 负责执行副作用。本 policy 只证明“每个声明 role 恰好出现一次、context 规则一致、
 // reverse release 顺序可解释”，避免 executor 在不同业务阶段复制并漂移同一张门禁表。
 class rdma_queue_cleanup_recipe_policy extends uvm_object;
-  `uvm_object_utils(rdma_queue_cleanup_recipe_policy)
+  `rdma_object_utils(rdma_queue_cleanup_recipe_policy)
 
   // 功能：构造无状态的 cleanup recipe policy 对象，不绑定 queue 或 backing。
   // 输入/输出及副作用：name 为 UVM 名；对象不持有 semaphore/plan/registry/adapter；校验均走静态 validate。

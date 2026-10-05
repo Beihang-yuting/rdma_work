@@ -415,7 +415,7 @@ function automatic rdma_status rdma_qp_backing_projection_status(
 endfunction
 
 class rdma_resource extends uvm_object;
-  `uvm_object_utils(rdma_resource)
+  `rdma_object_utils(rdma_resource)
 
   rdma_handle handle;
   rdma_function_handle owner;
@@ -524,7 +524,7 @@ class rdma_resource extends uvm_object;
 endclass
 
 class rdma_queue_resource extends rdma_resource;
-  `uvm_object_utils(rdma_queue_resource)
+  `rdma_object_utils(rdma_queue_resource)
 
   int unsigned depth;
   int unsigned producer_index;
@@ -642,7 +642,7 @@ class rdma_queue_resource extends rdma_resource;
 endclass
 
 class rdma_function extends rdma_resource;
-  `uvm_object_utils(rdma_function)
+  `rdma_object_utils(rdma_function)
 
   int unsigned local_function_id;
   int unsigned global_function_id;
@@ -706,7 +706,7 @@ class rdma_function extends rdma_resource;
 endclass
 
 class rdma_pd extends rdma_resource;
-  `uvm_object_utils(rdma_pd)
+  `rdma_object_utils(rdma_pd)
 
   int unsigned local_pd_id;
   int unsigned global_pd_id;
@@ -742,7 +742,7 @@ class rdma_pd extends rdma_resource;
 endclass
 
 class rdma_mr extends rdma_resource;
-  `uvm_object_utils(rdma_mr)
+  `rdma_object_utils(rdma_mr)
 
   int unsigned local_mr_id;
   int unsigned global_mr_id;
@@ -835,7 +835,7 @@ class rdma_mr extends rdma_resource;
 endclass
 
 class rdma_cq extends rdma_queue_resource;
-  `uvm_object_utils(rdma_cq)
+  `rdma_object_utils(rdma_cq)
 
   int unsigned local_cq_id;
   int unsigned global_cq_id;
@@ -923,7 +923,7 @@ class rdma_cq extends rdma_queue_resource;
 endclass
 
 class rdma_qp extends rdma_resource;
-  `uvm_object_utils(rdma_qp)
+  `rdma_object_utils(rdma_qp)
 
   int unsigned local_qp_id;
   int unsigned global_qp_id;
@@ -1280,7 +1280,7 @@ class rdma_qp extends rdma_resource;
 endclass
 
 class rdma_srq extends rdma_queue_resource;
-  `uvm_object_utils(rdma_srq)
+  `rdma_object_utils(rdma_srq)
 
   int unsigned local_srq_id;
   int unsigned global_srq_id;
@@ -1355,7 +1355,7 @@ class rdma_srq extends rdma_queue_resource;
 endclass
 
 class rdma_ceq extends rdma_queue_resource;
-  `uvm_object_utils(rdma_ceq)
+  `rdma_object_utils(rdma_ceq)
 
   int unsigned local_ceq_id;
   int unsigned global_ceq_id;
@@ -1400,7 +1400,7 @@ class rdma_ceq extends rdma_queue_resource;
 endclass
 
 class rdma_aeq extends rdma_queue_resource;
-  `uvm_object_utils(rdma_aeq)
+  `rdma_object_utils(rdma_aeq)
 
   int unsigned local_aeq_id;
   int unsigned global_aeq_id;
@@ -1445,7 +1445,7 @@ class rdma_aeq extends rdma_queue_resource;
 endclass
 
 class rdma_cmq extends rdma_queue_resource;
-  `uvm_object_utils(rdma_cmq)
+  `rdma_object_utils(rdma_cmq)
 
   int unsigned local_cmq_id;
   int unsigned global_cmq_id;

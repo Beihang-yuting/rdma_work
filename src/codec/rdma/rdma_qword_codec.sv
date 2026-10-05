@@ -17,7 +17,7 @@ function automatic bit rdma_raw_qword_mask_is_valid(
 endfunction
 
 class rdma_hw_qword_builder extends uvm_object;
-  `uvm_object_utils(rdma_hw_qword_builder)
+  `rdma_object_utils(rdma_hw_qword_builder)
 
   localparam int unsigned MAX_IMAGE_BYTES = RDMA_QPC_BYTES;
 

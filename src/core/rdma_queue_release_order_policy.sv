@@ -6,7 +6,7 @@
 // 设计说明：CQ→WQ 是唯一允许的跨 runtime 嵌套方向；policy 只做值约束，
 //   lock 获取、gate 生命周期和失败恢复由 rdma_queue_runtime/rdma_queue_data_engine 负责。
 class rdma_queue_release_order_policy extends uvm_object;
-  `uvm_object_utils(rdma_queue_release_order_policy)
+  `rdma_object_utils(rdma_queue_release_order_policy)
 
   // 功能：构造无状态 policy。
   // 输入/输出及副作用：name 设置 UVM 名称。

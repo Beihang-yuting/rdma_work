@@ -168,7 +168,7 @@ endfunction
 // 设计说明：opcode key 由 profile、硬件 opcode 与 variant 组成稳定注册键，
 // 避免 codec 选择依赖 polymorphic body 的 factory 类型名或对象身份。
 class rdma_cmq_opcode_key extends uvm_object;
-  `uvm_object_utils(rdma_cmq_opcode_key)
+  `rdma_object_utils(rdma_cmq_opcode_key)
 
   string profile_name;
   bit [31:0] opcode;
@@ -239,7 +239,7 @@ endfunction
 // 设计说明：recovery owner 把业务 workflow、资源 incarnation 与首次 admission attempt 冻结为一个值节点；
 // legacy sentinel 仅兼容旧调用方，永不授予自动恢复权限。
 class rdma_cmq_recovery_owner extends uvm_object;
-  `uvm_object_utils(rdma_cmq_recovery_owner)
+  `rdma_object_utils(rdma_cmq_recovery_owner)
 
   rdma_cmq_recovery_workflow_e workflow;
   rdma_handle resource_h;
@@ -571,7 +571,7 @@ endclass
 // 设计说明：command descriptor 汇合 Function、opcode、body、timeout 与 recovery owner 的准入边界；
 // journal 复验复用同一命令值，但按冻结 owner 规则校验。
 class rdma_cmq_command_desc extends uvm_object;
-  `uvm_object_utils(rdma_cmq_command_desc)
+  `rdma_object_utils(rdma_cmq_command_desc)
 
   rdma_function_handle function_h;
   rdma_cmq_opcode_key opcode_key;
@@ -775,7 +775,7 @@ endfunction
 // 设计说明：slot context 把 allocator 给出的 SQ 物理位置与 command 分离，
 // 使 profile 编码前可独立验证 Function/CMQ 归属和 sequence/index/wrap 几何。
 class rdma_cmq_slot_context extends uvm_object;
-  `uvm_object_utils(rdma_cmq_slot_context)
+  `rdma_object_utils(rdma_cmq_slot_context)
 
   rdma_function_handle function_h;
   rdma_handle cmq_h;
@@ -856,7 +856,7 @@ endclass
 // 设计说明：expected response 只描述 profile 应匹配的 opcode/variant，不绑定具体 payload 类型，
 // CQE 解码仍由选中的 hardware profile 负责。
 class rdma_cmq_expected_response extends uvm_object;
-  `uvm_object_utils(rdma_cmq_expected_response)
+  `rdma_object_utils(rdma_cmq_expected_response)
 
   bit [31:0] hardware_opcode;
   string variant;
@@ -902,7 +902,7 @@ endclass
 // 设计说明：decoded CQE 是 codec 与 engine lifecycle 之间的中间值，分开保存硬件字段、
 // operation status 与 polymorphic payload，尚不关联 ticket。
 class rdma_cmq_decoded_cqe extends uvm_object;
-  `uvm_object_utils(rdma_cmq_decoded_cqe)
+  `rdma_object_utils(rdma_cmq_decoded_cqe)
 
   bit [31:0] hardware_opcode;
   int unsigned wqe_index;
@@ -960,7 +960,7 @@ endclass
 // 设计说明：ticket 冻结单次提交的 command ID、Function/CMQ、slot 与 deadline，
 // 使 completion、timeout 与 late diagnostic 以同一 immutable identity 关联。
 class rdma_cmq_ticket extends uvm_object;
-  `uvm_object_utils(rdma_cmq_ticket)
+  `rdma_object_utils(rdma_cmq_ticket)
 
   longint unsigned command_id;
   rdma_function_handle function_h;
@@ -1099,7 +1099,7 @@ endfunction
 // 设计说明：completion envelope 聚合 ticket、operation status、原始 CQE 与 payload；
 // timeout/reset 允许无 CQE，其余路径必须保留可复验的硬件 image。
 class rdma_cmq_completion extends uvm_object;
-  `uvm_object_utils(rdma_cmq_completion)
+  `rdma_object_utils(rdma_cmq_completion)
 
   rdma_cmq_ticket ticket;
   rdma_status status;
@@ -1168,7 +1168,7 @@ endclass
 // 设计说明：diagnostic 与正常 completion 分离保存 late/orphan/reset 证据，
 // 避免诊断投递改变主 completion 生命周期或消费其 retained journal evidence。
 class rdma_cmq_diagnostic extends uvm_object;
-  `uvm_object_utils(rdma_cmq_diagnostic)
+  `rdma_object_utils(rdma_cmq_diagnostic)
 
   rdma_cmq_diagnostic_kind_e kind;
   rdma_cmq_ticket ticket;
@@ -1228,7 +1228,7 @@ endclass
 // 设计说明：runtime descriptor 冻结 CMQ ring 的 IOVA、固定几何与初始相位，供 engine 配置前复验；
 // 只描述 backing，不取得 Host-memory 生命周期。
 class rdma_cmq_runtime_desc extends uvm_object;
-  `uvm_object_utils(rdma_cmq_runtime_desc)
+  `rdma_object_utils(rdma_cmq_runtime_desc)
 
   rdma_function_handle function_h;
   rdma_handle cmq_h;

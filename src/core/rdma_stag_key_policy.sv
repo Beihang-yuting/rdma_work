@@ -22,7 +22,7 @@ virtual class rdma_stag_key_policy extends uvm_object;
 endclass
 
 class rdma_incarnation_stag_key_policy extends rdma_stag_key_policy;
-  `uvm_object_utils(rdma_incarnation_stag_key_policy)
+  `rdma_object_utils(rdma_incarnation_stag_key_policy)
 
   // 功能：构造策略对象。
   // 输入/输出及副作用：name 为 UVM 实例名；仅调用 super.new。

@@ -12,7 +12,7 @@ typedef enum bit [1:0] {
 
 // 设计说明：模型只维护数据布局；元数据复制不分配、不调用虚方法，bytes/summary 由入口自行处理。
 class rdma_hw_image extends uvm_object;
-  `uvm_object_utils(rdma_hw_image)
+  `rdma_object_utils(rdma_hw_image)
 
   byte unsigned bytes[$];
   longint unsigned length;

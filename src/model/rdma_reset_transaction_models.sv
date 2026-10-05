@@ -9,7 +9,7 @@
 // m_function_epochs；candidate 只封装这份 detached map，不把 reset policy 或 router
 // 副作用下放到模型层。
 class rdma_reset_epoch_candidate extends uvm_object;
-  `uvm_object_utils(rdma_reset_epoch_candidate)
+  `rdma_object_utils(rdma_reset_epoch_candidate)
 
   rdma_reset_epoch_t function_epochs[string];
   bit valid;

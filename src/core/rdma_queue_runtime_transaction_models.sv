@@ -42,7 +42,7 @@ typedef enum bit [2:0] {
 // 设计说明：ring cursor 须把 index 与 wrap 作为一个值传递，否则回卷边界仅比较 index 会把 stale reservation
 //  误认为当前事务。
 class rdma_queue_cursor_snapshot extends uvm_object;
-  `uvm_object_utils(rdma_queue_cursor_snapshot)
+  `rdma_object_utils(rdma_queue_cursor_snapshot)
   int unsigned index;
   bit wrap;
 
@@ -70,7 +70,7 @@ endclass
 // 设计说明：pending operation 是 recovery 的唯一事务证据载体，冻结 queue identity、cursor、image、
 //  route/epoch、MMIO evidence 与阶段位；runtime 经 non-fatal helper 建立 detached 快照，不信任 caller 的兼容 bit。
 class rdma_queue_pending_operation extends uvm_object;
-  `uvm_object_utils(rdma_queue_pending_operation)
+  `rdma_object_utils(rdma_queue_pending_operation)
   rdma_handle queue_h;
   rdma_queue_runtime_kind_e kind;
   bit producer;
@@ -262,7 +262,7 @@ endclass
 // 设计说明：host-produced ring 以 slot 记录 request/image/wr_id 与 completion 状态，才能按 signaled
 //  completion 连续释放前置 unsignaled WQE。
 class rdma_queue_slot_ledger_entry extends uvm_object;
-  `uvm_object_utils(rdma_queue_slot_ledger_entry)
+  `rdma_object_utils(rdma_queue_slot_ledger_entry)
   bit posted;
   bit consumed;
   bit signaled;

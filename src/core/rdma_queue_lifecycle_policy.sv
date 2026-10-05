@@ -991,7 +991,7 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
 endclass
 
 class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
-  `uvm_object_utils(rdma_cq_lifecycle_policy)
+  `rdma_object_utils(rdma_cq_lifecycle_policy)
 
   // 功能：构造 CQ 生命周期策略。
   // 输入/输出及副作用：name 为 UVM 对象名。
@@ -1292,7 +1292,7 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 endclass
 
 class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
-  `uvm_object_utils(rdma_srq_lifecycle_policy)
+  `rdma_object_utils(rdma_srq_lifecycle_policy)
 
   // 功能：构造 SRQ 生命周期策略。
   // 输入/输出及副作用：name 为 UVM 对象名。
@@ -1585,7 +1585,7 @@ class rdma_srq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 endclass
 
 class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
-  `uvm_object_utils(rdma_ceq_lifecycle_policy)
+  `rdma_object_utils(rdma_ceq_lifecycle_policy)
 
   // 功能：构造 CEQ 生命周期策略。
   // 输入/输出及副作用：name 为 UVM 对象名。
@@ -1835,7 +1835,7 @@ class rdma_ceq_lifecycle_policy extends rdma_queue_lifecycle_policy;
 endclass
 
 class rdma_aeq_lifecycle_policy extends rdma_queue_lifecycle_policy;
-  `uvm_object_utils(rdma_aeq_lifecycle_policy)
+  `rdma_object_utils(rdma_aeq_lifecycle_policy)
 
   // 功能：构造 AEQ 生命周期策略。
   // 输入/输出及副作用：name 为 UVM 对象名。

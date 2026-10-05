@@ -7,7 +7,7 @@
 // 再由 caller 决定 mode、wire 字段或 external-SGB descriptor 的发布。
 
 class rdma_sge_authority extends uvm_object;
-  `uvm_object_utils(rdma_sge_authority)
+  `rdma_object_utils(rdma_sge_authority)
 
   // 功能：构造 SGE authority helper，仅作静态函数命名空间。
   // 输入/输出及副作用：name 为 UVM 对象名。

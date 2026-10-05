@@ -9,7 +9,7 @@
 // 设计说明：host producer post 的返回对象与 runtime ledger 解耦，只发布 queue identity、
 // WR 标识、已提交 producer cursor、编码镜像和最终状态的值快照。
 class rdma_queue_post_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_post_result)
+  `rdma_object_utils(rdma_queue_post_result)
   rdma_handle queue_h;
   longint unsigned wr_id;
   int unsigned index;
@@ -35,7 +35,7 @@ endclass
 // 字段由各 publish 成功路径写入；失败路径不发布半成品。
 // occupancy_valid=0 表示提交后查询失败，不是 cursor 回滚，也不能当作 occupancy=0。
 class rdma_queue_device_publish_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_device_publish_result)
+  `rdma_object_utils(rdma_queue_device_publish_result)
   rdma_handle queue_h;
   int unsigned index;
   bit wrap;
@@ -62,7 +62,7 @@ endclass
 // 设计说明：CQ poll 结果保存预物化的 CQE 语义与 WQE release 值快照，不暴露 runtime 的 ledger entry，
 // 修改结果不会反向影响 SQ/RQ/SRQ credit。
 class rdma_queue_completion_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_completion_result)
+  `rdma_object_utils(rdma_queue_completion_result)
   rdma_handle queue_h;
   rdma_hw_cqe_model cqe;
   rdma_status completion_status;
@@ -83,7 +83,7 @@ endclass
 // 设计说明：CEQ/AEQ poll 只发布 event queue、路由目标模型与状态的 detached 值，
 // 不交出 CQ/QP attachment 或 event runtime 的可变引用。
 class rdma_queue_event_result extends uvm_object;
-  `uvm_object_utils(rdma_queue_event_result)
+  `rdma_object_utils(rdma_queue_event_result)
   rdma_handle queue_h;
   rdma_hw_model event_model;
   rdma_status event_status;
@@ -106,7 +106,7 @@ endclass
 // 设计说明：每个 ring 必须有独立 attachment（同一 QP 的 SQ/RQ 逻辑 offset 都从零开始）；
 // attachment 只保存各 ring 自己的 runtime/backing capability，不共享索引或释放权。
 class rdma_queue_data_attachment extends uvm_object;
-  `uvm_object_utils(rdma_queue_data_attachment)
+  `rdma_object_utils(rdma_queue_data_attachment)
   rdma_handle queue_h;
   rdma_handle ceq_h;
   rdma_queue_runtime_kind_e kind;
@@ -140,7 +140,7 @@ endclass
 // 设计说明：QP link 是 engine 内 SQ/RQ/SRQ 与 send/recv CQ 的冻结路由索引；handle 为值快照，
 // backing access/ref 为非拥有 capability，生命周期归 QP plan/manager。
 class rdma_queue_data_qp_link extends uvm_object;
-  `uvm_object_utils(rdma_queue_data_qp_link)
+  `rdma_object_utils(rdma_queue_data_qp_link)
   rdma_handle qp_h;
   rdma_handle srq_h;
   rdma_handle send_cq_h;
@@ -181,7 +181,7 @@ endclass
 // CQ resize 在 authority 发布后，旧 runtime/backing 可能因后端故障无法立即 detach/release；
 // 该记录由 engine 持有，直到清理完成。
 class rdma_cq_resize_recovery extends uvm_object;
-  `uvm_object_utils(rdma_cq_resize_recovery)
+  `rdma_object_utils(rdma_cq_resize_recovery)
   rdma_handle cq_h;
   rdma_function_identity function_identity;
   rdma_queue_runtime old_runtime;

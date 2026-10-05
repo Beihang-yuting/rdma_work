@@ -25,7 +25,7 @@ package rdma_host_mem_adapter_pkg;
   // mapping copies, but there is no numeric token or public identity getter.
   // Only the adapter retains the exact seal that can mark release completion.
   class rdma_host_mem_allocation_identity extends uvm_object;
-    `uvm_object_utils(rdma_host_mem_allocation_identity)
+    `rdma_object_utils(rdma_host_mem_allocation_identity)
 
     local rdma_host_mem_release_seal release_seal;
     local bit release_complete;
@@ -91,7 +91,7 @@ package rdma_host_mem_adapter_pkg;
   endclass
 
   class rdma_host_mem_mapping extends rdma_dma_mapping;
-    `uvm_object_utils(rdma_host_mem_mapping)
+    `rdma_object_utils(rdma_host_mem_mapping)
 
     local rdma_host_mem_allocation_identity allocation_identity;
 
@@ -313,7 +313,7 @@ package rdma_host_mem_adapter_pkg;
   endclass
 
   class rdma_host_mem_allocation_record extends uvm_object;
-    `uvm_object_utils(rdma_host_mem_allocation_record)
+    `rdma_object_utils(rdma_host_mem_allocation_record)
 
     rdma_host_mem_mapping authority;
     host_mem_pkg::host_mem_api backing_mem;
@@ -334,7 +334,7 @@ package rdma_host_mem_adapter_pkg;
   // 输入/输出及副作用：由 adapter 创建并更新；只保存 manager 非拥有引用和地址快照。
   // 失败/边界：active=0 表示已回收；重复回收不得再次调用 host_mem.free。
   class rdma_host_mem_umem_record extends uvm_object;
-    `uvm_object_utils(rdma_host_mem_umem_record)
+    `rdma_object_utils(rdma_host_mem_umem_record)
 
     rdma_umem umem;
     host_mem_pkg::host_mem_api backing_mem;
@@ -354,7 +354,7 @@ package rdma_host_mem_adapter_pkg;
   endclass
 
   class rdma_host_mem_adapter extends rdma_host_mem_api;
-    `uvm_object_utils(rdma_host_mem_adapter)
+    `rdma_object_utils(rdma_host_mem_adapter)
 
     // Upstream owns initialization and lifetime of this manager.  The adapter
     // composes it and never changes its configured address regions.

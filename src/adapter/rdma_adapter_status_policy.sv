@@ -6,7 +6,7 @@
 // 设计说明：adapter 契约要求所有 backend 调用返回非空 rdma_status；null 是下游契约违例，不能当成功或继续读 output。
 //  错误构造独立成纯值 policy，避免基类与具体 adapter 维护两套诊断前缀。
 class rdma_adapter_status_policy extends uvm_object;
-  `uvm_object_utils(rdma_adapter_status_policy)
+  `rdma_object_utils(rdma_adapter_status_policy)
 
   // 功能：构造无状态 policy。
   // 输入/输出及副作用：name 设置 UVM 对象名。

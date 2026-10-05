@@ -5,7 +5,7 @@
 
 class rdma_qp_lifecycle_executor extends uvm_object;
   // 生命周期执行器统一负责 QP backing 的分配、发布、恢复和最终清理。
-  `uvm_object_utils(rdma_qp_lifecycle_executor)
+  `rdma_object_utils(rdma_qp_lifecycle_executor)
 
   protected rdma_resource_manager manager;
   protected rdma_cmq_port cmq;

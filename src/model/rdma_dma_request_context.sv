@@ -4,7 +4,7 @@
 // 所有权与生命周期：对象拥有值字段及 handle 的 clone；调用方管理外部资源。
 
 class rdma_dma_request_context extends uvm_object;
-  `uvm_object_utils(rdma_dma_request_context)
+  `rdma_object_utils(rdma_dma_request_context)
 
   rdma_function_handle function_h;
   rdma_bdf_t requester_bdf;

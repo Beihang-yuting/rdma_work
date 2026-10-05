@@ -4,7 +4,7 @@
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
 class rdma_hmc_lease extends uvm_object;
-  `uvm_object_utils(rdma_hmc_lease)
+  `rdma_object_utils(rdma_hmc_lease)
 
   rdma_function_handle owner;
   rdma_resource_kind_e object_kind;
@@ -49,7 +49,7 @@ endclass
 // 只把 lease 置为 inactive，不回收容量也不复用地址，旧 owner/generation/kind 的地址
 // 因此不会重新生效；需要新 epoch 时应重新构造并配置 allocator。
 class rdma_hmc_allocator extends uvm_object;
-  `uvm_object_utils(rdma_hmc_allocator)
+  `rdma_object_utils(rdma_hmc_allocator)
 
   protected rdma_hmc_fvm_addr_t aperture_base;
   protected rdma_hmc_fvm_addr_t aperture_last;

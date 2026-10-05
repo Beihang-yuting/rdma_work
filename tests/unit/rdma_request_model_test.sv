@@ -3166,7 +3166,79 @@ class rdma_request_model_test extends uvm_test;
       `uvm_fatal("SGE_ALIAS_RQE", "RQE clone type mismatch")
     copies = rqe_clone.sges;
     check_sge_alias_list("SGE_ALIAS_RQE", sge, copies);
+    check_field_alias_copy();
   endtask
+
+  // 功能：同一对象被多个字段或嵌套层共享时，clone 后每处都须是完整、独立的值副本：
+  //   create-QP 请求的 send/recv CQ 句柄、post-send 的 qp_h/completion_qp_h，以及 QP backing plan 内
+  //   两个 backing ref 共享的同一 mapping（跨层：plan → ref → mapping）。
+  // 输入/输出及副作用：只创建本地对象。
+  // 失败/边界：任一副本丢值或与源/彼此别名时报告 FIELD_ALIAS_* UVM_ERROR。
+  task automatic check_field_alias_copy();
+    rdma_handle cq_h;
+    rdma_handle qp_h;
+    rdma_create_qp_req qp_req;
+    rdma_create_qp_req qp_req_clone;
+    rdma_post_send_req send_req;
+    rdma_post_send_req send_clone;
+    rdma_dma_mapping mapping;
+    rdma_qp_backing_ref sq_ref;
+    rdma_qp_backing_ref pd_ref;
+    rdma_qp_backing_plan plan;
+    rdma_qp_backing_plan plan_clone;
+    uvm_object cloned;
+
+    cq_h = make_handle("alias_cq", RDMA_RESOURCE_CQ, 32'h77);
+    qp_h = make_handle("alias_qp", RDMA_RESOURCE_QP, 32'h78);
+    qp_req = rdma_create_qp_req::type_id::create("alias_qp_req");
+    qp_req.send_cq_h = cq_h;
+    qp_req.recv_cq_h = cq_h;
+    cloned = qp_req.clone();
+    if (!$cast(qp_req_clone, cloned))
+      `uvm_fatal("FIELD_ALIAS_CQ", "create-QP clone type mismatch")
+    check_handle_copy("FIELD_ALIAS_SEND_CQ", cq_h, qp_req_clone.send_cq_h);
+    check_handle_copy("FIELD_ALIAS_RECV_CQ", cq_h, qp_req_clone.recv_cq_h);
+    if (qp_req_clone.send_cq_h == qp_req_clone.recv_cq_h)
+      `uvm_error("FIELD_ALIAS_CQ", "clone shares one CQ handle between two fields")
+
+    send_req = rdma_post_send_req::type_id::create("alias_send_req");
+    send_req.qp_h = qp_h;
+    send_req.completion_qp_h = qp_h;
+    cloned = send_req.clone();
+    if (!$cast(send_clone, cloned))
+      `uvm_fatal("FIELD_ALIAS_QP", "post-send clone type mismatch")
+    check_handle_copy("FIELD_ALIAS_QP_H", qp_h, send_clone.qp_h);
+    check_handle_copy("FIELD_ALIAS_COMPLETION_QP", qp_h, send_clone.completion_qp_h);
+
+    mapping = rdma_dma_mapping::type_id::create("alias_mapping");
+    mapping.iova.value = 64'h0000_5000_0000_0000;
+    mapping.size = 64'h2000;
+    sq_ref = rdma_qp_backing_ref::type_id::create("alias_sq_ref");
+    sq_ref.mapping = mapping;
+    pd_ref = rdma_qp_backing_ref::type_id::create("alias_pd_ref");
+    pd_ref.mapping = mapping;
+    plan = rdma_qp_backing_plan::type_id::create("alias_plan");
+    plan.sq_ref = sq_ref;
+    plan.sq_pd_ref = pd_ref;
+    cloned = plan.clone();
+    if (!$cast(plan_clone, cloned))
+      `uvm_fatal("FIELD_ALIAS_PLAN", "QP plan clone type mismatch")
+    if (plan_clone.sq_ref == null || plan_clone.sq_pd_ref == null ||
+        plan_clone.sq_ref.mapping == null || plan_clone.sq_pd_ref.mapping == null ||
+        plan_clone.sq_ref.mapping == mapping || plan_clone.sq_pd_ref.mapping == mapping ||
+        plan_clone.sq_ref.mapping.iova != mapping.iova ||
+        plan_clone.sq_pd_ref.mapping.iova != mapping.iova ||
+        plan_clone.sq_pd_ref.mapping.size != mapping.size)
+      `uvm_error("FIELD_ALIAS_PLAN", "shared mapping lost its value in a nested plan clone")
+  endtask
+
+  // 功能：断言 copy 是 source 的独立同值句柄副本。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：不符时报告 label 对应的 UVM_ERROR。
+  function void check_handle_copy(string label, rdma_handle source, rdma_handle copy);
+    if (copy == null || copy == source || !copy.same_instance(source))
+      `uvm_error(label, "handle copy is missing, aliased or lost its identity")
+  endfunction
 
   // 功能：断言 copies 为 3 个与 source 同值、互不相同且不等于 source 的 SGE。
   // 输入/输出及副作用：只读。

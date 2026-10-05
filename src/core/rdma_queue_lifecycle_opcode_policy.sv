@@ -10,7 +10,7 @@
 // CQ post-delete flush、ambiguous recovery 与错误优先级仍由 executor 决定；未知 kind
 // fail-closed 为 8'h00。
 class rdma_queue_lifecycle_opcode_policy extends uvm_object;
-  `uvm_object_utils(rdma_queue_lifecycle_opcode_policy)
+  `rdma_object_utils(rdma_queue_lifecycle_opcode_policy)
 
   // 功能：构造无状态 opcode policy 对象。
   // 输入/输出及副作用：name 为 UVM 对象名；不保存任何引用。

@@ -10,7 +10,7 @@
 // 设计说明：engine 是 CMQ runtime、journal、fence 与复位代际的唯一可变所有者，snapshot/value helper
 //  不另建账本；任何发布须先通过锁内身份检查。
 class rdma_cmq_engine extends uvm_object;
-  `uvm_object_utils(rdma_cmq_engine)
+  `rdma_object_utils(rdma_cmq_engine)
 
   localparam int unsigned CMQ_DEPTH = 32;
   localparam int unsigned CMQE_BYTES = 64;

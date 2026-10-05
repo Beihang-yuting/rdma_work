@@ -25,7 +25,7 @@ package rdma_codec_pkg;
   // CQE layout is an immutable value object describing profile size and the
   // byte offset at which the common completion header starts.
   class rdma_cqe_layout extends uvm_object;
-    `uvm_object_utils(rdma_cqe_layout)
+    `rdma_object_utils(rdma_cqe_layout)
     rdma_cqe_size_e size_profile;
     int unsigned bytes;
     int unsigned header_offset;

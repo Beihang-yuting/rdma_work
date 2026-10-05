@@ -13,7 +13,7 @@ typedef enum bit [1:0] {
 } rdma_tb_dma_result_e;
 
 class rdma_tb_dma extends uvm_object;
-  `uvm_object_utils(rdma_tb_dma)
+  `rdma_object_utils(rdma_tb_dma)
 
   rdma_tb_node_cfg cfg;
 

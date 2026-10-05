@@ -8,7 +8,7 @@
 // 设计说明：SQ/RQ/CQ/CEQ/AEQ 与 runtime 共用同一环回规则，集中后消除多份 `i + 1 >= depth`
 //   实现，同时 geometry admission、错误优先级和提交顺序仍由各 caller 保留。
 class rdma_queue_cursor_policy extends uvm_object;
-  `uvm_object_utils(rdma_queue_cursor_policy)
+  `rdma_object_utils(rdma_queue_cursor_policy)
 
   // 功能：构造无状态 cursor policy 对象。
   // 输入/输出及副作用：name 为 UVM 对象名；不保存 depth 或 cursor。

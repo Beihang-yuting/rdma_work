@@ -65,7 +65,7 @@ function automatic bit rdma_cmq_is_context_opcode(input bit [7:0] opcode);
 endfunction
 
 class rdma_hw_cmq_envelope extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_envelope)
+  `rdma_object_utils(rdma_hw_cmq_envelope)
 
   bit valid;
   bit vfid_override;
@@ -127,7 +127,7 @@ class rdma_hw_cmq_envelope extends uvm_object;
 endclass
 
 class rdma_hw_cmq_completion extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_completion)
+  `rdma_object_utils(rdma_hw_cmq_completion)
 
   bit owner;
   bit [7:0] opcode;
@@ -167,7 +167,7 @@ class rdma_hw_cmq_completion extends uvm_object;
 endclass
 
 class rdma_hw_cmq_completion_codec extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_completion_codec)
+  `rdma_object_utils(rdma_hw_cmq_completion_codec)
 
   // 功能：构造 rdma_hw_cmq_completion_codec，设置默认字段。
   // 输入/输出及副作用：name 为 UVM 实例名；仅调用 super.new。
@@ -461,7 +461,7 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
 endclass
 
 class rdma_hw_qpc_command_body extends rdma_hw_model;
-  `uvm_object_utils(rdma_hw_qpc_command_body)
+  `rdma_object_utils(rdma_hw_qpc_command_body)
 
   rdma_handle qp_h;
   rdma_handle send_cq_h;
@@ -547,7 +547,7 @@ class rdma_hw_qpc_command_body extends rdma_hw_model;
 endclass
 
 class rdma_hw_object_id_command_body extends rdma_hw_model;
-  `uvm_object_utils(rdma_hw_object_id_command_body)
+  `rdma_object_utils(rdma_hw_object_id_command_body)
 
   rdma_handle object_h;
 
@@ -594,7 +594,7 @@ endclass
 // 设计说明：CQC_DELETE 的 wire body 与 CQC_QUERY 不同——驱动会把 live CQC context 的前 56 字节原样复制到 WQE。
 // 单独的 typed body 迫使调用方提供完整 context，避免把只有 CQN 的 object body 误当成可发送请求。
 class rdma_hw_cqc_delete_body extends rdma_hw_model;
-  `uvm_object_utils(rdma_hw_cqc_delete_body)
+  `rdma_object_utils(rdma_hw_cqc_delete_body)
 
   rdma_cqc_model cqc_context;
 
@@ -673,7 +673,7 @@ class rdma_hw_cqc_delete_body extends rdma_hw_model;
 endclass
 
 class rdma_hw_mr_deregister_body extends rdma_hw_model;
-  `uvm_object_utils(rdma_hw_mr_deregister_body)
+  `rdma_object_utils(rdma_hw_mr_deregister_body)
 
   rdma_handle mr_h;
   bit [7:0] stag_key;
@@ -727,7 +727,7 @@ class rdma_hw_mr_deregister_body extends rdma_hw_model;
 endclass
 
 class rdma_hw_occ_flush_body extends rdma_hw_model;
-  `uvm_object_utils(rdma_hw_occ_flush_body)
+  `rdma_object_utils(rdma_hw_occ_flush_body)
 
   bit vf_flush;
   bit mr_serial_flush;
@@ -849,7 +849,7 @@ class rdma_hw_occ_flush_body extends rdma_hw_model;
 endclass
 
 class rdma_hw_cmq_empty_body extends rdma_hw_model;
-  `uvm_object_utils(rdma_hw_cmq_empty_body)
+  `rdma_object_utils(rdma_hw_cmq_empty_body)
 
   // 功能：构造 rdma_hw_cmq_empty_body，设置默认字段。
   // 输入/输出及副作用：name 为 UVM 实例名；仅调用 super.new。
@@ -894,7 +894,7 @@ class rdma_hw_cmq_body_token extends uvm_object;
 endclass
 
 class rdma_hw_cmq_body_image extends rdma_hw_image;
-  `uvm_object_utils(rdma_hw_cmq_body_image)
+  `rdma_object_utils(rdma_hw_cmq_body_image)
 
   local rdma_hw_cmq_body_token producer_token;
   local bit [7:0] producer_opcode;
@@ -1770,7 +1770,7 @@ class rdma_hw_cmq_empty_layout_codec
 endclass
 
 class rdma_hw_cmq_light_body_codec extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_light_body_codec)
+  `rdma_object_utils(rdma_hw_cmq_light_body_codec)
 
   protected rdma_hw_cmq_light_layout_codec codecs[256];
 
@@ -1850,7 +1850,7 @@ class rdma_hw_cmq_light_body_codec extends uvm_object;
 endclass
 
 class rdma_hw_cmq_body_encoder extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_body_encoder)
+  `rdma_object_utils(rdma_hw_cmq_body_encoder)
 
   protected rdma_hw_cmq_light_body_codec light_codec;
   protected rdma_codec_registry context_codecs;
@@ -1902,7 +1902,7 @@ endclass
 // 设计说明：0.1.34 CMQ 的请求与完成共享 64 字节 WQE；描述符把驱动 opcode、长度、位所有权与完成返回片段
 // 放在同一处，避免编码器与 checker 各自维护一份表。
 class rdma_cmq_opcode_descriptor extends uvm_object;
-  `uvm_object_utils(rdma_cmq_opcode_descriptor)
+  `rdma_object_utils(rdma_cmq_opcode_descriptor)
 
   bit [7:0] opcode;
   string symbolic_name;
@@ -1989,7 +1989,7 @@ endclass
 // 设计说明：CMQ registry 是 profile 的唯一 opcode 权威，只保存固定 0.1.34 数据；lookup 返回快照，
 // 未知命令与调用方篡改都不会影响后续 ring 提交。
 class rdma_cmq_codec_registry extends uvm_object;
-  `uvm_object_utils(rdma_cmq_codec_registry)
+  `rdma_object_utils(rdma_cmq_codec_registry)
 
   localparam int unsigned MAX_OPCODE = RDMA_OP_OCC_PD_KICKOUT;
   static rdma_cmq_opcode_descriptor descriptors[256];
@@ -2489,7 +2489,7 @@ class rdma_cmq_codec_registry extends uvm_object;
 endclass
 
 class rdma_hw_cmq_body_registry extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_body_registry)
+  `rdma_object_utils(rdma_hw_cmq_body_registry)
 
   protected bit registered[256];
   protected rdma_image_kind_e input_kinds[256];
@@ -2687,7 +2687,7 @@ function automatic rdma_status rdma_register_cmq_request_bodies(
 endfunction
 
 class rdma_hw_cmq_envelope_codec extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_envelope_codec)
+  `rdma_object_utils(rdma_hw_cmq_envelope_codec)
 
   // 功能：构造 rdma_hw_cmq_envelope_codec，设置默认字段。
   // 输入/输出及副作用：name 为 UVM 实例名；仅调用 super.new。
@@ -2761,7 +2761,7 @@ class rdma_hw_cmq_envelope_codec extends uvm_object;
 endclass
 
 class rdma_hw_cmq_request_composer extends uvm_object;
-  `uvm_object_utils(rdma_hw_cmq_request_composer)
+  `rdma_object_utils(rdma_hw_cmq_request_composer)
 
   protected rdma_hw_cmq_body_registry ownership;
   protected rdma_hw_cmq_envelope_codec envelope_codec;

@@ -39,7 +39,7 @@ typedef enum bit [2:0] {
 } rdma_sq_payload_mode_e;
 
 class rdma_cmq_sqe_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_cmq_sqe_model)
+  `rdma_object_utils(rdma_cmq_sqe_model)
 
   rdma_cmq_opcode_e opcode;
   longint unsigned command_id;
@@ -171,7 +171,7 @@ class rdma_cmq_sqe_model extends rdma_hw_model;
 endclass
 
 class rdma_cmq_completion_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_cmq_completion_model)
+  `rdma_object_utils(rdma_cmq_completion_model)
 
   rdma_cmq_opcode_e opcode;
   longint unsigned command_id;
@@ -261,7 +261,7 @@ virtual class rdma_sqe_transport_ext extends uvm_object;
 endclass
 
 class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
-  `uvm_object_utils(rdma_sqe_rc_ext)
+  `rdma_object_utils(rdma_sqe_rc_ext)
 
   rdma_iova_t remote_addr;
   bit [31:0] rkey;
@@ -343,7 +343,7 @@ class rdma_sqe_rc_ext extends rdma_sqe_transport_ext;
 endclass
 
 class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
-  `uvm_object_utils(rdma_sqe_ud_ext)
+  `rdma_object_utils(rdma_sqe_ud_ext)
 
   bit [23:0] destination_qpn;
   bit [31:0] qkey;
@@ -416,7 +416,7 @@ class rdma_sqe_ud_ext extends rdma_sqe_transport_ext;
 endclass
 
 class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
-  `uvm_object_utils(rdma_sqe_urc_ext)
+  `rdma_object_utils(rdma_sqe_urc_ext)
 
   bit [23:0] destination_qpn;
   rdma_handle completion_qp_h;
@@ -502,7 +502,7 @@ class rdma_sqe_urc_ext extends rdma_sqe_transport_ext;
 endclass
 
 class rdma_sqe_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_sqe_model)
+  `rdma_object_utils(rdma_sqe_model)
 
   rdma_transport_e transport;
   rdma_work_opcode_e opcode;
@@ -673,7 +673,7 @@ class rdma_sqe_model extends rdma_hw_model;
 endclass
 
 class rdma_rqe_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_rqe_model)
+  `rdma_object_utils(rdma_rqe_model)
 
   rdma_handle target_h;
   longint unsigned wr_id;
@@ -738,7 +738,7 @@ class rdma_rqe_model extends rdma_hw_model;
 endclass
 
 class rdma_cqe_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_cqe_model)
+  `rdma_object_utils(rdma_cqe_model)
 
   rdma_handle qp_h;
   longint unsigned wr_id;
@@ -805,7 +805,7 @@ class rdma_cqe_model extends rdma_hw_model;
 endclass
 
 class rdma_ceqe_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_ceqe_model)
+  `rdma_object_utils(rdma_ceqe_model)
 
   rdma_handle cq_h;
   int unsigned producer_index;
@@ -858,7 +858,7 @@ class rdma_ceqe_model extends rdma_hw_model;
 endclass
 
 class rdma_aeqe_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_aeqe_model)
+  `rdma_object_utils(rdma_aeqe_model)
 
   rdma_handle target_h;
   int unsigned event_code;
@@ -916,7 +916,7 @@ class rdma_aeqe_model extends rdma_hw_model;
 endclass
 
 class rdma_doorbell_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_doorbell_model)
+  `rdma_object_utils(rdma_doorbell_model)
 
   rdma_doorbell_kind_e kind;
   rdma_handle target_h;

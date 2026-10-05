@@ -25,7 +25,7 @@ endfunction
 // 一条 verb 请求：本地 buffer 位于节点数据 MR 的 local_offset，远端地址位于对端数据 MR 的
 //   remote_offset；SEND/WRITE 的源数据放在 data，由 driver 在投递前写入 host 内存。
 class rdma_verb_item extends uvm_sequence_item;
-  `uvm_object_utils(rdma_verb_item)
+  `rdma_object_utils(rdma_verb_item)
 
   rdma_verb_op_e op;
   int unsigned qp_index;
@@ -102,7 +102,7 @@ endclass
 
 // monitor 观测到的一条完成。
 class rdma_verb_completion extends uvm_object;
-  `uvm_object_utils(rdma_verb_completion)
+  `rdma_object_utils(rdma_verb_completion)
 
   int unsigned node_id;
   longint unsigned wr_id;

@@ -10,6 +10,7 @@ class rdma_handle extends uvm_object;
     `uvm_field_int(object_id, UVM_DEFAULT)
     `uvm_field_int(generation, UVM_DEFAULT)
   `uvm_object_utils_end
+  `rdma_alias_safe_clone
 
   rdma_resource_kind_e kind;
   longint unsigned function_uid;
@@ -56,7 +57,7 @@ class rdma_handle extends uvm_object;
 endclass
 
 class rdma_function_handle extends rdma_handle;
-  `uvm_object_utils(rdma_function_handle)
+  `rdma_object_utils(rdma_function_handle)
 
   // 功能：构造 Function 句柄，kind 固定为 RDMA_RESOURCE_FUNCTION。
   // 输入/输出及副作用：name 为 UVM 对象名。

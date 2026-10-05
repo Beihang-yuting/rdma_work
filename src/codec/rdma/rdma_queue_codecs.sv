@@ -85,7 +85,7 @@ class rdma_queue_codec;
 endclass
 
 class rdma_hw_sqe_model extends rdma_sqe_model;
-  `uvm_object_utils(rdma_hw_sqe_model)
+  `rdma_object_utils(rdma_hw_sqe_model)
   bit [20:0] qpn;
   bit [2:0] icos;
   bit [7:0] qp_sn;
@@ -395,7 +395,7 @@ class rdma_hw_sqe_model extends rdma_sqe_model;
 endclass
 
 class rdma_hw_rqe_model extends rdma_rqe_model;
-  `uvm_object_utils(rdma_hw_rqe_model)
+  `rdma_object_utils(rdma_hw_rqe_model)
   bit [23:0] qpn;
   bit [7:0] qp_sn;
   bit [3:0] hw_opcode;
@@ -841,7 +841,7 @@ class rdma_hw_rqe_model extends rdma_rqe_model;
 endclass
 
 class rdma_hw_cqe_model extends rdma_cqe_model;
-  `uvm_object_utils(rdma_hw_cqe_model)
+  `rdma_object_utils(rdma_hw_cqe_model)
 
   // wr.h 的公共 qword0/qword1 字段。
   rdma_cqe_variant_e variant;
@@ -1016,7 +1016,7 @@ class rdma_hw_cqe_model extends rdma_cqe_model;
 endclass
 
 class rdma_hw_ceqe_model extends rdma_ceqe_model;
-  `uvm_object_utils(rdma_hw_ceqe_model)
+  `rdma_object_utils(rdma_hw_ceqe_model)
   bit [20:0] qpn;
   bit [20:0] cqn;
   bit [7:0] ecode;
@@ -1151,7 +1151,7 @@ class rdma_hw_ceqe_model extends rdma_ceqe_model;
 endclass
 
 class rdma_hw_aeqe_model extends rdma_aeqe_model;
-  `uvm_object_utils(rdma_hw_aeqe_model)
+  `rdma_object_utils(rdma_hw_aeqe_model)
   bit [17:0] qpn;
   bit [2:0] qp_state;
   bit [7:0] ecode;
@@ -1897,7 +1897,7 @@ function automatic rdma_status validate_sq_signature(
 endfunction
 
 class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
-  `uvm_object_utils(rdma_hw_sqe_rc_codec)
+  `rdma_object_utils(rdma_hw_sqe_rc_codec)
   protected rdma_sq_payload_mode_e last_mode;
   protected bit [3:0] last_hw_opcode;
 
@@ -2744,7 +2744,7 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
 endclass
 
 class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
-  `uvm_object_utils(rdma_hw_sqe_ud_codec)
+  `rdma_object_utils(rdma_hw_sqe_ud_codec)
   // 功能：构造 UD SQE codec。
   // 输入/输出及副作用：name 传给 super.new。
   // 失败/边界：无。
@@ -3015,7 +3015,7 @@ class rdma_hw_sqe_ud_codec extends rdma_hw_sqe_rc_codec;
 endclass
 
 class rdma_hw_sqe_urc_codec extends rdma_hw_sqe_rc_codec;
-  `uvm_object_utils(rdma_hw_sqe_urc_codec)
+  `rdma_object_utils(rdma_hw_sqe_urc_codec)
   // 功能：构造 URC SQE codec。
   // 输入/输出及副作用：name 传给 super.new。
   // 失败/边界：无。
@@ -3168,7 +3168,7 @@ class rdma_hw_sqe_urc_codec extends rdma_hw_sqe_rc_codec;
 endclass
 
 class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
-  `uvm_object_utils(rdma_hw_rqe_codec)
+  `rdma_object_utils(rdma_hw_rqe_codec)
 
   // decode_fields 仅在构造 detached external model 的瞬间开启此 capability 窗口；
   // 以对象 identity 比较 active model，防止 fresh caller 伪造 raw marker。
@@ -3635,7 +3635,7 @@ class rdma_hw_rqe_codec extends rdma_hw_queue_codec_base;
 endclass
 
 class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
-  `uvm_object_utils(rdma_hw_cqe_codec)
+  `rdma_object_utils(rdma_hw_cqe_codec)
   protected int unsigned active_bytes;
   protected rdma_cqe_variant_e active_variant;
   protected bit variant_is_explicit;
@@ -4445,7 +4445,7 @@ class rdma_hw_cqe_codec extends rdma_hw_queue_codec_base;
 endclass
 
 class rdma_hw_ceqe_codec extends rdma_hw_queue_codec_base;
-  `uvm_object_utils(rdma_hw_ceqe_codec)
+  `rdma_object_utils(rdma_hw_ceqe_codec)
 
   // 功能：构造 CEQE codec。
   // 输入/输出及副作用：name 传给 super.new。
@@ -4785,7 +4785,7 @@ class rdma_hw_ceqe_codec extends rdma_hw_queue_codec_base;
 endclass
 
 class rdma_hw_aeqe_codec extends rdma_hw_queue_codec_base;
-  `uvm_object_utils(rdma_hw_aeqe_codec)
+  `rdma_object_utils(rdma_hw_aeqe_codec)
 
   // 功能：构造 AEQE codec。
   // 输入/输出及副作用：name 传给 super.new。

@@ -10,7 +10,7 @@
 // 首次 flush 后必须由 engine 的 flushed_shadow canonical cache 覆盖。policy 只验证不可伪造
 // 的 Function/CQ identity，避免把“canonical overwrite”误写成 caller payload 的二次提交。
 class rdma_cq_shadow_replay_policy extends uvm_object;
-  `uvm_object_utils(rdma_cq_shadow_replay_policy)
+  `rdma_object_utils(rdma_cq_shadow_replay_policy)
 
   // 功能：构造无状态的 CQ shadow replay policy 对象，不绑定 CQ、delegate 或 cache。
   // 输入/输出及副作用：name 为 UVM 名；不持有外部资源。

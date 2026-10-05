@@ -7,7 +7,7 @@
 //   保存本次 sequence 的非拥有引用，失败时负责调用 allocator.release()，成功后由调用方管理。
 
 class rdma_sriov_enumerator extends uvm_object;
-  `uvm_object_utils(rdma_sriov_enumerator)
+  `rdma_object_utils(rdma_sriov_enumerator)
 
   protected rdma_pcie_api pcie;
   protected rdma_pcie_bar_allocator allocator;
@@ -724,7 +724,7 @@ endclass
 // 输入/输出及副作用：继承 configure()/enumerate_and_configure_pf() 的全部接口和状态。
 // 失败/边界：该兼容类不增加影子 Function topology，也不改变 enumerator 的回滚语义。
 class rdma_function_manager extends rdma_sriov_enumerator;
-  `uvm_object_utils(rdma_function_manager)
+  `rdma_object_utils(rdma_function_manager)
 
   // 功能：构造兼容 facade 并初始化基类 enumerator。
   // 输入/输出及副作用：name（输入）；只调用 super.new，不创建外部 PCIe 资源。

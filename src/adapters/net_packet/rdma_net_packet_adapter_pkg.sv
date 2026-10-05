@@ -62,7 +62,7 @@ package rdma_net_packet_adapter_pkg;
   endclass
 
   class rdma_net_packet_adapter extends rdma_net_api;
-    `uvm_object_utils(rdma_net_packet_adapter)
+    `rdma_object_utils(rdma_net_packet_adapter)
 
     local rdma_net_packet_sink sink;
     local rdma_function_identity authority;

@@ -14,7 +14,7 @@ typedef enum bit [1:0] {
 } rdma_lifecycle_domain_e;
 
 class rdma_lifecycle_result_seed extends uvm_object;
-  `uvm_object_utils(rdma_lifecycle_result_seed)
+  `rdma_object_utils(rdma_lifecycle_result_seed)
 
   longint unsigned transaction_id;
   rdma_lifecycle_domain_e domain;

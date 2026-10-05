@@ -34,7 +34,7 @@ function automatic rdma_status rdma_hw_host_mem_rollback(
   endfunction
 
 class rdma_queue_host_mem_target extends uvm_object;
-  `uvm_object_utils(rdma_queue_host_mem_target)
+  `rdma_object_utils(rdma_queue_host_mem_target)
 
   // capability 刻意不是地址或 mapping，仅供 submitter 查找私有 ledger 记录。
   local string capability;
@@ -60,7 +60,7 @@ class rdma_queue_host_mem_target extends uvm_object;
 endclass
 
 class rdma_queue_host_mem_ledger_entry extends uvm_object;
-  `uvm_object_utils(rdma_queue_host_mem_ledger_entry)
+  `rdma_object_utils(rdma_queue_host_mem_ledger_entry)
 
   rdma_dma_mapping mapping;
   rdma_dma_mapping release_authority;
@@ -84,7 +84,7 @@ class rdma_queue_host_mem_ledger_entry extends uvm_object;
 endclass
 
 class rdma_queue_host_mem_submitter extends uvm_object;
-  `uvm_object_utils(rdma_queue_host_mem_submitter)
+  `rdma_object_utils(rdma_queue_host_mem_submitter)
 
   rdma_host_mem_api host_mem;
   rdma_codec_registry registry;

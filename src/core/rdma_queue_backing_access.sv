@@ -7,7 +7,7 @@
 
 // span 保留逻辑与物理偏移以跨 mapping 拼接数据；mapping 生命周期始终由外部 owner 管理。
 class rdma_queue_backing_span extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_span)
+  `rdma_object_utils(rdma_queue_backing_span)
 
   rdma_dma_mapping mapping;
   longint unsigned mapping_offset;
@@ -28,7 +28,7 @@ endclass
 
 // access 只提供地址与 DMA 权限边界；预检不能保证后端原子写入，调用方负责部分失败恢复。
 class rdma_queue_backing_access extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_access)
+  `rdma_object_utils(rdma_queue_backing_access)
 
   protected rdma_function_handle owner;
   protected rdma_host_mem_api host_mem;

@@ -7,7 +7,7 @@
 // 设计说明：只隔离 CMQ 与通用 scheduler 的调用契约，不缓存任何状态。委托后 I/O 可能
 //   已发生，故返回 envelope 不能 clone，未知结果也不能降级成 PRE_SUBMIT_REJECTED。
 class rdma_cmq_transport extends uvm_object;
-  `uvm_object_utils(rdma_cmq_transport)
+  `rdma_object_utils(rdma_cmq_transport)
 
   protected rdma_doorbell_scheduler scheduler;
   protected bit configured;

@@ -9,7 +9,7 @@
 // 设计说明：facade 提供 typed API，mutation 权威仍在唯一 queue-data engine；
 // 非拥有 delegate 与冻结的 Function 坐标阻断 reset/rebind 后的旧 facade。
 class rdma_cq_engine extends rdma_queue_facade;
-  `uvm_object_utils(rdma_cq_engine)
+  `rdma_object_utils(rdma_cq_engine)
 
   protected bit shared_configured;
   protected rdma_handle shared_cq_h;

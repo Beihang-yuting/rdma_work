@@ -6,7 +6,7 @@
 
 // 本地 QP 与对端 (节点, QP 下标) 的连接关系。
 class rdma_tb_qp_link extends uvm_object;
-  `uvm_object_utils(rdma_tb_qp_link)
+  `rdma_object_utils(rdma_tb_qp_link)
 
   rdma_qp qp;
   int unsigned peer_node;
@@ -24,7 +24,7 @@ class rdma_tb_qp_link extends uvm_object;
 endclass
 
 class rdma_tb_node_cfg extends uvm_object;
-  `uvm_object_utils(rdma_tb_node_cfg)
+  `rdma_object_utils(rdma_tb_node_cfg)
 
   int unsigned node_id;
   rdma_queue_data_engine engine;

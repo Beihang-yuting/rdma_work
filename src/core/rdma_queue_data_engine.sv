@@ -22,7 +22,7 @@
 // 设计说明：engine 是 lifecycle 资源与 runtime/backing/scheduler 之间的编排层；拥有 attachment/link/
 // recovery 索引与 detached 结果，不拥有 manager、binding、Host-memory、scheduler 或 mapping。
 class rdma_queue_data_engine extends uvm_object;
-  `uvm_object_utils(rdma_queue_data_engine)
+  `rdma_object_utils(rdma_queue_data_engine)
 
   // 值操作集中到无状态 projector；别名只缩短调用限定。
   typedef rdma_queue_data_projector value_ops;

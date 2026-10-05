@@ -8,7 +8,7 @@
 // 由各业务层负责，不能由诊断值推导提交结果。
 
 class rdma_status extends uvm_object;
-  `uvm_object_utils(rdma_status)
+  `rdma_object_utils(rdma_status)
 
   rdma_status_category_e category;
   rdma_status_code_e code;

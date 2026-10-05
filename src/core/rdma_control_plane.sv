@@ -6,7 +6,7 @@
 // 所有权与生命周期：外部依赖为非拥有引用；本类拥有 Function 锁表、事务号与 executor 对象。
 
 class rdma_control_plane extends uvm_object;
-  `uvm_object_utils(rdma_control_plane)
+  `rdma_object_utils(rdma_control_plane)
 
   protected rdma_resource_manager manager;
   protected rdma_cmq_port cmq;

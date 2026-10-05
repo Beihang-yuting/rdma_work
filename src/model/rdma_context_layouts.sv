@@ -38,7 +38,7 @@ typedef enum bit {
 } rdma_mr_address_mode_e;
 
 class rdma_ring_position extends uvm_object;
-  `uvm_object_utils(rdma_ring_position)
+  `rdma_object_utils(rdma_ring_position)
 
   int unsigned index;
   bit wrap;
@@ -81,7 +81,7 @@ class rdma_ring_position extends uvm_object;
 endclass
 
 class rdma_page_table_layout extends uvm_object;
-  `uvm_object_utils(rdma_page_table_layout)
+  `rdma_object_utils(rdma_page_table_layout)
 
   rdma_object_mode_e mode;
   rdma_backing_addr_t sd_base;
@@ -147,7 +147,7 @@ class rdma_page_table_layout extends uvm_object;
 endclass
 
 class rdma_address_vector extends uvm_object;
-  `uvm_object_utils(rdma_address_vector)
+  `rdma_object_utils(rdma_address_vector)
 
   int unsigned source_address_index;
   int unsigned source_vport;
@@ -247,7 +247,7 @@ class rdma_address_vector extends uvm_object;
 endclass
 
 class rdma_urc_queue_config extends uvm_object;
-  `uvm_object_utils(rdma_urc_queue_config)
+  `rdma_object_utils(rdma_urc_queue_config)
 
   rdma_backing_addr_t rsq_backing;
   rdma_backing_addr_t rdsq_backing;
@@ -344,7 +344,7 @@ class rdma_urc_queue_config extends uvm_object;
 endclass
 
 class rdma_mr_page_layout extends uvm_object;
-  `uvm_object_utils(rdma_mr_page_layout)
+  `rdma_object_utils(rdma_mr_page_layout)
 
   rdma_mr_pbl_mode_e pbl_mode;
   rdma_mr_host_page_size_e host_page_size;

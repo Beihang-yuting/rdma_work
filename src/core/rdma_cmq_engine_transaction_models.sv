@@ -79,7 +79,7 @@ function automatic bit rdma_cmq_format_batch_key(
 endfunction
 
 class rdma_cmq_slot_record extends uvm_object;
-  `uvm_object_utils(rdma_cmq_slot_record)
+  `rdma_object_utils(rdma_cmq_slot_record)
 
   longint unsigned slot_sequence;
   int unsigned sq_index;
@@ -139,7 +139,7 @@ endclass
 // 设计说明：单项预分配发布值把 journal request index 与 slot/registry 发布键绑定；
 //   仅在 engine 锁内持有，不形成第二份提交 authority。
 class rdma_cmq_preallocated_publish_item extends uvm_object;
-  `uvm_object_utils(rdma_cmq_preallocated_publish_item)
+  `rdma_object_utils(rdma_cmq_preallocated_publish_item)
 
   int unsigned request_index;
   rdma_cmq_slot_record slot_record;
@@ -163,7 +163,7 @@ endclass
 // 设计说明：批次预分配发布值保存 MMIO arm 原子提交所需的 sequence/profile 格式和有序单项；
 //   安装后由 arm 消费，PRE rollback、journal 删除或 reset 也会回收；arm 后 journal 仍保留证据。
 class rdma_cmq_preallocated_publish_batch extends uvm_object;
-  `uvm_object_utils(rdma_cmq_preallocated_publish_batch)
+  `rdma_object_utils(rdma_cmq_preallocated_publish_batch)
 
   string batch_key;
   longint unsigned attempt_id;
@@ -191,7 +191,7 @@ endclass
 // 设计说明：reset candidate 预建每个将被隔离的 runtime slot 与其 retained journal item 的
 //   定位和取消 completion；不拥有 runtime registry，commit 前不写回 engine。
 class rdma_cmq_reset_item_candidate extends uvm_object;
-  `uvm_object_utils(rdma_cmq_reset_item_candidate)
+  `rdma_object_utils(rdma_cmq_reset_item_candidate)
 
   string batch_key;
   // journal_item_index 为压紧后的 admitted-item 位置，须与 request_index 分开保存
@@ -221,7 +221,7 @@ endclass
 // 设计说明：reset batch candidate 保存一个 batch 的旧 journal 行、完整 proof 与 detached
 //   返回 proof；proof 仅在 backing release 成功后安装到 retained row。
 class rdma_cmq_reset_batch_candidate extends uvm_object;
-  `uvm_object_utils(rdma_cmq_reset_batch_candidate)
+  `rdma_object_utils(rdma_cmq_reset_batch_candidate)
 
   string batch_key;
   rdma_cmq_batch_submission_record quarantined_record;
@@ -245,7 +245,7 @@ endclass
 // 设计说明：reset candidate 是 release 前唯一的本地事务图，聚合旧 backing authority、
 //   逐项取消结果、逐 batch proof 及 caller 输出；commit 只消费这张图。
 class rdma_cmq_reset_candidate extends uvm_object;
-  `uvm_object_utils(rdma_cmq_reset_candidate)
+  `rdma_object_utils(rdma_cmq_reset_candidate)
 
   rdma_function_identity isolated_identity;
   rdma_dma_mapping backing_release_authority;

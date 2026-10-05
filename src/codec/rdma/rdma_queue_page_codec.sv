@@ -6,7 +6,7 @@
 // // 阅读提示：先看公开接口，再看实现；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_hw_queue_pd_entry extends uvm_object;
-  `uvm_object_utils(rdma_hw_queue_pd_entry)
+  `rdma_object_utils(rdma_hw_queue_pd_entry)
 
   rdma_iova_t page_iova;
   int unsigned rdma_vf_id;
@@ -24,7 +24,7 @@ class rdma_hw_queue_pd_entry extends uvm_object;
 endclass
 
 class rdma_hw_queue_pd_codec extends uvm_object;
-  `uvm_object_utils(rdma_hw_queue_pd_codec)
+  `rdma_object_utils(rdma_hw_queue_pd_codec)
 
   localparam int unsigned PAGE_BYTES = 4096;
   localparam int unsigned MAX_PAGES = 512;

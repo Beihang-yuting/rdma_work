@@ -11,7 +11,7 @@ package rdma_net_packet_bridge_pkg;
   `include "uvm_macros.svh"
 
   class rdma_net_packet_queue_sink extends rdma_net_packet_sink;
-    `uvm_object_utils(rdma_net_packet_queue_sink)
+    `rdma_object_utils(rdma_net_packet_queue_sink)
 
     packet sent_packets[$];
     packet receive_queue[$];

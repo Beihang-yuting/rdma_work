@@ -6,7 +6,7 @@
 // // 阅读提示：先看公开接口，再看 case 映射；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_hw_error_codec extends uvm_object;
-  `uvm_object_utils(rdma_hw_error_codec)
+  `rdma_object_utils(rdma_hw_error_codec)
 
   // 功能：构造硬件错误码 codec。
   // 输入/输出及副作用：name 传给 super.new。

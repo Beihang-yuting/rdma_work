@@ -5,7 +5,7 @@
 
 // RQ 与 SQ 共用相同的 runtime authority，但通过 delegate 的 queue kind/handle 校验保持环隔离。
 class rdma_rq_engine extends rdma_queue_facade;
-  `uvm_object_utils(rdma_rq_engine)
+  `rdma_object_utils(rdma_rq_engine)
 
   // 功能：创建未配置的 RQ facade，不分配接收队列或 Host-memory。
   // 输入/输出及副作用：name（输入）；默认字段由基类写入。

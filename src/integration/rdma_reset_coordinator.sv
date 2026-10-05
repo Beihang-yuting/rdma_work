@@ -9,7 +9,7 @@
 //       coordinator 在一次同步调用中创建的一次性 opaque capability；router 不保存它，写入自身
 //       coordinator 引用前须向 coordinator 回验目标、方向与 owner/token，避免单侧绑定。
 class rdma_reset_router_attach_capability extends uvm_object;
-  `uvm_object_utils(rdma_reset_router_attach_capability)
+  `rdma_object_utils(rdma_reset_router_attach_capability)
 
   // 功能：构造 legacy Host-router attach 的一次性 opaque capability。
   // 输入/输出及副作用：name 为 UVM 对象名；无业务字段。
@@ -23,7 +23,7 @@ endclass
 // 资源；身份由 coordinator 暂存并回验。仅可在创建它的 coordinator 同步调用中使用一次，复制、
 // 伪造、跨 router/跨操作重放均在回验处被拒绝。
 class rdma_reset_router_owned_capability extends uvm_object;
-  `uvm_object_utils(rdma_reset_router_owned_capability)
+  `rdma_object_utils(rdma_reset_router_owned_capability)
 
   // 功能：构造 leased Host-router attach/detach 的一次性 opaque capability。
   // 输入/输出及副作用：name 为 UVM 对象名；无业务字段。
@@ -38,7 +38,7 @@ endclass
 // 函数比对。仅可在 request_host_reset() 的单次同步调用中使用，复制、伪造或跨 Host/router 重放
 // 均被回验拒绝。
 class rdma_reset_router_epoch_capability extends uvm_object;
-  `uvm_object_utils(rdma_reset_router_epoch_capability)
+  `rdma_object_utils(rdma_reset_router_epoch_capability)
 
   // 功能：构造 Host epoch capacity/advance publication 的一次性 opaque capability。
   // 输入/输出及副作用：name 为 UVM 对象名；无业务字段。
@@ -72,7 +72,7 @@ class rdma_reset_tokenless_admission_policy;
 endclass
 
 class rdma_reset_coordinator extends uvm_object;
-  `uvm_object_utils(rdma_reset_coordinator)
+  `rdma_object_utils(rdma_reset_coordinator)
   protected rdma_reset_epoch_t m_function_epochs[string];
   protected rdma_reset_epoch_t m_host_epochs[int unsigned];
   protected rdma_reset_epoch_t m_device_epoch;

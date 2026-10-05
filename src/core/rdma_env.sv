@@ -5,7 +5,7 @@
 //   句柄，释放由上层 adapter 环境负责。
 
 class rdma_env_event_route extends uvm_object;
-  `uvm_object_utils(rdma_env_event_route)
+  `rdma_object_utils(rdma_env_event_route)
   rdma_function_identity target_function;
   int unsigned vector;
   int unsigned generation;

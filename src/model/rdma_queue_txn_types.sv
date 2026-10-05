@@ -28,7 +28,7 @@ typedef enum bit [1:0] {
 
 class rdma_queue_cq_release_plan extends uvm_object;
   // // CQ WQE 释放计划由事务 evidence 创建并拥有，记录 index/wrap 与释放状态，不转移队列资源所有权。
-  `uvm_object_utils(rdma_queue_cq_release_plan)
+  `rdma_object_utils(rdma_queue_cq_release_plan)
   int unsigned index;
   bit wrap;
   bit released;
@@ -50,7 +50,7 @@ class rdma_queue_cq_release_plan extends uvm_object;
 endclass
 
 class rdma_queue_txn_evidence extends uvm_object;
-  `uvm_object_utils(rdma_queue_txn_evidence)
+  `rdma_object_utils(rdma_queue_txn_evidence)
   rdma_function_identity function_identity;
   rdma_handle queue_h;
   rdma_queue_cursor_value_t cursor;

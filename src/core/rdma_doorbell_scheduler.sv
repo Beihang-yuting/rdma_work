@@ -34,7 +34,7 @@ typedef enum bit {
 // 设计说明：单条 dependency 把要写入的 detached hardware image 与非拥有 DMA
 //   mapping 绑定，并显式标注 payload/context 阶段，避免 scheduler 猜测写入顺序。
 class rdma_doorbell_dependency extends uvm_object;
-  `uvm_object_utils(rdma_doorbell_dependency)
+  `rdma_object_utils(rdma_doorbell_dependency)
 
   longint unsigned dependency_id;
   rdma_doorbell_dependency_stage_e stage;
@@ -80,7 +80,7 @@ endclass
 // 设计说明：descriptor 冻结一次 doorbell 的 Function/target、BAR payload、总
 //   deadline 和有序 dependency 队列；调用方拥有原值，scheduler 只消费锁内快照。
 class rdma_doorbell_desc extends uvm_object;
-  `uvm_object_utils(rdma_doorbell_desc)
+  `rdma_object_utils(rdma_doorbell_desc)
 
   rdma_doorbell_kind_e kind;
   rdma_function_handle function_h;
@@ -198,7 +198,7 @@ endclass
 // 设计说明：doorbell result 只承载成功发布后的不可变 identity、绝对 BAR 地址
 //   以及 declared dependency 数；它不持有 adapter、mapping 或 caller descriptor。
 class rdma_doorbell_result extends uvm_object;
-  `uvm_object_utils(rdma_doorbell_result)
+  `rdma_object_utils(rdma_doorbell_result)
 
   rdma_doorbell_kind_e kind;
   rdma_function_handle function_h;
@@ -259,7 +259,7 @@ endclass
 // 设计说明：observed result 是每次 submit 独占的恢复证据 envelope；普通 UVM copy
 // 保留深复制语义，而 legacy 投影绕过 clone/factory，保证 hostile override 下仍非致命返回。
 class rdma_doorbell_submission_result extends uvm_object;
-  `uvm_object_utils(rdma_doorbell_submission_result)
+  `rdma_object_utils(rdma_doorbell_submission_result)
 
   rdma_doorbell_result doorbell_result;
   rdma_status status;
@@ -405,7 +405,7 @@ endclass
 // 设计说明：scheduler 以 Function identity semaphore 串行化同一 Function 的 doorbell，
 // 并把每次调用的不可回退副作用高水位发布到 call-local observed envelope。
 class rdma_doorbell_scheduler extends uvm_object;
-  `uvm_object_utils(rdma_doorbell_scheduler)
+  `rdma_object_utils(rdma_doorbell_scheduler)
 
   protected rdma_host_mem_api host_mem;
   protected rdma_pcie_api pcie;

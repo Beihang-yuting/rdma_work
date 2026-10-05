@@ -11,7 +11,7 @@ typedef class rdma_pbl;
 typedef class rdma_mw_binding;
 
 class rdma_dma_mapping extends uvm_object;
-  `uvm_object_utils(rdma_dma_mapping)
+  `rdma_object_utils(rdma_dma_mapping)
 
   rdma_function_handle function_h;
   rdma_bdf_t requester_bdf;

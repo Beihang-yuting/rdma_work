@@ -13,7 +13,7 @@ typedef struct {
 } rdma_queue_wq_target_contract_t;
 
 class rdma_queue_wq_target_policy extends uvm_object;
-  `uvm_object_utils(rdma_queue_wq_target_policy)
+  `rdma_object_utils(rdma_queue_wq_target_policy)
 
   // 功能：构造无状态 policy 对象。
   // 输入/输出及副作用：name 为对象名；不保存任何状态。

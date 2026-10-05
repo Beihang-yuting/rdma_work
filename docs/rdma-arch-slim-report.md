@@ -72,6 +72,11 @@ Python 门禁另删除约 4.8k 行（结构冻结类）。
    QP lifecycle executor 分配/清零/释放（释放顺序排在最后，不改变既有角色顺序），resource manager/projector/
    recovery 校验同步覆盖；queue-data engine 在 post_recv 有效 SGE>2 时写 SGB 槽并在 RQE 填 SGB_PA，host-producer
    recovery 重放时重写该槽。SQ/RQ 共用 `sgb_slot_iova` 槽位解析。新增 `check_rq_external_sgb` 单元检查。
+12. **对象别名复制修复**：UVM 1.2 `uvm_object::copy` 在一次顶层复制中按源对象记录 global copy map，同一对象
+   第二次被嵌套 clone 时直接返回默认值对象（SGE 列表重复元素、send/recv CQ 共用句柄、plan 内多处共享 mapping
+   等会静默丢值）。新增 `rdma_object_utils`（`types/rdma_object_macros.svh`），src 内全部对象类改用它，
+   提供 create + 字段自动化 + do_copy 的别名安全 clone()；测试子类覆盖 clone() 的故障注入语义不变。
+   `request_model_test` 覆盖列表、跨字段与跨层三类别名。
 
 ## 验证
 

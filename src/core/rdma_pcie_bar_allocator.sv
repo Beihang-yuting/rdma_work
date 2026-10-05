@@ -7,7 +7,7 @@
 //   lease 置 inactive，区间可复用。
 
 class rdma_pcie_bar_lease extends uvm_object;
-  `uvm_object_utils(rdma_pcie_bar_lease)
+  `rdma_object_utils(rdma_pcie_bar_lease)
 
   longint unsigned lease_id;
   rdma_bdf_t owner_pf_bdf;
@@ -31,7 +31,7 @@ class rdma_pcie_bar_lease extends uvm_object;
 endclass
 
 class rdma_pcie_bar_allocator extends uvm_object;
-  `uvm_object_utils(rdma_pcie_bar_allocator)
+  `rdma_object_utils(rdma_pcie_bar_allocator)
 
   protected bit configured;
   protected rdma_bar_addr_t aperture_base;

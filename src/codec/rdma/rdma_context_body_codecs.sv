@@ -513,7 +513,7 @@ endclass
 
 class rdma_hw_cqc_create_body_codec
     extends rdma_hw_context_body_codec_base;
-  `uvm_object_utils(rdma_hw_cqc_create_body_codec)
+  `rdma_object_utils(rdma_hw_cqc_create_body_codec)
 
   // 功能：构造 codec 对象。
   // 输入/输出及副作用：name 为对象名；仅调用 super.new。
@@ -1174,7 +1174,7 @@ endclass
 
 class rdma_hw_mrt_key_alloc_body_codec
     extends rdma_hw_mrt_body_codec_base;
-  `uvm_object_utils(rdma_hw_mrt_key_alloc_body_codec)
+  `rdma_object_utils(rdma_hw_mrt_key_alloc_body_codec)
 
   // 功能：构造 codec 对象。
   // 输入/输出及副作用：name 为对象名；仅调用 super.new。
@@ -1196,7 +1196,7 @@ endclass
 
 class rdma_hw_mrt_register_body_codec
     extends rdma_hw_mrt_body_codec_base;
-  `uvm_object_utils(rdma_hw_mrt_register_body_codec)
+  `rdma_object_utils(rdma_hw_mrt_register_body_codec)
 
   // 功能：构造 codec 对象。
   // 输入/输出及副作用：name 为对象名；仅调用 super.new。
@@ -1218,7 +1218,7 @@ endclass
 
 class rdma_hw_srqc_create_body_codec
     extends rdma_hw_context_body_codec_base;
-  `uvm_object_utils(rdma_hw_srqc_create_body_codec)
+  `rdma_object_utils(rdma_hw_srqc_create_body_codec)
 
   // 功能：构造 codec 对象。
   // 输入/输出及副作用：name 为对象名；仅调用 super.new。
@@ -1522,7 +1522,7 @@ endclass
 
 class rdma_hw_ceqc_create_body_codec
     extends rdma_hw_eq_create_body_codec_base;
-  `uvm_object_utils(rdma_hw_ceqc_create_body_codec)
+  `rdma_object_utils(rdma_hw_ceqc_create_body_codec)
 
   // 功能：构造 codec 对象。
   // 输入/输出及副作用：name 为对象名；仅调用 super.new。
@@ -1607,7 +1607,7 @@ endclass
 
 class rdma_hw_aeqc_create_body_codec
     extends rdma_hw_eq_create_body_codec_base;
-  `uvm_object_utils(rdma_hw_aeqc_create_body_codec)
+  `rdma_object_utils(rdma_hw_aeqc_create_body_codec)
 
   // 功能：构造 codec 对象。
   // 输入/输出及副作用：name 为对象名；仅调用 super.new。

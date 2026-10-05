@@ -26,7 +26,7 @@ typedef enum bit [2:0] {
 } rdma_coverage_function_state_e;
 
 class rdma_coverage extends uvm_object;
-  `uvm_object_utils(rdma_coverage)
+  `rdma_object_utils(rdma_coverage)
 
   // 最后一次有效事件的 detached scalar snapshot，便于失败报告重现采样上下文。
   rdma_transport_e last_transport;

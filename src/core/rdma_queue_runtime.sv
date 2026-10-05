@@ -16,7 +16,7 @@
 // state/depth/PI/CI/used 标量兼容读取；identity、方向、polarity 与 route/epoch
 // authority 必须保持 protected，并通过带锁 detached/value query 发布。
 class rdma_queue_runtime extends uvm_object;
-  `uvm_object_utils(rdma_queue_runtime)
+  `rdma_object_utils(rdma_queue_runtime)
 
   // 类型别名不构造 provider；值投影不持有 runtime，锁和账本仍只属于本对象。
   typedef rdma_queue_runtime_projector value_ops;

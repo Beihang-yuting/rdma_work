@@ -122,7 +122,7 @@ function automatic bit rdma_send_opcode_valid_for_transport(
 endfunction
 
 class rdma_sge extends uvm_object;
-  `uvm_object_utils(rdma_sge)
+  `rdma_object_utils(rdma_sge)
 
   rdma_iova_t iova;
   int unsigned length;
@@ -168,7 +168,7 @@ class rdma_sge extends uvm_object;
 endclass
 
 class rdma_semantic_request extends uvm_object;
-  `uvm_object_utils(rdma_semantic_request)
+  `rdma_object_utils(rdma_semantic_request)
 
   longint unsigned request_id;
   longint unsigned correlation_id;
@@ -226,7 +226,7 @@ class rdma_semantic_request extends uvm_object;
 endclass
 
 class rdma_qp_context_attributes extends uvm_object;
-  `uvm_object_utils(rdma_qp_context_attributes)
+  `rdma_object_utils(rdma_qp_context_attributes)
   int unsigned path_mtu_bytes;
   bit [15:0] pkey;
   rdma_rdma_access_t access;
@@ -316,7 +316,7 @@ class rdma_qp_context_attributes extends uvm_object;
 endclass
 
 class rdma_create_pd_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_create_pd_req)
+  `rdma_object_utils(rdma_create_pd_req)
 
   // 功能：构造create PD 请求。
   // 输入/输出及副作用：name 为 UVM 实例名；仅调用 super.new。
@@ -327,7 +327,7 @@ class rdma_create_pd_req extends rdma_semantic_request;
 endclass
 
 class rdma_register_mr_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_register_mr_req)
+  `rdma_object_utils(rdma_register_mr_req)
 
   rdma_handle pd_h;
   rdma_iova_t iova;
@@ -384,7 +384,7 @@ class rdma_register_mr_req extends rdma_semantic_request;
 endclass
 
 class rdma_create_cq_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_create_cq_req)
+  `rdma_object_utils(rdma_create_cq_req)
 
   int unsigned depth;
   int unsigned cqe_size_bytes;
@@ -506,7 +506,7 @@ function automatic rdma_status rdma_qp_backing_spec_status(
 endfunction
 
 class rdma_create_qp_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_create_qp_req)
+  `rdma_object_utils(rdma_create_qp_req)
 
   rdma_transport_e transport;
   int unsigned sq_depth;
@@ -742,7 +742,7 @@ class rdma_create_qp_req extends rdma_semantic_request;
 endclass
 
 class rdma_create_srq_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_create_srq_req)
+  `rdma_object_utils(rdma_create_srq_req)
 
   int unsigned depth;
   int unsigned max_sge;
@@ -822,7 +822,7 @@ class rdma_create_srq_req extends rdma_semantic_request;
 endclass
 
 class rdma_create_ceq_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_create_ceq_req)
+  `rdma_object_utils(rdma_create_ceq_req)
 
   int unsigned depth, vector_id;
   rdma_queue_backing_spec ring_backing;
@@ -885,7 +885,7 @@ class rdma_create_ceq_req extends rdma_semantic_request;
 endclass
 
 class rdma_create_aeq_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_create_aeq_req)
+  `rdma_object_utils(rdma_create_aeq_req)
 
   int unsigned depth, vector_id;
   rdma_queue_backing_spec ring_backing;
@@ -948,7 +948,7 @@ class rdma_create_aeq_req extends rdma_semantic_request;
 endclass
 
 class rdma_destroy_resource_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_destroy_resource_req)
+  `rdma_object_utils(rdma_destroy_resource_req)
 
   rdma_handle target_h;
 
@@ -990,7 +990,7 @@ class rdma_destroy_resource_req extends rdma_semantic_request;
 endclass
 
 class rdma_modify_qp_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_modify_qp_req)
+  `rdma_object_utils(rdma_modify_qp_req)
 
   rdma_handle qp_h;
   rdma_qp_state_e new_state;
@@ -1080,7 +1080,7 @@ class rdma_modify_qp_req extends rdma_semantic_request;
 endclass
 
 class rdma_post_send_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_post_send_req)
+  `rdma_object_utils(rdma_post_send_req)
 
   rdma_handle qp_h;
   longint unsigned wr_id;
@@ -1325,7 +1325,7 @@ class rdma_post_send_req extends rdma_semantic_request;
 endclass
 
 class rdma_post_recv_req extends rdma_semantic_request;
-  `uvm_object_utils(rdma_post_recv_req)
+  `rdma_object_utils(rdma_post_recv_req)
 
   rdma_handle target_h;
   // 私有 RQ 在其目标 QP 上完成；投递到共享 SRQ 的 receive 需要关联 QP 句柄，
@@ -1420,7 +1420,7 @@ class rdma_post_recv_req extends rdma_semantic_request;
 endclass
 
 class rdma_packet extends uvm_object;
-  `uvm_object_utils(rdma_packet)
+  `rdma_object_utils(rdma_packet)
 
   rdma_transport_e transport;
   rdma_network_opcode_e opcode;
@@ -1635,7 +1635,7 @@ class rdma_packet extends uvm_object;
 endclass
 
 class rdma_net_response_policy extends uvm_object;
-  `uvm_object_utils(rdma_net_response_policy)
+  `rdma_object_utils(rdma_net_response_policy)
 
   rdma_responder_mode_e responder_mode;
   int unsigned drop_every_n;
@@ -1673,7 +1673,7 @@ class rdma_net_response_policy extends uvm_object;
 endclass
 
 class rdma_net_fault extends uvm_object;
-  `uvm_object_utils(rdma_net_fault)
+  `rdma_object_utils(rdma_net_fault)
 
   rdma_fault_kind_e kind;
   bit drop_packet;

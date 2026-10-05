@@ -214,7 +214,7 @@ function automatic rdma_status rdma_queue_base_from_iova(
 endfunction
 
 class rdma_queue_completion_authority extends uvm_object;
-  `uvm_object_utils(rdma_queue_completion_authority)
+  `rdma_object_utils(rdma_queue_completion_authority)
   bit complete;
 
   // 功能：构造对象，字段置默认值。
@@ -246,7 +246,7 @@ class rdma_queue_completion_authority extends uvm_object;
 endclass
 
 class rdma_queue_slot_token_contract extends uvm_object;
-  `uvm_object_utils(rdma_queue_slot_token_contract)
+  `rdma_object_utils(rdma_queue_slot_token_contract)
   rdma_queue_completion_authority completion_authority;
 
   // 功能：构造对象，字段置默认值。
@@ -282,7 +282,7 @@ class rdma_queue_slot_token_contract extends uvm_object;
 endclass
 
 class rdma_queue_opaque_slot_token extends rdma_queue_slot_token_contract;
-  `uvm_object_utils(rdma_queue_opaque_slot_token)
+  `rdma_object_utils(rdma_queue_opaque_slot_token)
 
   // 功能：构造对象，字段置默认值。
   // 输入/输出及副作用：name 传给 UVM 父类。
@@ -293,7 +293,7 @@ class rdma_queue_opaque_slot_token extends rdma_queue_slot_token_contract;
 endclass
 
 class rdma_queue_backing_slice extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_slice)
+  `rdma_object_utils(rdma_queue_backing_slice)
   rdma_queue_backing_role_e role;
   rdma_dma_mapping mapping;
   longint unsigned mapping_offset, length, logical_queue_offset;
@@ -349,7 +349,7 @@ class rdma_queue_backing_slice extends uvm_object;
 endclass
 
 class rdma_queue_backing_spec extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_spec)
+  `rdma_object_utils(rdma_queue_backing_spec)
   rdma_queue_backing_mode_e mode;
   rdma_queue_backing_slice slices[$];
 
@@ -415,7 +415,7 @@ class rdma_queue_backing_spec extends uvm_object;
 endclass
 
 class rdma_queue_dma_page_ref extends uvm_object;
-  `uvm_object_utils(rdma_queue_dma_page_ref)
+  `rdma_object_utils(rdma_queue_dma_page_ref)
   rdma_queue_backing_role_e role;
   rdma_dma_mapping mapping;
   longint unsigned mapping_offset;
@@ -492,7 +492,7 @@ class rdma_queue_dma_page_ref extends uvm_object;
 endclass
 
 class rdma_queue_ring_layout extends uvm_object;
-  `uvm_object_utils(rdma_queue_ring_layout)
+  `rdma_object_utils(rdma_queue_ring_layout)
   rdma_queue_backing_role_e role;
   int unsigned entry_size_bytes, depth;
   longint unsigned logical_bytes, storage_bytes;
@@ -599,7 +599,7 @@ class rdma_queue_ring_layout extends uvm_object;
 endclass
 
 class rdma_queue_backing_segment extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_segment)
+  `rdma_object_utils(rdma_queue_backing_segment)
   rdma_queue_backing_role_e role;
   rdma_dma_mapping mapping;
   rdma_resource_ownership_e ownership;
@@ -671,7 +671,7 @@ class rdma_queue_backing_segment extends uvm_object;
 endclass
 
 class rdma_queue_backing_ref extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_ref)
+  `rdma_object_utils(rdma_queue_backing_ref)
   rdma_queue_backing_role_e role;
   rdma_dma_mapping mapping;
   rdma_resource_ownership_e ownership;
@@ -791,7 +791,7 @@ class rdma_queue_backing_ref extends uvm_object;
 endclass
 
 class rdma_context_backing_ref extends uvm_object;
-  `uvm_object_utils(rdma_context_backing_ref)
+  `rdma_object_utils(rdma_context_backing_ref)
   rdma_function_handle owner;
   rdma_resource_kind_e resource_kind;
   int unsigned local_id;
@@ -920,7 +920,7 @@ class rdma_context_backing_ref extends uvm_object;
 endclass
 
 class rdma_queue_flush_target extends uvm_object;
-  `uvm_object_utils(rdma_queue_flush_target)
+  `rdma_object_utils(rdma_queue_flush_target)
   rdma_queue_backing_role_e role;
   rdma_queue_flush_phase_e phase;
   rdma_queue_backing_ref pd_ref;
@@ -981,7 +981,7 @@ class rdma_queue_flush_target extends uvm_object;
 endclass
 
 class rdma_queue_backing_plan extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_plan)
+  `rdma_object_utils(rdma_queue_backing_plan)
   rdma_resource_kind_e resource_kind;
   rdma_queue_ring_layout rings[$];
   rdma_queue_backing_ref refs[$];
@@ -1138,7 +1138,7 @@ class rdma_queue_backing_plan extends uvm_object;
 endclass
 
 class rdma_qp_ring_layout extends uvm_object;
-  `uvm_object_utils(rdma_qp_ring_layout)
+  `rdma_object_utils(rdma_qp_ring_layout)
   rdma_queue_backing_role_e role;
   int unsigned entry_size_bytes;
   int unsigned depth;
@@ -1238,7 +1238,7 @@ endfunction
 
 class rdma_qp_backing_ref extends uvm_object;
   // backing_ref 是 QP 资源持有的 mapping authority；borrowed 只保留 detached 引用。
-  `uvm_object_utils(rdma_qp_backing_ref)
+  `rdma_object_utils(rdma_qp_backing_ref)
   rdma_queue_backing_role_e role;
   rdma_dma_mapping mapping;
   rdma_resource_ownership_e ownership;
@@ -1379,7 +1379,7 @@ endfunction
 
 class rdma_qp_backing_plan extends uvm_object;
   // plan 按固定角色顺序保存 SQ、SQ-SGB、PD、RQ 和 URC backing。
-  `uvm_object_utils(rdma_qp_backing_plan)
+  `rdma_object_utils(rdma_qp_backing_plan)
   rdma_transport_e transport;
   int unsigned sq_depth;
   int unsigned rq_depth;
@@ -1608,7 +1608,7 @@ class rdma_qp_backing_plan extends uvm_object;
 endclass
 
 class rdma_queue_preflight extends uvm_object;
-  `uvm_object_utils(rdma_queue_preflight)
+  `rdma_object_utils(rdma_queue_preflight)
   rdma_resource_kind_e resource_kind;
   int unsigned depth;
   int unsigned cqe_size_bytes;

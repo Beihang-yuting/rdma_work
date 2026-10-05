@@ -80,7 +80,7 @@ function automatic rdma_status rdma_control_nested_status(
 endfunction
 
 class rdma_mr_backing_desc extends uvm_object;
-  `uvm_object_utils(rdma_mr_backing_desc)
+  `rdma_object_utils(rdma_mr_backing_desc)
 
   rdma_function_handle function_h;
   rdma_bdf_t requester_bdf;
@@ -208,7 +208,7 @@ class rdma_mr_backing_desc extends uvm_object;
 endclass
 
 class rdma_control_result extends uvm_object;
-  `uvm_object_utils(rdma_control_result)
+  `rdma_object_utils(rdma_control_result)
 
   longint unsigned transaction_id;
   rdma_status status;
@@ -470,7 +470,7 @@ endfunction
 
 class rdma_qp_recovery_state extends uvm_object;
   // recovery state 保存硬件不确定期间的不可伪造 authority 和逐角色进度。
-  `uvm_object_utils(rdma_qp_recovery_state)
+  `rdma_object_utils(rdma_qp_recovery_state)
   rdma_qp_recovery_intent_e intent;
   rdma_qp_ambiguous_operation_e ambiguous_operation;
   rdma_queue_backing_role_e ambiguous_role;
@@ -1112,7 +1112,7 @@ class rdma_qp_recovery_state extends uvm_object;
 endclass
 
 class rdma_recovery_record extends uvm_object;
-  `uvm_object_utils(rdma_recovery_record)
+  `rdma_object_utils(rdma_recovery_record)
 
   rdma_handle resource_h;
   rdma_hw_presence_e hardware_presence;

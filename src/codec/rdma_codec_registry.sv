@@ -10,7 +10,7 @@
 // 查询使用不同拼接规则；缺项、保留分隔符、未知 image kind 和重复 key 均 fail closed。
 
 class rdma_codec_registry extends uvm_object;
-  `uvm_object_utils(rdma_codec_registry)
+  `rdma_object_utils(rdma_codec_registry)
 
   protected rdma_codec_base codecs[string];
 

@@ -110,7 +110,7 @@ endclass
 
 class rdma_hw_cmq_sq_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_cmq_sq_doorbell_model)
+  `rdma_object_utils(rdma_hw_cmq_sq_doorbell_model)
 
   int unsigned pi;
   bit polarity;
@@ -171,7 +171,7 @@ endclass
 
 class rdma_hw_sq_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_sq_doorbell_model)
+  `rdma_object_utils(rdma_hw_sq_doorbell_model)
 
   byte unsigned sqe_header[$];
 
@@ -231,7 +231,7 @@ endclass
 
 class rdma_hw_rq_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_rq_doorbell_model)
+  `rdma_object_utils(rdma_hw_rq_doorbell_model)
 
   int unsigned qpn;
   int unsigned icos;
@@ -307,7 +307,7 @@ endclass
 
 class rdma_hw_srq_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_srq_doorbell_model)
+  `rdma_object_utils(rdma_hw_srq_doorbell_model)
 
   rdma_hw_srq_doorbell_variant_e variant;
   int unsigned srqn;
@@ -399,7 +399,7 @@ endclass
 
 class rdma_hw_cq_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_cq_doorbell_model)
+  `rdma_object_utils(rdma_hw_cq_doorbell_model)
 
   rdma_hw_cq_doorbell_variant_e variant;
   int unsigned cqn;
@@ -525,7 +525,7 @@ endclass
 
 class rdma_hw_ceq_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_ceq_doorbell_model)
+  `rdma_object_utils(rdma_hw_ceq_doorbell_model)
 
   int unsigned ceqn;
   int unsigned ci;
@@ -595,7 +595,7 @@ endclass
 
 class rdma_hw_aeq_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_aeq_doorbell_model)
+  `rdma_object_utils(rdma_hw_aeq_doorbell_model)
 
   int unsigned aeqn;
   int unsigned ci;
@@ -665,7 +665,7 @@ endclass
 
 class rdma_hw_qp_control_doorbell_model
     extends rdma_hw_doorbell_model_base;
-  `uvm_object_utils(rdma_hw_qp_control_doorbell_model)
+  `rdma_object_utils(rdma_hw_qp_control_doorbell_model)
 
   rdma_doorbell_kind_e kind;
   int unsigned qpn;
@@ -765,7 +765,7 @@ class rdma_hw_qp_control_doorbell_model
 endclass
 
 class rdma_hw_doorbell_codec extends rdma_codec_base;
-  `uvm_object_utils(rdma_hw_doorbell_codec)
+  `rdma_object_utils(rdma_hw_doorbell_codec)
 
   protected string variant_name;
 
@@ -1423,7 +1423,7 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
 endclass
 
 class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
-  `uvm_object_utils(rdma_hw_doorbell_codec_registry)
+  `rdma_object_utils(rdma_hw_doorbell_codec_registry)
 
   protected bit defaults_registered;
 

@@ -5,7 +5,7 @@
 // 所有权与生命周期：host_mem 为非拥有引用；owned ref 归 control plane，借用 backing 永不释放。
 
 class rdma_queue_backing_planner extends uvm_object;
-  `uvm_object_utils(rdma_queue_backing_planner)
+  `rdma_object_utils(rdma_queue_backing_planner)
 
   protected rdma_host_mem_api host_mem;
 

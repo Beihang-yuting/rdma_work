@@ -5,7 +5,7 @@
 // 所有权与生命周期：facade 借用共享 runtime 与 router；不拥有事件 ring、mapping 或外部后端。
 
 class rdma_eq_engine extends rdma_queue_facade;
-  `uvm_object_utils(rdma_eq_engine)
+  `rdma_object_utils(rdma_eq_engine)
 
   // 功能：创建未配置的 EQ facade，不分配 ring 或中断资源。
   // 输入/输出及副作用：name 传给基类（类型名 EQ）。

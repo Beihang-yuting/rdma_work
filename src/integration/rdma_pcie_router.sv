@@ -5,7 +5,7 @@
   // 所有权与生命周期：endpoint 由外部 PCIe 环境拥有；本 router 只保存非拥有引用和
   //       route entry 值，entry/authority 随 router 配置生命周期存在。
 class rdma_pcie_route_entry extends uvm_object;
-  `uvm_object_utils(rdma_pcie_route_entry)
+  `rdma_object_utils(rdma_pcie_route_entry)
   rdma_route_key_t route;
   rdma_pcie_api endpoint;
   // 中文：handle 路由所需的 Function authority；由 identity adapter 填充。
@@ -75,7 +75,7 @@ class rdma_pcie_route_entry extends uvm_object;
 endclass
 
 class rdma_pcie_router extends rdma_pcie_api;
-  `uvm_object_utils(rdma_pcie_router)
+  `rdma_object_utils(rdma_pcie_router)
   protected rdma_pcie_route_entry m_entries[$];
   // 功能：构造空 PCIe router；endpoint 表由 configure() 事务性发布。
   // 输入/输出及副作用：name 为 UVM 对象名；只写默认字段。

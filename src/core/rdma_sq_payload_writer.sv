@@ -8,7 +8,7 @@
 
 class rdma_sq_payload_write_receipt extends uvm_object;
   // receipt 保存 detached 的 payload/SGE 快照，供后续 record 生命周期使用。
-  `uvm_object_utils(rdma_sq_payload_write_receipt)
+  `rdma_object_utils(rdma_sq_payload_write_receipt)
 
   bit verified;
   bit released;
@@ -155,7 +155,7 @@ endclass
 
 class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   // 默认实现使用真实 rdma_host_mem_api；所有写入前检查必须先完成。
-  `uvm_object_utils(rdma_host_mem_sq_payload_writer)
+  `rdma_object_utils(rdma_host_mem_sq_payload_writer)
 
   typedef struct {
     longint unsigned id;

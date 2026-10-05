@@ -11,7 +11,7 @@
 
 // 每个 QP 的设备侧状态。
 class rdma_nic_qp_state extends uvm_object;
-  `uvm_object_utils(rdma_nic_qp_state)
+  `rdma_object_utils(rdma_nic_qp_state)
 
   int unsigned sq_index;
   bit sq_wrap;

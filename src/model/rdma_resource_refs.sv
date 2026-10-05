@@ -24,7 +24,7 @@ typedef enum bit [1:0] {
 } rdma_hw_presence_e;
 
 class rdma_backing_ref extends uvm_object;
-  `uvm_object_utils(rdma_backing_ref)
+  `rdma_object_utils(rdma_backing_ref)
 
   rdma_dma_mapping mapping;
   rdma_resource_ownership_e ownership;
@@ -74,7 +74,7 @@ class rdma_backing_ref extends uvm_object;
 endclass
 
 class rdma_hmc_ref extends uvm_object;
-  `uvm_object_utils(rdma_hmc_ref)
+  `rdma_object_utils(rdma_hmc_ref)
 
   rdma_function_handle owner;
   rdma_resource_kind_e object_kind;

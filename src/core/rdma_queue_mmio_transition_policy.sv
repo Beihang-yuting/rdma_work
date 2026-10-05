@@ -6,7 +6,7 @@
 // 设计说明：MMIO evidence 是 recovery 的安全边界。consumer 的 AMBIGUOUS 表示 doorbell 可能已提交，
 // 任何 retry 都须拒绝；device producer 的 NOT_APPLICABLE 仅在确认写入后才可安装。
 class rdma_queue_mmio_transition_policy extends uvm_object;
-  `uvm_object_utils(rdma_queue_mmio_transition_policy)
+  `rdma_object_utils(rdma_queue_mmio_transition_policy)
 
   // 功能：构造无状态 MMIO transition policy。
   // 输入/输出及副作用：name 为 UVM 名称；仅初始化基类。

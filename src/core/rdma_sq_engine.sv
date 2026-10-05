@@ -7,7 +7,7 @@
 // SQ facade 只做入口校验和转发。PI、CI、credit、slot ledger、pending journal
 // 全部留在 delegate 中，避免 SQ/RQ/CQ/EQ 各自维护互相漂移的副本。
 class rdma_sq_engine extends rdma_queue_facade;
-  `uvm_object_utils(rdma_sq_engine)
+  `rdma_object_utils(rdma_sq_engine)
 
   // 功能：创建未配置的 SQ facade，不分配发送队列或 Host-memory。
   // 输入/输出及副作用：name（输入）；默认字段由基类写入。

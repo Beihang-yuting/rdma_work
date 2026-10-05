@@ -4,6 +4,7 @@
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
 `include "rdma_status_macros.svh"
+`include "rdma_object_macros.svh"
 
 package rdma_types_pkg;
   import uvm_pkg::*;

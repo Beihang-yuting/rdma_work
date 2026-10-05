@@ -6,7 +6,7 @@
 // 中文说明：跨 Host/root 隔离的 Function 身份值快照与唯一权威。创建者通过 configure()
 // 写入；binding 持有其克隆作为 authority，调用方读取 detached snapshot。
 class rdma_function_identity extends uvm_object;
-  `uvm_object_utils(rdma_function_identity)
+  `rdma_object_utils(rdma_function_identity)
 
   rdma_function_key_t key;
   int unsigned global_function_id;

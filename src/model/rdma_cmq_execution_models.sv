@@ -89,7 +89,7 @@ endfunction
 // 设计说明：command identity 只投影不可变标量；它不保留 command/body/handle
 // 引用，因此可作为结果中的稳定诊断身份，而不能充当资源 authority。
 class rdma_cmq_command_identity extends uvm_object;
-  `uvm_object_utils(rdma_cmq_command_identity)
+  `rdma_object_utils(rdma_cmq_command_identity)
 
   rdma_resource_kind_e function_kind;
   longint unsigned function_uid;
@@ -665,7 +665,7 @@ endclass
 // 设计说明：执行结果把 operation outcome 与 observation health 分成两个 owned
 // status，避免证据捕获失败覆盖真实命令结果，并保留调用方判断恢复所需的 detached 值。
 class rdma_cmq_execution_result extends uvm_object;
-  `uvm_object_utils(rdma_cmq_execution_result)
+  `rdma_object_utils(rdma_cmq_execution_result)
 
   rdma_cmq_ticket ticket;
   rdma_cmq_completion completion;
@@ -711,7 +711,7 @@ endclass
 // 设计说明：每个 journal item 独立保留命令 authority、两层 effect 和生命周期
 // completion，使 FIFO 投递或批次聚合不会销毁单命令的等待与恢复证据。
 class rdma_cmq_batch_submission_item_record extends uvm_object;
-  `uvm_object_utils(rdma_cmq_batch_submission_item_record)
+  `rdma_object_utils(rdma_cmq_batch_submission_item_record)
 
   int unsigned request_index;
   rdma_cmq_command_desc command;
@@ -779,7 +779,7 @@ endclass
 // 设计说明：batch record 把一次共享 doorbell 的稳定 authority 投影与有序 items
 // 绑定在同一账本值中，供后续 CAS attempt 和 reset proof 对照原始提交边界。
 class rdma_cmq_batch_submission_record extends uvm_object;
-  `uvm_object_utils(rdma_cmq_batch_submission_record)
+  `rdma_object_utils(rdma_cmq_batch_submission_record)
 
   string batch_key;
   longint unsigned batch_id;
@@ -835,7 +835,7 @@ endclass
 // 设计说明：recovery item 只携带重算单项 digest 所需的不可变 authority，刻意
 // 排除会随完成或重试变化的 lifecycle 字段，便于与 journal-owned 图独立比对。
 class rdma_cmq_submission_recovery_item extends uvm_object;
-  `uvm_object_utils(rdma_cmq_submission_recovery_item)
+  `rdma_object_utils(rdma_cmq_submission_recovery_item)
 
   int unsigned request_index;
   rdma_cmq_command_desc command;
@@ -877,7 +877,7 @@ typedef enum logic [1:0] {
 // 设计说明：reset proof 是 engine mint 的旧 incarnation 隔离证据；稳定 digest
 // 覆盖原 identity 与 owner tuple，而 replacement/state 由独立合法迁移规则验证。
 class rdma_cmq_reset_isolation_proof extends uvm_object;
-  `uvm_object_utils(rdma_cmq_reset_isolation_proof)
+  `rdma_object_utils(rdma_cmq_reset_isolation_proof)
 
   string proof_key;
   longint unsigned proof_id;
@@ -925,7 +925,7 @@ endclass
 // 设计说明：recovery request 承载调用方 detached authority 图和期望 attempt；engine
 // 必须分别重算它与 retained journal，再以完整值相等决定是否允许恢复动作。
 class rdma_cmq_submission_recovery_request extends uvm_object;
-  `uvm_object_utils(rdma_cmq_submission_recovery_request)
+  `rdma_object_utils(rdma_cmq_submission_recovery_request)
 
   string batch_key;
   longint unsigned batch_id;

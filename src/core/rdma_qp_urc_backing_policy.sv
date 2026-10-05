@@ -11,7 +11,7 @@ typedef struct {
 } rdma_qp_urc_backing_spec_t;
 
 class rdma_qp_urc_backing_policy extends uvm_object;
-  `uvm_object_utils(rdma_qp_urc_backing_policy)
+  `rdma_object_utils(rdma_qp_urc_backing_policy)
 
   // 功能：构造无状态 policy。
   // 输入/输出及副作用：name 仅设置 UVM 对象名。

@@ -7,7 +7,7 @@
 //   qp_index 0/1/2 分别为 RC/UD/URC（后两者存在时才运行对应场景）。
 
 class rdma_verb_one_seq extends uvm_sequence #(rdma_verb_item);
-  `uvm_object_utils(rdma_verb_one_seq)
+  `rdma_object_utils(rdma_verb_one_seq)
 
   rdma_verb_item item;
 
@@ -28,7 +28,7 @@ class rdma_verb_one_seq extends uvm_sequence #(rdma_verb_item);
 endclass
 
 class rdma_tb_traffic_vseq extends uvm_sequence;
-  `uvm_object_utils(rdma_tb_traffic_vseq)
+  `rdma_object_utils(rdma_tb_traffic_vseq)
 
   rdma_tb_env env;
 

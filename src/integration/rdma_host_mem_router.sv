@@ -16,7 +16,7 @@
 // Device reset 可能独立发生；用 max() 合并会丢掉“某一维已变化、另一维
 // 恰好相同”的事实。所有读写释放操作都必须通过同一组 ledger 校验。
 class rdma_host_mem_route_entry extends uvm_object;
-  `uvm_object_utils(rdma_host_mem_route_entry)
+  `rdma_object_utils(rdma_host_mem_route_entry)
 
   int unsigned host_topology_key;
   rdma_host_mem_api manager;
@@ -32,7 +32,7 @@ class rdma_host_mem_route_entry extends uvm_object;
 endclass
 
 class rdma_host_mem_router extends rdma_host_mem_api;
-  `uvm_object_utils(rdma_host_mem_router)
+  `rdma_object_utils(rdma_host_mem_router)
 
   // 配置表由 Device env 发布；router 只保存非拥有引用。
   protected rdma_host_mem_api m_managers[int unsigned];

@@ -5,7 +5,7 @@
 //   事务结果与恢复记录由调用方消费。
 
 class rdma_queue_lifecycle_executor extends uvm_object;
-  `uvm_object_utils(rdma_queue_lifecycle_executor)
+  `rdma_object_utils(rdma_queue_lifecycle_executor)
 
   protected rdma_resource_manager manager;
   protected rdma_cmq_port cmq;

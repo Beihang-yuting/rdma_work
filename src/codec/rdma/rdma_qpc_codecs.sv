@@ -1055,7 +1055,7 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
 endclass
 
 class rdma_hw_qpc_rc_codec extends rdma_hw_qpc_codec_base;
-  `uvm_object_utils(rdma_hw_qpc_rc_codec)
+  `rdma_object_utils(rdma_hw_qpc_rc_codec)
 
   // 功能：构造 RC QPC codec。
   // 输入/输出及副作用：name 为 UVM 名。
@@ -1168,7 +1168,7 @@ class rdma_hw_qpc_rc_codec extends rdma_hw_qpc_codec_base;
 endclass
 
 class rdma_hw_qpc_ud_codec extends rdma_hw_qpc_codec_base;
-  `uvm_object_utils(rdma_hw_qpc_ud_codec)
+  `rdma_object_utils(rdma_hw_qpc_ud_codec)
 
   // 功能：构造 UD QPC codec。
   // 输入/输出及副作用：name 为 UVM 名。
@@ -1235,7 +1235,7 @@ class rdma_hw_qpc_ud_codec extends rdma_hw_qpc_codec_base;
 endclass
 
 class rdma_hw_qpc_urc_codec extends rdma_hw_qpc_codec_base;
-  `uvm_object_utils(rdma_hw_qpc_urc_codec)
+  `rdma_object_utils(rdma_hw_qpc_urc_codec)
 
   // 功能：构造 URC QPC codec。
   // 输入/输出及副作用：name 为 UVM 名。

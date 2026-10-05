@@ -4,7 +4,7 @@
 // 所有权与生命周期：仅拥有 occupancy 位图；调用方 image 由外部持有，packer 不保存其引用。
 
 class rdma_bit_packer extends uvm_object;
-  `uvm_object_utils(rdma_bit_packer)
+  `rdma_object_utils(rdma_bit_packer)
 
   protected bit occupancy[];
   protected int unsigned expected_byte_count;

@@ -230,7 +230,7 @@ function automatic rdma_mr_page_layout rdma_clone_mr_page_layout_value(
 endfunction
 
 class rdma_qpc_behavior extends uvm_object;
-  `uvm_object_utils(rdma_qpc_behavior)
+  `rdma_object_utils(rdma_qpc_behavior)
 
   int unsigned transport_version;
   bit migration_enable;
@@ -327,7 +327,7 @@ virtual class rdma_qpc_transport_ext extends uvm_object;
 endclass
 
 class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
-  `uvm_object_utils(rdma_qpc_rc_ext)
+  `rdma_object_utils(rdma_qpc_rc_ext)
 
   bit [23:0] remote_qpn;
   bit [23:0] send_psn;
@@ -390,7 +390,7 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
 endclass
 
 class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
-  `uvm_object_utils(rdma_qpc_ud_ext)
+  `rdma_object_utils(rdma_qpc_ud_ext)
 
   bit [31:0] qkey;
   // 驱动在 UD QPC 中单独提供目标 QPN；它不能由 qkey 的低 24 位推导。
@@ -445,7 +445,7 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
 endclass
 
 class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
-  `uvm_object_utils(rdma_qpc_urc_ext)
+  `rdma_object_utils(rdma_qpc_urc_ext)
 
   bit [23:0] remote_qpn;
   bit [23:0] rbsn;
@@ -525,7 +525,7 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
 endclass
 
 class rdma_qpc_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_qpc_model)
+  `rdma_object_utils(rdma_qpc_model)
 
   rdma_handle qp_h;
   rdma_handle pd_h;
@@ -775,7 +775,7 @@ endclass
 // 它只携带 CQ/Function authority 与可恢复游标，不持有 queue runtime、DMA
 // mapping 或 doorbell；因此 stale 检查可以在不触碰外部资源的情况下完成。
 class rdma_cq_shadow_snapshot extends uvm_object;
-  `uvm_object_utils(rdma_cq_shadow_snapshot)
+  `rdma_object_utils(rdma_cq_shadow_snapshot)
 
   rdma_handle cq_h;
   longint unsigned function_uid;
@@ -843,7 +843,7 @@ class rdma_cq_shadow_snapshot extends uvm_object;
 endclass
 
 class rdma_cqc_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_cqc_model)
+  `rdma_object_utils(rdma_cqc_model)
 
   rdma_handle cq_h;
   rdma_handle ceq_h;
@@ -969,7 +969,7 @@ class rdma_cqc_model extends rdma_hw_model;
 endclass
 
 class rdma_mrt_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_mrt_model)
+  `rdma_object_utils(rdma_mrt_model)
 
   rdma_handle mr_h;
   rdma_handle pd_h;
@@ -1074,7 +1074,7 @@ class rdma_mrt_model extends rdma_hw_model;
 endclass
 
 class rdma_srqc_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_srqc_model)
+  `rdma_object_utils(rdma_srqc_model)
 
   rdma_handle srq_h;
   rdma_handle pd_h;
@@ -1177,7 +1177,7 @@ class rdma_srqc_model extends rdma_hw_model;
 endclass
 
 class rdma_ceqc_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_ceqc_model)
+  `rdma_object_utils(rdma_ceqc_model)
 
   rdma_handle ceq_h;
   rdma_context_state_e state;
@@ -1269,7 +1269,7 @@ class rdma_ceqc_model extends rdma_hw_model;
 endclass
 
 class rdma_aeqc_model extends rdma_hw_model;
-  `uvm_object_utils(rdma_aeqc_model)
+  `rdma_object_utils(rdma_aeqc_model)
 
   rdma_handle aeq_h;
   rdma_context_state_e state;
@@ -1364,7 +1364,7 @@ endclass
 // 输入/输出及副作用：对象字段由 rdma_umem.pin_pages() 填充；对象不拥有外部 host-mem 页。
 // 失败/边界：host_va/iova 必须按 page_size 对齐，length 不得跨越一个配置页；pinned=0 表示不可提交 DMA。
 class rdma_umem_page extends uvm_object;
-  `uvm_object_utils(rdma_umem_page)
+  `rdma_object_utils(rdma_umem_page)
 
   longint unsigned host_va;
   rdma_iova_t iova;
@@ -1420,7 +1420,7 @@ endclass
 // 输入/输出及副作用：调用方设置 Function、VA、length、page_size、权限；pin/unpin 只更新本地页账本。
 // 失败/边界：零长度、地址溢出、非法页大小或 stale Function 被拒绝；非页对齐范围按对齐 DMA span 建页；重复 pin/unpin 幂等。
 class rdma_umem extends uvm_object;
-  `uvm_object_utils(rdma_umem)
+  `rdma_object_utils(rdma_umem)
 
   rdma_function_handle function_h;
   longint unsigned user_va;
@@ -1667,7 +1667,7 @@ endclass
 // 输入/输出及副作用：由 rdma_pbl_builder 创建并填充；对象不复制或释放 UMEM 页。
 // 失败/边界：active=0 的 PBL 不得用于 DMA；directory_iovas 与 page_entries 数量必须一致且页不跨界。
 class rdma_pbl extends uvm_object;
-  `uvm_object_utils(rdma_pbl)
+  `rdma_object_utils(rdma_pbl)
 
   rdma_umem umem_ref;
   rdma_function_handle function_h;
@@ -2035,7 +2035,7 @@ typedef enum bit [1:0] {
 // 输入/输出及副作用：bind 保存非拥有 UMEM/PBL 引用；invalidate 按 MW→PBL→UMEM 顺序释放 owned backing。
 // 失败/边界：跨 Function/stale generation、无 bind 权限或 PBL 不匹配时拒绝；invalidate 重复调用幂等。
 class rdma_mw_binding extends uvm_object;
-  `uvm_object_utils(rdma_mw_binding)
+  `rdma_object_utils(rdma_mw_binding)
 
   rdma_function_handle function_h;
   rdma_handle mw_h;

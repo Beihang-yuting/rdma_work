@@ -21,7 +21,7 @@ typedef enum bit {
 // ABI v5 协商/映射请求的值快照：调用方填写 version、region_kind、length、owner 与 borrowed backing，
 // 对象不接管外部 backing。空 owner、零长度、非法 region 或 backing 不匹配由 rdma_abi_v5_api 在提交前拒绝。
 class rdma_abi_v5_request extends uvm_object;
-  `uvm_object_utils(rdma_abi_v5_request)
+  `rdma_object_utils(rdma_abi_v5_request)
 
   int unsigned version;
   rdma_abi_v5_region_kind_e region_kind;
@@ -71,7 +71,7 @@ endclass
 // ABI v5 协商/映射响应，保留 Function authority 证据。失败响应保持 mapping_id=0、mapped=0；
 // 成功映射必须同时返回 UID、generation 与 reset epoch。
 class rdma_abi_v5_response extends uvm_object;
-  `uvm_object_utils(rdma_abi_v5_response)
+  `rdma_object_utils(rdma_abi_v5_response)
 
   int unsigned negotiated_version;
   rdma_abi_v5_region_kind_e region_kind;
@@ -143,7 +143,7 @@ endclass
 // 单个 ABI v5 mapping 的内部记录：保存释放权威与资源引用，context_ref/dma_mapping 为后端返回的
 // 非拥有快照。released 只能 0 到 1 一次，重复 unmap 不再触碰后端。
 class rdma_abi_v5_mapping_record extends uvm_object;
-  `uvm_object_utils(rdma_abi_v5_mapping_record)
+  `rdma_object_utils(rdma_abi_v5_mapping_record)
 
   longint unsigned mapping_id;
   rdma_abi_v5_region_kind_e region_kind;
@@ -183,7 +183,7 @@ endclass
 // ABI v5 API：管理固定版本协商、映射表与 exactly-once release。configure 注入 Function snapshot 与可选后端；
 // 版本、authority、长度、对齐或代际不匹配时拒绝事务，不推进 mapping ID 与引用计数。
 class rdma_abi_v5_api extends uvm_object;
-  `uvm_object_utils(rdma_abi_v5_api)
+  `rdma_object_utils(rdma_abi_v5_api)
 
   localparam int unsigned ABI_VERSION = 5;
   localparam longint unsigned DOORBELL_BYTES = 8192;

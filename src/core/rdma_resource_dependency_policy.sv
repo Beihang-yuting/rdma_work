@@ -20,7 +20,7 @@ typedef enum bit {
 } rdma_resource_release_mode_e;
 
 class rdma_resource_dependency_policy extends uvm_object;
-  `uvm_object_utils(rdma_resource_dependency_policy)
+  `rdma_object_utils(rdma_resource_dependency_policy)
 
   // 功能：构造无状态 dependency policy。
   // 输入/输出及副作用：name 为 UVM 名称；仅初始化基类。

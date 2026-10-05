@@ -18,7 +18,7 @@ typedef enum bit [2:0] {
 // 来源哨兵，供 commit_reset() 在同一 prepare/commit 事务内拒绝被替换的旧对象；它不拥有
 // Host-memory、PCIe 或 queue 资源，失败时调用方丢弃即可。
 class rdma_function_reset_candidate extends uvm_object;
-  `uvm_object_utils(rdma_function_reset_candidate)
+  `rdma_object_utils(rdma_function_reset_candidate)
   rdma_function_identity source_identity;
   rdma_function_binding source_binding;
   rdma_function_identity identity;
@@ -45,7 +45,7 @@ class rdma_function_reset_candidate extends uvm_object;
 endclass
 
 class rdma_function_context extends uvm_object;
-  `uvm_object_utils(rdma_function_context)
+  `rdma_object_utils(rdma_function_context)
   rdma_function_identity identity;
   rdma_function_binding binding;
   dpu_resource_snapshot resources;

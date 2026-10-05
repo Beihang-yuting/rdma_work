@@ -7,7 +7,7 @@
 // 设计说明：BAR metadata 为独立值节点，支持六个 aperture 的稳定索引与深拷贝，
 // 不把 PCIe 组件或 BAR 映射对象引入 model 层。
 class rdma_bar_info extends uvm_object;
-  `uvm_object_utils(rdma_bar_info)
+  `rdma_object_utils(rdma_bar_info)
 
   bit [2:0] bar_id;
   rdma_bar_addr_t base;
@@ -44,7 +44,7 @@ endclass
 // 设计说明：PCIe identity 将 BDF、使能位和六个 BAR 组成 owned 投影，
 // 供 binding snapshot 复制，不保存外部 PCIe 组件引用。
 class rdma_pcie_identity extends uvm_object;
-  `uvm_object_utils(rdma_pcie_identity)
+  `rdma_object_utils(rdma_pcie_identity)
 
   rdma_bdf_t bdf;
   rdma_bdf_t parent_pf_bdf;
@@ -100,7 +100,7 @@ endclass
 // 设计说明：兼容子类保留旧调用方的类型名，复用 rdma_pcie_identity 的字段与所有权，
 // 不形成第二套 PCIe authority。
 class rdma_pcie_function_info extends rdma_pcie_identity;
-  `uvm_object_utils(rdma_pcie_function_info)
+  `rdma_object_utils(rdma_pcie_function_info)
 
   // 功能：构造兼容类型，沿用基类默认值。
   // 输入/输出及副作用：name 透传给基类。
@@ -113,7 +113,7 @@ endclass
 // 设计说明：BAR decode 结果对象不带外部引用，携带 target BDF、BAR 和 offset，
 // 使 router 区分解码值与 aperture 自身生命周期。
 class rdma_bar_decode extends uvm_object;
-  `uvm_object_utils(rdma_bar_decode)
+  `rdma_object_utils(rdma_bar_decode)
 
   rdma_bdf_t target_bdf;
   bit [2:0] bar_id;
@@ -174,7 +174,7 @@ typedef struct {
 // 设计说明：binding 是 dpu_common 冻结 topology/PCIe/queue 能力的唯一 RDMA 消费投影；
 // nonfatal accessor 发布完整 detached 值，不反向改写外部 authority。
 class rdma_function_binding extends uvm_object;
-  `uvm_object_utils(rdma_function_binding)
+  `rdma_object_utils(rdma_function_binding)
 
   longint unsigned function_uid;
   // identity 由 binding 创建并拥有；外部只能通过 snapshot accessor 取 detached 副本。

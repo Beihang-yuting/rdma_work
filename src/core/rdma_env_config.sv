@@ -11,7 +11,7 @@ typedef enum bit [1:0] {
 } rdma_env_mode_e;
 
 class rdma_env_config extends uvm_object;
-  `uvm_object_utils(rdma_env_config)
+  `rdma_object_utils(rdma_env_config)
 
   rdma_env_mode_e mode;
   int unsigned hardware_version;
