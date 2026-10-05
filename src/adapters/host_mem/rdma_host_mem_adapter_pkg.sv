@@ -928,6 +928,31 @@ package rdma_host_mem_adapter_pkg;
       return rdma_status::success();
     endfunction
 
+    // 功能：设备 DMA 地址解析：在 ACTIVE allocation 中找覆盖 [iova, iova+size) 的映射。
+    // 输入/输出及副作用：mapping/offset 输出；只读。
+    // 失败/边界：无覆盖的单一映射返回 DMA_TRANSLATION。
+    virtual function rdma_status find_iova(
+      bit [63:0] iova,
+      int unsigned size,
+      output rdma_dma_mapping mapping,
+      output longint unsigned offset
+    );
+      mapping = null;
+      offset = 0;
+      foreach (allocations[i]) begin
+        if (allocations[i] == null || !allocations[i].active || allocations[i].authority == null)
+          continue;
+        if (iova >= allocations[i].authority.iova.value &&
+            {1'b0, iova} + size <=
+            {1'b0, allocations[i].authority.iova.value} + allocations[i].authority.size) begin
+          mapping = allocations[i].authority;
+          offset = iova - allocations[i].authority.iova.value;
+          return rdma_status::success();
+        end
+      end
+      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "device IOVA is not mapped");
+    endfunction
+
     // 功能：校验 mapping 与范围后从其 backing 读取数据。
     // 输入/输出及副作用：data 先清空，成功时填充。
     // 失败/边界：校验失败返回错误；size 为 0 直接成功；读回长度不符返回 UNKNOWN_HW_ERROR 并清空 data。

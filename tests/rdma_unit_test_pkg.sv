@@ -23,6 +23,7 @@ package rdma_unit_test_pkg;
   import rdma_codec_pkg::*;
   import rdma_core_pkg::*;
   import rdma_adapter_pkg::*;
+  import rdma_dev_pkg::*;
   import rdma_tb_pkg::*;
   // Disambiguate the shared recovery enum from the legacy core compatibility type.
   import rdma_model_pkg::rdma_queue_recovery_action_e;
@@ -79,6 +80,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_cmq_engine_test.sv"
   `include "unit/rdma_cmq_port_test.sv"
   `include "unit/rdma_cmq_request_golden_test.sv"
+  `include "unit/rdma_dev_cmq_test.sv"
   `include "unit/rdma_control_plane_test.sv"
   `include "unit/rdma_control_plane_cmq_engine_test.sv"
   `include "unit/rdma_codec_registry_test.sv"
@@ -163,6 +165,7 @@ endpackage
   import rdma_model_pkg::*;
   import rdma_core_pkg::*;
   import rdma_adapter_pkg::*;
+  import rdma_dev_pkg::*;
   import rdma_host_mem_adapter_pkg::*;
   `include "uvm_macros.svh"
   `include "integration/rdma_host_mem_adapter_test.sv"

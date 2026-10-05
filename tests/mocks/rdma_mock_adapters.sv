@@ -928,6 +928,31 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
+  // 功能：设备 DMA 地址解析：在 ACTIVE region 中找覆盖 [iova, iova+size) 的映射。
+  // 输入/输出及副作用：mapping/offset 输出；只读。
+  // 失败/边界：无覆盖的单一映射返回 DMA_TRANSLATION。
+  virtual function rdma_status find_iova(
+    bit [63:0] iova,
+    int unsigned size,
+    output rdma_dma_mapping mapping,
+    output longint unsigned offset
+  );
+    mapping = null;
+    offset = 0;
+    foreach (regions[i]) begin
+      if (regions[i].mapping == null || regions[i].mapping.state != RDMA_MAPPING_ACTIVE)
+        continue;
+      if (iova >= regions[i].mapping.iova.value &&
+          {1'b0, iova} + size <=
+          {1'b0, regions[i].mapping.iova.value} + regions[i].mapping.size) begin
+        mapping = regions[i].mapping;
+        offset = iova - regions[i].mapping.iova.value;
+        return rdma_status::success();
+      end
+    end
+    return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "device IOVA is not mapped");
+  endfunction
+
   // 功能：在 rdma_mock_host_mem 中，read 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
   // 输入/输出及副作用：mapping（输入）、offset（输入）、size（输入）、data（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
   //   快照，读取不取得外部资源所有权。

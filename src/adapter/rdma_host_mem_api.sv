@@ -59,6 +59,50 @@ virtual class rdma_host_mem_api extends uvm_object;
   // 失败/边界：owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果。
   pure virtual function rdma_status \release (rdma_dma_mapping mapping);
 
+  // 功能：设备侧 DMA 的地址解析：找到完整覆盖 [iova, iova+size) 的 ACTIVE 映射。
+  // 输入/输出及副作用：mapping/offset 输出；只读账本。
+  // 失败/边界：基类不认识设备地址，返回 UNSUPPORTED_OPCODE；具体 host_mem 覆盖。
+  virtual function rdma_status find_iova(
+    bit [63:0] iova,
+    int unsigned size,
+    output rdma_dma_mapping mapping,
+    output longint unsigned offset
+  );
+    mapping = null;
+    offset = 0;
+    return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                             "Host-memory manager does not resolve device IOVA");
+  endfunction
+
+  // 功能：设备按 IOVA 读取主机内存（等价 PCIe DMA read）。
+  // 输入/输出及副作用：data 输出；不改账本。
+  // 失败/边界：地址未落在单个 ACTIVE 映射内返回 find_iova 的错误。
+  virtual function rdma_status dma_read(bit [63:0] iova, int unsigned size, output byte data[]);
+    rdma_dma_mapping mapping;
+    longint unsigned offset;
+    rdma_status status;
+
+    data = new[0];
+    status = find_iova(iova, size, mapping, offset);
+    if (!status.ok())
+      return status;
+    return read(mapping, offset, size, data);
+  endfunction
+
+  // 功能：设备按 IOVA 写主机内存（等价 PCIe DMA write）。
+  // 输入/输出及副作用：写 backing。
+  // 失败/边界：地址未落在单个 ACTIVE 映射内返回 find_iova 的错误。
+  virtual function rdma_status dma_write(bit [63:0] iova, byte data[]);
+    rdma_dma_mapping mapping;
+    longint unsigned offset;
+    rdma_status status;
+
+    status = find_iova(iova, data.size(), mapping, offset);
+    if (!status.ok())
+      return status;
+    return write(mapping, offset, data);
+  endfunction
+
   // 功能：只读确认指定 allocation 的 release 满足 failure-atomic 契约。
   // 输入/输出及副作用：基类不访问 backing，不改 ledger。
   // 失败/边界：基类无法证明 release 顺序，始终返回 UNSUPPORTED_OPCODE（fail closed）。

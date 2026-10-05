@@ -342,6 +342,25 @@ class rdma_real_host_mem_proxy extends rdma_mock_host_mem;
     return status;
   endfunction
 
+  // 功能：设备 DMA 读直接转给真实 adapter（按 IOVA 解析其 canonical mapping）。
+  // 输入/输出及副作用：同 rdma_host_mem_api.dma_read。
+  // 失败/边界：delegate 缺失返回 INVALID_STATE。
+  virtual function rdma_status dma_read(bit [63:0] iova, int unsigned size, output byte data[]);
+    data = new[0];
+    if (delegate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "real host-memory delegate is missing");
+    return delegate.dma_read(iova, size, data);
+  endfunction
+
+  // 功能：设备 DMA 写直接转给真实 adapter。
+  // 输入/输出及副作用：同 rdma_host_mem_api.dma_write。
+  // 失败/边界：delegate 缺失返回 INVALID_STATE。
+  virtual function rdma_status dma_write(bit [63:0] iova, byte data[]);
+    if (delegate == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "real host-memory delegate is missing");
+    return delegate.dma_write(iova, data);
+  endfunction
+
   // 功能：read 先把 borrowed public mapping 安全解析到 canonical identity，
   //   再从真实 adapter 读取 mapping-relative offset/size 的 pinned bytes。
   // 输入/输出及副作用：mapping/offset/size 为输入；data 入口清空，真实
