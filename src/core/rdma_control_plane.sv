@@ -5,6 +5,16 @@
 //   context_backing 与 queue/QP executor。
 // 所有权与生命周期：外部依赖为非拥有引用；本类拥有 Function 锁表、事务号与 executor 对象。
 
+// MR 恢复一次调用内各步骤共享的上下文：目标句柄、锁内 owner、ERROR MR、恢复记录、结果与是否源自 create。
+class rdma_mr_recovery_context;
+  rdma_handle resource_h;
+  rdma_function_handle owner;
+  rdma_mr error_mr;
+  rdma_recovery_record recovery;
+  rdma_control_result result;
+  bit creation_origin;
+endclass
+
 class rdma_control_plane extends uvm_object;
   `rdma_object_utils(rdma_control_plane)
 
@@ -3082,8 +3092,8 @@ class rdma_control_plane extends uvm_object;
     );
   endtask
 
-  // 功能：恢复 ERROR 资源：按 recovery 记录继续硬件阶段、释放 HMC/backing 并 finalize_release；
-  //   QP 与队列类资源分派给对应 executor。
+  // 功能：恢复 ERROR 资源：在 Function 锁内校验目标后，QP/队列分派给对应 lifecycle executor，MR 按恢复记录
+  //   继续硬件阶段、释放 HMC/backing 并 finalize_release。
   // 输入/输出及副作用：binding、resource_h 为输入；result 输出事务结果；全程在 Function 锁内。
   // 失败/边界：锁、超时、generation 变化或提交证据不完整时保持原状态；不可恢复条件继续发布 RECOVERY_REQUIRED。
   task recover_resource(
@@ -3094,26 +3104,10 @@ class rdma_control_plane extends uvm_object;
     rdma_function_handle owner;
     rdma_function_handle locked_owner;
     rdma_resource resource;
-    rdma_mr error_mr;
-    rdma_queue_resource error_queue;
-    rdma_recovery_record recovery;
-    rdma_cmq_ticket ticket;
-    rdma_cmq_completion completion;
     rdma_status status;
-    rdma_status completion_status;
-    rdma_status persist_status;
-    rdma_status reconcile_status;
     semaphore function_lock;
     longint unsigned transaction_id;
-    longint unsigned lease_size;
-    rdma_control_step_e pending_hardware_step;
-    bit terminal_known;
-    bit release_complete;
-    bit creation_origin;
-    bit has_hardware_pending;
-    bit reserved_only;
     bit result_finalized;
-    bit defer_terminal_retry;
 
     result = make_result();
     function_lock = null;
@@ -3150,645 +3144,11 @@ class rdma_control_plane extends uvm_object;
       status = checked_status(status, "recovery lookup returned null");
       if (!status.ok())
         break;
-
-      // QP recovery 使用独立的 lifecycle executor（QPC image、query-buffer authority 与有序 backing 清理
-      // 不同于通用 queue/MR 恢复协议）；与 create/modify/destroy 一样在持有 Function 锁时派发。
-      if (resource_h.kind == RDMA_RESOURCE_QP) begin
-        rdma_qp error_qp;
-        if (qp_executor == null) begin
-          status = invalid_state("QP lifecycle executor is unavailable");
-          break;
-        end
-        if (!$cast(error_qp, resource) || error_qp == null ||
-            error_qp.state != RDMA_RESOURCE_ERROR) begin
-          status = invalid_state("QP recovery requires an ERROR QP");
-          break;
-        end
-        status = same_owner_status(error_qp.owner, locked_owner,
-                                   "recovery QP");
-        if (status == null || !status.ok())
-          break;
-        qp_executor.recover_locked(binding, locked_owner, resource_h,
-                                   transaction_id, result);
-        if (result == null) begin
-          result = make_result();
-          result.transaction_id = transaction_id;
-          status = invalid_state("QP recovery executor returned null result");
-          break;
-        end
-        result_finalized = 1'b1;
-        break;
-      end
-
-      // 队列恢复由 queue executor 按策略执行；在持有与 create/destroy 相同的 Function 锁时派发，
-      // executor 自己不分配事务号，也不再取其它锁。
-      if (resource_h.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-                                  RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) begin
-        if (queue_executor == null) begin
-          status = invalid_state("queue lifecycle executor is unavailable");
-          break;
-        end
-        if (!$cast(error_queue, resource) || error_queue == null ||
-            error_queue.state != RDMA_RESOURCE_ERROR) begin
-          status = invalid_state("recovery requires an ERROR queue");
-          break;
-        end
-        status = same_owner_status(error_queue.owner, locked_owner,
-                                   "recovery queue");
-        if (status == null || !status.ok())
-          break;
-        queue_executor.recover_locked(
-          binding, locked_owner, resource_h, transaction_id, result
-        );
-        if (result == null) begin
-          result = make_result();
-          result.transaction_id = transaction_id;
-          status = invalid_state("queue recovery executor returned null result");
-          break;
-        end
-        result_finalized = 1'b1;
-        break;
-      end
-      if (!$cast(error_mr, resource) || error_mr == null ||
-          error_mr.state != RDMA_RESOURCE_ERROR) begin
-        status = invalid_state("recovery requires an ERROR MR");
-        break;
-      end
-      result.resource_h = snapshot_handle(error_mr.handle);
-      status = same_owner_status(error_mr.owner, locked_owner, "recovery MR");
-      `RDMA_BREAK_IF_FAILED(status, "recovery owner check returned null")
-      status = manager.lookup_recovery(resource_h, recovery);
-      status = checked_status(
-        status, "recovery record lookup returned null"
-      );
-      if (!status.ok())
-        break;
-      if (recovery == null || recovery.primary_status == null) begin
-        status = invalid_state("ERROR MR recovery record is incomplete");
-        break;
-      end
-      rdma_recovery_project_history(recovery, result);
-      creation_origin = rdma_recovery_step_completed(
-        recovery, RDMA_CTRL_STEP_RESOURCE_RESERVED
-      );
-      reserved_only = recovery_is_reserved_only(recovery);
-      if (reserved_only) begin
-        recover_reserved_error(resource_h, recovery, result);
-        result_finalized = 1'b1;
-        break;
-      end
-
-      if (!creation_origin &&
-          destroy_recovery_restore_ready(recovery)) begin
-        restore_destroy_recovery(resource_h, recovery, result);
-        result_finalized = 1'b1;
-        break;
-      end
-
-      if (recovery.ambiguous_ticket != null) begin
-        ticket = recovery.ambiguous_ticket;
-        terminal_known = 1'b0;
-        completion = null;
-        cmq.reconcile(ticket, terminal_known, completion,
-                      reconcile_status);
-        reconcile_status = checked_status(
-          reconcile_status, "CMQ reconciliation returned null"
-        );
-        if (!terminal_known) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "ambiguous CMQ command has no terminal result"
-          );
-          if (!reconcile_status.ok())
-            result.rollback_statuses.push_back(
-              rdma_cmq_clone_status_value(reconcile_status)
-            );
-          result_finalized = 1'b1;
-          break;
-        end
-        if (completion == null || completion.status == null) begin
-          retain_recovery_failure(
-            resource_h, recovery,
-            invalid_state("CMQ reconciliation completion is incomplete"),
-            result, "CMQ reconciliation still requires recovery"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-        completion_status = checked_status(
-          completion.status, "CMQ reconciliation status returned null"
-        );
-        if (completion_status.code == RDMA_SC_RESET_CANCELLED) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "reset cancellation does not prove hardware absence"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-
-        if (ticket.opcode_key == null) begin
-          retain_recovery_failure(
-            resource_h, recovery,
-            invalid_state("ambiguous CMQ ticket has no opcode"), result,
-            "ambiguous CMQ command still requires recovery"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-        defer_terminal_retry = 1'b0;
-        case (ticket.opcode_key.opcode)
-          RDMA_OP_KEY_ALLOC: begin
-            if (!rdma_recovery_step_pending(
-                  recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED)) begin
-              retain_recovery_failure(
-                resource_h, recovery,
-                invalid_state("KEY_ALLOC ticket has no pending step"),
-                result, "ambiguous KEY_ALLOC still requires recovery"
-              );
-              result_finalized = 1'b1;
-              break;
-            end
-            recovery.ambiguous_ticket = null;
-            if (completion_status.ok()) begin
-              recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-              rdma_recovery_complete_step(
-                recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED
-              );
-              rdma_recovery_queue_step(
-                recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
-              );
-            end
-            else begin
-              recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-              rdma_recovery_remove_pending(
-                recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED
-              );
-              recovery.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(completion_status)
-              );
-              rdma_recovery_queue_step(
-                recovery, RDMA_CTRL_STEP_BACKING_RELEASED
-              );
-            end
-          end
-          RDMA_OP_OCC_FLUSH: begin
-            recovery.ambiguous_ticket = null;
-            recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            if (completion_status.ok()) begin
-              rdma_recovery_complete_step(
-                recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED
-              );
-              rdma_recovery_queue_step(
-                recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
-              );
-            end
-            else begin
-              if (!creation_origin)
-                rdma_recovery_remove_pending(
-                  recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED
-                );
-              recovery.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(completion_status)
-              );
-            end
-          end
-          RDMA_OP_MR_DEREGISTER: begin
-            recovery.ambiguous_ticket = null;
-            if (completion_status.ok()) begin
-              recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-              rdma_recovery_complete_step(
-                recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
-              );
-              if (creation_origin)
-                rdma_recovery_queue_step(
-                  recovery, RDMA_CTRL_STEP_BACKING_RELEASED
-                );
-              else
-                rdma_recovery_queue_step(
-                  recovery, RDMA_CTRL_STEP_HW_DRAINED
-                );
-            end
-            else begin
-              recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-              if (!creation_origin)
-                rdma_recovery_remove_pending(
-                  recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
-                );
-              else
-                defer_terminal_retry = 1'b1;
-              recovery.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(completion_status)
-              );
-            end
-          end
-          RDMA_OP_TQ_FLUSH: begin
-            recovery.ambiguous_ticket = null;
-            recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            if (completion_status.ok()) begin
-              rdma_recovery_complete_step(
-                recovery, RDMA_CTRL_STEP_HW_DRAINED
-              );
-              rdma_recovery_queue_step(
-                recovery, RDMA_CTRL_STEP_BACKING_RELEASED
-              );
-            end
-            else begin
-              recovery.rollback_statuses.push_back(
-                rdma_cmq_clone_status_value(completion_status)
-              );
-              defer_terminal_retry = 1'b1;
-            end
-          end
-          default: begin
-            retain_recovery_failure(
-              resource_h, recovery,
-              rdma_status::make(
-                RDMA_SC_UNSUPPORTED_OPCODE,
-                "ambiguous recovery opcode is unsupported"
-              ), result, "ambiguous CMQ command still requires recovery"
-            );
-            result_finalized = 1'b1;
-          end
-        endcase
-        if (result_finalized)
-          break;
-        persist_status = persist_recovery_record(resource_h, recovery);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "reconciled CMQ progress could not be persisted"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-        if (defer_terminal_retry) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "terminal hardware failure was retained for a later retry"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-        if (!creation_origin &&
-            destroy_recovery_restore_ready(recovery)) begin
-          restore_destroy_recovery(resource_h, recovery, result);
-          result_finalized = 1'b1;
-          break;
-        end
-      end
-
-      while (1'b1) begin
-        has_hardware_pending = first_pending_hardware_step(
-          recovery, pending_hardware_step
-        );
-        if (!has_hardware_pending)
-          break;
-        if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "unknown hardware state lacks terminal reconciliation"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-        if (pending_hardware_step == RDMA_CTRL_STEP_HW_KEY_ALLOCATED) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "KEY_ALLOC ambiguity requires its original terminal result"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-
-        execute_recovery_hardware_step(
-          error_mr, locked_owner, pending_hardware_step,
-          ticket, completion, status
-        );
-        if (!status.ok()) begin
-          if (status.code == RDMA_SC_TIMEOUT) begin
-            recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-              ticket, "recovery timeout ticket"
-            );
-            if (pending_hardware_step == RDMA_CTRL_STEP_HW_DRAINED)
-              recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            else
-              recovery.hardware_presence = RDMA_HW_PRESENCE_UNKNOWN;
-          end
-          else begin
-            recovery.ambiguous_ticket = null;
-            if (pending_hardware_step == RDMA_CTRL_STEP_HW_DRAINED)
-              recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            else
-              recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-          end
-          retain_recovery_failure(
-            resource_h, recovery, status, result,
-            "hardware recovery step failed"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-
-        case (pending_hardware_step)
-          RDMA_CTRL_STEP_HW_OCC_FLUSHED: begin
-            recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
-            rdma_recovery_complete_step(recovery, pending_hardware_step);
-            rdma_recovery_queue_step(
-              recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED
-            );
-          end
-          RDMA_CTRL_STEP_HW_MR_DEREGISTERED: begin
-            recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            rdma_recovery_complete_step(recovery, pending_hardware_step);
-            if (creation_origin)
-              rdma_recovery_queue_step(
-                recovery, RDMA_CTRL_STEP_BACKING_RELEASED
-              );
-            else
-              rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_DRAINED);
-          end
-          RDMA_CTRL_STEP_HW_DRAINED: begin
-            recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
-            rdma_recovery_complete_step(recovery, pending_hardware_step);
-            rdma_recovery_queue_step(
-              recovery, RDMA_CTRL_STEP_BACKING_RELEASED
-            );
-          end
-          default: begin
-          end
-        endcase
-        persist_status = persist_recovery_record(resource_h, recovery);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "hardware recovery progress could not be persisted"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-      end
-      if (result_finalized)
-        break;
-
-      has_hardware_pending = recovery_has_hardware_step(
-        recovery, 1'b0
-      );
-      if (has_hardware_pending ||
-          recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
-        rdma_recovery_publish_required(
-          recovery, result,
-          "hardware absence is not yet proven"
-        );
-        result_finalized = 1'b1;
-        break;
-      end
-
-      if (!rdma_recovery_step_pending(
-            recovery, RDMA_CTRL_STEP_BACKING_RELEASED) &&
-          !rdma_recovery_step_completed(
-            recovery, RDMA_CTRL_STEP_BACKING_RELEASED) &&
-          !rdma_recovery_step_pending(
-            recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
-        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
-        persist_status = persist_recovery_record(resource_h, recovery);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "local recovery plan could not be persisted"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-      end
-
-      if (rdma_recovery_step_pending(
-            recovery, RDMA_CTRL_STEP_BACKING_RELEASED)) begin
-        for (int i = int'(recovery.hmc_refs.size()) - 1; i >= 0; i--) begin
-          if (recovery.hmc_refs[i] == null) begin
-            status = invalid_state("recovery HMC reference is null");
-            retain_recovery_failure(
-              resource_h, recovery, status, result,
-              "HMC cleanup still requires recovery"
-            );
-            result_finalized = 1'b1;
-            break;
-          end
-          if (recovery.hmc_refs[i].ownership == RDMA_OWNERSHIP_BORROWED ||
-              recovery.hmc_refs[i].release_complete)
-            continue;
-          if (hmc_allocator == null) begin
-            status = invalid_state("recovery HMC allocator is unavailable");
-          end
-          else begin
-            status = hmc_allocator.lookup(
-              recovery.hmc_refs[i].owner,
-              recovery.hmc_refs[i].object_kind,
-              recovery.hmc_refs[i].address, lease_size
-            );
-            status = checked_status(
-              status, "recovery HMC lookup returned null"
-            );
-            if (status.ok() && lease_size != recovery.hmc_refs[i].size)
-              status = invalid_state("recovery HMC lease size changed");
-            if (status.ok()) begin
-              status = hmc_allocator.\release (
-                recovery.hmc_refs[i].owner,
-                recovery.hmc_refs[i].object_kind,
-                recovery.hmc_refs[i].address
-              );
-              status = checked_status(
-                status, "recovery HMC release returned null"
-              );
-            end
-            else if (status.code == RDMA_SC_INVALID_STATE) begin
-              status = rdma_status::success(
-                "recovery HMC lease was already released"
-              );
-            end
-          end
-          if (!status.ok()) begin
-            retain_recovery_failure(
-              resource_h, recovery, status, result,
-              "HMC cleanup still requires recovery"
-            );
-            result_finalized = 1'b1;
-            break;
-          end
-          recovery.hmc_refs[i].release_complete = 1'b1;
-          persist_status = persist_recovery_record(resource_h, recovery);
-          if (!persist_status.ok()) begin
-            rdma_recovery_publish_required(
-              recovery, result,
-              "HMC cleanup progress could not be persisted"
-            );
-            result_finalized = 1'b1;
-            break;
-          end
-        end
-        if (result_finalized)
-          break;
-
-        foreach (recovery.backing_refs[i]) begin
-          if (recovery.backing_refs[i] == null ||
-              recovery.backing_refs[i].mapping == null) begin
-            status = invalid_state("recovery backing reference is null");
-            retain_recovery_failure(
-              resource_h, recovery, status, result,
-              "backing cleanup still requires recovery"
-            );
-            result_finalized = 1'b1;
-            break;
-          end
-          if (recovery.backing_refs[i].ownership ==
-                RDMA_OWNERSHIP_BORROWED ||
-              recovery.backing_refs[i].release_complete)
-            continue;
-          status = manager.query_owned_release_completion(
-            recovery.backing_refs[i].mapping, release_complete
-          );
-          status = checked_status(
-            status, "recovery completion query returned null"
-          );
-          if (!status.ok()) begin
-            retain_recovery_failure(
-              resource_h, recovery, status, result,
-              "backing cleanup still requires recovery"
-            );
-            result_finalized = 1'b1;
-            break;
-          end
-          if (!release_complete) begin
-            if (host_mem == null)
-              status = invalid_state(
-                "recovery host memory adapter is unavailable"
-              );
-            else
-              status = host_mem.\release (
-                recovery.backing_refs[i].mapping
-              );
-            status = checked_status(
-              status, "recovery backing release returned null"
-            );
-            if (!status.ok()) begin
-              retain_recovery_failure(
-                resource_h, recovery, status, result,
-                "backing cleanup still requires recovery"
-              );
-              result_finalized = 1'b1;
-              break;
-            end
-            status = manager.query_owned_release_completion(
-              recovery.backing_refs[i].mapping, release_complete
-            );
-            status = checked_status(
-              status, "post-release completion query returned null"
-            );
-            if (!status.ok() || !release_complete) begin
-              if (status.ok())
-                status = invalid_state(
-                  "host memory release did not seal completion"
-                );
-              retain_recovery_failure(
-                resource_h, recovery, status, result,
-                "backing cleanup still requires recovery"
-              );
-              result_finalized = 1'b1;
-              break;
-            end
-          end
-          recovery.backing_refs[i].release_complete = 1'b1;
-          persist_status = persist_recovery_record(resource_h, recovery);
-          if (!persist_status.ok()) begin
-            rdma_recovery_publish_required(
-              recovery, result,
-              "backing cleanup progress could not be persisted"
-            );
-            result_finalized = 1'b1;
-            break;
-          end
-        end
-        if (result_finalized)
-          break;
-
-        rdma_recovery_complete_step(
-          recovery, RDMA_CTRL_STEP_BACKING_RELEASED
-        );
-        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
-        persist_status = persist_recovery_record(resource_h, recovery);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "backing cleanup completion could not be persisted"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-      end
-
-      if (recovery.pending_steps.size() != 0 &&
-          !rdma_recovery_step_pending(
-            recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
-        retain_recovery_failure(
-          resource_h, recovery,
-          invalid_state("recovery contains an unsupported pending step"),
-          result, "resource still requires recovery"
-        );
-        result_finalized = 1'b1;
-        break;
-      end
-
-      if (!rdma_recovery_step_completed(
-            recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
-        rdma_recovery_queue_step(
-          recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
-        );
-        rdma_recovery_complete_step(
-          recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
-        );
-        persist_status = persist_recovery_record(resource_h, recovery);
-        if (!persist_status.ok()) begin
-          rdma_recovery_publish_required(
-            recovery, result,
-            "resource-release progress could not be persisted"
-          );
-          result_finalized = 1'b1;
-          break;
-        end
-      end
-      if (recovery.pending_steps.size() != 0) begin
-        rdma_recovery_publish_required(
-          recovery, result,
-          "resource still has pending recovery work"
-        );
-        result_finalized = 1'b1;
-        break;
-      end
-      status = manager.finalize_release(resource_h);
-      status = checked_status(
-        status, "recovered ERROR final release returned null"
-      );
-      if (!status.ok()) begin
-        rdma_recovery_remove_completed(
-          recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
-        );
-        rdma_recovery_queue_step(
-          recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED
-        );
-        retain_recovery_failure(
-          resource_h, recovery, status, result,
-          "resource finalization still requires recovery"
-        );
-        result_finalized = 1'b1;
-        break;
-      end
-
-      rdma_recovery_project_history(recovery, result);
-      result.status = rdma_status::success();
-      result.final_resource_state = RDMA_RESOURCE_RELEASED;
-      result.final_resource_state_known = 1'b1;
-      result.recovery_required = 1'b0;
-      status = rdma_status::success();
+      if (resource_h.kind == RDMA_RESOURCE_MR)
+        recover_mr_locked(locked_owner, resource_h, resource, result, status, result_finalized);
+      else
+        dispatch_lifecycle_recovery(binding, locked_owner, resource_h, resource, transaction_id,
+                                    result, status, result_finalized);
     end while (1'b0);
 
     if (!result_finalized && (status == null || !status.ok()))
@@ -3796,4 +3156,514 @@ class rdma_control_plane extends uvm_object;
     if (function_lock != null)
       function_lock.put(1);
   endtask
+
+  // 功能：把 ERROR QP/队列的恢复派发给对应 lifecycle executor（与 create/modify/destroy 一样在持有
+  //   Function 锁时派发；QP 的 QPC image、query-buffer authority 与有序 backing 清理不同于通用协议）。
+  // 输入/输出及副作用：result 由 executor 填写（executor 不分配事务号、不再取锁）；finalized=1 表示结果已完成。
+  // 失败/边界：executor 缺失、资源非 ERROR、owner 不符或 executor 返回 null result 时返回错误 status。
+  protected task dispatch_lifecycle_recovery(
+    rdma_function_binding binding,
+    rdma_function_handle locked_owner,
+    rdma_handle resource_h,
+    rdma_resource resource,
+    longint unsigned transaction_id,
+    inout rdma_control_result result,
+    output rdma_status status,
+    output bit finalized
+  );
+    rdma_qp error_qp;
+    rdma_queue_resource error_queue;
+    string null_message;
+
+    finalized = 1'b0;
+    if (resource_h.kind == RDMA_RESOURCE_QP) begin
+      if (qp_executor == null) begin
+        status = invalid_state("QP lifecycle executor is unavailable");
+        return;
+      end
+      if (!$cast(error_qp, resource) || error_qp == null ||
+          error_qp.state != RDMA_RESOURCE_ERROR) begin
+        status = invalid_state("QP recovery requires an ERROR QP");
+        return;
+      end
+      status = same_owner_status(error_qp.owner, locked_owner, "recovery QP");
+      if (status == null || !status.ok())
+        return;
+      qp_executor.recover_locked(binding, locked_owner, resource_h, transaction_id, result);
+      null_message = "QP recovery executor returned null result";
+    end
+    else begin
+      if (queue_executor == null) begin
+        status = invalid_state("queue lifecycle executor is unavailable");
+        return;
+      end
+      if (!$cast(error_queue, resource) || error_queue == null ||
+          error_queue.state != RDMA_RESOURCE_ERROR) begin
+        status = invalid_state("recovery requires an ERROR queue");
+        return;
+      end
+      status = same_owner_status(error_queue.owner, locked_owner, "recovery queue");
+      if (status == null || !status.ok())
+        return;
+      queue_executor.recover_locked(binding, locked_owner, resource_h, transaction_id, result);
+      null_message = "queue recovery executor returned null result";
+    end
+    if (result == null) begin
+      result = make_result();
+      result.transaction_id = transaction_id;
+      status = invalid_state(null_message);
+      return;
+    end
+    finalized = 1'b1;
+  endtask
+
+  // 功能：恢复 ERROR MR：仅预留或可恢复的 destroy 走专用路径；否则对账歧义命令、执行待办硬件步骤，证明
+  //   absence 后释放 HMC/backing 并最终释放资源。
+  // 输入/输出及副作用：result 为输入句柄并被写入；finalized=1 表示结果已完成（含 RECOVERY_REQUIRED）。
+  // 失败/边界：入口校验失败返回错误 status 且 finalized=0。
+  protected task recover_mr_locked(
+    rdma_function_handle locked_owner,
+    rdma_handle resource_h,
+    rdma_resource resource,
+    rdma_control_result result,
+    output rdma_status status,
+    output bit finalized
+  );
+    rdma_mr_recovery_context ctx;
+    bit stop;
+
+    finalized = 1'b0;
+    status = open_mr_recovery(locked_owner, resource_h, resource, result, ctx);
+    if (!status.ok())
+      return;
+    finalized = 1'b1;
+    if (recovery_is_reserved_only(ctx.recovery)) begin
+      recover_reserved_error(resource_h, ctx.recovery, result);
+      return;
+    end
+    if (!ctx.creation_origin && destroy_recovery_restore_ready(ctx.recovery)) begin
+      restore_destroy_recovery(resource_h, ctx.recovery, result);
+      return;
+    end
+    if (ctx.recovery.ambiguous_ticket != null) begin
+      reconcile_mr_ambiguity(ctx, stop);
+      if (stop)
+        return;
+    end
+    run_mr_hardware_steps(ctx, stop);
+    if (stop)
+      return;
+    if (recovery_has_hardware_step(ctx.recovery, 1'b0) ||
+        ctx.recovery.hardware_presence != RDMA_HW_PRESENCE_ABSENT) begin
+      rdma_recovery_publish_required(ctx.recovery, result, "hardware absence is not yet proven");
+      return;
+    end
+    if (!release_mr_backing(ctx))
+      return;
+    status = finish_mr_recovery(ctx);
+  endtask
+
+  // 功能：校验 ERROR MR、owner 与恢复记录，建立 MR 恢复上下文。
+  // 输入/输出及副作用：成功时写 result.resource_h 与恢复历史；ctx 输出。
+  // 失败/边界：校验失败返回错误（null status 归一化为对应文案）。
+  protected function rdma_status open_mr_recovery(
+    rdma_function_handle locked_owner,
+    rdma_handle resource_h,
+    rdma_resource resource,
+    rdma_control_result result,
+    output rdma_mr_recovery_context ctx
+  );
+    rdma_status status;
+
+    ctx = new();
+    ctx.resource_h = resource_h;
+    ctx.owner = locked_owner;
+    ctx.result = result;
+    if (!$cast(ctx.error_mr, resource) || ctx.error_mr == null ||
+        ctx.error_mr.state != RDMA_RESOURCE_ERROR)
+      return invalid_state("recovery requires an ERROR MR");
+    result.resource_h = snapshot_handle(ctx.error_mr.handle);
+    status = same_owner_status(ctx.error_mr.owner, locked_owner, "recovery MR");
+    if (status == null || !status.ok())
+      return checked_status(status, "recovery owner check returned null");
+    status = checked_status(manager.lookup_recovery(resource_h, ctx.recovery),
+                            "recovery record lookup returned null");
+    if (!status.ok())
+      return status;
+    if (ctx.recovery == null || ctx.recovery.primary_status == null)
+      return invalid_state("ERROR MR recovery record is incomplete");
+    rdma_recovery_project_history(ctx.recovery, result);
+    ctx.creation_origin = rdma_recovery_step_completed(ctx.recovery,
+                                                       RDMA_CTRL_STEP_RESOURCE_RESERVED);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：持久化 MR 恢复进度；失败时以 message 发布 RECOVERY_REQUIRED。
+  // 输入/输出及副作用：写 manager 恢复记录。
+  // 失败/边界：返回 0 表示调用方须停止。
+  protected function bit persist_mr_progress(rdma_mr_recovery_context ctx, string message);
+    if (persist_recovery_record(ctx.resource_h, ctx.recovery).ok())
+      return 1'b1;
+    rdma_recovery_publish_required(ctx.recovery, ctx.result, message);
+    return 1'b0;
+  endfunction
+
+  // 功能：对账此前歧义的 MR 命令，按 opcode 推进恢复记录并持久化；可恢复的 destroy 恢复为 ACTIVE。
+  // 输入/输出及副作用：stop=1 表示结果已完成。
+  // 失败/边界：缺终态、reset 取消、ticket 无效、持久化失败或终态失败需重试时发布 RECOVERY_REQUIRED。
+  protected task reconcile_mr_ambiguity(rdma_mr_recovery_context ctx, output bit stop);
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status reconcile_status;
+    rdma_status completion_status;
+    bit terminal_known;
+    bit defer_terminal_retry;
+
+    stop = 1'b1;
+    ticket = ctx.recovery.ambiguous_ticket;
+    terminal_known = 1'b0;
+    completion = null;
+    cmq.reconcile(ticket, terminal_known, completion, reconcile_status);
+    reconcile_status = checked_status(reconcile_status, "CMQ reconciliation returned null");
+    if (!terminal_known) begin
+      rdma_recovery_publish_required(ctx.recovery, ctx.result,
+                                     "ambiguous CMQ command has no terminal result");
+      if (!reconcile_status.ok())
+        ctx.result.rollback_statuses.push_back(rdma_cmq_clone_status_value(reconcile_status));
+      return;
+    end
+    if (completion == null || completion.status == null) begin
+      retain_recovery_failure(ctx.resource_h, ctx.recovery,
+        invalid_state("CMQ reconciliation completion is incomplete"), ctx.result,
+        "CMQ reconciliation still requires recovery");
+      return;
+    end
+    completion_status = checked_status(completion.status,
+                                       "CMQ reconciliation status returned null");
+    if (completion_status.code == RDMA_SC_RESET_CANCELLED) begin
+      rdma_recovery_publish_required(ctx.recovery, ctx.result,
+                                     "reset cancellation does not prove hardware absence");
+      return;
+    end
+    if (ticket.opcode_key == null) begin
+      retain_recovery_failure(ctx.resource_h, ctx.recovery,
+        invalid_state("ambiguous CMQ ticket has no opcode"), ctx.result,
+        "ambiguous CMQ command still requires recovery");
+      return;
+    end
+    if (!apply_mr_reconciled_completion(ctx, ticket.opcode_key.opcode, completion_status,
+                                        defer_terminal_retry))
+      return;
+    if (!persist_mr_progress(ctx, "reconciled CMQ progress could not be persisted"))
+      return;
+    if (defer_terminal_retry) begin
+      rdma_recovery_publish_required(ctx.recovery, ctx.result,
+                                     "terminal hardware failure was retained for a later retry");
+      return;
+    end
+    if (!ctx.creation_origin && destroy_recovery_restore_ready(ctx.recovery)) begin
+      restore_destroy_recovery(ctx.resource_h, ctx.recovery, ctx.result);
+      return;
+    end
+    stop = 1'b0;
+  endtask
+
+  // 功能：按已对账命令的 opcode 与终态更新 MR 恢复记录（硬件存在性与待办/完成步骤）。
+  // 输入/输出及副作用：修改 ctx.recovery；defer_terminal_retry=1 表示终态失败需留待之后重试。
+  // 失败/边界：KEY_ALLOC 无对应待办或 opcode 不支持时保留恢复并返回 0（结果已完成）。
+  protected function bit apply_mr_reconciled_completion(
+    rdma_mr_recovery_context ctx,
+    bit [7:0] opcode,
+    rdma_status completion_status,
+    output bit defer_terminal_retry
+  );
+    rdma_recovery_record recovery;
+
+    recovery = ctx.recovery;
+    defer_terminal_retry = 1'b0;
+    if (opcode == RDMA_OP_KEY_ALLOC) begin
+      if (!rdma_recovery_step_pending(recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED)) begin
+        retain_recovery_failure(ctx.resource_h, recovery,
+          invalid_state("KEY_ALLOC ticket has no pending step"), ctx.result,
+          "ambiguous KEY_ALLOC still requires recovery");
+        return 1'b0;
+      end
+      recovery.ambiguous_ticket = null;
+      if (completion_status.ok()) begin
+        recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED);
+      end
+      else begin
+        recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+        rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_KEY_ALLOCATED);
+        recovery.rollback_statuses.push_back(rdma_cmq_clone_status_value(completion_status));
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+      end
+      return 1'b1;
+    end
+    if (!(opcode inside {RDMA_OP_OCC_FLUSH, RDMA_OP_MR_DEREGISTER, RDMA_OP_TQ_FLUSH})) begin
+      retain_recovery_failure(ctx.resource_h, recovery,
+        rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, "ambiguous recovery opcode is unsupported"),
+        ctx.result, "ambiguous CMQ command still requires recovery");
+      return 1'b0;
+    end
+    recovery.ambiguous_ticket = null;
+    if (!completion_status.ok())
+      recovery.rollback_statuses.push_back(rdma_cmq_clone_status_value(completion_status));
+    if (opcode == RDMA_OP_OCC_FLUSH) begin
+      recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+      if (completion_status.ok()) begin
+        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED);
+      end
+      else if (!ctx.creation_origin)
+        rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_OCC_FLUSHED);
+    end
+    else if (opcode == RDMA_OP_MR_DEREGISTER) begin
+      if (completion_status.ok()) begin
+        recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED);
+        rdma_recovery_queue_step(recovery, ctx.creation_origin ?
+          RDMA_CTRL_STEP_BACKING_RELEASED : RDMA_CTRL_STEP_HW_DRAINED);
+      end
+      else begin
+        recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+        if (!ctx.creation_origin)
+          rdma_recovery_remove_pending(recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED);
+        else
+          defer_terminal_retry = 1'b1;
+      end
+    end
+    else begin
+      recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+      if (completion_status.ok()) begin
+        rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_HW_DRAINED);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+      end
+      else
+        defer_terminal_retry = 1'b1;
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：按顺序执行待办硬件步骤（OCC flush → MR deregister → TQ drain），每步成功后持久化。
+  // 输入/输出及副作用：stop=1 表示结果已完成；失败时按超时/确定失败设置歧义 ticket 与存在性。
+  // 失败/边界：存在性未知、KEY_ALLOC 待办、执行或持久化失败时发布 RECOVERY_REQUIRED。
+  protected task run_mr_hardware_steps(rdma_mr_recovery_context ctx, output bit stop);
+    rdma_recovery_record recovery;
+    rdma_control_step_e step;
+    rdma_cmq_ticket ticket;
+    rdma_cmq_completion completion;
+    rdma_status status;
+
+    stop = 1'b1;
+    recovery = ctx.recovery;
+    while (first_pending_hardware_step(recovery, step)) begin
+      if (recovery.hardware_presence == RDMA_HW_PRESENCE_UNKNOWN) begin
+        rdma_recovery_publish_required(recovery, ctx.result,
+                                       "unknown hardware state lacks terminal reconciliation");
+        return;
+      end
+      if (step == RDMA_CTRL_STEP_HW_KEY_ALLOCATED) begin
+        rdma_recovery_publish_required(recovery, ctx.result,
+                                       "KEY_ALLOC ambiguity requires its original terminal result");
+        return;
+      end
+      execute_recovery_hardware_step(ctx.error_mr, ctx.owner, step, ticket, completion, status);
+      if (!status.ok()) begin
+        recovery.ambiguous_ticket = (status.code == RDMA_SC_TIMEOUT) ?
+          rdma_cmq_clone_ticket_value(ticket, "recovery timeout ticket") : null;
+        if (step == RDMA_CTRL_STEP_HW_DRAINED)
+          recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+        else
+          recovery.hardware_presence = (status.code == RDMA_SC_TIMEOUT) ?
+            RDMA_HW_PRESENCE_UNKNOWN : RDMA_HW_PRESENCE_PRESENT;
+        retain_recovery_failure(ctx.resource_h, recovery, status, ctx.result,
+                                "hardware recovery step failed");
+        return;
+      end
+      if (step == RDMA_CTRL_STEP_HW_OCC_FLUSHED) begin
+        recovery.hardware_presence = RDMA_HW_PRESENCE_PRESENT;
+        rdma_recovery_complete_step(recovery, step);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_HW_MR_DEREGISTERED);
+      end
+      else if (step == RDMA_CTRL_STEP_HW_MR_DEREGISTERED) begin
+        recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+        rdma_recovery_complete_step(recovery, step);
+        rdma_recovery_queue_step(recovery, ctx.creation_origin ?
+          RDMA_CTRL_STEP_BACKING_RELEASED : RDMA_CTRL_STEP_HW_DRAINED);
+      end
+      else if (step == RDMA_CTRL_STEP_HW_DRAINED) begin
+        recovery.hardware_presence = RDMA_HW_PRESENCE_ABSENT;
+        rdma_recovery_complete_step(recovery, step);
+        rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+      end
+      if (!persist_mr_progress(ctx, "hardware recovery progress could not be persisted"))
+        return;
+    end
+    stop = 1'b0;
+  endtask
+
+  // 功能：硬件 absence 证明后排入并执行本地释放：逆序释放 HMC lease、释放 owned backing，完成
+  //   BACKING_RELEASED 并排入 RESOURCE_RELEASED。
+  // 输入/输出及副作用：每项释放后持久化；返回 1 表示可继续最终释放。
+  // 失败/边界：引用缺失、lookup/release/完成查询失败或持久化失败时保留恢复并返回 0。
+  protected function bit release_mr_backing(rdma_mr_recovery_context ctx);
+    rdma_recovery_record recovery;
+
+    recovery = ctx.recovery;
+    if (!rdma_recovery_step_pending(recovery, RDMA_CTRL_STEP_BACKING_RELEASED) &&
+        !rdma_recovery_step_completed(recovery, RDMA_CTRL_STEP_BACKING_RELEASED) &&
+        !rdma_recovery_step_pending(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
+      rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+      if (!persist_mr_progress(ctx, "local recovery plan could not be persisted"))
+        return 1'b0;
+    end
+    if (!rdma_recovery_step_pending(recovery, RDMA_CTRL_STEP_BACKING_RELEASED))
+      return 1'b1;
+    if (!release_mr_hmc_refs(ctx) || !release_mr_backing_refs(ctx))
+      return 1'b0;
+    rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_BACKING_RELEASED);
+    rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+    return persist_mr_progress(ctx, "backing cleanup completion could not be persisted");
+  endfunction
+
+  // 功能：逆序释放恢复记录中未完成的 owned HMC lease（lease 已不存在视为已释放），每项后持久化。
+  // 输入/输出及副作用：调用 hmc_allocator lookup/release；置 release_complete。
+  // 失败/边界：引用为空、allocator 缺失、lease 大小变化、release 或持久化失败时保留恢复并返回 0。
+  protected function bit release_mr_hmc_refs(rdma_mr_recovery_context ctx);
+    rdma_recovery_record recovery;
+    rdma_status status;
+    longint unsigned lease_size;
+
+    recovery = ctx.recovery;
+    for (int i = int'(recovery.hmc_refs.size()) - 1; i >= 0; i--) begin
+      if (recovery.hmc_refs[i] == null) begin
+        retain_recovery_failure(ctx.resource_h, recovery,
+          invalid_state("recovery HMC reference is null"), ctx.result,
+          "HMC cleanup still requires recovery");
+        return 1'b0;
+      end
+      if (recovery.hmc_refs[i].ownership == RDMA_OWNERSHIP_BORROWED ||
+          recovery.hmc_refs[i].release_complete)
+        continue;
+      if (hmc_allocator == null)
+        status = invalid_state("recovery HMC allocator is unavailable");
+      else begin
+        status = checked_status(hmc_allocator.lookup(recovery.hmc_refs[i].owner,
+          recovery.hmc_refs[i].object_kind, recovery.hmc_refs[i].address, lease_size),
+          "recovery HMC lookup returned null");
+        if (status.ok() && lease_size != recovery.hmc_refs[i].size)
+          status = invalid_state("recovery HMC lease size changed");
+        if (status.ok())
+          status = checked_status(hmc_allocator.\release (recovery.hmc_refs[i].owner,
+            recovery.hmc_refs[i].object_kind, recovery.hmc_refs[i].address),
+            "recovery HMC release returned null");
+        else if (status.code == RDMA_SC_INVALID_STATE)
+          status = rdma_status::success("recovery HMC lease was already released");
+      end
+      if (!status.ok()) begin
+        retain_recovery_failure(ctx.resource_h, recovery, status, ctx.result,
+                                "HMC cleanup still requires recovery");
+        return 1'b0;
+      end
+      recovery.hmc_refs[i].release_complete = 1'b1;
+      if (!persist_mr_progress(ctx, "HMC cleanup progress could not be persisted"))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：释放恢复记录中未完成的 owned backing mapping：先查询 manager 完成证据，未完成则经 host_mem
+  //   释放并复查密封，每项后持久化。
+  // 输入/输出及副作用：可能调用 host_mem.release；置 release_complete。
+  // 失败/边界：引用为空、查询/释放失败、释放未密封或持久化失败时保留恢复并返回 0。
+  protected function bit release_mr_backing_refs(rdma_mr_recovery_context ctx);
+    rdma_recovery_record recovery;
+    rdma_status status;
+    bit release_complete;
+
+    recovery = ctx.recovery;
+    foreach (recovery.backing_refs[i]) begin
+      if (recovery.backing_refs[i] == null || recovery.backing_refs[i].mapping == null) begin
+        retain_recovery_failure(ctx.resource_h, recovery,
+          invalid_state("recovery backing reference is null"), ctx.result,
+          "backing cleanup still requires recovery");
+        return 1'b0;
+      end
+      if (recovery.backing_refs[i].ownership == RDMA_OWNERSHIP_BORROWED ||
+          recovery.backing_refs[i].release_complete)
+        continue;
+      status = checked_status(manager.query_owned_release_completion(
+        recovery.backing_refs[i].mapping, release_complete),
+        "recovery completion query returned null");
+      if (status.ok() && !release_complete) begin
+        if (host_mem == null)
+          status = invalid_state("recovery host memory adapter is unavailable");
+        else
+          status = host_mem.\release (recovery.backing_refs[i].mapping);
+        status = checked_status(status, "recovery backing release returned null");
+        if (status.ok()) begin
+          status = checked_status(manager.query_owned_release_completion(
+            recovery.backing_refs[i].mapping, release_complete),
+            "post-release completion query returned null");
+          if (status.ok() && !release_complete)
+            status = invalid_state("host memory release did not seal completion");
+        end
+      end
+      if (!status.ok()) begin
+        retain_recovery_failure(ctx.resource_h, recovery, status, ctx.result,
+                                "backing cleanup still requires recovery");
+        return 1'b0;
+      end
+      recovery.backing_refs[i].release_complete = 1'b1;
+      if (!persist_mr_progress(ctx, "backing cleanup progress could not be persisted"))
+        return 1'b0;
+    end
+    return 1'b1;
+  endfunction
+
+  // 功能：确认只剩 RESOURCE_RELEASED 后记录并持久化该步骤，调用 finalize_release，成功时 result 为 RELEASED。
+  // 输入/输出及副作用：返回最终 status（成功为 success；失败时结果已发布为 RECOVERY_REQUIRED）。
+  // 失败/边界：存在不支持的待办、持久化失败或最终释放失败时保留恢复。
+  protected function rdma_status finish_mr_recovery(rdma_mr_recovery_context ctx);
+    rdma_recovery_record recovery;
+    rdma_status status;
+
+    recovery = ctx.recovery;
+    if (recovery.pending_steps.size() != 0 &&
+        !rdma_recovery_step_pending(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
+      retain_recovery_failure(ctx.resource_h, recovery,
+        invalid_state("recovery contains an unsupported pending step"), ctx.result,
+        "resource still requires recovery");
+      return rdma_status::success();
+    end
+    if (!rdma_recovery_step_completed(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED)) begin
+      rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      rdma_recovery_complete_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      if (!persist_mr_progress(ctx, "resource-release progress could not be persisted"))
+        return rdma_status::success();
+    end
+    if (recovery.pending_steps.size() != 0) begin
+      rdma_recovery_publish_required(recovery, ctx.result,
+                                     "resource still has pending recovery work");
+      return rdma_status::success();
+    end
+    status = checked_status(manager.finalize_release(ctx.resource_h),
+                            "recovered ERROR final release returned null");
+    if (!status.ok()) begin
+      rdma_recovery_remove_completed(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      rdma_recovery_queue_step(recovery, RDMA_CTRL_STEP_RESOURCE_RELEASED);
+      retain_recovery_failure(ctx.resource_h, recovery, status, ctx.result,
+                              "resource finalization still requires recovery");
+      return rdma_status::success();
+    end
+    rdma_recovery_project_history(recovery, ctx.result);
+    ctx.result.status = rdma_status::success();
+    ctx.result.final_resource_state = RDMA_RESOURCE_RELEASED;
+    ctx.result.final_resource_state_known = 1'b1;
+    ctx.result.recovery_required = 1'b0;
+    return rdma_status::success();
+  endfunction
 endclass
