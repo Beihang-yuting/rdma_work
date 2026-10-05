@@ -121,14 +121,13 @@ class rdma_tb_scoreboard extends uvm_scoreboard;
   protected function void load_shadow();
     rdma_tb_node_cfg cfg;
     rdma_status status;
-    byte raw[];
+    rdma_bytes_t raw;
 
     loaded = 1'b1;
     foreach (nodes[n]) begin
       cfg = nodes[n];
-      status = cfg.engine.host_mem.read(cfg.data_mapping, data_base(cfg),
-                                        cfg.data_mr.length, raw);
-      if (status == null || !status.ok()) begin
+      status = cfg.drv.hw.read(cfg.data_buf, 0, cfg.data_buf.size, raw);
+      if (!status.ok()) begin
         fail($sformatf("node %0d shadow load failed", n));
         continue;
       end
@@ -136,13 +135,6 @@ class rdma_tb_scoreboard extends uvm_scoreboard;
       foreach (raw[k])
         shadow[n].push_back(raw[k]);
     end
-  endfunction
-
-  // 功能：数据 MR 起点在 backing mapping 内的偏移。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
-  protected function longint unsigned data_base(rdma_tb_node_cfg cfg);
-    return cfg.data_mr.iova.value - cfg.data_mapping.iova.value;
   endfunction
 
   // 功能：结算 SQ 完成：弹出该 QP 队列中直到 wr_id 的全部请求并应用预测；只比对最后一个的状态。
@@ -258,19 +250,18 @@ class rdma_tb_scoreboard extends uvm_scoreboard;
   protected function void compare_memory(int unsigned n);
     rdma_tb_node_cfg cfg;
     rdma_status status;
-    byte raw[];
+    rdma_bytes_t raw;
     int unsigned diffs;
 
     cfg = nodes[n];
-    status = cfg.engine.host_mem.read(cfg.data_mapping, data_base(cfg),
-                                      cfg.data_mr.length, raw);
-    if (status == null || !status.ok() || raw.size() != shadow[n].size()) begin
+    status = cfg.drv.hw.read(cfg.data_buf, 0, cfg.data_buf.size, raw);
+    if (!status.ok() || raw.size() != shadow[n].size()) begin
       fail($sformatf("node %0d final memory read failed", n));
       return;
     end
     diffs = 0;
     foreach (raw[k]) begin
-      if (byte'(shadow[n][k]) == raw[k])
+      if (shadow[n][k] == raw[k])
         continue;
       diffs++;
       if (diffs <= 8)

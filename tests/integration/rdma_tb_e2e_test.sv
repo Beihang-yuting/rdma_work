@@ -1,8 +1,11 @@
 // 目录：集成测试层 integration/rdma_tb_e2e_test.sv。
-// 职责：rdma_tb_flow_test 的端到端版本：每节点真实 host_mem（manager + adapter + proxy），
-//   wire 替换为经 net_packet RoCEv2 帧编码/解码（含 checksum/ICRC）的实现，复用同一流量序列与记分板。
+// 层：集成测试。
+// 职责：rdma_tb_flow_test 的端到端版本：每节点真实 host_mem（manager + adapter + proxy）供驱动与
+//   设备 DMA，wire 替换为经 net_packet RoCEv2 帧编码/解码（含 checksum/ICRC）的实现，复用同一
+//   流量序列与记分板。
 // 依赖：rdma_tb_flow_test、rdma_real_host_mem_proxy、net_packet adapter/bridge。
-// 所有权与生命周期：host_mem/adapter/proxy 由测试创建并在仿真期间常驻；wire 持有各节点 net adapter。
+// 所有权：host_mem/adapter/proxy 由测试创建；wire 持有各节点 net adapter。
+// 生命周期：仿真期间常驻。
 
 // 经 net_packet 帧编解码的 wire：源节点 adapter 编码发送，目的节点 adapter 从其 sink 解码接收。
 class rdma_tb_net_wire extends rdma_wire;
@@ -73,10 +76,10 @@ class rdma_tb_e2e_test extends rdma_tb_flow_test;
     super.build_phase(phase);
   endfunction
 
-  // 功能：为节点建立独立的真实 host_mem（不重叠的物理区间与 IOVA 域）并接入 fixture。
-  // 输入/输出及副作用：写 fx.mem。
+  // 功能：为节点建立独立的真实 host_mem（不重叠的物理区间与 IOVA 域）。
+  // 输入/输出及副作用：返回 proxy。
   // 失败/边界：无。
-  virtual function void prepare_fixture(int unsigned n, rdma_queue_data_engine_fixture fx);
+  virtual function rdma_host_mem_api make_host_mem(int unsigned n);
     rdma_host_mem_external_pkg::host_mem_manager host_mem;
     rdma_host_mem_adapter adapter;
     rdma_real_host_mem_proxy proxy;
@@ -91,19 +94,26 @@ class rdma_tb_e2e_test extends rdma_tb_flow_test;
     adapter.iova_base = 64'h0000_0030_0000_0000 + n * 64'h10_0000_0000;
     proxy = rdma_real_host_mem_proxy::type_id::create($sformatf("tb_mem_proxy%0d", n));
     proxy.delegate = adapter;
-    fx.mem = proxy;
+    return proxy;
   endfunction
 
-  // 功能：为每个节点登记 net_packet adapter（Function identity 取自 fixture binding）。
+  // 功能：为每个节点登记 net_packet adapter（Function identity：PF，BDF 总线号 = 节点号 + 2）。
   // 输入/输出及副作用：配置 env.fabric。
   // 失败/边界：wire 类型不符或配置失败报 UVM_FATAL。
   virtual function void attach_fabric();
     rdma_tb_net_wire net;
+    rdma_function_identity identity;
 
     if (!$cast(net, env.fabric))
       `uvm_fatal("TB_E2E", "env fabric is not the net_packet wire")
-    foreach (fixtures[n])
-      expect_ok("net wire add_node",
-                net.add_node(n, fixtures[n].binding.function_identity_snapshot()));
+    foreach (mems[n]) begin
+      identity = rdma_function_identity::type_id::create($sformatf("tb_identity%0d", n));
+      identity.key = '{root_id:16'h1, host_topology_key:32'h100, function_kind:RDMA_FUNCTION_PF,
+                       parent_pf_bdf:'0, vf_index:'0, bdf:'0};
+      identity.key.bdf = '{segment:16'h0, bus:8'(n + 2), device:5'h0, function_num:3'h0};
+      identity.function_uid = n + 1;
+      identity.generation = 1;
+      expect_ok("net wire add_node", net.add_node(n, identity));
+    end
   endfunction
 endclass

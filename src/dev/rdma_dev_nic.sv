@@ -944,9 +944,12 @@ class rdma_dev_nic extends uvm_object;
   // 输入/输出及副作用：ACK 推进 msn，经端口发包。
   // 失败/边界：无。
   protected task send_ack(int unsigned qpn, rdma_dev_qp_rt rt, bit [23:0] psn,
-                          bit [7:0] syndrome, bit [23:0] dst_qpn);
+                          bit [7:0] syndrome);
     rdma_packet pkt;
+    bit [23:0] dst_qpn;
 
+    // RC 响应的目的 QPN 取自本端 QPC（BTH 不携带源 QPN）。
+    dst_qpn = `RDMA_QPC(qpn, RDMA_QPC_DST_QPN);
     if (syndrome == RDMA_AETH_ACK) begin
       pkt = new_packet(qpn, RDMA_NET_ACK, 0, 1, psn, dst_qpn, 1'b0);
       rt.msn++;
@@ -1017,7 +1020,7 @@ class rdma_dev_nic extends uvm_object;
           else if (rt.rx_failed)
             syndrome = RDMA_AETH_NAK_INVALID_REQUEST;
           if (!ud)
-            send_ack(qpn, rt, pkt.psn, syndrome, pkt.source_qpn);
+            send_ack(qpn, rt, pkt.psn, syndrome);
         end
       end
       RDMA_NET_RDMA_WRITE, RDMA_NET_WRITE_WITH_IMM: begin
@@ -1029,7 +1032,7 @@ class rdma_dev_nic extends uvm_object;
           rt.wr_failed = !translate(pkt.reth_rkey, pd, RDMA_RIGHT_REMOTE_WRITE, pkt.reth_va,
                                     pkt.reth_len, segs);
           if (rt.wr_failed)
-            send_ack(qpn, rt, pkt.psn, RDMA_AETH_NAK_REMOTE_ACCESS, pkt.source_qpn);
+            send_ack(qpn, rt, pkt.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
         end
         if (!rt.wr_failed && data.size() != 0) begin
           rsges.delete();
@@ -1038,7 +1041,7 @@ class rdma_dev_nic extends uvm_object;
           rsges.push_back(rt.wr_len);
           if (!scatter(rsges, pd, RDMA_RIGHT_REMOTE_WRITE, rt.wr_offset, data)) begin
             rt.wr_failed = 1'b1;
-            send_ack(qpn, rt, pkt.psn, RDMA_AETH_NAK_REMOTE_ACCESS, pkt.source_qpn);
+            send_ack(qpn, rt, pkt.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
           end
         end
         rt.wr_offset += data.size();
@@ -1050,7 +1053,7 @@ class rdma_dev_nic extends uvm_object;
             else
               syndrome = RDMA_AETH_RNR_NAK;
           end
-          send_ack(qpn, rt, pkt.psn, syndrome, pkt.source_qpn);
+          send_ack(qpn, rt, pkt.psn, syndrome);
         end
       end
       RDMA_NET_RDMA_READ_REQUEST: begin
@@ -1085,20 +1088,20 @@ class rdma_dev_nic extends uvm_object;
     data = new[0];
     if (!translate(req.reth_rkey, pd, RDMA_RIGHT_REMOTE_READ, req.reth_va, req.reth_len,
                    segs)) begin
-      send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS, req.source_qpn);
+      send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
       return;
     end
     for (int k = 0; k < segs.size(); k += 2) begin
       if (!dma_read(segs[k], segs[k + 1], part)) begin
-        send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS, req.source_qpn);
+        send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
         return;
       end
       data = {data, part};
     end
     rt.msn++;
     for (int unsigned k = 0; k < count; k++) begin
-      pkt = new_packet(qpn, RDMA_NET_RDMA_READ_RESP, k, count, req.psn + k, req.source_qpn,
-                       1'b0);
+      pkt = new_packet(qpn, RDMA_NET_RDMA_READ_RESP, k, count, req.psn + k,
+                       `RDMA_QPC(qpn, RDMA_QPC_DST_QPN), 1'b0);
       start = k * mtu(qpn);
       take = data.size() - start;
       if (take > mtu(qpn))
@@ -1125,7 +1128,7 @@ class rdma_dev_nic extends uvm_object;
     if (req.atomic_va[2:0] != 3'b000 ||
         !translate(req.atomic_rkey, pd, RDMA_RIGHT_REMOTE_ATOMIC, req.atomic_va, 8, segs) ||
         !dma_read(segs[0], 8, raw)) begin
-      send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS, req.source_qpn);
+      send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
       return;
     end
     orig = '0;
@@ -1138,7 +1141,8 @@ class rdma_dev_nic extends uvm_object;
     foreach (raw[k])
       raw[k] = value >> (8 * k);
     void'(dma_write(segs[0], raw));
-    pkt = new_packet(qpn, RDMA_NET_ATOMIC_ACK, 0, 1, req.psn, req.source_qpn, 1'b0);
+    pkt = new_packet(qpn, RDMA_NET_ATOMIC_ACK, 0, 1, req.psn,
+                     `RDMA_QPC(qpn, RDMA_QPC_DST_QPN), 1'b0);
     rt.msn++;
     pkt.aeth_syndrome = RDMA_AETH_ACK;
     pkt.aeth_msn = rt.msn;

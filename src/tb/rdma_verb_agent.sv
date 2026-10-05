@@ -1,8 +1,10 @@
 // 目录：验证组件层 tb/rdma_verb_agent.sv。
-// 职责：verb agent：sequencer 下发 rdma_verb_item，driver 把它翻译成 queue-data engine 的
-//   post_send/post_recv（含源数据写入 host 内存），monitor 轮询 CQ 并广播完成事件。
-// 依赖：rdma_tb_node_cfg、queue_data_engine 公开接口与语义请求模型。
-// 所有权与生命周期：组件只借用节点配置；请求对象由 driver 每次新建并交给 engine。
+// 层：验证组件。
+// 职责：verb agent：sequencer 下发 rdma_verb_item，driver 把它翻译成驱动模型的 post_send/post_recv
+//   （含源数据写入 host 内存），monitor 经驱动模型 poll_cq 轮询 CQ 并广播完成事件。
+// 依赖：rdma_tb_node_cfg、rdma_drv_wr（驱动数据路径）。
+// 所有权：组件只借用节点配置；WR 对象由 driver 每次新建。
+// 生命周期：env.configure() 后开始工作，仿真期间常驻。
 
 typedef uvm_sequencer #(rdma_verb_item) rdma_verb_sequencer;
 
@@ -42,148 +44,121 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
     end
   endtask
 
-  // 功能：把 item 翻译为 engine 请求：SEND/WRITE 先把 data 写入本地 buffer，再构造 SGE（数据 MR
-  //   lkey）、远端地址（对端数据 MR + remote_offset，rkey）与 atomic 操作数后投递。
-  // 输入/输出及副作用：回填 item.node_id/wr_id；写 host 内存；调用 engine.post_send/post_recv。
+  // 功能：把 item 翻译为驱动 WR：SEND/WRITE 先把 data 写入本地 buffer，再构造 SGE（数据 MR
+  //   lkey）、远端地址（对端数据缓冲 + remote_offset，rkey）、atomic 操作数与 UD 目的后投递。
+  // 输入/输出及副作用：回填 item.node_id/wr_id；写 host 内存；调用 rdma_drv_wr。
   // 失败/边界：写内存或投递失败时报 UVM_ERROR，不广播 item，posted_ok=0。
   protected task automatic drive(rdma_verb_item item, output bit posted_ok);
-    rdma_qp qp;
+    rdma_tb_qp_link link;
     rdma_tb_node_cfg peer;
-    rdma_sge sges[$];
-    rdma_queue_post_result posted;
-    bit [23:0] peer_qpn;
+    rdma_drv_sge sges[$];
+    rdma_bytes_t bytes;
     rdma_status status;
-    byte raw[];
-    longint unsigned va;
 
     posted_ok = 1'b0;
     item.node_id = cfg.node_id;
     item.wr_id = {cfg.node_id[15:0], 48'(next_wr)};
     next_wr++;
-    qp = cfg.qps[item.qp_index].qp;
-    peer = nodes[cfg.qps[item.qp_index].peer_node];
-    va = cfg.data_mr.iova.value + item.local_offset;
+    link = cfg.qps[item.qp_index];
+    peer = nodes[link.peer_node];
     if (item.data.size() != 0) begin
-      raw = new[item.data.size()];
+      bytes = new[item.data.size()];
       foreach (item.data[i])
-        raw[i] = item.data[i];
-      status = cfg.engine.host_mem.write(cfg.data_mapping,
-                                         va - cfg.data_mapping.iova.value, raw);
-      if (status == null || !status.ok()) begin
+        bytes[i] = item.data[i];
+      status = cfg.drv.hw.write(cfg.data_buf, item.local_offset, bytes);
+      if (!status.ok()) begin
         `uvm_error("RDMA_DRV", {"source data write failed: ", item.convert2string()})
         return;
       end
     end
-    split_sges(item, va, sges);
-    if (item.op == RDMA_VERB_RECV) begin
-      rdma_post_recv_req req;
-
-      req = rdma_post_recv_req::type_id::create("drv_recv");
-      req.owner = cfg.owner();
-      req.target_h = rdma_clone_handle_value(qp.handle, "driver RECV QP");
-      req.wr_id = item.wr_id;
-      req.sges = sges;
-      cfg.engine.post_recv(req, posted, status);
-    end
-    else begin
-      rdma_post_send_req req;
-
-      req = rdma_post_send_req::type_id::create("drv_send");
-      req.owner = cfg.owner();
-      req.qp_h = rdma_clone_handle_value(qp.handle, "driver SEND QP");
-      req.wr_id = item.wr_id;
-      req.transport = qp.transport;
-      req.opcode = work_opcode(item.op);
-      req.signaled = item.signaled;
-      req.immediate_data = item.imm;
-      if (!(item.op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM})) begin
-        req.remote_addr.value = peer.data_mr.iova.value + item.remote_offset;
-        req.rkey = peer.data_mr.rkey;
-        req.remote_access_valid = 1'b1;
-        req.rkey_valid = 1'b1;
-      end
-      req.compare_value = item.compare_value;
-      req.swap_add_value = item.swap_add_value;
-      req.sges = sges;
-      peer_qpn = peer.qps[cfg.qps[item.qp_index].peer_qp_index].qp.local_qp_id;
-      if (qp.transport == RDMA_TRANSPORT_UD) begin
-        req.destination_qpn = peer_qpn;
-        req.qkey = cfg.ud_qkey;
-        req.address_vector_valid = 1'b1;
-        req.address_vector_id = item.qp_index;
-        req.address_vector = rdma_address_vector::type_id::create("drv_av");
-      end
-      if (qp.transport == RDMA_TRANSPORT_URC) begin
-        req.destination_qpn = peer_qpn;
-        req.completion_qp_h = rdma_clone_handle_value(qp.handle, "driver URC completion QP");
-      end
-      // UD 非零 payload 与超过 2 个 SGE 的请求使用 SQ 外部 SGB：槽位为当前 SQ PI × 512B。
-      if ((qp.transport == RDMA_TRANSPORT_UD && item.length != 0) || sges.size() > 2)
-        req.sgb_iova.value = sgb_slot(qp);
-      cfg.engine.post_send(req, posted, status);
-    end
-    if (status == null || !status.ok()) begin
-      `uvm_error("RDMA_DRV", $sformatf("post failed (%s): %s",
-                 status == null ? "null" : status.convert2string(), item.convert2string()))
+    split_sges(item, sges);
+    if (item.op == RDMA_VERB_RECV)
+      post_recv(item, link.qp, sges, status);
+    else
+      post_send(item, link, peer, sges, status);
+    if (!status.ok()) begin
+      `uvm_error("RDMA_DRV", $sformatf("post failed (%s): %s", status.convert2string(),
+                                       item.convert2string()))
       return;
     end
     posted_ok = 1'b1;
     posted_ap.write(item);
   endtask
 
-  // 功能：把 [va, va+length) 均分为 sge_count 个连续 SGE（末项含余数），lkey 取数据 MR。
+  // 功能：投递 RECV。
+  // 输入/输出及副作用：写 RQ 并敲 RQ doorbell。
+  // 失败/边界：驱动返回的错误经 status 输出。
+  protected task post_recv(rdma_verb_item item, rdma_drv_qp qp, rdma_drv_sge sges[$],
+                           output rdma_status status);
+    rdma_drv_recv_wr wr;
+
+    wr = rdma_drv_recv_wr::type_id::create("drv_recv");
+    wr.wr_id = item.wr_id;
+    wr.sges = sges;
+    rdma_drv_wr::post_recv(cfg.drv, qp, wr, status);
+  endtask
+
+  // 功能：投递 SQ 请求（RC 远端地址/rkey、atomic 操作数、UD 目的 QPN/Q_Key/DMAC）。
+  // 输入/输出及副作用：写 SQ/SGB 并按需敲 SQ doorbell。
+  // 失败/边界：驱动返回的错误经 status 输出。
+  protected task post_send(rdma_verb_item item, rdma_tb_qp_link link, rdma_tb_node_cfg peer,
+                           rdma_drv_sge sges[$], output rdma_status status);
+    rdma_drv_send_wr wr;
+
+    wr = rdma_drv_send_wr::type_id::create("drv_send");
+    wr.wr_id = item.wr_id;
+    wr.opcode = wr_opcode(item.op);
+    wr.signaled = item.signaled;
+    wr.imm = item.imm;
+    wr.sges = sges;
+    if (!(item.op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM})) begin
+      wr.remote_va = peer.data_buf.iova + item.remote_offset;
+      wr.rkey = peer.data_mr.key();
+    end
+    wr.compare_add = item.compare_value;
+    wr.swap = item.swap_add_value;
+    if (item.op == RDMA_VERB_FETCH_ADD)
+      wr.compare_add = item.swap_add_value;
+    if (link.qp.qp_type == RDMA_DRV_QPT_UD) begin
+      wr.dest_qpn = peer.qps[link.peer_qp_index].qp.qpn;
+      wr.qkey = cfg.ud_qkey;
+      wr.dmac = peer.mac;
+    end
+    rdma_drv_wr::post_send(cfg.drv, link.qp, wr, status);
+  endtask
+
+  // 功能：把本地 buffer [local_offset, +length) 均分为 sge_count 个连续 SGE（末项含余数）。
   // 输入/输出及副作用：sges 输出新建对象。
   // 失败/边界：sge_count 为 0 按 1 处理。
-  protected function void split_sges(rdma_verb_item item, longint unsigned va,
-                                     output rdma_sge sges[$]);
-    rdma_sge sge;
+  protected function void split_sges(rdma_verb_item item, output rdma_drv_sge sges[$]);
     int unsigned count;
     int unsigned chunk;
+    int unsigned len;
 
     count = item.sge_count == 0 ? 1 : item.sge_count;
     chunk = item.length / count;
     sges.delete();
     for (int unsigned k = 0; k < count; k++) begin
-      sge = rdma_sge::type_id::create("drv_sge");
-      sge.iova.value = va + k * chunk;
-      sge.length = (k == count - 1) ? item.length - k * chunk : chunk;
-      sge.lkey = cfg.data_mr.lkey;
-      sges.push_back(sge);
+      len = chunk;
+      if (k == count - 1)
+        len = item.length - k * chunk;
+      sges.push_back(rdma_drv_sge::make(cfg.data_buf.iova + item.local_offset + k * chunk, len,
+                                        cfg.data_mr.key()));
     end
   endfunction
 
-  // 功能：当前 SQ PI 对应的 SQ SGB 512B 槽 IOVA（engine 要求 sgb_iova 与 PI 槽一致）。
-  // 输入/输出及副作用：只读 runtime 游标与 qp_plan。
-  // 失败/边界：游标查询失败或无 SGB backing 返回 0，由 engine 拒绝投递。
-  protected function longint unsigned sgb_slot(rdma_qp qp);
-    rdma_status status;
-    int unsigned pi;
-    int unsigned ci;
-    bit pw;
-    bit cw;
-
-    if (qp.qp_plan == null || qp.qp_plan.sq_sgb_ref == null ||
-        qp.qp_plan.sq_sgb_ref.mapping == null)
-      return 0;
-    status = cfg.engine.query_runtime_cursors(qp.handle, RDMA_QUEUE_RUNTIME_SQ, pi, pw, ci, cw);
-    if (status == null || !status.ok())
-      return 0;
-    return qp.qp_plan.sq_sgb_ref.mapping.iova.value + qp.qp_plan.sq_sgb_ref.mapping_offset +
-           longint'(pi) * 512;
-  endfunction
-
-  // 功能：verb 操作映射为 WQE opcode。
+  // 功能：verb 操作映射为驱动 WR opcode。
   // 输入/输出及副作用：纯函数。
   // 失败/边界：RECV 不经此路径。
-  protected function rdma_work_opcode_e work_opcode(rdma_verb_op_e op);
+  protected function rdma_drv_wr_opcode_e wr_opcode(rdma_verb_op_e op);
     case (op)
-      RDMA_VERB_SEND_IMM:  return RDMA_WR_SEND_WITH_IMM;
-      RDMA_VERB_WRITE:     return RDMA_WR_RDMA_WRITE;
-      RDMA_VERB_WRITE_IMM: return RDMA_WR_WRITE_WITH_IMM;
-      RDMA_VERB_READ:      return RDMA_WR_RDMA_READ;
-      RDMA_VERB_CMP_SWAP:  return RDMA_WR_ATOMIC_CMP_SWAP;
-      RDMA_VERB_FETCH_ADD: return RDMA_WR_ATOMIC_FETCH_ADD;
-      default:             return RDMA_WR_SEND;
+      RDMA_VERB_SEND_IMM:  return RDMA_DRV_WR_SEND_IMM;
+      RDMA_VERB_WRITE:     return RDMA_DRV_WR_WRITE;
+      RDMA_VERB_WRITE_IMM: return RDMA_DRV_WR_WRITE_IMM;
+      RDMA_VERB_READ:      return RDMA_DRV_WR_READ;
+      RDMA_VERB_CMP_SWAP:  return RDMA_DRV_WR_CAS;
+      RDMA_VERB_FETCH_ADD: return RDMA_DRV_WR_FAA;
+      default:             return RDMA_DRV_WR_SEND;
     endcase
   endfunction
 endclass
@@ -205,37 +180,33 @@ class rdma_verb_monitor extends uvm_monitor;
     cqe_ap = new("cqe_ap", this);
   endfunction
 
-  // 功能：持续轮询节点 CQ，把每个完成转换为 rdma_verb_completion 广播。
-  // 输入/输出及副作用：消费 CQE（会释放对应 WQE 槽位）；永久循环。
-  // 失败/边界：QUEUE_EMPTY 时等待 poll_interval；其它失败报 UVM_ERROR。
+  // 功能：持续经驱动 poll_cq 轮询节点 CQ，把每个完成转换为 rdma_verb_completion 广播。
+  // 输入/输出及副作用：消费 CQE（推进驱动的 SQ/RQ 尾与 CQ shadow CI）；永久循环。
+  // 失败/边界：无完成时等待 poll_interval；轮询失败报 UVM_ERROR。
   task run_phase(uvm_phase phase);
-    rdma_queue_completion_result result;
+    rdma_drv_wc wcs[$];
     rdma_verb_completion done;
     rdma_status status;
 
     wait (cfg != null);
     forever begin
-      cfg.cq_lock.get(1);
-      cfg.engine.poll_cqe(cfg.cq.handle, 0, result, status);
-      cfg.cq_lock.put(1);
-      if (status != null && status.code == RDMA_SC_QUEUE_EMPTY) begin
-        #(cfg.poll_interval);
-        continue;
-      end
-      if (status == null || !status.ok() || result == null || result.cqe == null) begin
+      wcs.delete();
+      rdma_drv_wr::poll_cq(cfg.drv, cfg.cq, 1, wcs, status);
+      if (!status.ok())
         `uvm_error("RDMA_MON", $sformatf("node %0d CQ poll failed: %s", cfg.node_id,
-                   status == null ? "null" : status.convert2string()))
+                   status.convert2string()))
+      if (wcs.size() == 0) begin
         #(cfg.poll_interval);
         continue;
       end
       done = rdma_verb_completion::type_id::create("completion");
       done.node_id = cfg.node_id;
-      done.wr_id = result.cqe.wr_id;
-      done.rq = result.cqe.rq_cqe;
-      done.ok = result.completion_status != null && result.completion_status.ok();
-      done.ecode = result.cqe.ecode;
-      done.byte_len = result.cqe.payload_len;
-      done.imm = result.cqe.immediate_data;
+      done.wr_id = wcs[0].wr_id;
+      done.rq = wcs[0].is_recv;
+      done.ok = wcs[0].status == RDMA_DRV_WC_SUCCESS;
+      done.ecode = wcs[0].vendor_err;
+      done.byte_len = wcs[0].byte_len;
+      done.imm = wcs[0].imm;
       seen[done.wr_id] = done;
       ->seen_event;
       cqe_ap.write(done);

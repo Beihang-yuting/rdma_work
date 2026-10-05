@@ -4,7 +4,7 @@
 // 依赖：rdma_tb_env（各节点 sequencer）。
 // 所有权与生命周期：序列只借用 env；每个 item 新建后交给 driver。
 // 约定：数据 MR 内按区域划分偏移；signaled SQ 请求在 driver 内同步等待完成，RECV 不阻塞。
-//   qp_index 0/1/2 分别为 RC/UD/URC（后两者存在时才运行对应场景）。
+//   qp_index 0/1/2 分别为 RC/UD/URC（存在时才运行对应场景）。
 
 class rdma_verb_one_seq extends uvm_sequence #(rdma_verb_item);
   `rdma_object_utils(rdma_verb_one_seq)
@@ -48,10 +48,10 @@ class rdma_tb_traffic_vseq extends uvm_sequence;
     atomics();
     reverse_write();
     multi_sge();
-    if (env.nodes[0].qps.size() > 2) begin
+    if (env.nodes[0].qps.size() > 1)
       ud_send();
+    if (env.nodes[0].qps.size() > 2)
       urc_traffic();
-    end
     access_error();
   endtask
 
@@ -199,7 +199,7 @@ class rdma_tb_traffic_vseq extends uvm_sequence;
     rdma_verb_item item;
 
     item = make(RDMA_VERB_WRITE, 'h0000, 64,
-                env.nodes[1].data_mr.length - 32, 8);
+                env.nodes[1].data_buf.size - 32, 8);
     item.expect_error = 1'b1;
     post(0, item);
   endtask
