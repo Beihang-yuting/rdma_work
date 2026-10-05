@@ -6,19 +6,19 @@
 // 所有权与生命周期：helper 不保存引用或取得输入对象所有权；
 // 成功时由调用方接管独立快照，失败时输出始终为 null。
 
-// 设计说明：六条路径分别保留自身的 cast、runtime type、factory、
-// clone 与恢复顺序；不合并成无类型 helper，避免改变错误优先级或可观测次数。
+// 设计说明：handle 与 Function handle 字段完全相同，共用 identity 快照实现（Function 版本
+//   再做一次子类型 cast）；其余路径各自保留 cast、runtime type、factory、clone 与恢复顺序。
 
-// 功能：为 Function handle 构造保留 runtime type 与四个公开身份字段的独立 clone 快照。
-// 输入/输出及副作用：snapshot 先清空；成功输出非 source 的 handle；clone 后按 kind、
-//   function_uid、object_id、generation 的原顺序恢复 source。
-// 失败/边界：source 为 null，clone 为 null/不能 cast/自别名/type 改变，或四字段不等时按
-//   failure_code 拒绝；不比较 subtype 扩展字段，仍接受第三个等值对象。
-function automatic rdma_status rdma_cmq_checked_function_snapshot(
-  input rdma_function_handle source,
+// 功能：handle 与 Function handle 共用的快照实现：clone 后恢复 source 四个身份字段，
+//   要求副本类型名不变、非自别名且四字段与 source 一致。
+// 输入/输出及副作用：noun 只用于诊断（"handle"/"Function"）；snapshot 成功时为新副本。
+// 失败/边界：source 为 null、clone 契约失败或字段漂移时按 failure_code 拒绝，snapshot 为 null。
+function automatic rdma_status rdma_cmq_checked_identity_snapshot(
+  input rdma_handle source,
   input string label,
+  input string noun,
   input rdma_status_code_e failure_code,
-  output rdma_function_handle snapshot
+  output rdma_handle snapshot
 );
   uvm_object cloned_object;
   string source_type_name;
@@ -29,7 +29,7 @@ function automatic rdma_status rdma_cmq_checked_function_snapshot(
 
   snapshot = null;
   if (source == null)
-    return rdma_status::make(failure_code, {label, " Function is null"});
+    return rdma_status::make(failure_code, {label, " ", noun, " is null"});
   saved_kind = source.kind;
   source_type_name = source.get_type_name();
   saved_function_uid = source.function_uid;
@@ -44,7 +44,7 @@ function automatic rdma_status rdma_cmq_checked_function_snapshot(
       snapshot == source || snapshot.get_type_name() != source_type_name) begin
     snapshot = null;
     return rdma_status::make(
-      failure_code, {label, " Function snapshot clone contract failed"}
+      failure_code, {label, " ", noun, " snapshot clone contract failed"}
     );
   end
   if (source.kind != saved_kind ||
@@ -57,10 +57,36 @@ function automatic rdma_status rdma_cmq_checked_function_snapshot(
       snapshot.generation != saved_generation) begin
     snapshot = null;
     return rdma_status::make(
-      failure_code, {label, " Function snapshot changed its source value"}
+      failure_code, {label, " ", noun, " snapshot changed its source value"}
     );
   end
   return rdma_status::success();
+endfunction
+
+// 功能：为 Function handle 构造保留 runtime type 与四个公开身份字段的独立 clone 快照。
+// 输入/输出及副作用：snapshot 先清空；成功输出非 source 的 handle；clone 后按 kind、
+//   function_uid、object_id、generation 的原顺序恢复 source。
+// 失败/边界：source 为 null，clone 为 null/不能 cast/自别名/type 改变，或四字段不等时按
+//   failure_code 拒绝；不比较 subtype 扩展字段，仍接受第三个等值对象。
+function automatic rdma_status rdma_cmq_checked_function_snapshot(
+  input rdma_function_handle source,
+  input string label,
+  input rdma_status_code_e failure_code,
+  output rdma_function_handle snapshot
+);
+  rdma_handle generic;
+  rdma_status status;
+
+  snapshot = null;
+  status = rdma_cmq_checked_identity_snapshot(source, label, "Function",
+                                              failure_code, generic);
+  if (!status.ok())
+    return status;
+  if (!$cast(snapshot, generic))
+    return rdma_status::make(
+      failure_code, {label, " Function snapshot clone contract failed"}
+    );
+  return status;
 endfunction
 
 // 功能：为通用 handle 构造保留 runtime type 与四个公开身份字段的独立 clone 快照。
@@ -74,47 +100,8 @@ function automatic rdma_status rdma_cmq_checked_handle_snapshot(
   input rdma_status_code_e failure_code,
   output rdma_handle snapshot
 );
-  uvm_object cloned_object;
-  string source_type_name;
-  rdma_resource_kind_e saved_kind;
-  longint unsigned saved_function_uid;
-  int unsigned saved_object_id;
-  int unsigned saved_generation;
-
-  snapshot = null;
-  if (source == null)
-    return rdma_status::make(failure_code, {label, " handle is null"});
-  saved_kind = source.kind;
-  source_type_name = source.get_type_name();
-  saved_function_uid = source.function_uid;
-  saved_object_id = source.object_id;
-  saved_generation = source.generation;
-  cloned_object = source.clone();
-  source.kind = saved_kind;
-  source.function_uid = saved_function_uid;
-  source.object_id = saved_object_id;
-  source.generation = saved_generation;
-  if (cloned_object == null || !$cast(snapshot, cloned_object) ||
-      snapshot == source || snapshot.get_type_name() != source_type_name) begin
-    snapshot = null;
-    return rdma_status::make(
-      failure_code, {label, " handle snapshot clone contract failed"}
-    );
-  end
-  if (source.kind != saved_kind ||
-      source.function_uid != saved_function_uid ||
-      source.object_id != saved_object_id ||
-      source.generation != saved_generation ||
-      snapshot.kind != saved_kind ||
-      snapshot.function_uid != saved_function_uid ||
-      snapshot.object_id != saved_object_id ||
-      snapshot.generation != saved_generation) begin
-    snapshot = null;
-    return rdma_status::make(
-      failure_code, {label, " handle snapshot changed its source value"}
-    );
-  end
-  return rdma_status::success();
+  return rdma_cmq_checked_identity_snapshot(source, label, "handle",
+                                            failure_code, snapshot);
 endfunction
 
 // 功能：先验证 CMQ opcode key，再构造保留 profile_name、opcode、variant 的 clone 快照。

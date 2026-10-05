@@ -955,96 +955,91 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：读取并解码 CEQE，返回 detached model/image。
-  // 输入/输出及副作用：target、offset 输入；model/image 输出；只读 ledger/backing。
-  // 失败/边界：target 或 codec 查找失败、读出/解码失败时返回错误，model/image 保持 null。
+  // 功能：读取并解码一个事件队列条目（CEQE/AEQE 共用），返回 detached decoded model/image。
+  // 输入/输出及副作用：kind/name/bytes 选择 codec 与长度；decoded/image 输出；只读 ledger/backing。
+  // 失败/边界：target 或 codec 查找失败、读出/解码失败时返回错误，输出保持 null。
+  protected function rdma_status read_event_entry(
+    rdma_queue_host_mem_target target,
+    longint unsigned offset,
+    rdma_image_kind_e kind,
+    string name,
+    int unsigned bytes,
+    output rdma_hw_model decoded,
+    output rdma_hw_image image
+  );
+    rdma_queue_host_mem_ledger_entry entry;
+    rdma_codec_base codec;
+    rdma_status status;
+    rdma_hw_image candidate_image;
+
+    decoded = null;
+    image = null;
+    status = lookup_target(target, entry);
+    if (!status.ok())
+      return status;
+    status = lookup_queue_codec(kind, name.tolower(), "default", codec);
+    if (!status.ok())
+      return status;
+    if (codec == null)
+      return codec_error({name, " registry returned a null codec"});
+    status = complete_read_image(entry, offset, bytes, kind, codec,
+                                 candidate_image);
+    if (!status.ok())
+      return status;
+    status = codec.decode(candidate_image, decoded);
+    status = status_or(status, RDMA_SC_CODEC_ERROR,
+                       {name, " decode returned null status"});
+    if (!status.ok() || decoded == null) begin
+      decoded = null;
+      return status.ok() ? codec_error({"decoded ", name, " model type mismatch"})
+                         : status;
+    end
+    image = candidate_image;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：读取并解码 CEQE。
+  // 输入/输出及副作用：model/image 输出；只读 ledger/backing。
+  // 失败/边界：读取/解码失败或模型类型不符时返回错误，输出为 null。
   function rdma_status read_ceqe(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
     output rdma_hw_ceqe_model model,
     output rdma_hw_image image
   );
-    rdma_queue_host_mem_ledger_entry entry;
-    rdma_codec_base codec;
     rdma_hw_model decoded;
     rdma_status status;
-    rdma_hw_image candidate_image;
+
     model = null;
-    image = null;
-
-    status = lookup_target(target, entry);
-    if (!status.ok())
-      return status;
-
-    status = lookup_queue_codec(RDMA_IMAGE_CEQE, "ceqe", "default", codec);
-    if (!status.ok())
-      return status;
-
-    if (codec == null)
-      return codec_error("CEQE registry returned a null codec");
-
-    status = complete_read_image(entry, offset, RDMA_CEQE_BYTES,
-                                 RDMA_IMAGE_CEQE, codec,
-                                 candidate_image);
-    if (!status.ok())
-      return status;
-
-    status = codec.decode(candidate_image, decoded);
-    status = status_or(status, RDMA_SC_CODEC_ERROR,
-                       "CEQE decode returned null status");
-    if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
-      model = null;
+    status = read_event_entry(target, offset, RDMA_IMAGE_CEQE, "CEQE",
+                              RDMA_CEQE_BYTES, decoded, image);
+    if (status.ok() && !$cast(model, decoded)) begin
       image = null;
-      return status.ok() ? codec_error("decoded CEQE model type mismatch") : status;
+      return codec_error("decoded CEQE model type mismatch");
     end
-    image = candidate_image;
-    return rdma_status::success();
+    return status;
   endfunction
 
-  // 功能：读取并解码 AEQE，返回 detached model/image。
-  // 输入/输出及副作用：target、offset 输入；model/image 输出；只读 ledger/backing。
-  // 失败/边界：target 或 codec 查找失败、读出/解码失败时返回错误，model/image 保持 null。
+  // 功能：读取并解码 AEQE。
+  // 输入/输出及副作用：model/image 输出；只读 ledger/backing。
+  // 失败/边界：读取/解码失败或模型类型不符时返回错误，输出为 null。
   function rdma_status read_aeqe(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
     output rdma_hw_aeqe_model model,
     output rdma_hw_image image
   );
-    rdma_queue_host_mem_ledger_entry entry;
-    rdma_codec_base codec;
     rdma_hw_model decoded;
     rdma_status status;
-    rdma_hw_image candidate_image;
+
     model = null;
-    image = null;
-
-    status = lookup_target(target, entry);
-    if (!status.ok())
-      return status;
-
-    status = lookup_queue_codec(RDMA_IMAGE_AEQE, "aeqe", "default", codec);
-    if (!status.ok())
-      return status;
-
-    if (codec == null)
-      return codec_error("AEQE registry returned a null codec");
-
-    status = complete_read_image(entry, offset, RDMA_AEQE_BYTES,
-                                 RDMA_IMAGE_AEQE, codec,
-                                 candidate_image);
-    if (!status.ok())
-      return status;
-
-    status = codec.decode(candidate_image, decoded);
-    status = status_or(status, RDMA_SC_CODEC_ERROR,
-                       "AEQE decode returned null status");
-    if (!status.ok() || decoded == null || !$cast(model, decoded)) begin
-      model = null;
+    status = read_event_entry(target, offset, RDMA_IMAGE_AEQE, "AEQE",
+                              RDMA_AEQE_BYTES, decoded, image);
+    if (status.ok() && !$cast(model, decoded)) begin
       image = null;
-      return status.ok() ? codec_error("decoded AEQE model type mismatch") : status;
+      return codec_error("decoded AEQE model type mismatch");
     end
-    image = candidate_image;
-    return rdma_status::success();
+    return status;
   endfunction
 
   // 功能：校验 release authority 后释放 target 的 mapping，并标记 ledger 记录已释放。
