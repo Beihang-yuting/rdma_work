@@ -15,6 +15,7 @@ VIP 和 `net_packet` 的对象由各自环境拥有。
 - `tests/unit`：不依赖外部仓库的模型和 codec 回归。
 - `tests/integration`：`dpu_common`、真实 host-mem 或 `net_packet` 依赖的回归。
 - `hw/rdma`：从驱动归档提取的只读来源清单和 golden vectors；不复制外部源码。
+- `docs/history/batch-reports`：历次结构重构 batch 报告归档（只读历史记录）。
 
 ## 固定依赖
 
