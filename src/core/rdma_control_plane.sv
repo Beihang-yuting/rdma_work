@@ -88,6 +88,50 @@ class rdma_control_plane extends uvm_object;
     return rdma_cmq_clone_status_value(source);
   endfunction
 
+  // 功能：为 MR 的硬件阶段构造 CMQ 命令：OCC_FLUSHED→OCC_FLUSH（按 mr_serial 冲刷
+  //   PBLE）、MR_DEREGISTERED→MR_DEREGISTER（失效 MRT）、DRAINED→TQ_FLUSH。
+  // 输入/输出及副作用：owner 被深拷贝进命令，mr 只读；返回新命令，使用 default_timeout。
+  // 失败/边界：其它 step 返回 null，由调用方报告 UNSUPPORTED_OPCODE。
+  protected function rdma_cmq_command_desc make_mr_hw_command(
+    rdma_function_handle owner,
+    rdma_mr mr,
+    rdma_control_step_e step,
+    string name
+  );
+    rdma_hw_occ_flush_body occ_body;
+    rdma_hw_mr_deregister_body deregister_body;
+
+    case (step)
+      RDMA_CTRL_STEP_HW_OCC_FLUSHED: begin
+        occ_body = rdma_hw_occ_flush_body::type_id::create({name, "_body"});
+        occ_body.mr_serial_flush = 1'b1;
+        occ_body.pble = 1'b1;
+        occ_body.mr_serial = mr.mr_serial[11:0];
+        return rdma_make_cmq_command(owner, RDMA_OP_OCC_FLUSH, "occ_flush",
+                                     occ_body, default_timeout, name);
+      end
+      RDMA_CTRL_STEP_HW_MR_DEREGISTERED: begin
+        deregister_body =
+          rdma_hw_mr_deregister_body::type_id::create({name, "_body"});
+        deregister_body.mr_h = project_handle(mr.handle, mr.local_mr_id,
+                                              RDMA_RESOURCE_MR);
+        deregister_body.stag_key = mr.lkey[7:0];
+        deregister_body.next_state = RDMA_CONTEXT_INVALID;
+        return rdma_make_cmq_command(owner, RDMA_OP_MR_DEREGISTER,
+                                     "deregister", deregister_body,
+                                     default_timeout, name);
+      end
+      RDMA_CTRL_STEP_HW_DRAINED:
+        return rdma_make_cmq_command(
+          owner, RDMA_OP_TQ_FLUSH, "tq_flush",
+          rdma_hw_cmq_empty_body::type_id::create({name, "_body"}),
+          default_timeout, name
+        );
+      default:
+        return null;
+    endcase
+  endfunction
+
   // 功能：在 rdma_control_plane 中，execute_control_command_raw_status 收束一次
   //   legacy CMQ 原始 dispatch，明确保留 backend status identity，供仍依赖原始
   //   status 引用的特殊控制面阶段调用。
@@ -340,9 +384,7 @@ class rdma_control_plane extends uvm_object;
     output rdma_mr mr,
     output bit result_finalized
   );
-    rdma_hw_mr_deregister_body deregister_body;
     rdma_cmq_command_desc command;
-    rdma_cmq_opcode_key opcode_key;
     rdma_cmq_ticket ticket;
     rdma_cmq_completion completion;
     rdma_recovery_record recovery;
@@ -356,30 +398,9 @@ class rdma_control_plane extends uvm_object;
     released_owned_backing = 1'b0;
 
     if (hardware_key_allocated) begin
-      deregister_body = rdma_hw_mr_deregister_body::type_id::create(
-        "register_mr_rollback_deregister_body"
-      );
-      deregister_body.mr_h = project_handle(
-        reserved_mr.handle, reserved_mr.local_mr_id,
-        RDMA_RESOURCE_MR
-      );
-      deregister_body.stag_key = reserved_mr.lkey[7:0];
-      deregister_body.next_state = RDMA_CONTEXT_INVALID;
-      opcode_key = rdma_cmq_opcode_key::type_id::create(
-        "register_mr_rollback_deregister_opcode"
-      );
-      opcode_key.profile_name = "rdma";
-      opcode_key.opcode = RDMA_OP_MR_DEREGISTER;
-      opcode_key.variant = "deregister";
-      command = rdma_cmq_command_desc::type_id::create(
-        "register_mr_rollback_deregister"
-      );
-      command.function_h = rdma_clone_function_handle_value(
-        owner, "register MR rollback command"
-      );
-      command.opcode_key = opcode_key;
-      command.body = deregister_body;
-      command.timeout = default_timeout;
+      command = make_mr_hw_command(owner, reserved_mr,
+                                   RDMA_CTRL_STEP_HW_MR_DEREGISTERED,
+                                   "register_mr_rollback_deregister");
       execute_control_command(
         command, ticket, completion, rollback_status,
         "MR_DEREGISTER rollback returned null"
@@ -753,6 +774,195 @@ class rdma_control_plane extends uvm_object;
     if (!status.ok())
       return rdma_cmq_clone_status_value(status);
     return same_owner_status(request.owner, owner, "register MR request");
+  endfunction
+
+  // 功能：MR 注册的入口校验：可选 generation fence、request 合法且属于 owner、backing
+  //   描述与 request/ownership 一致；锁前、锁后、快照三处共用同一顺序。
+  // 输入/输出及副作用：fence_owner 为 null 时跳过 fence；stage 作为 null 归一化诊断的
+  //   前缀；只读全部输入，返回独立 status。
+  // 失败/边界：fence 失败返回 INVALID_ARGUMENT/STALE_GENERATION，其余沿用
+  //   register_mr_request_status 与 validate_backing 的错误码；子校验返回 null 时为 INVALID_STATE。
+  protected function rdma_status register_mr_input_status(
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_mr_backing_desc backing,
+    rdma_function_handle fence_owner,
+    rdma_function_handle owner,
+    rdma_resource_ownership_e required_ownership,
+    string stage
+  );
+    rdma_status status;
+
+    if (fence_owner != null) begin
+      status = checked_status(
+        generation_fence(binding, fence_owner),
+        {stage, "register MR generation fence returned null"}
+      );
+      if (!status.ok())
+        return status;
+    end
+    status = checked_status(
+      register_mr_request_status(request, owner),
+      {stage, "register MR request check returned null"}
+    );
+    if (!status.ok())
+      return status;
+    return checked_status(
+      validate_backing(binding, request, backing, owner, required_ownership),
+      {stage, "register MR backing check returned null"}
+    );
+  endfunction
+
+  // 功能：owned MR 的入口校验：request 合法且属于 owner、长度不超过 32 位 host 分配上限、
+  //   不请求 atomic；DMA context 合法、属于 owner、与 binding.queue_dma 授权一致且无 owner_h。
+  // 输入/输出及副作用：stage 作为诊断前缀区分锁前/锁后/快照；只读输入，返回独立 status。
+  // 失败/边界：超长/context 为空/owner_h 非空返回 INVALID_ARGUMENT，atomic 返回
+  //   UNSUPPORTED_OPCODE，DMA 授权不符返回 DMA_TRANSLATION，子校验 null 为 INVALID_STATE。
+  protected function rdma_status owned_mr_input_status(
+    rdma_function_binding binding,
+    rdma_register_mr_req request,
+    rdma_dma_request_context dma_context,
+    rdma_function_handle owner,
+    string stage
+  );
+    rdma_status status;
+
+    status = checked_status(
+      register_mr_request_status(request, owner),
+      {stage, "owned register MR request check returned null"}
+    );
+    if (!status.ok())
+      return status;
+    if (request.length > 64'h0000_0000_ffff_ffff)
+      return invalid_argument(
+        {stage, "owned MR length exceeds host allocation size"}
+      );
+    if (request.access.remote_atomic)
+      return rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        {stage, "owned MR helper cannot allocate atomic DMA authority"}
+      );
+    if (dma_context == null)
+      return invalid_argument({stage, "owned MR DMA request context is null"});
+    status = checked_status(
+      dma_context.validate(),
+      {stage, "owned MR DMA context validation returned null"}
+    );
+    if (!status.ok())
+      return status;
+    status = checked_status(
+      same_owner_status(dma_context.function_h, owner,
+                        {stage, "owned MR DMA context"}),
+      {stage, "owned MR DMA Function check returned null"}
+    );
+    if (!status.ok())
+      return status;
+    if (dma_context.requester_bdf != binding.queue_dma.requester_bdf ||
+        dma_context.pasid_valid != binding.queue_dma.pasid_valid ||
+        dma_context.pasid != binding.queue_dma.pasid ||
+        dma_context.dma_domain_valid != binding.queue_dma.dma_domain_valid ||
+        dma_context.dma_domain_id != binding.queue_dma.dma_domain_id)
+      return rdma_status::make(
+        RDMA_SC_DMA_TRANSLATION,
+        "owned MR DMA authority does not match Function"
+      );
+    if (dma_context.owner_h != null)
+      return invalid_argument("owned MR DMA request owner must be null");
+    return rdma_status::success();
+  endfunction
+
+  // 功能：深拷贝 register MR request，并确认副本与原对象及其 owner/PD 句柄不共享引用。
+  // 输入/输出及副作用：request 只读；frozen 输出新副本，失败时为 null。
+  // 失败/边界：clone 失败、类型不符或任一引用未分离时返回 INVALID_STATE。
+  protected function rdma_status detach_mr_request(
+    rdma_register_mr_req request,
+    output rdma_register_mr_req frozen
+  );
+    uvm_object cloned_object;
+
+    frozen = null;
+    cloned_object = request.clone();
+    if (cloned_object == null || !$cast(frozen, cloned_object) ||
+        frozen == request || frozen.owner == request.owner ||
+        frozen.pd_h == request.pd_h) begin
+      frozen = null;
+      return invalid_state("register MR request snapshot is not deeply detached");
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：深拷贝 MR backing 描述，并确认副本及其 Function 句柄、page layout、每个
+  //   backing/HMC 引用（含 mapping 与 owner 句柄）都不与原对象共享。
+  // 输入/输出及副作用：backing 只读；frozen 输出新副本，失败时为 null。
+  // 失败/边界：clone 失败、类型不符、数组长度不同或任一引用未分离时返回 INVALID_STATE。
+  protected function rdma_status detach_mr_backing(
+    rdma_mr_backing_desc backing,
+    output rdma_mr_backing_desc frozen
+  );
+    uvm_object cloned_object;
+
+    frozen = null;
+    cloned_object = backing.clone();
+    if (cloned_object == null || !$cast(frozen, cloned_object) ||
+        frozen == backing || frozen.function_h == backing.function_h ||
+        frozen.page_layout == backing.page_layout ||
+        frozen.backing_refs.size() != backing.backing_refs.size() ||
+        frozen.hmc_refs.size() != backing.hmc_refs.size()) begin
+      frozen = null;
+      return invalid_state("register MR backing snapshot is not deeply detached");
+    end
+    foreach (frozen.backing_refs[i]) begin
+      rdma_backing_ref copy_ref = frozen.backing_refs[i];
+      rdma_backing_ref orig_ref = backing.backing_refs[i];
+
+      if (copy_ref == null || orig_ref == null || copy_ref == orig_ref ||
+          copy_ref.mapping == null || orig_ref.mapping == null ||
+          copy_ref.mapping == orig_ref.mapping ||
+          copy_ref.mapping.function_h == orig_ref.mapping.function_h ||
+          (orig_ref.mapping.owner_h == null && copy_ref.mapping.owner_h != null) ||
+          (orig_ref.mapping.owner_h != null &&
+           (copy_ref.mapping.owner_h == null ||
+            copy_ref.mapping.owner_h == orig_ref.mapping.owner_h))) begin
+        frozen = null;
+        return invalid_state(
+          "register MR backing reference snapshot is not deeply detached"
+        );
+      end
+    end
+    foreach (frozen.hmc_refs[i]) begin
+      if (frozen.hmc_refs[i] == null || backing.hmc_refs[i] == null ||
+          frozen.hmc_refs[i] == backing.hmc_refs[i] ||
+          frozen.hmc_refs[i].owner == backing.hmc_refs[i].owner) begin
+        frozen = null;
+        return invalid_state(
+          "register MR HMC reference snapshot is not deeply detached"
+        );
+      end
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：深拷贝 owned MR 的 DMA request context，并确认 Function/owner 句柄均已分离。
+  // 输入/输出及副作用：dma_context 只读；frozen 输出新副本，失败时为 null。
+  // 失败/边界：clone 失败、类型不符或任一句柄仍共享时返回 INVALID_STATE。
+  protected function rdma_status detach_dma_context(
+    rdma_dma_request_context dma_context,
+    output rdma_dma_request_context frozen
+  );
+    uvm_object cloned_object;
+
+    frozen = null;
+    cloned_object = dma_context.clone();
+    if (cloned_object == null || !$cast(frozen, cloned_object) ||
+        frozen == dma_context ||
+        frozen.function_h == dma_context.function_h ||
+        (dma_context.owner_h == null && frozen.owner_h != null) ||
+        (dma_context.owner_h != null &&
+         (frozen.owner_h == null || frozen.owner_h == dma_context.owner_h))) begin
+      frozen = null;
+      return invalid_state("owned MR DMA context snapshot is not deeply detached");
+    end
+    return rdma_status::success();
   endfunction
 
   // 功能：required_dma_direction 使用 access 计算并返回 rdma_dma_direction_e 结果；不修改对象字段或外部资源。
@@ -1956,11 +2166,7 @@ class rdma_control_plane extends uvm_object;
     rdma_function_handle locked_owner;
     rdma_resource resource;
     rdma_mr mr_snapshot;
-    rdma_hw_occ_flush_body occ_body;
-    rdma_hw_mr_deregister_body deregister_body;
-    rdma_hw_cmq_empty_body drain_body;
     rdma_cmq_command_desc command;
-    rdma_cmq_opcode_key opcode_key;
     rdma_cmq_ticket ticket;
     rdma_cmq_completion completion;
     rdma_status status;
@@ -2084,27 +2290,9 @@ class rdma_control_plane extends uvm_object;
       result.final_resource_state = RDMA_RESOURCE_QUIESCING;
 
       if (mr_snapshot.hmc_refs.size() != 0) begin
-        occ_body = rdma_hw_occ_flush_body::type_id::create(
-          "deregister_mr_occ_flush_body"
-        );
-        occ_body.mr_serial_flush = 1'b1;
-        occ_body.pble = 1'b1;
-        occ_body.mr_serial = mr_snapshot.mr_serial[11:0];
-        opcode_key = rdma_cmq_opcode_key::type_id::create(
-          "deregister_mr_occ_flush_opcode"
-        );
-        opcode_key.profile_name = "rdma";
-        opcode_key.opcode = RDMA_OP_OCC_FLUSH;
-        opcode_key.variant = "occ_flush";
-        command = rdma_cmq_command_desc::type_id::create(
-          "deregister_mr_occ_flush"
-        );
-        command.function_h = rdma_clone_function_handle_value(
-          locked_owner, "deregister MR OCC command"
-        );
-        command.opcode_key = opcode_key;
-        command.body = occ_body;
-        command.timeout = default_timeout;
+        command = make_mr_hw_command(locked_owner, mr_snapshot,
+                                     RDMA_CTRL_STEP_HW_OCC_FLUSHED,
+                                     "deregister_mr_occ_flush");
         execute_control_command(
           command, ticket, completion, status,
           "OCC_FLUSH execution returned null"
@@ -2156,29 +2344,9 @@ class rdma_control_plane extends uvm_object;
         end
       end
 
-      deregister_body = rdma_hw_mr_deregister_body::type_id::create(
-        "deregister_mr_body"
-      );
-      deregister_body.mr_h = project_handle(
-        mr_snapshot.handle, mr_snapshot.local_mr_id, RDMA_RESOURCE_MR
-      );
-      deregister_body.stag_key = mr_snapshot.lkey[7:0];
-      deregister_body.next_state = RDMA_CONTEXT_INVALID;
-      opcode_key = rdma_cmq_opcode_key::type_id::create(
-        "deregister_mr_opcode"
-      );
-      opcode_key.profile_name = "rdma";
-      opcode_key.opcode = RDMA_OP_MR_DEREGISTER;
-      opcode_key.variant = "deregister";
-      command = rdma_cmq_command_desc::type_id::create(
-        "deregister_mr_command"
-      );
-      command.function_h = rdma_clone_function_handle_value(
-        locked_owner, "deregister MR command"
-      );
-      command.opcode_key = opcode_key;
-      command.body = deregister_body;
-      command.timeout = default_timeout;
+      command = make_mr_hw_command(locked_owner, mr_snapshot,
+                                   RDMA_CTRL_STEP_HW_MR_DEREGISTERED,
+                                   "deregister_mr_command");
       execute_control_command(
         command, ticket, completion, status,
         "MR_DEREGISTER execution returned null"
@@ -2232,24 +2400,9 @@ class rdma_control_plane extends uvm_object;
         break;
       end
 
-      drain_body = rdma_hw_cmq_empty_body::type_id::create(
-        "deregister_mr_tq_flush_body"
-      );
-      opcode_key = rdma_cmq_opcode_key::type_id::create(
-        "deregister_mr_tq_flush_opcode"
-      );
-      opcode_key.profile_name = "rdma";
-      opcode_key.opcode = RDMA_OP_TQ_FLUSH;
-      opcode_key.variant = "tq_flush";
-      command = rdma_cmq_command_desc::type_id::create(
-        "deregister_mr_tq_flush"
-      );
-      command.function_h = rdma_clone_function_handle_value(
-        locked_owner, "deregister MR TQ command"
-      );
-      command.opcode_key = opcode_key;
-      command.body = drain_body;
-      command.timeout = default_timeout;
+      command = make_mr_hw_command(locked_owner, mr_snapshot,
+                                   RDMA_CTRL_STEP_HW_DRAINED,
+                                   "deregister_mr_tq_flush");
       execute_control_command(
         command, ticket, completion, status,
         "TQ_FLUSH execution returned null"
@@ -2417,12 +2570,10 @@ class rdma_control_plane extends uvm_object;
     rdma_resource active_resource;
     rdma_mrt_model mrt;
     rdma_cmq_command_desc command;
-    rdma_cmq_opcode_key opcode_key;
     rdma_cmq_ticket ticket;
     rdma_cmq_completion completion;
     rdma_recovery_record recovery;
     rdma_status status;
-    uvm_object cloned_object;
     semaphore function_lock;
     longint unsigned transaction_id;
     longint unsigned live_lease_size;
@@ -2463,28 +2614,10 @@ class rdma_control_plane extends uvm_object;
                                 "Function binding check returned null");
         break;
       end
-      status = generation_fence(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "initial register MR generation fence returned null"
-        );
+      status = register_mr_input_status(binding, request, backing, owner,
+                                        owner, required_ownership, "");
+      if (!status.ok())
         break;
-      end
-      status = register_mr_request_status(request, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "register MR request check returned null"
-        );
-        break;
-      end
-      status = validate_backing(binding, request, backing, owner,
-                                required_ownership);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "register MR backing check returned null"
-        );
-        break;
-      end
 
       if (function_lock == null) begin
         acquire_function_lock(owner, function_lock);
@@ -2497,105 +2630,23 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      status = generation_fence(binding, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock register MR generation fence returned null"
-        );
+      status = register_mr_input_status(binding, request, backing, owner,
+                                        locked_owner, required_ownership,
+                                        "post-lock ");
+      if (!status.ok())
         break;
-      end
-      status = register_mr_request_status(request, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock register MR request check returned null"
-        );
-        break;
-      end
-      status = validate_backing(binding, request, backing, locked_owner,
-                                required_ownership);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock register MR backing check returned null"
-        );
-        break;
-      end
 
-      cloned_object = request.clone();
-      if (cloned_object == null ||
-          !$cast(frozen_request, cloned_object) ||
-          frozen_request == request ||
-          frozen_request.owner == request.owner ||
-          frozen_request.pd_h == request.pd_h) begin
-        status = invalid_state(
-          "register MR request snapshot is not deeply detached"
-        );
+      status = detach_mr_request(request, frozen_request);
+      if (!status.ok())
         break;
-      end
-      cloned_object = backing.clone();
-      if (cloned_object == null ||
-          !$cast(frozen_backing, cloned_object) ||
-          frozen_backing == backing ||
-          frozen_backing.function_h == backing.function_h ||
-          frozen_backing.page_layout == backing.page_layout ||
-          frozen_backing.backing_refs.size() != backing.backing_refs.size() ||
-          frozen_backing.hmc_refs.size() != backing.hmc_refs.size()) begin
-        status = invalid_state(
-          "register MR backing snapshot is not deeply detached"
-        );
+      status = detach_mr_backing(backing, frozen_backing);
+      if (!status.ok())
         break;
-      end
-      foreach (frozen_backing.backing_refs[i]) begin
-        if (frozen_backing.backing_refs[i] == null ||
-            backing.backing_refs[i] == null ||
-            frozen_backing.backing_refs[i] == backing.backing_refs[i] ||
-            frozen_backing.backing_refs[i].mapping == null ||
-            backing.backing_refs[i].mapping == null ||
-            frozen_backing.backing_refs[i].mapping ==
-              backing.backing_refs[i].mapping ||
-            frozen_backing.backing_refs[i].mapping.function_h ==
-              backing.backing_refs[i].mapping.function_h ||
-            (backing.backing_refs[i].mapping.owner_h == null &&
-             frozen_backing.backing_refs[i].mapping.owner_h != null) ||
-            (backing.backing_refs[i].mapping.owner_h != null &&
-             (frozen_backing.backing_refs[i].mapping.owner_h == null ||
-              frozen_backing.backing_refs[i].mapping.owner_h ==
-                backing.backing_refs[i].mapping.owner_h))) begin
-          status = invalid_state(
-            "register MR backing reference snapshot is not deeply detached"
-          );
-          break;
-        end
-      end
-      if (status == null || !status.ok())
+      status = register_mr_input_status(binding, frozen_request,
+                                        frozen_backing, null, locked_owner,
+                                        required_ownership, "snapshot ");
+      if (!status.ok())
         break;
-      foreach (frozen_backing.hmc_refs[i]) begin
-        if (frozen_backing.hmc_refs[i] == null ||
-            backing.hmc_refs[i] == null ||
-            frozen_backing.hmc_refs[i] == backing.hmc_refs[i] ||
-            frozen_backing.hmc_refs[i].owner == backing.hmc_refs[i].owner) begin
-          status = invalid_state(
-            "register MR HMC reference snapshot is not deeply detached"
-          );
-          break;
-        end
-      end
-      if (status == null || !status.ok())
-        break;
-      status = register_mr_request_status(frozen_request, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "register MR request snapshot check returned null"
-        );
-        break;
-      end
-      status = validate_backing(binding, frozen_request, frozen_backing,
-                                locked_owner, required_ownership);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "register MR backing snapshot check returned null"
-        );
-        break;
-      end
 
       status = manager.lookup(frozen_request.pd_h, pd_resource);
       if (status == null || !status.ok()) begin
@@ -2686,21 +2737,10 @@ class rdma_control_plane extends uvm_object;
       if (mrt.page_layout != null)
         mrt.page_layout.mr_serial = reserved_mr.mr_serial;
 
-      command = rdma_cmq_command_desc::type_id::create(
+      command = rdma_make_cmq_command(
+        locked_owner, RDMA_OP_KEY_ALLOC, "key_alloc", mrt, default_timeout,
         "register_mr_key_alloc"
       );
-      command.function_h = rdma_clone_function_handle_value(
-        locked_owner, "register MR command"
-      );
-      opcode_key = rdma_cmq_opcode_key::type_id::create(
-        "register_mr_key_alloc_opcode"
-      );
-      opcode_key.profile_name = "rdma";
-      opcode_key.opcode = RDMA_OP_KEY_ALLOC;
-      opcode_key.variant = "key_alloc";
-      command.opcode_key = opcode_key;
-      command.body = mrt;
-      command.timeout = default_timeout;
 
       execute_control_command_raw_status(
         command, ticket, completion, status
@@ -2877,7 +2917,6 @@ class rdma_control_plane extends uvm_object;
     rdma_backing_ref backing_ref;
     rdma_status status;
     rdma_status release_status;
-    uvm_object cloned_object;
     semaphore function_lock;
     longint unsigned transaction_id;
     bit ownership_transferred;
@@ -2913,13 +2952,6 @@ class rdma_control_plane extends uvm_object;
                                 "Function binding check returned null");
         break;
       end
-      status = register_mr_request_status(request, owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "owned register MR request check returned null"
-        );
-        break;
-      end
       if (alignment < 4096 ||
           (alignment & (alignment - 1'b1)) != 0) begin
         status = invalid_argument(
@@ -2927,56 +2959,9 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      if (request.length > 64'h0000_0000_ffff_ffff) begin
-        status = invalid_argument(
-          "owned MR length exceeds host allocation size"
-        );
+      status = owned_mr_input_status(binding, request, dma_context, owner, "");
+      if (!status.ok())
         break;
-      end
-      if (request.access.remote_atomic) begin
-        status = rdma_status::make(
-          RDMA_SC_UNSUPPORTED_OPCODE,
-          "owned MR helper cannot allocate atomic DMA authority"
-        );
-        break;
-      end
-      if (dma_context == null) begin
-        status = invalid_argument("owned MR DMA request context is null");
-        break;
-      end
-      status = dma_context.validate();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "owned MR DMA context validation returned null"
-        );
-        break;
-      end
-      status = same_owner_status(dma_context.function_h, owner,
-                                 "owned MR DMA context");
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "owned MR DMA Function check returned null"
-        );
-        break;
-      end
-      if (dma_context.requester_bdf != binding.queue_dma.requester_bdf ||
-          dma_context.pasid_valid != binding.queue_dma.pasid_valid ||
-          dma_context.pasid != binding.queue_dma.pasid ||
-          dma_context.dma_domain_valid !=
-            binding.queue_dma.dma_domain_valid ||
-          dma_context.dma_domain_id != binding.queue_dma.dma_domain_id) begin
-        status = rdma_status::make(
-          RDMA_SC_DMA_TRANSLATION,
-          "owned MR DMA authority does not match Function"
-        );
-        break;
-      end
-      if (dma_context.owner_h != null) begin
-        status = invalid_argument(
-          "owned MR DMA request owner must be null"
-        );
-        break;
-      end
       if (host_mem == null) begin
         status = invalid_state(
           "owned MR host memory adapter is unavailable"
@@ -3001,137 +2986,21 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      status = register_mr_request_status(request, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock owned register MR request check returned null"
-        );
+      status = owned_mr_input_status(binding, request, dma_context,
+                                     locked_owner, "post-lock ");
+      if (!status.ok())
         break;
-      end
-      if (request.length > 64'h0000_0000_ffff_ffff) begin
-        status = invalid_argument(
-          "owned MR length exceeds host allocation size"
-        );
-        break;
-      end
-      if (request.access.remote_atomic) begin
-        status = rdma_status::make(
-          RDMA_SC_UNSUPPORTED_OPCODE,
-          "owned MR helper cannot allocate atomic DMA authority"
-        );
-        break;
-      end
-      status = dma_context.validate();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock owned MR DMA context validation returned null"
-        );
-        break;
-      end
-      status = same_owner_status(
-        dma_context.function_h, locked_owner,
-        "post-lock owned MR DMA context"
-      );
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "post-lock owned MR DMA Function check returned null"
-        );
-        break;
-      end
-      if (dma_context.requester_bdf != binding.queue_dma.requester_bdf ||
-          dma_context.pasid_valid != binding.queue_dma.pasid_valid ||
-          dma_context.pasid != binding.queue_dma.pasid ||
-          dma_context.dma_domain_valid !=
-            binding.queue_dma.dma_domain_valid ||
-          dma_context.dma_domain_id != binding.queue_dma.dma_domain_id) begin
-        status = rdma_status::make(
-          RDMA_SC_DMA_TRANSLATION,
-          "owned MR DMA authority does not match Function"
-        );
-        break;
-      end
-      if (dma_context.owner_h != null) begin
-        status = invalid_argument(
-          "owned MR DMA request owner must be null"
-        );
-        break;
-      end
 
-      cloned_object = request.clone();
-      if (cloned_object == null ||
-          !$cast(frozen_request, cloned_object) ||
-          frozen_request == request ||
-          frozen_request.owner == request.owner ||
-          frozen_request.pd_h == request.pd_h) begin
-        status = invalid_state(
-          "owned MR request snapshot is not deeply detached"
-        );
+      status = detach_mr_request(request, frozen_request);
+      if (!status.ok())
         break;
-      end
-      cloned_object = dma_context.clone();
-      if (cloned_object == null ||
-          !$cast(frozen_context, cloned_object) ||
-          frozen_context == dma_context ||
-          frozen_context.function_h == dma_context.function_h ||
-          (dma_context.owner_h == null && frozen_context.owner_h != null) ||
-          (dma_context.owner_h != null &&
-           (frozen_context.owner_h == null ||
-            frozen_context.owner_h == dma_context.owner_h))) begin
-        status = invalid_state(
-          "owned MR DMA context snapshot is not deeply detached"
-        );
+      status = detach_dma_context(dma_context, frozen_context);
+      if (!status.ok())
         break;
-      end
-      status = register_mr_request_status(frozen_request, locked_owner);
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "owned MR request snapshot check returned null"
-        );
+      status = owned_mr_input_status(binding, frozen_request, frozen_context,
+                                     locked_owner, "snapshot ");
+      if (!status.ok())
         break;
-      end
-      if (frozen_request.length > 64'h0000_0000_ffff_ffff) begin
-        status = invalid_argument(
-          "owned MR snapshot length exceeds host allocation size"
-        );
-        break;
-      end
-      if (frozen_request.access.remote_atomic) begin
-        status = rdma_status::make(
-          RDMA_SC_UNSUPPORTED_OPCODE,
-          "owned MR snapshot cannot request atomic DMA authority"
-        );
-        break;
-      end
-      status = frozen_context.validate();
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "owned MR DMA context snapshot validation returned null"
-        );
-        break;
-      end
-      status = same_owner_status(
-        frozen_context.function_h, locked_owner,
-        "owned MR DMA context snapshot"
-      );
-      if (status == null || !status.ok()) begin
-        status = checked_status(
-          status, "owned MR DMA context snapshot Function check returned null"
-        );
-        break;
-      end
-      if (frozen_context.requester_bdf !=
-            binding.queue_dma.requester_bdf ||
-          frozen_context.pasid_valid != binding.queue_dma.pasid_valid ||
-          frozen_context.pasid != binding.queue_dma.pasid ||
-          frozen_context.dma_domain_valid !=
-            binding.queue_dma.dma_domain_valid ||
-          frozen_context.dma_domain_id != binding.queue_dma.dma_domain_id ||
-          frozen_context.owner_h != null) begin
-        status = invalid_argument(
-          "owned MR DMA context snapshot authority is invalid"
-        );
-        break;
-      end
       // Preserve the caller-selected MR IOVA.  The allocation contract cannot
       // request one, so inner backing validation must prove that the returned
       // mapping covers request.iova rather than silently rewriting it.
@@ -3540,11 +3409,7 @@ class rdma_control_plane extends uvm_object;
     output rdma_cmq_completion completion,
     output rdma_status status
   );
-    rdma_hw_occ_flush_body occ_body;
-    rdma_hw_mr_deregister_body deregister_body;
-    rdma_hw_cmq_empty_body drain_body;
     rdma_cmq_command_desc command;
-    rdma_cmq_opcode_key opcode_key;
 
     ticket = null;
     completion = null;
@@ -3554,63 +3419,15 @@ class rdma_control_plane extends uvm_object;
       return;
     end
 
-    opcode_key = rdma_cmq_opcode_key::type_id::create(
-      "recovery_opcode"
-    );
-    opcode_key.profile_name = "rdma";
-    case (step)
-      RDMA_CTRL_STEP_HW_OCC_FLUSHED: begin
-        occ_body = rdma_hw_occ_flush_body::type_id::create(
-          "recovery_occ_flush_body"
-        );
-        occ_body.mr_serial_flush = 1'b1;
-        occ_body.pble = 1'b1;
-        occ_body.mr_serial = error_mr.mr_serial[11:0];
-        opcode_key.opcode = RDMA_OP_OCC_FLUSH;
-        opcode_key.variant = "occ_flush";
-      end
-      RDMA_CTRL_STEP_HW_MR_DEREGISTERED: begin
-        deregister_body = rdma_hw_mr_deregister_body::type_id::create(
-          "recovery_mr_deregister_body"
-        );
-        deregister_body.mr_h = project_handle(
-          error_mr.handle, error_mr.local_mr_id, RDMA_RESOURCE_MR
-        );
-        deregister_body.stag_key = error_mr.lkey[7:0];
-        deregister_body.next_state = RDMA_CONTEXT_INVALID;
-        opcode_key.opcode = RDMA_OP_MR_DEREGISTER;
-        opcode_key.variant = "deregister";
-      end
-      RDMA_CTRL_STEP_HW_DRAINED: begin
-        drain_body = rdma_hw_cmq_empty_body::type_id::create(
-          "recovery_tq_flush_body"
-        );
-        opcode_key.opcode = RDMA_OP_TQ_FLUSH;
-        opcode_key.variant = "tq_flush";
-      end
-      default: begin
-        status = rdma_status::make(
-          RDMA_SC_UNSUPPORTED_OPCODE,
-          "recovery pending hardware step is unsupported"
-        );
-        return;
-      end
-    endcase
-
-    command = rdma_cmq_command_desc::type_id::create(
-      "recovery_hardware_command"
-    );
-    command.function_h = rdma_clone_function_handle_value(
-      owner, "recovery hardware command"
-    );
-    command.opcode_key = opcode_key;
-    case (step)
-      RDMA_CTRL_STEP_HW_OCC_FLUSHED: command.body = occ_body;
-      RDMA_CTRL_STEP_HW_MR_DEREGISTERED: command.body = deregister_body;
-      RDMA_CTRL_STEP_HW_DRAINED: command.body = drain_body;
-      default: command.body = null;
-    endcase
-    command.timeout = default_timeout;
+    command = make_mr_hw_command(owner, error_mr, step,
+                                 "recovery_hardware_command");
+    if (command == null) begin
+      status = rdma_status::make(
+        RDMA_SC_UNSUPPORTED_OPCODE,
+        "recovery pending hardware step is unsupported"
+      );
+      return;
+    end
     execute_control_command(
       command, ticket, completion, status,
       "recovery hardware execution returned null"

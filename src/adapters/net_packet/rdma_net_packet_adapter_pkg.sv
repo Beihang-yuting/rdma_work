@@ -642,7 +642,6 @@ package rdma_net_packet_adapter_pkg;
       packet net_value;
       rocev2_bth roce;
       iwarp_header iwarp;
-      udp_header udp;
       rdma_status status;
       int unsigned rdma_offset;
       int unsigned frame_end;

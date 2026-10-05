@@ -767,6 +767,45 @@ class rdma_cmq_command_desc extends uvm_object;
   endfunction
 endclass
 
+// 功能：构造 profile="rdma" 的 CMQ opcode key。
+// 输入/输出及副作用：opcode/variant 写入新对象；name 仅作 UVM 对象名。
+// 失败/边界：不校验 opcode 是否受 profile 支持，由 codec/engine 在提交时拒绝。
+function automatic rdma_cmq_opcode_key rdma_make_cmq_opcode_key(
+  bit [31:0] opcode,
+  string variant,
+  string name = "cmq_opcode_key"
+);
+  rdma_cmq_opcode_key key;
+
+  key = rdma_cmq_opcode_key::type_id::create(name);
+  key.profile_name = "rdma";
+  key.opcode = opcode;
+  key.variant = variant;
+  return key;
+endfunction
+
+// 功能：构造一条控制路径 CMQ 命令：detached Function 句柄、rdma opcode key、body 与超时。
+// 输入/输出及副作用：owner 被深拷贝，body 按引用挂接（调用方负责是否先 clone）；返回新命令。
+// 失败/边界：不调用 validate；owner 为 null 时 function_h 为 null，由提交路径拒绝。
+function automatic rdma_cmq_command_desc rdma_make_cmq_command(
+  rdma_function_handle owner,
+  bit [31:0] opcode,
+  string variant,
+  rdma_hw_model body,
+  time timeout,
+  string name = "cmq_command"
+);
+  rdma_cmq_command_desc command;
+
+  command = rdma_cmq_command_desc::type_id::create(name);
+  command.function_h = rdma_clone_function_handle_value(owner, name);
+  command.opcode_key = rdma_make_cmq_opcode_key(opcode, variant,
+                                                {name, "_opcode"});
+  command.body = body;
+  command.timeout = timeout;
+  return command;
+endfunction
+
 // 设计说明：slot context 把 allocator 给出的 SQ 物理位置与 command 分离，
 // 让 profile 编码前能独立验证 Function/CMQ 归属和 sequence/index/wrap 几何。
 class rdma_cmq_slot_context extends uvm_object;

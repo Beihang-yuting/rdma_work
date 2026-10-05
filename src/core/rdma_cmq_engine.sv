@@ -408,7 +408,6 @@ class rdma_cmq_engine extends uvm_object;
   );
     rdma_status validation_status;
     rdma_status snapshot_status;
-    rdma_status identity_status;
     rdma_cmq_ticket ticket_snapshot;
     uvm_object payload_snapshot;
 
@@ -2975,7 +2974,6 @@ class rdma_cmq_engine extends uvm_object;
     uvm_object cloned_object;
     uvm_object saved_object;
     uvm_object_wrapper source_wrapper;
-    rdma_status status;
     rdma_hw_model saved_body;
     string source_type_name;
     string saved_shell_value;
@@ -12742,7 +12740,6 @@ class rdma_cmq_engine extends uvm_object;
       rdma_cmq_batch_submission_item_record reducer_items[$];
       longint unsigned proof_id;
       string proof_key;
-      string failure_reason;
 
       next_proof_id++;
       proof_id = next_proof_id;
