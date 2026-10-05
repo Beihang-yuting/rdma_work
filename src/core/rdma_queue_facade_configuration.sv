@@ -47,11 +47,10 @@ function automatic rdma_status rdma_validate_queue_facade_configuration(
       RDMA_SC_INVALID_ARGUMENT,
       {label, " facade dependencies do not match shared engine"});
 
-  status = function_binding.validate();
-  if (status == null)
-    return rdma_status::make(
-      RDMA_SC_INVALID_STATE,
-      {label, " Function binding validation returned null"});
+  status = rdma_status::nonnull(
+    function_binding.validate(),
+    {label, " Function binding validation returned null"}
+  );
   if (!status.ok())
     return status;
   if (function_binding.state != RDMA_BIND_ACTIVE)

@@ -839,21 +839,17 @@ class rdma_host_mem_router extends rdma_host_mem_api;
       );
     manager = m_managers[host_key];
 
-    status = manager.validate_failure_atomic_release(mapping);
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Host manager failure-atomic validation returned null"
-      );
+    status = rdma_status::nonnull(
+      manager.validate_failure_atomic_release(mapping),
+      "Host manager failure-atomic validation returned null"
+    );
     if (!status.ok())
       return status;
 
-    status = manager.release_opaque(mapping);
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Host manager opaque release returned null"
-      );
+    status = rdma_status::nonnull(
+      manager.release_opaque(mapping),
+      "Host manager opaque release returned null"
+    );
     if (!status.ok())
       return status;
 

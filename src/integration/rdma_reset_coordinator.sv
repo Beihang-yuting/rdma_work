@@ -1195,12 +1195,10 @@ class rdma_reset_coordinator extends uvm_object;
           RDMA_SC_INVALID_ARGUMENT,
           "reset coordinator registration identity is null"
         );
-      identity_status = identities[index].validate();
-      if (identity_status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "reset coordinator registration identity validation returned null"
-        );
+      identity_status = rdma_status::nonnull(
+        identities[index].validate(),
+        "reset coordinator registration identity validation returned null"
+      );
       if (!identity_status.ok())
         return identity_status;
       name = identity_name(identities[index]);
@@ -1931,12 +1929,10 @@ class rdma_reset_coordinator extends uvm_object;
     if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function identity is null");
-    identity_status = identity.validate();
-    if (identity_status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Function identity validation returned null"
-      );
+    identity_status = rdma_status::nonnull(
+      identity.validate(),
+      "Function identity validation returned null"
+    );
     if (!identity_status.ok())
       return identity_status;
 
@@ -2032,12 +2028,10 @@ class rdma_reset_coordinator extends uvm_object;
     rdma_reset_epoch_t current_epoch;
 
     next_epoch = 0;
-    status = validate_registered_identity(identity);
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Function epoch preview returned null validation"
-      );
+    status = rdma_status::nonnull(
+      validate_registered_identity(identity),
+      "Function epoch preview returned null validation"
+    );
     if (!status.ok())
       return status;
     current_epoch = function_epoch(identity);

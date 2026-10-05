@@ -1019,12 +1019,10 @@ package rdma_host_mem_adapter_pkg;
         );
       // Functions cannot consume time, so sealing completion and freeing the
       // backing are one adapter operation.  The exact seal is never exposed.
-      status = concrete_mapping.mark_release_complete(release_seal);
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "host memory release completion marking returned null"
-        );
+      status = rdma_status::nonnull(
+        concrete_mapping.mark_release_complete(release_seal),
+        "host memory release completion marking returned null"
+      );
       if (!status.ok())
         return status;
       // The authoritative address and original manager select the allocation;

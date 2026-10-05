@@ -48,10 +48,10 @@ function automatic rdma_status rdma_validate_live_authority(
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              {label, " Function binding is not ACTIVE"});
 
-  status = authority_binding.validate();
-  if (status == null)
-    return rdma_status::make(RDMA_SC_INVALID_STATE,
-                             {label, " binding validation returned null"});
+  status = rdma_status::nonnull(
+    authority_binding.validate(),
+    {label, " binding validation returned null"}
+  );
   if (!status.ok())
     return status;
   return rdma_status::success();

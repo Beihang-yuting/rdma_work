@@ -1037,12 +1037,10 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "QP recovery completion query clone returned null"
       ) : status;
-    status = completion_query.release_completion_status(after_complete);
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "QP recovery completion query returned null"
-      );
+    status = rdma_status::nonnull(
+      completion_query.release_completion_status(after_complete),
+      "QP recovery completion query returned null"
+    );
     if (!status.ok())
       return status;
     if (!rdma_resource_projector::same_mapping_value(mapping, completion_query) ||
@@ -1521,12 +1519,10 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         {operation, " registry staged action is ambiguous"}
       );
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        {operation, " registry replacement validation returned null"}
-      );
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      {operation, " registry replacement validation returned null"}
+    );
     if (!status.ok())
       return status;
     if (!registry.exists(key) || registry[key] == null ||
@@ -1687,12 +1683,10 @@ class rdma_resource_manager extends uvm_object;
     end
 
     if (!binding_snapshots.exists(key)) begin
-      status = projected_binding.validate();
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "Function binding validation returned null"
-        );
+      status = rdma_status::nonnull(
+        projected_binding.validate(),
+        "Function binding validation returned null"
+      );
       if (!status.ok())
         return status;
       if (projected_binding.state != RDMA_BIND_ACTIVE)
@@ -1745,12 +1739,10 @@ class rdma_resource_manager extends uvm_object;
     if (retired_generations.exists(function_generation_key(owner)))
       return rdma_status::make(RDMA_SC_STALE_GENERATION,
                                "Function generation is retired");
-    status = trusted_binding.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Trusted Function binding validation returned null"
-      );
+    status = rdma_status::nonnull(
+      trusted_binding.validate(),
+      "Trusted Function binding validation returned null"
+    );
     if (!status.ok())
       return status;
     if (trusted_binding.state != RDMA_BIND_ACTIVE)
@@ -3608,20 +3600,18 @@ class rdma_resource_manager extends uvm_object;
       if (!status.ok())
         return status;
       prepared.state = RDMA_RESOURCE_PROGRAMMED;
-      status = prepared.validate();
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "prepared staged candidate validation returned null"
-        );
+      status = rdma_status::nonnull(
+        prepared.validate(),
+        "prepared staged candidate validation returned null"
+      );
       if (!status.ok())
         return status;
     end
     replacement.state = RDMA_RESOURCE_ALLOCATED;
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "staged candidate validation returned null");
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "staged candidate validation returned null"
+    );
     if (!status.ok())
       return status;
     return commit_registry_replacement(
@@ -3777,12 +3767,10 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_PROGRAMMED;
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "programmed candidate validation returned null"
-      );
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "programmed candidate validation returned null"
+    );
     if (!status.ok())
       return status;
     return commit_registry_replacement(
@@ -3827,10 +3815,10 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_ACTIVE;
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "active resource validation returned null");
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "active resource validation returned null"
+    );
     if (!status.ok())
       return status;
     return commit_registry_replacement(
@@ -4095,11 +4083,10 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     replacement.state = RDMA_RESOURCE_PROGRAMMED;
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE, "QP programming validation returned null"
-      );
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "QP programming validation returned null"
+    );
     if (!status.ok())
       return status;
     return commit_registry_replacement(
@@ -4146,11 +4133,10 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE, "QP semantic-state projection failed"
       ) : status;
     replacement.qp_state = state;
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE, "QP semantic-state validation returned null"
-      );
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "QP semantic-state validation returned null"
+    );
     if (!status.ok())
       return status;
     return commit_registry_replacement(
@@ -4325,11 +4311,7 @@ class rdma_resource_manager extends uvm_object;
       end
       replacement = expected_replacement;
     end
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE, "programmed QP validation returned null"
-      );
+    status = rdma_status::nonnull(replacement.validate(), "programmed QP validation returned null");
     if (!status.ok())
       return status;
     epoch_snapshot = publication_epoch;
@@ -4467,12 +4449,10 @@ class rdma_resource_manager extends uvm_object;
           RDMA_SC_INVALID_ARGUMENT,
           "pre-program QP recovery projection is empty"
         ) : status;
-      status = recovery_copy.validate();
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "pre-program QP recovery validation returned null"
-        );
+      status = rdma_status::nonnull(
+        recovery_copy.validate(),
+        "pre-program QP recovery validation returned null"
+      );
       if (!status.ok())
         return status;
       status = rdma_qp_partial_plan_authority(
@@ -4537,11 +4517,10 @@ class rdma_resource_manager extends uvm_object;
         return status.ok() ? rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT, "QP recovery projection is empty"
         ) : status;
-      status = recovery_copy.validate();
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE, "QP recovery validation returned null"
-        );
+      status = rdma_status::nonnull(
+        recovery_copy.validate(),
+        "QP recovery validation returned null"
+      );
       if (!status.ok())
         return status;
     end
@@ -4747,11 +4726,10 @@ class rdma_resource_manager extends uvm_object;
       else
         replacement.rq_iova.value = 0;
     end
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE, "QP ERROR resource validation returned null"
-      );
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "QP ERROR resource validation returned null"
+    );
     if (!status.ok())
       return status;
 
@@ -4796,11 +4774,10 @@ class rdma_resource_manager extends uvm_object;
       if (recovery_copy.query_presence_known)
         record_copy.hardware_presence = recovery_copy.query_presence;
     end
-    status = record_copy.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE, "QP recovery record validation returned null"
-      );
+    status = rdma_status::nonnull(
+      record_copy.validate(),
+      "QP recovery record validation returned null"
+    );
     if (!status.ok())
       return status;
 
@@ -5235,21 +5212,17 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_STATE,
         {operation, " registry source is missing"}
       );
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        {operation, " resource replacement validation returned null"}
-      );
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      {operation, " resource replacement validation returned null"}
+    );
     if (!status.ok())
       return status;
     if (replace_recovery) begin
-      status = recovery_replacement.validate();
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          {operation, " recovery replacement validation returned null"}
-        );
+      status = rdma_status::nonnull(
+        recovery_replacement.validate(),
+        {operation, " recovery replacement validation returned null"}
+      );
       if (!status.ok())
         return status;
     end
@@ -6815,12 +6788,10 @@ class rdma_resource_manager extends uvm_object;
         recovery_replacement.ambiguous_ticket = null;
         if (authoritative.handle.kind == RDMA_RESOURCE_SRQ)
           clear_srq_flush_progress(recovery_replacement.queue_plan);
-        status = recovery_replacement.validate();
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "restored queue recovery validation returned null"
-          );
+        status = rdma_status::nonnull(
+          recovery_replacement.validate(),
+          "restored queue recovery validation returned null"
+        );
         if (!status.ok())
           return status;
       end
@@ -6875,10 +6846,10 @@ class rdma_resource_manager extends uvm_object;
     if (authoritative.state == RDMA_RESOURCE_ERROR &&
         lifecycle_queue_kind(authoritative.handle.kind))
       queue_restore_pre_validate_observer(replacement);
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "restored resource validation returned null");
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "restored resource validation returned null"
+    );
     if (!status.ok())
       return status;
     if (authoritative.state == RDMA_RESOURCE_ERROR &&
@@ -7024,10 +6995,7 @@ class rdma_resource_manager extends uvm_object;
         RDMA_SC_INVALID_ARGUMENT,
         "recovery record does not match the resource incarnation"
       );
-    status = recovery_copy.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "recovery validation returned null");
+    status = rdma_status::nonnull(recovery_copy.validate(), "recovery validation returned null");
     if (!status.ok())
       return status;
     if (reserved_only) begin
@@ -7208,26 +7176,24 @@ class rdma_resource_manager extends uvm_object;
           status = queue_local_release_plan_status(recovery_copy.queue_plan);
           if (!status.ok()) return status;
         end
-        status = rdma_resource_projector::project_queue_plan_value(
-          recovery_copy.queue_plan, "mark error transaction resource plan",
-          authoritative_plan
+        status = rdma_status::nonnull(
+          rdma_resource_projector::project_queue_plan_value(
+              recovery_copy.queue_plan, "mark error transaction resource plan",
+              authoritative_plan
+            ),
+          "transaction resource plan projection returned null"
         );
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "transaction resource plan projection returned null"
-          );
-        if (!status.ok()) return status;
-        status = rdma_resource_projector::project_queue_plan_value(
-          recovery_copy.queue_plan, "mark error transaction recovery plan",
-          recovery_plan
+        if (!status.ok())
+          return status;
+        status = rdma_status::nonnull(
+          rdma_resource_projector::project_queue_plan_value(
+              recovery_copy.queue_plan, "mark error transaction recovery plan",
+              recovery_plan
+            ),
+          "transaction recovery plan projection returned null"
         );
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "transaction recovery plan projection returned null"
-          );
-        if (!status.ok()) return status;
+        if (!status.ok())
+          return status;
         queue_replacement.queue_plan = authoritative_plan;
         queue_replacement.depth = authoritative_plan.rings[0].depth;
         recovery_copy.queue_plan = recovery_plan;
@@ -7251,26 +7217,24 @@ class rdma_resource_manager extends uvm_object;
           queue_replacement.queue_plan, recovery_copy.queue_plan
         );
         if (!status.ok()) return status;
-        status = rdma_resource_projector::project_queue_plan_value(
-          recovery_copy.queue_plan,
-          "mark error reservation resource plan", authoritative_plan
+        status = rdma_status::nonnull(
+          rdma_resource_projector::project_queue_plan_value(
+              recovery_copy.queue_plan,
+              "mark error reservation resource plan", authoritative_plan
+            ),
+          "reservation resource plan projection returned null"
         );
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "reservation resource plan projection returned null"
-          );
-        if (!status.ok()) return status;
-        status = rdma_resource_projector::project_queue_plan_value(
-          recovery_copy.queue_plan,
-          "mark error reservation recovery plan", recovery_plan
+        if (!status.ok())
+          return status;
+        status = rdma_status::nonnull(
+          rdma_resource_projector::project_queue_plan_value(
+              recovery_copy.queue_plan,
+              "mark error reservation recovery plan", recovery_plan
+            ),
+          "reservation recovery plan projection returned null"
         );
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "reservation recovery plan projection returned null"
-          );
-        if (!status.ok()) return status;
+        if (!status.ok())
+          return status;
         queue_replacement.queue_plan = authoritative_plan;
         queue_replacement.depth = authoritative_plan.rings[0].depth;
         recovery_copy.queue_plan = recovery_plan;
@@ -7280,29 +7244,29 @@ class rdma_resource_manager extends uvm_object;
         // A QUIESCING progress record lives only in the registry.  Make that
         // snapshot authoritative when ERROR recovery begins so callers cannot
         // erase already-proven cleanup by supplying an older plan.
-        status = rdma_resource_projector::project_queue_plan_value(
-          queue_replacement.queue_plan,
-          "mark error authoritative queue plan", authoritative_plan
+        status = rdma_status::nonnull(
+          rdma_resource_projector::project_queue_plan_value(
+              queue_replacement.queue_plan,
+              "mark error authoritative queue plan", authoritative_plan
+            ),
+          "queue ERROR plan projection returned null"
         );
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "queue ERROR plan projection returned null"
-          );
-        if (!status.ok()) return status;
+        if (!status.ok())
+          return status;
         recovery_copy.queue_plan = authoritative_plan;
       end
-      status = recovery_copy.validate();
-      if (status == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "merged queue recovery validation returned null");
-      if (!status.ok()) return status;
+      status = rdma_status::nonnull(
+        recovery_copy.validate(),
+        "merged queue recovery validation returned null"
+      );
+      if (!status.ok())
+        return status;
     end
     replacement.state = RDMA_RESOURCE_ERROR;
-    status = replacement.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "ERROR resource validation returned null");
+    status = rdma_status::nonnull(
+      replacement.validate(),
+      "ERROR resource validation returned null"
+    );
     if (!status.ok())
       return status;
     return commit_resource_recovery_replacement(

@@ -115,10 +115,10 @@ class rdma_mr_backing_desc extends uvm_object;
       if (backing_refs[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "MR backing reference is null");
-      status = backing_refs[i].validate();
-      if (status == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "MR backing validation returned null");
+      status = rdma_status::nonnull(
+        backing_refs[i].validate(),
+        "MR backing validation returned null"
+      );
       if (!status.ok())
         return status;
     end
@@ -126,17 +126,14 @@ class rdma_mr_backing_desc extends uvm_object;
       if (hmc_refs[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "MR HMC reference is null");
-      status = hmc_refs[i].validate();
-      if (status == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "MR HMC validation returned null");
+      status = rdma_status::nonnull(hmc_refs[i].validate(), "MR HMC validation returned null");
       if (!status.ok())
         return status;
     end
-    status = page_layout.validate();
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "MR page layout validation returned null");
+    status = rdma_status::nonnull(
+      page_layout.validate(),
+      "MR page layout validation returned null"
+    );
     if (!status.ok())
       return status;
     case (page_layout.pbl_mode)
@@ -1165,10 +1162,10 @@ class rdma_recovery_record extends uvm_object;
       if (backing_refs[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "recovery backing reference is null");
-      status = backing_refs[i].validate();
-      if (status == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "recovery backing validation returned null");
+      status = rdma_status::nonnull(
+        backing_refs[i].validate(),
+        "recovery backing validation returned null"
+      );
       if (!status.ok())
         return status;
     end
@@ -1176,18 +1173,18 @@ class rdma_recovery_record extends uvm_object;
       if (hmc_refs[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "recovery HMC reference is null");
-      status = hmc_refs[i].validate();
-      if (status == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "recovery HMC validation returned null");
+      status = rdma_status::nonnull(
+        hmc_refs[i].validate(),
+        "recovery HMC validation returned null"
+      );
       if (!status.ok())
         return status;
     end
     if (ambiguous_ticket != null) begin
-      status = ambiguous_ticket.validate();
-      if (status == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "recovery ticket validation returned null");
+      status = rdma_status::nonnull(
+        ambiguous_ticket.validate(),
+        "recovery ticket validation returned null"
+      );
       if (!status.ok())
         return status;
     end

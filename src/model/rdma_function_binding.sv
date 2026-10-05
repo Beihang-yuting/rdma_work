@@ -275,12 +275,10 @@ class rdma_function_binding extends uvm_object;
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "Function identity is null");
-    status = source.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Function identity validation returned null status"
-      );
+    status = rdma_status::nonnull(
+      source.validate(),
+      "Function identity validation returned null status"
+    );
     if (!status.ok())
       return status;
     if (!rdma_deep_copy#(rdma_function_identity)::try_of(source, configured))
@@ -346,14 +344,12 @@ class rdma_function_binding extends uvm_object;
         RDMA_SC_RESOURCE_EXHAUSTED,
         "legacy Function identity allocation failed"
       );
-    status = legacy_identity.configure(
-      key, global_function_id, function_uid, generation, reset_epoch
+    status = rdma_status::nonnull(
+      legacy_identity.configure(
+          key, global_function_id, function_uid, generation, reset_epoch
+        ),
+      "legacy Function identity configuration returned null status"
     );
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "legacy Function identity configuration returned null status"
-      );
     if (!status.ok())
       return status;
     return configure_identity(legacy_identity);
@@ -837,12 +833,10 @@ class rdma_function_binding extends uvm_object;
     if (identity == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function identity is not configured");
-    identity_status = identity.validate();
-    if (identity_status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Function identity validation returned null status"
-      );
+    identity_status = rdma_status::nonnull(
+      identity.validate(),
+      "Function identity validation returned null status"
+    );
     if (!identity_status.ok())
       return identity_status;
     begin

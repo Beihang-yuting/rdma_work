@@ -237,12 +237,10 @@ class rdma_env extends uvm_env;
     rdma_function_binding candidate_binding_snapshot;
     if (cfg == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "rdma_env_config is null");
-    status = cfg.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "rdma_env configuration validation returned null"
-      );
+    status = rdma_status::nonnull(
+      cfg.validate(),
+      "rdma_env configuration validation returned null"
+    );
     if (!status.ok())
       return status;
     candidate_cfg = rdma_env_config::type_id::create("config_candidate");
@@ -255,24 +253,20 @@ class rdma_env extends uvm_env;
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "RDMA core object allocation failed");
     foreach (cfg.responder_regions[index]) begin
       source_region = cfg.responder_regions[index];
-      status = candidate_registry.claim(source_region.domain, source_region.mode,
-                                        source_region.route, source_region.base,
-                                        source_region.size, source_region.owner,
-                                        claimed_region);
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "responder registry claim returned null status"
-        );
+      status = rdma_status::nonnull(
+        candidate_registry.claim(source_region.domain, source_region.mode,
+          source_region.route, source_region.base,
+          source_region.size, source_region.owner,
+          claimed_region),
+        "responder registry claim returned null status"
+      );
       if (!status.ok())
         return status;
     end
-    status = candidate_registry.seal();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "responder registry seal returned null status"
-      );
+    status = rdma_status::nonnull(
+      candidate_registry.seal(),
+      "responder registry seal returned null status"
+    );
     if (!status.ok())
       return status;
     candidate_queue_data = rdma_queue_data_engine::type_id::create("queue_data");
@@ -473,12 +467,10 @@ class rdma_env extends uvm_env;
     rdma_status status;
     if (event_route == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "event route is null");
-    status = event_route.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "event route validation returned null status"
-      );
+    status = rdma_status::nonnull(
+      event_route.validate(),
+      "event route validation returned null status"
+    );
     if (!status.ok())
       return status;
     if (function_identity_snapshot != null &&

@@ -241,14 +241,10 @@ function automatic rdma_status rdma_qp_partial_plan_status(
        (!plan.sq_pd_flush_complete || plan.rq_source_h != null)))
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "partial QP plan metadata is invalid");
-  status = plan.sq_ring.validate();
-
-  if (status == null)
-    return rdma_status::make(
-      RDMA_SC_INVALID_STATE,
-      "partial QP SQ ring validation returned null status"
-    );
-
+  status = rdma_status::nonnull(
+    plan.sq_ring.validate(),
+    "partial QP SQ ring validation returned null status"
+  );
   if (!status.ok())
     return status;
   if (plan.sq_ring.role != RDMA_QUEUE_ROLE_QP_SQ_RING ||
@@ -303,14 +299,10 @@ function automatic rdma_status rdma_qp_partial_plan_status(
                                "partial QP SRQ authority is invalid");
   end else begin
     if (plan.rq_ring != null) begin
-      status = plan.rq_ring.validate();
-
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "partial QP RQ ring validation returned null status"
-        );
-
+      status = rdma_status::nonnull(
+        plan.rq_ring.validate(),
+        "partial QP RQ ring validation returned null status"
+      );
       if (!status.ok())
         return status;
       if (plan.rq_ring.role != RDMA_QUEUE_ROLE_QP_RQ_RING ||
@@ -366,14 +358,10 @@ function automatic rdma_status rdma_qp_partial_plan_status(
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "partial QP URC order is invalid");
   if (plan.context_ref != null) begin
-    status = plan.context_ref.validate();
-
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "partial QP context validation returned null status"
-      );
-
+    status = rdma_status::nonnull(
+      plan.context_ref.validate(),
+      "partial QP context validation returned null status"
+    );
     if (!status.ok())
       return status;
     if (plan.context_ref.resource_kind != RDMA_RESOURCE_QP ||
@@ -620,14 +608,10 @@ class rdma_queue_resource extends rdma_resource;
       if (queue_plan.resource_kind != resource_kind())
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "queue plan kind does not match resource");
-      status = queue_plan.validate();
-
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "queue backing plan validation returned null status"
-        );
-
+      status = rdma_status::nonnull(
+        queue_plan.validate(),
+        "queue backing plan validation returned null status"
+      );
       if (!status.ok())
         return status;
       if (resource_kind() inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ} &&
@@ -904,14 +888,10 @@ class rdma_cq extends rdma_queue_resource;
       if (!status.ok())
         return status;
       if (programmed_cqc != null) begin
-        status = programmed_cqc.validate();
-
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "programmed CQC validation returned null status"
-          );
-
+        status = rdma_status::nonnull(
+          programmed_cqc.validate(),
+          "programmed CQC validation returned null status"
+        );
         if (!status.ok())
           return status;
         if (programmed_cqc.cq_h == null ||
@@ -1118,14 +1098,10 @@ class rdma_qp extends rdma_resource;
           backing_refs.size() != 0 || hmc_refs.size() != 0)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "QP backing authority is incomplete or split");
-      status = qp_plan.validate();
-
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "QP backing plan validation returned null status"
-        );
-
+      status = rdma_status::nonnull(
+        qp_plan.validate(),
+        "QP backing plan validation returned null status"
+      );
       if (!status.ok())
         return status;
       if (qp_plan.context_ref.local_id != local_qp_id)
@@ -1133,14 +1109,10 @@ class rdma_qp extends rdma_resource;
           RDMA_SC_INVALID_STATE,
           "QP context local ID does not match the resource local QP ID"
         );
-      status = programmed_qpc.validate();
-
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "programmed QPC validation returned null status"
-        );
-
+      status = rdma_status::nonnull(
+        programmed_qpc.validate(),
+        "programmed QPC validation returned null status"
+      );
       if (!status.ok())
         return status;
       if (qp_plan.transport != transport || programmed_qpc.transport != transport ||

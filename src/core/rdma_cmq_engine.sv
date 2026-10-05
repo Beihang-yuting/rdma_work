@@ -2032,9 +2032,7 @@ class rdma_cmq_engine extends uvm_object;
       return invalid_argument("CMQ Function binding is null");
     if (binding.state != RDMA_BIND_PREPARED)
       return invalid_state("CMQ prepare requires a PREPARED binding");
-    status = binding.validate();
-    if (status == null)
-      return invalid_state("CMQ PREPARED binding returned null status");
+    status = rdma_status::nonnull(binding.validate(), "CMQ PREPARED binding returned null status");
     if (!status.ok())
       return status;
     return validate_binding_owner(binding, "PREPARED");
@@ -2052,9 +2050,7 @@ class rdma_cmq_engine extends uvm_object;
       return invalid_argument("CMQ active Function binding is null");
     if (binding.state != RDMA_BIND_ACTIVE)
       return invalid_state("CMQ activate requires an ACTIVE binding");
-    status = binding.validate();
-    if (status == null)
-      return invalid_state("CMQ ACTIVE binding returned null status");
+    status = rdma_status::nonnull(binding.validate(), "CMQ ACTIVE binding returned null status");
     if (!status.ok())
       return status;
     return validate_binding_owner(binding, "ACTIVE");
@@ -2092,9 +2088,7 @@ class rdma_cmq_engine extends uvm_object;
 
     if (cmq == null)
       return invalid_argument("CMQ resource is null");
-    status = cmq.validate();
-    if (status == null)
-      return invalid_state("CMQ resource returned null status");
+    status = rdma_status::nonnull(cmq.validate(), "CMQ resource returned null status");
     if (!status.ok())
       return status;
     if (cmq.state != RDMA_RESOURCE_ALLOCATED)

@@ -673,12 +673,11 @@ class rdma_hw_cqc_delete_body extends rdma_hw_model;
         "CQC delete context wrapper must be exact rdma_cqc_model"
       );
 
-    status = cqc_context.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT,
-        "CQC delete context validation returned null"
-      );
+    status = rdma_status::nonnull(
+      cqc_context.validate(),
+      "CQC delete context validation returned null",
+      RDMA_SC_INVALID_ARGUMENT
+    );
     if (!status.ok())
       return status;
 

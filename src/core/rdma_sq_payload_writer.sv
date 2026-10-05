@@ -445,19 +445,17 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "request context is null");
 
-    status = request_context.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "DMA request context validation returned null status");
+    status = rdma_status::nonnull(
+      request_context.validate(),
+      "DMA request context validation returned null status"
+    );
     if (!status.ok())
       return status;
 
-    status = identity_status(request_context);
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "writer identity validation returned null status");
+    status = rdma_status::nonnull(
+      identity_status(request_context),
+      "writer identity validation returned null status"
+    );
     if (!status.ok())
       return status;
     if (sges.size() == 0)

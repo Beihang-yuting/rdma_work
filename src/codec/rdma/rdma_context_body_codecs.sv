@@ -1721,14 +1721,12 @@ function automatic rdma_status rdma_register_context_body_codecs(
   key.image_kind = RDMA_IMAGE_CQC;
   key.object_type = "cqc";
   key.opcode = RDMA_OP_CQC_CREATE;
-  status = registry.register_codec(
-    key, rdma_hw_cqc_create_body_codec::type_id::create(
-      "rdma_cqc_create_body_codec"));
-  if (status == null)
-    return rdma_status::make(
-      RDMA_SC_INVALID_STATE,
-      "CQC codec registration returned null status"
-    );
+  status = rdma_status::nonnull(
+    registry.register_codec(
+      key, rdma_hw_cqc_create_body_codec::type_id::create(
+        "rdma_cqc_create_body_codec")),
+    "CQC codec registration returned null status"
+  );
   if (!status.ok())
     return status;
 
@@ -1736,27 +1734,23 @@ function automatic rdma_status rdma_register_context_body_codecs(
   key.object_type = "mrt";
   key.variant = "key_alloc";
   key.opcode = RDMA_OP_KEY_ALLOC;
-  status = registry.register_codec(
-    key, rdma_hw_mrt_key_alloc_body_codec::type_id::create(
-      "rdma_mrt_key_alloc_body_codec"));
-  if (status == null)
-    return rdma_status::make(
-      RDMA_SC_INVALID_STATE,
-      "MRT key-alloc codec registration returned null status"
-    );
+  status = rdma_status::nonnull(
+    registry.register_codec(
+      key, rdma_hw_mrt_key_alloc_body_codec::type_id::create(
+        "rdma_mrt_key_alloc_body_codec")),
+    "MRT key-alloc codec registration returned null status"
+  );
   if (!status.ok())
     return status;
 
   key.variant = "register";
   key.opcode = RDMA_OP_MR_REGISTER;
-  status = registry.register_codec(
-    key, rdma_hw_mrt_register_body_codec::type_id::create(
-      "rdma_mrt_register_body_codec"));
-  if (status == null)
-    return rdma_status::make(
-      RDMA_SC_INVALID_STATE,
-      "MRT register codec registration returned null status"
-    );
+  status = rdma_status::nonnull(
+    registry.register_codec(
+      key, rdma_hw_mrt_register_body_codec::type_id::create(
+        "rdma_mrt_register_body_codec")),
+    "MRT register codec registration returned null status"
+  );
   if (!status.ok())
     return status;
 
@@ -1764,28 +1758,24 @@ function automatic rdma_status rdma_register_context_body_codecs(
   key.object_type = "srqc";
   key.variant = "create";
   key.opcode = RDMA_OP_SRFQC_CREATE;
-  status = registry.register_codec(
-    key, rdma_hw_srqc_create_body_codec::type_id::create(
-      "rdma_srqc_create_body_codec"));
-  if (status == null)
-    return rdma_status::make(
-      RDMA_SC_INVALID_STATE,
-      "SRQC codec registration returned null status"
-    );
+  status = rdma_status::nonnull(
+    registry.register_codec(
+      key, rdma_hw_srqc_create_body_codec::type_id::create(
+        "rdma_srqc_create_body_codec")),
+    "SRQC codec registration returned null status"
+  );
   if (!status.ok())
     return status;
 
   key.image_kind = RDMA_IMAGE_CEQC;
   key.object_type = "ceqc";
   key.opcode = RDMA_OP_CEQC_CREATE;
-  status = registry.register_codec(
-    key, rdma_hw_ceqc_create_body_codec::type_id::create(
-      "rdma_ceqc_create_body_codec"));
-  if (status == null)
-    return rdma_status::make(
-      RDMA_SC_INVALID_STATE,
-      "CEQC codec registration returned null status"
-    );
+  status = rdma_status::nonnull(
+    registry.register_codec(
+      key, rdma_hw_ceqc_create_body_codec::type_id::create(
+        "rdma_ceqc_create_body_codec")),
+    "CEQC codec registration returned null status"
+  );
   if (!status.ok())
     return status;
 

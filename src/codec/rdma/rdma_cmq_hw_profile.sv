@@ -318,9 +318,11 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
       return invalid_argument(
         "CQC delete context requires exact rdma_cqc_model"
       );
-    status = source.validate();
-    if (status == null)
-      return invalid_argument("CQC delete context validation returned null");
+    status = rdma_status::nonnull(
+      source.validate(),
+      "CQC delete context validation returned null",
+      RDMA_SC_INVALID_ARGUMENT
+    );
     if (!status.ok())
       return status;
 
@@ -376,9 +378,11 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     candidate.arm_state = source.arm_state;
     candidate.shadow_backing = source.shadow_backing;
 
-    status = candidate.validate();
-    if (status == null)
-      return invalid_argument("CQC delete context snapshot validation null");
+    status = rdma_status::nonnull(
+      candidate.validate(),
+      "CQC delete context snapshot validation null",
+      RDMA_SC_INVALID_ARGUMENT
+    );
     if (!status.ok())
       return status;
     if (candidate == source || candidate.cq_h == source.cq_h ||
@@ -451,9 +455,11 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     else begin
       return invalid_argument("rdma CMQ command body wrapper is unsupported");
     end
-    status = source.validate();
-    if (status == null)
-      return invalid_argument("rdma CMQ body validation returned null");
+    status = rdma_status::nonnull(
+      source.validate(),
+      "rdma CMQ body validation returned null",
+      RDMA_SC_INVALID_ARGUMENT
+    );
     if (!status.ok())
       return status;
 

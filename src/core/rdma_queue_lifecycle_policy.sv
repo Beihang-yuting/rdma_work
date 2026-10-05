@@ -221,11 +221,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     owner = null;
     if (binding == null || request == null || manager == null)
       return invalid_argument("queue policy preflight input is null");
-    status = binding.validate();
-    if (status == null)
-      return invalid_state(
-        "queue policy Function binding validation returned null"
-      );
+    status = rdma_status::nonnull(
+      binding.validate(),
+      "queue policy Function binding validation returned null"
+    );
     if (!status.ok())
       return status;
     if (binding.state != RDMA_BIND_ACTIVE || binding.owner_h == null ||
@@ -234,11 +233,10 @@ virtual class rdma_queue_lifecycle_policy extends uvm_object;
     if (request.owner == null || !same_function(binding_owner,
                                                  request.owner))
       return invalid_argument("queue request owner does not match binding");
-    status = request.validate();
-    if (status == null)
-      return invalid_state(
-        "queue policy request validation returned null"
-      );
+    status = rdma_status::nonnull(
+      request.validate(),
+      "queue policy request validation returned null"
+    );
     if (!status.ok())
       return status;
     owner = binding_owner;

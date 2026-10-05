@@ -261,19 +261,17 @@ class rdma_qp_context_attributes extends uvm_object;
                                "QP context attributes are incomplete");
     // 嵌套扩展是可覆写的边界；先把 null 状态归一化，再调用 ok()，避免
     // 恶意/故障扩展把请求模型带入模拟器空句柄解引用。
-    status = address_vector.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "QP address vector validation returned null status");
+    status = rdma_status::nonnull(
+      address_vector.validate(),
+      "QP address vector validation returned null status"
+    );
     if (!status.ok())
       return status;
 
-    status = behavior.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "QP behavior validation returned null status");
+    status = rdma_status::nonnull(
+      behavior.validate(),
+      "QP behavior validation returned null status"
+    );
     if (!status.ok())
       return status;
 
@@ -281,11 +279,10 @@ class rdma_qp_context_attributes extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP transport extension does not match");
 
-    status = transport_ext.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "QP transport extension validation returned null status");
+    status = rdma_status::nonnull(
+      transport_ext.validate(),
+      "QP transport extension validation returned null status"
+    );
     if (!status.ok())
       return status;
 
@@ -422,11 +419,10 @@ class rdma_create_cq_req extends rdma_semantic_request;
     if (ring_backing == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CQ ring backing is null");
-    status = ring_backing.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "CQ ring backing validation returned null status");
+    status = rdma_status::nonnull(
+      ring_backing.validate(),
+      "CQ ring backing validation returned null status"
+    );
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -601,12 +597,12 @@ class rdma_create_qp_req extends rdma_semantic_request;
     if (context_attrs == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP context attributes are null");
-    status = context_attrs.validate(transport);
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "QP context attributes validation returned null status");
-    if (!status.ok()) return status;
+    status = rdma_status::nonnull(
+      context_attrs.validate(transport),
+      "QP context attributes validation returned null status"
+    );
+    if (!status.ok())
+      return status;
     if (pd_h != null && pd_h.kind != RDMA_RESOURCE_PD)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "QP requires a PD handle");
@@ -658,13 +654,7 @@ class rdma_create_qp_req extends rdma_semantic_request;
   );
     rdma_status status;
 
-    status = validate();
-
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "QP SRQ-depth validation returned null status");
-
+    status = rdma_status::nonnull(validate(), "QP SRQ-depth validation returned null status");
     if (!status.ok())
       return status;
     if (srq_h == null)
@@ -688,13 +678,7 @@ class rdma_create_qp_req extends rdma_semantic_request;
     longint unsigned sq_storage_bytes;
     longint unsigned rq_storage_bytes;
 
-    status = validate();
-
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "QP capability validation returned null status");
-
+    status = rdma_status::nonnull(validate(), "QP capability validation returned null status");
     if (!status.ok())
       return status;
     if (queue_caps.max_wq_sge == 0 ||
@@ -786,11 +770,10 @@ class rdma_create_srq_req extends rdma_semantic_request;
     if (payload_backing == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "SRQ payload backing is null");
-    status = payload_backing.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "SRQ payload backing validation returned null status");
+    status = rdma_status::nonnull(
+      payload_backing.validate(),
+      "SRQ payload backing validation returned null status"
+    );
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -850,11 +833,10 @@ class rdma_create_ceq_req extends rdma_semantic_request;
     if (ring_backing == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "CEQ ring backing is null");
-    status = ring_backing.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "CEQ ring backing validation returned null status");
+    status = rdma_status::nonnull(
+      ring_backing.validate(),
+      "CEQ ring backing validation returned null status"
+    );
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -914,11 +896,10 @@ class rdma_create_aeq_req extends rdma_semantic_request;
     if (ring_backing == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "AEQ ring backing is null");
-    status = ring_backing.validate();
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "AEQ ring backing validation returned null status");
+    status = rdma_status::nonnull(
+      ring_backing.validate(),
+      "AEQ ring backing validation returned null status"
+    );
     if (!status.ok())
       return status;
     return rdma_status::success();
@@ -1042,13 +1023,7 @@ class rdma_modify_qp_req extends rdma_semantic_request;
   );
     rdma_status status;
 
-    status = validate();
-
-    if (status == null)
-      return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "modify QP validation returned null status");
-
+    status = rdma_status::nonnull(validate(), "modify QP validation returned null status");
     if (!status.ok())
       return status;
     if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,

@@ -961,20 +961,16 @@ class rdma_device_env extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "VF FLR preflight requires VF identity"
           );
-        status = reset_coordinator.validate_registered_identity(identity);
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "VF FLR identity validation returned null"
-          );
+        status = rdma_status::nonnull(
+          reset_coordinator.validate_registered_identity(identity),
+          "VF FLR identity validation returned null"
+        );
         if (!status.ok())
           return status;
-        status = find_function(identity, target_context);
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "VF FLR context lookup returned null status"
-          );
+        status = rdma_status::nonnull(
+          find_function(identity, target_context),
+          "VF FLR context lookup returned null status"
+        );
         if (!status.ok())
           return status;
         if (target_context == null)
@@ -996,20 +992,16 @@ class rdma_device_env extends uvm_object;
             RDMA_SC_INVALID_ARGUMENT,
             "PF reset preflight requires PF identity"
           );
-        status = reset_coordinator.validate_registered_identity(identity);
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "PF reset identity validation returned null"
-          );
+        status = rdma_status::nonnull(
+          reset_coordinator.validate_registered_identity(identity),
+          "PF reset identity validation returned null"
+        );
         if (!status.ok())
           return status;
-        status = find_function(identity, target_context);
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "PF reset context lookup returned null status"
-          );
+        status = rdma_status::nonnull(
+          find_function(identity, target_context),
+          "PF reset context lookup returned null status"
+        );
         if (!status.ok())
           return status;
         if (target_context == null)
@@ -1025,12 +1017,10 @@ class rdma_device_env extends uvm_object;
       end
 
       RDMA_ENV_RESET_HOST: begin
-        status = reset_coordinator.validate_registered_host_scope(host_key);
-        if (status == null)
-          return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "Host reset scope validation returned null"
-          );
+        status = rdma_status::nonnull(
+          reset_coordinator.validate_registered_host_scope(host_key),
+          "Host reset scope validation returned null"
+        );
         if (!status.ok())
           return status;
       end

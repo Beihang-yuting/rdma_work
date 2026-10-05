@@ -205,12 +205,11 @@ class rdma_cq_engine extends uvm_object;
     if (cq_h == null || cq_h.kind != RDMA_RESOURCE_CQ)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "shared CQ handle is invalid");
-    handle_status = rdma_context_handle_status(cq_h, RDMA_RESOURCE_CQ, 21,
-                                                "shared CQ handle");
-    if (handle_status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "shared CQ handle validation returned null");
+    handle_status = rdma_status::nonnull(
+      rdma_context_handle_status(cq_h, RDMA_RESOURCE_CQ, 21,
+        "shared CQ handle"),
+      "shared CQ handle validation returned null"
+    );
     if (!handle_status.ok())
       return handle_status;
     if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD,
@@ -225,13 +224,12 @@ class rdma_cq_engine extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC shared CQ requires evidence engine");
     if (completion_qp_h != null) begin
-      handle_status = rdma_context_handle_status(completion_qp_h,
-                                                 RDMA_RESOURCE_QP, 21,
-                                                 "shared CQ completion QP");
-      if (handle_status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "shared CQ completion QP validation returned null");
+      handle_status = rdma_status::nonnull(
+        rdma_context_handle_status(completion_qp_h,
+          RDMA_RESOURCE_QP, 21,
+          "shared CQ completion QP"),
+        "shared CQ completion QP validation returned null"
+      );
       if (!handle_status.ok())
         return handle_status;
     end
@@ -400,13 +398,10 @@ class rdma_cq_engine extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "shared CQ is not configured");
     if (authority_binding != null) begin
-      authority_status = validate_live_authority("CQ shadow flush");
-
-      if (authority_status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "CQ shadow flush authority validation returned null");
-
+      authority_status = rdma_status::nonnull(
+        validate_live_authority("CQ shadow flush"),
+        "CQ shadow flush authority validation returned null"
+      );
       if (!authority_status.ok())
         return authority_status;
     end
@@ -430,12 +425,11 @@ class rdma_cq_engine extends uvm_object;
         RDMA_SC_INVALID_STATE);
       if (!authority_status.ok())
         return authority_status;
-      snapshot_status = clone_shadow_snapshot_value(
-        flushed_shadow, "replayed_cq_shadow", replayed);
-      if (snapshot_status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "CQ shadow replay snapshot returned null status");
+      snapshot_status = rdma_status::nonnull(
+        clone_shadow_snapshot_value(
+          flushed_shadow, "replayed_cq_shadow", replayed),
+        "CQ shadow replay snapshot returned null status"
+      );
       if (!snapshot_status.ok())
         return snapshot_status;
 
@@ -476,13 +470,10 @@ class rdma_cq_engine extends uvm_object;
     prepared_success = rdma_status::make_direct(RDMA_SC_OK);
 
     if (shared_transport == RDMA_TRANSPORT_URC) begin
-      evidence_status = delegate.capture_urc_shadow_evidence(captured);
-
-      if (evidence_status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "URC shadow evidence capture returned null");
-
+      evidence_status = rdma_status::nonnull(
+        delegate.capture_urc_shadow_evidence(captured),
+        "URC shadow evidence capture returned null"
+      );
       if (!evidence_status.ok())
         return evidence_status;
     end

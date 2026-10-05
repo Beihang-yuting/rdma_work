@@ -283,12 +283,10 @@ class rdma_function_context extends uvm_object;
           RDMA_SC_RESOURCE_EXHAUSTED,
           "Function context binding allocation failed"
         );
-      status = binding_copy.configure_identity(identity_copy);
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "Function context binding configuration returned null status"
-        );
+      status = rdma_status::nonnull(
+        binding_copy.configure_identity(identity_copy),
+        "Function context binding configuration returned null status"
+      );
       if (!status.ok())
         return status;
     end
@@ -322,14 +320,12 @@ class rdma_function_context extends uvm_object;
     // 时留下前面条目的半提交 ledger。
     if (!defer_coordinator_commit) begin
       identities.push_back(identity_copy);
-      status = selected_coordinator.commit_registration_atomic(
-        source_host_mem, identities
+      status = rdma_status::nonnull(
+        selected_coordinator.commit_registration_atomic(
+            source_host_mem, identities
+          ),
+        "Function context coordinator registration returned null status"
       );
-      if (status == null)
-        return rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "Function context coordinator registration returned null status"
-        );
       if (!status.ok())
         return status;
     end
@@ -469,14 +465,12 @@ class rdma_function_context extends uvm_object;
         RDMA_SC_RESOURCE_EXHAUSTED,
         "reset identity allocation failed"
       );
-    status = next_identity.configure(
-      identity.key, identity.global_function_id, identity.function_uid,
-      new_generation, new_epoch);
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "reset identity configuration returned null status"
-      );
+    status = rdma_status::nonnull(
+      next_identity.configure(
+        identity.key, identity.global_function_id, identity.function_uid,
+        new_generation, new_epoch),
+      "reset identity configuration returned null status"
+    );
     if (!status.ok())
       return status;
 
@@ -497,12 +491,10 @@ class rdma_function_context extends uvm_object;
           "reset binding clone failed"
         );
     end
-    status = next_binding.configure_identity(next_identity);
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "reset binding configuration returned null status"
-      );
+    status = rdma_status::nonnull(
+      next_binding.configure_identity(next_identity),
+      "reset binding configuration returned null status"
+    );
     if (!status.ok())
       return status;
 
@@ -577,12 +569,10 @@ class rdma_function_context extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "quarantined Function context cannot commit reset"
       );
-    status = candidate.identity.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Function reset candidate identity validation returned null"
-      );
+    status = rdma_status::nonnull(
+      candidate.identity.validate(),
+      "Function reset candidate identity validation returned null"
+    );
     if (!status.ok())
       return status;
     if (candidate.identity.generation <= identity.generation ||

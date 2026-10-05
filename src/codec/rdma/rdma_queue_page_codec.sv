@@ -95,13 +95,10 @@ class rdma_hw_queue_pd_codec extends uvm_object;
       if (pages[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "queue PD table contains a null page");
-      status = pages[i].validate();
-
-      if (status == null)
-        return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "queue PD page validation returned null status");
-
+      status = rdma_status::nonnull(
+        pages[i].validate(),
+        "queue PD page validation returned null status"
+      );
       if (!status.ok())
         return status;
       expected_offset = longint'(i) * PAGE_BYTES;
@@ -123,13 +120,10 @@ class rdma_hw_queue_pd_codec extends uvm_object;
       entry.rdma_vf_id = rdma_vf_id;
       entry.valid = 1'b1;
       entry_bytes = new[0];
-      status = encode_entry(entry, entry_bytes);
-
-      if (status == null)
-        return rdma_status::make(
-            RDMA_SC_INVALID_STATE,
-            "queue PD entry encoder returned null status");
-
+      status = rdma_status::nonnull(
+        encode_entry(entry, entry_bytes),
+        "queue PD entry encoder returned null status"
+      );
       if (!status.ok())
         return status;
 

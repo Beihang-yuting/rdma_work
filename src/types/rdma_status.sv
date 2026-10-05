@@ -172,6 +172,19 @@ class rdma_status extends uvm_object;
     return status;
   endfunction
 
+  // 功能：null 归一化：source 非 null 时原样返回同一对象，否则经 make 返回 code/message 新状态。
+  // 输入/输出及副作用：source 只读，不复制；仅 null 时分配新状态。
+  // 失败/边界：不判断 source 是否 OK，调用方仍需检查 ok()。
+  static function automatic rdma_status nonnull(
+    rdma_status source,
+    string message,
+    rdma_status_code_e code = RDMA_SC_INVALID_STATE
+  );
+    if (source != null)
+      return source;
+    return make(code, message);
+  endfunction
+
   // 功能：success 创建 code=OK、category=STATE、severity=INFO 的完整默认诊断。
   // 输入/输出及副作用：message 透传 make；返回 factory 状态对象，不读取或修改业务账本。
   // 失败/边界：继承 make 的 typed factory 回调及非空前提；不是无分配或非致命错误入口。

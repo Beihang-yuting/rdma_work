@@ -158,9 +158,10 @@ class rdma_queue_backing_access extends uvm_object;
       return invalid_state("backing access already has an attached backing");
     if (backing == null)
       return invalid("queue backing reference is null");
-    status = backing.validate();
-    if (status == null)
-      return invalid_state("queue backing validation returned null status");
+    status = rdma_status::nonnull(
+      backing.validate(),
+      "queue backing validation returned null status"
+    );
     if (!status.ok())
       return status;
     if (backing.mapping == null || backing.mapping.function_h == null)
@@ -186,9 +187,7 @@ class rdma_queue_backing_access extends uvm_object;
       return invalid_state("backing access already has an attached backing");
     if (backing == null)
       return invalid("QP backing reference is null");
-    status = backing.validate();
-    if (status == null)
-      return invalid_state("QP backing validation returned null status");
+    status = rdma_status::nonnull(backing.validate(), "QP backing validation returned null status");
     if (!status.ok())
       return status;
     if (backing.mapping == null || backing.mapping.function_h == null)

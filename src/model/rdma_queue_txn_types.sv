@@ -146,12 +146,10 @@ class rdma_queue_txn_evidence extends uvm_object;
     if (shadow == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "URC CQ shadow is null");
-    status = shadow.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "URC CQ shadow validation returned null status"
-      );
+    status = rdma_status::nonnull(
+      shadow.validate(),
+      "URC CQ shadow validation returned null status"
+    );
     if (!status.ok())
       return status;
     urc_sq_ci = shadow.sq_ci;
@@ -208,12 +206,10 @@ class rdma_queue_txn_evidence extends uvm_object;
 
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "Function identity is null");
-    status = source.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Function identity validation returned null status"
-      );
+    status = rdma_status::nonnull(
+      source.validate(),
+      "Function identity validation returned null status"
+    );
     if (!status.ok())
       return status;
     cloned = source.clone();
@@ -265,12 +261,10 @@ class rdma_queue_txn_evidence extends uvm_object;
     if (source == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "semantic request is null");
-    status = source.validate();
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "semantic request validation returned null status"
-      );
+    status = rdma_status::nonnull(
+      source.validate(),
+      "semantic request validation returned null status"
+    );
     if (!status.ok())
       return status;
     cloned = source.clone();
