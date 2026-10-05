@@ -2194,14 +2194,10 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       result.final_resource_state_known = 1'b1;
       result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RESERVED);
       status = populate_resource(reserved, preflight);
-      if (!status.ok()) begin
-        rollback_local(binding, expected_owner, policy, reserved, null, create_command, status, result,
-                       queue);
-        return;
-      end
-      status = normalize_status(planner.materialize(
-        binding, preflight, reserved.handle, plan
-      ), "queue planner materialize returned null");
+      if (status.ok())
+        status = normalize_status(planner.materialize(
+          binding, preflight, reserved.handle, plan
+        ), "queue planner materialize returned null");
       if (!status.ok()) begin
         rollback_local(binding, expected_owner, policy, reserved, null, create_command, status, result,
                        queue);
@@ -2247,12 +2243,8 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       status = live_binding_fence(binding, expected_owner);
       if (status.ok()) status = normalize_status(manager.stage_allocated(reserved),
                                 "queue stage allocated returned null");
-      if (!status.ok()) begin
-        rollback_local(binding, expected_owner, policy, reserved, plan, create_command, status, result,
-                       queue);
-        return;
-      end
-      status = initialize_plan(binding, plan);
+      if (status.ok())
+        status = initialize_plan(binding, plan);
       if (!status.ok()) begin
         rollback_local(binding, expected_owner, policy, reserved, plan, create_command, status, result,
                        queue);
@@ -2377,13 +2369,9 @@ class rdma_queue_lifecycle_executor extends uvm_object;
       end
       result.completed_steps.push_back(RDMA_CTRL_STEP_HW_CONTEXT_CREATED);
       status = live_binding_fence(binding, expected_owner);
-      if (!status.ok()) begin
-        rollback_created(binding, expected_owner, policy, reserved, plan, create_command, status,
-                         result, 1'b0, queue);
-        return;
-      end
-      status = normalize_status(manager.commit_programmed(reserved),
-                                "queue commit programmed returned null");
+      if (status.ok())
+        status = normalize_status(manager.commit_programmed(reserved),
+                                  "queue commit programmed returned null");
       if (!status.ok()) begin
         rollback_created(binding, expected_owner, policy, reserved, plan, create_command, status,
                          result, 1'b0, queue);

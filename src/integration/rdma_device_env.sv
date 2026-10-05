@@ -1354,6 +1354,38 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：四类复位入口的共用事务外壳：校验 env 未关闭、coordinator 存在且无并发复位，
+  //   开启复位事务后执行指定 scope 的 prepare/commit，并经 finish_reset_transaction 收尾。
+  // 输入/输出及副作用：scope/identity/host_key 透传给 execute_reset_scope；label 作为诊断前缀；
+  //   成功开启事务后置 m_reset_in_progress，由 finish_reset_transaction 负责清除。
+  // 失败/边界：env 已关闭或缺少 coordinator 返回 INVALID_STATE，已有复位返回
+  //   RESOURCE_BUSY；事务开启失败（含 null）在置位前返回，不改变 context。
+  protected function rdma_status run_reset_request(
+    rdma_device_reset_scope_e scope,
+    rdma_function_identity identity,
+    int unsigned host_key,
+    string label
+  );
+    rdma_status status;
+
+    if (m_closed)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "closed device env cannot reset");
+    if (reset_coordinator == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "device env reset coordinator is missing");
+    if (m_reset_in_progress)
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                               "device env reset is already in progress");
+    status = rdma_status::nonnull(begin_reset_transaction(),
+                                  {label, " transaction begin returned null"});
+    if (!status.ok())
+      return status;
+    m_reset_in_progress = 1'b1;
+    status = execute_reset_scope(scope, identity, host_key);
+    return finish_reset_transaction(status, label);
+  endfunction
+
   // 功能：请求指定 VF 的 Function-level reset，并以单 context prepare/commit 事务发布新 incarnation。
   // 输入/输出及副作用：identity（输入）；先只读校验 authority，再 quiesce 目标 VF，由 rebuild_scope
   //   预构造 identity/binding/ledger 候选，随后才推进 coordinator epoch 并无分配地提交；其他
@@ -1361,32 +1393,11 @@ class rdma_device_env extends uvm_object;
   // 失败/边界：null、非 VF、未知/过时代 identity、缺失目标 context、候选 factory 失败或
   //   coordinator 缺失时返回错误；epoch commit 前失败保持 context/router/epoch/ledger 不变。
   function rdma_status request_vf_flr(rdma_function_identity identity);
-    rdma_status status;
-
-    if (m_closed)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "closed device env cannot reset"
-      );
-    if (identity == null || identity.key.function_kind != RDMA_FUNCTION_VF)
+    if (!m_closed &&
+        (identity == null || identity.key.function_kind != RDMA_FUNCTION_VF))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "VF FLR requires a VF identity");
-    if (reset_coordinator == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "device env reset coordinator is missing");
-    if (m_reset_in_progress)
-      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
-                               "device env reset is already in progress");
-    status = begin_reset_transaction();
-    if (status == null || !status.ok())
-      return status == null ?
-        rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "VF FLR reset transaction begin returned null"
-        ) : status;
-    m_reset_in_progress = 1'b1;
-    status = execute_reset_scope(RDMA_ENV_RESET_VF, identity, 0);
-    return finish_reset_transaction(status, "VF FLR");
+    return run_reset_request(RDMA_ENV_RESET_VF, identity, 0, "VF FLR");
   endfunction
 
   // 功能：请求指定 PF reset，并按同 Host、同 root、同 parent BDF 级联执行跨 context prepare/commit。
@@ -1395,32 +1406,11 @@ class rdma_device_env extends uvm_object;
   // 失败/边界：null、非 PF、未知/过时代 identity、scope 覆盖不完整、任一 candidate/ledger
   //   factory 失败或 coordinator 缺失时返回错误；epoch commit 前失败不留下部分 context 变化。
   function rdma_status request_pf_reset(rdma_function_identity identity);
-    rdma_status status;
-
-    if (m_closed)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "closed device env cannot reset"
-      );
-    if (identity == null || identity.key.function_kind != RDMA_FUNCTION_PF)
+    if (!m_closed &&
+        (identity == null || identity.key.function_kind != RDMA_FUNCTION_PF))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "PF reset requires a PF identity");
-    if (reset_coordinator == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "device env reset coordinator is missing");
-    if (m_reset_in_progress)
-      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
-                               "device env reset is already in progress");
-    status = begin_reset_transaction();
-    if (status == null || !status.ok())
-      return status == null ?
-        rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "PF reset transaction begin returned null"
-        ) : status;
-    m_reset_in_progress = 1'b1;
-    status = execute_reset_scope(RDMA_ENV_RESET_PF, identity, 0);
-    return finish_reset_transaction(status, "PF reset");
+    return run_reset_request(RDMA_ENV_RESET_PF, identity, 0, "PF reset");
   endfunction
 
   // 功能：请求 Host reset，级联停止并以跨 context prepare/commit 重建该 Host topology 的全部 Function。
@@ -1429,29 +1419,8 @@ class rdma_device_env extends uvm_object;
   // 失败/边界：coordinator 缺失、Host 未登记、scope 覆盖不完整、candidate/ledger factory 失败或
   //   quarantined context 时在 epoch commit 前返回，并恢复本次 quiesce 的 context 状态。
   function rdma_status request_host_reset(int unsigned host_topology_key);
-    rdma_status status;
-
-    if (m_closed)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "closed device env cannot reset"
-      );
-    if (reset_coordinator == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "device env reset coordinator is missing");
-    if (m_reset_in_progress)
-      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
-                               "device env reset is already in progress");
-    status = begin_reset_transaction();
-    if (status == null || !status.ok())
-      return status == null ?
-        rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "Host reset transaction begin returned null"
-        ) : status;
-    m_reset_in_progress = 1'b1;
-    status = execute_reset_scope(RDMA_ENV_RESET_HOST, null, host_topology_key);
-    return finish_reset_transaction(status, "Host reset");
+    return run_reset_request(RDMA_ENV_RESET_HOST, null, host_topology_key,
+                             "Host reset");
   endfunction
 
   // 功能：请求 Device reset，级联停止并以全 env 的跨 context prepare/commit 重建所有 Function。
@@ -1460,29 +1429,7 @@ class rdma_device_env extends uvm_object;
   // 失败/边界：coordinator 缺失、env scope 为空/覆盖不完整、candidate factory 失败或 quarantined
   //   context 时在 epoch commit 前拒绝并恢复本次 quiesce；commit 后仅保留无分配 assignment 路径。
   function rdma_status request_device_reset();
-    rdma_status status;
-
-    if (m_closed)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "closed device env cannot reset"
-      );
-    if (reset_coordinator == null)
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-                               "device env reset coordinator is missing");
-    if (m_reset_in_progress)
-      return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
-                               "device env reset is already in progress");
-    status = begin_reset_transaction();
-    if (status == null || !status.ok())
-      return status == null ?
-        rdma_status::make(
-          RDMA_SC_INVALID_STATE,
-          "Device reset transaction begin returned null"
-        ) : status;
-    m_reset_in_progress = 1'b1;
-    status = execute_reset_scope(RDMA_ENV_RESET_DEVICE, null, 0);
-    return finish_reset_transaction(status, "Device reset");
+    return run_reset_request(RDMA_ENV_RESET_DEVICE, null, 0, "Device reset");
   endfunction
 
   // 功能：判断 context 是否属于给定复位范围，集中维护 VF/PF/Host/Device 选择规则。

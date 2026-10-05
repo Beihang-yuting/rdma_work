@@ -833,94 +833,52 @@ class rdma_reset_coordinator extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：为 Host reset 的 router-local epoch capacity preflight 建立并消费一次性内部
-  //       capability，确保 legacy 无 lease publication 也能与 direct callback 区分。
-  // 输入/输出及副作用：host_topology_key、owner、token（输入）选择当前 router/lease；函数
-  //       在同步调用中暂存 capability，调用 router 只读检查 local epoch capacity，返回 status；
-  //       无论成功或失败都会清除暂存配对，不修改 coordinator Host/Function epoch。
-  // 失败/边界：未绑定 router 时返回 OK 且不产生 router-local side effect（由调用方决定是否
-  //       继续 coordinator-only reset）；capability 分配失败、router 返回 null/错误或 callback
-  //       提前消费句柄时返回明确错误，拒绝路径不递增 local epoch，外层 reset scope 必须停止提交。
-  protected function rdma_status validate_host_router_epoch_capacity(
+  // 功能：在 coordinator 暂存一次性 router epoch capability 后，委托已绑定的 Host router
+  //   校验（advance=0）或推进（advance=1）该 Host 的 router-local reset epoch。
+  // 输入/输出及副作用：host_topology_key/owner/token 透传给 router；capability 与目标/方向
+  //   配对只在调用期间暂存，所有返回路径都会清除；不修改 coordinator Host/Function epoch。
+  // 失败/边界：未绑定 router 返回 OK 且无副作用；capability 分配失败返回
+  //   RESOURCE_EXHAUSTED；router 返回 null 时归一化为 INVALID_STATE，其他失败原样返回。
+  protected function rdma_status call_host_router_epoch(
     int unsigned host_topology_key,
     uvm_object owner,
-    longint unsigned token
+    longint unsigned token,
+    bit advance
   );
     uvm_object capability;
     rdma_status status;
+    string op;
 
     if (m_host_router == null)
       return rdma_status::success();
+    op = advance ? "advance" : "capacity";
     capability = rdma_reset_router_epoch_capability::type_id::create(
-      "rdma_host_router_epoch_capacity_capability"
+      {"rdma_host_router_epoch_", op, "_capability"}
     );
     if (capability == null)
       return rdma_status::make(
         RDMA_SC_RESOURCE_EXHAUSTED,
-        "Host router epoch capacity capability allocation failed"
+        {"Host router epoch ", op, " capability allocation failed"}
       );
     m_router_epoch_capability = capability;
     m_router_epoch_target = m_host_router;
     m_router_epoch_host = host_topology_key;
-    m_router_epoch_advance = 1'b0;
-    status = m_host_router.validate_host_epoch_capacity(
-      host_topology_key, owner, token, capability
-    );
+    m_router_epoch_advance = advance;
+    if (advance)
+      status = m_host_router.advance_host_epoch(
+        host_topology_key, owner, token, capability
+      );
+    else
+      status = m_host_router.validate_host_epoch_capacity(
+        host_topology_key, owner, token, capability
+      );
     m_router_epoch_capability = null;
     m_router_epoch_target = null;
     m_router_epoch_host = 0;
     m_router_epoch_advance = 1'b0;
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Host router epoch capacity validation returned null"
-      );
-    return status;
-  endfunction
-
-  // 功能：为 Host reset 的 router-local epoch commit 建立并消费 advance capability，在
-  //       capacity 已预检后递增目标 router 的 local epoch。
-  // 输入/输出及副作用：host_topology_key、owner、token（输入）选择当前 router/lease；函数
-  //       暂存一次性 capability 并调用 router advance seam，成功时只改变 router-local epoch；
-  //       coordinator Host/Function map 仍由 request_host_reset_impl() 随后整体提交。
-  // 失败/边界：router 缺失时返回 OK 且不改变 coordinator 或 router ledger；capability 分配
-  //       失败、目标/方向/lease 校验失败或 router 返回 null/错误时保持 coordinator ledger
-  //       不变；暂存 capability 在所有返回路径清除。
-  protected function rdma_status advance_host_router_epoch(
-    int unsigned host_topology_key,
-    uvm_object owner,
-    longint unsigned token
-  );
-    uvm_object capability;
-    rdma_status status;
-
-    if (m_host_router == null)
-      return rdma_status::success();
-    capability = rdma_reset_router_epoch_capability::type_id::create(
-      "rdma_host_router_epoch_advance_capability"
+    return rdma_status::nonnull(
+      status, {"Host router epoch ", op, " returned null"}
     );
-    if (capability == null)
-      return rdma_status::make(
-        RDMA_SC_RESOURCE_EXHAUSTED,
-        "Host router epoch advance capability allocation failed"
-      );
-    m_router_epoch_capability = capability;
-    m_router_epoch_target = m_host_router;
-    m_router_epoch_host = host_topology_key;
-    m_router_epoch_advance = 1'b1;
-    status = m_host_router.advance_host_epoch(
-      host_topology_key, owner, token, capability
-    );
-    m_router_epoch_capability = null;
-    m_router_epoch_target = null;
-    m_router_epoch_host = 0;
-    m_router_epoch_advance = 1'b0;
-    if (status == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_STATE,
-        "Host router epoch advance returned null"
-      );
-    return status;
   endfunction
 
   // 功能：通过 coordinator 自有的一次性 capability 把 Host router 连接到本 coordinator，
@@ -1676,9 +1634,8 @@ class rdma_reset_coordinator extends uvm_object;
         "Host reset epoch is exhausted"
       );
     if (m_host_router != null) begin
-      status = validate_host_router_epoch_capacity(
-        host_topology_key, owner, lease_token
-      );
+      status = call_host_router_epoch(
+        host_topology_key, owner, lease_token, 1'b0);
       if (status == null || !status.ok())
         return status == null ?
           rdma_status::make(
@@ -1703,9 +1660,8 @@ class rdma_reset_coordinator extends uvm_object;
     // maps are staged first; a rejected router advance therefore leaves coordinator
     // Host/Function epochs untouched.
     if (m_host_router != null) begin
-      router_status = advance_host_router_epoch(
-        host_topology_key, owner, lease_token
-      );
+      router_status = call_host_router_epoch(
+        host_topology_key, owner, lease_token, 1'b1);
       if (router_status == null || !router_status.ok())
         return router_status == null ?
           rdma_status::make(

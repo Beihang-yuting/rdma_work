@@ -703,41 +703,23 @@ class rdma_queue_backing_planner extends uvm_object;
     ring.initial_polarity = initial_polarity;
     status = normalize_status(ring.validate_metadata(),
                               "CQ resize ring metadata validation returned null");
-    if (!status.ok()) begin
-      ring = null;
-      return status;
-    end
-    status = make_request_context(binding, resource_h, request_context);
-    if (!status.ok()) begin
-      ring = null;
-      return status;
-    end
-    status = allocate_owned_ref(binding, request_context, resource_h,
-                                RDMA_QUEUE_ROLE_CQ_RING, storage_bytes,
-                                4096, RDMA_DMA_DEVICE_WRITE, ref_value);
+    if (status.ok())
+      status = make_request_context(binding, resource_h, request_context);
+    if (status.ok())
+      status = allocate_owned_ref(binding, request_context, resource_h,
+                                  RDMA_QUEUE_ROLE_CQ_RING, storage_bytes,
+                                  4096, RDMA_DMA_DEVICE_WRITE, ref_value);
     if (!status.ok()) begin
       ring = null;
       return status;
     end
     status = populate_owned_ring(ring, ref_value);
-    if (!status.ok()) begin
-      status = rollback_owned_ref(ref_value, status);
-      if (ref_value.cleanup_complete)
-        ref_value = null;
-      ring = null;
-      return status;
-    end
-    status = normalize_status(ref_value.validate(),
-                              "CQ resize backing reference validation returned null");
-    if (!status.ok()) begin
-      status = rollback_owned_ref(ref_value, status);
-      if (ref_value.cleanup_complete)
-        ref_value = null;
-      ring = null;
-      return status;
-    end
-    status = normalize_status(ring.validate(),
-                              "CQ resize ring validation returned null");
+    if (status.ok())
+      status = normalize_status(ref_value.validate(),
+                                "CQ resize backing reference validation returned null");
+    if (status.ok())
+      status = normalize_status(ring.validate(),
+                                "CQ resize ring validation returned null");
     if (!status.ok()) begin
       status = rollback_owned_ref(ref_value, status);
       if (ref_value.cleanup_complete)

@@ -81,12 +81,9 @@ class rdma_resource_projector;
     status = project_function_handle_value(
       source.function_h, {copy_label, "_function"}, result.function_h
     );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_handle_value(source.owner_h, {copy_label, "_owner"},
-                                  result.owner_h);
+    if (status.ok())
+      status = project_handle_value(source.owner_h, {copy_label, "_owner"},
+                                    result.owner_h);
     if (!status.ok()) begin
       result = null;
       return status;
@@ -592,18 +589,12 @@ class rdma_resource_projector;
     status = project_function_handle_value(
       source.function_h, {copy_label, "_function"}, result.function_h
     );
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_handle_value(source.cmq_h, {copy_label, "_cmq"},
-                                  result.cmq_h);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_opcode_value(source.opcode_key, {copy_label, "_opcode"},
-                                  result.opcode_key);
+    if (status.ok())
+      status = project_handle_value(source.cmq_h, {copy_label, "_cmq"},
+                                    result.cmq_h);
+    if (status.ok())
+      status = project_opcode_value(source.opcode_key, {copy_label, "_opcode"},
+                                    result.opcode_key);
     if (!status.ok()) begin
       result = null;
       return status;
@@ -675,13 +666,10 @@ class rdma_resource_projector;
     status = project_ticket_value(source.ambiguous_ticket,
                                   {copy_label, "_ticket"},
                                   result.ambiguous_ticket);
-    if (!status.ok()) begin
-      result = null;
-      return status;
-    end
-    status = project_status_value(source.primary_status,
-                                  {copy_label, "_primary"},
-                                  result.primary_status);
+    if (status.ok())
+      status = project_status_value(source.primary_status,
+                                    {copy_label, "_primary"},
+                                    result.primary_status);
     if (!status.ok()) begin
       result = null;
       return status;

@@ -684,11 +684,8 @@ class rdma_queue_host_mem_submitter extends uvm_object;
                        "DMA mapping authority snapshot returned null");
     if (status.ok() && authority == null)
       status = state_error("DMA mapping authority snapshot returned null");
-    if (!status.ok()) begin
-      release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
-      return status;
-    end
-    status = clone_context(request_context, context_snapshot);
+    if (status.ok())
+      status = clone_context(request_context, context_snapshot);
     if (!status.ok()) begin
       release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       return status;

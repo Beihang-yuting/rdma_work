@@ -3601,14 +3601,11 @@ class rdma_cmq_engine extends uvm_object;
       source.function_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
       factory_snapshot.function_h
     );
-    if (!status.ok()) begin
-      snapshot = null;
-      return status;
-    end
-    status = rdma_cmq_checked_handle_snapshot(
-      source.cmq_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
-      factory_snapshot.cmq_h
-    );
+    if (status.ok())
+      status = rdma_cmq_checked_handle_snapshot(
+        source.cmq_h, "CMQ completion ticket", RDMA_SC_INVALID_STATE,
+        factory_snapshot.cmq_h
+      );
     if (!status.ok()) begin
       snapshot = null;
       return status;
@@ -3907,13 +3904,10 @@ class rdma_cmq_engine extends uvm_object;
     status = rdma_cmq_checked_function_snapshot(
       function_h, "CMQ ticket", RDMA_SC_INVALID_STATE, ticket.function_h
     );
-    if (!status.ok()) begin
-      ticket = null;
-      return status;
-    end
-    status = rdma_cmq_checked_handle_snapshot(
-      cmq_h, "CMQ ticket", RDMA_SC_INVALID_STATE, ticket.cmq_h
-    );
+    if (status.ok())
+      status = rdma_cmq_checked_handle_snapshot(
+        cmq_h, "CMQ ticket", RDMA_SC_INVALID_STATE, ticket.cmq_h
+      );
     if (!status.ok()) begin
       ticket = null;
       return status;
@@ -4279,12 +4273,9 @@ class rdma_cmq_engine extends uvm_object;
     status = clone_function_handle_fields(request_context.function_h,
                                           "cmq_runtime_function",
                                           runtime_function);
-    if (!status.ok()) begin
-      runtime = null;
-      return status;
-    end
-    status = clone_handle_fields(cmq.handle, "cmq_runtime_cmq",
-                                 runtime_cmq);
+    if (status.ok())
+      status = clone_handle_fields(cmq.handle, "cmq_runtime_cmq",
+                                   runtime_cmq);
     if (!status.ok()) begin
       runtime = null;
       return status;
@@ -4332,12 +4323,9 @@ class rdma_cmq_engine extends uvm_object;
     status = clone_function_handle_fields(source.function_h,
                                           "cmq_published_function",
                                           runtime_function);
-    if (!status.ok()) begin
-      snapshot = null;
-      return status;
-    end
-    status = clone_handle_fields(source.cmq_h, "cmq_published_cmq",
-                                 runtime_cmq);
+    if (status.ok())
+      status = clone_handle_fields(source.cmq_h, "cmq_published_cmq",
+                                   runtime_cmq);
     if (!status.ok()) begin
       snapshot = null;
       return status;
@@ -7470,21 +7458,15 @@ class rdma_cmq_engine extends uvm_object;
     end
 
     status = clone_binding_snapshot(binding, binding_candidate);
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
-    status = prepared_binding_status(binding_candidate);
+    if (status.ok())
+      status = prepared_binding_status(binding_candidate);
     if (!status.ok()) begin
       engine_lock.put(1);
       return;
     end
     status = clone_cmq_snapshot(cmq, cmq_candidate);
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
-    status = cmq_resource_status(cmq_candidate, binding_candidate);
+    if (status.ok())
+      status = cmq_resource_status(cmq_candidate, binding_candidate);
     if (!status.ok()) begin
       engine_lock.put(1);
       return;
@@ -7507,12 +7489,9 @@ class rdma_cmq_engine extends uvm_object;
     status = profile.validate_profile();
     if (status == null)
       status = invalid_state("CMQ hardware profile returned null status");
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
-    status = make_request_context(binding_candidate, cmq_candidate,
-                                  pasid_valid, pasid, context_candidate);
+    if (status.ok())
+      status = make_request_context(binding_candidate, cmq_candidate,
+                                    pasid_valid, pasid, context_candidate);
     if (!status.ok()) begin
       engine_lock.put(1);
       return;
@@ -7700,11 +7679,8 @@ class rdma_cmq_engine extends uvm_object;
       return;
     end
     status = clone_binding_snapshot(active_binding, binding_candidate);
-    if (!status.ok()) begin
-      engine_lock.put(1);
-      return;
-    end
-    status = active_binding_status(binding_candidate);
+    if (status.ok())
+      status = active_binding_status(binding_candidate);
     if (!status.ok()) begin
       engine_lock.put(1);
       return;

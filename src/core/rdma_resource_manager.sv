@@ -2247,23 +2247,15 @@ class rdma_resource_manager extends uvm_object;
       );
     end
     status = local_id_status(RDMA_RESOURCE_FUNCTION, has_free_id);
-    if (!status.ok()) begin
-      candidate.clear();
-      candidate = null;
-      return status;
-    end
-    status = rdma_resource_projector::project_function_handle_value(
-      candidate.owner, "Function identity handle", candidate.handle
-    );
-    if (!status.ok()) begin
-      candidate.clear();
-      candidate = null;
-      return status;
-    end
-    status = commit_identity_reservation(binding, candidate.trusted_binding,
-      candidate.owner, RDMA_RESOURCE_FUNCTION, registration_needed, admission_epoch,
-      candidate.local_id, candidate.used_free_id, candidate.registered_binding,
-      unused_serial, candidate.manager_epoch);
+    if (status.ok())
+      status = rdma_resource_projector::project_function_handle_value(
+        candidate.owner, "Function identity handle", candidate.handle
+      );
+    if (status.ok())
+      status = commit_identity_reservation(binding, candidate.trusted_binding,
+        candidate.owner, RDMA_RESOURCE_FUNCTION, registration_needed, admission_epoch,
+        candidate.local_id, candidate.used_free_id, candidate.registered_binding,
+        unused_serial, candidate.manager_epoch);
     if (!status.ok()) begin
       candidate.clear();
       candidate = null;
@@ -2933,12 +2925,9 @@ class rdma_resource_manager extends uvm_object;
     authoritative.binding = null;
     status = rdma_resource_projector::project_binding_value(identity.trusted_binding, "Function resource",
                                    authoritative.binding);
-    if (!status.ok()) begin
-      rollback_function_identity_candidate(identity);
-      return status;
-    end
-    status = publish_function_identity_candidate(identity, authoritative,
-                                                 published);
+    if (status.ok())
+      status = publish_function_identity_candidate(identity, authoritative,
+                                                   published);
     if (!status.ok()) begin
       rollback_function_identity_candidate(identity);
       return status;
