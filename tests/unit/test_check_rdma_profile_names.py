@@ -274,7 +274,7 @@ enum xtrdma_cqe_ecode {
         hardware_code 角色由 validate_error_codec 在测试中拒绝。
         """
         return """
-`uvm_object_utils(rdma_hw_error_codec)
+`rdma_object_utils(rdma_hw_error_codec)
 local function rdma_status_code_e classify(bit [7:0] hardware_code);
   case (hardware_code)
     RDMA_CMQ_SUCCESS_ECODE: return RDMA_SC_OK;

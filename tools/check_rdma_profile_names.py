@@ -1377,15 +1377,15 @@ def validate_error_codec_preprocessor(codec_code: str) -> None:
     """
     功能：在 RDMA profile checker 的 validate_error_codec_preprocessor 中锁定错误
     codec 唯一的
-    uvm_object_utils 宏。
+    rdma_object_utils 宏（别名安全 clone 的 uvm_object_utils 包装）。
     输入输出及副作用：codec_code 为错误 codec 源码；成功返回 None，
-    并确认唯一的 uvm_object_utils(rdma_hw_error_codec) 宏。
+    并确认唯一的 rdma_object_utils(rdma_hw_error_codec) 宏。
     失败边界：反引号数量不是 1、宏名称/
     行形态不匹配或宏不在唯一反引号范围内时抛 ValidationError。
     """
     approved = list(
         re.finditer(
-            r"^[ \t]*`uvm_object_utils\(rdma_hw_error_codec\)"
+            r"^[ \t]*`rdma_object_utils\(rdma_hw_error_codec\)"
             r"[ \t]*(?=\r?$)",
             codec_code,
             re.M,
