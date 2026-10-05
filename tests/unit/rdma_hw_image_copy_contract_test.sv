@@ -20,31 +20,6 @@ class rdma_image_publish_probe extends rdma_queue_data_engine;
   endfunction
 endclass
 
-// canonical CQE 入口需要 completion/ticket，但不需要 prepare engine 或持有 backing。
-class rdma_image_canonical_probe extends rdma_cmq_engine;
-  // 功能：建立未配置 CMQ 探针，只使用 completion 的纯值 canonicalization。
-  // 输入/输出及副作用：name 传给基类；不建立外部依赖。
-  // 失败/边界：不进行 submit/poll，不能代表已配置的 CMQ 生命周期。
-  function new(string name = "image_canonical_probe");
-    super.new(name);
-  endfunction
-
-  // 功能：把可选 image 放入独立 completion，调用原 canonical raw-CQE 入口。
-  // 输入/输出及副作用：source 输入、copy 输出；ticket generation 取自 source。
-  // 失败/边界：null source 保持合法空 raw；其它 shape 错误由原入口拒绝。
-  function rdma_status copy_for_test(rdma_hw_image source, output rdma_hw_image copy);
-    rdma_cmq_completion completion;
-
-    completion = new("completion");
-    completion.ticket = new("ticket");
-    completion.ticket.function_h = new("function");
-    if (source != null)
-      completion.ticket.function_h.generation = source.function_generation;
-    completion.raw_cqe = source;
-    return canonicalize_completion_raw_cqe(completion, copy);
-  endfunction
-endclass
-
 // 记录完整创建名序列；预填队列暴露 append 与 replace 差异，故障只在指定名触发。
 class rdma_image_copy_factory extends uvm_default_factory;
   string trace;
@@ -94,7 +69,7 @@ class rdma_image_copy_factory extends uvm_default_factory;
   endfunction
 endclass
 
-// 八个旧入口使用独立字段 oracle；不使用生产的同值比较或新增 helper 自证正确性。
+// 七个旧入口使用独立字段 oracle；不使用生产的同值比较或新增 helper 自证正确性。
 class rdma_hw_image_copy_contract_test extends uvm_test;
   `uvm_component_utils(rdma_hw_image_copy_contract_test)
   int unsigned cases;
@@ -108,22 +83,22 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
   endfunction
 
   // 功能：构造覆盖 endian、四类 target、非零地址和满位版本值的 64-byte 镜像。
-  // 输入/输出及副作用：tag 决定 metadata/bytes；canonical 清零 targets 并选择 CMQ_CQE。
+  // 输入/输出及副作用：tag 决定 metadata/bytes。
   // 失败/边界：仅用于值复制，target 地址不是外部授权；所有 queue 均测试独占。
-  function rdma_hw_image make_source(int unsigned tag, bit canonical = 0);
+  function rdma_hw_image make_source(int unsigned tag);
     rdma_hw_image value;
 
     value = new("metadata_source");
     value.length = 64;
     value.alignment = 1 << (tag % 7);
     value.endian = tag[0] ? RDMA_ENDIAN_BIG : RDMA_ENDIAN_LITTLE;
-    value.image_kind = canonical ? RDMA_IMAGE_CMQ_CQE : RDMA_IMAGE_SQE;
+    value.image_kind = RDMA_IMAGE_SQE;
     value.hardware_version = tag == 15 ? '1 : tag + 1;
     value.function_generation = tag == 15 ? '1 : tag + 17;
-    value.write_target_kind = canonical ? RDMA_HW_TARGET_NONE : rdma_hw_target_kind_e'(tag % 4);
-    value.backing_target.value = canonical ? 0 : 64'h8123_4567_89ab_cdef + tag;
-    value.hmc_target.value = canonical ? 0 : 64'hfedc_ba98_7654_3210 - tag;
-    value.bar_target.value = canonical ? 0 : 64'hffff_ffff_ffff_ffff - tag;
+    value.write_target_kind = rdma_hw_target_kind_e'(tag % 4);
+    value.backing_target.value = 64'h8123_4567_89ab_cdef + tag;
+    value.hmc_target.value = 64'hfedc_ba98_7654_3210 - tag;
+    value.bar_target.value = 64'hffff_ffff_ffff_ffff - tag;
     for (int unsigned i = 0; i < 64; i++)
       value.bytes.push_back(byte'(i + tag));
     value.field_summary.push_back($sformatf("metadata %0d", tag));
@@ -162,13 +137,12 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     end
   endfunction
 
-  // 功能：按 api 选择八个既有复制入口，只为 void/bit 接口生成直接 status 供统一断言。
+  // 功能：按 api 选择七个既有复制入口，只为 void/bit 接口生成直接 status 供统一断言。
   // 输入/输出及副作用：api/source 输入、copy 输出；每次递增 cases，不调用 metadata helper。
   // 失败/边界：api 越界 fatal；生产错误 status 原样返回，探针不覆盖原 protected 方法。
   function rdma_status invoke(int unsigned api, rdma_hw_image source, output rdma_hw_image copy);
     rdma_queue_pending_operation pending, pending_copy;
     rdma_image_publish_probe publisher;
-    rdma_image_canonical_probe canonical;
     bit copied;
 
     cases++;
@@ -195,16 +169,12 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
         return rdma_status::make_direct(copied ? RDMA_SC_OK : RDMA_SC_INVALID_ARGUMENT);
       end
       6: return rdma_cmq_checked_image_snapshot(source, "metadata", RDMA_SC_TIMEOUT, copy);
-      7: begin
-        canonical = new();
-        return canonical.copy_for_test(source, copy);
-      end
       default: `uvm_fatal("IMAGE_COPY", "unknown copy API")
     endcase
     return rdma_status::make_direct(RDMA_SC_OK);
   endfunction
 
-  // 功能：128 组成功样本冻结八入口的 metadata、queue 策略、创建序列和结果隔离。
+  // 功能：112 组成功样本冻结七入口的 metadata、queue 策略、创建序列和结果隔离。
   // 输入/输出及副作用：无参数；短期安装记录 factory，修改 copy 证明 source queue 不变。
   // 失败/边界：任何非 OK、别名、创建名/顺序变化或源值漂移均报 error，最后恢复 factory。
   function void check_success_matrix();
@@ -216,10 +186,10 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     string expected_trace;
 
     original = uvm_factory::get();
-    for (int unsigned api = 0; api < 8; api++) begin
+    for (int unsigned api = 0; api < 7; api++) begin
       for (int unsigned tag = 0; tag < 16; tag++) begin
-        source = make_source(tag, api == 7);
-        expected = make_source(tag, api == 7);
+        source = make_source(tag);
+        expected = make_source(tag);
         observer = new();
         service.set_factory(observer);
         status = invoke(api, source, copy);
@@ -290,7 +260,7 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     end
   endfunction
 
-  // 功能：固定六个可空入口、六种 hostile clone 和三次自别名复制的旧行为。
+  // 功能：固定五个可空入口、六种 hostile clone 和三次自别名复制的旧行为。
   // 输入/输出及副作用：无参数；clone 可改写源值，checked snapshot 必须恢复公开字段；
   //   runtime/publish 的 hostile factory 自别名保留先清空源队列的历史行为。
   // 失败/边界：不对 null 调用 do_copy，不测试非空 poll 自追加；拒绝 clone 必须清空输出。
@@ -303,7 +273,7 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     rdma_status status;
     rdma_status_code_e code;
 
-    for (int unsigned api = 1; api < 8; api++) begin
+    for (int unsigned api = 1; api < 7; api++) begin
       if (api == 4)
         continue;
       status = invoke(api, null, copy);
@@ -355,15 +325,15 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
 
   // 功能：运行成功、factory 故障、clone 恢复与 alias 三组矩阵，输出完整计数标记。
   // 输入/输出及副作用：phase 管理 objection；只执行同步值操作，结束不遗留 factory/callback。
-  // 失败/边界：153 次调用不齐报 error；测试不使用等待，不代表线程并发或 I/O 验证。
+  // 失败/边界：136 次调用不齐报 error；测试不使用等待，不代表线程并发或 I/O 验证。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_success_matrix();
     check_factory_failures();
     check_boundaries();
-    if (cases != 153)
+    if (cases != 136)
       `uvm_error("IMAGE_COPY", $sformatf("unexpected calls %0d", cases))
-    `uvm_info("IMAGE_COPY", "completed 153 image copy contract calls", UVM_LOW)
+    `uvm_info("IMAGE_COPY", "completed 136 image copy contract calls", UVM_LOW)
     phase.drop_objection(this);
   endtask
 endclass

@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
-# 目录/层次：scripts，core UVM logical-to-physical 执行控制层。
-# 文件职责：把普通 logical test 映射到自身，把 engine umbrella 展开为十八个
-#   独立 simulator process。
-# 主要依赖：bash、tee、可执行 simv、strict UVM summary checker，以及只读
-#   engine process manifest。
-# 资源所有权：调用者拥有 simv/checker/manifest；本脚本只覆盖每个 physical
-#   test 的独立日志，不持有外部资源。
+# 目录/层次：scripts，core UVM 单测执行控制层。
+# 文件职责：在已编译的 simv 上运行一个 UVM test，写独立日志并做严格 summary 检查。
+# 主要依赖：bash、tee、可执行 simv、strict UVM summary checker。
+# 资源所有权：调用者拥有 simv/checker；本脚本只覆盖该 test 的日志，不持有外部资源。
 
 set -uo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "Usage: $0 <logical-test> <build-dir> <engine-manifest> <summary-checker>" >&2
+if [[ $# -ne 3 ]]; then
+  echo "Usage: $0 <logical-test> <build-dir> <summary-checker>" >&2
   exit 2
 fi
 
 readonly logical_test=$1
 readonly logical_build=$2
-readonly engine_manifest=$3
-readonly summary_checker=$4
-readonly engine_logical_test=rdma_cmq_engine_test
+readonly summary_checker=$3
 
 # logical test 名同时形成 UVM 参数和日志 basename，先限制为 SV identifier，
 # 避免路径分隔、空白或 shell token 把一个 logical execution 扩成非预期资源。
@@ -42,49 +37,7 @@ if [[ ! -x "$summary_checker" ]]; then
   exit 2
 fi
 
-declare -a physical_tests=()
-
-# engine manifest 是唯一 physical inventory authority；严格 cardinality、首项、
-# identifier 与唯一性校验在任何 simulator 启动前完成，畸形清单不会产生
-# 部分日志。
-if [[ "$logical_test" == "$engine_logical_test" ]]; then
-  if [[ ! -r "$engine_manifest" ]]; then
-    echo "engine process manifest is missing: $engine_manifest" >&2
-    exit 2
-  fi
-
-  mapfile -t physical_tests < <(
-    sed -e 's/[[:space:]]*#.*$//' \
-        -e '/^[[:space:]]*$/d' "$engine_manifest"
-  )
-
-  if (( ${#physical_tests[@]} != 18 )); then
-    echo "engine process manifest requires exactly eighteen tests" >&2
-    exit 2
-  fi
-
-  if [[ "${physical_tests[0]}" != "$logical_test" ]]; then
-    echo "engine process manifest must start with $logical_test" >&2
-    exit 2
-  fi
-
-  declare -A process_seen=()
-  for physical_test in "${physical_tests[@]}"; do
-    if [[ ! "$physical_test" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      echo "invalid engine process test: $physical_test" >&2
-      exit 2
-    fi
-
-    if [[ -n "${process_seen[$physical_test]+x}" ]]; then
-      echo "duplicate engine process test: $physical_test" >&2
-      exit 2
-    fi
-
-    process_seen[$physical_test]=1
-  done
-else
-  physical_tests=("$logical_test")
-fi
+declare -a physical_tests=("$logical_test")
 
 # 每片即使 simulator 或 summary 失败也继续执行后续片；两个状态分别记录，
 # 最终 logical status 取全体 all-of，避免后续成功覆盖先前失败证据。

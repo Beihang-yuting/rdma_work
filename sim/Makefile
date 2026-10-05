@@ -16,20 +16,16 @@ VCS ?= vcs
 VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_access+class
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
-ENGINE_PROCESS_LIST := rdma_cmq_engine_process.list
 CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
 
-# 功能：把一个 logical core test 转交给唯一 controller；普通 test 自映射，
-#   engine 按十八片展开，base 后八项、profile-wide CQE 与 retention 前缀各自独占一片。
-# 输入输出及副作用：参数 1 是 logical UVM test，参数 2 是含 simv 的 build
-#   目录；写每片独立 log 并打印聚合状态。
+# 功能：把一个 core UVM test 转交给统一 runner 执行并检查 summary。
+# 输入输出及副作用：参数 1 是 UVM test，参数 2 是含 simv 的 build 目录；写独立 log。
 # 失败边界：controller 对参数、manifest、simulator 或 summary 任一失败返回
 #   非零；Make 不保留第二份 fan-out 逻辑。
 define RUN_CORE_LOGICAL_TEST
 	"$(CORE_LOGICAL_RUNNER)" \
 		"$(strip $(1))" \
 		"$(strip $(2))" \
-		"$(ENGINE_PROCESS_LIST)" \
 		"../scripts/check_uvm_summary.sh"
 endef
 

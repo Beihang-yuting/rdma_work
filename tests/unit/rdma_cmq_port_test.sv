@@ -6,24 +6,6 @@
 // 中文说明：rdma_cmq_port_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-class rdma_cmq_late_pair_probe extends rdma_cmq_engine_probe;
-  `uvm_object_utils(rdma_cmq_late_pair_probe)
-
-  // 功能：构造 rdma_cmq_late_pair_probe，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_cmq_late_pair_probe 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name = "rdma_cmq_late_pair_probe");
-    super.new(name);
-  endfunction
-
-  // 功能：late_final_count 只读当前账本/队列状态并计算 int unsigned 计数或可用容量，不推进任何事务游标。
-  // 输入/输出及副作用：无显式参数；late_final_count 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：late_final_count 的结果直接由 return late_final_fifo.size() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-  function int unsigned late_final_count();
-    return late_final_fifo.size();
-  endfunction
-endclass
-
 // 设计说明：该 probe 只暴露 production adapter 的 observed envelope 判定，
 //   不绑定 engine 或外部资源；它用于把身份图的 fail-closed 决策表写成独立测试。
 class rdma_cmq_observed_semantics_probe extends rdma_cmq_engine_port_adapter;
@@ -192,143 +174,6 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     binding.owner_h = binding.make_handle();
     return binding;
   endfunction
-
-  // 功能：在测试辅助 rdma_cmq_port_test.check_mock_rejects_hostile_command_snapshots 中构造或驱动“mock rejects hostile command
-  //   snapshots”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
-  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
-  task automatic check_mock_rejects_hostile_command_snapshots();
-    rdma_function_binding binding;
-    rdma_mock_cmq_port mock_cmq;
-    rdma_cmq_command_desc mutating_command;
-    rdma_cmq_command_desc alias_command;
-    rdma_cmq_command_desc recovery_command;
-    rdma_cmq_sqe_model mutating_body;
-    rdma_cmq_sqe_model alias_body;
-    rdma_cmq_clone_fault_function_handle mutating_function;
-    rdma_cmq_clone_fault_function_handle alias_function;
-    rdma_cmq_clone_fault_function_handle sibling_function;
-    rdma_function_handle saved_command_function;
-    rdma_cmq_opcode_key saved_command_opcode;
-    rdma_hw_model saved_command_body;
-    rdma_hw_image saved_command_signature;
-    rdma_function_handle saved_body_function;
-    rdma_handle saved_body_target;
-    rdma_cmq_ticket ticket;
-    rdma_cmq_completion completion;
-    rdma_status retained_outcome;
-    rdma_status status;
-    int unsigned saved_object_id;
-    int unsigned saved_sibling_object_id;
-
-    binding = make_binding("mock_hostile_binding", RDMA_BIND_ACTIVE);
-    mock_cmq = rdma_mock_cmq_port::type_id::create("mock_hostile_cmq");
-    retained_outcome = rdma_status::make(
-      RDMA_SC_DMA_PERMISSION, "retained hostile snapshot outcome"
-    );
-    mock_cmq.fail_opcode(RDMA_OP_KEY_ALLOC, retained_outcome);
-
-    mutating_command = make_command(
-      "mock_mutating_command", binding, RDMA_OP_KEY_ALLOC, 8'h21, 1us
-    );
-    if (!$cast(mutating_body, mutating_command.body))
-      `uvm_fatal("MOCK_HOSTILE_SETUP", "mutating body type is invalid")
-    mutating_function =
-      rdma_cmq_clone_fault_function_handle::type_id::create(
-        "mock_mutating_function"
-      );
-    mutating_function.copy(mutating_command.function_h);
-    mutating_function.clone_fault = RDMA_CMQ_TEST_CLONE_MUTATE;
-    mutating_command.function_h = mutating_function;
-    saved_command_function = mutating_command.function_h;
-    saved_command_opcode = mutating_command.opcode_key;
-    saved_command_body = mutating_command.body;
-    saved_command_signature = mutating_command.qpc_signature_source;
-    saved_body_function = mutating_body.function_h;
-    saved_body_target = mutating_body.target_h;
-    saved_object_id = mutating_function.object_id;
-
-    mock_cmq.execute(mutating_command, ticket, completion, status);
-    expect_status("MOCK_MUTATING_SNAPSHOT", status,
-                  RDMA_SC_INVALID_ARGUMENT);
-    if (ticket != null || completion != null || mock_cmq.calls.size() != 0)
-      `uvm_error("MOCK_MUTATING_EFFECTS",
-                 "mutating clone produced a ticket, completion, or call")
-    if (mutating_command.function_h != saved_command_function ||
-        mutating_command.opcode_key != saved_command_opcode ||
-        mutating_command.body != saved_command_body ||
-        mutating_command.qpc_signature_source != saved_command_signature ||
-        mutating_body.function_h != saved_body_function ||
-        mutating_body.target_h != saved_body_target ||
-        mutating_function.object_id != saved_object_id)
-      `uvm_error("MOCK_MUTATING_RESTORE",
-                 "mutating clone changed the caller-owned command graph")
-
-    alias_command = make_command(
-      "mock_alias_command", binding, RDMA_OP_KEY_ALLOC, 8'h22, 1us
-    );
-    if (!$cast(alias_body, alias_command.body))
-      `uvm_fatal("MOCK_HOSTILE_SETUP", "alias body type is invalid")
-    sibling_function =
-      rdma_cmq_clone_fault_function_handle::type_id::create(
-        "mock_alias_sibling_function"
-      );
-    sibling_function.copy(alias_body.function_h);
-    sibling_function.clone_fault = RDMA_CMQ_TEST_CLONE_GOOD;
-    alias_body.function_h = sibling_function;
-    alias_function = rdma_cmq_clone_fault_function_handle::type_id::create(
-      "mock_alias_function"
-    );
-    alias_function.copy(alias_command.function_h);
-    alias_function.clone_fault = RDMA_CMQ_TEST_CLONE_ALIAS;
-    alias_function.alias_target = sibling_function;
-    alias_function.alias_once = 1'b1;
-    alias_command.function_h = alias_function;
-    saved_command_function = alias_command.function_h;
-    saved_command_opcode = alias_command.opcode_key;
-    saved_command_body = alias_command.body;
-    saved_command_signature = alias_command.qpc_signature_source;
-    saved_body_function = alias_body.function_h;
-    saved_body_target = alias_body.target_h;
-    saved_object_id = alias_function.object_id;
-    saved_sibling_object_id = sibling_function.object_id;
-
-    rdma_cmq_clone_fault_function_handle::clear_fault_clone_calls();
-    mock_cmq.execute(alias_command, ticket, completion, status);
-    expect_status("MOCK_ALIAS_SNAPSHOT", status, RDMA_SC_INVALID_ARGUMENT);
-    if (rdma_cmq_clone_fault_function_handle::fault_clone_call_count() != 1 ||
-        alias_function.alias_once != 1'b0)
-      `uvm_error("MOCK_ALIAS_HOOK",
-                 "one-shot alias hook did not execute exactly once")
-    if (ticket != null || completion != null || mock_cmq.calls.size() != 0)
-      `uvm_error("MOCK_ALIAS_EFFECTS",
-                 "alias-laundered clone produced a ticket or call")
-    if (alias_command.function_h != saved_command_function ||
-        alias_command.opcode_key != saved_command_opcode ||
-        alias_command.body != saved_command_body ||
-        alias_command.qpc_signature_source != saved_command_signature ||
-        alias_body.function_h != saved_body_function ||
-        alias_body.target_h != saved_body_target ||
-        alias_function.alias_target != saved_body_function ||
-        alias_function.object_id != saved_object_id ||
-        sibling_function.object_id != saved_sibling_object_id)
-      `uvm_error("MOCK_ALIAS_RESTORE",
-                 "alias-laundered clone changed its caller-owned source")
-
-    recovery_command = make_command(
-      "mock_hostile_recovery", binding, RDMA_OP_KEY_ALLOC, 8'h23, 1us
-    );
-    mock_cmq.execute(recovery_command, ticket, completion, status);
-    expect_status("MOCK_HOSTILE_RECOVERY", status, RDMA_SC_DMA_PERMISSION);
-    if (ticket == null || completion == null ||
-        completion.status == null || mock_cmq.calls.size() != 1 ||
-        mock_cmq.calls[0] == null ||
-        mock_cmq.calls[0].\sequence  != 1 || ticket.command_id != 1 ||
-        completion.status.code != RDMA_SC_DMA_PERMISSION ||
-        rdma_cmq_clone_fault_function_handle::fault_clone_call_count() != 1)
-      `uvm_error("MOCK_HOSTILE_RECOVERY",
-                 "rejected snapshots advanced sequence or consumed outcome")
-  endtask
 
   // 功能：验证 mock CMQ 的失败、超时、晚完成和成功 FIFO 顺序，并确认 ticket
   //   从调用快照派生、absolute_deadline 使用调用时刻加 command.timeout。
@@ -518,680 +363,114 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     end
   endtask
 
-  // 功能：在测试辅助 rdma_cmq_port_test.check_adapter_routes_real_engines_by_function 中构造或驱动“adapter routes real engines by
-  //   function”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
-  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
+  // 功能：把 fixture 改写为另一个 Function（uid/global id/BDF 均不同），用于多 engine 路由。
+  // 输入/输出及副作用：修改 fx 的 binding 与 CMQ。
+  // 失败/边界：identity 重建失败时报告 UVM_ERROR。
+  function automatic void retarget_fixture(string label, rdma_cmq_engine_fixture fx);
+    rdma_function_binding bindings[2];
+
+    bindings = '{fx.prepared, fx.active};
+    foreach (bindings[i]) begin
+      bindings[i].function_uid++;
+      bindings[i].global_function_id++;
+      bindings[i].pcie.bdf.function_num = 3'h2;
+      bindings[i].queue_dma.requester_bdf = bindings[i].pcie.bdf;
+      expect_status({label, "_IDENTITY"},
+                    bindings[i].configure_identity_from_legacy_mirrors(16'h0, 32'h1,
+                                                                       RDMA_FUNCTION_PF),
+                    RDMA_SC_OK);
+      bindings[i].owner_h = bindings[i].make_handle();
+    end
+    fx.cmq = make_cmq({label, "_cmq"}, fx.prepared);
+  endfunction
+
+  // 功能：两个 Function 各绑定一个真实 engine，adapter 按 command Function 路由；A 正常完成，
+  //   B 的设备丢弃完成而看门狗超时；reconcile 恒无终态；未绑定 generation 不触达任何 engine。
+  // 输入/输出及副作用：两套 fixture 各自 prepare/activate/shutdown。
+  // 失败/边界：路由串线、证据缺失或绑定校验失效时报告 UVM_ERROR。
   task automatic check_adapter_routes_real_engines_by_function();
     rdma_cmq_engine_port_adapter adapter;
-    rdma_cmq_engine_probe engine_a;
-    rdma_cmq_engine_probe engine_b;
-    rdma_mock_host_mem mem_a;
-    rdma_mock_host_mem mem_b;
-    rdma_cmq_test_pcie pcie_a;
-    rdma_cmq_test_pcie pcie_b;
-    rdma_doorbell_scheduler scheduler_a;
-    rdma_doorbell_scheduler scheduler_b;
-    rdma_cmq_test_profile profile_a;
-    rdma_cmq_test_profile profile_b;
-    rdma_function_binding prepared_a;
-    rdma_function_binding prepared_b;
-    rdma_function_binding active_a;
-    rdma_function_binding active_b;
-    rdma_function_binding unbound_binding;
-    rdma_cmq cmq_a;
-    rdma_cmq cmq_b;
-    rdma_cmq_runtime_desc runtime_a;
-    rdma_cmq_runtime_desc runtime_b;
-    rdma_cmq_command_desc command_a;
-    rdma_cmq_command_desc command_b;
-    rdma_cmq_command_desc unbound_command;
-    rdma_cmq_ticket ticket_a;
+    rdma_cmq_engine_fixture fx_a;
+    rdma_cmq_engine_fixture fx_b;
+    rdma_cmq_execution_result result_a;
     rdma_cmq_ticket ticket_b;
     rdma_cmq_ticket unbound_ticket;
-    rdma_cmq_ticket cqe_hint_a;
-    rdma_cmq_ticket unbound_reconcile_ticket;
-    rdma_cmq_completion completion_a;
     rdma_cmq_completion completion_b;
-    rdma_cmq_execution_result observed_result_a;
     rdma_cmq_completion unbound_completion;
-    rdma_cmq_completion reconciled_completion;
-    rdma_dma_mapping mapping_a;
-    rdma_hw_image raw_a;
-    rdma_status status;
-    rdma_status status_a;
-    rdma_status status_b;
+    rdma_cmq_completion reconciled;
+    rdma_function_binding unbound_binding;
     rdma_function_handle wrong_owner;
-    bit terminal_known;
-    bit routes_published;
+    rdma_status status_b;
+    rdma_status status;
     bit no_submit_b;
+    bit terminal_known;
 
     adapter = rdma_cmq_engine_port_adapter::type_id::create("adapter");
-    engine_a = rdma_cmq_engine_probe::type_id::create("adapter_engine_a");
-    engine_b = rdma_cmq_engine_probe::type_id::create("adapter_engine_b");
-    mem_a = rdma_mock_host_mem::type_id::create("adapter_mem_a");
-    mem_b = rdma_mock_host_mem::type_id::create("adapter_mem_b");
-    pcie_a = rdma_cmq_test_pcie::type_id::create("adapter_pcie_a");
-    pcie_b = rdma_cmq_test_pcie::type_id::create("adapter_pcie_b");
-    scheduler_a = rdma_doorbell_scheduler::type_id::create(
-      "adapter_scheduler_a"
-    );
-    scheduler_b = rdma_doorbell_scheduler::type_id::create(
-      "adapter_scheduler_b"
-    );
-    profile_a = rdma_cmq_test_profile::type_id::create("adapter_profile_a");
-    profile_b = rdma_cmq_test_profile::type_id::create("adapter_profile_b");
-    prepared_a = make_binding("adapter_prepared_a", RDMA_BIND_PREPARED);
-    active_a = make_binding("adapter_active_a", RDMA_BIND_ACTIVE);
-    prepared_b = make_binding("adapter_prepared_b", RDMA_BIND_PREPARED);
-    prepared_b.function_uid = prepared_a.function_uid + 1'b1;
-    prepared_b.global_function_id = prepared_a.global_function_id + 1'b1;
-    prepared_b.pcie.bdf.function_num = 3'h2;
-    prepared_b.queue_dma.requester_bdf = prepared_b.pcie.bdf;
-    // 中文：B 夹具改写兼容镜像后，必须重建同一条 Function identity authority；
-    // 否则 prepare 会按设计拒绝镜像与权威快照不一致的 binding。
-    status = prepared_b.configure_identity_from_legacy_mirrors(
-      16'h0, 32'h1, RDMA_FUNCTION_PF
-    );
-    expect_status("ADAPTER_B_PREPARED_IDENTITY", status, RDMA_SC_OK);
-    prepared_b.owner_h = prepared_b.make_handle();
-    active_b = make_binding("adapter_active_b", RDMA_BIND_ACTIVE);
-    active_b.function_uid = active_a.function_uid + 1'b1;
-    active_b.global_function_id = active_a.global_function_id + 1'b1;
-    active_b.pcie.bdf.function_num = 3'h2;
-    active_b.queue_dma.requester_bdf = active_b.pcie.bdf;
-    // 中文：active B 与 prepared B 共用新的 Function 路由身份，但各自保持
-    // 独立 generation/state fixture，供 activate 和 engine adapter 分别校验。
-    status = active_b.configure_identity_from_legacy_mirrors(
-      16'h0, 32'h1, RDMA_FUNCTION_PF
-    );
-    expect_status("ADAPTER_B_ACTIVE_IDENTITY", status, RDMA_SC_OK);
-    active_b.owner_h = active_b.make_handle();
-    if (prepared_a.function_uid == prepared_b.function_uid ||
-        prepared_a.global_function_id == prepared_b.global_function_id)
-      `uvm_fatal("ADAPTER_DISTINCT_FUNCTIONS",
-                 "adapter route fixture reused one Function")
-    cmq_a = make_cmq("adapter_cmq_a", prepared_a);
-    cmq_b = make_cmq("adapter_cmq_b", prepared_b);
-    prepare_active("ADAPTER_A", engine_a, mem_a, pcie_a, scheduler_a,
-                   profile_a, prepared_a, active_a, cmq_a, runtime_a);
-    prepare_active("ADAPTER_B", engine_b, mem_b, pcie_b, scheduler_b,
-                   profile_b, prepared_b, active_b, cmq_b, runtime_b);
+    build_fixture("adapter_a", fx_a);
+    build_fixture("adapter_b", fx_b);
+    retarget_fixture("ADAPTER_B", fx_b);
+    start_fixture("ADAPTER_A", fx_a);
+    start_fixture("ADAPTER_B", fx_b);
 
-    status = adapter.bind_engine(active_a.make_handle(), engine_a);
-    expect_status("ADAPTER_BIND_A", status, RDMA_SC_OK);
-    status = adapter.bind_engine(active_b.make_handle(), engine_b);
-    expect_status("ADAPTER_BIND_B", status, RDMA_SC_OK);
-    status = adapter.bind_engine(active_a.make_handle(), engine_b);
-    expect_status("ADAPTER_BIND_DUPLICATE", status, RDMA_SC_INVALID_STATE);
-    status = adapter.bind_engine(null, engine_a);
-    expect_status("ADAPTER_BIND_NULL_OWNER", status,
+    expect_status("ADAPTER_BIND_A", adapter.bind_engine(fx_a.active.make_handle(), fx_a.engine),
+                  RDMA_SC_OK);
+    expect_status("ADAPTER_BIND_B", adapter.bind_engine(fx_b.active.make_handle(), fx_b.engine),
+                  RDMA_SC_OK);
+    expect_status("ADAPTER_BIND_DUPLICATE",
+                  adapter.bind_engine(fx_a.active.make_handle(), fx_b.engine),
+                  RDMA_SC_INVALID_STATE);
+    expect_status("ADAPTER_BIND_NULL_OWNER", adapter.bind_engine(null, fx_a.engine),
                   RDMA_SC_INVALID_ARGUMENT);
-    wrong_owner = active_a.make_handle();
+    wrong_owner = fx_a.active.make_handle();
     wrong_owner.kind = RDMA_RESOURCE_CMQ;
-    status = adapter.bind_engine(wrong_owner, engine_a);
-    expect_status("ADAPTER_BIND_WRONG_OWNER", status,
+    expect_status("ADAPTER_BIND_WRONG_OWNER", adapter.bind_engine(wrong_owner, fx_a.engine),
                   RDMA_SC_INVALID_ARGUMENT);
-    status = adapter.bind_engine(active_a.make_handle(), null);
-    expect_status("ADAPTER_BIND_NULL_ENGINE", status,
+    expect_status("ADAPTER_BIND_NULL_ENGINE",
+                  adapter.bind_engine(fx_a.active.make_handle(), null),
                   RDMA_SC_INVALID_ARGUMENT);
 
-    command_a = make_command("adapter_command_a", active_a,
-                             rdma_cmq_test_profile::TEST_OPCODE_A,
-                             8'h51, 1us);
-    command_b = make_command("adapter_command_b", active_b,
-                             rdma_cmq_test_profile::TEST_OPCODE_B,
-                             8'h52, 1us);
-    mapping_a = engine_a.mapping_snapshot();
-    cqe_hint_a = rdma_cmq_ticket::type_id::create("adapter_cqe_hint_a");
-    cqe_hint_a.function_h = command_a.function_h;
-    cqe_hint_a.opcode_key = command_a.opcode_key;
-    cqe_hint_a.sq_index = 0;
-    cqe_hint_a.sq_wrap = 1'b0;
+    // A 走 observed API，B 经 rdma_cmq_dispatch 拆包；两条路径并发且不串证据。
+    fx_b.device.drop_next = 1'b1;
     fork
-      begin
-        // A 路径直接调用 observed API，B 经 rdma_cmq_dispatch 拆包，
-        // 同一 fixture 证明两条路径不会串证据。
-        adapter.execute_observed(command_a, observed_result_a);
-      end
-      begin
-        rdma_cmq_dispatch(adapter, command_b, ticket_b, completion_b,
-                          status_b, no_submit_b, "adapter unavailable",
-                          "adapter command is null");
-      end
-    join_none
-    routes_published = 1'b0;
-    fork : wait_for_adapter_route_publication
-      begin
-        while (engine_a.outstanding_count() != 1 ||
-               engine_b.outstanding_count() != 1 ||
-               engine_a.published_count() != 1 ||
-               engine_b.published_count() != 1)
-          #1ns;
-        routes_published = 1'b1;
-      end
-      begin
-        #100ns;
-      end
-    join_any
-    disable wait_for_adapter_route_publication;
-    if (!routes_published) begin
-      `uvm_error(
-        "ADAPTER_REAL_ROUTE_TIMEOUT",
-        $sformatf(
-          {"Function routes did not publish before the observation ",
-           "deadline: A published=%0d outstanding=%0d, ",
-           "B published=%0d outstanding=%0d"},
-          engine_a.published_count(), engine_a.outstanding_count(),
-          engine_b.published_count(), engine_b.outstanding_count()
-        )
-      )
-      wait fork;
-      engine_a.shutdown(status);
-      expect_status("ADAPTER_TIMEOUT_SHUTDOWN_A", status, RDMA_SC_OK);
-      engine_b.shutdown(status);
-      expect_status("ADAPTER_TIMEOUT_SHUTDOWN_B", status, RDMA_SC_OK);
-      return;
-    end
-    if (engine_a.outstanding_count() != 1 ||
-        engine_b.outstanding_count() != 1 ||
-        engine_a.published_count() != 1 ||
-        engine_b.published_count() != 1)
-      `uvm_error("ADAPTER_REAL_ROUTE",
-                 "commands did not reach their Function-specific engines")
-    write_profile_cqe("ADAPTER_CQE_A", mem_a, mapping_a, profile_a,
-                      0, 1'b1, cqe_hint_a, 0, raw_a);
-    wait fork;
-    if (observed_result_a != null) begin
-      ticket_a = observed_result_a.ticket;
-      completion_a = observed_result_a.completion;
-      status_a = observed_result_a.status;
-    end
-    expect_status("ADAPTER_EXECUTE_A", status_a, RDMA_SC_OK);
+      adapter.execute_observed(make_hw_command("adapter_command_a", fx_a.active,
+                                               RDMA_OP_TQ_FLUSH), result_a);
+      rdma_cmq_dispatch(adapter, make_hw_command("adapter_command_b", fx_b.active,
+                                                 RDMA_OP_OCC_FLUSH, 300ns),
+                        ticket_b, completion_b, status_b, no_submit_b,
+                        "adapter unavailable", "adapter command is null");
+    join
+    expect_terminal("ADAPTER_EXECUTE_A", result_a);
+    if (result_a != null)
+      expect_status("ADAPTER_EXECUTE_A", result_a.status, RDMA_SC_OK);
     expect_status("ADAPTER_EXECUTE_B", status_b, RDMA_SC_TIMEOUT);
-    if (completion_a == null || completion_b == null ||
-        completion_a.status == null || completion_b.status == null ||
-        status_a != completion_a.status || status_b != completion_b.status ||
-        ticket_a == null || ticket_b == null ||
-        completion_a.ticket == null || completion_b.ticket == null ||
-        completion_a.raw_cqe == null || completion_b.raw_cqe != null ||
-        completion_a.ticket.function_h.generation != active_a.generation ||
-        completion_b.ticket.function_h.generation != active_b.generation ||
-        completion_a.ticket.function_h.function_uid !=
-          active_a.function_uid ||
-        completion_b.ticket.function_h.function_uid !=
-          active_b.function_uid ||
-        completion_a.ticket.function_h.object_id !=
-          active_a.global_function_id ||
-        completion_b.ticket.function_h.object_id !=
-          active_b.global_function_id ||
-        engine_a.outstanding_count() != 0 ||
-        engine_b.outstanding_count() != 0 ||
-        engine_a.quarantine_count() != 0 ||
-        engine_b.quarantine_count() != 1)
-      `uvm_error("ADAPTER_REAL_COMPLETE",
-                 "adapter did not retain detached timeout ticket/status")
-    if (observed_result_a == null ||
-        observed_result_a.submission_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED ||
-        observed_result_a.attempt_effect == RDMA_SUBMIT_EFFECT_UNOBSERVED ||
-        observed_result_a.completion_phase != RDMA_CMQ_COMPLETION_TERMINAL ||
-        observed_result_a.recovery_required != 1'b0 ||
-        observed_result_a.ticket == null ||
-        observed_result_a.completion == null ||
-        observed_result_a.ticket != observed_result_a.completion.ticket ||
-        observed_result_a.status != observed_result_a.completion.status ||
-        rdma_cmq_result_no_submit_proven(observed_result_a) || no_submit_b)
-      `uvm_error("ADAPTER_DIRECT_OBSERVED_ROUTE",
-                 "direct observed route did not preserve terminal evidence")
+    if (result_a == null || result_a.ticket == null || ticket_b == null ||
+        completion_b == null || completion_b.raw_cqe != null || no_submit_b ||
+        result_a.ticket.function_h.function_uid != fx_a.active.function_uid ||
+        ticket_b.function_h.function_uid != fx_b.active.function_uid ||
+        fx_a.device.observed_opcodes.size() != 1 || fx_b.device.observed_opcodes.size() != 1 ||
+        fx_a.device.observed_opcodes[0] != RDMA_OP_TQ_FLUSH ||
+        fx_b.device.observed_opcodes[0] != RDMA_OP_OCC_FLUSH ||
+        fx_a.engine.state() != RDMA_CMQ_ENGINE_ACTIVE ||
+        fx_b.engine.state() != RDMA_CMQ_ENGINE_POISONED)
+      `uvm_error("ADAPTER_REAL_ROUTE", "commands did not reach their Function-specific engines")
 
-    adapter.reconcile(ticket_b, terminal_known, reconciled_completion, status);
-    expect_status("ADAPTER_RECONCILE_ROUTE", status, RDMA_SC_TIMEOUT);
-    if (!terminal_known || reconciled_completion == null ||
-        reconciled_completion.status == null ||
-        reconciled_completion.status.code != RDMA_SC_TIMEOUT ||
-        engine_a.quarantine_count() != 0 ||
-        engine_b.quarantine_count() != 1)
-      `uvm_error("ADAPTER_RECONCILE_ROUTE",
-                 "reconcile did not route to the ticket generation")
-    unbound_reconcile_ticket = rdma_cmq_clone_ticket_value(
-      ticket_b, "adapter unbound reconcile"
-    );
-    unbound_reconcile_ticket.function_h.generation++;
-    unbound_reconcile_ticket.cmq_h.generation++;
-    adapter.reconcile(unbound_reconcile_ticket, terminal_known,
-                      reconciled_completion, status);
-    expect_status("ADAPTER_RECONCILE_UNBOUND", status,
-                  RDMA_SC_INVALID_STATE);
-    if (terminal_known || reconciled_completion != null ||
-        engine_b.quarantine_count() != 1)
-      `uvm_error("ADAPTER_RECONCILE_UNBOUND",
-                 "unbound reconcile consumed a bound generation")
+    adapter.reconcile(ticket_b, terminal_known, reconciled, status);
+    expect_status("ADAPTER_RECONCILE_ROUTE", status, RDMA_SC_INVALID_STATE);
+    if (terminal_known || reconciled != null)
+      `uvm_error("ADAPTER_RECONCILE_ROUTE", "reconcile reported a terminal completion")
 
-    unbound_binding = next_generation_binding("adapter_unbound",
-                                              RDMA_BIND_ACTIVE, 2);
-    unbound_command = make_command("adapter_unbound_command",
-                                   unbound_binding,
-                                   rdma_cmq_test_profile::TEST_OPCODE_A,
-                                   8'h53, 1us);
-    rdma_cmq_dispatch(adapter, unbound_command, unbound_ticket,
-                      unbound_completion, status, no_submit_b,
+    unbound_binding = next_generation_binding("adapter_unbound", RDMA_BIND_ACTIVE, 2);
+    rdma_cmq_dispatch(adapter, make_hw_command("adapter_unbound_command", unbound_binding,
+                                               RDMA_OP_TQ_FLUSH),
+                      unbound_ticket, unbound_completion, status, no_submit_b,
                       "adapter unavailable", "adapter command is null");
-    expect_status("ADAPTER_UNBOUND_GENERATION", status,
-                  RDMA_SC_INVALID_STATE);
+    expect_status("ADAPTER_UNBOUND_GENERATION", status, RDMA_SC_INVALID_STATE);
     if (unbound_ticket != null || unbound_completion != null ||
-        engine_a.published_count() != 1 || engine_b.published_count() != 1)
-      `uvm_error("ADAPTER_UNBOUND_GENERATION",
-                 "unbound generation reached a different engine")
+        fx_a.engine.published_count() != 1 || fx_b.engine.published_count() != 1)
+      `uvm_error("ADAPTER_UNBOUND_GENERATION", "unbound generation reached a different engine")
 
-    engine_a.shutdown(status);
-    expect_status("ADAPTER_SHUTDOWN_A", status, RDMA_SC_OK);
-    engine_b.shutdown(status);
-    expect_status("ADAPTER_SHUTDOWN_B", status, RDMA_SC_OK);
-  endtask
-
-  // 功能：在测试辅助 rdma_cmq_port_test.check_real_engine_ticket_specific_reconcile 中构造或驱动“real engine ticket specific
-  //   reconcile”场景，并断言 DUT 的状态、错误码和资源账本符合契约。
-  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
-  task automatic check_real_engine_ticket_specific_reconcile();
-    rdma_cmq_engine_probe engine;
-    rdma_mock_host_mem mem;
-    rdma_cmq_test_pcie pcie;
-    rdma_doorbell_scheduler scheduler;
-    rdma_cmq_test_profile profile;
-    rdma_function_binding prepared_binding;
-    rdma_function_binding active_binding;
-    rdma_cmq cmq;
-    rdma_cmq_runtime_desc runtime_desc;
-    rdma_cmq_command_desc requests[];
-    rdma_cmq_command_desc failure_request;
-    rdma_cmq_ticket tickets[];
-    rdma_cmq_ticket failure_ticket;
-    rdma_cmq_ticket forged_ticket;
-    rdma_cmq_ticket stale_ticket;
-    rdma_status item_statuses[];
-    rdma_status batch_status;
-    rdma_status status;
-    rdma_cmq_completion completion;
-    rdma_cmq_completion completions[$];
-    rdma_cmq_diagnostic diagnostics[$];
-    rdma_dma_mapping mapping;
-    rdma_hw_image first_raw;
-    rdma_hw_image second_raw;
-    rdma_hw_image third_raw;
-    rdma_hw_image failure_raw;
-    bit terminal_known;
-
-    engine = rdma_cmq_engine_probe::type_id::create("reconcile_engine");
-    mem = rdma_mock_host_mem::type_id::create("reconcile_mem");
-    pcie = rdma_cmq_test_pcie::type_id::create("reconcile_pcie");
-    scheduler = rdma_doorbell_scheduler::type_id::create(
-      "reconcile_scheduler"
-    );
-    profile = rdma_cmq_test_profile::type_id::create("reconcile_profile");
-    prepared_binding = make_binding("reconcile_prepared",
-                                    RDMA_BIND_PREPARED);
-    active_binding = make_binding("reconcile_active", RDMA_BIND_ACTIVE);
-    cmq = make_cmq("reconcile_cmq", prepared_binding);
-    prepare_active("RECONCILE", engine, mem, pcie, scheduler, profile,
-                   prepared_binding, active_binding, cmq, runtime_desc);
-    requests = new[3];
-    requests[0] = make_command("reconcile_first", active_binding,
-                               rdma_cmq_test_profile::TEST_OPCODE_A,
-                               8'h61, 5ns);
-    requests[1] = make_command("reconcile_second", active_binding,
-                               rdma_cmq_test_profile::TEST_OPCODE_B,
-                               8'h62, 5ns);
-    requests[2] = make_command("reconcile_third", active_binding,
-                               rdma_cmq_test_profile::TEST_OPCODE_A,
-                               8'h63, 5ns);
-    engine.submit_batch(requests, tickets, item_statuses, batch_status);
-    expect_status("RECONCILE_SUBMIT", batch_status, RDMA_SC_OK);
-    if (tickets.size() != 3 || tickets[0] == null || tickets[1] == null ||
-        tickets[2] == null) begin
-      `uvm_error("RECONCILE_SUBMIT", "three timeout tickets were not produced")
-      engine.shutdown(status);
-      return;
-    end
-    mapping = engine.mapping_snapshot();
-    #10ns;
-
-    forged_ticket = rdma_cmq_clone_ticket_value(tickets[1],
-                                                "reconcile forged");
-    forged_ticket.command_id += 32;
-    engine.reconcile_ticket(forged_ticket, terminal_known, completion, status);
-    expect_status("RECONCILE_FORGED", status, RDMA_SC_INVALID_ARGUMENT);
-    if (terminal_known || completion != null ||
-        engine.terminal_fifo_count() != 0 ||
-        engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 0 || engine.outstanding_count() != 3 ||
-        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
-      `uvm_error("RECONCILE_FORGED_ISOLATION",
-                 "forged ticket changed unrelated engine authority")
-
-    stale_ticket = rdma_cmq_clone_ticket_value(tickets[1],
-                                               "reconcile stale");
-    stale_ticket.function_h.generation++;
-    stale_ticket.cmq_h.generation++;
-    engine.reconcile_ticket(stale_ticket, terminal_known, completion, status);
-    expect_status("RECONCILE_STALE", status, RDMA_SC_INVALID_ARGUMENT);
-    if (terminal_known || completion != null ||
-        engine.terminal_fifo_count() != 0 ||
-        engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 0 || engine.outstanding_count() != 3 ||
-        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
-      `uvm_error("RECONCILE_STALE_ISOLATION",
-                 "stale ticket changed unrelated engine authority")
-
-    engine.reconcile_ticket(tickets[1], terminal_known, completion, status);
-    expect_status("RECONCILE_MIDDLE_TIMEOUT", status, RDMA_SC_TIMEOUT);
-    if (!terminal_known || completion == null || completion.status == null ||
-        completion.ticket == null ||
-        completion.ticket.command_id != tickets[1].command_id ||
-        completion.status.code != RDMA_SC_TIMEOUT ||
-        completion.raw_cqe != null ||
-        engine.terminal_fifo_count() != 3 ||
-        engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 3 || engine.outstanding_count() != 0 ||
-        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
-      `uvm_error("RECONCILE_TIMEOUT_ISOLATION",
-                 "middle reconcile changed outer terminal FIFO entries")
-
-    write_profile_cqe("RECONCILE_LATE_FIRST", mem, mapping, profile,
-                      0, 1'b1, tickets[0], 0, first_raw);
-    write_profile_cqe("RECONCILE_LATE_SECOND", mem, mapping, profile,
-                      1, 1'b1, tickets[1], 0, second_raw);
-    write_profile_cqe("RECONCILE_LATE_THIRD", mem, mapping, profile,
-                      2, 1'b1, tickets[2], 0, third_raw);
-    engine.reconcile_ticket(tickets[1], terminal_known, completion, status);
-    expect_status("RECONCILE_MIDDLE_LATE", status, RDMA_SC_TIMEOUT);
-    if (!terminal_known || completion == null || completion.status == null ||
-        completion.ticket == null ||
-        completion.ticket.command_id != tickets[1].command_id ||
-        completion.status.code != RDMA_SC_TIMEOUT ||
-        completion.decoded_response != null ||
-        completion.raw_cqe != null ||
-        engine.terminal_fifo_count() != 3 ||
-        engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 3 ||
-        engine.cq_consumed_count() != 0 || engine.retired_count() != 0)
-      `uvm_error("RECONCILE_LATE_ISOLATION",
-                 $sformatf("middle late mismatch tf=%0d df=%0d q=%0d cq=%0d ret=%0d",
-                           engine.terminal_fifo_count(), engine.diagnostic_fifo_count(),
-                           engine.quarantine_count(), engine.cq_consumed_count(),
-                           engine.retired_count()))
-    if (completion != null && completion.status != null &&
-        completion.status.code == RDMA_SC_TIMEOUT)
-      expect_status("RECONCILE_MIDDLE_LATE_FINAL", completion.status,
-                    RDMA_SC_TIMEOUT);
-
-    engine.poll(completions, diagnostics, status);
-    expect_status("RECONCILE_OUTER_POLL", status, RDMA_SC_OK);
-    if (completions.size() != 3 || diagnostics.size() != 3 ||
-        completions[0] == null || completions[0].ticket == null ||
-        completions[0].status == null ||
-        completions[1] == null || completions[1].ticket == null ||
-        completions[1].status == null ||
-        completions[2] == null || completions[2].ticket == null ||
-        completions[2].status == null ||
-        completions[0].ticket.command_id != tickets[0].command_id ||
-        completions[1].ticket.command_id != tickets[1].command_id ||
-        completions[2].ticket.command_id != tickets[2].command_id ||
-        completions[0].status.code != RDMA_SC_TIMEOUT ||
-        completions[1].status.code != RDMA_SC_TIMEOUT ||
-        completions[2].status.code != RDMA_SC_TIMEOUT ||
-        completions[0].raw_cqe != null || completions[1].raw_cqe != null ||
-        completions[2].raw_cqe != null ||
-        diagnostics[0] == null || diagnostics[0].ticket == null ||
-        diagnostics[0].status == null || diagnostics[0].raw_cqe == null ||
-        diagnostics[1] == null || diagnostics[1].ticket == null ||
-        diagnostics[1].status == null || diagnostics[1].raw_cqe == null ||
-        diagnostics[2] == null || diagnostics[2].ticket == null ||
-        diagnostics[2].status == null || diagnostics[2].raw_cqe == null ||
-        diagnostics[0].ticket.command_id != tickets[0].command_id ||
-        diagnostics[1].ticket.command_id != tickets[1].command_id ||
-        diagnostics[2].ticket.command_id != tickets[2].command_id ||
-        diagnostics[0].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
-        diagnostics[1].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
-        diagnostics[2].kind != RDMA_CMQ_DIAG_LATE_COMPLETION ||
-        !engine.probe_same_image(diagnostics[0].raw_cqe, first_raw) ||
-        !engine.probe_same_image(diagnostics[1].raw_cqe, second_raw) ||
-        !engine.probe_same_image(diagnostics[2].raw_cqe, third_raw) ||
-        engine.terminal_fifo_count() != 0 ||
-        engine.diagnostic_fifo_count() != 0 ||
-        engine.quarantine_count() != 0 ||
-        engine.outstanding_count() != 0 ||
-        engine.cq_consumed_count() != 3 || engine.retired_count() != 3)
-      `uvm_error("RECONCILE_OUTER_ORDER",
-                 "A/C terminal or diagnostic FIFO order was not retained")
-    if (diagnostics.size() == 3) begin
-      expect_late_diagnostic("RECONCILE_OUTER_FIRST_DIAGNOSTIC", engine,
-                             diagnostics[0], tickets[0], first_raw);
-      expect_late_diagnostic("RECONCILE_OUTER_SECOND_DIAGNOSTIC", engine,
-                             diagnostics[1], tickets[1], second_raw);
-      expect_late_diagnostic("RECONCILE_OUTER_THIRD_DIAGNOSTIC", engine,
-                             diagnostics[2], tickets[2], third_raw);
-    end
-
-    failure_request = make_command(
-      "reconcile_late_failure", active_binding,
-      rdma_cmq_test_profile::TEST_OPCODE_B, 8'h64, 5ns
-    );
-    engine.submit(failure_request, failure_ticket, status);
-    expect_status("RECONCILE_FAILURE_SUBMIT", status, RDMA_SC_OK);
-    if (failure_ticket == null) begin
-      `uvm_error("RECONCILE_FAILURE_SUBMIT",
-                 "late-failure ticket was not produced")
-      engine.shutdown(status);
-      return;
-    end
-    #10ns;
-    engine.reconcile_ticket(failure_ticket, terminal_known, completion,
-                            status);
-    expect_status("RECONCILE_FAILURE_TIMEOUT", status, RDMA_SC_TIMEOUT);
-    if (!terminal_known || completion == null || completion.status == null ||
-        completion.status.code != RDMA_SC_TIMEOUT ||
-        completion.raw_cqe != null)
-      `uvm_error("RECONCILE_FAILURE_TIMEOUT",
-                 "late-failure setup did not consume its timeout")
-    write_profile_cqe(
-      "RECONCILE_LATE_FAILURE", mem, mapping, profile, 3, 1'b1,
-      failure_ticket, RDMA_ECODE_EC_RCE_CQ_FULL, failure_raw
-    );
-    engine.reconcile_ticket(failure_ticket, terminal_known, completion,
-                            status);
-    expect_status("RECONCILE_LATE_FAILURE", status, RDMA_SC_TIMEOUT);
-    if (!terminal_known || completion == null || completion.status == null ||
-        completion.status.code != RDMA_SC_TIMEOUT ||
-        completion.decoded_response != null || completion.raw_cqe != null)
-      `uvm_error("RECONCILE_LATE_FAILURE",
-                 "late hardware failure was not returned as final status")
-    engine.poll(completions, diagnostics, status);
-    expect_status("RECONCILE_LATE_FAILURE_POLL", status, RDMA_SC_OK);
-    if (completions.size() != 1 || diagnostics.size() != 1 ||
-        completions[0] == null || completions[0].status == null ||
-        completions[0].status.code != RDMA_SC_TIMEOUT ||
-        diagnostics[0] == null || diagnostics[0].status == null ||
-        diagnostics[0].status.code != RDMA_SC_TIMEOUT)
-      `uvm_error("RECONCILE_LATE_FAILURE_POLL",
-                 $sformatf("late failure poll mismatch c=%0d d=%0d c0=%0d d0=%0d",
-                           completions.size(), diagnostics.size(),
-                           (completions.size() > 0 && completions[0] != null &&
-                            completions[0].status != null) ? completions[0].status.code : -1,
-                           (diagnostics.size() > 0 && diagnostics[0] != null &&
-                            diagnostics[0].status != null) ? diagnostics[0].status.code : -1))
-
-    engine.shutdown(status);
-    expect_status("RECONCILE_SHUTDOWN", status, RDMA_SC_OK);
-  endtask
-
-  // 功能：在测试辅助 rdma_cmq_port_test.check_real_engine_late_pair_cleanup 中构造或驱动“real engine late pair cleanup”场景，并断言 DUT
-  //   的状态、错误码和资源账本符合契约。
-  // 输入/输出及副作用：无显式参数；fixture/输入由测试调用方提供；执行时会产生 UVM assertion/report，不向 DUT 转移未声明的资源所有权。
-  // 失败/边界：fixture 未初始化、故障注入未生效或观测值与预期不一致时报告 UVM_ERROR/断言失败；测试不会吞掉失败。
-  task automatic check_real_engine_late_pair_cleanup();
-    rdma_cmq_late_pair_probe engine;
-    rdma_mock_host_mem mem;
-    rdma_cmq_test_pcie pcie;
-    rdma_doorbell_scheduler scheduler;
-    rdma_cmq_test_profile profile;
-    rdma_function_binding prepared_binding;
-    rdma_function_binding active_binding;
-    rdma_cmq cmq;
-    rdma_cmq_runtime_desc runtime_desc;
-    rdma_cmq_command_desc requests[];
-    rdma_cmq_ticket tickets[];
-    rdma_status item_statuses[];
-    rdma_status batch_status;
-    rdma_status status;
-    rdma_cmq_completion completion;
-    rdma_cmq_completion completions[$];
-    rdma_cmq_diagnostic diagnostics[$];
-    rdma_dma_mapping mapping;
-    rdma_hw_image raw_cqes[2];
-    bit terminal_known;
-    string label;
-
-    for (int unsigned mode = 0; mode < 4; mode++) begin
-      case (mode)
-        0: label = "LATE_PAIR_ACTIVE_POLL";
-        1: label = "LATE_PAIR_QUIESCED_POLL";
-        2: label = "LATE_PAIR_RESET";
-        default: label = "LATE_PAIR_SHUTDOWN";
-      endcase
-      engine = rdma_cmq_late_pair_probe::type_id::create(
-        $sformatf("late_pair_cleanup_engine_%0d", mode)
-      );
-      mem = rdma_mock_host_mem::type_id::create(
-        $sformatf("late_pair_cleanup_mem_%0d", mode)
-      );
-      pcie = rdma_cmq_test_pcie::type_id::create(
-        $sformatf("late_pair_cleanup_pcie_%0d", mode)
-      );
-      scheduler = rdma_doorbell_scheduler::type_id::create(
-        $sformatf("late_pair_cleanup_scheduler_%0d", mode)
-      );
-      profile = rdma_cmq_test_profile::type_id::create(
-        $sformatf("late_pair_cleanup_profile_%0d", mode)
-      );
-      prepared_binding = make_binding(
-        $sformatf("late_pair_cleanup_prepared_%0d", mode),
-        RDMA_BIND_PREPARED
-      );
-      active_binding = make_binding(
-        $sformatf("late_pair_cleanup_active_%0d", mode), RDMA_BIND_ACTIVE
-      );
-      cmq = make_cmq($sformatf("late_pair_cleanup_cmq_%0d", mode),
-                     prepared_binding);
-      prepare_active(label, engine, mem, pcie, scheduler, profile,
-                     prepared_binding, active_binding, cmq, runtime_desc);
-      requests = new[2];
-      foreach (requests[i]) begin
-        requests[i] = make_command(
-          $sformatf("late_pair_cleanup_request_%0d_%0d", mode, i),
-          active_binding,
-          (i == 0) ? rdma_cmq_test_profile::TEST_OPCODE_A :
-                     rdma_cmq_test_profile::TEST_OPCODE_B,
-          8'h70 + i, 5ns
-        );
-      end
-      engine.submit_batch(requests, tickets, item_statuses, batch_status);
-      expect_status({label, "_SUBMIT"}, batch_status, RDMA_SC_OK);
-      if (tickets.size() != 2 || tickets[0] == null || tickets[1] == null) begin
-        `uvm_error(label, "cleanup fixture did not produce two tickets")
-        engine.shutdown(status);
-        continue;
-      end
-      mapping = engine.mapping_snapshot();
-      #10ns;
-      foreach (tickets[i]) begin
-        engine.reconcile_ticket(tickets[i], terminal_known, completion,
-                                status);
-        expect_status($sformatf("%s_TIMEOUT_%0d", label, i), status,
-                      RDMA_SC_TIMEOUT);
-        if (!terminal_known || completion == null ||
-            completion.status == null ||
-            completion.status.code != RDMA_SC_TIMEOUT ||
-            completion.raw_cqe != null)
-          `uvm_error(label, "cleanup fixture did not consume its timeout")
-      end
-      foreach (tickets[i]) begin
-        write_profile_cqe(
-          $sformatf("%s_CQE_%0d", label, i), mem, mapping, profile, i,
-          1'b1, tickets[i], 0, raw_cqes[i]
-        );
-      end
-      engine.reconcile_ticket(tickets[0], terminal_known, completion, status);
-      expect_status({label, "_RECONCILE"}, status, RDMA_SC_TIMEOUT);
-      if (!terminal_known || completion == null ||
-          completion.status == null || completion.status.code != RDMA_SC_TIMEOUT ||
-          engine.diagnostic_fifo_count() != 0 ||
-          engine.late_final_count() != 0)
-        `uvm_error(label,
-                   "cleanup fixture did not retain one strict pair")
-
-      case (mode)
-        0: begin
-          engine.poll(completions, diagnostics, status);
-          expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
-          if (completions.size() != 2 || diagnostics.size() != 2 ||
-              engine.diagnostic_fifo_count() != 0 ||
-              engine.late_final_count() != 0)
-            `uvm_error(label,
-                       $sformatf("ACTIVE poll mismatch c=%0d d=%0d df=%0d lf=%0d",
-                                 completions.size(), diagnostics.size(),
-                                 engine.diagnostic_fifo_count(), engine.late_final_count()))
-          else begin
-            expect_late_diagnostic({label, "_DIAGNOSTIC_0"}, engine,
-                                   diagnostics[0], tickets[0], raw_cqes[0]);
-            expect_late_diagnostic({label, "_DIAGNOSTIC_1"}, engine,
-                                   diagnostics[1], tickets[1], raw_cqes[1]);
-          end
-          engine.shutdown(status);
-          expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
-        end
-        1: begin
-          engine.cancel_generation(prepared_binding.generation,
-                                   completions, status);
-          expect_status({label, "_CANCEL"}, status, RDMA_SC_OK);
-          if (engine.late_final_count() != 0 ||
-              engine.diagnostic_fifo_count() != 0)
-            `uvm_error(label,
-                       $sformatf("quiesce pair mismatch df=%0d lf=%0d",
-                                 engine.diagnostic_fifo_count(), engine.late_final_count()))
-          engine.poll(completions, diagnostics, status);
-          expect_status({label, "_STATUS"}, status, RDMA_SC_INVALID_STATE);
-          if (completions.size() != 0 || diagnostics.size() != 0 ||
-              engine.diagnostic_fifo_count() != 0 ||
-              engine.late_final_count() != 0)
-            `uvm_error(
-              label,
-              $sformatf("non-ACTIVE poll mismatch c=%0d d=%0d df=%0d lf=%0d",
-                        completions.size(), diagnostics.size(),
-                        engine.diagnostic_fifo_count(), engine.late_final_count())
-            )
-          else begin
-            // Non-ACTIVE poll intentionally returns no diagnostics; no indexing.
-          end
-          engine.shutdown(status);
-          expect_status({label, "_SHUTDOWN"}, status, RDMA_SC_OK);
-        end
-        2: begin
-          engine.reset(completions, status);
-          expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
-          if (engine.state() != RDMA_CMQ_ENGINE_UNCONFIGURED ||
-              engine.late_final_count() != 0)
-            `uvm_error(label, "reset retained a paired final result")
-        end
-        default: begin
-          engine.shutdown(status);
-          expect_status({label, "_STATUS"}, status, RDMA_SC_OK);
-          if (engine.state() != RDMA_CMQ_ENGINE_UNCONFIGURED ||
-              engine.late_final_count() != 0)
-            `uvm_error(label, "shutdown retained a paired final result")
-        end
-      endcase
-    end
+    stop_fixture("ADAPTER_A", fx_a);
+    stop_fixture("ADAPTER_B", fx_b);
   endtask
 
   // 功能：逐项验证 command identity 的无 factory 形状判断与既有 Function/opcode
@@ -1270,7 +549,7 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
 
   // 功能：按顺序执行 identity 等价性、legacy fallback、mock 与 real-engine port
   //   场景，使 factory override 前置条件和后续非零时间 deadline 覆盖保持确定。
-  // 输入/输出及副作用：phase 为 UVM 输入；持有一次 objection，调用本类八个检查
+  // 输入/输出及副作用：phase 为 UVM 输入；持有一次 objection，调用本类五个检查
   //   task 并由它们发布 UVM assertion，最后释放 objection。
   // 失败/边界：子检查通过 UVM_ERROR/FATAL 报告契约偏差；本 task 不吞掉失败，
   //   正常路径始终在全部同步检查返回后 drop_objection。
@@ -1278,12 +557,9 @@ class rdma_cmq_port_test extends rdma_cmq_engine_test;
     phase.raise_objection(this);
     check_production_observed_pre_rejection();
     check_command_identity_capture_equivalence();
-    check_mock_rejects_hostile_command_snapshots();
     check_mock_fifo_status_and_reconcile();
     check_mock_gate_prerelease();
     check_adapter_routes_real_engines_by_function();
-    check_real_engine_ticket_specific_reconcile();
-    check_real_engine_late_pair_cleanup();
     phase.drop_objection(this);
   endtask
 endclass

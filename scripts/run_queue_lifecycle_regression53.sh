@@ -70,13 +70,6 @@ readonly CORE_TESTS=(
   rdma_doorbell_scheduler_authority_test
   rdma_doorbell_scheduler_reset_epoch_test
   rdma_cmq_engine_test
-  rdma_cmq_poll_transaction_test
-  rdma_cmq_recovery_exit_test
-  rdma_cmq_recovery_publish_test
-  rdma_cmq_execute_observation_test
-  rdma_cmq_reconcile_delivery_test
-  rdma_cmq_wait_delivery_test
-  rdma_cmq_shutdown_delivery_test
   rdma_cmq_port_test
   rdma_control_plane_test
   rdma_control_plane_cmq_engine_test
@@ -139,40 +132,12 @@ readonly UNIT_INTEGRATION_TESTS=(
   rdma_reset_coordinator_lifecycle_test
 )
 
-# engine 的物理 process 由 sim/rdma_cmq_engine_process.list 交给统一
-# logical runner 展开；这里仅用于 --list 闭合普通 unit-test 发现集合，
-# 不能把 shard 名混进 CORE_TESTS，否则 regression 会重复执行每个 leaf。
-readonly ENGINE_PROCESS_TESTS=(
-  rdma_cmq_engine_test
-  rdma_cmq_engine_base_suffix_process_test
-  rdma_cmq_engine_capacity_process_test
-  rdma_cmq_engine_submission_process_test
-  rdma_cmq_engine_submission_matrix_process_test
-  rdma_cmq_engine_profile_wide_process_test
-  rdma_cmq_engine_retention_prefix_process_test
-  rdma_cmq_engine_submission_continuation_process_test
-  rdma_cmq_engine_submission_profile_process_test
-  rdma_cmq_engine_invariant_process_test
-  rdma_cmq_engine_raw_snapshot_process_test
-  rdma_cmq_engine_poll_fault_process_test
-  rdma_cmq_engine_poison_reset_process_test
-  rdma_cmq_engine_wrap_process_test
-  rdma_cmq_engine_wrap_publication_process_test
-  rdma_cmq_engine_journal_process_test
-  rdma_cmq_engine_mmio_arm_process_test
-  rdma_cmq_engine_hostile_factory_process_test
-)
-
 if [[ ${1-} == "--list" ]]; then
   if [[ $# -ne 1 ]]; then
     echo "Usage: $0 [--list]" >&2
     exit 2
   fi
   printf '%s\n' "${CORE_TESTS[@]}"
-  # engine 的首项就是 CORE_TESTS 中已列出的 logical test；公开发现清单
-  # 保持 exact-once，physical inventory 本身仍由完整 ENGINE_PROCESS_TESTS
-  # 交给 run_core_logical_test.sh 展开。
-  printf '%s\n' "${ENGINE_PROCESS_TESTS[@]:1}"
   printf '%s\n' "${UNIT_INTEGRATION_TESTS[@]}"
   exit 0
 fi

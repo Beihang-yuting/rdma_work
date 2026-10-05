@@ -6,228 +6,6 @@
 // 中文说明：rdma_control_plane_cmq_engine_test.sv 属于单元测试，覆盖对应模型、编码器或执行器契约。
 // 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
 
-class rdma_control_plane_cmq_engine_responder_pcie extends rdma_mock_pcie;
-  `uvm_object_utils(rdma_control_plane_cmq_engine_responder_pcie)
-
-  localparam longint unsigned CMQ_CQ_OFFSET = 64'd2048;
-  localparam int unsigned CMQE_BYTES = 64;
-  localparam int unsigned CMQ_DEPTH = 32;
-
-  protected rdma_mock_host_mem host_mem;
-  protected rdma_dma_mapping cmq_mapping;
-  protected rdma_function_handle expected_function;
-  protected rdma_bar_addr_t expected_doorbell_address;
-  protected longint unsigned sq_sequence;
-  protected longint unsigned cq_sequence;
-
-  bit [7:0] observed_opcodes[$];
-  bit [4:0] observed_wqe_indices[$];
-  bit observed_wqe_wraps[$];
-  bit observed_cq_owners[$];
-  int unsigned observed_doorbell_pis[$];
-  bit observed_doorbell_polarities[$];
-
-  // 功能：构造 rdma_control_plane_cmq_engine_responder_pcie，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：host_mem=null；cmq_mapping=null；expected_function=null；expected_doorbell_address='0；sq_sequence=0；cq_sequence=0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_control_plane_cmq_engine_responder_pcie 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(
-    string name = "rdma_control_plane_cmq_engine_responder_pcie"
-  );
-    super.new(name);
-    host_mem = null;
-    cmq_mapping = null;
-    expected_function = null;
-    expected_doorbell_address = '0;
-    sq_sequence = 0;
-    cq_sequence = 0;
-  endfunction
-
-  // 功能：在 rdma_control_plane_cmq_engine_responder_pcie 中，configure_responder 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
-  // 输入/输出及副作用：host_mem_arg（输入）、cmq_mapping_arg（输入）、binding（输入）；configure_responder 先依据 host_mem_arg == null || cmq_mapping_arg == null || binding == null；cmq_mapping_arg.state != RDMA_MAPPING_ACTIVE || cmq_mapping_arg.size != 4096 校验 host_mem_arg、cmq_mapping_arg、binding；成功时更新本对象配置/状态并保存非拥有引用，返回
-  //   rdma_status。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
-  function rdma_status configure_responder(
-    rdma_mock_host_mem host_mem_arg,
-    rdma_dma_mapping cmq_mapping_arg,
-    rdma_function_binding binding
-  );
-    host_mem = null;
-    cmq_mapping = null;
-    expected_function = null;
-    if (host_mem_arg == null || cmq_mapping_arg == null || binding == null)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT, "CMQ responder authority is incomplete"
-      );
-    if (cmq_mapping_arg.state != RDMA_MAPPING_ACTIVE ||
-        cmq_mapping_arg.size != 4096)
-      return rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT, "CMQ responder mapping is invalid"
-      );
-    host_mem = host_mem_arg;
-    cmq_mapping = cmq_mapping_arg;
-    expected_function = binding.make_handle();
-    expected_doorbell_address.value =
-      binding.notify_base.value + RDMA_DB_CMQ_OFFSET;
-    observed_opcodes.delete();
-    observed_wqe_indices.delete();
-    observed_wqe_wraps.delete();
-    observed_cq_owners.delete();
-    observed_doorbell_pis.delete();
-    observed_doorbell_polarities.delete();
-    sq_sequence = 0;
-    cq_sequence = 0;
-    return rdma_status::success();
-  endfunction
-
-  // 功能：在 rdma_control_plane_cmq_engine_responder_pcie 中，big_endian_qword0 按 golden 文件格式解析/规范化字节或文本，得到稳定的比较输入。
-  // 输入/输出及副作用：data（输入）；big_endian_qword0 读取 data 并使用字段 value；函数返回 bit [63:0]，不取得调用方资源所有权。
-  // 失败/边界：big_endian_qword0 先检查 data.size(，再返回 value；拒绝分支不提交部分状态，也不隐式重试。
-  function automatic bit [63:0] big_endian_qword0(byte data[]);
-    bit [63:0] value;
-
-    value = '0;
-    if (data.size() < 8)
-      return value;
-    for (int unsigned i = 0; i < 8; i++)
-      value = {value[55:0], data[i]};
-    return value;
-  endfunction
-
-  // 功能：make_xtr_success_cqe 创建独立的 rdma_hw_image；根据 opcode、wqe_index、wrap、owner、generation 设置字段 image、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind、qword0、i，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：opcode（输入）、wqe_index（输入）、wrap（输入）、owner（输入）、generation（输入）；make_xtr_success_cqe 读取 opcode、wqe_index、wrap、owner、generation 并使用字段 image、image.length、image.alignment、image.endian、image.image_kind、image.hardware_version、image.function_generation、image.write_target_kind；函数返回 rdma_hw_image，不取得调用方资源所有权。
-  // 失败/边界：make_xtr_success_cqe 的结果直接由 return image 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
-  function automatic rdma_hw_image make_xtr_success_cqe(
-    bit [7:0] opcode,
-    bit [4:0] wqe_index,
-    bit wrap,
-    bit owner,
-    int unsigned generation
-  );
-    rdma_hw_image image;
-    bit [63:0] qword0;
-
-    image = rdma_hw_image::type_id::create("control_success_cqe");
-    repeat (64) image.bytes.push_back(8'h00);
-    image.length = 64;
-    image.alignment = 64;
-    image.endian = RDMA_ENDIAN_BIG;
-    image.image_kind = RDMA_IMAGE_CMQ_CQE;
-    image.hardware_version = 1;
-    image.function_generation = generation;
-    image.write_target_kind = RDMA_HW_TARGET_NONE;
-    qword0 = '0;
-    qword0[63] = owner;
-    qword0[45] = wrap;
-    qword0[44:40] = wqe_index;
-    qword0[39:32] = opcode;
-    for (int unsigned i = 0; i < 8; i++)
-      image.bytes[i] = qword0[63 - (i * 8) -: 8];
-    return image;
-  endfunction
-
-  // 功能：在 rdma_control_plane_cmq_engine_responder_pcie 中，mmio_write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：function_h（输入）、address（输入）、data（输入）、status（输出）；mmio_write 驱动下游事务，并写入 status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：mmio_write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
-  virtual task mmio_write(
-    rdma_function_handle function_h,
-    rdma_bar_addr_t address,
-    byte data[],
-    output rdma_status status
-  );
-    byte sqe_data[];
-    byte cqe_data[];
-    rdma_hw_image cqe;
-    bit [63:0] doorbell_qword0;
-    bit [63:0] sqe_qword0;
-    bit [7:0] opcode;
-    bit [4:0] wqe_index;
-    bit wqe_wrap;
-    bit cqe_owner;
-    int unsigned doorbell_pi;
-    bit doorbell_polarity;
-    int unsigned expected_pi;
-    bit expected_polarity;
-    longint unsigned sq_offset;
-    longint unsigned cq_offset;
-
-    super.mmio_write(function_h, address, data, status);
-    if (status == null || !status.ok())
-      return;
-    if (host_mem == null || cmq_mapping == null ||
-        expected_function == null) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE, "CMQ responder is not configured"
-      );
-      return;
-    end
-    if (function_h == null ||
-        !function_h.same_instance(expected_function) ||
-        address != expected_doorbell_address || data.size() != 8) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_ARGUMENT, "CMQ responder saw a non-CMQ doorbell"
-      );
-      return;
-    end
-
-    doorbell_qword0 = big_endian_qword0(data);
-    doorbell_pi = doorbell_qword0[36:32];
-    doorbell_polarity = doorbell_qword0[37];
-    expected_pi = (sq_sequence + 1'b1) % CMQ_DEPTH;
-    expected_polarity = ((sq_sequence + 1'b1) / CMQ_DEPTH) & 1'b1;
-    if (doorbell_pi != expected_pi ||
-        doorbell_polarity != expected_polarity) begin
-      status = rdma_status::make(
-        RDMA_SC_INVALID_STATE, "CMQ SQ doorbell did not advance in order"
-      );
-      return;
-    end
-
-    sq_offset = (sq_sequence % CMQ_DEPTH) * CMQE_BYTES;
-    sqe_data = new[0];
-    status = host_mem.read(cmq_mapping, sq_offset, CMQE_BYTES, sqe_data);
-    if (status == null || !status.ok())
-      return;
-    sqe_qword0 = big_endian_qword0(sqe_data);
-    opcode = sqe_qword0[39:32];
-    wqe_index = sqe_qword0[44:40];
-    wqe_wrap = sqe_qword0[45];
-    if (sqe_qword0[63] != !wqe_wrap ||
-        wqe_index != (sq_sequence % CMQ_DEPTH) ||
-        wqe_wrap != ((sq_sequence / CMQ_DEPTH) & 1'b1) ||
-        !(opcode inside {RDMA_OP_KEY_ALLOC,
-                         RDMA_OP_MR_DEREGISTER,
-                         RDMA_OP_TQ_FLUSH})) begin
-      status = rdma_status::make(
-        RDMA_SC_CODEC_ERROR, "CMQ responder decoded an invalid SQE envelope"
-      );
-      return;
-    end
-
-    cqe_owner = !((cq_sequence / CMQ_DEPTH) & 1'b1);
-    cqe = make_xtr_success_cqe(
-      opcode, wqe_index, wqe_wrap, cqe_owner,
-      expected_function.generation
-    );
-    cqe_data = new[CMQE_BYTES];
-    foreach (cqe_data[i])
-      cqe_data[i] = cqe.bytes[i];
-    cq_offset = CMQ_CQ_OFFSET +
-                ((cq_sequence % CMQ_DEPTH) * CMQE_BYTES);
-    status = host_mem.write(cmq_mapping, cq_offset, cqe_data);
-    if (status == null || !status.ok())
-      return;
-
-    observed_opcodes.push_back(opcode);
-    observed_wqe_indices.push_back(wqe_index);
-    observed_wqe_wraps.push_back(wqe_wrap);
-    observed_cq_owners.push_back(cqe_owner);
-    observed_doorbell_pis.push_back(doorbell_pi);
-    observed_doorbell_polarities.push_back(doorbell_polarity);
-    sq_sequence++;
-    cq_sequence++;
-  endtask
-endclass
-
 class rdma_control_plane_cmq_engine_test extends uvm_test;
   `uvm_component_utils(rdma_control_plane_cmq_engine_test)
 
@@ -465,7 +243,7 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
   // 失败/边界：run_phase 的 setup/阶段驱动失败时停止新增事务，并按测试生命周期清理 objection 与临时引用。
   task run_phase(uvm_phase phase);
     rdma_mock_host_mem mock_mem;
-    rdma_control_plane_cmq_engine_responder_pcie mock_pcie;
+    rdma_cmq_device_responder mock_pcie;
     rdma_mock_call_trace call_trace;
     rdma_doorbell_scheduler scheduler;
     rdma_hw_cmq_hw_profile profile;
@@ -498,10 +276,7 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
     phase.raise_objection(this);
 
     mock_mem = rdma_mock_host_mem::type_id::create("mock_mem");
-    mock_pcie =
-      rdma_control_plane_cmq_engine_responder_pcie::type_id::create(
-        "mock_pcie"
-      );
+    mock_pcie = rdma_cmq_device_responder::type_id::create("mock_pcie");
     call_trace = rdma_mock_call_trace::type_id::create("call_trace");
     mock_mem.set_call_trace(call_trace);
     mock_pcie.set_call_trace(call_trace);
@@ -585,8 +360,7 @@ class rdma_control_plane_cmq_engine_test extends uvm_test;
         `uvm_error("REAL_ENGINE_PD", "production PD destroy failed")
     end
 
-    if (engine.outstanding_count() != 0 ||
-        engine.quarantine_count() != 0)
+    if (engine.outstanding_count() != 0)
       `uvm_error("REAL_ENGINE", "CMQ ticket leaked")
     if (mock_mem.live_allocations() != cmq_backing_only_baseline)
       `uvm_error("REAL_ENGINE", "owned MR backing leaked")

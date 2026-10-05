@@ -325,33 +325,6 @@ typedef enum bit {
   RDMA_MOCK_CMQ_TIMEOUT
 } rdma_mock_cmq_outcome_kind_e;
 
-class rdma_mock_cmq_snapshot_engine extends rdma_cmq_engine;
-  `uvm_object_utils(rdma_mock_cmq_snapshot_engine)
-
-  // 功能：构造 rdma_mock_cmq_snapshot_engine，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：profile=rdma_hw_cmq_hw_profile::type_id::create(。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_mock_cmq_snapshot_engine 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
-  function new(string name = "rdma_mock_cmq_snapshot_engine");
-    super.new(name);
-    profile = rdma_hw_cmq_hw_profile::type_id::create(
-      {name, "_profile"}
-    );
-  endfunction
-
-  // 功能：在 rdma_mock_cmq_snapshot_engine 中，snapshot_command_for_mock 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：source（输入）、snapshot（输出）、staging_invariant_failed（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为
-  //   detached 快照，读取不取得外部资源所有权。
-  // 失败/边界：snapshot_command_for_mock 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
-  function rdma_status snapshot_command_for_mock(
-    rdma_cmq_command_desc source,
-    output rdma_cmq_command_desc snapshot,
-    output bit staging_invariant_failed
-  );
-    return snapshot_command_value(source, snapshot,
-                                  staging_invariant_failed);
-  endfunction
-endclass
-
 class rdma_mock_cmq_outcome extends uvm_object;
   `uvm_object_utils(rdma_mock_cmq_outcome)
 
@@ -401,7 +374,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
   protected rdma_mock_cmq_outcome outcomes[bit [7:0]][$];
   protected rdma_cmq_completion late_completions[string][$];
   protected rdma_mock_cmq_reconcile_script reconcile_scripts[string][$];
-  protected rdma_mock_cmq_snapshot_engine snapshot_engine;
   protected bit gate_enabled;
   protected bit [7:0] gated_opcode;
   protected int unsigned gate_target_count;
@@ -432,9 +404,6 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     last_execute_no_submit_proven = 1'b0;
     role_failures.delete();
     method_ordinals.delete();
-    snapshot_engine = rdma_mock_cmq_snapshot_engine::type_id::create(
-      {name, "_snapshot_engine"}
-    );
   endfunction
 
   // 功能：在 rdma_mock_cmq_port 中，set_call_trace 记录 set_call_trace 的调用名称和顺序，供测试断言转发路径；不改变被测事务业务结果。
@@ -665,42 +634,14 @@ class rdma_mock_cmq_port extends rdma_cmq_port;
     return 1'b0;
   endfunction
 
-  // 功能：在 rdma_mock_cmq_port 中，snapshot_command 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：source（输入）、snapshot（输出）；snapshot_command 读取 source、snapshot 并使用字段 snapshot、staging_invariant_failed、snapshot_status、status_copy，并写入 snapshot；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：snapshot_command 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：在 rdma_mock_cmq_port 中复用 engine 的命令深拷贝快照，使 mock 与真实 engine 接受同一组命令。
+  // 输入/输出及副作用：source（输入）、snapshot（输出）；不修改 source。
+  // 失败/边界：快照或校验失败时返回其 status 且 snapshot=null。
   protected function rdma_status snapshot_command(
     rdma_cmq_command_desc source,
     output rdma_cmq_command_desc snapshot
   );
-    rdma_status snapshot_status;
-    rdma_status status_copy;
-    bit staging_invariant_failed;
-
-    snapshot = null;
-    staging_invariant_failed = 1'b0;
-    if (snapshot_engine == null)
-      return invalid_state("mock CMQ snapshot engine is unavailable");
-    snapshot_status = snapshot_engine.snapshot_command_for_mock(
-      source, snapshot, staging_invariant_failed
-    );
-    if (snapshot_status == null) begin
-      snapshot = null;
-      return invalid_state("mock CMQ command snapshot returned null status");
-    end
-    if (staging_invariant_failed) begin
-      snapshot = null;
-      return invalid_state("mock CMQ command snapshot invariant failed");
-    end
-    if (!snapshot_status.ok()) begin
-      snapshot = null;
-      status_copy = rdma_cmq_clone_status_value(snapshot_status);
-      return (status_copy == null) ?
-        invalid_state("mock CMQ command snapshot status copy failed") :
-        status_copy;
-    end
-    if (snapshot == null)
-      return invalid_state("mock CMQ command snapshot is null");
-    return rdma_status::success();
+    return rdma_cmq_engine::snapshot_command(source, snapshot);
   endfunction
 
   // 功能：make_ticket 创建独立的 rdma_status；根据 command、call_sequence、ticket 设置字段 ticket、ticket.command_id、ticket.function_h、function_h.kind、function_h.function_uid、function_h.object_id、function_h.generation、ticket.cmq_h、cmq_h.kind、cmq_h.function_uid，返回对象仅由调用方持有，不转移外部资源所有权。
