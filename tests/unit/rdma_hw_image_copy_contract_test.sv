@@ -1,5 +1,5 @@
 // 目录/层次：tests/unit；职责：通过既有入口固定 hardware image 的复制与恢复契约。
-// 依赖：model/core、UVM，以及 runtime 的错型载体和 CMQ 的 hostile clone/catcher fixture。
+// 依赖：model/core、UVM，以及 runtime 的错型载体和 factory fatal catcher。
 // 所有权/生命周期：测试拥有 image、探针和短期 factory；不 configure engine、不申请外部资源，
 //   每个测试窗口恢复原 factory；不调用新增 metadata helper，允许在旧生产版本上执行。
 
@@ -17,6 +17,31 @@ class rdma_image_publish_probe extends rdma_queue_data_engine;
   // 失败/边界：不吞 null/错型 factory 的拒绝或 fatal，不重试。
   function rdma_status copy_for_test(rdma_hw_image source, output rdma_hw_image copy);
     return clone_publish_image(source, copy);
+  endfunction
+endclass
+
+// 设计说明：UVM registry::create() 对 class-handle null 的 $cast 成功并返回 null，
+// 只有不兼容动态类型会发布 FCTTYP fatal；本 catcher 让 factory 故障窗口断言 fatal 次数。
+class rdma_image_factory_fatal_catcher extends uvm_report_catcher;
+  int unsigned caught_count;
+
+  // 功能：构造尚未捕获 FCTTYP 的 factory catcher。
+  // 输入/输出及副作用：name 传给基类；caught_count 清零，不自动注册 callback。
+  // 失败/边界：调用方必须在窗口前后显式 add/delete，防止吞掉非目标 fatal。
+  function new(string name = "rdma_image_factory_fatal_catcher");
+    super.new(name);
+    caught_count = 0;
+  endfunction
+
+  // 功能：精确捕获 severity=UVM_FATAL 且 ID=FCTTYP 的 registry 类型错误。
+  // 输入/输出及副作用：读取当前 report；命中时递增 caught_count 并返回 CAUGHT。
+  // 失败/边界：任何非 FCTTYP 或非 fatal report 均 THROW，不降级真实产品错误。
+  virtual function action_e catch();
+    if (get_severity() == UVM_FATAL && get_id() == "FCTTYP") begin
+      caught_count++;
+      return CAUGHT;
+    end
+    return THROW;
   endfunction
 endclass
 
@@ -69,7 +94,7 @@ class rdma_image_copy_factory extends uvm_default_factory;
   endfunction
 endclass
 
-// 七个旧入口使用独立字段 oracle；不使用生产的同值比较或新增 helper 自证正确性。
+// 五个旧入口使用独立字段 oracle；不使用生产的同值比较或新增 helper 自证正确性。
 class rdma_hw_image_copy_contract_test extends uvm_test;
   `uvm_component_utils(rdma_hw_image_copy_contract_test)
   int unsigned cases;
@@ -137,13 +162,12 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     end
   endfunction
 
-  // 功能：按 api 选择七个既有复制入口，只为 void/bit 接口生成直接 status 供统一断言。
+  // 功能：按 api 选择五个既有复制入口，只为 void/bit 接口生成直接 status 供统一断言。
   // 输入/输出及副作用：api/source 输入、copy 输出；每次递增 cases，不调用 metadata helper。
   // 失败/边界：api 越界 fatal；生产错误 status 原样返回，探针不覆盖原 protected 方法。
   function rdma_status invoke(int unsigned api, rdma_hw_image source, output rdma_hw_image copy);
     rdma_queue_pending_operation pending, pending_copy;
     rdma_image_publish_probe publisher;
-    bit copied;
 
     cases++;
     case (api)
@@ -164,17 +188,12 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
         pending_copy.do_copy(pending);
         copy = pending_copy.image;
       end
-      5: begin
-        copied = rdma_cmq_try_snapshot_image_direct(source, 1'b1, copy);
-        return rdma_status::make_direct(copied ? RDMA_SC_OK : RDMA_SC_INVALID_ARGUMENT);
-      end
-      6: return rdma_cmq_checked_image_snapshot(source, "metadata", RDMA_SC_TIMEOUT, copy);
       default: `uvm_fatal("IMAGE_COPY", "unknown copy API")
     endcase
     return rdma_status::make_direct(RDMA_SC_OK);
   endfunction
 
-  // 功能：112 组成功样本冻结七入口的 metadata、queue 策略、创建序列和结果隔离。
+  // 功能：80 组成功样本冻结五入口的 metadata、queue 策略、创建序列和结果隔离。
   // 输入/输出及副作用：无参数；短期安装记录 factory，修改 copy 证明 source queue 不变。
   // 失败/边界：任何非 OK、别名、创建名/顺序变化或源值漂移均报 error，最后恢复 factory。
   function void check_success_matrix();
@@ -186,7 +205,7 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     string expected_trace;
 
     original = uvm_factory::get();
-    for (int unsigned api = 0; api < 7; api++) begin
+    for (int unsigned api = 0; api < 5; api++) begin
       for (int unsigned tag = 0; tag < 16; tag++) begin
         source = make_source(tag);
         expected = make_source(tag);
@@ -198,7 +217,6 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
           1: expected_trace = "nonfatal_image_copy;runtime_status;";
           2: expected_trace = "cq_poll_pending_image;queue_data_engine_status;";
           3: expected_trace = "image_publish_probe_backing_planner;publish_image_copy;rdma_status;";
-          6: expected_trace = "metadata_saved;rdma_status;";
           default: expected_trace = "";
         endcase
         if (status == null || !status.ok() || copy == source || observer.trace != expected_trace)
@@ -219,7 +237,7 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     uvm_coreservice_t service = uvm_coreservice_t::get();
     uvm_factory original;
     rdma_image_copy_factory observer;
-    rdma_cmq_snapshot_factory_fatal_catcher catcher;
+    rdma_image_factory_fatal_catcher catcher;
     rdma_hw_image source, copy;
     rdma_status status;
     string names[3] = '{"nonfatal_image_copy", "cq_poll_pending_image", "publish_image_copy"};
@@ -260,45 +278,23 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
     end
   endfunction
 
-  // 功能：固定五个可空入口、六种 hostile clone 和三次自别名复制的旧行为。
-  // 输入/输出及副作用：无参数；clone 可改写源值，checked snapshot 必须恢复公开字段；
-  //   runtime/publish 的 hostile factory 自别名保留先清空源队列的历史行为。
+  // 功能：固定三个可空入口、自复制和两次 factory 自别名复制的旧行为。
+  // 输入/输出及副作用：无参数；runtime/publish 的 hostile factory 自别名保留先清空源队列的
+  //   历史行为。
   // 失败/边界：不对 null 调用 do_copy，不测试非空 poll 自追加；拒绝 clone 必须清空输出。
   function void check_boundaries();
     uvm_coreservice_t service = uvm_coreservice_t::get();
     uvm_factory original;
     rdma_image_copy_factory observer;
-    rdma_cmq_snapshot_image hostile;
     rdma_hw_image source, copy, expected;
     rdma_status status;
     rdma_status_code_e code;
 
-    for (int unsigned api = 1; api < 7; api++) begin
-      if (api == 4)
-        continue;
+    for (int unsigned api = 1; api < 4; api++) begin
       status = invoke(api, null, copy);
-      code = api inside {2, 3} ? RDMA_SC_INVALID_ARGUMENT :
-             api == 6 ? RDMA_SC_TIMEOUT : RDMA_SC_OK;
+      code = api inside {2, 3} ? RDMA_SC_INVALID_ARGUMENT : RDMA_SC_OK;
       if (status == null || status.code != code || copy != null)
         `uvm_error("IMAGE_COPY", "null input contract drift")
-    end
-    for (int unsigned mode = 0; mode < 6; mode++) begin
-      hostile = new("hostile_image");
-      expected = make_source(4);
-      hostile.do_copy(expected);
-      hostile.clone_mode = rdma_cmq_snapshot_clone_mode_e'(mode);
-      hostile.third_equal_value = make_source(4);
-      status = invoke(6, hostile, copy);
-      check_value(expected, hostile);
-      if (hostile.clone_calls != 1 || status == null)
-        `uvm_fatal("IMAGE_COPY", "hostile clone did not complete")
-      if (mode inside {0, 5}) begin
-        if (!status.ok() || copy == hostile)
-          `uvm_error("IMAGE_COPY", "equal clone rejected")
-        check_value(expected, copy);
-      end
-      else if (status.code != RDMA_SC_TIMEOUT || copy != null)
-        `uvm_error("IMAGE_COPY", "hostile clone accepted")
     end
     source = make_source(15);
     expected = make_source(15);
@@ -325,15 +321,15 @@ class rdma_hw_image_copy_contract_test extends uvm_test;
 
   // 功能：运行成功、factory 故障、clone 恢复与 alias 三组矩阵，输出完整计数标记。
   // 输入/输出及副作用：phase 管理 objection；只执行同步值操作，结束不遗留 factory/callback。
-  // 失败/边界：136 次调用不齐报 error；测试不使用等待，不代表线程并发或 I/O 验证。
+  // 失败/边界：96 次调用不齐报 error；测试不使用等待，不代表线程并发或 I/O 验证。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     check_success_matrix();
     check_factory_failures();
     check_boundaries();
-    if (cases != 136)
+    if (cases != 96)
       `uvm_error("IMAGE_COPY", $sformatf("unexpected calls %0d", cases))
-    `uvm_info("IMAGE_COPY", "completed 136 image copy contract calls", UVM_LOW)
+    `uvm_info("IMAGE_COPY", "completed 96 image copy contract calls", UVM_LOW)
     phase.drop_objection(this);
   endtask
 endclass

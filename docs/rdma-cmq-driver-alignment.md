@@ -47,6 +47,6 @@ QPC_CREATE 请求/响应有闭环证据。全覆盖分两层：
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | P1 | 新引擎：驱动流程（环/PI/polarity/doorbell/CQE 校验/pending 链表/clean_pending/看门狗），保留 port 契约 | 新引擎测试（含 ring 满排队、wrap/polarity 翻转、wrap/opcode/ecode 失败、reset 排空、看门狗）+ 全量回归 |
-| P2 | 旧引擎与旧测试（`rdma_cmq_engine_test` 2.6 万行、CMQ gate 分片、相关 Python 门禁）下线，port/control-plane 测试按新语义改写 | 全量回归 |
+| P2 | 旧引擎与旧测试（`rdma_cmq_engine_test` 2.6 万行、CMQ gate 分片、相关 Python 门禁）下线，port/control-plane 测试按新语义改写；删除只服务旧引擎的 journal/digest/typed-snapshot/body-value 模型与 profile 快照/canonicalization 接口 | 全量回归 |
 | P3 | 70 个 opcode 的 body 模型/编码器与查询类 CQE 解码 | 每 opcode 编码单测 |
 | P4 | C oracle 扩展到全部 opcode，生成 golden 向量，能力表闭环 | oracle 比对全通过 |

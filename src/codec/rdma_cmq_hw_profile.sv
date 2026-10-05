@@ -1,13 +1,10 @@
 // 目录/层次：codec 层 CMQ hardware profile 抽象契约。
-// 职责：定义 profile 名称/自校验、SQE/CQE/doorbell 编解码，以及 model 层无法实现的 polymorphic
-//  body/payload 非致命快照与 canonicalization seam。
+// 职责：定义 profile 名称/自校验与 SQE/CQE/doorbell 编解码。
 // 依赖：rdma_cmq_engine_models 的 command/slot/ticket/CQE 值、rdma_hw_image/model、rdma_status；
 //  具体 body 类型只出现在派生 profile 中。
-// 所有权与生命周期：profile 拥有自身 codec 组合；输入为非拥有只读值，成功输出由调用方拥有，
-//  基类默认 seam 不保存输入句柄。
+// 所有权与生命周期：profile 拥有自身 codec 组合；输入为非拥有只读值，成功输出由调用方拥有。
 
-// 设计说明：抽象 profile 是 model 与具体 hardware codec 的依赖倒置边界；polymorphic body/payload 的
-//  复制与 canonicalization 须留在知道真实类型的派生层。
+// 设计说明：抽象 profile 是 model 与具体 hardware codec 的依赖倒置边界。
 virtual class rdma_cmq_hw_profile extends uvm_object;
 
   // 功能：构造抽象基对象，仅建立 UVM 实例身份。
@@ -26,90 +23,6 @@ virtual class rdma_cmq_hw_profile extends uvm_object;
   // 输入/输出及副作用：无参数；只读配置。
   // 失败/边界：错误码与拒绝条件由派生类定义；不得隐式注册或修复 codec。
   pure virtual function rdma_status validate_profile();
-
-  // 功能：polymorphic command body 的非致命 snapshot 边界。
-  // 输入/输出及副作用：source 输入；snapshot 输出且入口清空；派生实现成功时发布 typed detached 值。
-  // 失败/边界：基类恒返回 INVALID_ARGUMENT/null；实现不得用会 fatal 的 generic clone/copy，也不得回退未知 subtype。
-  virtual function rdma_status snapshot_command_body(
-    rdma_hw_model source,
-    output rdma_hw_model snapshot
-  );
-    snapshot = null;
-    return rdma_status::make(
-      RDMA_SC_INVALID_ARGUMENT,
-      "CMQ profile does not recognize the command body type"
-    );
-  endfunction
-
-  // 功能：polymorphic command body 的 V1 canonicalization seam。
-  // 输入/输出及副作用：source 输入；schema_tag/field bytes 为新输出，仅返回 type tag 之后的字段 bytes。
-  // 失败/边界：基类清空两项输出并返回 UNSUPPORTED_OPCODE；未知 body 不得以 factory name 或 fallback tag 编码。
-  virtual function rdma_status canonicalize_command_body(
-    input rdma_hw_model source,
-    output string schema_tag,
-    output byte unsigned canonical_field_bytes[]
-  );
-    schema_tag = "";
-    canonical_field_bytes = new[0];
-    return rdma_status::make(
-      RDMA_SC_UNSUPPORTED_OPCODE,
-      "CMQ profile does not canonicalize this command body type"
-    );
-  endfunction
-
-  // 功能：声明 command body 值相等检查，供 snapshot 发布前验真。
-  // 输入/输出及副作用：lhs/rhs 只读；基类固定返回 0。
-  // 失败/边界：基类即使两句柄相同或均为 null 也返回 0；派生类须精确派发。
-  virtual function bit same_command_body_value(
-    rdma_hw_model lhs,
-    rdma_hw_model rhs
-  );
-    return 1'b0;
-  endfunction
-
-  // 功能：声明 command body 图分离检查，阻止 snapshot 保留源节点别名。
-  // 输入/输出及副作用：source/snapshot 只读；基类固定返回 0。
-  // 失败/边界：基类从不认证 detached；派生类须检查外层与每个可变嵌套句柄。
-  virtual function bit command_body_graph_detached(
-    rdma_hw_model source,
-    rdma_hw_model snapshot
-  );
-    return 1'b0;
-  endfunction
-
-  // 功能：completion payload 的非致命 polymorphic snapshot 边界。
-  // 输入/输出及副作用：source 输入；snapshot 输出且入口清空；派生实现成功时发布 typed detached payload。
-  // 失败/边界：基类恒返回 INVALID_ARGUMENT/null；未知 subtype 或分离失败不发布 partial，不得依赖会 fatal 的 factory clone。
-  virtual function rdma_status snapshot_completion_payload(
-    uvm_object source,
-    output uvm_object snapshot
-  );
-    snapshot = null;
-    return rdma_status::make(
-      RDMA_SC_INVALID_ARGUMENT,
-      "CMQ profile does not recognize the completion payload type"
-    );
-  endfunction
-
-  // 功能：声明 completion payload 值相等检查，验证直接拷贝结果。
-  // 输入/输出及副作用：lhs/rhs 只读；基类固定返回 0。
-  // 失败/边界：基类不接受 null 或相同句柄作为相等证据；派生类须逐字段比较。
-  virtual function bit same_completion_payload_value(
-    uvm_object lhs,
-    uvm_object rhs
-  );
-    return 1'b0;
-  endfunction
-
-  // 功能：声明 completion payload 图分离检查，保证观测快照不别名源图。
-  // 输入/输出及副作用：source/snapshot 只读；基类固定返回 0。
-  // 失败/边界：基类从不认证已分离；派生类须拒绝外层自别名与嵌套共享节点。
-  virtual function bit completion_payload_graph_detached(
-    uvm_object source,
-    uvm_object snapshot
-  );
-    return 1'b0;
-  endfunction
 
   // 功能：把已校验的 command 与 slot 编码为完整 SQE，并产生 CQE 期望键。
   // 输入/输出及副作用：command/slot 只读；sqe/expected 输出且应入口清空，成功后由调用方拥有。

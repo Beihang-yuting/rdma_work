@@ -1,5 +1,5 @@
 // 目录/层次：model 层 CMQ 共享值模型。
-// 职责：定义 CMQ opcode、recovery owner、command、slot、ticket、completion、diagnostic 与 runtime
+// 职责：定义 CMQ opcode、recovery owner、command、slot、ticket、completion 与 runtime
 //   描述，并在进入 engine/codec 前统一校验句柄归属与代际。
 // 依赖：rdma_status、rdma_handle/function_handle、rdma_hw_image/model、rdma_submission_evidence；
 //   不依赖具体 RDMA codec body。
@@ -13,13 +13,6 @@ typedef enum bit [2:0] {
   RDMA_CMQ_ENGINE_QUIESCED,
   RDMA_CMQ_ENGINE_POISONED
 } rdma_cmq_engine_state_e;
-
-typedef enum bit [1:0] {
-  RDMA_CMQ_DIAG_LATE_COMPLETION,
-  RDMA_CMQ_DIAG_MALFORMED_CQE,
-  RDMA_CMQ_DIAG_UNKNOWN_CQE,
-  RDMA_CMQ_DIAG_POISON
-} rdma_cmq_diagnostic_kind_e;
 
 // 设计说明：workflow 是恢复权限的业务域，不能由 opcode 或完成状态反推；四态类型保留 X/Z，
 // 所有校验入口须在 case/index 前显式拒绝未知值。
@@ -958,7 +951,7 @@ class rdma_cmq_decoded_cqe extends uvm_object;
 endclass
 
 // 设计说明：ticket 冻结单次提交的 command ID、Function/CMQ、slot 与 deadline，
-// 使 completion、timeout 与 late diagnostic 以同一 immutable identity 关联。
+// 使 completion 与 timeout 以同一 immutable identity 关联。
 class rdma_cmq_ticket extends uvm_object;
   `rdma_object_utils(rdma_cmq_ticket)
 
@@ -1042,7 +1035,7 @@ class rdma_cmq_ticket extends uvm_object;
   endfunction
 endclass
 
-// 功能：为 completion/diagnostic 的传统 do_copy 克隆可选 ticket。
+// 功能：为 completion 的传统 do_copy 克隆可选 ticket。
 // 输入/输出及副作用：source 只读，label 用于诊断；null 返回 null，否则返回 clone 的新 ticket 图。
 // 失败/边界：clone 返回 null 或类型错误触发 RDMA_COPY_TYPE fatal；nonfatal 路径应使用 snapshot context。
 function automatic rdma_cmq_ticket rdma_cmq_clone_ticket_value(
@@ -1162,66 +1155,6 @@ class rdma_cmq_completion extends uvm_object;
       return rdma_status::success();
     end
     return rdma_cmq_raw_cqe_status(raw_cqe, ticket, "CMQ completion");
-  endfunction
-endclass
-
-// 设计说明：diagnostic 与正常 completion 分离保存 late/orphan/reset 证据，
-// 避免诊断投递改变主 completion 生命周期或消费其 retained journal evidence。
-class rdma_cmq_diagnostic extends uvm_object;
-  `rdma_object_utils(rdma_cmq_diagnostic)
-
-  rdma_cmq_diagnostic_kind_e kind;
-  rdma_cmq_ticket ticket;
-  rdma_status status;
-  rdma_hw_image raw_cqe;
-
-  // 功能：构造默认 late-completion 类别的空诊断 envelope。
-  // 输入/输出及副作用：name 为 UVM 实例名；ticket/status/raw_cqe 置 null。
-  // 失败/边界：默认对象缺 status/ticket/CQE，无效，不得当作已观测事件。
-  function new(string name = "rdma_cmq_diagnostic");
-    super.new(name);
-    kind = RDMA_CMQ_DIAG_LATE_COMPLETION;
-    ticket = null;
-    status = null;
-    raw_cqe = null;
-  endfunction
-
-  // 功能：复制diagnostic 的值字段，得到与源隔离的快照。
-  // 输入/输出及副作用：rhs 为只读源；覆盖 kind，深拷贝 ticket、status 与 raw CQE。
-  // 失败/边界：类型不符或 clone/cast 失败触发 UVM fatal（CMQ diagnostic copy mismatch）。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_cmq_diagnostic rhs_diagnostic;
-
-    super.do_copy(rhs);
-    if (!$cast(rhs_diagnostic, rhs))
-      `uvm_fatal("RDMA_COPY_TYPE", "CMQ diagnostic copy mismatch")
-    kind = rhs_diagnostic.kind;
-    ticket = rdma_cmq_clone_ticket_value(rhs_diagnostic.ticket,
-                                         "CMQ diagnostic");
-    status = rdma_cmq_clone_status_value(rhs_diagnostic.status);
-    raw_cqe = rdma_cmq_clone_image_value(rhs_diagnostic.raw_cqe,
-                                         "CMQ diagnostic raw CQE");
-  endfunction
-
-  // 功能：校验诊断 status、late-completion 的 ticket 要求与 raw CQE 的 image 契约。
-  // 输入/输出及副作用：只读，可校验可选 ticket，最后返回 raw-CQE 校验结果。
-  // 失败/边界：status 为 null、late-completion 缺 ticket、可选 ticket 无效或 raw CQE 为 null/形状非法时拒绝；
-  //   其他类别允许 ticket==null。
-  function rdma_status validate();
-    rdma_status validation_status;
-
-    if (status == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "CMQ diagnostic status is null");
-    if (kind == RDMA_CMQ_DIAG_LATE_COMPLETION && ticket == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "late CMQ completion has no ticket");
-    if (ticket != null) begin
-      validation_status = ticket.validate();
-      if (!validation_status.ok())
-        return validation_status;
-    end
-    return rdma_cmq_raw_cqe_status(raw_cqe, ticket, "CMQ diagnostic");
   endfunction
 endclass
 
