@@ -101,35 +101,32 @@ class rdma_control_plane extends uvm_object;
     rdma_hw_occ_flush_body occ_body;
     rdma_hw_mr_deregister_body deregister_body;
 
-    case (step)
-      RDMA_CTRL_STEP_HW_OCC_FLUSHED: begin
-        occ_body = rdma_hw_occ_flush_body::type_id::create({name, "_body"});
-        occ_body.mr_serial_flush = 1'b1;
-        occ_body.pble = 1'b1;
-        occ_body.mr_serial = mr.mr_serial[11:0];
-        return rdma_make_cmq_command(owner, RDMA_OP_OCC_FLUSH, "occ_flush",
-                                     occ_body, default_timeout, name);
-      end
-      RDMA_CTRL_STEP_HW_MR_DEREGISTERED: begin
-        deregister_body =
-          rdma_hw_mr_deregister_body::type_id::create({name, "_body"});
-        deregister_body.mr_h = project_handle(mr.handle, mr.local_mr_id,
-                                              RDMA_RESOURCE_MR);
-        deregister_body.stag_key = mr.lkey[7:0];
-        deregister_body.next_state = RDMA_CONTEXT_INVALID;
-        return rdma_make_cmq_command(owner, RDMA_OP_MR_DEREGISTER,
-                                     "deregister", deregister_body,
-                                     default_timeout, name);
-      end
-      RDMA_CTRL_STEP_HW_DRAINED:
-        return rdma_make_cmq_command(
-          owner, RDMA_OP_TQ_FLUSH, "tq_flush",
-          rdma_hw_cmq_empty_body::type_id::create({name, "_body"}),
-          default_timeout, name
-        );
-      default:
-        return null;
-    endcase
+    if (step == RDMA_CTRL_STEP_HW_OCC_FLUSHED) begin
+      occ_body = rdma_hw_occ_flush_body::type_id::create({name, "_body"});
+      occ_body.mr_serial_flush = 1'b1;
+      occ_body.pble = 1'b1;
+      occ_body.mr_serial = mr.mr_serial[11:0];
+      return rdma_make_cmq_command(owner, RDMA_OP_OCC_FLUSH, "occ_flush",
+                                   occ_body, default_timeout, name);
+    end
+    if (step == RDMA_CTRL_STEP_HW_MR_DEREGISTERED) begin
+      deregister_body =
+        rdma_hw_mr_deregister_body::type_id::create({name, "_body"});
+      deregister_body.mr_h = project_handle(mr.handle, mr.local_mr_id,
+                                            RDMA_RESOURCE_MR);
+      deregister_body.stag_key = mr.lkey[7:0];
+      deregister_body.next_state = RDMA_CONTEXT_INVALID;
+      return rdma_make_cmq_command(owner, RDMA_OP_MR_DEREGISTER,
+                                   "deregister", deregister_body,
+                                   default_timeout, name);
+    end
+    if (step == RDMA_CTRL_STEP_HW_DRAINED)
+      return rdma_make_cmq_command(
+        owner, RDMA_OP_TQ_FLUSH, "tq_flush",
+        rdma_hw_cmq_empty_body::type_id::create({name, "_body"}),
+        default_timeout, name
+      );
+    return null;
   endfunction
 
   // 功能：在 rdma_control_plane 中，execute_control_command_raw_status 收束一次
