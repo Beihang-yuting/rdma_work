@@ -3440,13 +3440,9 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       request = fixture.make_recv(64'h5eb0_0100);
       request.target_h = rdma_clone_handle_value(plain.qp.handle, "plain RQ");
       request.owner = plain.binding.make_handle();
-      for (int unsigned k = 0; k < 2; k++) begin
-        sge = rdma_sge::type_id::create($sformatf("rq_sgb_plain_sge%0d", k));
-        sge.iova.value = 64'h0000_3000_0000_8000 + k * 64'h100;
-        sge.length = 32;
-        sge.lkey = 32'h0a0b_0d00 + k;
-        request.sges.push_back(sge);
-      end
+      // 同一 SGE 对象出现 3 次（别名）：请求快照须保留 3 个有效 SGE，因而在无 RQ SGB 的 QP 上被拒。
+      for (int unsigned k = 0; k < 2; k++)
+        request.sges.push_back(request.sges[0]);
       plain.engine.post_recv(request, result, status);
       void'(plain.engine.query_runtime_cursors(plain.qp.handle, RDMA_QUEUE_RUNTIME_RQ,
                                                pi, pw, ci, cw));

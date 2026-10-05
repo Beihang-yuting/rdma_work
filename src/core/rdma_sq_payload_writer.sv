@@ -83,8 +83,7 @@ class rdma_sq_payload_write_receipt extends uvm_object;
         sges.push_back(null);
       end
       else begin
-        sge_copy = rdma_sge::type_id::create($sformatf("receipt_sge_%0d", i));
-        sge_copy.copy(source.sges[i]);
+        sge_copy = source.sges[i].duplicate();
         sges.push_back(sge_copy);
       end
     end

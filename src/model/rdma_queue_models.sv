@@ -560,8 +560,7 @@ class rdma_sqe_model extends rdma_hw_model;
         sges.push_back(null);
       end
       else begin
-        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
-          rhs_sqe.sges[i], "SQE SGE clone mismatch");
+        cloned_sge = rhs_sqe.sges[i].duplicate();
         sges.push_back(cloned_sge);
       end
     end
@@ -707,8 +706,7 @@ class rdma_rqe_model extends rdma_hw_model;
         sges.push_back(null);
       end
       else begin
-        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
-          rhs_rqe.sges[i], "RQE SGE clone mismatch");
+        cloned_sge = rhs_rqe.sges[i].duplicate();
         sges.push_back(cloned_sge);
       end
     end

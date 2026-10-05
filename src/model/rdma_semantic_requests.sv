@@ -151,6 +151,20 @@ class rdma_sge extends uvm_object;
     length = rhs_sge.length;
     lkey = rhs_sge.lkey;
   endfunction
+
+  // 功能：按值复制为新的 SGE，供请求/WQE 模型复制 SGE 列表。
+  // 输入/输出及副作用：返回新对象，源不变。
+  // 失败/边界：不经 uvm_object::copy——UVM 1.2 在嵌套 copy 中按源对象记录 global copy map，同一 SGE
+  //   在列表中出现多次（别名）时第二次 clone 会提前返回而得到全零 SGE，进而被当作零长度 SGE 丢弃。
+  function rdma_sge duplicate();
+    rdma_sge copy;
+
+    copy = rdma_sge::type_id::create(get_name());
+    copy.iova = iova;
+    copy.length = length;
+    copy.lkey = lkey;
+    return copy;
+  endfunction
 endclass
 
 class rdma_semantic_request extends uvm_object;
@@ -1176,8 +1190,7 @@ class rdma_post_send_req extends rdma_semantic_request;
         sges.push_back(null);
       end
       else begin
-        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
-          rhs_req.sges[i], "SGE clone type mismatch");
+        cloned_sge = rhs_req.sges[i].duplicate();
         sges.push_back(cloned_sge);
       end
     end
@@ -1352,8 +1365,7 @@ class rdma_post_recv_req extends rdma_semantic_request;
         sges.push_back(null);
       end
       else begin
-        cloned_sge = rdma_deep_copy#(rdma_sge)::of(
-          rhs_req.sges[i], "SGE clone type mismatch");
+        cloned_sge = rhs_req.sges[i].duplicate();
         sges.push_back(cloned_sge);
       end
     end

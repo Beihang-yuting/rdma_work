@@ -3111,6 +3111,79 @@ class rdma_request_model_test extends uvm_test;
         fault_clone.deterministic_seed != 32'h2468_ace0)
       `uvm_error("FAULT_CLONE", "network fault lost deterministic fields")
 
+    check_sge_alias_copy();
     phase.drop_objection(this);
   endtask
+
+  // 功能：同一 SGE 对象在列表中出现多次（别名）时，post-send/post-receive 请求与 SQE/RQE 模型的
+  //   clone 必须得到同样数量、同值且彼此独立的 SGE（防止 UVM 嵌套 copy map 把重复项克隆为空）。
+  // 输入/输出及副作用：只创建本地对象。
+  // 失败/边界：数量、字段或对象独立性不符时报告 SGE_ALIAS_* UVM_ERROR。
+  task automatic check_sge_alias_copy();
+    rdma_sge sge;
+    rdma_sge copies[$];
+    rdma_post_send_req send_req;
+    rdma_post_recv_req recv_req;
+    rdma_sqe_model sqe;
+    rdma_rqe_model rqe;
+    uvm_object cloned;
+    rdma_post_send_req send_clone;
+    rdma_post_recv_req recv_clone;
+    rdma_sqe_model sqe_clone;
+    rdma_rqe_model rqe_clone;
+
+    sge = rdma_sge::type_id::create("alias_sge");
+    sge.iova.value = 64'h0000_4000_0000_1000;
+    sge.length = 48;
+    sge.lkey = 32'h0102_0aa0;
+    send_req = rdma_post_send_req::type_id::create("alias_send");
+    recv_req = rdma_post_recv_req::type_id::create("alias_recv");
+    sqe = rdma_sqe_model::type_id::create("alias_sqe");
+    rqe = rdma_rqe_model::type_id::create("alias_rqe");
+    repeat (3) begin
+      send_req.sges.push_back(sge);
+      recv_req.sges.push_back(sge);
+      sqe.sges.push_back(sge);
+      rqe.sges.push_back(sge);
+    end
+    cloned = send_req.clone();
+    if (!$cast(send_clone, cloned))
+      `uvm_fatal("SGE_ALIAS_SEND", "post-send clone type mismatch")
+    copies = send_clone.sges;
+    check_sge_alias_list("SGE_ALIAS_SEND", sge, copies);
+    cloned = recv_req.clone();
+    if (!$cast(recv_clone, cloned))
+      `uvm_fatal("SGE_ALIAS_RECV", "post-receive clone type mismatch")
+    copies = recv_clone.sges;
+    check_sge_alias_list("SGE_ALIAS_RECV", sge, copies);
+    cloned = sqe.clone();
+    if (!$cast(sqe_clone, cloned))
+      `uvm_fatal("SGE_ALIAS_SQE", "SQE clone type mismatch")
+    copies = sqe_clone.sges;
+    check_sge_alias_list("SGE_ALIAS_SQE", sge, copies);
+    cloned = rqe.clone();
+    if (!$cast(rqe_clone, cloned))
+      `uvm_fatal("SGE_ALIAS_RQE", "RQE clone type mismatch")
+    copies = rqe_clone.sges;
+    check_sge_alias_list("SGE_ALIAS_RQE", sge, copies);
+  endtask
+
+  // 功能：断言 copies 为 3 个与 source 同值、互不相同且不等于 source 的 SGE。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：不符时报告 label 对应的 UVM_ERROR。
+  function void check_sge_alias_list(string label, rdma_sge source, rdma_sge copies[$]);
+    if (copies.size() != 3) begin
+      `uvm_error(label, $sformatf("expected 3 SGEs, got %0d", copies.size()))
+      return;
+    end
+    foreach (copies[i]) begin
+      if (copies[i] == null || copies[i] == source ||
+          copies[i].iova != source.iova || copies[i].length != source.length ||
+          copies[i].lkey != source.lkey)
+        `uvm_error(label, $sformatf("SGE %0d lost its value or aliases the source", i))
+      for (int unsigned j = 0; j < i; j++)
+        if (copies[i] == copies[j])
+          `uvm_error(label, $sformatf("SGE %0d aliases SGE %0d in the clone", i, j))
+    end
+  endfunction
 endclass
