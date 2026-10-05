@@ -16,14 +16,15 @@
 
 | 指标 | 基线 1ea354f | 本分支 | 变化 |
 | --- | ---: | ---: | ---: |
-| 代码行 | 91,544 | 89,438 | −2,106 |
-| 注释行 | 16,412 | 12,170 | −4,242 |
-| 总行数 | 114,092 | 107,610 | −6,482（−5.7%） |
+| 代码行 | 91,544 | 76,578 | −14,966 |
+| 注释行 | 16,412 | 11,423 | −4,989 |
+| 总行数 | 114,092 | 93,573 | −20,519（−18.0%） |
 
-主要文件：`rdma_cmq_engine` 13,763→13,089；`rdma_queue_data_engine` 9,911→9,181；
-`rdma_resource_manager` 7,936→7,534；`rdma_control_plane` 4,490→3,801；
-`rdma_queue_runtime` 3,795→3,568；`rdma_qp_lifecycle_executor` 4,338→4,177。
-Python 门禁另删除约 4.8k 行（结构冻结类）。
+主要文件：`rdma_cmq_engine` 13,763→849（按驱动流程重写）；`rdma_queue_data_engine` 9,911→9,295
+（含新增 SQ/RQ 外部 SGB）；`rdma_resource_manager` 7,936→7,543；`rdma_control_plane` 4,490→3,669；
+`rdma_cmq_codecs` 3,436→3,320。新增 `rdma_cmq_field_codec` 300 行与生成字段表 138 行。
+tests 179,228→135,872（旧 CMQ 引擎测试 26,435 行下线，新引擎测试 691 行、golden 测试 647 行）。
+全分支相对基线：405 个文件，+22,486/−84,376 行（含 tests、Python 门禁与文档归档）。
 
 ## 结构改动
 
@@ -78,6 +79,29 @@ Python 门禁另删除约 4.8k 行（结构冻结类）。
    提供 create + 字段自动化 + do_copy 的别名安全 clone()；测试子类覆盖 clone() 的故障注入语义不变。
    `request_model_test` 覆盖列表、跨字段与跨层三类别名。
 
+13. **恢复函数拆分**：queue `recover_locked`、control plane `recover_resource`（MR）、QP
+   `recover_destroy_locked` 按恢复阶段拆成独立函数，行为不变（893b5fd、bc037d5、f31cdec）。
+14. **CMQ 按驱动 `cmq.c` 重写**（设计与取舍见 `docs/rdma-cmq-driver-alignment.md`）：
+   - 引擎（ce10173）：SQ 环 + PI、polarity/wrap、doorbell、CQE 有效性/wrap/opcode/ecode 校验、pending
+     链表、`clean_pending` 式 reset/teardown、看门狗（超时 → POISONED），保留 `rdma_cmq_port` 契约；
+     13,763 行 → 约 850 行。旧引擎测试与 18 个 CMQ gate 分片下线，改为共享设备 responder
+     （`tests/support/rdma_cmq_device_responder.sv`）+ 新引擎测试。fb8cc4b 删除只服务旧引擎的
+     journal/digest/typed-snapshot/body-value 模型与 profile 快照接口。
+   - 操作全覆盖（3c8e3f3）：驱动 `exec_cmq_cmd` 分派的 70 个 opcode 全部可编码。49 个由表驱动字段
+     codec 编码，字段表由 `tools/gen_cmq_request_fields.py` 从驱动填充函数与字段宏生成；21 个沿用专用
+     body 编码器。唯一有意偏离：驱动对 7 个无填充函数的 opcode 提交全零 WQE，模型发信封头。
+   - review 修复（bc99db7）：超时请求移出 pending、teardown 只报告自身取消的请求、QUIESCED 下 reset
+     返回 INVALID_STATE、CQE `wqe_index` 与环位置不符即毒化引擎、SD 附加数据仅允许 SD_UPDATE。
+15. **驱动 golden 与能力表闭环**（31b5719）：把驱动原文编译进用户态 harness（53 上对锁定归档执行）生成：
+   - 请求：表驱动 49 个 opcode 50 例（`cmq_requests.hex`）+ 专用编码器 21 个 opcode 31 例
+     （`cmq_requests_dedicated.hex`，覆盖 QPC 各状态/模式、KEY_ALLOC/MR_REGISTER pbl 0–2 级、
+     OCC_FLUSH 5 种驱动组合等），SV 侧逐字节比对，上下文类另解码核对关键字段；
+   - 响应：逐位翻转 CQE 测出驱动实际读取位，71 例（`cmq_responses.hex`）；发现驱动 KEY_QUERY/CQC_QUERY
+     分别越过 64B CQE 读 16/8 字节，模型不跟随；
+   - `cmq_capabilities.tsv` 由 `tools/check_cmq_capabilities.py` 从驱动枚举、提交/完成两个 switch 与 golden
+     重建，驱动分派的方向必须有 golden 证据；驱动不分派的 5 行标 `DRIVER_NOT_DISPATCHED`。
+     completion 支持集合改为与驱动 CQ 侧分派一致（加 QP_FLUSH，去 OCC_PD_SEARCH/IDX）。
+
 ## 验证
 
 每轮均为全量：Python 门禁、changed-SV style、驱动契约（rdma_defs）、core、CMQ gate、integration、
@@ -92,13 +116,23 @@ host_mem、PCIe、E2E（dual env / multi-VF / high traffic）。
 | v5 | 303730e | 同上全部通过 |
 | v6 | 914203a | 同上全部通过，另含 core `rdma_tb_flow_test`、e2e `rdma_tb_e2e_test` |
 | v7 | f6d47f9 | 同上全部通过，另含 net_packet suite |
+| v8 | 2996737 | 全部通过（core 116 / CMQ 28） |
+| v9 | 6dffa60 | 仅驱动门禁失败（错误码宏门禁不认 `rdma_object_utils`），其余全通过 |
+| v10 | 711d6a2 | 门禁正则修复后全部通过 |
+| v11–v13 | 893b5fd / bc037d5 / f31cdec | 恢复函数拆分，每步全部通过 |
+| v14 | ce10173 | 新 CMQ 引擎全部通过（旧引擎测试下线后 core 92 / CMQ 11） |
+| v15 | fb8cc4b | 全部通过 |
+| v16 | 3c8e3f3 | 仅驱动门禁失败（SD_UPDATE 签名写法不符 composer 单写者规则），其余全通过（CMQ 12 / core 93） |
+| v17 | 31b5719 | 全部通过：Python、style、驱动门禁、CMQ 12、core 93、net_packet、PCIe、host_mem 3、integration 10、E2E 5 组（告警 2 来自外部 net_packet） |
 
-后续轮次结果见对应提交说明。注释改写由脚本逐文件校验：去除注释与空白后的代码 token
+v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线，不是用例失败。注释改写由脚本逐文件校验：
+去除注释与空白后的代码 token 与改写前完全一致。注释改写由脚本逐文件校验：去除注释与空白后的代码 token
 与改写前完全一致。
 
 ## 未做与遗留
 
 - CEQ/AEQ 的 request/resource/context model 与 lifecycle policy 仍为平行实现；字段名不同，
   用钩子合并反而增加行数，需先统一模型基类才值得做。
-- cmq engine 的类型化快照（按类型逐字段克隆并校验）保持原设计，以保留对异常 do_copy 子类的修复语义。
+- 驱动对 7 个无填充函数 opcode 提交全零 WQE，模型发信封头（有意偏离，见 CMQ 对齐文档）。
+- 驱动 KEY_QUERY/CQC_QUERY 越界读 CQE 之后字节，模型只解码 64B CQE 内的内容。
 - 包级 DAG（Phase E）未开始。
