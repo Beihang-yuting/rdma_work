@@ -1,23 +1,19 @@
 // 目录/层次：核心执行层 core/rdma_queue_runtime_transaction_models.sv。
-// 文件职责：定义 queue runtime 使用的枚举、cursor、pending recovery evidence 和
-//   host slot ledger 值模型，把 detached transaction 数据与可变 runtime owner 分离。
-// 主要依赖：依赖 rdma_types_pkg 的 status/route/reset epoch、rdma_model_pkg 的
-//   handle、semantic request 与 hardware image，以及 UVM object factory；不访问
-//   runtime lock、账本、Host-memory、PCIe 或外部 adapter。
-// 所有权与生命周期：这些对象只保存一次 runtime transaction 窗口内的 detached 值；
-//   runtime 仍拥有 slots、pending publication、cursor mutation 和锁，外部 backing、
-//   scheduler、QP/Function 资源仍由各自 lifecycle owner 管理。
+// 职责：定义 queue runtime 的枚举、cursor、pending recovery evidence 与 host slot ledger 值模型，
+//  把 detached transaction 数据与可变 runtime owner 分离。
+// 依赖：rdma_types_pkg 的 status/route/reset epoch、rdma_model_pkg 的 handle/semantic request/
+//  hardware image 与 UVM factory；不访问 runtime lock、账本、Host-memory、PCIe 或 adapter。
+// 所有权与生命周期：对象只保存一次 runtime transaction 窗口内的 detached 值；slots、pending publication、
+//  cursor 修改与锁仍归 runtime，外部资源由各自 lifecycle owner 管理。
 
-// 中文设计说明：这些 enum 是 queue runtime 的 wire-independent 状态 vocabulary。
-// 它们放在值模型文件中，保证 policy/engine 可以读取稳定分类，而不需要依赖 runtime
-// 的可变实现；新增枚举不能隐含创建第二份状态账本。
+// // 这些 enum 是 queue runtime 与 wire 无关的状态词汇表，放在值模型文件中让 policy/engine 无需依赖 runtime
+// // 实现；新增枚举不得隐含创建第二份状态账本。
 typedef enum bit [2:0] {
   RDMA_QUEUE_RUNTIME_DETACHED = 3'd0,
   RDMA_QUEUE_RUNTIME_ATTACHED = 3'd1,
   RDMA_QUEUE_RUNTIME_ACTIVE = 3'd2,
   RDMA_QUEUE_RUNTIME_RECOVERY_REQUIRED = 3'd3,
-  // resize 在 QUIESCING 窗口禁止新事务；它与 DETACHED 分离，使 replacement 失败时
-  // 还能恢复旧 attachment 而不丢失游标账本。
+  // // resize 在 QUIESCING 窗口禁止新事务；它与 DETACHED 分离，使 replacement 失败时可恢复旧 attachment 而不丢游标账本。
   RDMA_QUEUE_RUNTIME_QUIESCING = 3'd4
 } rdma_queue_runtime_state_e;
 
@@ -43,25 +39,25 @@ typedef enum bit [2:0] {
   RDMA_QUEUE_MMIO_AMBIGUOUS      = 3'd4
 } rdma_queue_mmio_evidence_e;
 
-// 设计说明：ring cursor 必须把 index 和 wrap 作为一个值传递，否则在回卷边界仅
-// 比较 index 会把 stale reservation 误认为当前事务。
+// 设计说明：ring cursor 须把 index 与 wrap 作为一个值传递，否则回卷边界仅比较 index 会把 stale reservation
+//  误认为当前事务。
 class rdma_queue_cursor_snapshot extends uvm_object;
   `uvm_object_utils(rdma_queue_cursor_snapshot)
   int unsigned index;
   bit wrap;
 
-  // 功能：构造默认指向 ring 第 0 项、未回卷的 cursor 值对象。
-  // 输入/输出及副作用：name（输入）仅设置 UVM 对象名；初始化 index=0/wrap=0。
-  // 失败/边界：构造不知道 ring depth，因此 0/0 只是值默认项，不是已授权 reservation。
+  // 功能：构造默认指向第 0 项、未回卷的 cursor 值对象。
+  // 输入/输出及副作用：name 设置 UVM 名；index=0、wrap=0。
+  // 失败/边界：不知道 ring depth，0/0 只是默认值，不是已授权的 reservation。
   function new(string name = "rdma_queue_cursor_snapshot");
     super.new(name);
     index = 0;
     wrap = 0;
   endfunction
 
-  // 功能：将 rhs 中 cursor 的 index/wrap 复制到当前对象，建立与源对象隔离的值快照。
-  // 输入/输出及副作用：rhs（输入）；类型正确时覆盖当前 index/wrap，不修改 rhs。
-  // 失败/边界：类型不匹配时保留 cursor；rhs 必须非空，不验证 index<depth，自复制保值。
+  // 功能：复制 cursor 的 index/wrap。
+  // 输入/输出及副作用：rhs 为源；类型正确时覆盖当前值，不改 rhs。
+  // 失败/边界：类型不匹配时保留当前值；rhs 须非空，不验证 index<depth。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_cursor_snapshot source;
     super.do_copy(rhs);
@@ -71,9 +67,8 @@ class rdma_queue_cursor_snapshot extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：pending operation 是 recovery 的唯一事务证据载体，冻结 queue identity、
-// cursor、image、route/epoch、MMIO evidence 和阶段位；runtime 通过 non-fatal helper
-// 建立 detached 快照，不信任 caller 的兼容 bit。
+// 设计说明：pending operation 是 recovery 的唯一事务证据载体，冻结 queue identity、cursor、image、
+//  route/epoch、MMIO evidence 与阶段位；runtime 经 non-fatal helper 建立 detached 快照，不信任 caller 的兼容 bit。
 class rdma_queue_pending_operation extends uvm_object;
   `uvm_object_utils(rdma_queue_pending_operation)
   rdma_handle queue_h;
@@ -85,7 +80,7 @@ class rdma_queue_pending_operation extends uvm_object;
   bit cq_consumer_committed;
   bit completion_released;
   bit consumer_doorbell_succeeded;
-  // CQ shadow publication 是 host-memory write，不是 MMIO doorbell；两者 evidence 分离。
+  // // CQ shadow publication 是 host-memory write 而非 MMIO doorbell，二者 evidence 分离。
   bit consumer_shadow_required;
   bit consumer_shadow_urc;
   bit consumer_shadow_attempted;
@@ -116,11 +111,10 @@ class rdma_queue_pending_operation extends uvm_object;
   rdma_reset_epoch_t reset_epoch;
   bit epoch_valid;
 
-  // 功能：构造一个尚未具备任何可提交 authority 的 pending evidence 外壳。
-  // 输入/输出及副作用：name（输入）设置 UVM 名称；所有 handle/快照置 null、阶段位清零，
-  //   kind 默认 SQ，MMIO authority 置 RDMA_QUEUE_MMIO_NONE。
-  // 失败/边界：默认对象不能直接交给 recovery；缺 queue_h/cursor/image/status/route/epoch
-  //   的 device evidence 必须在 enter_recovery_prepared 被拒绝。
+  // 功能：构造尚无任何可提交 authority 的 pending evidence 外壳。
+  // 输入/输出及副作用：name 设置 UVM 名；handle/快照置 null，阶段位清零，kind 默认 SQ，MMIO 为 NONE。
+  // 失败/边界：默认对象不能直接交给 recovery；缺 queue_h/cursor/image/status/route/epoch 的 device evidence
+  //  须在 enter_recovery_prepared 被拒绝。
   function new(string name = "rdma_queue_pending_operation");
     super.new(name);
     queue_h = null;
@@ -163,13 +157,11 @@ class rdma_queue_pending_operation extends uvm_object;
     epoch_valid = 0;
   endfunction
 
-  // 功能：do_copy 为 UVM print/clone 兼容复制 pending 标量，并为 queue/cursor/image/status
-  //   建立局部值对象；image 元数据复用模型值复制，队列仍直接赋值；
-  //   request_snapshot/routed_qp_h 保留兼容的非拥有引用。
-  // 输入/输出及副作用：rhs 输入；覆盖当前对象，非自别名时不修改 rhs；关键 recovery 深拷贝由
-  //   rdma_queue_runtime_projector::clone_pending_value 提供，以便传播 non-fatal 失败。
-  // 失败/边界：rhs 必须非空，类型不匹配保留当前值；自复制会先替换子对象，不能保证保值。
-  //   本 void 入口不保证完整 detached graph，不能替代 runtime 的带状态 clone helper。
+  // 功能：为 UVM print/clone 兼容复制 pending 标量，并为 queue/cursor/image/status 建立局部值对象；
+  //  request_snapshot/routed_qp_h 保留非拥有引用。
+  // 输入/输出及副作用：rhs 为源；覆盖当前对象；关键 recovery 深拷贝由 rdma_queue_runtime_projector::
+  //  clone_pending_value 提供以传播 non-fatal 失败。
+  // 失败/边界：rhs 须非空，类型不匹配保留当前值；自复制不保值；不保证完整 detached 图。
   virtual function void do_copy(uvm_object rhs);
     rdma_queue_pending_operation source;
     super.do_copy(rhs);
@@ -267,8 +259,8 @@ class rdma_queue_pending_operation extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：host-produced ring 需要以 slot 记录 request/image/wr_id 与 completion 状态，
-// 才能按 signaled completion 连续释放前置 unsignaled WQE。
+// 设计说明：host-produced ring 以 slot 记录 request/image/wr_id 与 completion 状态，才能按 signaled
+//  completion 连续释放前置 unsignaled WQE。
 class rdma_queue_slot_ledger_entry extends uvm_object;
   `uvm_object_utils(rdma_queue_slot_ledger_entry)
   bit posted;
@@ -281,10 +273,9 @@ class rdma_queue_slot_ledger_entry extends uvm_object;
   rdma_hw_image image;
   rdma_status completion_status;
 
-  // 功能：构造一个未 post、未 consume 的 host WQE ledger slot。
-  // 输入/输出及副作用：name（输入）设置 UVM 名称；清零游标/元数据并置 request_snapshot、
-  //   image、completion_status 为 null。
-  // 失败/边界：初始 slot 不代表可消费 WQE；只有 commit_producer 可以将 posted 置位。
+  // 功能：构造未 post、未 consume 的 host WQE ledger slot。
+  // 输入/输出及副作用：name 设置 UVM 名；清零游标/元数据，快照与 status 置 null。
+  // 失败/边界：初始 slot 不代表可消费 WQE；只有 commit_producer 才置 posted。
   function new(string name = "rdma_queue_slot_ledger_entry");
     super.new(name);
     posted = 0;

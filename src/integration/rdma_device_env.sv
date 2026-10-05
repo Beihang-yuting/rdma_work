@@ -56,11 +56,9 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
   int unsigned expected_owner_generation;
   bit captured;
 
-  // 功能：构造空的 candidate fingerprint，所有 authority/owner 字段均置为未捕获状态。
-  // 输入/输出及副作用：name（输入）；new 初始化 UVM 名称、空 identity/source 引用和
-  //   标志字段，不修改 candidate、context 或 coordinator，也不取得外部资源所有权。
-  // 失败/边界：新对象不能直接用于 verify；必须先由 capture() 在 epoch 发布前完成
-  //   一次完整捕获，捕获失败时调用方应丢弃本对象并恢复 quiesce。
+  // 功能：构造空的 candidate fingerprint，各 authority/owner 字段为未捕获状态。
+  // 输入/输出及副作用：仅初始化名称与空引用/标志，不碰 candidate/context/coordinator。
+  // 失败/边界：未经 capture() 不能 verify；capture 失败时调用方应丢弃本对象并恢复 quiesce。
   function new(string name = "rdma_reset_candidate_fingerprint");
     super.new(name);
     expected_identity = null;
@@ -96,12 +94,9 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
     captured = 1'b0;
   endfunction
 
-  // 功能：把 identity 的五组值字段复制到 env-owned detached snapshot，避免 seal 与
-  //       candidate 的可变句柄共享对象。
-  // 输入/输出及副作用：source（输入）、name（输入）；返回新建 identity 值快照，不修改
-  //   source 或任何外部 ledger；该函数只使用直接构造和字段赋值，不调用 factory clone。
-  // 失败/边界：source 为 null 时返回 null；返回值只代表字段复制成功，不替代调用方对
-  //   route、UID、generation 和 reset_epoch 的业务校验。
+  // 功能：把 identity 的值字段复制为 env 私有的 detached 快照，避免与 candidate 共享可变句柄。
+  // 输入/输出及副作用：source 只读；返回新快照，只用直接构造与字段赋值，不调用 factory clone。
+  // 失败/边界：source 为 null 返回 null；不替代调用方对 route/UID/generation/epoch 的业务校验。
   protected static function rdma_function_identity copy_identity_value(
     rdma_function_identity source,
     string name
@@ -119,13 +114,9 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
     return copy;
   endfunction
 
-  // 功能：逐字段比较 reset candidate 的完整 binding 公开值图，覆盖 PCIe/BAR、notify、
-  //       queue DMA/能力、interrupt vector、owner、生命周期和 readiness 字段。
-  // 输入/输出及副作用：expected（输入）是 capture() 期间构造的 detached binding；actual
-  //   （输入）是 virtual callback 后仍待提交的 candidate binding；identity（输入）是预期
-  //   binding incarnation。函数只读对象并返回 bit，不调用 validate、clone、factory 或外部 router。
-  // 失败/边界：任一对象/嵌套值缺失、identity 镜像不一致、BAR/vector 顺序或任意公开字段漂移
-  //   返回 0；该比较不替代 capture 阶段对 source graph 的完整性检查。
+  // 功能：逐字段比较 reset candidate 的完整 binding 公开值图（PCIe/BAR、notify、队列 DMA、vector、owner 等）。
+  // 输入/输出及副作用：expected 为 capture 时构造的 detached binding，actual 为仍待提交的 candidate binding；只读，返回 bit。
+  // 失败/边界：任一对象/嵌套值缺失、identity 镜像不符、BAR/vector 顺序或公开字段漂移返回 0。
   protected static function bit binding_value_matches(
     rdma_function_binding expected,
     rdma_function_binding actual,
@@ -193,15 +184,11 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：复制 binding 的完整公开值图，建立 reset seal 专用 detached snapshot；该路径
-  //       校验 identity/PCIe/BAR/owner 图的结构和镜像一致性，但不把 ACTIVE readiness
-  //       （MSE/BME、notify/DMI/VFT ready）误当成 reset capture 的前置条件。
-  // 输入/输出及副作用：source（输入）为 context 或 candidate binding；name（输入）为
-  //   snapshot 名称；snapshot（输出）获得独立 identity、PCIe/BAR、queue/vector、owner
-  //   和 readiness 值，不修改 source、context、router 或 coordinator。
-  // 失败/边界：source/identity/PCIe/BAR 缺失、identity snapshot 或 owner 类型不支持、
-  //   UID/generation/route 镜像不一致时返回 INVALID_STATE/INVALID_ARGUMENT；该 helper
-  //   不调用 source.validate()，因此调用方仍须由 binding_value_matches() 做最终值比对。
+  // 功能：复制 binding 完整公开值图为 reset seal 专用的 detached 快照。
+  // 输入/输出及副作用：source 只读；snapshot 输出独立的 identity/PCIe/BAR/queue/vector/owner/readiness 值；不要求
+  //   ACTIVE readiness。
+  // 失败/边界：source/identity/PCIe/BAR 缺失、owner 类型不支持或 UID/generation/route 镜像不符返回 INVALID_*；不调用
+  //   source.validate()。
   protected static function rdma_status snapshot_binding_value_graph(
     rdma_function_binding source,
     string name,
@@ -337,16 +324,11 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 virtual validate_reset_candidate() 之前，根据旧 identity 和 coordinator
-  //       preview 的 next generation/epoch 记录候选预期值及 source/binding/owner 哨兵，
-  //       建立防止后续 hostile callback 改写早期 candidate 的 env-owned seal。
-  // 输入/输出及副作用：candidate、previous_identity、next_generation、next_epoch、
-  //   expected_source_identity、expected_source_binding、expected_source_state（输入）；
-  //   成功时写入本 fingerprint 的 detached identity 与公开 route/owner 镜像并返回 OK，
-  //   不修改 candidate/context。
-  // 失败/边界：candidate、旧 identity、binding、owner 或 binding identity snapshot 缺失、
-  //   candidate identity/binding 与 preview incarnation 不一致、PCIe route 不完整时返回
-  //   INVALID_STATE；调用方不得在失败后调用 virtual validate 或发布 epoch。
+  // 功能：在 virtual validate_reset_candidate() 之前，按旧 identity 与 preview 的 next generation/epoch
+  //   记录候选预期值与 source 哨兵。
+  // 输入/输出及副作用：成功时写入本 fingerprint 的 detached identity 与 route/owner 镜像；不修改 candidate/context。
+  // 失败/边界：candidate/旧 identity/binding/owner 缺失、与 preview incarnation 不符或 PCIe route 不完整返回
+  //   INVALID_STATE；失败后不得继续 virtual validate 或发布 epoch。
   function rdma_status capture(
     rdma_function_reset_candidate candidate,
     rdma_function_identity previous_identity_arg,
@@ -518,14 +500,9 @@ class rdma_reset_candidate_fingerprint extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在所有 context 的 virtual prepare/validate 返回后，以不经过 factory/virtual
-  //       callback 的直接值比较验证 candidate 仍等于 capture() 时的预期图，阻止 epoch
-  //       publish 后提交漂移值。
-  // 输入/输出及副作用：candidate（输入）；只读比较 candidate 与 fingerprint 保存的
-  //   identity、binding route/owner 和 source 哨兵，返回 detached status，不修改任何对象。
-  // 失败/边界：seal 未捕获、validation_complete 被清除、任一 identity/source/PCIe/owner
-  //   字段漂移或 binding noalloc authority 不再接受 owner 时返回 INVALID_STATE；调用方必须
-  //   在 coordinator epoch publication 前恢复 quiesce 并放弃 candidate。
+  // 功能：所有 context 的 virtual prepare/validate 返回后，直接比较 candidate 是否仍等于 capture 时的预期图。
+  // 输入/输出及副作用：只读比较 identity、binding route/owner 与 source 哨兵；返回 detached status。
+  // 失败/边界：seal 未捕获、validation_complete 被清除、任一字段漂移或 owner 不再被 noalloc authority 接受返回 INVALID_STATE。
   function rdma_status verify(
     rdma_function_reset_candidate candidate
   );
@@ -654,12 +631,9 @@ class rdma_device_env extends uvm_object;
   // 使 coordinator lease 与 env 生命周期有明确的终点。
   protected bit m_closed;
 
-  // 功能：env_status_or_error 将 identity/context/reset 边界返回的状态统一为
-  //       非空值，避免集成层在错误诊断中再次解引用 null。
-  // 输入/输出及副作用：status 和 label 为输入；非空状态原样返回，null 状态
-  //       转为 INVALID_STATE；不修改快照、identity、context 或 coordinator。
-  // 失败/边界：任何外部适配器返回 null 都被视为契约违例，调用方必须停止当前
-  //       构建或复位分支，不能发布半初始化 device env。
+  // 功能：把外部边界返回的 status 统一为非空值。
+  // 输入/输出及副作用：非空原样返回；null 转为 INVALID_STATE 并带 label。
+  // 失败/边界：null 视为契约违例，调用方须停止当前构建或复位分支。
   protected static function rdma_status env_status_or_error(
     rdma_status status,
     string label
@@ -672,9 +646,9 @@ class rdma_device_env extends uvm_object;
     return status;
   endfunction
 
-  // 功能：构造空的设备环境对象并初始化 UVM 对象名称；实际依赖绑定由 build() 完成。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
+  // 功能：构造空的 device env；实际依赖由 build() 绑定。
+  // 输入/输出及副作用：name 为 UVM 对象名；初始化 reset/close 标志。
+  // 失败/边界：不分配 Host-memory/PCIe/manager 资源。
   function new(string name="rdma_device_env");
     super.new(name);
     m_reset_in_progress = 1'b0;
@@ -682,14 +656,10 @@ class rdma_device_env extends uvm_object;
     m_closed = 1'b0;
   endfunction
 
-  // 功能：以冻结 dpu_common 快照为权威，原子地组装 device env、identity ledger
-  //       和 reset coordinator；失败时返回错误状态且不返回半初始化环境。
-  // 输入/输出及副作用：冻结快照和 manager/router 以非拥有引用写入候选 env；每个 Function
-  //   由 adapter 投影 identity/binding、由 context 克隆并暂存 identity，全部 Function 成功后
-  //   才通过 coordinator 批量提交 Host-router/identity ledger；result_env 仅在最终 commit 成功
-  //   后发布，registry/build_timeout 仅为兼容参数。
-  // 失败/边界：依赖为空、快照未冻结/不一致或任一 Function 投影/构造失败时返回错误且
-  //   result_env 保持 null；候选对象不会对外发布。
+  // 功能：以冻结的 dpu_common 快照为权威，原子组装 device env、identity ledger 与 reset coordinator。
+  // 输入/输出及副作用：快照/manager/router 以非拥有引用保存；全部 Function 成功后才批量提交，result_env 仅在最终成功后发布；
+  //   registry/build_timeout 仅为兼容参数。
+  // 失败/边界：依赖为空、快照未冻结/不一致或任一 Function 投影/构造失败返回错误且 result_env 为 null。
   static function rdma_status build(
     dpu_device_snapshot source_device_snapshot,
     dpu_resource_snapshot source_resources,
@@ -827,10 +797,9 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按 dpu_common 完整 Function key 查询身份，并返回与内部 ledger 解耦的克隆。
-  // 输入/输出及副作用：key（输入）；按 dpu_function_key_name 查找 ledger，并返回 identity 的
-  //   clone；读取不修改 ledger，也不转移快照所有权。
-  // 失败/边界：key 未枚举或 clone/cast 失败时返回 null；调用方不得把 null 当作有效身份。
+  // 功能：按 dpu_common 完整 Function key 查询身份。
+  // 输入/输出及副作用：只读 ledger；返回与 ledger 解耦的 clone。
+  // 失败/边界：key 未枚举或 clone/cast 失败返回 null。
   function rdma_function_identity get_identity(dpu_function_key_t key);
     rdma_function_identity copy;
     string key_name;
@@ -842,10 +811,9 @@ class rdma_device_env extends uvm_object;
     return copy;
   endfunction
 
-  // 功能：将 RDMA identity 的完整 Host/root/PF-parent/VF/BDF 路由编码为内部索引键。
-  // 输入/输出及副作用：identity_key（输入）；只读编码 Host/root/function-kind/VF/BDF/parent-PF
-  //   为稳定字符串键，不包含 generation 或对象句柄。
-  // 失败/边界：identity_key 的字段始终是 packed 值；函数不分配资源，缺省字段按 0 编码。
+  // 功能：把 RDMA identity 的 Host/root/function-kind/VF/BDF/parent-PF 路由编码为索引键。
+  // 输入/输出及副作用：identity_key 只读；返回字符串键，不含 generation 或句柄。
+  // 失败/边界：无。
   protected static function string identity_key_name(
     rdma_function_key_t identity_key
   );
@@ -864,11 +832,9 @@ class rdma_device_env extends uvm_object;
                      identity_key.parent_pf_bdf.function_num);
   endfunction
 
-  // 功能：按完整 identity 查找已枚举的 Function context，并校验调用方提供的
-  //       identity 与 env 保存的 incarnation 一致。
-  // 输入/输出及副作用：identity（输入）、result_context（输出）；按完整 identity key 查找并
-  //   发布 env 持有的 context 非拥有引用，不克隆 context 或修改 ledger。
-  // 失败/边界：identity 为空、key 不存在或 generation/epoch 不一致时返回明确错误状态。
+  // 功能：按完整 identity 查找 Function context，并校验与 env 保存的 incarnation 一致。
+  // 输入/输出及副作用：result_context 输出 env 持有的非拥有引用；不克隆、不改 ledger。
+  // 失败/边界：identity 为空、key 不存在或 generation/epoch 不一致返回错误。
   function rdma_status find_function(
     rdma_function_identity identity,
     output rdma_function_context result_context
@@ -890,10 +856,8 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按 Function handle 反查 context，保证 UID、global ID 和 generation 三元组
-  //       与 env 的 immutable identity 完全匹配，避免同一 Host 上本地编号串线。
-  // 输入/输出及副作用：function_handle（输入）、result_context（输出）；按 function_uid、global ID
-  //   和 generation 三元组扫描 context，发布匹配的非拥有引用。
+  // 功能：按 Function handle 反查 context，要求 UID、global ID、generation 三元组与 env identity 一致。
+  // 输入/输出及副作用：result_context 输出非拥有引用。
   // 失败/边界：句柄为空/类型错误返回 INVALID_ARGUMENT；UID 存在但 generation 过期返回 STALE。
   function rdma_status find_handle(
     rdma_handle function_handle,
@@ -924,19 +888,16 @@ class rdma_device_env extends uvm_object;
                              "Function handle is not enumerated");
   endfunction
 
-  // 功能：返回当前 device env 已枚举的 Function context 数量，供上层完成拓扑覆盖检查。
-  // 输入/输出及副作用：无参数；只读返回 m_contexts 中已枚举的 context 数量。
-  // 失败/边界：尚未枚举任何 Function 时返回 0；函数不创建或删除 context。
+  // 功能：返回已枚举的 Function context 数量。
+  // 输入/输出及副作用：只读 m_contexts。
+  // 失败/边界：未枚举时返回 0。
   function int unsigned context_count();
     return m_contexts.num();
   endfunction
 
-  // 功能：在任何 reset side effect 前验证目标 scope 的 authority、登记关系和 context 覆盖，建立
-  //       quiesce 前的只读屏障。
-  // 输入/输出及副作用：scope/identity/host_key（输入）；调用 coordinator 的 registered identity/
-  //   Host scope 查询并扫描本 env context，成功只返回状态，不修改 context、router、epoch 或 ledger。
-  // 失败/边界：unknown/stale identity、未登记 Host、空 scope、context 缺失或选中 context 已
-  //   QUARANTINED 时返回错误；所有拒绝均发生在 quiesce 前，调用方可安全保持旧状态。
+  // 功能：在任何 reset 副作用前验证 scope 的 authority、登记关系与 context 覆盖。
+  // 输入/输出及副作用：查询 coordinator 并扫描 env context；只返回状态，不改任何状态。
+  // 失败/边界：identity 未知/过期、Host 未登记、scope 为空、context 缺失或已 QUARANTINED 时返回错误；均发生在 quiesce 前。
   protected function rdma_status validate_reset_scope(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -1026,9 +987,8 @@ class rdma_device_env extends uvm_object;
       end
 
       RDMA_ENV_RESET_DEVICE: begin
-        // Device reset has no external identity argument, but an empty env is
-        // still an invalid target: otherwise coordinator epoch would advance
-        // without a context capable of consuming the new incarnation.
+        // Device reset 没有外部 identity 参数，但空 env 仍是非法目标：否则 coordinator epoch 会前进，
+        // 却没有 context 能消费新的 incarnation。
       end
 
       default:
@@ -1063,12 +1023,9 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：执行一个已经完成参数/authority 初筛的 env reset scope，并把 preflight、quiesce
-  //       和两阶段 rebuild 串成单一可清理的事务边界。
-  // 输入/输出及副作用：scope/identity/host_key（输入）选择 reset 范围；函数只调用现有
-  //       validate_reset_scope()/quiesce_scope()/rebuild_scope()，成功时发布对应新 incarnation。
-  // 失败/边界：任一阶段返回 null 或错误都立即返回；调用方负责在进入本函数前设置 guard，
-  //       并在返回后清除 guard，使 virtual callback 重入请求只能观察到 RESOURCE_BUSY。
+  // 功能：把 preflight、quiesce 与两阶段 rebuild 串成一个 reset 事务。
+  // 输入/输出及副作用：按 scope/identity/host_key 依次调用 validate/quiesce/rebuild，成功时发布新 incarnation。
+  // 失败/边界：任一阶段返回 null 或错误立即返回；guard 由调用方设置和清除，重入请求只会得到 RESOURCE_BUSY。
   protected function rdma_status execute_reset_scope(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -1097,12 +1054,9 @@ class rdma_device_env extends uvm_object;
     return env_status_or_error(status, {phase, " rebuild"});
   endfunction
 
-  // 功能：在 env-local guard 之外，为已 claim coordinator lease 的 device env 开启 reset
-  //       transaction；standalone legacy probe 没有 lease 时保留旧的单对象语义。
-  // 输入/输出及副作用：无显式输入；读取 reset_coordinator/m_reset_lease_token，成功时由
-  //       coordinator 设置 active 标志；无 lease 时返回 OK 且只依赖 m_reset_in_progress。
-  // 失败/边界：coordinator 缺失返回 INVALID_STATE；另一个 owner、旧 token 或已有 active
-  //       transaction 返回 RESOURCE_BUSY/INVALID_STATE，调用方不得进入 execute_reset_scope。
+  // 功能：为已持有 coordinator lease 的 env 开启 reset 事务。
+  // 输入/输出及副作用：读取 coordinator 与 lease token，成功时 coordinator 置 active；无 lease 的 standalone env 返回 OK。
+  // 失败/边界：coordinator 缺失返回 INVALID_STATE；他人持有、旧 token 或已有 active 返回 RESOURCE_BUSY/INVALID_STATE。
   protected function rdma_status begin_reset_transaction();
     if (reset_coordinator == null)
       return rdma_status::make(
@@ -1114,48 +1068,36 @@ class rdma_device_env extends uvm_object;
     return reset_coordinator.begin_reset(this, m_reset_lease_token);
   endfunction
 
-  // 功能：关闭 begin_reset_transaction() 建立的 coordinator active 标志，作为 env reset
-  //       成功、预检失败或 rollback 返回后的统一清理出口。
-  // 输入/输出及副作用：无显式输入；读取当前 coordinator lease，成功时清除 active 标志；无
-  //       lease 的 standalone env 返回 OK，不修改 context/epoch/ledger。
-  // 失败/边界：coordinator 缺失或 owner/token 已失效返回对应错误；end 失败表示生命周期契约
-  //       破坏，调用方应保留原 reset status 并将环境视为需要隔离。
+  // 功能：关闭 begin_reset_transaction 设置的 active 标志，作为统一清理出口。
+  // 输入/输出及副作用：成功时清除 coordinator active；standalone env 返回 OK。
+  // 失败/边界：coordinator 缺失或 owner/token 失效返回错误，表示生命周期契约被破坏。
   protected function rdma_status end_reset_transaction();
     if (reset_coordinator == null || !reset_coordinator.lease_held())
       return rdma_status::success();
     return reset_coordinator.end_reset(this, m_reset_lease_token);
   endfunction
 
-  // 功能：为 reset scope 的所有 context/coordinator seam 统一提供可选 lease owner，避免
-  //       standalone/no-lease env 把非零 owner 与零 token 组合传入而被误判为半授权调用。
-  // 输入/输出及副作用：无显式输入；当 coordinator 当前由本 env 持有 lease 时返回 this，
-  //       否则返回 null；只读 coordinator lease，不修改 context、router 或 reset ledger。
-  // 失败/边界：coordinator 缺失或未 claim lease 时返回 null，调用方必须同时使用
-  //       reset_operation_token() 的零 token 兼容值，不能只替换 owner 参数。
+  // 功能：为 reset 的 context/coordinator 调用统一提供可选 lease owner。
+  // 输入/输出及副作用：只读；本 env 持有 lease 时返回 this，否则 null。
+  // 失败/边界：coordinator 缺失或未 claim 时返回 null，须与零 token 配套使用。
   protected function uvm_object reset_operation_owner();
     if (reset_coordinator != null && reset_coordinator.lease_held())
       return this;
     return null;
   endfunction
 
-  // 功能：返回与 reset_operation_owner() 成对的 coordinator lease token，供 context 状态
-  //       迁移、epoch publication 和 prevalidated commit 共用同一授权边界。
-  // 输入/输出及副作用：无显式输入；持有当前 env lease 时返回 m_reset_lease_token，否则
-  //       返回零；函数只读 env/coordinator 生命周期字段，不修改任何账本。
-  // 失败/边界：coordinator 未 claim lease、token 尚未初始化或 coordinator 缺失时返回零；
-  //       调用方不得把零 token 与非 null owner 拼接使用。
+  // 功能：返回与 reset_operation_owner 成对的 lease token。
+  // 输入/输出及副作用：只读；持有 lease 时返回 m_reset_lease_token，否则 0。
+  // 失败/边界：coordinator 缺失或未 claim 返回 0，不得与非 null owner 搭配。
   protected function longint unsigned reset_operation_token();
     if (reset_coordinator != null && reset_coordinator.lease_held())
       return m_reset_lease_token;
     return 0;
   endfunction
 
-  // 功能：在 execute_reset_scope() 返回后清除 env guard、结束 coordinator transaction，并
-  //       合并 reset 原始结果与 end_reset 清理结果，保持最先可定位的失败诊断不被吞掉。
-  // 输入/输出及副作用：reset_status/phase（输入）；清除 m_reset_in_progress，调用 end_reset_transaction()
-  //       并返回原始成功/失败或带清理 metadata 的 detached status，不修改已发布 epoch。
-  // 失败/边界：end_reset 返回 null/错误时 fail-closed；原始 reset 失败与清理失败同时存在时
-  //       返回包含两者消息的 status，调用方不得把 transaction 生命周期破坏当作成功。
+  // 功能：execute_reset_scope 返回后清除 env guard、结束事务，并合并原始结果与清理结果。
+  // 输入/输出及副作用：清除 m_reset_in_progress，调用 end_reset_transaction；不改已发布 epoch。
+  // 失败/边界：end_reset 返回 null/错误时 fail-closed；两者都失败时返回含两者消息的 status。
   protected function rdma_status finish_reset_transaction(
     rdma_status reset_status,
     string phase
@@ -1172,15 +1114,9 @@ class rdma_device_env extends uvm_object;
     );
   endfunction
 
-  // 功能：在 device env 改写 Host-router 或 retained context 之前，逐项预检所有 context
-  //       是否能够在同一 owner/token 下完成 close quarantine，建立不会产生部分 teardown
-  //       的失败屏障。
-  // 输入/输出及副作用：owner/lease_token（输入）描述当前 env 的 coordinator ownership；
-  //       函数只读取 m_contexts 及每个 context 的 reset authority，返回第一个失败 status，
-  //       不清空 identity/binding、router 引用、coordinator ledger 或任何外部资源所有权。
-  // 失败/边界：索引中出现 null context、context 的 coordinator/lease 不匹配、owner/token
-  //       不成对或 coordinator transaction 已失效时返回错误；全部 context 已处于
-  //       QUARANTINED 仍按幂等路径通过，调用方只有在本函数成功后才可进入 teardown 提交。
+  // 功能：在改写 Host-router 或 context 之前，预检所有 context 能否在同一 owner/token 下完成 close quarantine。
+  // 输入/输出及副作用：只读 m_contexts 与各 context 的 reset authority；返回首个失败 status。
+  // 失败/边界：出现 null context、coordinator/lease 不匹配、owner/token 不成对或事务失效返回错误；已 QUARANTINED 视为幂等通过。
   protected function rdma_status preflight_close_contexts(
     uvm_object owner = null,
     longint unsigned lease_token = 0
@@ -1207,16 +1143,10 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：关闭 device env 的 reset ownership 生命周期，先预检所有 retained context，再
-  //       双侧解除 Host-router 绑定并 quarantine context，最后释放 coordinator lease 并
-  //       清理 env 对所有外部快照、manager、router、context 和 identity 的非拥有引用；
-  //       预检保证任一 context authority 拒绝时不会先发生 router 单侧 detach。
-  // 输入/输出及副作用：无显式输入；成功时 m_closed 置位、context 进入
-  //       RDMA_CONTEXT_QUARANTINED、router 与 coordinator 的反向引用均清除；外部
-  //       snapshot/manager/PCIe/Host 资源仍由调用方拥有，close 不调用或释放它们。
-  // 失败/边界：reset 正在执行、coordinator lease 属于他人、router 未知/仍有 active mapping 或
-  //       detach/release 返回错误时保持 env、lease 和双侧绑定不变；重复 close 幂等成功，调用方
-  //       必须先 drain mapping 后再重试 close。
+  // 功能：关闭 device env：预检 context，双侧解除 Host-router 绑定并 quarantine，释放 lease，清除所有非拥有引用。
+  // 输入/输出及副作用：成功时 m_closed 置位，context 变 QUARANTINED；外部 snapshot/manager/PCIe/Host 资源仍归调用方。
+  // 失败/边界：reset 进行中、lease 属他人、router 未知/仍有 active mapping 或 detach 失败时保持 env/lease/绑定不变；重复
+  //   close 幂等，需先 drain mapping 再重试。
   function rdma_status close();
     rdma_status status;
     string key_name;
@@ -1354,12 +1284,10 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：四类复位入口的共用事务外壳：校验 env 未关闭、coordinator 存在且无并发复位，
-  //   开启复位事务后执行指定 scope 的 prepare/commit，并经 finish_reset_transaction 收尾。
-  // 输入/输出及副作用：scope/identity/host_key 透传给 execute_reset_scope；label 作为诊断前缀；
-  //   成功开启事务后置 m_reset_in_progress，由 finish_reset_transaction 负责清除。
-  // 失败/边界：env 已关闭或缺少 coordinator 返回 INVALID_STATE，已有复位返回
-  //   RESOURCE_BUSY；事务开启失败（含 null）在置位前返回，不改变 context。
+  // 功能：四类复位入口共用的事务外壳。
+  // 输入/输出及副作用：scope/identity/host_key 透传给 execute_reset_scope；label 为诊断前缀；开启事务后置
+  //   m_reset_in_progress，由 finish_reset_transaction 清除。
+  // 失败/边界：env 已关闭或无 coordinator 返回 INVALID_STATE；已有复位返回 RESOURCE_BUSY；事务开启失败在置位前返回。
   protected function rdma_status run_reset_request(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -1386,12 +1314,9 @@ class rdma_device_env extends uvm_object;
     return finish_reset_transaction(status, label);
   endfunction
 
-  // 功能：请求指定 VF 的 Function-level reset，并以单 context prepare/commit 事务发布新 incarnation。
-  // 输入/输出及副作用：identity（输入）；先只读校验 authority，再 quiesce 目标 VF，由 rebuild_scope
-  //   预构造 identity/binding/ledger 候选，随后才推进 coordinator epoch 并无分配地提交；其他
-  //   Function 不受影响，prepare 失败会恢复本次 quiesce 屏障。
-  // 失败/边界：null、非 VF、未知/过时代 identity、缺失目标 context、候选 factory 失败或
-  //   coordinator 缺失时返回错误；epoch commit 前失败保持 context/router/epoch/ledger 不变。
+  // 功能：请求指定 VF 的 Function-level reset，以单 context prepare/commit 发布新 incarnation。
+  // 输入/输出及副作用：先只读校验，再 quiesce 目标 VF、预构造候选，之后才推进 epoch 并无分配提交；其他 Function 不受影响。
+  // 失败/边界：null、非 VF、未知/过期 identity、context 缺失、候选构造失败或 coordinator 缺失返回错误；epoch 提交前失败保持状态不变。
   function rdma_status request_vf_flr(rdma_function_identity identity);
     if (!m_closed &&
         (identity == null || identity.key.function_kind != RDMA_FUNCTION_VF))
@@ -1400,11 +1325,9 @@ class rdma_device_env extends uvm_object;
     return run_reset_request(RDMA_ENV_RESET_VF, identity, 0, "VF FLR");
   endfunction
 
-  // 功能：请求指定 PF reset，并按同 Host、同 root、同 parent BDF 级联执行跨 context prepare/commit。
-  // 输入/输出及副作用：identity（输入）；先只读校验完整 PF scope，再 quiesce 所有选中 context，
-  //   为 PF/VF 全集准备 detached candidate 和 identity ledger，全部成功后才推进 PF epoch 并提交。
-  // 失败/边界：null、非 PF、未知/过时代 identity、scope 覆盖不完整、任一 candidate/ledger
-  //   factory 失败或 coordinator 缺失时返回错误；epoch commit 前失败不留下部分 context 变化。
+  // 功能：请求 PF reset，按同 Host、同 root、同 parent BDF 级联重建 PF/VF 全集。
+  // 输入/输出及副作用：先校验完整 PF scope，quiesce 全部选中 context，准备候选与 identity ledger，全部成功后才推进 PF epoch。
+  // 失败/边界：null、非 PF、identity 未知/过期、scope 覆盖不全、候选/ledger 构造失败或 coordinator 缺失返回错误；epoch 提交前失败不留部分变化。
   function rdma_status request_pf_reset(rdma_function_identity identity);
     if (!m_closed &&
         (identity == null || identity.key.function_kind != RDMA_FUNCTION_PF))
@@ -1413,30 +1336,26 @@ class rdma_device_env extends uvm_object;
     return run_reset_request(RDMA_ENV_RESET_PF, identity, 0, "PF reset");
   endfunction
 
-  // 功能：请求 Host reset，级联停止并以跨 context prepare/commit 重建该 Host topology 的全部 Function。
-  // 输入/输出及副作用：host_topology_key（输入）；先只读校验 Host scope 和 context 覆盖，再 quiesce
-  //   全部选中 context，预构造所有下一代值图，最后一次性推进 Host/Function epoch 并发布候选。
-  // 失败/边界：coordinator 缺失、Host 未登记、scope 覆盖不完整、candidate/ledger factory 失败或
-  //   quarantined context 时在 epoch commit 前返回，并恢复本次 quiesce 的 context 状态。
+  // 功能：请求 Host reset，级联重建该 Host topology 下全部 Function。
+  // 输入/输出及副作用：先校验 Host scope 与覆盖，quiesce 全部 context，预构造下一代值图，最后一次性推进 Host/Function epoch。
+  // 失败/边界：coordinator 缺失、Host 未登记、覆盖不全、候选/ledger 构造失败或存在 quarantined context 时在 epoch 提交前返回并恢复
+  //   quiesce。
   function rdma_status request_host_reset(int unsigned host_topology_key);
     return run_reset_request(RDMA_ENV_RESET_HOST, null, host_topology_key,
                              "Host reset");
   endfunction
 
-  // 功能：请求 Device reset，级联停止并以全 env 的跨 context prepare/commit 重建所有 Function。
-  // 输入/输出及副作用：无参数；先只读校验 device scope 覆盖，再 quiesce 全部 context，预构造
-  //   下一代 identity/binding/ledger，所有候选成功后才推进全局 Device epoch 并无分配地提交。
-  // 失败/边界：coordinator 缺失、env scope 为空/覆盖不完整、candidate factory 失败或 quarantined
-  //   context 时在 epoch commit 前拒绝并恢复本次 quiesce；commit 后仅保留无分配 assignment 路径。
+  // 功能：请求 Device reset，级联重建 env 内全部 Function。
+  // 输入/输出及副作用：无参数；先校验 device scope 覆盖，quiesce 全部 context，预构造下一代 identity/binding/ledger，成功后推进
+  //   Device epoch。
+  // 失败/边界：coordinator 缺失、scope 为空/覆盖不全、候选构造失败或存在 quarantined context 时在 epoch 提交前拒绝并恢复 quiesce。
   function rdma_status request_device_reset();
     return run_reset_request(RDMA_ENV_RESET_DEVICE, null, 0, "Device reset");
   endfunction
 
-  // 功能：判断 context 是否属于给定复位范围，集中维护 VF/PF/Host/Device 选择规则。
-  // 输入/输出及副作用：context/scope/identity/host_key（输入）；只读判断 context 是否落在 VF、PF、
-  //   Host 或 Device 复位选择范围内，不修改任何状态。
-  // 失败/边界：null context/identity 永不匹配；PF 只通过完整 Host+root+parent BDF 选择后代 VF，
-  //   同 Host、同 BDF 但 root 不同的 malformed topology 必须被隔离。
+  // 功能：判断 context 是否属于给定复位范围（VF/PF/Host/Device）。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：null context/identity 不匹配；PF 仅按完整 Host+root+parent BDF 选择后代 VF，root 不同的畸形拓扑须被隔离。
   protected function bit scope_matches(
     rdma_function_context ctx_snapshot,
     rdma_device_reset_scope_e scope,
@@ -1469,12 +1388,9 @@ class rdma_device_env extends uvm_object;
     endcase
   endfunction
 
-  // 功能：计算给定 reset scope 在 coordinator ledger 中应覆盖的 Function 数量，用于在任何
-  //       quiesce/epoch side effect 前后防止 env 只重建部分 context。
-  // 输入/输出及副作用：scope/identity/host_key（输入）；只读查询 coordinator 的 Host/PF/Device
-  //   ledger 计数，不修改 context、router 或 epoch；返回 0 表示 scope 参数或 coordinator 不可用。
-  // 失败/边界：VF 固定要求一个已登记 Function；PF/Host/Device 计数由 coordinator 提供，调用方
-  //   必须把 0 视为覆盖失败而非合法空 reset。
+  // 功能：计算 reset scope 在 coordinator ledger 中应覆盖的 Function 数。
+  // 输入/输出及副作用：只读查询 coordinator 的 Host/PF/Device 计数；返回 0 表示参数或 coordinator 不可用。
+  // 失败/边界：VF 固定要求 1 个已登记 Function；调用方须把 0 视为覆盖失败。
   protected function int unsigned expected_scope_count(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -1496,12 +1412,9 @@ class rdma_device_env extends uvm_object;
     endcase
   endfunction
 
-  // 功能：恢复 quiesce_scope 本次实际从 ACTIVE 转为 QUIESCING 的 context，撤销尚未提交的
-  //       reset 屏障而不触碰既有 QUIESCING/其他 scope 状态。
-  // 输入/输出及副作用：transitioned_contexts（输入）是本次成功状态迁移的非拥有引用；逐个调用
-  //   restore_after_quiesce()，成功时只写回 context state，不分配 owner handle 或修改 epoch。
-  // 失败/边界：列表含 null、context owner 已失效或恢复 status 为 null/错误时立即返回错误；调用方
-  //   应保留原始 prepare 失败诊断，并将恢复失败视为需要隔离/人工处理的环境契约违例。
+  // 功能：恢复 quiesce_scope 本次从 ACTIVE 迁到 QUIESCING 的 context，撤销未提交的屏障。
+  // 输入/输出及副作用：transitioned_contexts 为本次迁移的非拥有引用；逐个 restore_after_quiesce，只写回 state。
+  // 失败/边界：列表含 null、owner 失效或恢复返回 null/错误时立即返回错误，调用方应保留原始失败诊断。
   protected function rdma_status restore_quiesced_scope(
     rdma_function_context transitioned_contexts[$]
   );
@@ -1523,13 +1436,9 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：把 reset prepare/epoch 的原始失败与 quiesce rollback 结果合并为一个可观察 status，
-  //       确保 rollback 自身失败时不会被原始错误吞掉。
-  // 输入/输出及副作用：original_status/rollback_status/phase 为输入；成功恢复时原样返回
-  //   original_status，恢复失败时返回携带原始诊断和 rollback metadata 的 detached status，
-  //   不修改输入 status、context、epoch 或 ledger。
-  // 失败/边界：original_status 为空或 rollback_status 为空均转为 INVALID_STATE；rollback
-  //   非 OK 时 fail-closed，调用方必须把环境视为需要隔离/人工处理，而不能继续重试提交。
+  // 功能：把 prepare/epoch 的原始失败与 quiesce rollback 结果合并为一个 status。
+  // 输入/输出及副作用：恢复成功则原样返回 original_status；失败则返回含两者诊断的 detached status。
+  // 失败/边界：任一输入为空转 INVALID_STATE；rollback 非 OK 时 fail-closed，环境须隔离，不得继续提交。
   protected static function rdma_status reset_status_after_rollback(
     rdma_status original_status,
     rdma_status rollback_status,
@@ -1572,12 +1481,10 @@ class rdma_device_env extends uvm_object;
     return original_status;
   endfunction
 
-  // 功能：在 epoch 发布前停止选中 context 接收新事务，并记录本次实际迁移的对象供失败回滚。
-  // 输入/输出及副作用：scope/identity/host_key（输入）；transitioned_contexts（输出）保存从 ACTIVE
-  //   成功转为 QUIESCING 的 context；函数不推进 coordinator epoch，DISCOVERED/既有 QUIESCING
-  //   context 保持原状态。
-  // 失败/边界：空/非法 context、QUARANTINED 或 quiesce 返回错误时 fail-closed；已成功 quiesce 的
-  //   context 会先尝试恢复，任何 epoch/router/identity ledger 都不会在本函数中改变。
+  // 功能：在 epoch 发布前停止选中 context 接收新事务，并记录实际迁移的对象供回滚。
+  // 输入/输出及副作用：transitioned_contexts 输出从 ACTIVE 转为 QUIESCING 的 context；不推进 epoch；DISCOVERED/已
+  //   QUIESCING 保持原状。
+  // 失败/边界：空/非法 context、QUARANTINED 或 quiesce 出错时 fail-closed，已迁移的先尝试恢复。
   protected function rdma_status quiesce_scope(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -1633,13 +1540,9 @@ class rdma_device_env extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在所有 context candidate 和 identity ledger 副本准备完成后，才向 coordinator 发布
-  //       当前 reset scope 的 Host/Function/Device epoch。
-  // 输入/输出及副作用：scope/identity/host_key（输入）；调用对应 coordinator request_*，成功时
-  //   一次性更新该 scope 的 epoch；调用前不修改 context identity/binding，调用后不再执行会分配
-  //   资源的动作。
-  // 失败/边界：coordinator 缺失、scope 参数非法或 request 返回 null/错误时原样拒绝；调用方必须
-  //   在该函数前完成所有可能失败的 candidate/ledger prepare，以避免 epoch 后出现部分重建。
+  // 功能：在所有候选与 ledger 副本备好后，向 coordinator 发布该 scope 的 Host/Function/Device epoch。
+  // 输入/输出及副作用：调用对应 request_*，一次性更新 epoch；之后不再做可能分配资源的动作。
+  // 失败/边界：coordinator 缺失、scope 参数非法或 request 返回 null/错误时原样拒绝；调用前须完成所有可能失败的 prepare。
   protected function rdma_status publish_reset_epoch(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,
@@ -1678,13 +1581,9 @@ class rdma_device_env extends uvm_object;
     return env_status_or_error(status, "reset coordinator epoch publication");
   endfunction
 
-  // 功能：为指定旧/new identity 对制作 detached ledger copy，定位 dpu_common identity ledger
-  //       的稳定键，但不修改任何 map；该 helper 是跨 context commit 的最后一个可失败阶段。
-  // 输入/输出及副作用：previous_identity/next_identity（输入）；ledger_key/staged_copy（输出）分别
-  //   返回匹配条目的 key 和 next_identity clone；函数只调用 clone，不改变 context、m_identities
-  //   或 coordinator 所有权。
-  // 失败/边界：任一 identity 为空、ledger 含不完整条目、clone/cast 失败或找不到 same_function
-  //   条目时返回错误，并保持 staged_copy null；调用方不得在失败后推进 epoch。
+  // 功能：为新旧 identity 对制作 detached 的 ledger 副本并定位稳定键，不改任何 map。
+  // 输入/输出及副作用：ledger_key/staged_copy 输出匹配条目的 key 与 next_identity 的 clone。
+  // 失败/边界：identity 为空、ledger 条目不完整、clone/cast 失败或找不到 same_function 条目时返回错误且 staged_copy 为 null。
   protected function rdma_status stage_identity_ledger_copy(
     rdma_function_identity previous_identity,
     rdma_function_identity next_identity,
@@ -1724,15 +1623,11 @@ class rdma_device_env extends uvm_object;
     );
   endfunction
 
-  // 功能：在 quiesce 后执行跨 context reset 的两阶段事务：先准备全部新值和 ledger copy，再发布
-  //       coordinator epoch，最后仅以无分配 assignment 提交所有 context/ledger。
-  // 输入/输出及副作用：scope/identity/host_key（输入）选择 reset 范围；transitioned_contexts（输入）
-  //   仅用于 prepare/epoch 失败时恢复本次 quiesce。成功时所有匹配 context 获得下一 generation/epoch，
-  //   m_identities 同步替换，且不再调用可能失败的 factory。
-  // 失败/边界：scope 覆盖计数不一致、context authority/ generation/epoch 校验失败、candidate 或
-  //   ledger clone 失败、coordinator epoch publication 失败时回滚 quiesce 并保持旧 identity/context；
-  //   epoch 已发布后只调用 commit_reset_prevalidated() 和 ledger assignment，所有可失败校验
-  //   均已前移，不能在发布后返回部分成功或伪造全局成功。
+  // 功能：quiesce 后的两阶段 reset：先备齐新值与 ledger 副本，再发布 epoch，最后用无分配 assignment 提交。
+  // 输入/输出及副作用：transitioned_contexts 仅用于失败时恢复 quiesce；成功时匹配 context 进入下一 generation/epoch，
+  //   m_identities 同步替换。
+  // 失败/边界：覆盖计数不符、authority/generation/epoch 校验失败、候选或 ledger clone 失败、epoch 发布失败时回滚 quiesce
+  //   并保持旧状态；epoch 发布后不再返回部分成功。
   protected function rdma_status rebuild_scope(
     rdma_device_reset_scope_e scope,
     rdma_function_identity identity,

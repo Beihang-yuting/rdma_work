@@ -1,10 +1,7 @@
 // 目录：协议与资源模型层 model/rdma_dma_request_context.sv。
-// 职责：实现 rdma_dma_request_context 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_dma_request_context.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：描述一次 DMA 请求的 Function、BDF/PASID、DMA domain、route/epoch 与 owner 快照。
+// 依赖：rdma_function_handle、route key、reset epoch、rdma_status。
+// 所有权与生命周期：对象拥有值字段及 handle 的 clone；调用方管理外部资源。
 
 class rdma_dma_request_context extends uvm_object;
   `uvm_object_utils(rdma_dma_request_context)
@@ -27,9 +24,9 @@ class rdma_dma_request_context extends uvm_object;
   bit queue_role_valid;
   int unsigned queue_role;
 
-  // 功能：构造 rdma_dma_request_context，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：function_h=null；requester_bdf='0；pasid_valid=1'b0；pasid='0；dma_domain_valid=1'b0；dma_domain_id='0；route='0；reset_epoch=0；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_dma_request_context 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造默认（全无效）DMA 请求上下文。
+  // 输入/输出及副作用：name 为对象名；各字段清零，句柄置 null。
+  // 失败/边界：无。
   function new(string name = "rdma_dma_request_context");
     super.new(name);
     function_h = null;
@@ -47,13 +44,9 @@ class rdma_dma_request_context extends uvm_object;
     queue_role = '0;
   endfunction
 
-  // 功能：normalize_validation_status 把本地校验链产生的 rdma_status 规范化为
-  //       可安全解引用的结果，保证可覆盖的状态工厂或 owner 校验器返回 null 时
-  //       仍以确定的 INVALID_STATE 结束请求校验。
-  // 输入/输出及副作用：candidate、boundary 为输入；非空 candidate 原样返回，
-  //       null 时直接构造一个独立的失败状态，不修改 request context 或外部资源。
-  // 失败/边界：candidate 为 null 表示下游状态构造违反非空契约；helper 不把 null
-  //       转成成功，也不调用可能再次被 hostile override 的 factory 创建路径。
+  // 功能：把校验链得到的 status 规范化，null 时返回确定的 INVALID_STATE。
+  // 输入/输出及副作用：candidate 非空原样返回；boundary 用于拼接诊断文本；不改上下文。
+  // 失败/边界：null 不转成成功，且用 make_direct 避免被重载的 factory 再返回 null。
   function automatic rdma_status normalize_validation_status(
     rdma_status candidate,
     string boundary
@@ -66,9 +59,9 @@ class rdma_dma_request_context extends uvm_object;
     return candidate;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“DMA request Function is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、function_h、function_h.kind、function_h.generation、route_valid、route、pasid_valid、pasid 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“DMA request Function is invalid”“DMA request Function generation is zero”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 Function、generation、route、PASID 与 owner 的一致性。
+  // 输入/输出及副作用：只读本对象；返回 status。
+  // 失败/边界：Function 非法/generation 为零/route 非法/无效 PASID 非零/owner 不属于 Function 时返回对应错误。
   function rdma_status validate();
     rdma_status status;
 
@@ -110,9 +103,9 @@ class rdma_dma_request_context extends uvm_object;
     return normalize_validation_status(status, "success construction");
   endfunction
 
-  // 功能：将 rhs 中 rdma_dma_request_context 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（rdma_dma_request_context copy type mismatch），不保留部分有效快照。
+  // 功能：深拷贝 rhs 的值字段，handle 字段按 clone 复制。
+  // 输入/输出及副作用：覆盖当前对象字段；rhs 不被修改。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_dma_request_context rhs_context;
 

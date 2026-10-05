@@ -21,10 +21,9 @@ class rdma_host_mem_route_entry extends uvm_object;
   int unsigned host_topology_key;
   rdma_host_mem_api manager;
 
-  // 功能：构造一个未绑定 manager 的 Host route entry；调用方随后填写 Host key 和
-  //       非拥有 manager 引用，再交给 router.configure() 做完整校验。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
+  // 功能：构造未绑定 manager 的 Host route entry。
+  // 输入/输出及副作用：name 为对象名；调用方随后填写 Host key 和非拥有 manager 引用。
+  // 失败/边界：无。
   function new(string name = "rdma_host_mem_route_entry");
     super.new(name);
     host_topology_key = 0;
@@ -39,9 +38,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   protected rdma_host_mem_api m_managers[int unsigned];
   protected rdma_reset_epoch_t m_epochs[int unsigned];
 
-  // m_maps 中的 object 是 manager 返回、由调用方持有的 mapping。其余
-  // parallel arrays 是 router 自己拥有的不可变 authority ledger，任何
-  // release 都必须同步删除，避免后续 allocation 与 ledger 错位。
+  // m_maps 存 manager 返回、由调用方持有的 mapping；其余平行数组是 router 自有的 authority ledger，
+  // release 时必须同步删除，避免与后续 allocation 错位。
   protected rdma_dma_mapping m_maps[$];
   protected rdma_reset_epoch_t m_map_epochs[$];
   protected rdma_reset_epoch_t m_map_local_host_epochs[$];
@@ -61,17 +59,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   protected rdma_bdf_t m_map_requester_bdfs[$];
   protected rdma_reset_coordinator m_reset;
 
-  // 功能：统一验证 router 可变入口是否由当前 coordinator lease owner 调用，避免
-  //       direct configure/epoch advance 在 env reset transaction 中绕过 ownership 边界；
-  //       Host epoch publication 由 coordinator 主入口授权后可显式允许 active seam。
-  // 输入/输出及副作用：owner/token（输入）描述可选 lease；require_active（输入）要求
-  //       coordinator transaction 已开始；allow_active（输入）仅供 coordinator 已授权的
-  //       epoch publication seam 使用；函数只读 m_reset 与 coordinator lease，不修改 mapping。
-  // 失败/边界：未绑定 coordinator 时保留 legacy null/0 语义；已绑定但尚未 claim lease
-  //       的 legacy coordinator 仍必须经过 coordinator 的 publication/transaction guard，
-  //       不能借 router 这条入口绕过同步 callback 屏障。已有 lease 且 owner/token 不匹配
-  //       返回 RESOURCE_BUSY，要求 active 但未 begin 返回 INVALID_STATE；active 期间未显式
-  //       允许的 direct callback 仍被拒绝。
+  // 功能：校验 router 可变入口是否由当前 coordinator lease owner 调用，防止绕过 reset 事务。
+  // 输入/输出及副作用：owner/token 描述 lease；require_active 要求 coordinator 事务已开始；
+  //   allow_active 仅供 coordinator 授权的 epoch publication seam；只读 m_reset，不改 mapping。
+  // 失败/边界：未绑定 coordinator 时保留 legacy 语义；lease 已存在且 owner/token 不符返回
+  //   RESOURCE_BUSY；要求 active 但未 begin 返回 INVALID_STATE；active 期间未允许的直接调用被拒绝。
   protected function rdma_status authorize_router_operation(
     uvm_object owner,
     longint unsigned token,
@@ -91,16 +83,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     );
   endfunction
 
-  // 功能：把五个不携带 owner/token 的 Host-router dataplane 入口接到 coordinator 的
-  //       reset-admission seam；正常数据面在 reset publication/transaction 中停止，释放
-  //       路径可显式声明 cleanup 以继续排空旧 mapping 或回滚外部 allocation。
-  // 输入/输出及副作用：operation_name（输入）用于诊断；allow_cleanup（输入）仅由
-  //       release/release_opaque 传入；函数只读 m_reset 的 admission 状态，不修改 mapping、
-  //       manager 或任一 epoch ledger，返回 rdma_status。
-  // 失败/边界：未绑定 coordinator 时保留 legacy tokenless 语义并返回 OK；绑定 coordinator
-  //       且 reset publication/transaction active 时，非 cleanup 操作返回 RESOURCE_BUSY；
-  //       cleanup 操作继续交给 mapping authority/stale-drain 校验。该 helper 不要求 lease
-  //       owner/token，也不提供跨线程或跨进程互斥。
+  // 功能：把不带 owner/token 的 dataplane 入口接到 coordinator 的 reset-admission seam。
+  // 输入/输出及副作用：operation_name 用于诊断；allow_cleanup 仅 release/release_opaque 传入；
+  //   只读 admission 状态，返回 rdma_status。
+  // 失败/边界：未绑定 coordinator 返回 OK；reset publication/transaction active 时非 cleanup
+  //   操作返回 RESOURCE_BUSY；cleanup 继续交给 stale-drain 校验；不提供跨线程互斥。
   protected function rdma_status authorize_dataplane_operation(
     string operation_name,
     bit allow_cleanup = 1'b0
@@ -112,25 +99,19 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     );
   endfunction
 
-  // 功能：构造空 Host-memory router，初始化 reset coordinator 引用；路由表由 configure()
-  //       发布，mapping ledger 由 allocate() 建立。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
+  // 功能：构造空 Host-memory router；路由表由 configure() 发布，ledger 由 allocate() 建立。
+  // 输入/输出及副作用：name 为对象名；初始化 reset coordinator 引用。
+  // 失败/边界：无。
   function new(string name = "rdma_host_mem_router");
     super.new(name);
     m_reset = null;
   endfunction
 
-  // 所有权：只保存非拥有引用，不负责 coordinator 的创建或销毁。
-  // 功能：通过 coordinator 的 legacy facade 连接共享 reset coordinator，使 router 能读取
-  //       Function/Host/Device epoch，同时维持 coordinator/router 双侧绑定。
-  // 输入/输出及副作用：coordinator（输入）；非空且未被 lease 独占时转发到
-  //   coordinator.attach_host_router_status(this)，成功才更新双方非拥有引用；不取得任何
-  //   coordinator/manager 所有权，也不改写 mapping。
-  // 失败/边界：传入 null 时兼容 void wrapper 保持现有引用不变；非空 coordinator 在已有
-  //   active mapping、跨 coordinator replacement 或旧 coordinator lease 时由 facade 拒绝。
-  //   void 入口无法返回错误码，需要诊断的调用方应使用 attach_reset_coordinator_owned()
-  //   或 coordinator.attach_host_router_status()。
+  // 功能：经 coordinator legacy facade 连接共享 reset coordinator，维持双侧绑定；只保存非拥有引用。
+  // 输入/输出及副作用：coordinator 非空且未被 lease 独占时转发 attach_host_router_status(this)，
+  //   成功才更新双方引用；不改 mapping。
+  // 失败/边界：null 时保持现有引用；已有 active mapping、跨 coordinator 替换或旧 lease 时被
+  //   facade 拒绝；void 入口无法返回错误，需诊断应改用 attach_reset_coordinator_owned()。
   function void attach_reset_coordinator(
     rdma_reset_coordinator coordinator
   );
@@ -138,14 +119,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
       void'(coordinator.attach_host_router_status(this));
   endfunction
 
-  // 功能：由 coordinator 内部以受控 seam 校验并绑定/解绑 reset coordinator，给 registration
-  //       commit 一个可观察的 attach 结果，避免兼容 void wrapper 吞掉拒绝。
-  // 输入/输出及副作用：coordinator（输入）为目标非拥有引用；coordinator_initiated（输入）
-  //   只是兼容标志，必须同时携带 coordinator 产生的一次性 capability；成功时更新 m_reset，
-  //   失败时保留旧 coordinator、mapping 和 epoch ledger，不取得任何外部所有权。
-  // 失败/边界：目标 coordinator 已被其它 env lease、现有 mapping、旧 coordinator lease 或
-  //   其它 active authority 阻挡时返回 RESOURCE_BUSY；缺少 capability、null 解绑或跨
-  //   coordinator rebind 均 fail-closed。持有 lease 的合法调用者必须改用 owned attach。
+  // 功能：由 coordinator 以受控 seam 校验并绑定/解绑 reset coordinator，返回可观察的结果。
+  // 输入/输出及副作用：coordinator 为目标引用；coordinator_initiated 须配合一次性 capability；
+  //   成功更新 m_reset，失败保留旧 coordinator、mapping 和 epoch ledger。
+  // 失败/边界：目标被其它 lease、现有 mapping 或 active authority 阻挡返回 RESOURCE_BUSY；
+  //   缺 capability、null 解绑、跨 coordinator rebind 均 fail-closed。
   function rdma_status attach_reset_coordinator_status(
     rdma_reset_coordinator coordinator,
     bit coordinator_initiated = 1'b0,
@@ -168,16 +146,15 @@ class rdma_host_mem_router extends rdma_host_mem_api;
         RDMA_SC_RESOURCE_BUSY,
         "target reset coordinator already has an ownership lease"
       );
-    // null coordinator 的 legacy detach 没有可以核验的双侧 capability；必须走
-    // coordinator.detach_host_router_owned()，避免清掉 router 单侧引用后留下反向指针。
+    // null coordinator 的 legacy detach 无法核验双侧 capability，须走
+    // coordinator.detach_host_router_owned()，避免只清 router 单侧引用留下反向指针。
     if (m_reset == null && m_maps.size() != 0)
       return rdma_status::make(
         RDMA_SC_RESOURCE_BUSY,
         "active router state prevents coordinator attach"
       );
-    // 换绑到另一个 coordinator 同样会改变 mapping 读取时使用的 epoch
-    // authority。active mapping 或旧 coordinator lease 任一存在时，旧绑定
-    // 必须保持不变；相同 coordinator 的重复 attach 仍是幂等操作。
+    // 换绑 coordinator 会改变 mapping 读取的 epoch authority；有 active mapping 或旧 lease 时
+    // 保持旧绑定；同一 coordinator 重复 attach 是幂等的。
     if (m_reset != null && m_reset !== coordinator)
       return rdma_status::make(
         RDMA_SC_RESOURCE_BUSY,
@@ -198,14 +175,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 coordinator 已验证 owner/token 且准备同时清除反向引用时，解除当前 router
-  //       与该 coordinator 的绑定；这是严格一对一生命周期的唯一 detach seam。
-  // 输入/输出及副作用：coordinator、owner、token、capability（输入）；成功时清除 m_reset，
-  //   但不释放 Host mapping 或 manager backing；capability 经 coordinator 回验后立即消费，
-  //   调用方随后由 coordinator 清除 m_host_router。
-  // 失败/边界：coordinator 为空、owner/token 不匹配、缺少/伪造 capability、当前绑定不是
-  //   该 coordinator 或仍有 mapping 时返回 INVALID_ARGUMENT/RESOURCE_BUSY，失败路径保持
-  //   原绑定与 ledger，不能形成 router 单侧 detach。
+  // 功能：在 coordinator 已验证 owner/token 后解除与它的绑定（严格一对一的唯一 detach seam）。
+  // 输入/输出及副作用：coordinator/owner/token/capability 为输入；成功清除 m_reset，不释放
+  //   mapping 或 backing；capability 回验后即消费，随后由 coordinator 清除反向引用。
+  // 失败/边界：coordinator 为空、owner/token 或 capability 不符、绑定不匹配或仍有 mapping
+  //   时返回 INVALID_ARGUMENT/RESOURCE_BUSY，保持原绑定。
   function rdma_status detach_reset_coordinator_owned(
     rdma_reset_coordinator coordinator,
     uvm_object owner,
@@ -260,14 +234,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 coordinator 已发布的一次性 capability 和明确 owner lease 下绑定或确认
-  //       coordinator，阻止调用方直接改写 router 的 reset ledger。
-  // 输入/输出及副作用：coordinator、owner、token、capability（输入）；成功时保存非拥有
-  //       coordinator 引用，不清理 mapping；capability 经 coordinator 回验后立即消费，返回
-  //       status 供 coordinator registration commit 判断是否可继续。
-  // 失败/边界：null coordinator、owner/token 不匹配、缺少/伪造 capability、已有 mapping 或
-  //       另一个 coordinator 绑定时返回 INVALID_ARGUMENT、RESOURCE_BUSY；失败路径保留旧
-  //       m_reset 与 mapping ledger，不能形成 router 单侧 attach。
+  // 功能：在一次性 capability 和 owner lease 下绑定或确认 coordinator，禁止直接改写 reset ledger。
+  // 输入/输出及副作用：coordinator/owner/token/capability 为输入；成功保存非拥有引用，
+  //   capability 回验后即消费；返回 status 供 registration commit 判断。
+  // 失败/边界：null、owner/token 不符、capability 缺失/伪造、已有 mapping 或绑定了另一
+  //   coordinator 时返回 INVALID_ARGUMENT/RESOURCE_BUSY，保留旧 m_reset 与 ledger。
   function rdma_status attach_reset_coordinator_owned(
     rdma_reset_coordinator coordinator,
     uvm_object owner,
@@ -298,10 +269,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
         RDMA_SC_RESOURCE_BUSY,
         "owned Host router attach requires a coordinator-issued capability"
       );
-    // m_reset 为空时也可能已有 mapping（例如先配置/分配，再首次 attach）。
-    // 这类 mapping 的 epoch authority 已经固定为旧的 null-coordinator 视图，
-    // 不能通过 owned attach 偷换到新 ledger；只有无 mapping 的首次绑定或
-    // 同一 coordinator 幂等确认可以继续。
+    // m_reset 为空时也可能已有 mapping（先配置/分配、再首次 attach）；其 epoch authority 已固定为
+    // null-coordinator 视图，不能经 owned attach 换到新 ledger；仅无 mapping 首次绑定或同一
+    // coordinator 幂等确认可继续。
     if ((m_reset == null && m_maps.size() != 0) ||
         (m_reset !== null && m_reset !== coordinator))
       return rdma_status::make(
@@ -324,11 +294,10 @@ class rdma_host_mem_router extends rdma_host_mem_api;
   endfunction
 
   // 功能：事务性校验并替换 Host→manager 路由表，同时重置本地 Host epoch ledger。
-  // 输入/输出及副作用：entries（输入）逐项提供 Host key 与非拥有 manager 引用；函数先在
-  //       局部表校验 entry/manager 非空、Host key 唯一且 manager 不跨 Host 复用，成功后替换
-  //       本对象路由和 local epoch ledger，返回 rdma_status。
-  // 失败/边界：owner/token 不通过 lease 或 publication guard、存在 active mapping、空 entry、
-  //       重复 Host 或同一 manager 绑定多个 Host 时拒绝，旧配置保持不变以保留 mapping 的释放出口。
+  // 输入/输出及副作用：entries 逐项给出 Host key 与 manager；先在局部表校验，成功后替换路由
+  //   和 local epoch ledger，返回 rdma_status。
+  // 失败/边界：lease/publication guard 不通过、存在 active mapping、空 entry、重复 Host 或
+  //   manager 跨 Host 复用时拒绝，旧配置保持不变。
   function rdma_status configure(
     rdma_host_mem_route_entry entries[$],
     uvm_object owner = null,
@@ -346,8 +315,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
           "Host router configure lease validation returned null"
         ) : lease_status;
 
-    // 清理路由表会使仍在使用的 backing 失去释放出口，因此必须事务性
-    // 拒绝，而不是先清空旧表再报告失败。
+    // 清空路由表会让在用 backing 失去释放出口，必须事务性拒绝，而非先清表再报错。
     if (m_maps.size() != 0)
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                "active mappings prevent reconfigure");
@@ -374,13 +342,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：依据请求快照选择 Host manager，分配 DMA mapping，并保存完整 Function/owner/
-  //       route/requester BDF 及四维 reset epoch ledger。
-  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
-  //   output 发布新句柄/映射。
-  // 失败/边界：route/epoch 缺失、Host 未配置、reset publication/transaction active、
-  //   manager 返回 authority 不匹配或 epoch 过期时拒绝；拒绝路径不能调用 manager 或
-  //   发布 router mapping row。
+  // 功能：按请求快照选 Host manager 分配 DMA mapping，并登记 Function/owner/route/BDF 及四维 epoch。
+  // 输入/输出及副作用：request_context/size/alignment/direction 为输入；mapping 为输出；
+  //   成功时更新 ledger 并发布 mapping。
+  // 失败/边界：route/epoch 缺失、Host 未配置、reset active、authority 不匹配或 epoch 过期时
+  //   拒绝；拒绝路径不调用 manager，也不发布 mapping row。
   function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -425,10 +391,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
           "Host router dataplane admission returned null"
         ) : status;
 
-    // request_snapshot 是 caller 输入的 immutable value authority；manager 只能
-    // 看到它的第二份 detached work copy。这样 manager 即使在 allocate() 内
-    // 原地改写 request_context 的 Function/owner/route/epoch，也不能污染
-    // router 后续用于比较和 ledger 发布的 caller snapshot。
+    // request_snapshot 是 caller 输入的不可变快照；manager 只拿到第二份 detached 副本，
+    // 即使其改写 request_context 也不会污染 router 后续比较和 ledger 发布。
     request_snapshot = rdma_dma_request_context::type_id::create(
       "host_dma_request_snapshot");
     if (request_snapshot == null)
@@ -437,11 +401,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
         "DMA request snapshot allocation failed"
       );
     request_snapshot.copy(request_context);
-    // coordinator 绑定后，Function handle、完整 route、generation 和
-    // canonical reset_epoch 必须先通过 coordinator-owned registration
-    // authority；否则未知 UID 的 function_epoch_uid()==0 哨兵可能被误当成
-    // 合法初始 epoch，并在 manager.allocate() 已产生副作用后才暴露错误。
-    // 该只读预检位于 manager 调用前，确保未知/重复 UID 直接 fail closed。
+    // coordinator 绑定后，Function handle、route、generation 和 reset_epoch 须先通过
+    // coordinator 的 registration authority；否则未知 UID 的 function_epoch_uid()==0 哨兵可能
+    // 被当作合法初始 epoch，并在 manager.allocate() 产生副作用后才暴露错误。
     if (m_reset != null) begin
       status = m_reset.validate_registered_function_handle(
         request_snapshot.function_h,
@@ -497,10 +459,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
       return rollback_manager_mapping(manager, manager_mapping, status);
     end
     if (manager_mapping == null) begin
-      // allocate() 的 success 契约要求 output mapping 携带 opaque identity；
-      // 没有 identity 就不存在安全的回滚目标，不能猜测“最近一次 allocation”。
-      // 因此把 success+null 明确报告为 adapter contract violation，并要求
-      // 具体 manager 遵守“success+null 不得遗留 allocation”的接口约束。
+      // success 契约要求 output mapping 带 opaque identity；没有 identity 就没有安全回滚目标，
+      // 故把 success+null 报告为 adapter contract violation。
       return rdma_status::make(
         RDMA_SC_INVALID_STATE,
         "manager allocation violated success mapping contract"
@@ -555,9 +515,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     coordinator_host_epoch = (m_reset != null) ?
                               m_reset.host_epoch(host_key) : 0;
     device_epoch_value = (m_reset != null) ? m_reset.device_epoch() : 0;
-    // manager.allocate() 是外部可重入边界；它返回前 coordinator 可能已经
-    // 发布了 reset。再次验证当前 handle/incarnation，避免把 preflight 时的
-    // Function epoch 当成提交时 authority；失败时 rollback opaque mapping。
+    // manager.allocate() 是外部可重入边界，返回前 coordinator 可能已发布 reset；
+    // 重新验证 handle/incarnation，失败时 rollback opaque mapping。
     if (m_reset != null) begin
       status = m_reset.validate_registered_function_handle(
         request_snapshot.function_h,
@@ -583,13 +542,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
         );
       function_epoch_value = validated_function_epoch;
     end
-    // request_context.reset_epoch 的唯一生产来源是 Function identity。
-    // Host/Device reset 虽然会级联推进该 identity epoch，但 coordinator
-    // 仍分别保留 Host/Device ledger 作为旧 mapping 的失效维度；把这些
-    // 计数再次相加会让一次 Host reset 变成“1 (Function) + 1 (Host) +
-    // 1 (router-local Host)”的伪造 epoch，导致 reset rebuild 产生的新
-    // request context 永远无法重新 allocate。未绑定 coordinator 时，
-    // router-local Host epoch 是唯一可验证的 legacy reset authority。
+    // request_context.reset_epoch 只来自 Function identity。Host/Device reset 已级联推进它，
+    // 再叠加各 ledger 计数会伪造 epoch，使 reset 重建后的 request context 无法再 allocate。
+    // 未绑定 coordinator 时 router-local Host epoch 是唯一可验证的 legacy authority。
     canonical_request_epoch = (m_reset != null) ?
                               function_epoch_value : local_host_epoch;
     if (request_snapshot.reset_epoch != canonical_request_epoch)
@@ -598,11 +553,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
         rdma_status::make(RDMA_SC_STALE_GENERATION,
                           "DMA request reset epoch is stale"));
 
-    // manager.allocate() 是外部可重入边界；即使 Function authority 与 epoch
-    // 没有变化，coordinator 也可能在该调用期间进入 reset transaction 或
-    // publication guard。该同步 admission 必须紧邻 ledger commit，再次阻止
-    // tokenless allocation 在 reset 窗口发布 router mapping；失败时仍使用
-    // opaque identity 回滚 manager backing，保持 router/manager 两侧原子性。
+    // allocate() 可重入：期间 coordinator 可能进入 reset transaction/publication guard。
+    // 该 admission 须紧邻 ledger commit；失败时用 opaque identity 回滚 manager backing，
+    // 保持 router/manager 两侧原子。
     status = authorize_dataplane_operation("allocate");
     if (status == null || !status.ok())
       return rollback_manager_mapping(
@@ -615,8 +568,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
       );
 
     mapping = manager_mapping;
-    // 替换 manager 返回的可变 alias，mapping 的 authority 由 router 自己
-    // 拥有值快照；底层 backing/iova/size 等数据仍由 manager 返回对象提供。
+    // 替换 manager 返回的可变 alias，mapping authority 由 router 自有的值快照承载；
+    // backing/iova/size 仍由 manager 返回对象提供。
     mapping.function_h = rdma_clone_function_handle_value(
       request_snapshot.function_h, "Host mapping Function");
     if (request_snapshot.owner_h == null)
@@ -626,9 +579,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
         request_snapshot.owner_h, "Host mapping owner");
     mapping.route = request_snapshot.route;
     mapping.route_valid = 1'b1;
-    // mapping.reset_epoch 必须与 request_context/Function identity 的
-    // canonical scalar 一致；四个独立 epoch 已在平行 ledger 中保存，
-    // validate_mapping() 会逐维检查它们，不能再用聚合和覆盖该字段。
+    // mapping.reset_epoch 须与 Function identity 的 canonical scalar 一致；四个独立 epoch 已存于
+    // 平行 ledger，由 validate_mapping() 逐维检查，不能再用聚合值覆盖该字段。
     mapping.reset_epoch = canonical_request_epoch;
     mapping.epoch_valid = 1'b1;
     mapping.requester_bdf = request_snapshot.requester_bdf;
@@ -661,11 +613,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return status;
   endfunction
 
-  // 功能：验证 mapping 的 route、authority 和 reset ledger 后，将写请求转发到对应 Host manager。
-  // 输入/输出及副作用：mapping/offset/data（输入）；校验通过后把写请求转发给 mapping 所在
-  //   Host manager，底层 manager 自行维护其 backing 状态。
-  // 失败/边界：mapping 被篡改、释放、过期、Host 路由不存在或 reset publication/transaction
-  //   active 时不触碰底层 manager；正常 leased dataplane 不需要携带 owner/token。
+  // 功能：校验 mapping 的 route/authority/reset ledger 后，把写请求转发给对应 Host manager。
+  // 输入/输出及副作用：mapping/offset/data 为输入；backing 状态由 manager 维护。
+  // 失败/边界：mapping 被篡改、已释放、过期、无 Host 路由或 reset active 时不触碰 manager。
   function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -696,11 +646,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return normalize_status(status, "Host manager write");
   endfunction
 
-  // 功能：验证 mapping 后从对应 Host manager 读取指定范围，并通过 data 返回字节数组。
-  // 输入/输出及副作用：mapping/offset/size（输入）、data（输出）；函数入口先清空 data，校验
-  //   通过后由对应 Host manager 填充读取字节，不取得 mapping 或 manager 所有权。
-  // 失败/边界：校验失败或 reset publication/transaction active 时先清空 data 并返回错误，
-  //   避免调用方误用旧读数据，也不触碰底层 manager。
+  // 功能：校验 mapping 后从对应 Host manager 读取指定范围。
+  // 输入/输出及副作用：mapping/offset/size 为输入；data 为输出，入口先清空，校验通过后由 manager 填充。
+  // 失败/边界：校验失败或 reset active 时 data 保持清空并返回错误，不触碰 manager。
   function rdma_status read(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -713,8 +661,7 @@ class rdma_host_mem_router extends rdma_host_mem_api;
 
     data.delete();
     index = find_mapping(mapping);
-    // 正常读取仍必须观察当前四维 reset epoch；旧 mapping 的 drain 例外
-    // 只适用于下面的 release()，不能让失效 backing 继续暴露数据。
+    // 读取必须观察当前四维 reset epoch；stale-drain 例外只适用于 release()。
     status = validate_mapping(mapping, index);
     if (!status.ok())
       return status;
@@ -738,20 +685,17 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return status;
   endfunction
 
-  // 功能：验证 mapping 后把释放操作交给原 Host manager；底层成功时同步删除所有 parallel
-  //       authority ledger，防止同一对象再次被路由访问。
-  // 输入/输出及副作用：mapping（输入）；先校验本地 ledger，再调用原 Host manager 释放；底层
-  //   成功后同步删除 parallel authority/epoch 数组，失败时保留 ledger 供重试。
-  // 失败/边界：校验失败或 manager 释放失败时保留 ledger，便于调用方重试或诊断；reset
-  //   publication/transaction active 时仍允许 cleanup admission，保留 stale-drain 语义。
+  // 功能：校验 mapping 后交给原 Host manager 释放，成功时同步删除全部 parallel ledger。
+  // 输入/输出及副作用：mapping 为输入；先校验本地 ledger，再调用 manager 释放。
+  // 失败/边界：校验或 manager 释放失败时保留 ledger 以便重试；reset active 时仍允许 cleanup。
   function rdma_status \release (rdma_dma_mapping mapping);
     int index;
     rdma_host_mem_api manager;
     rdma_status status;
 
     index = find_mapping(mapping);
-    // 释放是 reset recovery 的 drain 操作：仍要求 mapping 与旧 ledger
-    // 的 route/identity/epoch 完全一致，但允许当前 reset epoch 已前进。
+    // 释放是 reset recovery 的 drain 操作：route/identity/epoch 须与旧 ledger 一致，但允许当前
+    // reset epoch 已前进。
     status = validate_mapping(mapping, index, 1'b1);
     if (!status.ok())
       return status;
@@ -775,9 +719,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return status;
   endfunction
 
-  // 功能：按 opaque allocation identity 唯一定位 router row，并向该 row 的 stored manager 做只读能力查询。
-  // 输入/输出及副作用：mapping 为待验证 authority；只读 parallel ledger 与 manager，不 release 或删除 row。
-  // 失败/边界：未知/歧义 row、stored manager 缺失及 manager null/non-OK 均 fail closed 且保持 ledger。
+  // 功能：按 opaque identity 唯一定位 router row，并向其 stored manager 做只读能力查询。
+  // 输入/输出及副作用：mapping 为待验证 authority；只读 ledger 与 manager，不删除 row。
+  // 失败/边界：row 未知/歧义、manager 缺失或返回 null/non-OK 均 fail closed 并保持 ledger。
   virtual function rdma_status validate_failure_atomic_release(
     rdma_dma_mapping mapping
   );
@@ -808,10 +752,10 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return status;
   endfunction
 
-  // 功能：按 router retained opaque row 选择 stored manager，验证能力后执行 failure-atomic release。
-  // 输入/输出及副作用：mapping 为释放 authority；manager 非空 OK 后同步删除 exact parallel-ledger row。
-  // 失败/边界：lookup/validator/release 的 null 或 non-OK 均在删除前返回，保留 read/retry
-  //   authority；reset active 时允许该入口作为明确 cleanup/rollback seam 排空 mapping。
+  // 功能：按保留的 opaque row 选 stored manager，验证能力后执行 failure-atomic release。
+  // 输入/输出及副作用：mapping 为释放 authority；manager 返回 OK 后同步删除对应 ledger row。
+  // 失败/边界：lookup/validator/release 返回 null 或 non-OK 时不删除 row；reset active 时允许
+  //   作为 cleanup/rollback seam 排空 mapping。
   virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
     rdma_host_mem_api manager;
     rdma_status status;
@@ -857,16 +801,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return status;
   endfunction
 
-  // 功能：只读预检指定 Host 的 router-local epoch 是否还能安全递增，为 coordinator 的
-  //       Host reset 事务提供与本地 mapping ledger 相同的容量边界。
-  // 输入/输出及副作用：host_topology_key、owner、token（输入）描述 Host 与可选 lease；
-  //       publication_capability（输入）仅由 coordinator 内部预检 seam 携带；函数只读取
-  //       m_epochs 和授权状态，返回 OK、INVALID_STATE 或 RESOURCE_EXHAUSTED，不创建 route、
-  //       不失效 mapping，也不修改 reset 状态。
-  // 失败/边界：Host route 未配置时返回 OK，表示旧兼容语义下没有 router-local ledger 需要
-  //       推进；local epoch 已为全一最大值时返回 RESOURCE_EXHAUSTED；无 capability 的 direct
-  //       callback 在 coordinator publication active 时返回 RESOURCE_BUSY，不能借公开
-  //       allow_active 语义伪装成内部 publication。
+  // 功能：只读预检指定 Host 的 router-local epoch 是否还能递增。
+  // 输入/输出及副作用：host_topology_key/owner/token 描述 Host 与 lease；publication_capability
+  //   仅 coordinator 预检 seam 携带；只读 m_epochs，返回 status，不改状态。
+  // 失败/边界：Host 未配置返回 OK；epoch 已达全一最大值返回 RESOURCE_EXHAUSTED；无 capability
+  //   的直接调用在 publication active 时返回 RESOURCE_BUSY。
   function rdma_status validate_host_epoch_capacity(
     int unsigned host_topology_key,
     uvm_object owner = null,
@@ -876,8 +815,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     rdma_status lease_status;
 
     if (publication_capability == null)
-      // 普通调用只能在 publication guard 未 active 时运行；coordinator 的内部
-      // request_host_reset() 通过一次性 capability 走下方专用回验。
+      // 普通调用只能在 publication guard 未 active 时运行；coordinator 的 request_host_reset()
+      // 通过一次性 capability 走下方专用回验。
       lease_status = authorize_router_operation(owner, token, 1'b1, 1'b0);
     else if (m_reset == null)
       lease_status = rdma_status::make(
@@ -905,15 +844,11 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：推进指定 Host 的 router-local epoch，使该 Host 上已有 mapping 在下一次访问时失效，
-  //       并把容量/配置错误以 status 返回给共享 reset coordinator。
-  // 输入/输出及副作用：host_topology_key、owner、token（输入）选择 Host 与可选 lease；
-  //       publication_capability（输入）仅由 coordinator 内部 advance seam 携带；成功时
-  //       只递增 m_epochs 中对应值，不创建路由、不直接释放 mapping，返回值供调用方决定是否
-  //       继续提交其它 epoch。
-  // 失败/边界：Host route 未配置时返回 OK 且保持 m_epochs 不变，以保留空 router fixture 的
-  //       no-op 语义；local epoch 已达最大值时返回错误且保持原值；无 capability 的 direct
-  //       callback 在 publication active 时被拒绝，函数不会回绕或隐式创建 Host route。
+  // 功能：递增指定 Host 的 router-local epoch，使该 Host 已有 mapping 在下次访问时失效。
+  // 输入/输出及副作用：host_topology_key/owner/token 选 Host 与 lease；publication_capability
+  //   仅 coordinator advance seam 携带；成功只递增 m_epochs 对应值，不释放 mapping。
+  // 失败/边界：Host 未配置返回 OK 且不变；epoch 已达最大值返回错误且保持原值（不回绕）；
+  //   无 capability 的直接调用在 publication active 时被拒绝。
   function rdma_status advance_host_epoch(
     int unsigned host_topology_key,
     uvm_object owner = null,
@@ -953,15 +888,10 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：返回指定 Host 的 local、coordinator Host 和 Device epoch 的兼容聚合值，供旧的
-  //       可观测性/诊断调用方比较 reset 活动；该值不是 DMA request 或 mapping 的 canonical
-  //       reset_epoch，真正的 authority 仍由 Function incarnation 与四个独立 ledger 维度决定。
-  // 输入/输出及副作用：host_topology_key（输入）；返回 router-local、coordinator Host 和
-  //   Device epoch 的算术和；未配置 Host 时 local 维度为 0，但仍可观察已绑定 coordinator
-  //   的 Host/Device 维度；函数只读 ledger，不创建隐式 Host 路由。
-  // 失败/边界：聚合值可能在定宽算术下回绕，也可能因不同维度组合相同而产生碰撞；调用方
-  //   不得把它写入 request_context.reset_epoch、mapping.reset_epoch 或用它替代逐维 stale
-  //   校验。需要 canonical request epoch 时必须先通过 coordinator 的 Function authority seam。
+  // 功能：返回 local、coordinator Host 和 Device epoch 的兼容聚合值，仅供旧的诊断调用方使用。
+  // 输入/输出及副作用：host_topology_key 为输入；返回三者算术和；未配置 Host 时 local 为 0；只读。
+  // 失败/边界：定宽算术可能回绕或碰撞；不得写入 reset_epoch 或替代逐维 stale 校验，
+  //   canonical epoch 须经 coordinator 的 Function authority。
   function rdma_reset_epoch_t host_epoch(int unsigned host_topology_key);
     rdma_reset_epoch_t local_host_epoch;
     rdma_reset_epoch_t coordinator_host_epoch;
@@ -973,10 +903,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
            ((m_reset != null) ? m_reset.device_epoch() : 0);
   endfunction
 
-  // 功能：对 mapping 做边界完整性检查，包括 route、Function/owner authority、requester
-  //       BDF、四维 reset epoch 和 manager 存在性；返回错误时禁止任何外部访问。
-  // 输入/输出及副作用：mapping（输入）、index（输入）；validate_mapping 读取 mapping、index 并使用字段 local_host_epoch、coordinator_host_epoch、function_epoch_value、device_epoch_value；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate_mapping 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_DMA_TRANSLATION、RDMA_SC_STALE_GENERATION；典型拒绝条件为“unknown DMA mapping”“DMA mapping route was modified”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 mapping 的 route、Function/owner authority、BDF、四维 reset epoch 和 manager。
+  // 输入/输出及副作用：mapping 与 ledger index 为输入；返回 rdma_status，只读。
+  // 失败/边界：返回 INVALID_ARGUMENT、DMA_TRANSLATION 或 STALE_GENERATION；失败时禁止外部访问。
   protected function rdma_status validate_mapping(
     rdma_dma_mapping mapping,
     int index,
@@ -1063,12 +992,10 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return rdma_status::success();
   endfunction
 
-  // 功能：回滚 manager.allocate 已成功但尚未登记到 router ledger 的 mapping，
-  //       避免 authority 校验失败时遗留 Host-memory backing。
-  // 输入/输出及副作用：manager/mapping/original_status 为输入；函数最多调用一次
-  //       manager.release_opaque(mapping)，不修改 router ledger，并保留 opaque identity
-  //       作为底层 cleanup 的唯一释放依据。
-  // 失败/边界：底层释放失败时返回 cleanup 错误并保留原始诊断；mapping 为空时原样返回。
+  // 功能：回滚 manager.allocate 已成功但尚未登记 ledger 的 mapping，避免遗留 backing。
+  // 输入/输出及副作用：manager/mapping/original_status 为输入；最多调用一次
+  //   manager.release_opaque(mapping)，不改 ledger。
+  // 失败/边界：释放失败返回 cleanup 错误并保留原始诊断；mapping 为空时原样返回。
   protected function rdma_status rollback_manager_mapping(
     rdma_host_mem_api manager,
     rdma_dma_mapping mapping,
@@ -1081,8 +1008,8 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     if (manager == null)
       cleanup_status = null;
     else
-      // 回滚入口使用 manager 的 opaque identity；mapping 的 public route/geometry
-      // 可能正是导致本次校验失败的篡改字段，不能再依赖严格 release()。
+      // 回滚用 manager 的 opaque identity；mapping 的 public route/geometry 可能正是被篡改的字段，
+      // 不能再依赖严格 release()。
       cleanup_status = manager.release_opaque(mapping);
     if (cleanup_status == null || !cleanup_status.ok()) begin
       if (cleanup_status == null)
@@ -1100,10 +1027,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return original_status;
   endfunction
 
-  // 功能：按对象或 opaque release authority 在 router 自有 mapping 列表中定位 ledger 下标。
-  // 输入/输出及副作用：mapping（输入）；优先按原对象身份查找，随后调用各 manager mapping
-  //       的 authority 等价校验以支持 planner 产生的 detached 快照；不修改数组。
-  // 失败/边界：mapping 为空、未知或匹配多个 allocation 时返回 -1，避免释放歧义资源。
+  // 功能：按对象或 opaque release authority 在 mapping 列表中定位 ledger 下标。
+  // 输入/输出及副作用：mapping 为输入；先按对象身份找，再用 authority 等价校验支持 detached 快照；只读。
+  // 失败/边界：mapping 为空、未知或匹配多个 allocation 时返回 -1。
   protected function int find_mapping(rdma_dma_mapping mapping);
     int matched_index;
     rdma_status authority_status;
@@ -1128,10 +1054,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     return matched_index;
   endfunction
 
-  // 功能：比较 Host/root/segment/BDF 完整 route key，用于 mapping ledger 一致性校验。
-  // 输入/输出及副作用：lhs/rhs（输入值）；只读比较 Host/root/segment/BDF 标量字段，不更新
-  //   mapping 或 ledger；该值类型比较没有失败返回路径。
-  // 失败/边界：任一路由字段不相等时返回 0；packed route 比较不抛出异常。
+  // 功能：比较 Host/root/segment/BDF 完整 route key。
+  // 输入/输出及副作用：lhs/rhs 为输入值；只读比较标量字段。
+  // 失败/边界：任一字段不等返回 0。
   protected function bit same_route(rdma_route_key_t lhs,
                                     rdma_route_key_t rhs);
     return lhs.host_topology_key == rhs.host_topology_key &&
@@ -1139,11 +1064,9 @@ class rdma_host_mem_router extends rdma_host_mem_api;
            rdma_bdf_same(lhs.bdf, rhs.bdf);
   endfunction
 
-  // 功能：清空所有 mapping 与 parallel authority ledger；仅在确认没有 active mapping
-  //       的 configure() 提交阶段调用。
-  // 输入/输出及副作用：无参数；清空 router 自有 mapping 及所有 parallel authority/epoch ledger。
-  //   仅由 configure() 在确认无 active mapping 后调用，不负责释放底层 manager backing。
-  // 失败/边界：调用方若未先确认无 active mapping，清空会丢失本地索引；函数本身不检查或释放 manager backing。
+  // 功能：清空所有 mapping 与 parallel authority ledger；仅在 configure() 确认无 active mapping 后调用。
+  // 输入/输出及副作用：无参数；清空 router 自有 mapping 与 ledger，不释放 manager backing。
+  // 失败/边界：不检查 active mapping，调用方须先确认，否则丢失本地索引。
   protected function void clear_mapping_ledgers();
     m_maps.delete();
     m_map_epochs.delete();
@@ -1164,22 +1087,19 @@ class rdma_host_mem_router extends rdma_host_mem_api;
     m_map_requester_bdfs.delete();
   endfunction
 
-  // 功能：在 coordinator 绑定生命周期切换后，把 router-local Host epoch 重新锚定到
-  //       当前配置的 route 集合，避免旧 env 的 local counter 污染新 coordinator ledger。
-  // 输入/输出及副作用：无参数；删除旧 m_epochs 并为 m_managers 中每个已配置 Host 写入零，
-  //       不修改 manager 引用、mapping 或外部 backing；调用方必须已确认 mapping 为空。
-  // 失败/边界：函数本身不验证 active mapping，也不创建新 Host route；若调用方绕过 attach/
-  //       detach 生命周期直接调用会丢失 local stale 记录，因此只允许内部 teardown/rebind seam 使用。
+  // 功能：coordinator 绑定切换后，把 router-local Host epoch 重新锚定到当前 route 集合。
+  // 输入/输出及副作用：无参数；删除旧 m_epochs，为每个已配置 Host 写 0；不改 manager 和 mapping。
+  // 失败/边界：不验证 active mapping、不创建 Host route；仅限内部 teardown/rebind seam，
+  //   调用方须已确认 mapping 为空。
   protected function void reset_local_host_epochs();
     m_epochs.delete();
     foreach (m_managers[host_key])
       m_epochs[host_key] = 0;
   endfunction
 
-  // 功能：按同一 index 同步删除 mapping 的全部 authority/epoch ledger，保持数组对齐。
-  // 输入/输出及副作用：index（输入）；从所有 parallel 数组删除同一下标，保持 ledger 对齐。
-  //   调用前必须已完成 manager 释放和 index 查找；本函数不校验对象，也不执行底层释放。
-  // 失败/边界：index 不存在时各 associative array 的 delete 保持幂等；函数不触发底层 Host-memory release。
+  // 功能：按同一 index 删除 mapping 的全部 authority/epoch ledger，保持数组对齐。
+  // 输入/输出及副作用：index 为输入；从所有平行数组删除同一下标；不校验对象，不做底层释放。
+  // 失败/边界：index 不存在时 delete 幂等。
   protected function void delete_mapping_ledgers(int index);
     m_maps.delete(index);
     m_map_epochs.delete(index);

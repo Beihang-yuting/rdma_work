@@ -1,24 +1,23 @@
 // 目录：硬件编解码层 codec/rdma/rdma_error_codec.sv。
-// 职责：实现 rdma_hw_error_codec 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：把 8-bit 硬件 ecode 分类并解码为 rdma_status（code/category/来源引擎/符号名/severity/retryable）。
+// 依赖：本层公共 types/model/adapter 契约及冻结驱动的 ecode 定义。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源仅保存非拥有引用，生命周期由调用方管理。
 
-// 中文说明：rdma_error_codec.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// // 阅读提示：先看公开接口，再看 case 映射；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_hw_error_codec extends uvm_object;
   `uvm_object_utils(rdma_hw_error_codec)
 
-  // 功能：构造 rdma_hw_error_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_error_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造硬件错误码 codec。
+  // 输入/输出及副作用：name 传给 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_error_codec");
     super.new(name);
   endfunction
 
-  // 功能：判断 valid_engine 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：engine（输入）；valid_engine 读取 engine 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：valid_engine 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：判断 engine 是否属于合法 rdma_engine_kind_e 枚举值。
+  // 输入/输出及副作用：engine 只读；返回 bit。
+  // 失败/边界：枚举外的值（含 X/Z）返回 0。
   local function bit valid_engine(rdma_engine_kind_e engine);
     return engine inside {
       RDMA_ENGINE_NONE, RDMA_ENGINE_RESOURCE, RDMA_ENGINE_CMQ,
@@ -28,9 +27,9 @@ class rdma_hw_error_codec extends uvm_object;
     };
   endfunction
 
-  // 功能：classify 使用 hardware_code 计算并返回 rdma_status_code_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：hardware_code（输入）；classify 读取 hardware_code 并使用输入参数和固定枚举/常量；函数返回 rdma_status_code_e，不取得调用方资源所有权。
-  // 失败/边界：classify 的结果直接由 return RDMA_SC_OK 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：把 8-bit 硬件 ecode 分类为 rdma_status_code_e。
+  // 输入/输出及副作用：hardware_code 只读；返回状态码。
+  // 失败/边界：按 case 映射，成功码返回 OK；未列出的码走默认分支。
   local function rdma_status_code_e classify(bit [7:0] hardware_code);
     case (hardware_code)
       RDMA_CMQ_SUCCESS_ECODE:
@@ -51,9 +50,9 @@ class rdma_hw_error_codec extends uvm_object;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_error_codec 中，inferred_engine 把输入枚举或资源类型映射成对应的状态类别、执行引擎、opcode 或生命周期策略。
-  // 输入/输出及副作用：hardware_code（输入）、code（输入）；inferred_engine 读取 hardware_code、code 并使用输入参数和固定枚举/常量；函数返回 rdma_engine_kind_e，不取得调用方资源所有权。
-  // 失败/边界：inferred_engine 按 case(hardware_code、code) 的固定映射计算 rdma_engine_kind_e（RDMA_ECODE_EC_RCE_CQ_FULL→RDMA_ENGINE_CQ；RDMA_ECODE_EC_RCE_CEQ_FULL→RDMA_ENGINE_CEQ；RDMA_ECODE_EC_RCE_AEQ_FULL→RDMA_ENGINE_AEQ；RDMA_ECODE_EC_GLB_MBUS_ERR→RDMA_ENGINE_PCIE；其余 case 分支按源码继续映射；default→RDMA_ENGINE_CMQ）；未列出的输入走 default，不修改运行时账本。
+  // 功能：按 ecode 与状态码推断错误来源引擎。
+  // 输入/输出及副作用：hardware_code、code 只读；返回 rdma_engine_kind_e。
+  // 失败/边界：按 case 固定映射；未命中走默认分支。
   local function rdma_engine_kind_e inferred_engine(
     bit [7:0] hardware_code,
     rdma_status_code_e code
@@ -76,11 +75,10 @@ class rdma_hw_error_codec extends uvm_object;
     endcase
   endfunction
 
-  // Names and membership are transcribed from the frozen driver defs.h/wr.h
-  // at commit 491faf2ba42627fffd4dd027607299c8bb591ec2.
-  // 功能：在 rdma_hw_error_codec 中，symbolic_name 把冻结驱动定义中的 8-bit hardware ecode 映射成稳定符号名，供状态诊断文本使用。
-  // 输入/输出及副作用：hardware_code（输入）；symbolic_name 读取 hardware_code 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：symbolic_name 按 case(hardware_code) 的固定映射计算 string（RDMA_CMQ_SUCCESS_ECODE→"RDMA_CMQ_SUCCESS"；RDMA_ECODE_XTRDMA_CQE_ECODE_TX_RSP_NML→"XTRDMA_CQE_ECODE_TX_RSP_NML"；RDMA_ECODE_EC_TPE_DB_TYPE_INVLD→"EC_TPE_DB_TYPE_INVLD"；RDMA_ECODE_EC_TPE_OCC_QPC_ERR→"EC_TPE_OCC_QPC_ERR"；其余 case 分支按源码继续映射）；未列出的输入走 default，不修改运行时账本。
+  // // 名称与成员抄自冻结驱动 defs.h/wr.h（commit 491faf2ba42627fffd4dd027607299c8bb591ec2）。
+  // 功能：把 8-bit ecode 映射为稳定符号名，用于状态诊断文本。
+  // 输入/输出及副作用：hardware_code 只读；返回字符串。
+  // 失败/边界：按 case 固定映射；未列出的码走默认分支。
   local function string symbolic_name(bit [7:0] hardware_code);
     case (hardware_code)
       RDMA_CMQ_SUCCESS_ECODE: return "RDMA_CMQ_SUCCESS";
@@ -227,14 +225,10 @@ class rdma_hw_error_codec extends uvm_object;
     endcase
   endfunction
 
-  // 功能：decode_status 将 8-bit hardware_code 分类为 rdma_status code，选择可信的
-  //   observed_engine 或按错误码推断来源，并组装完整 decoded status。
-  // 输入/输出及副作用：hardware_code、observed_engine（输入），decoded（输出）；先清空
-  //   decoded，再写入 code/category/source/message、硬件码有效位、severity 和 retryable，
-  //   不取得外部资源所有权。
-  // 失败/边界：observed_engine 为 NONE/未知时走 inferred_engine；未知硬件码仍以
-  //   RDMA_UNKNOWN_ECODE 和成功 wrapper 返回，函数没有拒绝分支，调用方不得把成功 wrapper
-  //   当作硬件码合法性的证明。
+  // 功能：把 8-bit ecode 分类为 rdma_status code，选定来源引擎（可信 observed_engine，否则推断），组装 status。
+  // 输入/输出及副作用：hardware_code、observed_engine 输入；decoded 输出，入口置 null；写 code/category/
+  //  source/message、硬件码有效位、severity、retryable。
+  // 失败/边界：observed_engine 为 NONE/非法时用 inferred_engine；未知码仍返回成功 wrapper，不能当作码合法的证明。
   function rdma_status decode_status(
     bit [7:0] hardware_code,
     rdma_engine_kind_e observed_engine,

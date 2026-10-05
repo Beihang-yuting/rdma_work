@@ -1,13 +1,11 @@
 // 目录/层次：model 层 Function binding 与 PCIe 投影值。
 // 职责：绑定 dpu_common 冻结的 Function identity、PCIe/BAR、queue DMA/能力、
-// interrupt vector 和 ACTIVE owner，并提供不致命的完整值快照边界。
-// 主要依赖：rdma_function_identity、rdma_handle/function_handle、BDF/BAR 地址类型、
-// binding state 与 rdma_status；本文件不管理 PCIe 组件或 DMA allocator。
-// 所有权与生命周期：binding 拥有 identity、PCIe 和六个 BAR 值节点；owner_h 是
-// 外部 Function 资源的身份快照，不接管资源生命周期。
+// interrupt vector 和 ACTIVE owner，并提供不致命的完整值快照。
+// 依赖：rdma_function_identity、rdma_handle/function_handle、BDF/BAR 地址类型、rdma_status。
+// 所有权与生命周期：binding 拥有 identity、PCIe 和六个 BAR 值节点；owner_h 仅是身份快照。
 
-// 设计说明：BAR metadata 作为独立值节点，支持六个 aperture 的稳定索引和深拷贝，
-// 同时不把 PCIe 组件或 BAR 映射对象引入 model 层。
+// 设计说明：BAR metadata 为独立值节点，支持六个 aperture 的稳定索引与深拷贝，
+// 不把 PCIe 组件或 BAR 映射对象引入 model 层。
 class rdma_bar_info extends uvm_object;
   `uvm_object_utils(rdma_bar_info)
 
@@ -16,10 +14,9 @@ class rdma_bar_info extends uvm_object;
   longint unsigned size;
   bit enabled;
 
-  // 功能：构造 disabled/零窗口的 BAR metadata 值容器。
-  // 输入/输出及副作用：name 设置 UVM 实例名；bar_id/base/size 清零，enabled 置 0，
-  // 不保存 BAR 管理器或 PCIe 组件句柄。
-  // 失败/边界：默认值仅是未配置投影；是否可用由包含它的 binding.validate() 判定。
+  // 功能：构造 disabled/零窗口的 BAR 值容器。
+  // 输入/输出及副作用：name 为 UVM 实例名；所有字段清零。
+  // 失败/边界：默认值仅表示未配置，是否可用由 binding.validate() 判定。
   function new(string name = "rdma_bar_info");
     super.new(name);
     bar_id = '0;
@@ -28,12 +25,9 @@ class rdma_bar_info extends uvm_object;
     enabled = 1'b0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_bar_info 的值字段复制到当前对象，
-  // 建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs 为只读 BAR；按值覆盖 bar_id/base/size/enabled，
-  // 不分配嵌套对象或修改源值。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发
-  // UVM fatal（rdma_bar_info copy type mismatch），不保留部分有效快照。
+  // 功能：按值复制 rdma_bar_info 字段。
+  // 输入/输出及副作用：rhs 只读；覆盖 bar_id/base/size/enabled。
+  // 失败/边界：类型不匹配触发 UVM fatal（rdma_bar_info copy type mismatch）。
   virtual function void do_copy(uvm_object rhs);
     rdma_bar_info rhs_bar;
 
@@ -47,8 +41,8 @@ class rdma_bar_info extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：PCIe identity 把 dpu_common 冻结的 BDF、使能位和六个 BAR 组成 owned
-// 投影，供 binding snapshot 原子复制，而不保存外部 PCIe 组件引用。
+// 设计说明：PCIe identity 将 BDF、使能位和六个 BAR 组成 owned 投影，
+// 供 binding snapshot 复制，不保存外部 PCIe 组件引用。
 class rdma_pcie_identity extends uvm_object;
   `uvm_object_utils(rdma_pcie_identity)
 
@@ -59,11 +53,9 @@ class rdma_pcie_identity extends uvm_object;
   bit bme;
   rdma_bar_info bar[6];
 
-  // 功能：构造零 BDF、MSE/BME 关闭且拥有六个固定 BAR 值节点的 PCIe 投影。
-  // 输入/输出及副作用：name 设置 UVM 实例名；bdf/parent/vf_index/MSE/BME 清零，
-  // 直接 new bar[0:5] 并使每个 bar_id 等于数组索引。
-  // 失败/边界：默认 PCIe 投影不代表已启用 Function；直接构造避免 factory override
-  // 改变 constructor-owned BAR 的类型/数量。
+  // 功能：构造零 BDF、MSE/BME 关闭且带六个 BAR 值节点的 PCIe 投影。
+  // 输入/输出及副作用：name 为 UVM 实例名；直接 new bar[0:5] 并令 bar_id 等于索引。
+  // 失败/边界：默认值不代表 Function 已启用；直接 new 避免 factory override 改变 BAR 类型/数量。
   function new(string name = "rdma_pcie_identity");
     super.new(name);
     bdf = '0;
@@ -77,12 +69,9 @@ class rdma_pcie_identity extends uvm_object;
     end
   endfunction
 
-  // 功能：将 rhs 中 rdma_pcie_identity 的值字段复制到当前对象，
-  // 建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs 为只读 PCIe 投影；覆盖 BDF/vf/MSE/BME，
-  // 并对六个非空 BAR 逐个 clone；源图不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发
-  // UVM fatal（rdma_pcie_identity copy type mismatch），不保留部分有效快照。
+  // 功能：复制 PCIe 投影，六个 BAR 逐个 clone。
+  // 输入/输出及副作用：rhs 只读；覆盖 BDF/vf/MSE/BME，rhs 的空 BAR 复制为 null。
+  // 失败/边界：类型不匹配或 BAR clone/cast 失败触发 UVM fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_pcie_identity rhs_pcie;
     uvm_object cloned_object;
@@ -108,21 +97,21 @@ class rdma_pcie_identity extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：该兼容子类保留旧调用方使用的类型名，同时完全复用
-// rdma_pcie_identity 的字段、校验和所有权，不形成第二套 PCIe authority。
+// 设计说明：兼容子类保留旧调用方的类型名，复用 rdma_pcie_identity 的字段与所有权，
+// 不形成第二套 PCIe authority。
 class rdma_pcie_function_info extends rdma_pcie_identity;
   `uvm_object_utils(rdma_pcie_function_info)
 
-  // 功能：构造兼容类型 rdma_pcie_function_info，完全沿用 PCIe identity 的默认拓扑。
-  // 输入/输出及副作用：name 透传给基类；所有 BDF、enable 和六 BAR 由基类初始化。
-  // 失败/边界：本兼容子类不添加状态或所有权；默认值仍是未配置 PCIe 投影。
+  // 功能：构造兼容类型，沿用基类默认值。
+  // 输入/输出及副作用：name 透传给基类。
+  // 失败/边界：无。
   function new(string name = "rdma_pcie_function_info");
     super.new(name);
   endfunction
 endclass
 
-// 设计说明：BAR decode 用一个无外部引用的结果对象携带 target BDF、BAR 和 offset，
-// 让 router 可显式区分解码值与 aperture 自身的生命周期。
+// 设计说明：BAR decode 结果对象不带外部引用，携带 target BDF、BAR 和 offset，
+// 使 router 区分解码值与 aperture 自身生命周期。
 class rdma_bar_decode extends uvm_object;
   `uvm_object_utils(rdma_bar_decode)
 
@@ -130,10 +119,9 @@ class rdma_bar_decode extends uvm_object;
   bit [2:0] bar_id;
   longint unsigned bar_offset;
 
-  // 功能：构造零值 BAR decode 结果，供 router 写入 target BDF、BAR ID 和 offset。
-  // 输入/输出及副作用：name 设置 UVM 实例名；三个结果字段全部清零，
-  // 不保存 BAR aperture 的所有句柄。
-  // 失败/边界：零值可能是 BDF 0/BAR0/offset0 的合法解码，是否命中必须由调用方单独记录。
+  // 功能：构造零值 BAR decode 结果。
+  // 输入/输出及副作用：name 为 UVM 实例名；三个结果字段清零。
+  // 失败/边界：零值也可能是 BDF0/BAR0/offset0 的合法解码，是否命中须由调用方另记。
   function new(string name = "rdma_bar_decode");
     super.new(name);
     target_bdf = '0;
@@ -141,12 +129,9 @@ class rdma_bar_decode extends uvm_object;
     bar_offset = '0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_bar_decode 的值字段复制到当前对象，
-  // 建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs 为只读 decode 结果；按值覆盖 target_bdf/bar_id/bar_offset，
-  // 不分配嵌套对象。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发
-  // UVM fatal（rdma_bar_decode copy type mismatch），不保留部分有效快照。
+  // 功能：按值复制 rdma_bar_decode 字段。
+  // 输入/输出及副作用：rhs 只读；覆盖 target_bdf/bar_id/bar_offset。
+  // 失败/边界：类型不匹配触发 UVM fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_bar_decode rhs_decode;
 
@@ -186,14 +171,13 @@ typedef struct {
   bit enabled;
 } rdma_interrupt_vector_binding;
 
-// 设计说明：Function binding 是 dpu_common 冻结 topology/PCIe/queue 能力的唯一
-// RDMA 消费投影；nonfatal accessors 发布完整 detached 值而不反向改写外部 authority。
+// 设计说明：binding 是 dpu_common 冻结 topology/PCIe/queue 能力的唯一 RDMA 消费投影；
+// nonfatal accessor 发布完整 detached 值，不反向改写外部 authority。
 class rdma_function_binding extends uvm_object;
   `uvm_object_utils(rdma_function_binding)
 
   longint unsigned function_uid;
-  // 中文：identity 由 binding 创建并拥有；外部只能通过 snapshot accessor
-  // 读取 detached 副本，不能替换或就地修改 authority。
+  // identity 由 binding 创建并拥有；外部只能通过 snapshot accessor 取 detached 副本。
   protected rdma_function_identity identity;
   // identity 是唯一 authority；其后的 legacy scalar 字段仅是兼容镜像。
   rdma_pcie_identity pcie;
@@ -224,11 +208,9 @@ class rdma_function_binding extends uvm_object;
   bit vft_valid;
   bit vft_ready;
 
-  // 功能：构造 binding 及其 constructor-owned identity、PCIe 和六个 BAR 默认值。
-  // 输入/输出及副作用：name 传给 uvm_object；所有 owned child 均直接 new，
-  //   避免 factory override 改写默认值拓扑，其余字段初始化为 DISCOVERED/零。
-  // 失败/边界：默认 binding 尚无有效 identity、能力、notify aperture 或 owner，
-  //   必须完成 configure/activate 后才能通过 validate；不取得外部资源所有权。
+  // 功能：构造 binding 及其 owned identity、PCIe 和六个 BAR 默认值。
+  // 输入/输出及副作用：name 传给 uvm_object；owned child 直接 new，state 为 DISCOVERED，其余清零。
+  // 失败/边界：默认 binding 无有效 identity/能力/notify/owner，需配置并激活后才能通过 validate。
   function new(string name = "rdma_function_binding");
     super.new(name);
     function_uid = '0;
@@ -258,15 +240,11 @@ class rdma_function_binding extends uvm_object;
     vft_ready = 1'b0;
   endfunction
 
-  // 中文：配置者转移的是值快照，不转移调用方句柄所有权；同时刷新旧标量
-  // 镜像，供尚未迁移的调用方读取。identity 配置失败时 binding 保持不变。
-  // 功能：验证并克隆 dpu_common Function identity，再刷新 UID/global-ID/generation
-  //   和 PCIe 镜像。
-  // 输入/输出及副作用：source 为调用方拥有的 identity；成功后 binding 拥有 clone，
-  // 并更新 function_uid/global_function_id/generation 及 PCIe BDF/PF/VF 兼容投影。
-  // 失败/边界：source 为 null、validator 返回 null 或校验失败时不改写 binding；
-  // clone/cast 失败返回 RESOURCE_EXHAUSTED。identity 发布后若 pcie==null，
-  // 会通过 legacy factory 重建 PCIe 投影。
+  // 配置者转移的是值快照，不转移调用方句柄所有权；同时刷新旧标量镜像。
+  // 功能：验证并克隆 Function identity，再刷新 UID/global-ID/generation 和 PCIe 镜像。
+  // 输入/输出及副作用：source 由调用方拥有；成功后 binding 持有 clone 并更新上述镜像。
+  // 失败/边界：source 为 null 或校验失败不改 binding；clone 失败返回 RESOURCE_EXHAUSTED；
+  //   pcie==null 时经 factory 重建，失败同样不改 binding。
   function rdma_status configure_identity(rdma_function_identity source);
     rdma_function_identity configured;
     rdma_pcie_identity pcie_candidate;
@@ -307,16 +285,12 @@ class rdma_function_binding extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 设计说明：该 helper 仅用于兼容迁移；legacy 调用方可以继续填充公开 scalar mirrors
-  // 和 PCIe 投影，但在构造 handle 前必须显式提供 route authority。要求
-  // host_topology_key 与 PCIe BDF，是为了拒绝有歧义的 route。
-  // 功能：把 legacy scalar/PCIe mirrors 与显式 Host/root 路由组合成新 Function identity。
-  // 输入/输出及副作用：root_id、host_topology_key、function_kind、vf_index 和 reset_epoch
-  // 提供缺失 authority；读取现有 BDF/UID/global-ID/generation，成功后委托
-  // configure_identity()。
-  // 失败/边界：pcie==null 返回 INVALID_STATE；PF/VF route、UID/generation 或
-  // reset epoch 无效时返回 identity.configure()/validate() 错误，不用模糊路由构造
-  // Function handle。
+  // 设计说明：仅用于兼容迁移；legacy 调用方可继续填充标量镜像和 PCIe 投影，
+  // 但必须显式给出 host_topology_key 与 BDF，以拒绝有歧义的 route。
+  // 功能：把 legacy 镜像与显式 Host/root 路由组合成新 Function identity。
+  // 输入/输出及副作用：root_id/host_topology_key/function_kind/vf_index/reset_epoch 补足 authority；
+  //   读取现有 BDF/UID/global-ID/generation，成功后委托 configure_identity()。
+  // 失败/边界：pcie==null 返回 INVALID_STATE；identity configure/validate 错误原样返回。
   function rdma_status configure_identity_from_legacy_mirrors(
     bit [15:0] root_id,
     bit [31:0] host_topology_key,
@@ -355,14 +329,12 @@ class rdma_function_binding extends uvm_object;
     return configure_identity(legacy_identity);
   endfunction
 
-  // 设计说明：迁移期测试会先写 legacy generation 再调用 make_handle()；因此必须显式
-  // 沿已配置 route 重投影变更后的 mirrors，不能从标量重新猜测 route。
-  // 功能：在 legacy 调用方改写 UID/global-ID/generation 镜像后，沿原 route 重建
-  // authority identity。
-  // 输入/输出及副作用：无参数；只读原 identity.key/reset_epoch 作 route 根，并通过
-  // configure_identity_from_legacy_mirrors() 更新 binding 拥有的 identity 和 PCIe 镜像。
-  // 失败/边界：原 identity 为 null、validator 返回 null 或无效时返回 INVALID_STATE 且不伪造 route；
-  // 重建过程的其他拒绝 status 原样透传。
+  // 设计说明：迁移期测试先写 legacy generation 再调用 make_handle()，故须沿已配置 route
+  // 重投影变更后的镜像，不能从标量重新猜测 route。
+  // 功能：legacy 调用方改写镜像后，沿原 route 重建 authority identity。
+  // 输入/输出及副作用：无参数；以原 identity.key/reset_epoch 为根调用
+  //   configure_identity_from_legacy_mirrors()，更新 identity 和 PCIe 镜像。
+  // 失败/边界：原 identity 为 null 或无效返回 INVALID_STATE；重建失败的 status 原样透传。
   function rdma_status synchronize_identity_from_legacy_mirrors();
     rdma_status identity_status;
 
@@ -381,11 +353,10 @@ class rdma_function_binding extends uvm_object;
     );
   endfunction
 
-  // 功能：为 legacy UVM copy 路径复制完整 binding，包括 identity、PCIe/BAR 和 owner handle。
-  // 输入/输出及副作用：rhs 为只读 binding；深拷贝三类嵌套对象，并按值覆盖
-  // notify、ID、DMA、capability、vector、state 和 readiness flags。
-  // 失败/边界：rhs 类型错误或任一 factory clone/cast 失败时发布 UVM fatal，
-  // 且可能已覆盖前置字段；需要原子 nonfatal 发布时必须用 snapshot_complete_nonfatal()。
+  // 功能：legacy UVM copy 路径下复制完整 binding。
+  // 输入/输出及副作用：rhs 只读；深拷贝 identity/PCIe/owner，按值覆盖其余字段。
+  // 失败/边界：类型不匹配或 clone/cast 失败触发 UVM fatal，可能已覆盖前置字段；
+  //   需要原子 nonfatal 发布时用 snapshot_complete_nonfatal()。
   virtual function void do_copy(uvm_object rhs);
     rdma_function_binding rhs_binding;
 
@@ -422,17 +393,16 @@ class rdma_function_binding extends uvm_object;
     vft_ready = rhs_binding.vft_ready;
   endfunction
 
-  // 功能：从已配置 authority identity 构造可交给其他模型的 Function handle 值。
-  // 输入/输出及副作用：无参数；比对 identity 与 UID/global-ID/generation/PCIe 镜像，
-  // 成功时 factory-create 新 rdma_function_handle，调用方拥有该身份值。
-  // 失败/边界：identity/pcie 缺失、validator 返回 null/无效、任一兼容镜像不一致或
-  // Function handle factory 返回 null 时返回 null；不回退到可能歧义的 legacy scalars。
+  // 功能：由已配置 identity 构造 Function handle 值。
+  // 输入/输出及副作用：无参数；核对 identity 与 UID/global-ID/generation/PCIe 镜像，
+  //   成功时 factory 创建新 handle，调用方拥有。
+  // 失败/边界：identity/pcie 缺失或无效、镜像不一致、factory 返回 null 时返回 null。
   function rdma_function_handle make_handle();
     rdma_function_handle handle;
     rdma_status identity_status;
 
-    // 中文：identity 缺失或非法时不得退回 legacy scalar（global ID=0 也
-    // 是合法值），否则会把未配置 binding 伪装成可用 Function。
+    // identity 缺失或非法时不得退回 legacy scalar（global ID=0 也合法），
+    // 否则未配置 binding 会被伪装成可用 Function。
     if (identity == null || pcie == null)
       return null;
     identity_status = identity.validate();
@@ -455,11 +425,9 @@ class rdma_function_binding extends uvm_object;
     return handle;
   endfunction
 
-  // 功能：判断一个 handle 是否精确指向当前 binding 的 Function incarnation。
-  // 输入/输出及副作用：handle 为非拥有输入；只读 identity 和兼容镜像，返回
-  // kind/UID/global object ID/generation 是否全部一致，不修改 binding。
-  // 失败/边界：handle/identity/pcie 为 null、identity 无效、镜像漂移或 incarnation 不同
-  // 均返回 0；该布尔边界不返回详细 status。
+  // 功能：判断 handle 是否精确指向当前 binding 的 Function incarnation。
+  // 输入/输出及副作用：handle 非拥有；只读，比对 kind/UID/global object ID/generation。
+  // 失败/边界：任一对象缺失、identity 无效、镜像漂移或 incarnation 不同均返回 0。
   function bit accepts(rdma_handle handle);
     rdma_status identity_status;
 
@@ -481,13 +449,10 @@ class rdma_function_binding extends uvm_object;
            handle.generation == identity.generation;
   endfunction
 
-  // 功能：在 reset commit 的已验证路径中，以纯字段比较确认 owner handle 仍指向当前
-  //       binding incarnation，避免为只读校验构造 rdma_status 或进入 factory。
-  // 输入/输出及副作用：handle（输入）只读；函数直接读取 identity、PCIe 镜像、UID/
-  //   global-ID/generation 和 route key，返回 bit，不修改 binding、owner 或 reset ledger。
-  // 失败/边界：handle/identity/pcie 缺失、identity 字段为零/route 非法、兼容镜像漂移或
-  //   kind/UID/object-id/generation 不匹配时返回 0；该 seam 不发布诊断 status，调用方需
-  //   在 prepare/validate 阶段使用 accepts() 获取详细错误。
+  // 功能：reset commit 路径上以纯字段比较确认 owner handle 仍指向当前 incarnation。
+  // 输入/输出及副作用：handle 只读；不构造 rdma_status、不进 factory，不修改任何状态。
+  // 失败/边界：对象缺失、identity 零值/route 非法、镜像漂移或字段不匹配返回 0；
+  //   不发布诊断，需要详细错误时用 accepts()。
   function bit accepts_noalloc(rdma_handle handle);
     if (handle == null || identity == null || pcie == null ||
         identity.function_uid == 0 || identity.generation == 0 ||
@@ -506,10 +471,9 @@ class rdma_function_binding extends uvm_object;
            handle.generation == identity.generation;
   endfunction
 
-  // 功能：为 binding nonfatal snapshot 路径直接构造完整 status 值。
-  // 输入/输出及副作用：code/message 为输入；返回调用者拥有的新 status，不经 factory。
-  // 失败/边界：未知 code 仍使用 rdma_status::category_for 的保守 HARDWARE 类别；
-  //   本 helper 不发布 UVM fatal，也不修改 binding。
+  // 功能：直接构造 nonfatal snapshot 路径使用的 status 值。
+  // 输入/输出及副作用：code/message 为输入；返回新 status，不经 factory。
+  // 失败/边界：未知 code 沿用 category_for 的保守类别；不发 UVM fatal。
   protected function rdma_status snapshot_status(
     rdma_status_code_e code,
     string message = ""
@@ -534,11 +498,10 @@ class rdma_function_binding extends uvm_object;
     return status;
   endfunction
 
-  // 功能：直接复制 protected Function identity，作为不致命、status-returning 边界。
-  // 输入/输出及副作用：snapshot 为输出且入口先清空；成功发布 detached identity，
-  //   不暴露或修改 binding 内部 authority handle。
-  // 失败/边界：identity 为 null、未知 subtype、零 UID/generation 或 PF/VF route
-  //   非法时返回非空错误 status 与 null output，绝不进入 factory/clone/copy。
+  // 功能：直接复制 protected identity，提供不致命的 status 返回边界。
+  // 输入/输出及副作用：snapshot 为输出，入口先置 null；成功发布 detached identity。
+  // 失败/边界：identity 为 null、subtype 未知、零 UID/generation 或 route 非法时返回错误
+  //   status 且 snapshot 为 null；不进入 factory/clone/copy。
   function rdma_status snapshot_identity_nonfatal(
     output rdma_function_identity snapshot
   );
@@ -572,11 +535,11 @@ class rdma_function_binding extends uvm_object;
     return snapshot_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：直接复制完整 binding 值图并保留 exact base/Function owner subtype。
-  // 输入/输出及副作用：snapshot 为输出且入口先清空；成功发布拥有独立 identity、
-  //   PCIe、六 BAR、owner 与 queue/vector 值的 base binding snapshot。
-  // 失败/边界：源 validate 失败、嵌套值缺失、owner 为未知 subtype、候选不等值/
-  //   不 detached 时返回非空错误 status；不调用 clone/copy/type_id::create。
+  // 功能：直接复制完整 binding 值图，保留 exact base/Function owner subtype。
+  // 输入/输出及副作用：snapshot 为输出，入口先置 null；成功发布独立的 identity、PCIe、
+  //   六 BAR、owner 与 queue/vector 值。
+  // 失败/边界：源 validate 失败、嵌套值缺失、owner subtype 未知或候选不等值/未 detached
+  //   时返回错误 status；不调用 clone/copy/type_id::create。
   function rdma_status snapshot_complete_nonfatal(
     output rdma_function_binding snapshot
   );
@@ -748,10 +711,9 @@ class rdma_function_binding extends uvm_object;
     return snapshot_status(RDMA_SC_OK);
   endfunction
 
-  // 返回 detached snapshot，调用方修改结果不会改变 binding 的 authority。
-  // 功能：兼容旧调用方，委托 nonfatal seam 返回 protected identity 的 detached 值。
-  // 输入/输出及副作用：无输入；返回新 snapshot 或 null，不修改 binding。
-  // 失败/边界：identity 缺失/非法时返回 null，不再 clone 或发布 UVM fatal。
+  // 功能：兼容旧调用方，委托 nonfatal seam 返回 detached identity；修改结果不影响 authority。
+  // 输入/输出及副作用：无输入；返回新 snapshot 或 null。
+  // 失败/边界：identity 缺失/非法返回 null，不发 UVM fatal。
   function rdma_function_identity function_identity_snapshot();
     rdma_function_identity snapshot;
     rdma_status status;
@@ -762,29 +724,25 @@ class rdma_function_binding extends uvm_object;
     return snapshot;
   endfunction
 
-  // 中文：别名 accessor，统一强调返回副本而非可变 authority。
-  // 功能：作为 legacy 别名返回 function_identity_snapshot() 的 detached 值。
-  // 输入/输出及副作用：无输入；返回新 identity 或 null，不修改 authority。
-  // 失败/边界：nonfatal snapshot 失败时返回 null，保持旧签名兼容。
+  // 功能：function_identity_snapshot() 的别名，强调返回副本。
+  // 输入/输出及副作用：无输入；返回新 identity 或 null。
+  // 失败/边界：snapshot 失败返回 null。
   function rdma_function_identity identity_snapshot();
     return function_identity_snapshot();
   endfunction
 
-  // 功能：为旧 get_identity() API 返回同一 nonfatal detached identity 投影。
-  // 输入/输出及副作用：无输入；返回新 identity 或 null，无账本副作用。
-  // 失败/边界：protected identity 无效时返回 null，不回退 legacy scalar。
+  // 功能：旧 get_identity() API，返回 nonfatal detached identity。
+  // 输入/输出及副作用：无输入；返回新 identity 或 null。
+  // 失败/边界：identity 无效返回 null，不回退 legacy scalar。
   function rdma_function_identity get_identity();
     return function_identity_snapshot();
   endfunction
 
-  // 功能：在不分配 detached identity 的前提下，验证 binding 当前 authority 与已准备的
-  //       identity snapshot 仍属于同一 Function incarnation。
-  // 输入/输出及副作用：expected（输入）是调用方在 prepare 阶段保存的 identity snapshot；
-  //   函数只读取 protected identity、UID/global-ID/generation 和 PCIe BDF 镜像，返回 bit，
-  //   不调用 factory/clone、不修改 binding 或外部账本。
-  // 失败/边界：expected/identity/pcie 缺失、当前 identity 的 UID/generation/route 无效、
-  //   UID 或 generation 镜像漂移、BDF/PF-parent/VF 投影不一致时返回 0；成功只表示
-  //   authority 与 snapshot 一致，不代表 queue/capability/vector 业务字段已经完整校验。
+  // 功能：不分配 snapshot，验证当前 authority 与 prepare 阶段保存的 identity 仍是同一 incarnation。
+  // 输入/输出及副作用：expected 为 prepare 阶段 snapshot；只读 identity、UID/global-ID/generation
+  //   和 PCIe BDF 镜像，返回 bit，不调用 factory/clone。
+  // 失败/边界：对象缺失、identity 无效、镜像漂移或 BDF/PF/VF 不一致返回 0；
+  //   成功不代表 queue/capability/vector 字段已校验。
   function bit matches_identity_snapshot(
     rdma_function_identity expected
   );
@@ -807,20 +765,18 @@ class rdma_function_binding extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：返回 binding 所拥有 Function identity 的 reset epoch 镜像。
-  // 输入/输出及副作用：无参数；只读 protected identity，返回 rdma_reset_epoch_t，
-  // 不暴露 identity 句柄也不修改 binding。
-  // 失败/边界：identity==null 时返回 0 作为未配置哨兵；本 accessor 不验证其他 identity 字段。
+  // 功能：返回 identity 的 reset epoch。
+  // 输入/输出及副作用：无参数；只读，不暴露 identity 句柄。
+  // 失败/边界：identity==null 返回 0 作为未配置哨兵；不校验其他字段。
   function rdma_reset_epoch_t function_reset_epoch();
     return identity == null ? 0 : identity.reset_epoch;
   endfunction
 
-  // 功能：校验 Function authority 与兼容镜像、queue DMA/能力、vector、notify BAR 和 ACTIVE 门禁。
-  // 输入/输出及副作用：只读 binding 的 identity/PCIe/BAR、DMA/capability/vector、owner 与
-  // readiness flags，返回首个拒绝 status 或 OK；不修改快照或外部组件。
-  // 失败/边界：缺失/invalid identity、PCIe 镜像漂移、PASID/BDF/能力/vector 非法、
-  // BAR/notify 窗口缺失或溢出时拒绝；ACTIVE 还要求匹配 owner、DMA domain、MSE/BME
-  // 及 notify/DMI/VFT valid+ready，owner generation 过时单独返回 STALE_GENERATION。
+  // 功能：校验 identity 与镜像、queue DMA/能力、vector、notify BAR 和 ACTIVE 门禁。
+  // 输入/输出及副作用：只读 binding，返回首个拒绝 status 或 OK；不修改任何状态。
+  // 失败/边界：identity/PCIe 镜像、PASID/BDF/能力/vector、BAR/notify 窗口任一非法即拒绝；
+  //   ACTIVE 另需匹配 owner、DMA domain、MSE/BME 和 notify/DMI/VFT valid+ready，
+  //   owner generation 过时返回 STALE_GENERATION。
   virtual function rdma_status validate();
     longint unsigned bar_last;
     longint unsigned notify_last;

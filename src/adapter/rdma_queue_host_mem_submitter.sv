@@ -3,16 +3,12 @@
 // 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
-// 中文说明：rdma_queue_host_mem_submitter.sv 属于适配器接口层，定义主机内存、PCIe、网络及上下文后端接口。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// XTR v1 queue entry 的事务性 host-memory 访问：queue engine 负责槽位选择与 doorbell，
+// 本 adapter 只接受 opaque allocation capability 和 mapping 内字节偏移。
 
-// Transactional host-memory access for XTR v1 queue entries.  Queue engines
-// own slot selection and doorbells; this adapter deliberately accepts only an
-// opaque allocation capability and a mapping-relative byte offset.
-
-// 功能：在 rdma_queue_host_mem_submitter 中，rdma_hw_host_mem_release 按 owner、generation 和幂等规则释放或清理已验证资源，同时删除相关账本记录。
-// 输入/输出及副作用：api（输入）、mapping（输入）；rdma_hw_host_mem_release 读取 api、mapping 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：rdma_hw_host_mem_release 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“host memory adapter is null”；调用方必须先完成 release-authority 校验，失败路径不提交部分状态或转移未声明资源。
+// 功能：通过 host-memory adapter 严格释放已验证的 mapping。
+// 输入/输出及副作用：api、mapping 输入；调用 api.release，返回其状态。
+// 失败/边界：api 为 null 返回 INVALID_STATE；调用方须先完成 release-authority 校验。
 function automatic rdma_status rdma_hw_host_mem_release(
     rdma_host_mem_api api,
     rdma_dma_mapping mapping
@@ -23,9 +19,10 @@ function automatic rdma_status rdma_hw_host_mem_release(
     return api.\release (mapping);
   endfunction
 
-// 功能：在 allocate_target 的 immediate-failure 路径中，使用 adapter 内部 opaque allocation identity 回滚尚未登记到 submitter ledger 的 mapping。
-// 输入/输出及副作用：api（输入）、mapping（输入）；rdma_hw_host_mem_rollback 只释放本次 allocate 产生的候选 backing，不修改 submitter ledger。
-// 失败/边界：mapping 的 public route/geometry/owner 可能正是校验失败原因，因此不能依赖严格 release()；api 为空或 opaque token 无效时返回明确错误，由调用方保留原始失败证据。
+// 功能：allocate_target 失败路径回滚尚未登记到 ledger 的 mapping（用 adapter 内部 opaque identity）。
+// 输入/输出及副作用：api、mapping 输入；只释放本次候选 backing，不改 submitter ledger。
+// 失败/边界：mapping 的 route/geometry/owner 可能正是失败原因，故不走严格 release()；
+//   api 为空或 opaque token 无效时返回错误，调用方保留原始失败证据。
 function automatic rdma_status rdma_hw_host_mem_rollback(
     rdma_host_mem_api api,
     rdma_dma_mapping mapping
@@ -39,14 +36,13 @@ function automatic rdma_status rdma_hw_host_mem_rollback(
 class rdma_queue_host_mem_target extends uvm_object;
   `uvm_object_utils(rdma_queue_host_mem_target)
 
-  // The capability is intentionally not an allocation address or a mapping.
-  // It is used only by the submitter to find its private ledger entry.
+  // capability 刻意不是地址或 mapping，仅供 submitter 查找私有 ledger 记录。
   local string capability;
   local static longint unsigned next_capability;
 
-  // 功能：构造 rdma_queue_host_mem_target，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_capability=1；capability=$sformatf("queue-target-%0d", next_capability)。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_host_mem_target 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 target，分配全局递增的 opaque capability 字符串。
+  // 输入/输出及副作用：name 输入；next_capability 为 0 时置 1，写 capability 后自增。
+  // 失败/边界：无。
   function new(string name = "rdma_queue_host_mem_target");
     super.new(name);
     if (next_capability == 0)
@@ -55,11 +51,9 @@ class rdma_queue_host_mem_target extends uvm_object;
     next_capability++;
   endfunction
 
-  // Exposes no mapping or address; callers can only present this opaque token
-  // back to a submitter instance.
-  // 功能：在 rdma_queue_host_mem_target 中，capability_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：无显式参数；capability_key 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-// 失败/边界：capability_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：返回 opaque capability；不暴露 mapping 或地址，只能交回 submitter 查找 ledger。
+  // 输入/输出及副作用：无输入；只读 capability。
+  // 失败/边界：无。
   function string capability_key();
     return capability;
   endfunction
@@ -75,9 +69,9 @@ class rdma_queue_host_mem_ledger_entry extends uvm_object;
   rdma_dma_permission_t permissions;
   bit released;
 
-  // 功能：构造 rdma_queue_host_mem_ledger_entry，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mapping=null；release_authority=null；request_context=null；direction=RDMA_DMA_DEVICE_READ；permissions='0；released=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_host_mem_ledger_entry 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 ledger 记录并清空 mapping/authority/context 与 released 标志。
+  // 输入/输出及副作用：name 输入；direction 默认 DEVICE_READ。
+  // 失败/边界：无。
   function new(string name = "rdma_queue_host_mem_ledger_entry");
     super.new(name);
     mapping = null;
@@ -95,13 +89,12 @@ class rdma_queue_host_mem_submitter extends uvm_object;
   rdma_host_mem_api host_mem;
   rdma_codec_registry registry;
 
-  // The mapping and all authority snapshots are retained only here.  A
-  // target contains no public reference to this ledger or to backing memory.
+  // mapping 与全部 authority 快照只保存在此；target 不持有 ledger 或 backing 的公开引用。
   protected rdma_queue_host_mem_ledger_entry ledger[string];
 
-  // 功能：构造 rdma_queue_host_mem_submitter，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：host_mem=null；registry=null。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_queue_host_mem_submitter 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 submitter，host_mem/registry 置 null 并清空 ledger。
+  // 输入/输出及副作用：name 输入；不接管外部资源。
+  // 失败/边界：host_mem 未配置时业务入口返回 INVALID_STATE。
   function new(string name = "rdma_queue_host_mem_submitter");
     super.new(name);
     host_mem = null;
@@ -109,33 +102,30 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     ledger.delete();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，invalid 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
-  // 输入/输出及副作用：message（输入）；invalid 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_ARGUMENT 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，state_error 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
-  // 输入/输出及副作用：message（输入）；state_error 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：state_error 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_STATE 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status state_error(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，codec_error 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
-  // 输入/输出及副作用：message（输入）；codec_error 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：codec_error 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 CODEC_ERROR 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：status_or 将 host-memory/codec helper 返回的可空 status 规范化为可诊断结果，
-  //   非空 status 原样透传，空值时按 fallback_code 和 fallback_message 构造替代错误。
-  // 输入/输出及副作用：status、fallback_code、fallback_message（输入）；返回一个非空
-  //   rdma_status，不修改 submitter、ledger、mapping 或外部资源。
-  // 失败/边界：status 为 null 时永远采用 fallback；fallback_code/message 由调用方保证能
-  //   描述真实拒绝原因，函数不把 null 当作成功，也不执行重试。
+  // 功能：把可空 status 规范化：非空原样返回，null 时按 fallback 构造错误。
+  // 输入/输出及副作用：status、fallback_code、fallback_message 输入；返回非空 status，无其他副作用。
+  // 失败/边界：null 不视为成功，也不重试。
   protected function rdma_status status_or(
     rdma_status status,
     rdma_status_code_e fallback_code,
@@ -146,9 +136,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::make(fallback_code, fallback_message);
   endfunction
 
-  // 功能：将 rhs 中 rdma_queue_host_mem_submitter 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：source（输入）、result（输出）；clone_context 读取 source、result 并使用字段 result、cloned，并写入 result；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：clone_context 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“DMA request context clone failed”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：克隆 DMA request context，得到与源隔离的快照。
+  // 输入/输出及副作用：source 输入；result 输出（入口先清空）。
+  // 失败/边界：source 为 null 返回 INVALID_ARGUMENT；clone 失败或类型不符返回 INVALID_STATE。
   protected function rdma_status clone_context(
     rdma_dma_request_context source,
     output rdma_dma_request_context result
@@ -164,14 +154,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：mapping_identity_status 在登记 queue target 前核对 mapping 与 request_ctx 的
-  //   Function、BDF、PASID、DMA domain、route、reset epoch、尺寸、对齐和方向权限。
-  // 输入/输出及副作用：mapping、request_ctx、requested_size、requested_alignment、
-  //   requested_direction（输入）；只读检查并返回 rdma_status，不写 mapping、request_ctx、
-  //   ledger 或外部 Host-memory 资源。
-  // 失败/边界：空/非 ACTIVE mapping、缺少 Function、身份或 route/epoch 不一致、尺寸/对齐/
-  //   方向/权限不符、零长度及 IOVA 溢出或回绕分别返回 INVALID/STATE、DMA_TRANSLATION、
-  //   DMA_PERMISSION 或 STALE_GENERATION；失败不发布 target。
+  // 功能：登记 target 前核对 mapping 与 request_ctx 的 Function/BDF/PASID/domain/route/epoch、尺寸、对齐、方向权限。
+  // 输入/输出及副作用：mapping、request_ctx 与 requested_* 输入；只读检查，返回 status。
+  // 失败/边界：空/非 ACTIVE mapping 与零长度返回 INVALID_ARGUMENT/INVALID_STATE；身份、尺寸、对齐、
+  //   IOVA 溢出或回绕返回 DMA_TRANSLATION；方向/权限不符返回 DMA_PERMISSION；epoch 不符返回 STALE_GENERATION。
   protected function rdma_status mapping_identity_status(
     rdma_dma_mapping mapping,
     rdma_dma_request_context request_ctx,
@@ -201,9 +187,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
         mapping.dma_domain_id != request_ctx.dma_domain_id)
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                 "DMA mapping domain identity mismatch");
-    // Legacy direct Host-memory callers may omit route/epoch metadata.  Once
-    // either side supplies an authority, however, both copies must be valid
-    // and identical; production planner/router paths always supply both.
+    // 旧的直接调用方可省略 route/epoch；一旦任一侧提供，两侧必须有效且一致。
     if (request_ctx.route_valid || mapping.route_valid) begin
       if (!request_ctx.route_valid || !rdma_route_key_valid(request_ctx.route) ||
           !mapping.route_valid || !rdma_route_key_valid(mapping.route) ||
@@ -255,15 +239,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：ledger_entry_authority_status 校验一条 target ledger 记录的完整
-  //       mapping、release authority、request context、Function、route、epoch
-  //       和生命周期 authority。
-  // 输入/输出及副作用：entry（输入）；函数只读取 entry 及其嵌套字段，返回
-  //       规范化 rdma_status，不调用 host_mem、不修改 ledger 或 mapping。
-  // 失败/边界：entry、mapping、release_authority、request_context 或 Function
-  //       缺失，mapping 非 ACTIVE、身份/路由/epoch/owner 不一致、几何或权限
-  //       非法时返回对应错误；release authority 只通过 mapping 提供的
-  //       opaque equivalence hook 校验，不读取或重建其内部 token。
+  // 功能：校验一条 ledger 记录的 mapping、release authority、request context 及 Function/route/epoch/owner。
+  // 输入/输出及副作用：entry 输入；只读，不调用 host_mem、不改 ledger 或 mapping。
+  // 失败/边界：记录/mapping/authority/context/Function 缺失、已 released、非 ACTIVE、身份/route/epoch/owner
+  //   不一致或方向权限非法时返回对应错误；release authority 只经 mapping 的 opaque hook 校验。
   protected function rdma_status ledger_entry_authority_status(
     rdma_queue_host_mem_ledger_entry entry
   );
@@ -345,8 +324,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
         "queue host-memory target DMA domain mismatch"
       );
 
-    // Direct unit callers may omit route/epoch metadata.  Once either side
-    // carries an authority, both copies must be present, valid and identical.
+    // 同上：任一侧携带 route/epoch authority 时，两侧必须存在、有效且一致。
     if (request_ctx.route_valid || mapping.route_valid) begin
       if (!request_ctx.route_valid || !mapping.route_valid ||
           !rdma_route_key_valid(request_ctx.route) ||
@@ -408,12 +386,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：lookup_target 按 opaque capability 查找唯一 ledger 记录，并在返回
-  //       前执行完整 authority 校验，阻止 malformed entry 进入任何 I/O 路径。
-  // 输入/输出及副作用：target（输入）、entry（输出）；函数只读取 target 和
-  //       private ledger，返回经过验证的内部 entry 引用，不取得外部资源所有权。
-  // 失败/边界：target/key 未登记、entry 或其 mapping/context/authority 缺失、
-  //       身份/route/epoch/lifecycle 校验失败时返回非成功 status 且 entry=null。
+  // 功能：按 opaque capability 查找唯一 ledger 记录，并在返回前做完整 authority 校验。
+  // 输入/输出及副作用：target 输入；entry 输出（已验证的内部引用）；只读 ledger。
+  // 失败/边界：target/key 未登记或 authority 校验失败时返回非成功 status 且 entry=null。
   protected function rdma_status lookup_target(
     rdma_queue_host_mem_target target,
     output rdma_queue_host_mem_ledger_entry entry
@@ -440,13 +415,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return status;
   endfunction
 
-  // 功能：validate_range 把 target ledger entry 与 offset/length/方向/权限组合成一次
-  //   Host-memory access，并在调用 mapping.check_access 前验证 IOVA 几何和生命周期。
-  // 输入/输出及副作用：entry、offset、length、requested_direction、requested_permissions
-  //   （输入）；只读 entry/mapping/context，返回检查 status，不修改 ledger、mapping 或游标。
-  // 失败/边界：entry 缺失、已 release、length 为零、offset 或 IOVA 计算溢出时拒绝；
-  //   mapping.check_access 的 null status 规范化为 DMA_TRANSLATION，其余失败原样传播，
-  //   任何失败都不启动 I/O。
+  // 功能：把 entry 与 offset/length/方向/权限组成一次 access，在 mapping.check_access 前验证 IOVA 几何与生命周期。
+  // 输入/输出及副作用：entry、offset、length、requested_direction/permissions 输入；只读，返回检查 status。
+  // 失败/边界：entry 缺失、已 release、length 为零、offset 或 IOVA 溢出时拒绝；check_access 的 null status
+  //   规范化为 DMA_TRANSLATION，其余失败原样传播；失败不启动 I/O。
   protected function rdma_status validate_range(
     rdma_queue_host_mem_ledger_entry entry,
     longint unsigned offset,
@@ -486,10 +458,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
                      "DMA mapping access check returned null");
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，lookup_queue_codec 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：image_kind（输入）、object_type（输入）、variant（输入）、codec（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为
-  //   detached 快照，读取不取得外部资源所有权。
-  // 失败/边界：lookup_queue_codec 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：按 image_kind/object_type/variant 在 registry 中查找 queue codec。
+  // 输入/输出及副作用：image_kind、object_type、variant 输入；codec 输出（入口先置 null）。
+  // 失败/边界：registry 未配置返回 INVALID_STATE；lookup 返回 null 时归一化为 UNSUPPORTED_OPCODE。
   protected function rdma_status lookup_queue_codec(
     rdma_image_kind_e image_kind,
     string object_type,
@@ -512,9 +483,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
                      "queue codec lookup returned null");
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，image_to_array 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
-  // 输入/输出及副作用：image（输入）、write_data（输出）；image_to_array 读取 image、write_data 并使用字段 write_data，并写入 write_data；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：image_to_array 返回 RDMA_SC_CODEC_ERROR；典型拒绝条件为“encoded queue image is malformed”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：把 image 的字节拷贝为 write_data 数组，供 host-memory 写入。
+  // 输入/输出及副作用：image 输入；write_data 输出。
+  // 失败/边界：image 非法（malformed）时返回 CODEC_ERROR。
   protected function rdma_status image_to_array(
     rdma_hw_image image,
     output byte write_data[]
@@ -529,14 +500,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：complete_read_image 读取一个已登记的 host-memory entry，建立 detached
-  //   image，并在 CQE 路径上执行与 entry-size/variant 对应的 codec 校验。
-  // 输入/输出及副作用：entry、offset、image_length、image_kind、codec 和可选
-  //   cqe_variant 为输入；image 为输出。函数只读取 backing，成功后发布独立 image，
-  //   不推进队列游标，也不取得调用方资源所有权。
-  // 失败/边界：host-memory 读出长度不符、image 分配失败、variant codec 类型不符、
-  //   codec 返回 null/非成功 status 时返回相应错误；所有失败路径保持 image=null，
-  //   不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：读取已登记 entry，建立 detached image；CQE 路径按 entry-size/variant 做 codec 校验。
+  // 输入/输出及副作用：entry、offset、image_length、image_kind、codec、可选 cqe_variant 输入；image 输出；
+  //   只读 backing，不推进游标。
+  // 失败/边界：读出长度不符、image 分配失败、codec 类型不符或 codec 返回 null/失败时返回错误，image=null。
   protected function rdma_status complete_read_image(
     rdma_queue_host_mem_ledger_entry entry,
     longint unsigned offset,
@@ -594,9 +561,8 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     candidate.hmc_target = '0;
     candidate.bar_target = '0;
 
-    // CQE size is a transaction property.  The registry intentionally shares
-    // one codec object, so validate through its explicit profile API instead
-    // of reading the mutable 64B/32B/128B active profile.
+    // CQE 大小属于事务属性；registry 共享同一 codec，须用显式 profile API 校验，
+    // 不读取可变的 active profile。
     if (image_kind == RDMA_IMAGE_CQE) begin
       if (!$cast(cqe_codec, codec))
         return codec_error("CQ registry codec cannot validate a variable profile");
@@ -617,10 +583,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，allocate_target 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
-  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、target（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output
-  //   发布新句柄/映射。
-  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
+  // 功能：校验请求后向 host_mem 分配 mapping，核对身份并登记 ledger，返回 opaque target。
+  // 输入/输出及副作用：request_context、size、alignment、direction 输入；target 输出；成功时新增 ledger 记录。
+  // 失败/边界：参数非法、adapter 失败、mapping 身份不符、快照/分配失败返回错误；
+  //   失败路径对已得到的 mapping 回滚一次，不泄漏资源。
   function rdma_status allocate_target(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -658,9 +624,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     status = host_mem.allocate(request_context, size, alignment, direction,
                                mapping);
     if (status == null || !status.ok()) begin
-      // A defensive adapter may return a live mapping together with a
-      // failure status.  Treat that as a post-allocation failure and make the
-      // single cleanup attempt before returning the allocation error.
+      // adapter 可能在失败 status 时仍返回活动 mapping：视为分配后失败，仅回滚一次。
       if (mapping != null)
         release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       return status_or(status, RDMA_SC_DMA_TRANSLATION,
@@ -671,8 +635,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     status = mapping_identity_status(mapping, request_context, size,
                                      alignment, direction);
     if (!status.ok()) begin
-      // An adapter may have returned a mapping with malformed identity.  It
-      // is still released exactly once before the failed allocation exits.
+      // mapping 身份异常时同样只回滚一次再返回。
       release_status = rdma_hw_host_mem_rollback(host_mem, mapping);
       if (release_status == null || !release_status.ok())
         return status;
@@ -715,12 +678,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，write_queue_entry 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：target（输入）、offset（输入）、model（输入）、image_kind（输入）、variant（输入）、expected_length（输入）、image（输出）；输入
-  //   request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，并通过 output 返回结果。
-  // 失败/边界：target authority、Host-memory adapter、codec 或 model 缺失，
-  //   codec 返回 null status/image、后端拒绝、范围溢出、DMA 权限不足或
-  //   readback 校验失败时返回错误，不发布 image，也不推进本地游标。
+  // 功能：编码 queue entry，校验 image 与范围后写入 host-memory 并回读校验。
+  // 输入/输出及副作用：target、offset、model、image_kind、variant、expected_length 输入；image 输出；写 backing。
+  // 失败/边界：target authority、adapter、codec、model 缺失，codec 返回 null/尺寸不符、后端拒绝、
+  //   范围溢出、DMA 权限不足或回读校验失败时返回错误，不发布 image。
   protected function rdma_status write_queue_entry(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -824,8 +785,7 @@ class rdma_queue_host_mem_submitter extends uvm_object;
         return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                   "queue host-memory readback mismatch");
     end
-    // Validate the readback image too.  This catches an adapter that returns
-    // bytes with malformed metadata or a codec image that was not detached.
+    // 同样校验回读 image，捕获 adapter 返回 metadata 异常或未 detached 的 image。
     readback_image = rdma_hw_image::type_id::create("queue_readback_image");
     if (readback_image == null)
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
@@ -848,10 +808,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，write_sqe 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：target（输入）、offset（输入）、model（输入）、image（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或
-  //   pending journal，并通过 output 返回结果。
-  // 失败/边界：write_sqe 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：按 model.transport 选择 rc/ud/urc variant 写入 SQE。
+  // 输入/输出及副作用：target、offset、model 输入；image 输出；委托 write_queue_entry。
+  // 失败/边界：model 为 null 或 transport 不支持返回 INVALID_ARGUMENT，image=null。
   function rdma_status write_sqe(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -885,10 +844,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     );
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，write_rqe 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：target（输入）、offset（输入）、model（输入）、image（输出）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或
-  //   pending journal，并通过 output 返回结果。
-  // 失败/边界：write_rqe 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：写入 RQE（default variant）。
+  // 输入/输出及副作用：target、offset、model 输入；image 输出；委托 write_queue_entry。
+  // 失败/边界：model 为 null 返回 INVALID_ARGUMENT，image=null。
   function rdma_status write_rqe(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -911,10 +869,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     );
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，read_cqe 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：target（输入）、offset（输入）、model（输出）、image（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
-  //   快照，读取不取得外部资源所有权。
-  // 失败/边界：read_cqe 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：以默认 CQE 大小读取并解码 CQE。
+  // 输入/输出及副作用：target、offset 输入；model/image 输出；委托 read_cqe_sized。
+  // 失败/边界：同 read_cqe_sized。
   function rdma_status read_cqe(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -924,12 +881,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return read_cqe_sized(target, offset, RDMA_CQE_BYTES, model, image);
   endfunction
 
-  // 功能：按运行时 CQE entry 大小读取并以兼容的 RC variant 解码 CQE，供旧的
-  //       32/64/128B CQ ring 调用方继续使用。
-  // 输入/输出及副作用：target、offset、entry_size 为输入，model/image 为输出；委托
-  //       显式 variant 入口仅读取 host-memory ledger，不修改共享 codec 状态。
-  // 失败/边界：entry_size 不是 32/64/128、映像长度不匹配、RC overlay 不适用或
-  //       codec 解码失败时不发布 model/image；UD/RQ/SRFQ 调用方必须选新入口。
+  // 功能：按运行时 CQE entry 大小以 RC variant 解码 CQE，兼容旧 32/64/128B CQ ring 调用方。
+  // 输入/输出及副作用：target、offset、entry_size 输入；model/image 输出；委托 variant 入口，只读 ledger。
+  // 失败/边界：entry_size 非 32/64/128、长度不匹配、RC overlay 不适用或解码失败时不发布；
+  //   UD/RQ/SRFQ 调用方须用 variant 入口。
   function rdma_status read_cqe_sized(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -941,15 +896,10 @@ class rdma_queue_host_mem_submitter extends uvm_object;
                                   RDMA_CQE_VARIANT_RC, model, image);
   endfunction
 
-  // 功能：按运行时 CQE entry 大小和调用方明确给出的 variant 读取并解码
-  //       CQE；variant 决定 qword2/qword3 中 RC、UD 或 RQ/SRFQ overlay 的
-  //       保留位与字段解释，避免共享 registry codec 隐式沿用 RC 默认值。
-  // 输入/输出及副作用：target、offset、entry_size、variant 为输入；model、image
-  //       为输出；函数仅读取 target 对应 host-memory ledger，发布 detached
-  //       CQE model/image，不修改共享 codec 的 active profile 或 variant。
-  // 失败/边界：target 不存在、entry_size 不是 32/64/128、variant 非法、映像
-  //       metadata/长度不匹配、codec 解码失败或类型转换失败时返回明确错误，且
-  //       model/image 保持 null；调用方不得从 raw qword2/qword3 非零值猜 variant。
+  // 功能：按 entry_size 与显式 variant 读取并解码 CQE，variant 决定 qword2/qword3 的 overlay 解释。
+  // 输入/输出及副作用：target、offset、entry_size、variant 输入；model/image 输出；只读，发布 detached 值。
+  // 失败/边界：target 不存在、entry_size 非法、variant 非法、metadata/长度不符、解码或类型转换失败时
+  //   返回错误，model/image 保持 null；调用方不得由 raw qword 猜 variant。
   function rdma_status read_cqe_sized_variant(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -977,10 +927,8 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     if (!status.ok())
       return status;
 
-    // CQE profile and variant are properties of this read transaction, not
-    // mutable state on the shared registry codec.  Decode through the
-    // explicit variant API so interleaved reads cannot observe one another's
-    // overlay authority.
+    // profile/variant 属于本次读事务而非共享 codec 的可变状态；经显式 variant API 解码，
+    // 避免交错读互相影响 overlay。
     status = complete_read_image(entry, offset, entry_size,
                                  RDMA_IMAGE_CQE, codec,
                                  candidate_image, 1'b1, variant);
@@ -1007,10 +955,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，read_ceqe 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：target（输入）、offset（输入）、model（输出）、image（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
-  //   快照，读取不取得外部资源所有权。
-  // 失败/边界：read_ceqe 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：读取并解码 CEQE，返回 detached model/image。
+  // 输入/输出及副作用：target、offset 输入；model/image 输出；只读 ledger/backing。
+  // 失败/边界：target 或 codec 查找失败、读出/解码失败时返回错误，model/image 保持 null。
   function rdma_status read_ceqe(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -1054,10 +1001,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，read_aeqe 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：target（输入）、offset（输入）、model（输出）、image（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
-  //   快照，读取不取得外部资源所有权。
-  // 失败/边界：read_aeqe 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：读取并解码 AEQE，返回 detached model/image。
+  // 输入/输出及副作用：target、offset 输入；model/image 输出；只读 ledger/backing。
+  // 失败/边界：target 或 codec 查找失败、读出/解码失败时返回错误，model/image 保持 null。
   function rdma_status read_aeqe(
     rdma_queue_host_mem_target target,
     longint unsigned offset,
@@ -1101,9 +1047,9 @@ class rdma_queue_host_mem_submitter extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_queue_host_mem_submitter 中，release_target 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：target（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release_target 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：校验 release authority 后释放 target 的 mapping，并标记 ledger 记录已释放。
+  // 输入/输出及副作用：target 输入；调用 host_mem 释放，成功置 entry.released。
+  // 失败/边界：target 未登记、已释放、authority 校验或 adapter 释放失败返回错误，不重新激活旧 target。
   function rdma_status release_target(
     rdma_queue_host_mem_target target
   );

@@ -1,61 +1,55 @@
 // 目录：硬件编解码层 codec/rdma/rdma_qpc_codecs.sv。
-// 职责：实现 rdma_hw_qpc_codecs 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_qpc_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：QPC 硬件 codec 的公共基类与各 transport（RC/UD/URC）QPC 编解码实现。
+// 依赖：依赖 rdma_codec_base、rdma_qpc_model、qword builder 及 QPC 字段常量。
+// 所有权与生命周期：codec 不拥有 builder/model；编码产物由调用方持有。
 
 virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
 
-  // 功能：构造 rdma_hw_qpc_codec_base，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_qpc_codec_base 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 QPC codec 基类。
+  // 输入/输出及副作用：name 为 UVM 名。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_qpc_codec_base");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，expected_transport 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_transport 读取 对象字段：rdma_status、message 并使用字段 rdma_status、message；函数返回 rdma_transport_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_transport 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回本 codec 对应的 transport（由派生类实现）。
+  // 输入/输出及副作用：无。
+  // 失败/边界：无。
   protected pure virtual function rdma_transport_e expected_transport();
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode_extension 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：qpc（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：编码 transport 专属的 QPC 扩展字段（由派生类实现）。
+  // 输入/输出及副作用：qpc 只读；字段经 builder 写入 image。
+  // 失败/边界：字段非法时返回错误状态。
   protected pure virtual function rdma_status encode_extension(
     rdma_qpc_model qpc,
     rdma_hw_qword_builder builder
   );
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，decode_extension 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、qpc（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：解码 transport 专属的 QPC 扩展字段到 qpc（由派生类实现）。
+  // 输入/输出及副作用：builder 只读；结果写入 qpc。
+  // 失败/边界：字段非法时返回错误状态。
   protected pure virtual function rdma_status decode_extension(
     rdma_hw_qword_builder builder,
     rdma_qpc_model qpc
   );
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；invalid_argument 用 message 构造 RDMA_SC_INVALID_ARGUMENT，不更新 QPC codec 或外部资源；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_ARGUMENT 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，codec_error 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
-  // 输入/输出及副作用：message（输入）；codec_error 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：codec_error 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 CODEC_ERROR 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：qpc_status_or_error 统一处理 QPC codec 与 builder 边界返回的状态，
-  //       把 null 转成可诊断的确定性失败。
-  // 输入/输出及副作用：status 和 label 为输入；非空状态原样返回，null 状态
-  //       转换为 INVALID_STATE；不修改 QPC、image、builder 或外部资源。
-  // 失败/边界：派生 codec、模型 validator 或后端 builder 违反非空状态契约时，
-  //       调用方必须停止当前阶段，不能继续访问 status.ok() 或 status.message。
+  // 功能：把 builder/validator 返回的 null status 转为确定性失败。
+  // 输入/输出及副作用：label 用于诊断；非空 status 原样返回，不修改其他对象。
+  // 失败/边界：status 为 null 返回 INVALID_STATE；调用方须据此停止当前阶段。
   protected function rdma_status qpc_status_or_error(
     rdma_status status,
     string label
@@ -68,9 +62,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，put 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输入）；put 读取 builder、word_byte_offset、lsb、width、value 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：put 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：经 builder 写入一个 QPC 字段。
+  // 输入/输出及副作用：按 word_byte_offset/lsb/width 写入 value；修改 builder 内部 image。
+  // 失败/边界：builder 为空或写入失败时返回 CODEC_ERROR（失败信息附带原因）。
   protected function rdma_status put(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -91,10 +85,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，get 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output
-  //   为 detached 快照，读取不取得外部资源所有权。
-  // 失败/边界：get 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：经 builder 读取一个 QPC 字段。
+  // 输入/输出及副作用：按 word_byte_offset/lsb/width 读入 value；不修改 image。
+  // 失败/边界：builder 为空或读取失败时返回 CODEC_ERROR。
   protected function rdma_status get(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -115,12 +108,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：add_allowed_field 在 qpc_allowed_mask 构造阶段把一个 profile 字段的位范围并入
-  //   当前 qword 的软件可写掩码。
-  // 输入/输出及副作用：qword_index、word_byte_offset、lsb、width（输入），mask（inout）；
-  //   当 word_byte_offset 对应 qword 时只更新 mask，不创建对象或取得外部资源。
-  // 失败/边界：qword 不匹配时无操作；该 void helper 不报告错误，调用方必须提供 1..64 的
-  //   width 和有效 lsb，否则位移结果不具备协议意义。
+  // 功能：把一个字段的位范围并入指定 qword 的可写掩码。
+  // 输入/输出及副作用：仅在字段落在 qword_index 时更新 mask（inout）。
+  // 失败/边界：qword 不匹配时无操作；width 须为 1..64，不报错。
   protected function void add_allowed_field(
     int unsigned qword_index,
     int unsigned word_byte_offset,
@@ -135,12 +125,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     mask |= width_mask << lsb;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，qpc_allowed_mask 构造软件可写的 QPC
-  //   字段所有权掩码，供 encode occupancy 校验确认每个字段均由当前 codec 负责。
-  // 输入/输出及副作用：transport、qword_index（输入）；mask（输出）接收当前
-  //   transport 的 writable 字段集合；函数只读 profile 常量，不取得外部资源所有权。
-  // 失败/边界：qword_index 超过 63 或 transport 不是 RC/UD/URC 时返回 0；
-  //   qword63 的硬件 runtime shadow 不在此掩码中，软件写路径因此保持零值。
+  // 功能：构造指定 transport 与 qword 的软件可写字段掩码，供 encode 占用校验。
+  // 输入/输出及副作用：mask 输出该 qword 的可写位；只读 profile 常量。
+  // 失败/边界：qword_index>=64 或 transport 非 RC/UD/URC 返回 0；qword63 runtime shadow 不在其中。
   protected function bit qpc_allowed_mask(
     rdma_transport_e transport,
     int unsigned qword_index,
@@ -256,15 +243,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return 1'b1;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，qpc_decode_allowed_mask 在 writable
-  //   字段掩码之上叠加驱动明确声明的 QPC runtime shadow 读回位，区分观察数据
-  //   与软件可写状态，供 decode/validate_image 使用。
-  // 输入/输出及副作用：transport、qword_index（输入）；mask（输出）先接收
-  //   qpc_allowed_mask 的字段集合，再在 qword63 加入 wr.h 的四段 shadow 位；
-  //   这些位只作为硬件观察值参与保留位校验，不投影为软件模型字段；函数不
-  //   修改 image、model 或外部资源。
-  // 失败/边界：基础 transport/qword 校验失败时返回 0；除 qword63 的
-  //   RDMA_QPC_RUNTIME_SHADOW_READBACK_MASK 外，所有未声明位仍保持拒绝。
+  // 功能：在可写掩码上叠加 qword63 runtime shadow 读回位，供 decode 校验。
+  // 输入/输出及副作用：mask 输出；shadow 位仅作硬件观察值，不投影为软件字段。
+  // 失败/边界：基础掩码查找失败返回 0；其余未声明位仍被拒绝。
   protected function bit qpc_decode_allowed_mask(
     rdma_transport_e transport,
     int unsigned qword_index,
@@ -279,9 +260,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return 1'b1;
   endfunction
 
-  // 功能：validate_qpc_encode_mask 校验 builder、transport 与当前对象状态的一致性，并显式处理“QPC encode occupancy is not 64 qwords”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：builder（输入）、transport（输入）；validate_qpc_encode_mask 读取 builder、transport 并使用字段 i、occupancy、rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate_qpc_encode_mask 返回 RDMA_SC_CODEC_ERROR；典型拒绝条件为“QPC encode occupancy is not 64 qwords”“QPC encode mask lookup failed”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 builder 的字段写入占用与可写掩码逐 qword 一致。
+  // 输入/输出及副作用：读取 builder occupancy；不修改状态。
+  // 失败/边界：occupancy 非 64 qword、掩码查找失败或占用与掩码不符时返回 CODEC_ERROR。
   protected function rdma_status validate_qpc_encode_mask(
     rdma_hw_qword_builder builder,
     rdma_transport_e transport
@@ -302,12 +283,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_qpc_decode_mask 校验硬件 readback image 的 64 个 qword，
-  //   对普通字段和 qword63 runtime shadow 分别使用精确 ownership mask。
-  // 输入/输出及副作用：builder、transport（输入）；builder 提供 words 快照，
-  //   函数只返回校验状态，不发布模型、修改 image 或取得调用方资源所有权。
-  // 失败/边界：image 长度不是 64 qword、transport 不支持，或任一 qword 含有
-  //   未被 writable/profile/shadow mask 声明的位时返回 RDMA_SC_CODEC_ERROR。
+  // 功能：校验读回 image 的 64 个 qword 不含掩码之外的保留位。
+  // 输入/输出及副作用：读取 builder words 快照；不修改状态。
+  // 失败/边界：非 64 qword、掩码查找失败或含未声明位时返回 CODEC_ERROR。
   protected function rdma_status validate_qpc_decode_mask(
     rdma_hw_qword_builder builder,
     rdma_transport_e transport
@@ -328,9 +306,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode_log2 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：value（输入）、width（输入）、label（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_log2 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 2 的幂 value 编码为 log2 码。
+  // 输入/输出及副作用：label 用于诊断；code 输出 log2 值。
+  // 失败/边界：value 非 2 的幂或 log2 超出 width 位时返回 INVALID_ARGUMENT。
   protected function rdma_status encode_log2(
     int unsigned value,
     int unsigned width,
@@ -347,9 +325,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode_threshold 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：value（输入）、label（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_threshold 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把阈值编码为 log2 码，0 表示 0。
+  // 输入/输出及副作用：code 输出；非零值按 4 位宽走 encode_log2。
+  // 失败/边界：非零且不是 2 的幂或超宽时返回 INVALID_ARGUMENT。
   protected function rdma_status encode_threshold(
     int unsigned value,
     string label,
@@ -362,9 +340,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return encode_log2(value, 4, label, code);
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode_page 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：backing（输入）、label（输入）、page（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_page 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 4 KiB 对齐的 backing 地址转为 52 位页号。
+  // 输入/输出及副作用：page 输出（失败时为 0）。
+  // 失败/边界：未 4 KiB 对齐或页号超过 52 位时返回 INVALID_ARGUMENT。
   protected function rdma_status encode_page(
     rdma_backing_addr_t backing,
     string label,
@@ -381,9 +359,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode_state 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：state（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_state 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 QP 状态编码为 3 位硬件码（SQD/SQE 同为 5）。
+  // 输入/输出及副作用：code 输出。
+  // 失败/边界：未知状态返回 INVALID_ARGUMENT。
   protected function rdma_status encode_state(rdma_qp_state_e state,
                                                 output bit [2:0] code);
     case (state)
@@ -398,9 +376,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，decode_state 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：code（输入）、state（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_state 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 3 位硬件码解码为 QP 状态（5 对应 SQD）。
+  // 输入/输出及副作用：state 输出。
+  // 失败/边界：码值 6/7 非法，返回 CODEC_ERROR。
   protected function rdma_status decode_state(bit [2:0] code,
                                                 output rdma_qp_state_e state);
     case (code)
@@ -415,9 +393,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode_pmtu 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：mtu（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_pmtu 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 path MTU（1024..8192）编码为 3 位硬件码。
+  // 输入/输出及副作用：code 输出。
+  // 失败/边界：MTU 不在 1024/2048/4096/8192 时返回 INVALID_ARGUMENT。
   protected function rdma_status encode_pmtu(int unsigned mtu,
                                                output bit [2:0] code);
     case (mtu)
@@ -430,9 +408,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，decode_pmtu 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：code（输入）、mtu（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_pmtu 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 3 位 PMTU 码解码为字节数。
+  // 输入/输出及副作用：mtu 输出。
+  // 失败/边界：码值不在 2..5 时返回 CODEC_ERROR。
   protected function rdma_status decode_pmtu(bit [2:0] code,
                                                output int unsigned mtu);
     case (code)
@@ -445,9 +423,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，projected_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
-  // 输入/输出及副作用：name（输入）、kind（输入）、object_id（输入）；projected_handle 读取 name、kind、object_id 并使用字段 handle、handle.kind、handle.object_id、handle.function_uid、handle.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-  // 失败/边界：projected_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：构造投影用资源句柄，function_uid 与 generation 置 0。
+  // 输入/输出及副作用：name/kind/object_id 为输入；返回新 handle。
+  // 失败/边界：无。
   protected function rdma_handle projected_handle(
     string name,
     rdma_resource_kind_e kind,
@@ -462,9 +440,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return handle;
   endfunction
 
-  // 功能：validate_profile_model 校验 qpc 与当前对象状态的一致性，并显式处理“QPC model is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：qpc（输入）；validate_profile_model 读取 qpc 并使用字段 status、expected_ecn；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 qpc 模型能否被本 codec 编码为硬件 QPC。
+  // 输入/输出及副作用：只读 qpc；调用 encode_* helper 试算页号/log2/PMTU。
+  // 失败/边界：qpc 为空、模型自检失败、transport 不符、标识超宽或字段不可编码时返回 INVALID_ARGUMENT。
   protected function rdma_status validate_profile_model(rdma_qpc_model qpc);
     rdma_status status;
     int unsigned code;
@@ -507,9 +485,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“rdma QPC codec requires rdma_qpc_model”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 hw model 是 rdma_qpc_model 且可编码。
+  // 输入/输出及副作用：只读 model。
+  // 失败/边界：类型转换失败返回 INVALID_ARGUMENT，其余同 validate_profile_model。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_qpc_model qpc;
     if (!$cast(qpc, model))
@@ -517,9 +495,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return validate_profile_model(qpc);
   endfunction
 
-  // 功能：validate_image 校验 image 与当前对象状态的一致性，并显式处理“QPC image is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：image（输入）；validate_image 读取 image 并使用字段 payload、builder、status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 QPC image 的长度、元数据、保留位。
+  // 输入/输出及副作用：只读 image；用临时 builder 反序列化并检查 decode 掩码。
+  // 失败/边界：image 为空、长度非 512B、元数据不符、反序列化失败或含非法位时返回 CODEC_ERROR。
   virtual function rdma_status validate_image(rdma_hw_image image);
     rdma_hw_qword_builder builder;
     byte unsigned payload[];
@@ -553,23 +531,23 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return validate_qpc_decode_mask(builder, expected_transport());
   endfunction
 
-  // 功能：hardware_endian 使用 当前对象字段 计算并返回 rdma_byte_endian_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；hardware_endian 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_byte_endian_e，不取得调用方资源所有权。
-  // 失败/边界：hardware_endian 是只读访问器，返回 RDMA_ENDIAN_BIG；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 QPC 硬件字节序（大端）。
+  // 输入/输出及副作用：无。
+  // 失败/边界：无。
   virtual function rdma_byte_endian_e hardware_endian();
     return RDMA_ENDIAN_BIG;
   endfunction
 
-  // 功能：describe_fields 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；describe_fields 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回 image 的描述文本。
+  // 输入/输出及副作用：文本含 transport 名；无副作用。
+  // 失败/边界：无。
   virtual function string describe_fields();
     return $sformatf("rdma 512-byte %s QPC image", expected_transport().name());
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，normalized_rights 把访问方向或请求权限规范化为 Host-memory/DMA 校验使用的权限位集合。
-  // 输入/输出及副作用：access（输入）；normalized_rights 读取 access 并使用字段 rights；函数返回 bit [4:0]，不取得调用方资源所有权。
-  // 失败/边界：normalized_rights 是只读访问器，返回 rights；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：把 QP 访问权限映射为 QPC 权限位。
+  // 输入/输出及副作用：只读 access；返回权限位集合。
+  // 失败/边界：任一写权限（本地/远端写/原子）都置 LOCAL_WRITE。
   protected function bit [4:0] normalized_rights(rdma_rdma_access_t access);
     bit [4:0] rights;
     rights = '0;
@@ -582,9 +560,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rights;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode_common 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：qpc（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_common 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 qpc 的 transport 无关字段经 builder 写入 QPC image。
+  // 输入/输出及副作用：qpc 只读；builder 被写入各字段与目的 IP。
+  // 失败/边界：输入为空、transport 不支持或任一字段编码/写入失败时返回错误。
   protected function rdma_status encode_common(
     rdma_qpc_model qpc,
     rdma_hw_qword_builder builder
@@ -678,9 +656,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，decode_common 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、payload（输入）、qpc（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_common 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：从 builder 读回 transport 无关字段并填充 qpc。
+  // 输入/输出及副作用：qpc 被覆盖（失败时可能部分填充）；payload 用于读取目的 IP；handle 的 function_uid/generation 为 0。
+  // 失败/边界：输入为空、service type 与 codec 不符、状态/PMTU/forwarding 码非法或 ICOS 与 traffic class 不一致时返回错误。
   protected function rdma_status decode_common(
     rdma_hw_qword_builder builder,
     byte unsigned payload[],
@@ -812,9 +790,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 qpc 模型编码为 512B 大端 QPC image。
+  // 输入/输出及副作用：image 先置 null，成功后返回新 image；model 不被修改。
+  // 失败/边界：校验、common/extension 编码、掩码校验或序列化失败时返回错误，image 保持 null。
   virtual function rdma_status encode(
     rdma_hw_model model,
     output rdma_hw_image image
@@ -872,9 +850,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，decode 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：image（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 QPC image 解码为 rdma_qpc_model。
+  // 输入/输出及副作用：model 先置 null，成功后返回新 qpc；image 只读。
+  // 失败/边界：image 校验、common/extension 解码或模型/profile 校验失败时返回错误，model 保持 null。
   virtual function rdma_status decode(
     rdma_hw_image image,
     output rdma_hw_model model
@@ -923,9 +901,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，projected_handle_equal 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：任一对象为空、数组长度不同或类型不匹配时返回 false/错误结果；不得出现空句柄解引用。
+  // 功能：按 kind 与 object_id 比较两个 handle。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：任一为空时仅当两者同为空返回 1。
   protected function bit projected_handle_equal(rdma_handle lhs,
                                                   rdma_handle rhs);
     if (lhs == null || rhs == null)
@@ -933,9 +911,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
     return lhs.kind == rhs.kind && lhs.object_id == rhs.object_id;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codec_base 中，canonical_state_equal 规范化输入 key/恢复记录并检查必需字段，使同一语义对象只产生一种登记表示。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：canonical_state_equal 先检查 lhs == rhs，再返回 1'b1；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：比较两个 QP 状态是否等价，SQD 与 SQE 共用硬件码，视为相同。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：无。
   protected function bit canonical_state_equal(rdma_qp_state_e lhs,
                                                  rdma_qp_state_e rhs);
     if (lhs == rhs) return 1'b1;
@@ -943,9 +921,9 @@ virtual class rdma_hw_qpc_codec_base extends rdma_codec_base;
            (rhs inside {RDMA_QPS_SQD, RDMA_QPS_SQE});
   endfunction
 
-  // 功能：在 rdma_hw_qpc_codecs 中由 serialized_equal 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）、equal（输出）、mismatch（输出）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：serialized_equal 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：逐字段比较两个 QPC 模型的硬件序列化语义，报告首个差异字段。
+  // 输入/输出及副作用：equal/mismatch 输出；比较 handle、规范化 state、权限位与扩展字段；只读。
+  // 失败/边界：输入不是 rdma_qpc_model 返回 INVALID_ARGUMENT；扩展类型不符或 transport 不支持记为不等。
   virtual function rdma_status serialized_equal(
     rdma_hw_model lhs,
     rdma_hw_model rhs,
@@ -1079,22 +1057,22 @@ endclass
 class rdma_hw_qpc_rc_codec extends rdma_hw_qpc_codec_base;
   `uvm_object_utils(rdma_hw_qpc_rc_codec)
 
-  // 功能：构造 RC QPC codec，初始化 UVM 对象身份并复用基础 QPC 布局工具。
-  // 输入/输出及副作用：name 是 UVM 实例名；new 只调用 super.new，不创建 QPC image、QP handle 或 backing 资源。
-  // 失败/边界：构造不验证 RC extension；缺失或类型错误的 extension 由 validate_model 在 encode 前拒绝。
+  // 功能：构造 RC QPC codec。
+  // 输入/输出及副作用：name 为 UVM 名。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_qpc_rc_codec");
     super.new(name);
   endfunction
-  // 功能：返回该派生 codec 支持的固定 RC transport，供基础 QPC 校验选择对应字段图。
-  // 输入/输出及副作用：无显式参数；返回 RDMA_TRANSPORT_RC，不读取或修改 model、image、builder 或资源账本。
-  // 失败/边界：该访问器没有运行时失败分支；若调用方传入非 RC model，validate_model 会返回 INVALID_ARGUMENT。
+  // 功能：返回 RDMA_TRANSPORT_RC。
+  // 输入/输出及副作用：无。
+  // 失败/边界：无。
   protected virtual function rdma_transport_e expected_transport();
     return RDMA_TRANSPORT_RC;
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“RC QPC extension type is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：在基类校验之上检查 RC 扩展。
+  // 输入/输出及副作用：只读 model。
+  // 失败/边界：基类校验失败、扩展类型错误或 retry 计数超过 3 位时返回 INVALID_ARGUMENT。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_status status;
     rdma_qpc_model qpc;
@@ -1110,9 +1088,9 @@ class rdma_hw_qpc_rc_codec extends rdma_hw_qpc_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_rc_codec 中，encode_extension 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：qpc（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：写入 RC 扩展字段（RNR/重试阈值、SRQ、远端 QPN、各 PSN 镜像）。
+  // 输入/输出及副作用：send_psn/recv_psn 写入多个镜像字段；修改 builder。
+  // 失败/边界：扩展缺失或任一字段写入失败时返回错误。
   protected virtual function rdma_status encode_extension(
     rdma_qpc_model qpc, rdma_hw_qword_builder builder
   );
@@ -1142,9 +1120,9 @@ class rdma_hw_qpc_rc_codec extends rdma_hw_qpc_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_rc_codec 中，decode_extension 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、qpc（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：读取 RC 扩展字段并校验 PSN 镜像一致。
+  // 输入/输出及副作用：成功时创建 rc ext 并挂到 qpc.transport_ext。
+  // 失败/边界：SRQ 禁用时 SRQ ID 非零，或 PSN 镜像不一致，返回 CODEC_ERROR。
   protected virtual function rdma_status decode_extension(
     rdma_hw_qword_builder builder, rdma_qpc_model qpc
   );
@@ -1192,22 +1170,22 @@ endclass
 class rdma_hw_qpc_ud_codec extends rdma_hw_qpc_codec_base;
   `uvm_object_utils(rdma_hw_qpc_ud_codec)
 
-  // 功能：构造 UD QPC codec，初始化 UVM 对象身份并复用基础 QPC 布局工具。
-  // 输入/输出及副作用：name 是 UVM 实例名；new 只调用 super.new，不创建 QPC image、QP handle 或 backing 资源。
-  // 失败/边界：构造不验证 UD extension；缺失或类型错误的 extension 由 validate_model 在 encode 前拒绝。
+  // 功能：构造 UD QPC codec。
+  // 输入/输出及副作用：name 为 UVM 名。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_qpc_ud_codec");
     super.new(name);
   endfunction
-  // 功能：返回该派生 codec 支持的固定 UD transport，供基础 QPC 校验选择对应字段图。
-  // 输入/输出及副作用：无显式参数；返回 RDMA_TRANSPORT_UD，不读取或修改 model、image、builder 或资源账本。
-  // 失败/边界：该访问器没有运行时失败分支；若调用方传入非 UD model，validate_model 会返回 INVALID_ARGUMENT。
+  // 功能：返回 RDMA_TRANSPORT_UD。
+  // 输入/输出及副作用：无。
+  // 失败/边界：无。
   protected virtual function rdma_transport_e expected_transport();
     return RDMA_TRANSPORT_UD;
   endfunction
 
-  // 功能：在 rdma_hw_qpc_ud_codec 中，encode_extension 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：qpc（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：写入 UD 扩展字段（qkey 高/低段、目的 QPN）。
+  // 输入/输出及副作用：修改 builder。
+  // 失败/边界：扩展缺失或字段写入失败时返回错误。
   protected virtual function rdma_status encode_extension(
     rdma_qpc_model qpc, rdma_hw_qword_builder builder
   );
@@ -1226,9 +1204,9 @@ class rdma_hw_qpc_ud_codec extends rdma_hw_qpc_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_ud_codec 中，decode_extension 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、qpc（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：读取 UD 扩展字段，重组 qkey 与目的 QPN。
+  // 输入/输出及副作用：创建 ud ext 挂到 qpc.transport_ext，srq_h 置 null。
+  // 失败/边界：字段读取失败时返回其错误。
   protected virtual function rdma_status decode_extension(
     rdma_hw_qword_builder builder, rdma_qpc_model qpc
   );
@@ -1259,22 +1237,22 @@ endclass
 class rdma_hw_qpc_urc_codec extends rdma_hw_qpc_codec_base;
   `uvm_object_utils(rdma_hw_qpc_urc_codec)
 
-  // 功能：构造 URC QPC codec，初始化 UVM 对象身份并复用基础 QPC 布局工具。
-  // 输入/输出及副作用：name 是 UVM 实例名；new 只调用 super.new，不创建 QPC image、QP handle 或 backing 资源。
-  // 失败/边界：构造不验证 URC queue extension；缺失或类型错误的 extension 由 validate_model 在 encode 前拒绝。
+  // 功能：构造 URC QPC codec。
+  // 输入/输出及副作用：name 为 UVM 名。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_qpc_urc_codec");
     super.new(name);
   endfunction
-  // 功能：返回该派生 codec 支持的固定 URC transport，供基础 QPC 校验选择对应字段图。
-  // 输入/输出及副作用：无显式参数；返回 RDMA_TRANSPORT_URC，不读取或修改 model、image、builder 或资源账本。
-  // 失败/边界：该访问器没有运行时失败分支；若调用方传入非 URC model，validate_model 会返回 INVALID_ARGUMENT。
+  // 功能：返回 RDMA_TRANSPORT_URC。
+  // 输入/输出及副作用：无。
+  // 失败/边界：无。
   protected virtual function rdma_transport_e expected_transport();
     return RDMA_TRANSPORT_URC;
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“URC QPC queue extension is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 URC 队列扩展，再调用基类校验。
+  // 输入/输出及副作用：只读 model；试算页号、log2、阈值。
+  // 失败/边界：扩展/queues 缺失、远端 QPN 为 0、fetch 数超 6 位、字段不可编码或 DSQ 下一页溢出 52 位时返回 INVALID_ARGUMENT。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_status status;
     rdma_qpc_model qpc;
@@ -1303,9 +1281,9 @@ class rdma_hw_qpc_urc_codec extends rdma_hw_qpc_codec_base;
     return qpc_status_or_error(status, "URC QPC base model validation");
   endfunction
 
-  // 功能：在 rdma_hw_qpc_urc_codec 中，encode_extension 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：qpc（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：写入 URC 扩展字段（RSQ/RDSQ/DSQ 页与深度、BSN/PSN 镜像、阈值）。
+  // 输入/输出及副作用：当前 DSQ 页与下一页（+1）分别写入；修改 builder。
+  // 失败/边界：扩展缺失、字段不可编码、DSQ 下一页溢出或写入失败时返回错误。
   protected virtual function rdma_status encode_extension(
     rdma_qpc_model qpc, rdma_hw_qword_builder builder
   );
@@ -1359,9 +1337,9 @@ class rdma_hw_qpc_urc_codec extends rdma_hw_qpc_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qpc_urc_codec 中，decode_extension 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、qpc（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_extension 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：读取 URC 扩展字段，校验镜像字段与 DSQ 页关系。
+  // 输入/输出及副作用：创建 urc ext 挂到 qpc.transport_ext，srq_h 置 null。
+  // 失败/边界：远端 QPN 为 0、BSN/PSN 镜像不一致或 DSQ 下一页不等于当前页+1 时返回 CODEC_ERROR。
   protected virtual function rdma_status decode_extension(
     rdma_hw_qword_builder builder, rdma_qpc_model qpc
   );
@@ -1432,9 +1410,9 @@ class rdma_hw_qpc_urc_codec extends rdma_hw_qpc_codec_base;
   endfunction
 endclass
 
-// 功能：在 rdma_hw_qpc_urc_codec 中，rdma_register_qpc_codecs 把 XTR v1 对应对象类型、opcode 和 variant 的 codec 注册到 profile registry，并拒绝重复键。
-// 输入/输出及副作用：registry（输入）；rdma_register_qpc_codecs 读取 registry 并使用字段 key.hw_version、key.image_kind、key.object_type、key.opcode、key.variant、status；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：rdma_register_qpc_codecs 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QPC codec registry is null”；失败路径不提交部分状态或转移未声明资源。
+// 功能：把 RC/UD/URC 三个 QPC codec 注册到 registry。
+// 输入/输出及副作用：registry 被写入三个 key（仅 variant 不同）。
+// 失败/边界：registry 为空返回 INVALID_ARGUMENT；某次注册失败（如重复键）立即返回，之前已注册的保留。
 function automatic rdma_status rdma_register_qpc_codecs(
   rdma_codec_registry registry
 );

@@ -1,18 +1,11 @@
 // 目录：硬件编解码层 codec/rdma/rdma_qword_codec.sv。
-// 职责：实现 rdma_hw_qword_codec 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：按 qword 布局构造/解析 64 位字硬件 image，并检查字段范围、重叠与允许位掩码。
+// 依赖：rdma_status、RDMA_QPC_BYTES、body_mask/request_envelope_mask 等 codec 常量。
+// 所有权与生命周期：builder 独占 words/occupancy 副本；对外只输出拷贝，生命周期由调用方管理。
 
-// 中文说明：rdma_qword_codec.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
-// 功能：rdma_raw_qword_mask_is_valid 在所有原始 qword ownership/reserved 检查前，
-//       以四态语义确认 raw word 和允许掩码均为确定值，再判断 raw word 是否只包含
-//       驱动声明的位。
-// 输入/输出及副作用：raw_word、allowed_mask（输入）均按 logic[63:0] 接收；函数只读
-//       两个输入，不修改 builder、image 或模型，返回 1 表示检查通过、0 表示拒绝。
-// 失败/边界：raw_word 或 allowed_mask 任一包含 X/Z 时 fail-closed；二态输入仅在
-//       (raw_word & ~allowed_mask) 精确等于零时通过，因此不会扩大任何原始驱动 mask。
+// 功能：校验 raw qword 只含 allowed_mask 允许的位。
+// 输入/输出及副作用：raw_word、allowed_mask 为 logic[63:0]；纯函数，返回 1 通过。
+// 失败/边界：任一输入含 X/Z 返回 0（fail-closed）；(raw_word & ~allowed_mask) 非零返回 0。
 function automatic bit rdma_raw_qword_mask_is_valid(
   input logic [63:0] raw_word,
   input logic [63:0] allowed_mask
@@ -33,9 +26,9 @@ class rdma_hw_qword_builder extends uvm_object;
   protected int unsigned byte_count;
   protected bit initialized;
 
-  // 功能：构造 rdma_hw_qword_builder，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：words=new[0]；occupancy=new[0]；byte_count=0；initialized=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_qword_builder 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造未初始化的 builder。
+  // 输入/输出及副作用：name 为对象名；清空 words/occupancy。
+  // 失败/边界：未 reset/deserialize 前字段操作返回 INVALID_STATE。
   function new(string name = "rdma_hw_qword_builder");
     super.new(name);
     words = new[0];
@@ -44,9 +37,9 @@ class rdma_hw_qword_builder extends uvm_object;
     initialized = 1'b0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_qword_builder 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（qword builder copy type mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的 words/occupancy/byte_count/initialized。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_qword_builder rhs_builder;
 
@@ -59,27 +52,24 @@ class rdma_hw_qword_builder extends uvm_object;
     initialized = rhs_builder.initialized;
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，invalid_state_status 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：无显式参数；invalid_state_status 读取 对象字段：rdma_status 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_state_status 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“qword builder is not initialized”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：生成“builder 未初始化”的 INVALID_STATE 状态。
+  // 输入/输出及副作用：返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_state_status();
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              "qword builder is not initialized");
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，codec_error 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
-  // 输入/输出及副作用：message（输入）；codec_error 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：codec_error 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
+  // 功能：生成 CODEC_ERROR 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：validate_field_access 将 byte offset/bit slice 映射到已初始化 qword builder 的合法
-  //   索引，并在任何字段读写前完成范围检查。
-  // 输入/输出及副作用：word_byte_offset、lsb、width（输入），qword_index（输出）；先把
-  //   qword_index 清零，只读 words/initialized，不修改 words 或 occupancy。
-  // 失败/边界：builder 未初始化、offset 未按 8 字节对齐、qword 超出 image、width 不在
-  //   1..64、lsb 超出 63 或字段跨 qword 时返回 INVALID_STATE/CODEC_ERROR。
+  // 功能：把 byte offset/lsb/width 映射为 qword 索引并做范围检查。
+  // 输入/输出及副作用：qword_index 先清零后输出；只读 words/initialized。
+  // 失败/边界：未初始化返回 INVALID_STATE；offset 未 8 字节对齐/越界、width 不在 1..64、lsb>=64、字段跨 qword 返回 CODEC_ERROR。
   protected function rdma_status validate_field_access(
     int unsigned word_byte_offset,
     int unsigned lsb,
@@ -104,9 +94,9 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：byte_count（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
+  // 功能：以全零 words/occupancy 重新初始化 image。
+  // 输入/输出及副作用：byte_count 为 image 字节数；成功后替换 words/occupancy 并置 initialized。
+  // 失败/边界：长度为零或非 8 的倍数返回 CODEC_ERROR；超过 MAX_IMAGE_BYTES 返回 INVALID_ARGUMENT；失败不改状态。
   function rdma_status reset(int unsigned byte_count);
     bit [63:0] replacement_words[];
     bit [63:0] replacement_occupancy[];
@@ -135,12 +125,9 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：put_field 在通过 validate_field_access 后，把 value 按 qword 位布局写入 words，并
-  //   登记对应 occupancy 以阻止后续字段重叠。
-  // 输入/输出及副作用：word_byte_offset、lsb、width、value（输入）；成功时更新当前 builder
-  //   的 words/occupancy，函数不修改外部 image 或取得资源所有权。
-  // 失败/边界：builder 未初始化、字段几何非法、value 超出 width 或 occupancy 已占用该位时
-  //   返回错误；所有检查先于写入，失败保持 words/occupancy 不变。
+  // 功能：把 value 写入指定位段并登记 occupancy。
+  // 输入/输出及副作用：成功时更新 words/occupancy。
+  // 失败/边界：几何非法、value 超出 width 或与已写位重叠返回错误；检查先于写入，失败不改状态。
   function rdma_status put_field(
     int unsigned word_byte_offset,
     int unsigned lsb,
@@ -170,9 +157,9 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，get_field 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：word_byte_offset（输入）、lsb（输入）、width（输入）；get_field 读取 对象字段：rdma_status、value 并使用字段 status、width_mask、decoded、value；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：get_field 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：读取指定位段的值。
+  // 输入/输出及副作用：value 为 inout，成功时写入解码值；不改 builder。
+  // 失败/边界：几何非法或未初始化返回错误，value 保持调用方原值。
   function rdma_status get_field(
     int unsigned word_byte_offset,
     int unsigned lsb,
@@ -197,9 +184,9 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，put_memcpy 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：final_byte_offset（输入）、value（输入）；put_memcpy 读取 final_byte_offset、value 并使用字段 absolute_byte、qword_index、byte_in_qword、shift、byte_mask、byte_value；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：put_memcpy 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：按大端字节序把 value 写入 image 的 final_byte_offset 起始处并登记 occupancy。
+  // 输入/输出及副作用：成功时更新 words/occupancy。
+  // 失败/边界：未初始化、value 为空、范围越界或与已写字节重叠返回错误；先预检再写入，失败不改状态。
   function rdma_status put_memcpy(
     int unsigned final_byte_offset,
     byte unsigned value[]
@@ -245,9 +232,9 @@ class rdma_hw_qword_builder extends uvm_object;
   endfunction
 
   // inout is required for caller-output atomicity on an invalid builder state.
-  // 功能：在 rdma_hw_qword_builder 中，serialize 按 profile 的字段布局和端序把语义模型编码为硬件镜像，并在发布前检查长度与对齐。
-  // 输入/输出及副作用：value（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：模型为空、字段越界、保留位非零或输出长度不足时返回编码错误，不发布部分图像。
+  // 功能：把 words 序列化为大端字节数组。
+  // 输入/输出及副作用：value 为 inout，成功时被替换。
+  // 失败/边界：未初始化返回 INVALID_STATE，value 不变。
   function rdma_status serialize(inout byte unsigned value[]);
     byte unsigned encoded[];
 
@@ -264,9 +251,9 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，deserialize 从输入 image/bytes 按固定 offset 提取字段，交付解码所需的值。
-  // 输入/输出及副作用：value（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：deserialize 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “serialized qword image must be nonempty”；“serialized qword image exceeds rdma maximum length”；“serialized qword image length must be divisible by eight”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：从字节数组加载 words 并清空 occupancy。
+  // 输入/输出及副作用：成功时替换 words/occupancy/byte_count 并置 initialized。
+  // 失败/边界：为空或长度非 8 的倍数返回 CODEC_ERROR；超过 MAX_IMAGE_BYTES 返回 INVALID_ARGUMENT；失败不改状态。
   function rdma_status deserialize(byte unsigned value[]);
     bit [63:0] decoded_words[];
     bit [63:0] decoded_occupancy[];
@@ -300,9 +287,10 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_allowed_mask 校验 image_kind、opcode、pbl_mode 与当前对象状态的一致性，并显式处理“body mask validation requires exactly eight qwords”；“body mask overlaps request envelope ownership”；“body image contains a bit outside its allowed mask”；“image kind, opcode, and PBL mode have no rdma body mask”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：image_kind（输入）、opcode（输入）、pbl_mode（输入）；validate_allowed_mask 读取 image_kind、opcode、pbl_mode 并使用字段 rdma_status、initialized、qword_index、words；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate_allowed_mask 返回 RDMA_SC_UNSUPPORTED_OPCODE；具体拒绝条件包括 “body mask validation requires exactly eight qwords”；“body mask overlaps request envelope ownership”；“body image contains a bit outside its allowed mask”；“image kind, opcode, and PBL mode have no rdma body mask”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：按 image kind/opcode/PBL 模式的 body mask 校验 8 个 qword 的位使用。
+  // 输入/输出及副作用：只读 words；返回 status。
+  // 失败/边界：未初始化返回 INVALID_STATE；qword 数不为 8、mask 与 envelope 重叠、含掩码外的位返回 CODEC_ERROR；无 mask 返回
+  //   UNSUPPORTED_OPCODE。
   function rdma_status validate_allowed_mask(
     rdma_image_kind_e image_kind,
     bit [7:0] opcode,
@@ -328,16 +316,16 @@ class rdma_hw_qword_builder extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，get_words 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：value（输出）；get_words 读取 value 并使用字段 value，并写入 value；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：get_words 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：输出 words 副本。
+  // 输入/输出及副作用：value 为输出。
+  // 失败/边界：无。
   function void get_words(output bit [63:0] value[]);
     value = words;
   endfunction
 
-  // 功能：在 rdma_hw_qword_builder 中，get_occupancy 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：value（输出）；get_occupancy 读取 value 并使用字段 value，并写入 value；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：get_occupancy 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：输出 occupancy 副本。
+  // 输入/输出及副作用：value 为输出。
+  // 失败/边界：无。
   function void get_occupancy(output bit [63:0] value[]);
     value = occupancy;
   endfunction

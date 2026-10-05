@@ -1,17 +1,12 @@
 // 目录：模型层 model/rdma_lifecycle_transaction_models.sv。
-// 职责：保存 control-plane、queue lifecycle 和 QP lifecycle 共用的 detached
-//   结果初始化值，把 transaction id、业务域和“尚未完成”状态从各 executor
-//   的重复样板中抽出；本文件不执行外部 I/O，也不拥有任何可变账本。
-// 依赖：依赖 rdma_model_pkg 已先定义的 rdma_control_result、rdma_status 及
-//   rdma_resource_state_e；只消费值模型和 status clone 工具。
-// 所有权与生命周期：seed 只拥有自己的标量和字符串值；initialize_result 只向
-//   调用方提供的 rdma_control_result 写入 detached 字段，不取得 result、manager、
-//   CMQ、Host-memory、PCIe 或 recovery ledger 的所有权。
+// 职责：保存 control-plane、queue、QP lifecycle 共用的 detached 结果初始值（事务号、业务域、
+//   “尚未完成”状态）；不执行外部 I/O，不拥有可变账本。
+// 依赖：rdma_model_pkg 中的 rdma_control_result、rdma_status、rdma_resource_state_e。
+// 所有权与生命周期：seed 只拥有自身标量和字符串；initialize_result 只向调用方传入的
+//   result 写 detached 字段，不取得 result 或任何外部资源的所有权。
 
-// 设计说明：三个生命周期 executor 都需要先发布一个可验证的“事务尚未完成”
-// 结果，随后才根据具体业务推进 resource_h、completed_steps、recovery 和最终
-// 状态。seed 只统一这段公共 value staging；实际错误优先级、外部调用顺序和
-// mutable owner 仍由各自 executor 决定，避免把不同生命周期误合成为万能事务。
+// 设计说明：三个生命周期 executor 都先发布“事务尚未完成”的结果，再推进具体业务。
+// seed 只统一这段 value staging；错误优先级、外部调用顺序和 mutable owner 仍归各 executor。
 typedef enum bit [1:0] {
   RDMA_LIFECYCLE_DOMAIN_CONTROL = 2'd0,
   RDMA_LIFECYCLE_DOMAIN_QUEUE   = 2'd1,
@@ -25,12 +20,9 @@ class rdma_lifecycle_result_seed extends uvm_object;
   rdma_lifecycle_domain_e domain;
   string pending_message;
 
-  // 功能：构造 lifecycle result seed，保存所属业务域、事务号和未完成诊断文案，
-  //   为后续 executor 生成统一的 detached rdma_control_result 初始值。
-  // 输入/输出及副作用：name（输入）；new 只初始化 transaction_id、domain 和
-  //   pending_message，不访问外部对象，也不发布或回滚任何资源。
-  // 失败/边界：构造函数允许 transaction_id 为 0，因为 control-plane 可能先建立
-  //   默认结果再补写分配到的 id；业务入口仍须在真正提交前拒绝 0 id。
+  // 功能：构造 result seed，保存业务域、事务号和未完成文案。
+  // 输入/输出及副作用：name 为对象名；只初始化三个字段。
+  // 失败/边界：transaction_id 默认 0；业务入口须在提交前自行拒绝 0 id。
   function new(string name = "rdma_lifecycle_result_seed");
     super.new(name);
     transaction_id = 0;
@@ -38,12 +30,9 @@ class rdma_lifecycle_result_seed extends uvm_object;
     pending_message = "lifecycle operation did not complete";
   endfunction
 
-  // 功能：validate 检查 seed 的业务域和未完成诊断文案是否可用于结果初始化，
-  //   防止空文案或未知域把不完整状态发布给 caller。
-  // 输入/输出及副作用：对象字段 transaction_id、domain、pending_message（输入）；
-  //   返回 detached rdma_status，不修改 seed 或任何外部账本。
-  // 失败/边界：domain 含未知值或 pending_message 为空时返回 RDMA_SC_INVALID_ARGUMENT；
-  //   transaction_id 为 0 不在本函数拒绝范围内，交给各 executor 按原有错误优先级处理。
+  // 功能：检查 seed 的业务域与未完成文案是否可用。
+  // 输入/输出及副作用：读取 domain、pending_message；返回新 status，不修改 seed。
+  // 失败/边界：domain 未知或 pending_message 为空返回 INVALID_ARGUMENT；不检查 transaction_id。
   virtual function rdma_status validate();
     if (!(domain inside {RDMA_LIFECYCLE_DOMAIN_CONTROL,
                          RDMA_LIFECYCLE_DOMAIN_QUEUE,
@@ -56,14 +45,10 @@ class rdma_lifecycle_result_seed extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：initialize_result 把 seed 的 transaction_id、未完成 status、初始资源状态
-  //   和 recovery 标志写入调用方提供的 rdma_control_result，统一三个 executor 的
-  //   事务起始语义。
-  // 输入/输出及副作用：result（输出/inout）接收 detached status 和默认状态字段；
-  //   seed 只读取自身值，函数不取得 result 或外部资源所有权。
-  // 失败/边界：result 为空、seed 校验失败或 status clone 失败时返回明确错误并不
-  //   发布半初始化结果；成功时 status/primary_status 都表示同一份“尚未完成”状态，
-  //   final_resource_state 固定为 RDMA_RESOURCE_NEW、recovery_required 清零。
+  // 功能：把 seed 的事务号和“未完成”状态写入 result。
+  // 输入/输出及副作用：写 result 的 transaction_id、status、primary_status（各为独立 clone）、
+  //   final_resource_state=NEW（known=0）、recovery_required=0。
+  // 失败/边界：result 为空、seed 校验失败或 clone 失败时返回错误且不写 result。
   function rdma_status initialize_result(rdma_control_result result);
     rdma_status status;
     rdma_status pending_status;

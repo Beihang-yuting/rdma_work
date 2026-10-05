@@ -1,36 +1,33 @@
 // 目录：协议与资源模型层 model/rdma_context_models.sv。
-// 职责：实现 rdma_context_models 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_context_models.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：定义硬件 context 模型（QPC/CQC/MRT/SRQC/CEQC/AEQC）、UMEM/PBL 与 MW 绑定，并提供校验与深拷贝。
+// 依赖：本层 types/model 契约（handle、page layout、ring position、address vector、status）。
+// 所有权与生命周期：对象拥有值字段与 clone 出的嵌套对象；外部 Host 内存保存非拥有引用，由调用方管理。
 
 virtual class rdma_hw_model extends uvm_object;
 
-  // 功能：构造 rdma_hw_model，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 hw model 基类对象。
+  // 输入/输出及副作用：name 为对象名。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_model");
     super.new(name);
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、label、object_id_width、handle、handle.kind、handle.object_id、object_id_limit 并使用字段 object_id_limit；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 context 模型字段与状态一致性（由各派生类实现）。
+  // 输入/输出及副作用：只读；返回 rdma_status。
+  // 失败/边界：不一致时返回 INVALID_ARGUMENT/INVALID_STATE，不修改模型。
   pure virtual function rdma_status validate();
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回 context 模型的稳定文本描述（由各派生类实现）。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   pure virtual function string describe();
 endclass
 
 // Context handles carry hardware-projection/local IDs.  Resource-manager
 // incarnation IDs remain opaque registry identities and are not used here.
-// 功能：rdma_context_handle_status 校验 handle、expected_kind、object_id_width、label 与当前对象状态的一致性，并显式处理“handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-// 输入/输出及副作用：handle（输入）、expected_kind（输入）、object_id_width（输入）、label（输入）；rdma_context_handle_status 读取 handle、expected_kind、object_id_width、label 并使用字段 object_id_limit；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：rdma_context_handle_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+// 功能：校验 handle 非空、kind 符合预期且 object_id 不超出位宽。
+// 输入/输出及副作用：纯函数；label 用于诊断文本。
+// 失败/边界：handle 为空、kind 不符或 object_id 超出 object_id_width 位返回 INVALID_ARGUMENT。
 function automatic rdma_status rdma_context_handle_status(
   rdma_handle handle,
   rdma_resource_kind_e expected_kind,
@@ -54,9 +51,9 @@ function automatic rdma_status rdma_context_handle_status(
   return rdma_status::success();
 endfunction
 
-// 功能：rdma_context_lifecycle_status 校验 reference、candidate、label 与当前对象状态的一致性，并显式处理“lifecycle handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-// 输入/输出及副作用：reference（输入）、candidate（输入）、label（输入）；rdma_context_lifecycle_status 读取 reference、candidate、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：rdma_context_lifecycle_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION；失败路径不提交部分状态或转移未声明资源。
+// 功能：校验 candidate 与 reference 的 Function UID 与 generation 一致。
+// 输入/输出及副作用：纯函数。
+// 失败/边界：任一为空或 UID 不符返回 INVALID_ARGUMENT；generation 不符返回 STALE_GENERATION。
 function automatic rdma_status rdma_context_lifecycle_status(
   rdma_handle reference,
   rdma_handle candidate,
@@ -74,9 +71,10 @@ function automatic rdma_status rdma_context_lifecycle_status(
   return rdma_status::success();
 endfunction
 
-// 功能：rdma_function_incarnation_status 统一校验 Function UID、object ID、generation 和 reset epoch。
-// 输入/输出及副作用：candidate、expected_uid、expected_object_id、expected_generation、expected_epoch 为输入；函数只返回状态，不修改句柄或资源账本。
-// 失败/边界：空句柄/错误 kind 或 UID/object 不匹配返回 INVALID_ARGUMENT；generation/epoch 不匹配返回 STALE_GENERATION。
+// 功能：统一校验 Function handle 的 UID、object ID、generation 与 reset epoch。
+// 输入/输出及副作用：纯函数；candidate_epoch 为 0 表示不检查 epoch。
+// 失败/边界：空/非 Function kind 或 UID/object 不符返回 INVALID_ARGUMENT；generation/epoch 不符返回
+//   STALE_GENERATION。
 function automatic rdma_status rdma_function_incarnation_status(
   rdma_function_handle candidate,
   longint unsigned expected_uid,
@@ -101,9 +99,9 @@ function automatic rdma_status rdma_function_incarnation_status(
   return rdma_status::success();
 endfunction
 
-// 功能：rdma_context_state_status 校验 state、label 与当前对象状态的一致性，并显式处理“context state is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-// 输入/输出及副作用：state（输入）、label（输入）；rdma_context_state_status 读取 state、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：rdma_context_state_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+// 功能：校验 context state 取值合法。
+// 输入/输出及副作用：纯函数；label 用于诊断文本。
+// 失败/边界：不在 INVALID/VALID/ERROR 内返回 INVALID_ARGUMENT。
 function automatic rdma_status rdma_context_state_status(
   rdma_context_state_e state,
   string label
@@ -115,9 +113,9 @@ function automatic rdma_status rdma_context_state_status(
   return rdma_status::success();
 endfunction
 
-// 功能：rdma_mr_state_status 校验 MRT 专用 INVLD/FREE/VLD 三态，避免把驱动的 FREE 状态误当成通用 context state。
-// 输入/输出及副作用：state（输入）、label（输入）；函数只读取枚举和标签并返回状态，不修改 MRT、句柄或资源账本。
-// 失败/边界：state 为 2'b11 时返回 RDMA_SC_INVALID_ARGUMENT；合法的 INVALID、FREE、VALID 三态均返回成功，label 只用于诊断文本。
+// 功能：校验 MRT 专用的 INVALID/FREE/VALID 三态，避免与通用 context state 混用。
+// 输入/输出及副作用：纯函数；label 用于诊断文本。
+// 失败/边界：不在三态内（如 2'b11）返回 INVALID_ARGUMENT。
 function automatic rdma_status rdma_mr_state_status(
   rdma_mr_state_e state,
   string label
@@ -129,9 +127,9 @@ function automatic rdma_status rdma_mr_state_status(
   return rdma_status::success();
 endfunction
 
-// 功能：rdma_object_mode_status 校验 mode、label 与当前对象状态的一致性，并显式处理“object mode is invalid”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-// 输入/输出及副作用：mode（输入）、label（输入）；rdma_object_mode_status 读取 mode、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：rdma_object_mode_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+// 功能：校验 object mode 取值合法。
+// 输入/输出及副作用：纯函数；label 用于诊断文本。
+// 失败/边界：不在 DIRECT_4K/INDIRECT_4K/HUGE_2M/L3_INDIRECT_4K 内返回 INVALID_ARGUMENT。
 function automatic rdma_status rdma_object_mode_status(
   rdma_object_mode_e mode,
   string label
@@ -144,12 +142,9 @@ function automatic rdma_status rdma_object_mode_status(
   return rdma_status::success();
 endfunction
 
-// 功能：rdma_context_nested_status 将 context model 依赖的 virtual validator
-//       返回值规范化为可安全消费的 rdma_status。
-// 输入/输出及副作用：status（输入）和 label（输入）；非空 status 原样返回，
-//       null status 转换为 INVALID_STATE，不修改任何模型、句柄或资源账本。
-// 失败/边界：null 表示下游扩展违反状态返回契约；调用方收到确定失败后不得
-//       继续读取下游对象或发布 context image。
+// 功能：规范化 context model 依赖的 virtual validator 返回值。
+// 输入/输出及副作用：非空 status 原样返回；null 转 INVALID_STATE；不改模型。
+// 失败/边界：null 表示下游违反契约，调用方不得继续读取下游对象或发布 context image。
 function automatic rdma_status rdma_context_nested_status(
   rdma_status status,
   string label
@@ -162,9 +157,9 @@ function automatic rdma_status rdma_context_nested_status(
   return status;
 endfunction
 
-// 功能：rdma_clone_page_layout_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-// 输入/输出及副作用：source（输入）、label（输入）；rdma_clone_page_layout_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_page_table_layout，不取得调用方资源所有权。
-// 失败/边界：rdma_clone_page_layout_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
+// 功能：clone page table layout。
+// 输入/输出及副作用：source 只读；返回新对象；label 用于诊断。
+// 失败/边界：source 为 null 返回 null；clone 或 cast 失败触发 uvm_fatal。
 function automatic rdma_page_table_layout rdma_clone_page_layout_value(
   rdma_page_table_layout source,
   string label
@@ -180,9 +175,9 @@ function automatic rdma_page_table_layout rdma_clone_page_layout_value(
   return cloned_layout;
 endfunction
 
-// 功能：rdma_clone_ring_position_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-// 输入/输出及副作用：source（输入）、label（输入）；rdma_clone_ring_position_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_ring_position，不取得调用方资源所有权。
-// 失败/边界：rdma_clone_ring_position_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
+// 功能：clone ring position。
+// 输入/输出及副作用：source 只读；返回新对象；label 用于诊断。
+// 失败/边界：source 为 null 返回 null；clone 或 cast 失败触发 uvm_fatal。
 function automatic rdma_ring_position rdma_clone_ring_position_value(
   rdma_ring_position source,
   string label
@@ -198,9 +193,9 @@ function automatic rdma_ring_position rdma_clone_ring_position_value(
   return cloned_position;
 endfunction
 
-// 功能：rdma_clone_address_vector_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-// 输入/输出及副作用：source（输入）、label（输入）；rdma_clone_address_vector_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_address_vector，不取得调用方资源所有权。
-// 失败/边界：rdma_clone_address_vector_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
+// 功能：clone address vector。
+// 输入/输出及副作用：source 只读；返回新对象；label 用于诊断。
+// 失败/边界：source 为 null 返回 null；clone 或 cast 失败触发 uvm_fatal。
 function automatic rdma_address_vector rdma_clone_address_vector_value(
   rdma_address_vector source,
   string label
@@ -216,9 +211,9 @@ function automatic rdma_address_vector rdma_clone_address_vector_value(
   return cloned_vector;
 endfunction
 
-// 功能：rdma_clone_mr_page_layout_value 复制 source、label 的受控字段并生成独立快照，供查询、编码或恢复使用；源对象保持不变。
-// 输入/输出及副作用：source（输入）、label（输入）；rdma_clone_mr_page_layout_value 读取 source、label 并使用字段 cloned_object；函数返回 rdma_mr_page_layout，不取得调用方资源所有权。
-// 失败/边界：rdma_clone_mr_page_layout_value 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal，不保留部分有效快照。
+// 功能：clone MR page layout。
+// 输入/输出及副作用：source 只读；返回新对象；label 用于诊断。
+// 失败/边界：source 为 null 返回 null；clone 或 cast 失败触发 uvm_fatal。
 function automatic rdma_mr_page_layout rdma_clone_mr_page_layout_value(
   rdma_mr_page_layout source,
   string label
@@ -245,9 +240,9 @@ class rdma_qpc_behavior extends uvm_object;
   bit atomic_after_atomic_fence;
   int unsigned \priority ;
 
-  // 功能：构造 rdma_qpc_behavior，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：transport_version=0；migration_enable=1'b0；tx_endian_swap=1'b1；rx_endian_swap=1'b1；read_after_write_fence=1'b1；atomic_after_atomic_fence=1'b1；priority=0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qpc_behavior 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_qpc_behavior");
     super.new(name);
     transport_version = 0;
@@ -259,9 +254,9 @@ class rdma_qpc_behavior extends uvm_object;
     \priority = 0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_qpc_behavior 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QPC behavior copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_behavior rhs_behavior;
 
@@ -277,9 +272,9 @@ class rdma_qpc_behavior extends uvm_object;
     \priority = rhs_behavior.\priority ;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“QPC transport version exceeds 3”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、transport_version、priority 并使用字段 rdma_status、transport_version、priority；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QPC transport version exceeds 3”“QPC priority exceeds 7”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 QPC behavior 的 transport_version 与 priority 范围。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：transport_version 超过 3 或 priority 超过 7 返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     if (transport_version > 3)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -290,9 +285,9 @@ class rdma_qpc_behavior extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf(
       "Behavior(tver=%0d migration=%0b tx_swap=%0b rx_swap=%0b ra_fence=%0b atomic_fence=%0b priority=%0d)",
@@ -304,20 +299,24 @@ endclass
 
 virtual class rdma_qpc_transport_ext extends uvm_object;
 
-  // 功能：构造 rdma_qpc_transport_ext，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
+  // 功能：构造 rdma_qpc_transport_ext，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate
+  //   明确注入。
   // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qpc_transport_ext 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 失败/边界：rdma_qpc_transport_ext 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续
+  //   configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_qpc_transport_ext");
     super.new(name);
   endfunction
 
   // 功能：transport_kind 使用 当前对象字段 计算并返回 rdma_transport_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；transport_kind 读取 对象字段：retry_count、rnr_retry_count 并使用字段 name、remote_qpn、send_psn、recv_psn、retry_count、rnr_retry_count；函数返回 rdma_transport_e，不取得调用方资源所有权。
+  // 输入/输出及副作用：无显式参数；transport_kind 读取 对象字段：retry_count、rnr_retry_count 并使用字段 name、remote_qpn、
+  //   send_psn、recv_psn、retry_count、rnr_retry_count；函数返回 rdma_transport_e，不取得调用方资源所有权。
   // 失败/边界：transport_kind 是只读访问器，按对象字段返回固定值；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
   pure virtual function rdma_transport_e transport_kind();
 
   // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“rdma_qpc_rc_ext”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 name、remote_qpn、send_psn、recv_psn、retry_count 和 rnr_retry_count，返回 RC 扩展上下文的字段约束状态；函数返回 rdma_status，不取得调用方资源所有权。
+  // 输入/输出及副作用：无显式参数；validate 读取 name、remote_qpn、send_psn、recv_psn、retry_count 和 rnr_retry_count，返回
+  //   RC 扩展上下文的字段约束状态；函数返回 rdma_status，不取得调用方资源所有权。
   // 失败/边界：validate 在 name 不是 rdma_qpc_rc_ext 或任一 PSN/重试字段超出编码范围时返回错误；成功路径不修改上下文，也不接管外部资源。
   pure virtual function rdma_status validate();
 
@@ -336,9 +335,9 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
   int unsigned retry_count;
   int unsigned rnr_retry_count;
 
-  // 功能：构造 rdma_qpc_rc_ext，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：remote_qpn='0；send_psn='0；recv_psn='0；retry_count='0；rnr_retry_count='0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qpc_rc_ext 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_qpc_rc_ext");
     super.new(name);
     remote_qpn = '0;
@@ -348,9 +347,9 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
     rnr_retry_count = '0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_qpc_rc_ext 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（RC QPC extension copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_rc_ext rhs_ext;
 
@@ -371,9 +370,9 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
     return RDMA_TRANSPORT_RC;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“RC QPC remote QPN is zero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、remote_qpn 并使用字段 rdma_status、remote_qpn；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“RC QPC remote QPN is zero”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 RC 扩展的 remote_qpn。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：remote_qpn 为零返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     if (remote_qpn == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -381,9 +380,9 @@ class rdma_qpc_rc_ext extends rdma_qpc_transport_ext;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("RC(remote_qpn=%0d send_psn=%0d recv_psn=%0d)",
                      remote_qpn, send_psn, recv_psn);
@@ -397,18 +396,18 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
   // 驱动在 UD QPC 中单独提供目标 QPN；它不能由 qkey 的低 24 位推导。
   bit [23:0] destination_qpn;
 
-  // 功能：构造 rdma_qpc_ud_ext，调用 super.new 建立 UVM 对象，并把 qkey 与独立目标 QPN 初始化为零。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qpc_ud_ext 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_qpc_ud_ext");
     super.new(name);
     qkey = '0;
     destination_qpn = '0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_qpc_ud_ext 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（UD QPC extension copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_ud_ext rhs_ext;
 
@@ -426,9 +425,9 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
     return RDMA_TRANSPORT_UD;
   endfunction
 
-  // 功能：validate 校验 UD QPC 的 qkey 是否满足现有抽象模型的基本约束，同时保留独立 destination_qpn。
-  // 输入/输出及副作用：无显式参数；validate 只读 qkey，返回 rdma_status，不修改模型或资源账本。
-  // 失败/边界：qkey 为零时返回 RDMA_SC_INVALID_ARGUMENT；destination_qpn 的零值语义由具体驱动命令决定，不能在通用模型中擅自拒绝。
+  // 功能：校验 UD 扩展的 qkey，destination_qpn 单独保留。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：qkey 为零返回 INVALID_ARGUMENT；destination_qpn 的零值语义由驱动命令决定，此处不拒绝。
   virtual function rdma_status validate();
     if (qkey == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -436,9 +435,9 @@ class rdma_qpc_ud_ext extends rdma_qpc_transport_ext;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 UD QPC 的 qkey 与独立目标 QPN 编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("UD(qkey=0x%08x destination_qpn=0x%06x)",
                      qkey, destination_qpn);
@@ -455,9 +454,9 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
   bit [23:0] dpsn;
   rdma_urc_queue_config queues;
 
-  // 功能：构造 rdma_qpc_urc_ext，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：remote_qpn='0；rbsn='0；dbsn='0；rpsn='0；dpsn='0；queues=rdma_urc_queue_config::type_id::create("queues")。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qpc_urc_ext 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_qpc_urc_ext");
     super.new(name);
     remote_qpn = '0;
@@ -468,9 +467,9 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     queues = rdma_urc_queue_config::type_id::create("queues");
   endfunction
 
-  // 功能：将 rhs 中 rdma_qpc_urc_ext 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（URC QPC extension copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_urc_ext rhs_ext;
 
@@ -493,9 +492,9 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     return RDMA_TRANSPORT_URC;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“URC QPC remote QPN is zero”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、remote_qpn、queues 并使用字段 rdma_status、remote_qpn、queues；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“URC QPC remote QPN is zero”“URC QPC queue configuration is null”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 URC 扩展的 remote_qpn 与 queues 配置。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：remote_qpn 为零或 queue 配置为 null 等返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -511,9 +510,9 @@ class rdma_qpc_urc_ext extends rdma_qpc_transport_ext;
     return status;
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     string queues_text;
 
@@ -556,9 +555,9 @@ class rdma_qpc_model extends rdma_hw_model;
   rdma_qpc_behavior behavior;
   rdma_qpc_transport_ext transport_ext;
 
-  // 功能：构造 rdma_qpc_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：qp_h=null；pd_h=null；send_cq_h=null；recv_cq_h=null；srq_h=null；transport=RDMA_TRANSPORT_RC；state=RDMA_QPS_RESET；host_id='0；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_qpc_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_qpc_model");
     super.new(name);
     qp_h = null;
@@ -590,9 +589,9 @@ class rdma_qpc_model extends rdma_hw_model;
     transport_ext = null;
   endfunction
 
-  // 功能：将 rhs 中 rdma_qpc_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QPC model copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_qpc_model rhs_qpc;
 
@@ -632,9 +631,10 @@ class rdma_qpc_model extends rdma_hw_model;
       rhs_qpc.transport_ext, "QPC extension clone mismatch");
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“QPC behavior is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、behavior、path_mtu_bytes、srq_h、sq_depth、state、sq_backing.value、hfff 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“QPC behavior is null”“QPC path MTU is zero”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 QPC 的 behavior、各资源 handle、depth/state、backing 对齐、address vector 与传输扩展。
+  // 输入/输出及副作用：只读；返回 status；嵌套对象经 clone 后校验。
+  // 失败/边界：behavior/address vector 为空、path MTU 为零、handle 非法、depth 非 2 的幂、state 非法、4 KiB/512 字节对齐不符、
+  //   RC/UD 缺扩展或扩展与 transport 不符返回错误。
   virtual function rdma_status validate();
     rdma_status status;
     rdma_qpc_rc_ext rc_ext;
@@ -753,9 +753,9 @@ class rdma_qpc_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     string behavior_text;
     string extension_text;
@@ -861,9 +861,9 @@ class rdma_cqc_model extends rdma_hw_model;
   bit [1:0] arm_state;
   rdma_backing_addr_t shadow_backing;
 
-  // 功能：构造 rdma_cqc_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：cq_h=null；ceq_h=null；state=RDMA_CONTEXT_INVALID；depth='0；cqe_size_bytes='0；threshold='0；page_layout=rdma_page_table_layout::type_id::create("page_layout")；producer=rdma_ring_position::type_id::create("producer")；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_cqc_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_cqc_model");
     super.new(name);
     cq_h = null;
@@ -883,9 +883,9 @@ class rdma_cqc_model extends rdma_hw_model;
     shadow_backing = '0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_cqc_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CQC model copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_cqc_model rhs_cqc;
 
@@ -911,9 +911,9 @@ class rdma_cqc_model extends rdma_hw_model;
     shadow_backing = rhs_cqc.shadow_backing;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CQC CQ”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、ceq_h、depth、page_layout、producer、consumer、producer.index、consumer.index 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CQC depth is not a nonzero power of two”“CQC nested layout or ring is null”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 CQC 的 CEQ handle、depth、page layout 与 producer/consumer ring position。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：depth 非 2 的幂、嵌套 layout/ring 为 null 或 handle/索引非法返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -959,9 +959,9 @@ class rdma_cqc_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("CQC(depth=%0d cqe_size=%0d shadow=0x%016x)",
                      depth, cqe_size_bytes, shadow_backing.value);
@@ -982,11 +982,9 @@ class rdma_mrt_model extends rdma_hw_model;
   bit [1:0] object_type;
   rdma_mr_page_layout page_layout;
 
-  // 功能：构造 rdma_mrt_model，调用 super.new 建立 UVM 对象，并把默认值设为
-  //   mr_h=null、pd_h=null、state=RDMA_MR_STATE_INVALID、iova='0、length='0、
-  //   lkey='0、rkey='0、access='0；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_mrt_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_mrt_model");
     super.new(name);
     mr_h = null;
@@ -1001,9 +999,9 @@ class rdma_mrt_model extends rdma_hw_model;
     page_layout = rdma_mr_page_layout::type_id::create("page_layout");
   endfunction
 
-  // 功能：将 rhs 中 rdma_mrt_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（MRT model copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_mrt_model rhs_mrt;
 
@@ -1023,10 +1021,9 @@ class rdma_mrt_model extends rdma_hw_model;
                                                   "MRT");
   endfunction
 
-  // 功能：validate 校验 MRT 的句柄、专用 state（INVLD/FREE/VLD）、长度、key
-  //   和 page layout 一致性，供 KEY_ALLOC/MR_REGISTER 提交前使用。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、length、mr_h.object_id、lkey、rkey、page_layout 并使用字段 status、has_remote_right；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“MRT length is zero”“MRT length exceeds 46 bits”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 MRT 的 handle、INVALID/FREE/VALID 状态、长度、lkey/rkey 与 page layout，供提交前使用。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：长度为零或超过 46 位、handle/key/state/layout 非法返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     rdma_status status;
     bit has_remote_right;
@@ -1067,9 +1064,9 @@ class rdma_mrt_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("MRT(iova=0x%016x length=%0d lkey=0x%08x)",
                      iova.value, length, lkey);
@@ -1091,9 +1088,9 @@ class rdma_srqc_model extends rdma_hw_model;
   rdma_ring_position producer;
   bit [1:0] arm_sequence;
 
-  // 功能：构造 rdma_srqc_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：srq_h=null；pd_h=null；state=RDMA_CONTEXT_INVALID；depth='0；load_pi_threshold='0；limit_threshold='0；object_mode=RDMA_OBJECT_DIRECT_4K；srfq_backing='0；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_srqc_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_srqc_model");
     super.new(name);
     srq_h = null;
@@ -1109,9 +1106,9 @@ class rdma_srqc_model extends rdma_hw_model;
     arm_sequence = '0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_srqc_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（SRQC model copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_srqc_model rhs_srqc;
 
@@ -1132,9 +1129,9 @@ class rdma_srqc_model extends rdma_hw_model;
     arm_sequence = rhs_srqc.arm_sequence;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“SRQC SRQ”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、depth、srfq_backing.value、producer、producer.index 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“SRQC depth is not a nonzero power of two”“SRQC queue backing is not 4 KiB aligned”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 SRQC 的 depth、backing 对齐与 producer ring position。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：depth 非 2 的幂、backing 未 4 KiB 对齐、嵌套 ring 为 null 或 handle 非法返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1170,9 +1167,9 @@ class rdma_srqc_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("SRQC(depth=%0d producer=%0d)", depth,
                      (producer == null) ? 0 : producer.index);
@@ -1190,9 +1187,9 @@ class rdma_ceqc_model extends rdma_hw_model;
   rdma_ring_position producer;
   rdma_ring_position consumer;
 
-  // 功能：构造 rdma_ceqc_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：ceq_h=null；state=RDMA_CONTEXT_INVALID；depth='0；vector_id='0；page_layout=rdma_page_table_layout::type_id::create("page_layout")；producer=rdma_ring_position::type_id::create("producer")；consumer=rdma_ring_position::type_id::create("consumer")。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_ceqc_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_ceqc_model");
     super.new(name);
     ceq_h = null;
@@ -1204,9 +1201,9 @@ class rdma_ceqc_model extends rdma_hw_model;
     consumer = rdma_ring_position::type_id::create("consumer");
   endfunction
 
-  // 功能：将 rhs 中 rdma_ceqc_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CEQC model copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_ceqc_model rhs_ceqc;
 
@@ -1225,9 +1222,9 @@ class rdma_ceqc_model extends rdma_hw_model;
                                               "CEQC consumer");
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CEQC CEQ”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、depth、page_layout、producer、consumer、producer.index、consumer.index 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CEQC depth is not a nonzero power of two”“CEQC nested layout or ring is null”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 CEQC 的 depth、page layout 与 producer/consumer ring position。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：depth 非 2 的幂、嵌套 layout/ring 为 null 或 handle/索引非法返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1263,9 +1260,9 @@ class rdma_ceqc_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("CEQC(depth=%0d vector=%0d)", depth, vector_id);
   endfunction
@@ -1282,9 +1279,9 @@ class rdma_aeqc_model extends rdma_hw_model;
   rdma_ring_position producer;
   rdma_ring_position consumer;
 
-  // 功能：构造 rdma_aeqc_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：aeq_h=null；state=RDMA_CONTEXT_INVALID；depth='0；vector_id='0；page_layout=rdma_page_table_layout::type_id::create("page_layout")；producer=rdma_ring_position::type_id::create("producer")；consumer=rdma_ring_position::type_id::create("consumer")。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_aeqc_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造对象并设置默认字段值。
+  // 输入/输出及副作用：name 为对象名；只初始化本地字段。
+  // 失败/边界：无。
   function new(string name = "rdma_aeqc_model");
     super.new(name);
     aeq_h = null;
@@ -1296,9 +1293,9 @@ class rdma_aeqc_model extends rdma_hw_model;
     consumer = rdma_ring_position::type_id::create("consumer");
   endfunction
 
-  // 功能：将 rhs 中 rdma_aeqc_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（AEQC model copy mismatch），不保留部分有效快照。
+  // 功能：复制 rhs 的值字段，嵌套对象按实现 clone。
+  // 输入/输出及副作用：覆盖当前字段，rhs 不变。
+  // 失败/边界：类型不匹配触发 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_aeqc_model rhs_aeqc;
 
@@ -1317,9 +1314,9 @@ class rdma_aeqc_model extends rdma_hw_model;
                                               "AEQC consumer");
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“AEQC AEQ”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、depth、page_layout、producer、consumer、producer.index、consumer.index 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“AEQC depth is not a nonzero power of two”“AEQC nested layout or ring is null”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 AEQC 的 depth、page layout 与 producer/consumer ring position。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：depth 非 2 的幂、嵌套 layout/ring 为 null 或 handle/索引非法返回 INVALID_ARGUMENT。
   virtual function rdma_status validate();
     rdma_status status;
 
@@ -1355,9 +1352,9 @@ class rdma_aeqc_model extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回对象字段的稳定文本描述，供日志/索引使用。
+  // 输入/输出及副作用：只读，返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("AEQC(depth=%0d vector=%0d)", depth, vector_id);
   endfunction
@@ -1419,9 +1416,9 @@ class rdma_umem_page extends uvm_object;
   endfunction
 endclass
 
-// 功能：rdma_umem 管理一段用户虚拟地址范围的页 pin、引用计数和 exactly-once unpin。
-// 输入/输出及副作用：调用方设置 Function、VA、length、page_size 和权限；pin/unpin 只更新本地页账本。
-// 失败/边界：零长度、地址溢出、非法页大小或 stale Function 被拒绝；非页对齐范围按对齐 DMA span 建立页描述，重复 pin/unpin 幂等且不重复计数。
+// 功能：rdma_umem 管理用户 VA 范围的页 pin、引用计数与 exactly-once unpin。
+// 输入/输出及副作用：调用方设置 Function、VA、length、page_size、权限；pin/unpin 只更新本地页账本。
+// 失败/边界：零长度、地址溢出、非法页大小或 stale Function 被拒绝；非页对齐范围按对齐 DMA span 建页；重复 pin/unpin 幂等。
 class rdma_umem extends uvm_object;
   `uvm_object_utils(rdma_umem)
 
@@ -1461,11 +1458,9 @@ class rdma_umem extends uvm_object;
     detached = 1'b0;
   endfunction
 
-  // 功能：校验 UMEM 的 Function authority、原始 VA 范围、页粒度和权限，并确认
-  //   对齐后的 DMA span 不溢出。
-  // 输入/输出及副作用：只读 function_h、user_va、length、page_size、permissions
-  //   和 generation；返回状态，不 pin/unpin 或修改引用计数。
-  // 失败/边界：Function 为空/类型错误、零长度、页大小非法、VA+length 溢出、DMA 权限为空或代际过期返回明确错误；原始 VA/length 不要求页对齐。
+  // 功能：校验 UMEM 的 Function authority、VA 范围、页粒度与权限，并确认对齐后的 DMA span 不溢出。
+  // 输入/输出及副作用：只读 function_h、user_va、length、page_size、permissions、generation；不 pin/unpin。
+  // 失败/边界：Function 为空/类型错、零长度、页大小非法、VA+length 溢出、权限为空或代际过期返回错误；VA/length 不要求页对齐。
   function rdma_status validate();
     bit [65:0] aligned_span;
 
@@ -1493,11 +1488,9 @@ class rdma_umem extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：pin_pages 按 Linux ib_umem 的对齐区间创建每个 page_size 粒度的页
-  //   描述符，并建立一次 pin 引用。
-  // 输入/输出及副作用：成功时填充 first_page_offset、pages、pinned、refcount
-  //   和 pin_count；页描述符保存对齐后的 host_va/iova，不拥有外部 host-mem 页。
-  // 失败/边界：已 pin 调用直接成功；校验、页数溢出或页对象创建失败时清空部分页并保持未 pin，原始非对齐 VA/length 本身不被拒绝。
+  // 功能：按 ib_umem 的对齐区间创建每个 page_size 的页描述符，并建立一次 pin 引用。
+  // 输入/输出及副作用：成功填充 first_page_offset、pages、pinned、refcount、pin_count；不拥有外部页。
+  // 失败/边界：已 pin 直接成功；校验失败、页数溢出或页创建失败时清空部分页并保持未 pin。
   function rdma_status pin_pages();
     rdma_status status;
     longint unsigned page_count;
@@ -1569,11 +1562,9 @@ class rdma_umem extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：检查给定 DMA IOVA/长度是否完全落在本 UMEM 的原始用户范围及其已 pin 页序列中。
-  // 输入/输出及副作用：first_iova、access_length 为输入；只读 first_page_offset、pages 和生命周期字段，不修改 pin/refcount。
-  // 失败/边界：范围溢出、首尾页 padding、页描述符无效、页间 gap/重叠、跨越
-  //   未 pin 页或代际不符均返回 DMA_TRANSLATION/STALE_GENERATION；该接口只接受
-  //   连续 DMA span，PBL2 的非连续逻辑访问必须由带页表翻译的上层路径处理。
+  // 功能：检查 IOVA/长度是否完全落在本 UMEM 的原始用户范围及已 pin 页序列内。
+  // 输入/输出及副作用：first_iova、access_length 输入；只读，不改 pin/refcount。
+  // 失败/边界：范围溢出、padding/页描述符无效、页间 gap/重叠、跨未 pin 页返回 DMA_TRANSLATION/STALE_GENERATION；只接受连续 DMA span。
   function rdma_status check_range(rdma_iova_t first_iova,
                                    longint unsigned access_length);
     longint unsigned logical_start;
@@ -1906,9 +1897,9 @@ class rdma_pbl extends uvm_object;
   endfunction
 endclass
 
-// 功能：rdma_pbl_builder::build_multilevel 将 UMEM DMA block 序列按真实连续性组织为 PBL0/PBL1/PBL2。
-// 输入/输出及副作用：umem 和可选 hmc_ref 为输入，pbl 为输出；成功时创建页和目录快照，不改变 UMEM pin/refcount 或 HMC 所有权。
-// 失败/边界：未 pin、页地址不齐、目录缺少驱动 allocator lease、页跨界或 Function stale 时在提交前返回错误，不伪造 PBL2 地址。
+// 功能：把 UMEM DMA block 序列按真实连续性组织为 PBL0/PBL1/PBL2（build_multilevel）。
+// 输入/输出及副作用：umem、可选 hmc_ref 输入，pbl 输出；成功创建页与目录快照，不改 UMEM/HMC 所有权。
+// 失败/边界：未 pin、页地址不齐、目录缺 allocator lease、页跨界或 Function stale 时提交前返回错误，不伪造 PBL2 地址。
 class rdma_pbl_builder;
   // 功能：判断 UMEM 的 DMA block 是否按 page_size 逐页连续，供 PBL mode 选择使用。
   // 输入/输出及副作用：umem 为只读输入；函数比较相邻 page_entries 的 IOVA，不修改页或资源账本。
@@ -1927,11 +1918,9 @@ class rdma_pbl_builder;
     return 1'b1;
   endfunction
 
-  // 功能：根据页数构建每级最多 512 项的 PBL 目录并验证所有叶子页。
-  // 输入/输出及副作用：umem、hmc_ref 为只读输入；pbl 输出新对象，失败时保持 null，不释放调用方 UMEM/HMC 资源。
-  // 失败/边界：连续 block 使用 PBL0，恰好两个非连续 block 使用 PBL1，其余非
-  //   连续 block 必须提供有效 HMC/PBLE lease 才使用 PBL2；不会从 UMEM 尾部伪造
-  //   目录 IOVA。
+  // 功能：按页数构建每级至多 512 项的 PBL 目录并校验叶子页。
+  // 输入/输出及副作用：umem、hmc_ref 只读；pbl 输出新对象，失败保持 null，不释放调用方资源。
+  // 失败/边界：连续 block 用 PBL0，恰好两个非连续 block 用 PBL1，其余需有效 HMC/PBLE lease 才用 PBL2。
   static function rdma_status build_multilevel(rdma_umem umem,
                                                 output rdma_pbl pbl,
                                                 input rdma_hmc_ref hmc_ref = null);

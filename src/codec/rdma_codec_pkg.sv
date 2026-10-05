@@ -1,10 +1,7 @@
 // 目录：硬件编解码层 codec/rdma_codec_pkg.sv。
-// 职责：实现 rdma_codec_pkg 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_codec_pkg.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：声明 codec 包：CQE layout、codec key，并按序 include 各 codec 实现。
+// 依赖：依赖 uvm_pkg、rdma_types_pkg 与 rdma_model_pkg。
+// 所有权与生命周期：layout 为独立值对象，由创建者持有；包本身不持有运行期资源。
 
 package rdma_codec_pkg;
   import uvm_pkg::*;

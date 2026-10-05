@@ -3,7 +3,7 @@
 // 依赖：rdma_net_packet_adapter_pkg 和外部 net_packet packet 类。
 // 所有权与生命周期：bridge 拥有自身队列中的 packet 副本；调用方传入的 packet 始终由调用方管理。
 
-// 中文说明：该 bridge 是验证夹具，不模拟真实 NIC 调度；真实 AXIS/PCIe 环境可实现同一 sink 接口。
+// 中文说明：该 bridge 是验证夹具，不模拟 NIC 调度；真实 AXIS/PCIe 环境可实现同一 sink 接口。
 package rdma_net_packet_bridge_pkg;
   import uvm_pkg::*;
   import rdma_types_pkg::*;
@@ -20,9 +20,9 @@ package rdma_net_packet_bridge_pkg;
     int unsigned sent_count;
     int unsigned receive_count;
 
-    // 功能：构造 queue sink，初始化发送/接收队列和计数器。
-    // 输入/输出及副作用：name（输入）；只创建本地队列，不绑定外部 DUT 或释放外部对象。
-    // 失败/边界：构造不会预分配无限队列；调用方应通过 status 处理空接收队列。
+    // 功能：构造 queue sink 并清空收发队列与计数。
+    // 输入/输出及副作用：name 为对象名；只初始化本地队列。
+    // 失败/边界：无。
     function new(string name = "rdma_net_packet_queue_sink");
       super.new(name);
       sent_packets.delete();
@@ -33,9 +33,9 @@ package rdma_net_packet_bridge_pkg;
       receive_count = 0;
     endfunction
 
-    // 功能：复制 packet 的 raw_data 并重新解析 layer_stack，形成 sink 自有值快照。
-    // 输入/输出及副作用：source（输入）；返回新建 packet，源对象和其层句柄保持不变。
-    // 失败/边界：source 为空或 raw_data 为空时返回 null，不把外部句柄放入本地队列。
+    // 功能：按 raw_data 重新 unpack，得到 sink 自有的 packet 副本。
+    // 输入/输出及副作用：source 只读；返回新 packet。
+    // 失败/边界：source 为空或 raw_data 为空返回 null。
     static function packet clone_packet(packet source);
       packet clone_value;
 
@@ -46,9 +46,9 @@ package rdma_net_packet_bridge_pkg;
       return clone_value;
     endfunction
 
-    // 功能：把最近一次发送的 packet 快照放入接收队列，构造 loopback 测试路径。
-    // 输入/输出及副作用：无显式输入；增加 receive_queue 元素，不修改 sent_packets。
-    // 失败/边界：没有最近发送报文时保持队列不变，避免注入空 packet。
+    // 功能：把最近一次发送的 packet 副本放入接收队列（loopback）。
+    // 输入/输出及副作用：追加 receive_queue，不改 sent_packets。
+    // 失败/边界：无已发送报文时不动作。
     function void enqueue_last_sent_for_receive();
       packet clone_value;
 
@@ -59,9 +59,9 @@ package rdma_net_packet_bridge_pkg;
         receive_queue.push_back(clone_value);
     endfunction
 
-    // 功能：将显式 packet 快照放入接收队列，供 parser/错误恢复场景使用。
-    // 输入/输出及副作用：source（输入）；成功时复制 source，不转移 source 所有权。
-    // 失败/边界：source 无 raw_data 时静默拒绝；接收方通过 QUEUE_EMPTY 观察无数据状态。
+    // 功能：把 source 的副本放入接收队列。
+    // 输入/输出及副作用：source 只读，不转移所有权。
+    // 失败/边界：source 无 raw_data 时静默忽略。
     function void enqueue(packet source);
       packet clone_value;
 
@@ -70,9 +70,9 @@ package rdma_net_packet_bridge_pkg;
         receive_queue.push_back(clone_value);
     endfunction
 
-    // 功能：保存发送 packet 的 raw bytes 副本并加入 sent_packets，模拟外部网络注入点。
-    // 输入/输出及副作用：pkt（输入）、status（输出）；只更新 bridge 自有队列和统计量。
-    // 失败/边界：pkt 为空或 raw_data 为空时返回 INVALID_ARGUMENT，不保存半包。
+    // 功能：保存发送 packet 的副本并记录 last_raw/previous_raw。
+    // 输入/输出及副作用：pkt 输入、status 输出；更新 sent_packets 与 sent_count。
+    // 失败/边界：pkt 为空或无 raw_data 返回 INVALID_ARGUMENT；克隆失败返回 RESOURCE_EXHAUSTED。
     virtual task send(packet pkt, output rdma_status status);
       packet clone_value;
 
@@ -94,9 +94,9 @@ package rdma_net_packet_bridge_pkg;
       sent_count++;
     endtask
 
-    // 功能：从 receive_queue 弹出一个 packet 快照，向 adapter 发布非拥有引用。
-    // 输入/输出及副作用：pkt、status（输出）；只移动 bridge 队列头，不修改发送记录。
-    // 失败/边界：队列为空时返回 RDMA_SC_QUEUE_EMPTY，pkt 保持为空。
+    // 功能：从 receive_queue 弹出一个 packet 发布给调用方。
+    // 输入/输出及副作用：pkt、status 为输出；递增 receive_count。
+    // 失败/边界：队列为空返回 QUEUE_EMPTY，pkt 为 null。
     virtual task receive(output packet pkt, output rdma_status status);
       pkt = null;
       if (receive_queue.size() == 0) begin

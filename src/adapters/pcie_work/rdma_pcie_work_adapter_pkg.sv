@@ -1,10 +1,9 @@
 // 目录：适配器实现层 adapters/pcie_work/。
 // 职责：把 pcie_work 的 Function manager、配置代理和 BAR decoder 封装成
 //   RDMA 侧的 Function-aware PCIe 契约；RDMA 核心只依赖 rdma_pcie_api。
-// 依赖：pcie_tl_pkg（外部 pcie_work）、rdma_types_pkg、rdma_model_pkg 和
-//   rdma_adapter_pkg；不复制或接管外部 PCIe/Host-memory 对象的生命周期。
-// 所有权与生命周期：func_mgr、bar_decoder、config_proxy 均为非拥有引用；
-//   route_handles 保存 detached Function handle 快照，随 adapter 生命周期失效。
+// 依赖：pcie_tl_pkg、rdma_types_pkg、rdma_model_pkg、rdma_adapter_pkg。
+// 所有权与生命周期：func_mgr/bar_decoder/config_proxy 为非拥有引用；
+//   route_handles 为 detached handle 快照，随 adapter 生命周期失效。
 
 package rdma_pcie_work_adapter_pkg;
   import uvm_pkg::*;
@@ -17,29 +16,27 @@ package rdma_pcie_work_adapter_pkg;
   class rdma_pcie_work_adapter extends rdma_pcie_api;
     `uvm_object_utils(rdma_pcie_work_adapter)
 
-    // 外部 canonical PCIe 对象：adapter 只保存引用，不负责 new/delete。
+    // 外部 PCIe 对象：adapter 只保存引用，不负责 new/delete。
     pcie_tl_func_manager func_mgr;
     pcie_tl_bar_decoder bar_decoder;
     pcie_tl_config_proxy config_proxy;
     bit model_bypass;
     bit configured;
 
-    // UID -> detached route snapshot。BDF 和 object_id 由注册时锁定，
-    // generation 在校验时与 manager 当前 generation 对齐以隔离 reset/rekey。
+    // UID -> detached route 快照。BDF/object_id 注册时锁定，
+    // generation 校验时与 manager 当前值对齐，以隔离 reset/rekey。
     rdma_function_handle route_handles[longint unsigned];
     rdma_bdf_t route_bdfs[longint unsigned];
     int unsigned route_generations[longint unsigned];
 
-    // 最近一次成功的模型 MMIO 路由，便于 sequence/scoreboard 观察目标 Function。
+    // 最近一次成功的模型 MMIO 路由，供 sequence/scoreboard 观察。
     rdma_bar_decode last_mmio_route;
     byte last_mmio_payload[$];
     bit last_mmio_valid;
 
-    // 功能：构造 PCIe adapter 并清空本地 registry/诊断快照，不创建外部 PCIe 对象。
-    // 输入/输出及副作用：name（输入）；初始化 configured/model_bypass 和本地 route
-    //   registry，返回一个未绑定后端的 adapter；不修改任何 manager 状态。
-    // 失败/边界：构造成功不代表可用；在 configure() 成功前所有业务入口必须返回
-    //   RDMA_SC_INVALID_STATE，且不应向外部 PCIe 发送事务。
+    // 功能：构造 adapter 并清空本地 registry 与诊断快照。
+    // 输入/输出及副作用：name 为实例名；不创建或修改外部 PCIe 对象。
+    // 失败/边界：configure() 成功前业务入口返回 INVALID_STATE，且不向外部 PCIe 发送事务。
     function new(string name = "rdma_pcie_work_adapter");
       super.new(name);
       func_mgr = null;
@@ -55,11 +52,9 @@ package rdma_pcie_work_adapter_pkg;
       last_mmio_valid = 1'b0;
     endfunction
 
-    // 功能：创建带 PCIe 引擎来源和 Function 代际上下文的统一状态对象。
-    // 输入/输出及副作用：code/message/function_uid/generation（输入）；返回 detached
-    //   rdma_status，不修改 adapter、manager 或调用方对象。
-    // 失败/边界：所有 code 均保留原始错误类别；零 UID/代际只表示调用方未提供上下文，
-    //   不会被函数伪造为有效身份。
+    // 功能：创建带 PCIe 引擎来源和 Function 上下文的 status。
+    // 输入/输出及副作用：code/message/function_uid/generation 为输入；返回新 status。
+    // 失败/边界：零 UID/generation 仅表示调用方未提供上下文。
     function automatic rdma_status status_for(
       rdma_status_code_e code,
       string message,
@@ -74,10 +69,10 @@ package rdma_pcie_work_adapter_pkg;
       return status;
     endfunction
 
-    // 功能：检查 adapter 是否已绑定完整的 manager、decoder 和必要的配置代理。
-    // 输入/输出及副作用：无显式参数；返回状态快照，不修改外部对象。
-    // 失败/边界：configured、func_mgr、bar_decoder 缺失返回 INVALID_STATE；
-    //   非 bypass 模式缺少 config_proxy 或 multi_function_mode 时同样 fail-closed。
+    // 功能：检查 adapter 是否已绑定完整的 manager、decoder 和必要的 config_proxy。
+    // 输入/输出及副作用：无参数；只读。
+    // 失败/边界：configured/func_mgr/bar_decoder 缺失返回 INVALID_STATE；
+    //   非 bypass 模式缺 config_proxy 或未开 multi_function_mode 同样拒绝。
     function automatic rdma_status validate_ready();
       if (!configured || func_mgr == null || bar_decoder == null)
         return status_for(RDMA_SC_INVALID_STATE,
@@ -89,12 +84,10 @@ package rdma_pcie_work_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：把外部 PCIe manager/decoder/proxy 连接到 adapter，并建立明确的
-    //   model-bypass 边界；decoder/proxy 若已绑定其他 manager 则拒绝混接。
-    // 输入/输出及副作用：new_func_mgr/new_bar_decoder/new_config_proxy（输入）、
-    //   allow_model_bypass（输入）；成功时保存非拥有引用并设置 configured，返回状态。
-    // 失败/边界：任一必需对象为空、decoder/proxy 指向不同 manager、或非 bypass 模式
-    //   未开启 multi_function_mode 时返回 INVALID_ARGUMENT/INVALID_STATE，旧绑定不变。
+    // 功能：绑定外部 manager/decoder/proxy 并设定 model-bypass 边界。
+    // 输入/输出及副作用：成功时保存非拥有引用并置 configured。
+    // 失败/边界：必需对象为空、decoder/proxy 绑定了其他 manager，或非 bypass 模式未开
+    //   multi_function_mode 时返回错误，旧绑定不变。
     function rdma_status configure(
       pcie_tl_func_manager new_func_mgr,
       pcie_tl_bar_decoder new_bar_decoder,
@@ -134,20 +127,17 @@ package rdma_pcie_work_adapter_pkg;
       return status_for(RDMA_SC_OK, "PCIe adapter configured");
     endfunction
 
-    // 功能：把 RDMA BDF 快照转换为 pcie_work 使用的 16 位 Routing ID。
-    // 输入/输出及副作用：bdf（输入）；返回值为 bus/device/function 拼接结果，不修改
-    //   BDF 或 manager；segment 必须由调用方先检查。
-    // 失败/边界：pcie_work manager 只有 16 位 BDF；调用方必须先由
-    //   lookup_context() 检查 segment，避免本函数被误用为静默截断转换器。
+    // 功能：把 RDMA BDF 转为 pcie_work 的 16 位 Routing ID（bus/device/function 拼接）。
+    // 输入/输出及副作用：bdf 为输入；返回拼接值，无副作用。
+    // 失败/边界：不检查 segment，调用方须先经 lookup_context() 检查，避免静默截断。
     function automatic bit [15:0] raw_bdf(rdma_bdf_t bdf);
       return rdma_bdf_requester_id(bdf);
     endfunction
 
-    // 功能：验证 RDMA BDF 能否在当前 manager 中查到唯一 enabled Function。
-    // 输入/输出及副作用：bdf（输入）、ctx（输出）；ctx 为外部非拥有引用，成功时仅供
-    //   当前调用读取，不转移其生命周期。
-    // 失败/边界：非零 segment、未知 BDF 和 disabled VF 分别返回 PCIE_COMPLETION 或
-    //   INVALID_STATE；不会退回 PF0 或 profile 默认 Function。
+    // 功能：确认 BDF 在当前 manager 中对应唯一 enabled Function。
+    // 输入/输出及副作用：bdf 为输入，ctx 为输出（非拥有引用，仅供当前调用读取）。
+    // 失败/边界：非零 segment、未知 BDF、disabled VF 返回 PCIE_COMPLETION 或 INVALID_STATE；
+    //   不回退到 PF0 或默认 Function。
     function automatic rdma_status lookup_context(
       rdma_bdf_t bdf,
       output pcie_tl_func_context ctx
@@ -167,12 +157,10 @@ package rdma_pcie_work_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：从 PF/VF context 和其配置空间生成 detached RDMA Function 信息，统一
-    //   投影 BDF、父 PF、MSE/BME 及 BAR aperture。
-    // 输入/输出及副作用：bdf（输入）、info（输出）；info 由 adapter 新建并由调用方
-    //   持有；不修改 manager/context。
-    // 失败/边界：unknown/disabled BDF、缺失 cfg_mgr 或 SR-IOV capability 返回明确错误；
-    //   VF BAR 优先使用 SR-IOV VF BAR aggregate base，不使用未配置的 VF context base。
+    // 功能：从 PF/VF context 与配置空间生成 detached Function 信息（BDF、父 PF、MSE/BME、BAR）。
+    // 输入/输出及副作用：bdf 为输入，info 为输出（新建，由调用方持有）；不修改 manager。
+    // 失败/边界：unknown/disabled BDF、缺 cfg_mgr 或 SR-IOV capability 返回错误；
+    //   VF BAR 优先取 SR-IOV VF BAR aggregate base，不用未配置的 VF context base。
     virtual function rdma_status get_function_info(
       rdma_bdf_t bdf,
       output rdma_pcie_function_info info
@@ -246,11 +234,10 @@ package rdma_pcie_work_adapter_pkg;
                         0, int'(func_mgr.config_generation));
     endfunction
 
-    // 功能：读取 PF 的 SR-IOV capability，返回与 manager 脱离的参数和 VF BAR 快照。
-    // 输入/输出及副作用：pf_bdf（输入）、info（输出）；只读 manager，不启用/禁用 VF，
-    //   输出数组由值复制生成。
-    // 失败/边界：VF BDF、unknown/disabled PF、缺失 capability 或非法 PF index 返回
-    //   INVALID_ARGUMENT/PCIE_COMPLETION/INVALID_STATE；不根据 vf_index 猜测 capability。
+    // 功能：读取 PF 的 SR-IOV capability，输出脱离 manager 的参数与 VF BAR 快照。
+    // 输入/输出及副作用：pf_bdf 为输入，info 为输出；只读，不启用/禁用 VF。
+    // 失败/边界：VF BDF、unknown/disabled PF、缺 capability 或 PF index 非法时返回错误；
+    //   不根据 vf_index 猜测 capability。
     virtual function rdma_status discover_sriov(
       rdma_bdf_t pf_bdf,
       output rdma_pcie_sriov_info info
@@ -294,11 +281,9 @@ package rdma_pcie_work_adapter_pkg;
                         0, int'(func_mgr.config_generation));
     endfunction
 
-    // 功能：把 byte-enable mask 转换为 config_proxy 所需的连续 byte offset/length。
-    // 输入/输出及副作用：byte_enable（输入）、byte_offset/byte_length（输出）；只计算
-    //   局部值，不更新 config space。
-    // 失败/边界：零 mask、非连续 mask（例如 0101）或越界 mask 返回 0；允许 1/2/3/4
-    //   字节连续写，调用方据此 fail-closed。
+    // 功能：把 byte-enable mask 转成 config_proxy 需要的连续 byte offset/length。
+    // 输入/输出及副作用：byte_enable 为输入，byte_offset/byte_length 为输出；纯计算。
+    // 失败/边界：零 mask、非连续 mask（如 0101）或越界返回 0；仅接受 1~4 字节连续写。
     function automatic bit decode_byte_enable(
       bit [3:0] byte_enable,
       output int byte_offset,
@@ -326,11 +311,10 @@ package rdma_pcie_work_adapter_pkg;
       return 1'b1;
     endfunction
 
-    // 功能：通过 config_proxy/manager 读取目标 Function 的一个 32-bit 配置 DWORD。
-    // 输入/输出及副作用：target/offset（输入）、data/status（输出）；成功时 data 来自
-    //   canonical config image；不推进任何 RDMA 队列或修改配置。
-    // 失败/边界：offset 必须 4-byte 对齐且不超过 0xffc；unknown BDF 返回
-    //   PCIE_COMPLETION；非零 segment、缺失 proxy/backend 或代理拒绝均不伪造成功。
+    // 功能：经 config_proxy/manager 读取目标 Function 的一个 32-bit 配置 DWORD。
+    // 输入/输出及副作用：target/offset 为输入，data/status 为输出；不修改配置。
+    // 失败/边界：offset 须 4 字节对齐且不超过 0xffc；unknown BDF 返回 PCIE_COMPLETION；
+    //   非零 segment、缺 proxy/backend 或代理拒绝均不伪造成功。
     virtual task cfg_read32(
       rdma_bdf_t target,
       rdma_cfg_offset_t offset,
@@ -373,12 +357,12 @@ package rdma_pcie_work_adapter_pkg;
                           0, int'(func_mgr.config_generation));
     endtask
 
-    // 功能：向目标 Function 提交带连续 byte-enable 的 32-bit 配置写，并让
-    //   config_proxy 负责 SR-IOV、BAR、MSE/BME 与 BDF LUT 的 canonical 更新。
-    // 输入/输出及副作用：target/offset/data/byte_enable（输入）、status（输出）；成功
-    //   时外部 config image 可能改变并递增 manager generation。
-    // 失败/边界：offset 未对齐、byte_enable 非连续/为零、unknown BDF、代理缺失或拒绝
-    //   均 fail-closed；失败路径不写入部分 config 字节。
+    // 功能：提交带连续 byte-enable 的 32-bit 配置写，SR-IOV/BAR/MSE/BME/BDF LUT 的更新由
+    //   config_proxy 负责。
+    // 输入/输出及副作用：target/offset/data/byte_enable 为输入，status 为输出；成功时外部
+    //   config image 可能改变并递增 manager generation。
+    // 失败/边界：offset 未对齐、byte_enable 为零或非连续、unknown BDF、代理缺失或拒绝均
+    //   返回错误，不写入部分 config 字节。
     virtual task cfg_write32(
       rdma_bdf_t target,
       rdma_cfg_offset_t offset,
@@ -431,11 +415,9 @@ package rdma_pcie_work_adapter_pkg;
                           0, int'(func_mgr.config_generation));
     endtask
 
-    // 功能：扫描 canonical PF/VF BAR aperture，为 bar_decoder 提供唯一的 target BDF
-    //   hint；最终合法性仍由外部 decoder 决定。
-    // 输入/输出及副作用：address（输入）、candidate/found（输出）；只读 manager，
-    //   不建立影子 BAR 表或修改 decoder cache。
-    // 失败/边界：地址落在 disabled VF aperture 时仍返回其 BDF 以便 decoder 产生
+    // 功能：扫描 PF/VF BAR aperture，为 bar_decoder 提供唯一的 target BDF hint。
+    // 输入/输出及副作用：address 为输入，candidate/found 为输出；只读，不建影子 BAR 表。
+    // 失败/边界：落在 disabled VF aperture 时仍返回其 BDF，使 decoder 报告
     //   PCIE_BAR_DECODE_DISABLED；溢出或多重命中不选取任意 Function。
     function automatic void find_candidate_bdf(
       bit [63:0] address,
@@ -509,12 +491,12 @@ package rdma_pcie_work_adapter_pkg;
         candidate = 16'hffff;
     endfunction
 
-    // 功能：构造 memory TLP、调用外部 BAR decoder，并把 route 投影为 RDMA detached
-    //   rdma_bar_decode；mmio_write 与 decode_bar 共用这一条 boundary/BE 校验路径。
-    // 输入/输出及副作用：address/payload（输入）、route（输出）；decoder 只读 manager
-    //   并可能刷新自身 generation cache，不修改 RDMA queue 状态。
-    // 失败/边界：空 payload、非对齐地址、跨 Function/BAR、disabled/unknown BDF 和
-    //   decoder 错误均映射为明确 RDMA status；失败时 route 只保留全零快照。
+    // 功能：构造 memory TLP 并调用 BAR decoder，把 route 投影为 detached rdma_bar_decode；
+    //   mmio_write 与 decode_bar 共用此校验路径。
+    // 输入/输出及副作用：address/payload 为输入，route 为输出；decoder 可能刷新自身 generation
+    //   cache，不改 RDMA 队列状态。
+    // 失败/边界：空 payload、非对齐、跨 Function/BAR、disabled/unknown BDF 或 decoder 错误
+    //   映射为 RDMA status；失败时 route 为全零快照。
     function automatic rdma_status decode_memory_request(
       rdma_bar_addr_t address,
       byte payload[],
@@ -581,11 +563,10 @@ package rdma_pcie_work_adapter_pkg;
       endcase
     endfunction
 
-    // 功能：按地址解码一个最小 BAR 访问，供 sequence 预检目标 Function/BAR/offset。
-    // 输入/输出及副作用：address（输入）、result（输出）；成功时 result 是 detached
-    //   route，失败时不发布部分有效目标；不产生 PCIe 写事务。
-    // 失败/边界：未配置、地址未命中、disabled VF 或跨边界请求按 decode_memory_request
-    //   的 fail-closed 映射返回，不从 address 猜测默认 PF。
+    // 功能：按地址解码最小 BAR 访问，供 sequence 预检目标 Function/BAR/offset。
+    // 输入/输出及副作用：address 为输入，result 为输出；不产生 PCIe 写事务。
+    // 失败/边界：未配置、未命中、disabled VF 或跨边界按 decode_memory_request 映射返回，
+    //   失败时不发布部分有效目标。
     virtual function rdma_status decode_bar(
       rdma_bar_addr_t address,
       output rdma_bar_decode result
@@ -601,12 +582,11 @@ package rdma_pcie_work_adapter_pkg;
       return status;
     endfunction
 
-    // 功能：登记 Function UID、object ID 与 canonical BDF 的绑定，供后续 MMIO/屏障
-    //   做 generation 和目标 Function 双重校验。
-    // 输入/输出及副作用：info/function_uid/object_id（输入）；成功时写入 adapter-owned
-    //   detached handle/route 快照；返回状态，不修改 manager。
-    // 失败/边界：空 info、零 UID、unknown/disabled BDF、UID 冲突或 generation 不可用
-    //   返回错误；重复登记同一 BDF/UID 可幂等成功，冲突登记不会留下部分条目。
+    // 功能：登记 Function UID、object ID 与 canonical BDF 的绑定，供后续 MMIO/屏障校验。
+    // 输入/输出及副作用：info/function_uid/object_id 为输入；成功时写入 adapter 内的 detached
+    //   handle/route 快照，不修改 manager。
+    // 失败/边界：空 info、零 UID、unknown/disabled BDF、UID 冲突或 generation 不可用返回错误；
+    //   重复登记同一 BDF/UID 幂等，冲突不留部分条目。
     function rdma_status register_function(
       rdma_pcie_function_info info,
       longint unsigned function_uid,
@@ -651,12 +631,11 @@ package rdma_pcie_work_adapter_pkg;
                         function_uid, generation);
     endfunction
 
-    // 功能：校验调用方 Function handle 的 kind、UID、object ID、BDF registry 和当前
-    //   manager generation，阻断 stale handle 写入 BAR。
-    // 输入/输出及副作用：function_h（输入）；返回状态，不修改调用方 handle；registry
-    //   generation 仅在成功校验前读取，不把外部句柄保存为可变引用。
-    // 失败/边界：null/wrong kind/unknown UID/BDF mismatch 返回 INVALID_ARGUMENT/STATE；
-    //   handle generation 与当前 manager generation 不等返回 STALE_GENERATION。
+    // 功能：校验 handle 的 kind、UID、object ID、BDF registry 及 manager 当前 generation，
+    //   阻断 stale handle。
+    // 输入/输出及副作用：function_h 为输入；只读，不保存外部句柄。
+    // 失败/边界：null/kind 错误/UID 未登记/BDF 不符返回 INVALID_ARGUMENT/STATE；
+    //   handle generation 与 manager 当前值不等返回 STALE_GENERATION。
     function automatic rdma_status validate_function_handle(
       rdma_function_handle function_h
     );
@@ -690,12 +669,11 @@ package rdma_pcie_work_adapter_pkg;
                         function_h.function_uid, current_generation);
     endfunction
 
-    // 功能：验证 Function-aware MMIO payload、解码其 BAR route，并在 model-bypass 下
-    //   记录 detached 写入；真实 backend 模式未接入发送端时明确返回 INVALID_STATE。
-    // 输入/输出及副作用：function_h/address/data（输入）、status（输出）；成功时更新
-    //   last_mmio_route/last_mmio_payload 诊断快照，不修改 manager BAR 状态。
-    // 失败/边界：stale/unknown handle、空数据、非对齐、跨 BAR/Function、disabled VF
-    //   均不写入快照；关闭 model_bypass 时不假装已发出 PCIe TLP。
+    // 功能：校验 Function-aware MMIO 写并解码 BAR route，model-bypass 下记录 detached 写入。
+    // 输入/输出及副作用：function_h/address/data 为输入，status 为输出；成功时更新
+    //   last_mmio_route/last_mmio_payload，不改 manager BAR 状态。
+    // 失败/边界：stale/unknown handle、空数据、非对齐、跨 BAR/Function、disabled VF 均不写
+    //   快照；关闭 model_bypass 时返回 INVALID_STATE，不假装已发出 TLP。
     virtual task mmio_write(
       rdma_function_handle function_h,
       rdma_bar_addr_t address,
@@ -738,11 +716,9 @@ package rdma_pcie_work_adapter_pkg;
                           function_h.generation);
     endtask
 
-    // 功能：在 Function authority 已验证后执行 DMA 可见性屏障；model-bypass 仅记录
-    //   已完成的顺序点，真实 backend 必须由上层注入后才能报告成功。
-    // 输入/输出及副作用：function_h（输入）、status（输出）；不写入 PCIe config/BAR。
-    // 失败/边界：null/wrong/stale/unknown handle 或未连接真实 backend 返回明确错误，
-    //   不隐式等待或重试。
+    // 功能：Function 校验通过后执行 DMA 可见性屏障；model-bypass 仅记录顺序点。
+    // 输入/输出及副作用：function_h 为输入，status 为输出；不写 PCIe config/BAR。
+    // 失败/边界：null/wrong/stale/unknown handle 或未连接真实 backend 返回错误，不等待或重试。
     virtual task dma_visibility_barrier(
       rdma_function_handle function_h,
       output rdma_status status
@@ -760,11 +736,10 @@ package rdma_pcie_work_adapter_pkg;
                           function_h.function_uid, function_h.generation);
     endtask
 
-    // 功能：在 Function authority 已验证后执行 MMIO ordering 屏障，保证 doorbell 前
-    //   的模型写入按序可见；真实 PCIe ordering backend 缺失时不伪造硬件完成。
-    // 输入/输出及副作用：function_h（输入）、status（输出）；不推进队列 PI/CI，也不
-    //   修改 manager；model-bypass 成功只表示模型顺序点已建立。
-    // 失败/边界：handle 未登记、代际陈旧或真实 backend 未连接返回错误且不发布部分状态。
+    // 功能：Function 校验通过后执行 MMIO ordering 屏障，保证 doorbell 前的模型写按序可见。
+    // 输入/输出及副作用：function_h 为输入，status 为输出；不推进队列 PI/CI，不改 manager；
+    //   model-bypass 成功仅表示模型顺序点已建立。
+    // 失败/边界：handle 未登记、generation 陈旧或真实 backend 未连接返回错误，不发布部分状态。
     virtual task mmio_ordering_barrier(
       rdma_function_handle function_h,
       output rdma_status status

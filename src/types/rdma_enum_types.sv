@@ -3,9 +3,6 @@
 // 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
-// 中文说明：rdma_enum_types.sv 属于基础类型层，集中定义 RDMA 枚举、地址、身份和状态契约。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
 typedef enum bit [4:0] {
   RDMA_SC_OK                 = 5'd0,
   RDMA_SC_INVALID_ARGUMENT   = 5'd1,

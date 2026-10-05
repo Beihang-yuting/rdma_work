@@ -14,15 +14,10 @@ class rdma_rq_engine extends rdma_queue_facade;
     super.new(name, "RQ");
   endfunction
 
-  // 功能：将接收请求交给共享 engine，执行 RQ 槽位预留、RQE 写入、producer
-  //   doorbell 和提交。
-  // 输入/输出及副作用：request（输入）、result/status（输出）；输入 request/image/
-  //   cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，
-  //   并通过 output 返回结果。
-  // 失败/边界：未配置、空请求、错误 Function/队列类型、槽位耗尽或 MMIO 不确定
-  //   时不发布结果；authority/delegate 返回 null status 时统一返回 INVALID_STATE；
-  //   delegate 返回非空失败状态时保留其 code/message。任一失败都清空 result，
-  //   调用方不会观察到没有成功状态支撑的提交结果。
+  // 功能：校验后把接收请求委托给共享 engine（槽位预留、RQE 写入、doorbell、提交）。
+  // 输入/输出及副作用：request 输入；result/status 输出；成功时由 delegate 更新 PI/CI 与 ledger。
+  // 失败/边界：授权校验失败直接返回；delegate 的 null status 归一为 INVALID_STATE，
+  //   其余失败保留 code/message；任一失败都清空 result。
   task post_recv(
     rdma_post_recv_req request,
     output rdma_queue_post_result result,

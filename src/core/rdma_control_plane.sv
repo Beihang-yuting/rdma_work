@@ -1,10 +1,9 @@
-// 目录：核心执行层 core/rdma_control_plane.sv。
-// 职责：实现 rdma_control_plane 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_control_plane.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 目录/层次：核心执行层 core/rdma_control_plane.sv。
+// 职责：控制面事务入口：PD/MR/CQ/SRQ/CEQ/AEQ/QP 的创建、修改、销毁与恢复，
+//   串联 resource manager、CMQ、host-memory、HMC 与队列/QP executor，并维护 Function 锁与事务号。
+// 依赖：依赖 resource manager、cmq port、STAG key policy、host_mem、hmc_allocator、
+//   context_backing 与 queue/QP executor。
+// 所有权与生命周期：外部依赖为非拥有引用；本类拥有 Function 锁表、事务号与 executor 对象。
 
 class rdma_control_plane extends uvm_object;
   `uvm_object_utils(rdma_control_plane)
@@ -25,9 +24,9 @@ class rdma_control_plane extends uvm_object;
   protected semaphore lock_table_guard;
   protected semaphore function_locks[string];
 
-  // 功能：构造 rdma_control_plane，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：manager=null；cmq=null；key_policy=null；host_mem=null；hmc_allocator=null；context_backing=null；queue_executor=null；qp_executor=null；其余字段按实现默认值初始化。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_control_plane 构造只建立本地初始状态；本地 semaphore/ledger 等按构造体显式分配，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造控制面，外部依赖置空。
+  // 输入/输出及副作用：name 为 UVM 实例名。
+  // 失败/边界：未 configure 前业务入口返回 INVALID_STATE。
   function new(string name = "rdma_control_plane");
     super.new(name);
     manager = null;
@@ -46,23 +45,23 @@ class rdma_control_plane extends uvm_object;
     function_locks.delete();
   endfunction
 
-  // 功能：在 rdma_control_plane 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；invalid_argument 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_ARGUMENT 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，invalid_state 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；invalid_state 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_state 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_STATE 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，snapshot_handle 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：source（输入）；snapshot_handle 读取 source 并使用字段 snapshot、snapshot.kind、snapshot.function_uid、snapshot.object_id、snapshot.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-  // 失败/边界：snapshot_handle 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：生成 handle 的 detached 快照（kind、UID、object_id、generation）。
+  // 输入/输出及副作用：source 只读；返回新 handle。
+  // 失败/边界：source 为 null 返回 null。
   protected function rdma_handle snapshot_handle(rdma_handle source);
     rdma_handle snapshot;
 
@@ -76,9 +75,9 @@ class rdma_control_plane extends uvm_object;
     return snapshot;
   endfunction
 
-  // 功能：checked_status 校验 source、null_message 与当前对象状态的一致性，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：source（输入）、null_message（输入）；checked_status 读取 source、null_message 并使用输入参数和固定枚举/常量；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：checked_status 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
+  // 功能：把后端 status 克隆为 detached 副本，null 转为 INVALID_STATE。
+  // 输入/输出及副作用：source、null_message 为输入；返回独立 status。
+  // 失败/边界：source 为 null 时返回带 null_message 的 INVALID_STATE。
   protected function rdma_status checked_status(
     rdma_status source,
     string null_message
@@ -88,8 +87,8 @@ class rdma_control_plane extends uvm_object;
     return rdma_cmq_clone_status_value(source);
   endfunction
 
-  // 功能：为 MR 的硬件阶段构造 CMQ 命令：OCC_FLUSHED→OCC_FLUSH（按 mr_serial 冲刷
-  //   PBLE）、MR_DEREGISTERED→MR_DEREGISTER（失效 MRT）、DRAINED→TQ_FLUSH。
+  // 功能：为 MR 的硬件阶段构造 CMQ 命令：OCC_FLUSHED→OCC_FLUSH（按 mr_serial 冲刷 PBLE）、
+  //   MR_DEREGISTERED→MR_DEREGISTER（失效 MRT）、DRAINED→TQ_FLUSH。
   // 输入/输出及副作用：owner 被深拷贝进命令，mr 只读；返回新命令，使用 default_timeout。
   // 失败/边界：其它 step 返回 null，由调用方报告 UNSUPPORTED_OPCODE。
   protected function rdma_cmq_command_desc make_mr_hw_command(
@@ -129,16 +128,10 @@ class rdma_control_plane extends uvm_object;
     return null;
   endfunction
 
-  // 功能：在 rdma_control_plane 中，execute_control_command_raw_status 收束一次
-  //   legacy CMQ 原始 dispatch，明确保留 backend status identity，供仍依赖原始
-  //   status 引用的特殊控制面阶段调用。
-  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）。任务
-  //   清空本次事务的 ticket/completion，检查 CMQ/command 后恰好调用 cmq.execute 一次，
-  //   将 backend 原始 status 写入 status；不取得 command 或外部 CMQ 资源所有权。
-  // 失败/边界：cmq 为空时返回 RDMA_SC_INVALID_STATE，command 为空时返回
-  //   RDMA_SC_INVALID_ARGUMENT；backend 返回 null status 时保留 null，由调用方按其
-  //   原有诊断和 recovery 优先级归一化。任务不重试、不推断 timeout 或 ambiguity，
-  //   也不推进 generation/资源状态。
+  // 功能：派发一次 legacy CMQ 命令，原样保留 backend 的 status 引用。
+  // 输入/输出及副作用：command 为输入；ticket、completion、status 为输出；恰调用 cmq.execute 一次。
+  // 失败/边界：cmq 为空返回 INVALID_STATE，command 为空返回 INVALID_ARGUMENT；backend 返回 null status 时保留 null，
+  //   由调用方归一化；不重试、不推断 timeout，不推进 generation 或资源状态。
   protected task execute_control_command_raw_status(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -156,15 +149,10 @@ class rdma_control_plane extends uvm_object;
     );
   endtask
 
-  // 功能：在 rdma_control_plane 中，execute_control_command 在原始 CMQ dispatch
-  // 之后生成 detached status，供 MR 回滚、注销和恢复阶段安全读取稳定诊断值。
-  // 输入/输出及副作用：command（输入）；ticket、completion、status（输出）；
-  //   null_status_message（输入）。任务复用 raw-status seam 且只调用一次
-  //   cmq.execute；成功或 backend status 均复制为独立 status，不取得 command 或
-  //   外部 CMQ 资源所有权。
-  // 失败/边界：cmq/command guard 的错误沿用 raw seam；backend null status 按
-  //   null_status_message 归一化为 RDMA_SC_INVALID_STATE。任务不重试、不推断
-  //   timeout/ambiguity，也不推进 generation、资源状态或 recovery journal。
+  // 功能：在 raw 派发之后把 status 归一化为 detached 副本，供回滚/注销/恢复阶段稳定读取。
+  // 输入/输出及副作用：command、null_status_message 为输入；ticket、completion、status 为输出；只调用 cmq.execute 一次。
+  // 失败/边界：cmq/command 的错误沿用 raw 路径；backend 返回 null status 时转为 INVALID_STATE；
+  //   不重试，不推进 generation、资源状态或 recovery journal。
   protected task execute_control_command(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -178,13 +166,9 @@ class rdma_control_plane extends uvm_object;
     status = checked_status(status, null_status_message);
   endtask
 
-  // 功能：make_result 通过 control 域 lifecycle result seed 建立 detached 的未完成
-  //   rdma_control_result，供 PD/MR/CQ/QP 等控制面入口在同一结果契约上追加业务阶段。
-  // 输入/输出及副作用：无显式参数；返回写入 status、primary_status、初始资源状态
-  //   和 recovery 标志的 result，只访问本地 seed，不取得 manager、CMQ 或外部 adapter
-  //   所有权。
-  // 失败/边界：seed 分配或初始化失败时返回带 INVALID_STATE 的结果；transaction_id
-  //   仍由调用入口在原有分配窗口写入，函数不提前改变 exhaustion、错误优先级或提交顺序。
+  // 功能：经 control 域 lifecycle result seed 创建未完成的 detached rdma_control_result。
+  // 输入/输出及副作用：无输入；返回写入 status、primary_status、初始资源状态与 recovery 标志的 result。
+  // 失败/边界：seed 创建或初始化失败时返回带 INVALID_STATE 的结果；transaction_id 由调用入口写入。
   protected function rdma_control_result make_result();
     rdma_control_result result;
     rdma_lifecycle_result_seed seed;
@@ -216,9 +200,9 @@ class rdma_control_plane extends uvm_object;
     return result;
   endfunction
 
-  // 功能：在 rdma_control_plane 中，cleanup_activated_pd 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
-  // 输入/输出及副作用：pd_h（输入）、result（输入）；cleanup_activated_pd 读取 pd_h、result 并使用字段 cleanup_status、result.final_resource_state、result.final_resource_state_known；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：cleanup_activated_pd 无返回值，仅执行 cleanup_status=manager.begin_quiesce(pd_h)、cleanup_status=checked_status(、result.final_resource_state=RDMA_RESOURCE_QUIESCING、result.final_resource_state_known=1'b1；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：清理已激活的 PD：先 begin_quiesce，再 finalize_release。
+  // 输入/输出及副作用：pd_h 为输入；result 被更新（final_resource_state、completed_steps、rollback_statuses）。
+  // 失败/边界：任一步失败时把 status 记入 result.rollback_statuses 并停止。
   protected function void cleanup_activated_pd(
     rdma_handle pd_h,
     rdma_control_result result
@@ -252,9 +236,10 @@ class rdma_control_plane extends uvm_object;
     result.completed_steps.push_back(RDMA_CTRL_STEP_RESOURCE_RELEASED);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，finalize_mr_recovery 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
-  // 输入/输出及副作用：reserved_mr（输入）、recovery（输入）、primary_status（输入）、result（输入）、mr（输出）、result_finalized（输出）、b0（输入）；finalize_mr_recovery 读取 reserved_mr、recovery、primary_status、result、mr、result_finalized、reserved_error 并使用字段 mr、result_finalized、normalized_primary、recovery_status、result.final_resource_state、result.final_resource_state_known、result.recovery_required、result.primary_status，并写入 mr、result_finalized；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：finalize_mr_recovery 返回 RDMA_SC_RECOVERY_REQUIRED；典型拒绝条件为“MR state requires recovery”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：冻结 MR 的 recovery 记录并发布 RECOVERY_REQUIRED 结果。
+  // 输入/输出及副作用：reserved_mr、recovery、primary_status 为输入；mr、result_finalized 为输出；
+  //   经 manager.mark_error 或 mark_reserved_error 冻结，再 lookup 取得 ERROR MR 快照。
+  // 失败/边界：冻结失败时记录错误并回查权威状态，recovery_required 置 0；最终 result.status 恒为 RECOVERY_REQUIRED。
   protected function void finalize_mr_recovery(
     rdma_mr reserved_mr,
     rdma_recovery_record recovery,
@@ -332,9 +317,10 @@ class rdma_control_plane extends uvm_object;
     );
   endfunction
 
-  // 功能：执行 retain_mr_rollback_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：reserved_mr（输入）、primary_status（输入）、result（输入）、hardware_presence（输入）、has_pending_step（输入）、pending_step（输入）、ambiguous_ticket（输入）、mr（输出）、result_finalized（输出）；retain_mr_rollback_error 读取 reserved_mr、primary_status、result、hardware_presence、has_pending_step、pending_step、ambiguous_ticket、mr、result_finalized 并使用字段 recovery、recovery.resource_h、recovery.hardware_presence、recovery.completed_steps、recovery.backing_refs、recovery.hmc_refs、recovery.ambiguous_ticket、recovery.primary_status，并写入 mr、result_finalized；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：retain_mr_rollback_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+  // 功能：MR 创建回滚失败后，登记 recovery 记录并发布结果。
+  // 输入/输出及副作用：reserved_mr、primary_status、result、hardware_presence、待执行 step、ambiguous_ticket 为输入；
+  //   mr、result_finalized 为输出；调用 finalize_mr_recovery。
+  // 失败/边界：无。
   protected function void retain_mr_rollback_error(
     rdma_mr reserved_mr,
     rdma_status primary_status,
@@ -367,10 +353,12 @@ class rdma_control_plane extends uvm_object;
                          result_finalized);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，rollback_mr_creation 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：reserved_mr（输入）、owner（输入）、primary_status（输入）、result（输入）、hardware_key_allocated（输入）、registry_programmed（输入）、mr（输出）、result_finalized（输出）；输入
-  //   handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：rollback_mr_creation 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：回滚未完成的 MR 创建：依次 MR_DEREGISTER（若已分配硬件 key）、释放 owned HMC 与 backing、
+  //   释放预留或 mark_error 后 finalize_release。
+  // 输入/输出及副作用：reserved_mr、owner、primary_status、result、hardware_key_allocated、
+  //   registry_programmed 为输入；
+  //   mr、result_finalized 为输出。
+  // 失败/边界：任一回滚步骤失败则经 retain_mr_rollback_error 保留 recovery 记录，不继续释放。
   protected task rollback_mr_creation(
     rdma_mr reserved_mr,
     rdma_function_handle owner,
@@ -598,9 +586,10 @@ class rdma_control_plane extends uvm_object;
     result.final_resource_state_known = 1'b1;
   endtask
 
-  // 功能：执行 retain_mr_destroy_error 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：mr_snapshot（输入）、primary_status（输入）、result（输入）、hardware_presence（输入）、has_pending_step（输入）、pending_step（输入）、ambiguous_ticket（输入）、result_finalized（输出）；retain_mr_destroy_error 读取 mr_snapshot、primary_status、result、hardware_presence、has_pending_step、pending_step、ambiguous_ticket、result_finalized 并使用字段 recovery、recovery.resource_h、recovery.hardware_presence、recovery.completed_steps、recovery.backing_refs、recovery.hmc_refs、recovery.ambiguous_ticket、recovery.primary_status，并写入 result_finalized；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：retain_mr_destroy_error 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+  // 功能：MR 注销失败后，登记 recovery 记录并发布结果。
+  // 输入/输出及副作用：mr_snapshot、primary_status、result、hardware_presence、待执行 step、ambiguous_ticket 为输入；
+  //   result_finalized 为输出；调用 finalize_mr_recovery。
+  // 失败/边界：无。
   protected function void retain_mr_destroy_error(
     rdma_mr mr_snapshot,
     rdma_status primary_status,
@@ -635,9 +624,9 @@ class rdma_control_plane extends uvm_object;
     );
   endfunction
 
-  // 功能：在 rdma_control_plane 中，finish_result 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
-  // 输入/输出及副作用：result（输入）、operation_status（输入）；finish_result 读取 result、operation_status 并使用字段 normalized、result.status、result.primary_status；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：finish_result 无返回值，仅执行 normalized=checked_status(、result.status=rdma_cmq_clone_status_value(normalized)、result.primary_status=rdma_cmq_clone_status_value(normalized)；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：把 operation_status 归一化后写入 result.status 与 primary_status。
+  // 输入/输出及副作用：result、operation_status 为输入；result 被更新。
+  // 失败/边界：result 为 null 直接返回；status 为 null 时归一化为 INVALID_STATE。
   protected function void finish_result(
     rdma_control_result result,
     rdma_status operation_status
@@ -653,9 +642,9 @@ class rdma_control_plane extends uvm_object;
     result.primary_status = rdma_cmq_clone_status_value(normalized);
   endfunction
 
-  // 功能：configured_status 校验 当前对象字段 与当前对象状态的一致性，并显式处理“control plane is not configured”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；configured_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：configured_status 返回 RDMA_SC_INVALID_STATE；典型拒绝条件为“control plane is not configured”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：检查控制面是否已配置。
+  // 输入/输出及副作用：只读本对象字段；返回 status。
+  // 失败/边界：未配置、manager/cmq/key_policy 为空或默认 timeout 为 0 返回 INVALID_STATE。
   protected function rdma_status configured_status();
     if (!configured || manager == null || cmq == null ||
         key_policy == null || default_timeout == 0)
@@ -663,9 +652,9 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_control_plane 中，binding_owner_status 把 binding_owner_status 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：binding（输入）、owner（输出）；binding_owner_status 读取 binding、owner 并使用字段 owner、status，并写入 owner；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 功能：校验 Function binding 并构造其 owner 句柄。
+  // 输入/输出及副作用：binding 为输入；owner 为输出。
+  // 失败/边界：binding 为空返回 INVALID_ARGUMENT；校验返回 null/失败、非 ACTIVE 或 owner 构造失败返回对应错误。
   protected function rdma_status binding_owner_status(
     rdma_function_binding binding,
     output rdma_function_handle owner
@@ -688,9 +677,9 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_control_plane 中，generation_fence 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
-  // 输入/输出及副作用：binding（输入）、expected_owner（输入）；generation_fence 读取 binding、expected_owner 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：generation_fence 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION；典型拒绝条件为“generation fence authority is null”“generation fence Function differs”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 binding 与期望 owner 的 Function 身份与 generation 一致。
+  // 输入/输出及副作用：binding、expected_owner 只读；返回 status。
+  // 失败/边界：任一为空或 Function 不同返回 INVALID_ARGUMENT；generation 不同返回 STALE_GENERATION。
   protected function rdma_status generation_fence(
     rdma_function_binding binding,
     rdma_function_handle expected_owner
@@ -712,9 +701,10 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_control_plane 中由 same_owner_status 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：candidate（输入）、expected（输入）、label（输入）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：same_owner_status 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：校验候选 owner 与期望 Function owner 的身份与 generation 一致。
+  // 输入/输出及副作用：candidate、expected、label 为输入；返回 status。
+  // 失败/边界：candidate 非 Function 返回 INVALID_ARGUMENT；expected 非法返回 INVALID_STATE；
+  //   身份不符返回 INVALID_ARGUMENT；generation 不同返回 STALE_GENERATION。
   protected function rdma_status same_owner_status(
     rdma_function_handle candidate,
     rdma_function_handle expected,
@@ -736,9 +726,9 @@ class rdma_control_plane extends uvm_object;
   endfunction
 
 
-  // 功能：register_mr_request_status 校验 request、owner 与当前对象状态的一致性，并显式处理“register MR request is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：request（输入）、owner（输入）；register_mr_request_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：register_mr_request_status 返回 函数体规定的失败状态；具体拒绝条件包括 “register MR request is null”；“register MR request validation returned null”；“register MR request”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：校验 MR 注册请求合法且属于 owner。
+  // 输入/输出及副作用：request、owner 只读；返回 status。
+  // 失败/边界：request 为空返回 INVALID_ARGUMENT；validate 返回 null 为 INVALID_STATE；owner 不符透传其错误。
   protected function rdma_status register_mr_request_status(
     rdma_register_mr_req request,
     rdma_function_handle owner
@@ -755,12 +745,11 @@ class rdma_control_plane extends uvm_object;
     return same_owner_status(request.owner, owner, "register MR request");
   endfunction
 
-  // 功能：MR 注册的入口校验：可选 generation fence、request 合法且属于 owner、backing
-  //   描述与 request/ownership 一致；锁前、锁后、快照三处共用同一顺序。
-  // 输入/输出及副作用：fence_owner 为 null 时跳过 fence；stage 作为 null 归一化诊断的
-  //   前缀；只读全部输入，返回独立 status。
-  // 失败/边界：fence 失败返回 INVALID_ARGUMENT/STALE_GENERATION，其余沿用
-  //   register_mr_request_status 与 validate_backing 的错误码；子校验返回 null 时为 INVALID_STATE。
+  // 功能：MR 注册的入口校验：可选 generation fence、request 合法且属于 owner、backing 与 request/ownership 一致；
+  //   锁前、锁后、快照三处共用同一顺序。
+  // 输入/输出及副作用：fence_owner 为 null 时跳过 fence；stage 作为诊断前缀；只读输入，返回独立 status。
+  // 失败/边界：fence 失败返回 INVALID_ARGUMENT/STALE_GENERATION，其余沿用 register_mr_request_status 与
+  //   validate_backing 的错误码；子校验返回 null 为 INVALID_STATE。
   protected function rdma_status register_mr_input_status(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -792,11 +781,11 @@ class rdma_control_plane extends uvm_object;
     );
   endfunction
 
-  // 功能：owned MR 的入口校验：request 合法且属于 owner、长度不超过 32 位 host 分配上限、
-  //   不请求 atomic；DMA context 合法、属于 owner、与 binding.queue_dma 授权一致且无 owner_h。
-  // 输入/输出及副作用：stage 作为诊断前缀区分锁前/锁后/快照；只读输入，返回独立 status。
-  // 失败/边界：超长/context 为空/owner_h 非空返回 INVALID_ARGUMENT，atomic 返回
-  //   UNSUPPORTED_OPCODE，DMA 授权不符返回 DMA_TRANSLATION，子校验 null 为 INVALID_STATE。
+  // 功能：owned MR 的入口校验：request 合法且属于 owner、长度不超 32 位 host 分配上限、不请求 atomic；
+  //   DMA context 合法、属于 owner、与 binding.queue_dma 一致且无 owner_h。
+  // 输入/输出及副作用：stage 作为诊断前缀；只读输入，返回独立 status。
+  // 失败/边界：超长/context 为空/owner_h 非空返回 INVALID_ARGUMENT，atomic 返回 UNSUPPORTED_OPCODE，
+  //   DMA 授权不符返回 DMA_TRANSLATION，子校验 null 为 INVALID_STATE。
   protected function rdma_status owned_mr_input_status(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -852,7 +841,7 @@ class rdma_control_plane extends uvm_object;
 
   // 功能：深拷贝 register MR request，并确认副本与原对象及其 owner/PD 句柄不共享引用。
   // 输入/输出及副作用：request 只读；frozen 输出新副本，失败时为 null。
-  // 失败/边界：clone 失败、类型不符或任一引用未分离时返回 INVALID_STATE。
+  // 失败/边界：clone 失败、类型不符或任一引用未分离返回 INVALID_STATE。
   protected function rdma_status detach_mr_request(
     rdma_register_mr_req request,
     output rdma_register_mr_req frozen
@@ -870,10 +859,9 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：深拷贝 MR backing 描述，并确认副本及其 Function 句柄、page layout、每个
-  //   backing/HMC 引用（含 mapping 与 owner 句柄）都不与原对象共享。
+  // 功能：深拷贝 MR backing 描述，并确认副本及其 Function 句柄、page layout、每个 backing/HMC 引用均不与原对象共享。
   // 输入/输出及副作用：backing 只读；frozen 输出新副本，失败时为 null。
-  // 失败/边界：clone 失败、类型不符、数组长度不同或任一引用未分离时返回 INVALID_STATE。
+  // 失败/边界：clone 失败、类型不符、数组长度不同或任一引用未分离返回 INVALID_STATE。
   protected function rdma_status detach_mr_backing(
     rdma_mr_backing_desc backing,
     output rdma_mr_backing_desc frozen
@@ -921,9 +909,9 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：深拷贝 owned MR 的 DMA request context，并确认 Function/owner 句柄均已分离。
+  // 功能：深拷贝 owned MR 的 DMA request context，并确认 Function/owner 句柄已分离。
   // 输入/输出及副作用：dma_context 只读；frozen 输出新副本，失败时为 null。
-  // 失败/边界：clone 失败、类型不符或任一句柄仍共享时返回 INVALID_STATE。
+  // 失败/边界：clone 失败、类型不符或句柄仍共享返回 INVALID_STATE。
   protected function rdma_status detach_dma_context(
     rdma_dma_request_context dma_context,
     output rdma_dma_request_context frozen
@@ -944,9 +932,9 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：required_dma_direction 使用 access 计算并返回 rdma_dma_direction_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：access（输入）；required_dma_direction 读取 access 并使用输入参数和固定枚举/常量；函数返回 rdma_dma_direction_e，不取得调用方资源所有权。
-  // 失败/边界：required_dma_direction 是只读访问器，按对象字段返回固定值；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：按 MR access 计算所需 DMA 方向。
+  // 输入/输出及副作用：access 为输入；返回方向。
+  // 失败/边界：含 local_write/remote_write/remote_atomic 为 BIDIRECTIONAL，否则为 DEVICE_READ。
   protected function rdma_dma_direction_e required_dma_direction(
     rdma_rdma_access_t access
   );
@@ -955,9 +943,10 @@ class rdma_control_plane extends uvm_object;
            RDMA_DMA_BIDIRECTIONAL : RDMA_DMA_DEVICE_READ;
   endfunction
 
-  // 功能：validate_backing 校验 binding、request、backing、owner、required_ownership 与当前对象状态的一致性，并显式处理“register MR backing authority is incomplete”；“register MR backing descriptor is null”；“register MR backing validation returned null”；“register MR first PBL index exceeds 28 bits”；“register MR backing reference is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：binding（输入）、request（输入）、backing（输入）、owner（输入）、required_ownership（输入）；validate_backing 读取 binding、request、backing、owner、required_ownership 并使用字段 status、required_permissions、required_permissions.device_read、required_permissions.device_write、required_permissions.atomic、required_direction；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 MR backing 描述：owner、requester BDF/PASID、mapping 访问权限、HMC 引用与 lease 大小。
+  // 输入/输出及副作用：binding、request、backing、owner、required_ownership 为输入；只读，返回 status。
+  // 失败/边界：权威信息缺失为 INVALID_STATE；backing/引用为空、ownership 非法、PBL 索引超 28 位为 INVALID_ARGUMENT；
+  //   BDF/PASID 与 Function 不符返回 DMA_TRANSLATION；HMC allocator 缺失或 lookup 失败返回对应错误。
   protected function rdma_status validate_backing(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -1057,9 +1046,9 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_control_plane 中，project_handle 从输入对象提取受控字段并返回 detached 投影，阻断调用方通过别名修改 authority。
-  // 输入/输出及副作用：software_h（输入）、local_id（输入）、expected_kind（输入）；project_handle 读取 software_h、local_id、expected_kind 并使用字段 projected、projected.kind、projected.function_uid、projected.object_id、projected.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-  // 失败/边界：project_handle 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
+  // 功能：把软件句柄投影为硬件视角的 handle（object_id 换成 local_id）。
+  // 输入/输出及副作用：software_h、local_id、expected_kind 为输入；返回新 handle。
+  // 失败/边界：software_h 为空或 kind 不符返回 null。
   protected function rdma_handle project_handle(
     rdma_handle software_h,
     int unsigned local_id,
@@ -1077,9 +1066,10 @@ class rdma_control_plane extends uvm_object;
     return projected;
   endfunction
 
-  // 功能：pd_handle_owner_status 校验 pd_h、owner 与当前对象状态的一致性，并显式处理“destroy PD handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：pd_h（输入）、owner（输入）；pd_handle_owner_status 读取 pd_h、owner 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：pd_handle_owner_status 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“destroy PD handle is null”“destroy PD handle kind is not PD”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 destroy PD 的句柄 kind 与 Function 归属。
+  // 输入/输出及副作用：pd_h、owner 只读；返回 status。
+  // 失败/边界：句柄为空或非 PD、属于其他 Function 返回 INVALID_ARGUMENT；owner 非法返回 INVALID_STATE；
+  //   generation 不同返回 STALE_GENERATION。
   protected function rdma_status pd_handle_owner_status(
     rdma_handle pd_h,
     rdma_function_handle owner
@@ -1100,9 +1090,10 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：mr_handle_owner_status 校验 mr_h、owner 与当前对象状态的一致性，并显式处理“deregister MR handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：mr_h（输入）、owner（输入）；mr_handle_owner_status 读取 mr_h、owner 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：mr_handle_owner_status 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“deregister MR handle is null”“deregister MR handle kind is not MR”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验注销 MR 的句柄 kind 与 Function 归属。
+  // 输入/输出及副作用：mr_h、owner 只读；返回 status。
+  // 失败/边界：句柄为空或非 MR、属于其他 Function 返回 INVALID_ARGUMENT；owner 非法返回 INVALID_STATE；
+  //   generation 不同返回 STALE_GENERATION。
   protected function rdma_status mr_handle_owner_status(
     rdma_handle mr_h,
     rdma_function_handle owner
@@ -1123,24 +1114,23 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_control_plane 中，function_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：owner（输入）；function_key 读取 owner 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
-// 失败/边界：function_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：用 Function UID 与 object_id 生成 Function 锁表的 key。
+  // 输入/输出及副作用：owner 为输入；返回 string。
+  // 失败/边界：无。
   protected function string function_key(rdma_function_handle owner);
     return $sformatf("%016h:%08h", owner.function_uid, owner.object_id);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，reserve_transaction_id 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
-  // 输入/输出及副作用：transaction_id（输出）、status（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
+  // 功能：分配一个控制面事务号。
+  // 输入/输出及副作用：transaction_id、status 为输出；持 lock_table_guard 递增 next_transaction_id。
+  // 失败/边界：事务号空间耗尽返回 RESOURCE_EXHAUSTED，transaction_id 保持 0。
   protected task reserve_transaction_id(
     output longint unsigned transaction_id,
     output rdma_status status
   );
     transaction_id = 0;
     status = invalid_state("transaction ID allocation did not complete");
-    // Keep the uncontended guard off the blocking scheduler; a failed fast
-    // path still uses get() and preserves real contention semantics.
+    // 先尝试 try_get，避免无竞争时阻塞调度；失败再 get()，保持真实竞争语义。
     if (!lock_table_guard.try_get(1))
       lock_table_guard.get(1);
     if (transaction_ids_exhausted) begin
@@ -1160,9 +1150,9 @@ class rdma_control_plane extends uvm_object;
     lock_table_guard.put(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，acquire_function_lock 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
-  // 输入/输出及副作用：owner（输入）、function_lock（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
+  // 功能：获取 owner 对应的 Function 锁（必要时创建）。
+  // 输入/输出及副作用：owner 为输入；function_lock 输出已取得的信号量，由调用方释放。
+  // 失败/边界：无错误返回；阻塞直到取得锁。
   protected task acquire_function_lock(
     rdma_function_handle owner,
     output semaphore function_lock
@@ -1171,8 +1161,7 @@ class rdma_control_plane extends uvm_object;
 
     function_lock = null;
     key = function_key(owner);
-    // Keep the uncontended guard off the blocking scheduler; a failed fast
-    // path still uses get() and preserves real contention semantics.
+    // 先尝试 try_get，避免无竞争时阻塞调度；失败再 get()，保持真实竞争语义。
     if (!lock_table_guard.try_get(1))
       lock_table_guard.get(1);
     if (!function_locks.exists(key))
@@ -1182,10 +1171,10 @@ class rdma_control_plane extends uvm_object;
     function_lock.get(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
-  // 输入/输出及副作用：resource_manager（输入）、cmq_port（输入）、key_policy（输入）、host_mem（输入）、hmc_allocator（输入）、context_backing（输入）、command_timeout（输入）；configure 先依据 configured；resource_manager == null；cmq_port == null 校验 resource_manager、cmq_port、key_policy、host_mem、hmc_allocator、context_backing、command_timeout；成功时更新本对象配置/状态并保存非拥有引用，返回
-  //   rdma_status。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：配置控制面依赖并创建 queue/QP executor。
+  // 输入/输出及副作用：resource_manager、cmq_port、key_policy 必填，host_mem/hmc_allocator/context_backing 可选；
+  //   保存非拥有引用并创建 executor，成功后置 configured。
+  // 失败/边界：重复配置、必填依赖为空或 timeout 为 0 返回错误；QP executor 仅在 host_mem 与 context_backing 都存在时配置。
   function rdma_status configure(
     rdma_resource_manager resource_manager,
     rdma_cmq_port cmq_port,
@@ -1247,9 +1236,9 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：queue_request_status 校验 request、owner、label 与当前对象状态的一致性，并显式处理“request is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：request（输入）、owner（输入）、label（输入）；queue_request_status 读取 request、owner、label 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：queue_request_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验队列类请求合法且属于 owner。
+  // 输入/输出及副作用：request、owner、label 为输入；返回 status。
+  // 失败/边界：request 为空返回 INVALID_ARGUMENT；validate 返回 null 为 INVALID_STATE；owner 不符透传其错误。
   protected function rdma_status queue_request_status(
     rdma_semantic_request request,
     rdma_function_handle owner,
@@ -1267,9 +1256,10 @@ class rdma_control_plane extends uvm_object;
     return same_owner_status(request.owner, owner, label);
   endfunction
 
-  // 功能：queue_target_owner_status 校验 target、owner、label 与当前对象状态的一致性，并显式处理“target handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：target（输入）、owner（输入）、label（输入）；queue_target_owner_status 读取 target、owner、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：queue_target_owner_status 返回 RDMA_SC_STALE_GENERATION、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验队列请求目标句柄的 Function 归属。
+  // 输入/输出及副作用：target、owner、label 为输入；返回 status。
+  // 失败/边界：target 为空或属于其他 Function 返回 INVALID_ARGUMENT；owner 非法返回 INVALID_STATE；
+  //   generation 不同返回 STALE_GENERATION。
   protected function rdma_status queue_target_owner_status(
     rdma_handle target,
     rdma_function_handle owner,
@@ -1287,12 +1277,11 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：校验请求合法且属于 owner；target 非 NONE 时再从请求中重新读取目标句柄，
-  //   校验其 Function/generation 归属，destroy 目标还须为 expected_kind 类型。
-  // 输入/输出及副作用：只读 request/owner，每次调用都重新读取请求字段（锁后复验依赖此点）；
-  //   label 作为诊断前缀；返回非 null 的独立 status。
-  // 失败/边界：请求/目标类型不符返回 INVALID_ARGUMENT，归属不符返回 INVALID_ARGUMENT
-  //   或 STALE_GENERATION，子校验返回 null 时为 INVALID_STATE。
+  // 功能：校验请求合法且属于 owner；target 非 NONE 时再从请求中重新读取目标句柄并校验归属，
+  //   destroy 目标还须为 expected_kind。
+  // 输入/输出及副作用：每次调用都重新读取请求字段（锁后复验依赖此点）；label 为诊断前缀；返回非 null status。
+  // 失败/边界：请求类型或目标 kind 不符返回 INVALID_ARGUMENT，归属不符返回 INVALID_ARGUMENT/STALE_GENERATION，
+  //   子校验返回 null 为 INVALID_STATE。
   protected function rdma_status request_target_status(
     rdma_semantic_request request,
     rdma_control_target_e target,
@@ -1325,12 +1314,11 @@ class rdma_control_plane extends uvm_object;
     );
   endfunction
 
-  // 功能：控制面锁内操作的统一准入：锁前校验 binding 与请求/目标，获取 Function 锁，
-  //   再以锁内 binding 重新校验身份并重新读取请求/目标完成复验。
-  // 输入/输出及副作用：owner 输出锁前 binding 推导的 Function 句柄；function_lock 输出
-  //   已取得的锁（未取得时为 null），由调用方在退出前释放；status 输出非 null 结果。
-  // 失败/边界：任一校验失败立即返回该状态；锁内 binding 漂移为非同一 Function/generation
-  //   时返回 INVALID_ARGUMENT/STALE_GENERATION，调用方不得继续执行副作用。
+  // 功能：锁内操作的统一准入：锁前校验 binding 与请求/目标，取得 Function 锁，再以锁内 binding 重新校验。
+  // 输入/输出及副作用：owner 输出锁前 binding 推导的 Function 句柄；function_lock 输出已取得的锁（未取得为 null），
+  //   由调用方释放；status 输出非 null 结果。
+  // 失败/边界：任一校验失败立即返回；锁内 binding 的 Function 或 generation 漂移返回 INVALID_ARGUMENT/STALE_GENERATION，
+  //   调用方不得继续执行副作用。
   protected task admit_locked_request(
     rdma_function_binding binding,
     rdma_semantic_request request,
@@ -1366,10 +1354,9 @@ class rdma_control_plane extends uvm_object;
                                    locked_owner, {"post-lock ", label});
   endtask
 
-  // 功能：create_queue_facade 创建独立的 无直接返回值；根据 binding、request、requires_context、expected_kind、queue、result 设置字段 queue、result、function_lock、result.transaction_id、status，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、request（输入）、requires_context（输入）、expected_kind（输入）、queue（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
-  //   output 发布新句柄/映射。
-  // 失败/边界：create_queue_facade 失败或超时通过 queue、result 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：创建 CQ/SRQ/CEQ/AEQ 的共用事务外壳：分配事务号、检查配置与适配器、准入后调用 queue executor。
+  // 输入/输出及副作用：binding、request、requires_context、expected_kind 为输入；queue、result 为输出；退出前释放 Function 锁。
+  // 失败/边界：未配置、缺 executor/host_mem/context_backing 返回 INVALID_STATE；失败时 queue 为 null，错误经 result 发布。
   protected task create_queue_facade(
     rdma_function_binding binding,
     rdma_semantic_request request,
@@ -1437,12 +1424,9 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：queue（CQ/SRQ/CEQ/AEQ）与 QP destroy 共用的事务外壳：分配事务号、经
-  //   admit_locked_request 完成锁前/锁内准入，然后在 Function 锁内调用对应 executor。
-  // 输入/输出及副作用：expected_kind 为 destroy 目标类型，use_qp_executor 选择 QP executor；
-  //   result 输出事务结果；退出前释放 Function 锁。
-  // 失败/边界：准入失败或 executor 返回 null/改写事务号时以 INVALID_STATE 等发布结果；
-  //   executor 已调用后的失败由其自身 result 承载，外壳不覆盖。
+  // 功能：queue（CQ/SRQ/CEQ/AEQ）与 QP destroy 共用的事务外壳：分配事务号、准入，再在锁内调用对应 executor。
+  // 输入/输出及副作用：expected_kind 为目标类型，use_qp_executor 选择 QP executor；result 输出事务结果；退出前释放锁。
+  // 失败/边界：准入失败或 executor 返回 null/改写事务号时以 INVALID_STATE 等发布；executor 调用后的失败由其 result 承载。
   protected task run_destroy_operation(
     rdma_function_binding binding,
     rdma_destroy_resource_req request,
@@ -1496,18 +1480,16 @@ class rdma_control_plane extends uvm_object;
         status = invalid_state({op, " executor returned null result"});
       executor_called = 1'b0;
     end
-    // QP executor 自行发布最终结果；queue executor 的失败结果沿用原契约由外壳
-    //   以其 status 重新归一化 status/primary_status。
+    // QP executor 自行发布最终结果；queue executor 的失败结果沿用原契约，由外壳以其 status 重新归一化。
     if (!status.ok() && (!executor_called || !use_qp_executor))
       finish_result(result, status);
     if (function_lock != null)
       function_lock.put(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，destroy_queue_facade 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、expected_kind（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按
-  //   adapter 契约释放。
-  // 失败/边界：destroy_queue_facade 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：销毁 队列资源（CQ/SRQ/CEQ/AEQ），转交 destroy 事务外壳并校验目标类型。
+  // 输入/输出及副作用：binding、request 为输入；result 输出事务结果。
+  // 失败/边界：owner/generation 不符或目标 kind 错误时拒绝，错误经 result 发布。
   protected task destroy_queue_facade(
     rdma_function_binding binding,
     rdma_destroy_resource_req request,
@@ -1517,9 +1499,9 @@ class rdma_control_plane extends uvm_object;
     run_destroy_operation(binding, request, expected_kind, 1'b0, result);
   endtask
 
-  // 功能：create_cq 创建独立的 无直接返回值；根据 binding、request、cq、result 设置字段 cq，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、request（输入）、cq（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：create_cq 失败或超时通过 cq、result 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：创建 CQ，经 create_queue_facade 完成事务并校验返回资源。
+  // 输入/输出及副作用：binding、request 为输入；cq 输出 ACTIVE 资源，result 输出事务结果。
+  // 失败/边界：失败或类型/状态不符时 cq 为 null，错误经 result 发布。
   task create_cq(
     rdma_function_binding binding,
     rdma_create_cq_req request,
@@ -1537,9 +1519,9 @@ class rdma_control_plane extends uvm_object;
     end
   endtask
 
-  // 功能：create_srq 创建独立的 无直接返回值；根据 binding、request、srq、result 设置字段 srq，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、request（输入）、srq（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：create_srq 失败或超时通过 srq、result 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：创建 SRQ，经 create_queue_facade 完成事务并校验返回资源。
+  // 输入/输出及副作用：binding、request 为输入；srq 输出 ACTIVE 资源，result 输出事务结果。
+  // 失败/边界：失败或类型/状态不符时 srq 为 null，错误经 result 发布。
   task create_srq(
     rdma_function_binding binding,
     rdma_create_srq_req request,
@@ -1557,9 +1539,9 @@ class rdma_control_plane extends uvm_object;
     end
   endtask
 
-  // 功能：create_ceq 创建独立的 无直接返回值；根据 binding、request、ceq、result 设置字段 ceq，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、request（输入）、ceq（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：create_ceq 失败或超时通过 ceq、result 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：创建 CEQ，经 create_queue_facade 完成事务并校验返回资源。
+  // 输入/输出及副作用：binding、request 为输入；ceq 输出 ACTIVE 资源，result 输出事务结果。
+  // 失败/边界：失败或类型/状态不符时 ceq 为 null，错误经 result 发布。
   task create_ceq(
     rdma_function_binding binding,
     rdma_create_ceq_req request,
@@ -1577,9 +1559,9 @@ class rdma_control_plane extends uvm_object;
     end
   endtask
 
-  // 功能：create_aeq 创建独立的 无直接返回值；根据 binding、request、aeq、result 设置字段 aeq，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、request（输入）、aeq（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：create_aeq 失败或超时通过 aeq、result 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：创建 AEQ，经 create_queue_facade 完成事务并校验返回资源。
+  // 输入/输出及副作用：binding、request 为输入；aeq 输出 ACTIVE 资源，result 输出事务结果。
+  // 失败/边界：失败或类型/状态不符时 aeq 为 null，错误经 result 发布。
   task create_aeq(
     rdma_function_binding binding,
     rdma_create_aeq_req request,
@@ -1597,13 +1579,12 @@ class rdma_control_plane extends uvm_object;
     end
   endtask
 
-  // 功能：QP create/modify 共用的控制面事务外壳：分配事务号，锁前/锁后校验 binding、
-  //   请求与（modify 时）目标 QP 归属，在 Function 锁内调用 QP executor，并校验返回的
-  //   事务号与类型化 QP 投影（create 必须为 RESET 态）。
-  // 输入/输出及副作用：request 为 rdma_create_qp_req 或 rdma_modify_qp_req，is_modify
-  //   选择执行器入口；qp/result 为输出，失败时 qp 为 null；退出前释放 Function 锁。
-  // 失败/边界：未配置或缺少 host-memory/context-backing/QP executor 时 INVALID_STATE；
-  //   校验失败沿用子检查状态；executor 改写事务号或返回非法 QP 投影时 INVALID_STATE。
+  // 功能：QP create/modify 共用的事务外壳：分配事务号，锁前/锁后校验 binding、请求与（modify 时）目标 QP 归属，
+  //   在 Function 锁内调用 QP executor，并校验返回的事务号与 QP 投影（create 必须为 RESET 态）。
+  // 输入/输出及副作用：request 为 create 或 modify 请求，is_modify 选择入口；qp/result 为输出，失败时 qp 为 null；
+  //   退出前释放 Function 锁。
+  // 失败/边界：未配置或缺 host-memory/context-backing/QP executor 返回 INVALID_STATE；校验失败沿用子检查状态；
+  //   executor 改写事务号或返回非法 QP 投影返回 INVALID_STATE。
   protected task run_qp_operation(
     rdma_function_binding binding,
     rdma_semantic_request request,
@@ -1690,7 +1671,7 @@ class rdma_control_plane extends uvm_object;
   endtask
 
 
-  // 功能：创建 QP：经 run_qp_operation 在 Function 锁内调用 QP executor 的 create 路径。
+  // 功能：创建 QP：经 run_qp_operation 调用 QP executor 的 create 路径。
   // 输入/输出及副作用：request 为创建请求；qp 输出 RESET 态 ACTIVE QP，result 输出事务结果。
   // 失败/边界：失败时 qp 为 null，错误与恢复要求经 result 发布。
   task create_qp(
@@ -1702,7 +1683,7 @@ class rdma_control_plane extends uvm_object;
     run_qp_operation(binding, request, 1'b0, qp, result);
   endtask
 
-  // 功能：修改 QP 状态/属性：经 run_qp_operation 在 Function 锁内调用 QP executor 的 modify 路径。
+  // 功能：修改 QP 状态/属性：经 run_qp_operation 调用 QP executor 的 modify 路径。
   // 输入/输出及副作用：request 携带目标 qp_h；qp 输出修改后的 ACTIVE QP，result 输出事务结果。
   // 失败/边界：目标不属于 owner 或执行失败时 qp 为 null，错误与恢复要求经 result 发布。
   task modify_qp(
@@ -1714,9 +1695,9 @@ class rdma_control_plane extends uvm_object;
     run_qp_operation(binding, request, 1'b1, qp, result);
   endtask
 
-  // 功能：在 rdma_control_plane 中，destroy_qp 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_qp 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：销毁 QP，转交 destroy 事务外壳并校验目标类型。
+  // 输入/输出及副作用：binding、request 为输入；result 输出事务结果。
+  // 失败/边界：owner/generation 不符或目标 kind 错误时拒绝，错误经 result 发布。
   task destroy_qp(
     rdma_function_binding binding,
     rdma_destroy_resource_req request,
@@ -1725,9 +1706,9 @@ class rdma_control_plane extends uvm_object;
     run_destroy_operation(binding, request, RDMA_RESOURCE_QP, 1'b1, result);
   endtask
 
-  // 功能：在 rdma_control_plane 中，destroy_cq 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_cq 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：销毁 CQ，转交 destroy 事务外壳并校验目标类型。
+  // 输入/输出及副作用：binding、request 为输入；result 输出事务结果。
+  // 失败/边界：owner/generation 不符或目标 kind 错误时拒绝，错误经 result 发布。
   task destroy_cq(
     rdma_function_binding binding,
     rdma_destroy_resource_req request,
@@ -1736,9 +1717,9 @@ class rdma_control_plane extends uvm_object;
     destroy_queue_facade(binding, request, RDMA_RESOURCE_CQ, result);
   endtask
 
-  // 功能：在 rdma_control_plane 中，destroy_srq 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_srq 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：销毁 SRQ，转交 destroy 事务外壳并校验目标类型。
+  // 输入/输出及副作用：binding、request 为输入；result 输出事务结果。
+  // 失败/边界：owner/generation 不符或目标 kind 错误时拒绝，错误经 result 发布。
   task destroy_srq(
     rdma_function_binding binding,
     rdma_destroy_resource_req request,
@@ -1747,9 +1728,9 @@ class rdma_control_plane extends uvm_object;
     destroy_queue_facade(binding, request, RDMA_RESOURCE_SRQ, result);
   endtask
 
-  // 功能：在 rdma_control_plane 中，destroy_ceq 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_ceq 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：销毁 CEQ，转交 destroy 事务外壳并校验目标类型。
+  // 输入/输出及副作用：binding、request 为输入；result 输出事务结果。
+  // 失败/边界：owner/generation 不符或目标 kind 错误时拒绝，错误经 result 发布。
   task destroy_ceq(
     rdma_function_binding binding,
     rdma_destroy_resource_req request,
@@ -1758,9 +1739,9 @@ class rdma_control_plane extends uvm_object;
     destroy_queue_facade(binding, request, RDMA_RESOURCE_CEQ, result);
   endtask
 
-  // 功能：在 rdma_control_plane 中，destroy_aeq 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_aeq 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：销毁 AEQ，转交 destroy 事务外壳并校验目标类型。
+  // 输入/输出及副作用：binding、request 为输入；result 输出事务结果。
+  // 失败/边界：owner/generation 不符或目标 kind 错误时拒绝，错误经 result 发布。
   task destroy_aeq(
     rdma_function_binding binding,
     rdma_destroy_resource_req request,
@@ -1769,9 +1750,10 @@ class rdma_control_plane extends uvm_object;
     destroy_queue_facade(binding, request, RDMA_RESOURCE_AEQ, result);
   endtask
 
-  // 功能：create_pd 创建独立的 无直接返回值；根据 binding、request、pd、result 设置字段 pd、result、function_lock、result.transaction_id、status、result.resource_h、result.final_resource_state、result.final_resource_state_known、rollback_status，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、request（输入）、pd（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：create_pd 失败或超时通过 pd、result 明确发布；该路径不隐式重试，也不转移未声明资源。
+  // 功能：创建 PD：预留、激活并回查 ACTIVE 快照。
+  // 输入/输出及副作用：binding、request 为输入；pd 输出 ACTIVE PD，result 输出事务结果；
+  //   经 manager.create_pd/activate/lookup。
+  // 失败/边界：预留或激活失败时释放预留；激活后回查失败则清理已激活 PD；失败时 pd 为 null。
   task create_pd(
     rdma_function_binding binding,
     rdma_create_pd_req request,
@@ -1879,9 +1861,9 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，destroy_pd 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：binding（输入）、pd_h（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_pd 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：销毁 PD：校验归属后 begin_quiesce，再 finalize_release。
+  // 输入/输出及副作用：binding、pd_h 为输入；result 输出事务结果。
+  // 失败/边界：PD 不存在、快照无效、owner 不符或 PD 非 ACTIVE 时拒绝，错误经 result 发布。
   task destroy_pd(
     rdma_function_binding binding,
     rdma_handle pd_h,
@@ -1949,9 +1931,11 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，deregister_mr 按 owner、generation 和幂等规则释放或清理资源，同时删除相关账本记录。
-  // 输入/输出及副作用：binding（输入）、mr_h（输入）、result（输出）；deregister_mr 驱动下游事务，并写入 result；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：deregister_mr 返回 RDMA_SC_RESOURCE_BUSY；典型拒绝条件为“deregister MR has outstanding operations”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：注销 MR：quiesce 后依次执行硬件阶段（有 HMC 时 OCC_FLUSH、MR_DEREGISTER、TQ_FLUSH），
+  //   再释放 HMC 与 owned backing，最后 finalize_release。
+  // 输入/输出及副作用：binding、mr_h 为输入；result 输出事务结果。
+  // 失败/边界：MR 非 ACTIVE 或 owner 不符拒绝，仍有 outstanding 返回 RESOURCE_BUSY；超时或释放失败经
+  //   retain_mr_destroy_error 保留 recovery，可恢复时先 restore_active。
   task deregister_mr(
     rdma_function_binding binding,
     rdma_handle mr_h,
@@ -2290,10 +2274,11 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，register_mr_internal 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、backing（输入）、required_ownership（输入）、supplied_transaction_id（输入）、supplied_function_lock（输入）、mr（输出）、result（输出）；register_mr_internal 先依据 transaction_id == 0；status == null || !status.ok(；function_lock == null 校验 binding、request、backing、required_ownership、supplied_transaction_id、supplied_function_lock、mr、result；成功时更新本对象配置/状态并保存非拥有引用，返回
-  //   无直接返回值。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：MR 注册的内部实现：冻结请求与 backing，预留 MR、派生 STAG key、发出硬件命令，
+  //   再 commit_programmed 并 activate。
+  // 输入/输出及副作用：required_ownership 区分 borrowed/owned backing；supplied_transaction_id
+  //   与 supplied_function_lock 非空时沿用调用方的事务号与锁；mr、result 为输出。
+  // 失败/边界：任一步失败经 rollback_mr_creation 回滚，硬件超时或回滚失败经 finalize_mr_recovery 发布 RECOVERY_REQUIRED。
   protected task register_mr_internal(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -2590,10 +2575,9 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，register_mr 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：binding（输入）、request（输入）、backing（输入）、mr（输出）、result（输出）；register_mr 先依据 依赖存在性、authority 和 generation 条件 校验 binding、request、backing、mr、result；成功时更新本对象配置/状态并保存非拥有引用，返回
-  //   无直接返回值。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：注册借用（borrowed）backing 的 MR。
+  // 输入/输出及副作用：binding、request、backing 为输入；mr、result 为输出；转交 register_mr_internal。
+  // 失败/边界：错误与恢复要求经 result 发布。
   task register_mr(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -2605,9 +2589,10 @@ class rdma_control_plane extends uvm_object;
                          RDMA_OWNERSHIP_BORROWED, 0, null, mr, result);
   endtask
 
-  // 功能：在 rdma_control_plane 中，alloc_and_register_mr 按容量、身份和生命周期约束预留或分配资源，并返回带 authority 证据的句柄或计划。
-  // 输入/输出及副作用：binding（输入）、request（输入）、dma_context（输入）、alignment（输入）、mapping（输出）、mr（输出）、result（输出）；alloc_and_register_mr 驱动下游事务，并写入 mapping、mr、result；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：alloc_and_register_mr 返回 RDMA_SC_UNSUPPORTED_OPCODE、RDMA_SC_DMA_TRANSLATION、RDMA_SC_RECOVERY_REQUIRED；具体拒绝条件包括 “owned MR helper cannot allocate atomic DMA authority”；“owned MR DMA authority does not match Function”；“owned MR snapshot cannot request atomic DMA authority”；“unattached owned MR mapping requires caller recovery”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：为 owned MR 从 host_mem 分配 backing 并注册。
+  // 输入/输出及副作用：dma_context、alignment 为输入；mapping、mr、result 为输出；分配后转交 register_mr_internal。
+  // 失败/边界：alignment 须为不小于 4096 的 2 的幂；适配器缺失或分配结果无效返回错误；注册失败时释放未挂接的 mapping，
+  //   释放也失败则返回 RECOVERY_REQUIRED。
   task alloc_and_register_mr(
     rdma_function_binding binding,
     rdma_register_mr_req request,
@@ -2686,9 +2671,8 @@ class rdma_control_plane extends uvm_object;
                                      locked_owner, "snapshot ");
       if (!status.ok())
         break;
-      // Preserve the caller-selected MR IOVA.  The allocation contract cannot
-      // request one, so inner backing validation must prove that the returned
-      // mapping covers request.iova rather than silently rewriting it.
+      // 保留调用方选定的 MR IOVA。分配契约无法指定 IOVA，故内部 backing 校验须证明返回的 mapping
+      // 覆盖 request.iova，而不是悄悄改写它。
       status = host_mem.allocate(
         frozen_context, frozen_request.length, alignment,
         required_dma_direction(frozen_request.access), allocated_mapping
@@ -2768,15 +2752,9 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：first_pending_hardware_step 按 recovery.pending_steps 的持久化顺序选择
-  //   本轮应先处理的第一个硬件阶段，供 recover_resource 的硬件恢复循环建立稳定
-  //   的执行候选；该 helper 只抽离扫描职责，不改变后续 CMQ 调用或状态迁移。
-  // 输入/输出及副作用：recovery（输入）只读 pending_steps；step（输出）先置为
-  //   RDMA_CTRL_STEP_RESOURCE_RESERVED，命中时写入首个硬件 step；函数返回 bit 表示
-  //   是否找到硬件阶段，不修改 recovery、result、CMQ、锁、资源账本或外部依赖。
-  // 失败/边界：recovery 为 null 或 pending_steps 为空/仅含本地阶段时返回 0 并保留
-  //   默认 step；helper 不验证 recovery schema、hardware_presence、ticket、owner、
-  //   generation 或 pending 阶段的其它 authority，调用方仍须按原顺序执行这些门禁。
+  // 功能：在 recovery.pending_steps 中按持久化顺序找出第一个硬件阶段。
+  // 输入/输出及副作用：recovery 只读；step 输出（默认 RESOURCE_RESERVED，命中时为该硬件 step）；返回是否找到。
+  // 失败/边界：recovery 为空或无硬件阶段返回 0；不校验 recovery 的其它 authority，调用方仍须按原顺序执行门禁。
   protected function bit first_pending_hardware_step(
     rdma_recovery_record recovery,
     output rdma_control_step_e step
@@ -2793,16 +2771,9 @@ class rdma_control_plane extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：recovery_has_hardware_step 在恢复账本的 completed_steps 或
-  //   pending_steps 中检查是否存在硬件阶段，统一 reserved-only 判定和末尾
-  //   硬件缺失校验使用的阶段扫描规则。
-  // 输入/输出及副作用：recovery（输入）只读恢复账本；
-  //   inspect_completed（输入）
-  //   为 1 时扫描 completed_steps，为 0 时扫描 pending_steps；函数返回 bit，
-  //   不修改 recovery、result、锁、CMQ 或任何外部资源。
-  // 失败/边界：recovery 为 null、所选阶段数组为空或仅含本地阶段时返回 0；
-  //   helper 不验证阶段顺序、hardware_presence、ticket、owner 或 generation，
-  //   调用方仍须保留原有状态门禁和错误优先级。
+  // 功能：检查 recovery 的 completed_steps 或 pending_steps 中是否含硬件阶段。
+  // 输入/输出及副作用：recovery 只读；inspect_completed 为 1 扫描 completed_steps，否则扫描 pending_steps；返回 bit。
+  // 失败/边界：recovery 为空或所选数组无硬件阶段返回 0；不校验顺序或 hardware_presence。
   protected function bit recovery_has_hardware_step(
     rdma_recovery_record recovery,
     bit inspect_completed
@@ -2824,13 +2795,10 @@ class rdma_control_plane extends uvm_object;
     return 1'b0;
   endfunction
 
-  // 功能：recovery_is_reserved_only 判断 ERROR MR 的恢复账本是否满足“仅本地预留待释放”
-  //   快速路径，并复用 completed_steps 的硬件阶段扫描，集中保留 reserved-only 的 shape 约束。
-  // 输入/输出及副作用：recovery（输入）只读 hardware_presence、ambiguous_ticket、HMC/backing/
-  //   pending 记录和 completed_steps；函数返回 bit，不修改恢复账本、结果、锁、CMQ 或外部资源。
-  // 失败/边界：recovery 为空、硬件存在/未知、有 ambiguous ticket、HMC 引用非空、backing 数量/所有权
-  //   不符、pending 阶段不是 BACKING_RELEASED/RESOURCE_RELEASED，或 completed 含硬件阶段时返回 0；
-  //   函数不检查 primary_status、owner/generation，调用方须先保留现有 ERROR MR 门禁。
+  // 功能：判断 ERROR MR 的 recovery 是否满足“仅本地预留待释放”的快速路径形状。
+  // 输入/输出及副作用：recovery 只读；返回 bit，不修改任何状态。
+  // 失败/边界：硬件存在或未知、有 ambiguous ticket、有 HMC 引用、backing 非单个 control-plane 拥有、
+  //   pending 不是 BACKING_RELEASED/RESOURCE_RELEASED 或 completed 含硬件阶段时返回 0；不检查 owner/generation。
   protected function bit recovery_is_reserved_only(
     rdma_recovery_record recovery
   );
@@ -2850,9 +2818,9 @@ class rdma_control_plane extends uvm_object;
     return !recovery_has_hardware_step(recovery, 1'b1);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，persist_recovery_record 记录或执行队列恢复步骤，依据提交证据选择重试、提交或回滚并保持操作幂等。
-  // 输入/输出及副作用：resource_h（输入）、recovery（输入）；persist_recovery_record 读取 resource_h、recovery 并使用字段 first_status、retry_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：persist_recovery_record 先检查 first_status.ok(；!retry_status.ok(，再返回 first_status；拒绝分支不提交部分状态，也不隐式重试。
+  // 功能：持久化 recovery 进度，失败时重试一次。
+  // 输入/输出及副作用：resource_h、recovery 为输入；调用 manager.mark_error，失败状态追加到 recovery.rollback_statuses。
+  // 失败/边界：首次成功即返回；重试仍失败时返回重试的 status。
   protected function rdma_status persist_recovery_record(
     rdma_handle resource_h,
     rdma_recovery_record recovery
@@ -2881,9 +2849,9 @@ class rdma_control_plane extends uvm_object;
     return first_status;
   endfunction
 
-  // 功能：执行 retain_recovery_failure 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：resource_h（输入）、recovery（输入）、failure（输入）、result（输入）、message（输入）；retain_recovery_failure 读取 resource_h、recovery、failure、result、message 并使用字段 persist_status；函数返回 void，不取得调用方资源所有权。
-  // 失败/边界：retain_recovery_failure 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+  // 功能：记录一次 recovery 失败并发布 RECOVERY_REQUIRED。
+  // 输入/输出及副作用：resource_h、recovery、failure、result、message 为输入；追加失败状态、持久化 recovery 并更新 result。
+  // 失败/边界：持久化失败且尚无记录时补记该失败。
   protected function void retain_recovery_failure(
     rdma_handle resource_h,
     rdma_recovery_record recovery,
@@ -2904,9 +2872,9 @@ class rdma_control_plane extends uvm_object;
     rdma_recovery_publish_required(recovery, result, message);
   endfunction
 
-  // 功能：在 rdma_control_plane 中，destroy_recovery_restore_ready 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：recovery（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：destroy_recovery_restore_ready 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：判断 destroy 的 recovery 是否可直接 restore_active。
+  // 输入/输出及副作用：recovery 只读；返回 bit。
+  // 失败/边界：硬件非 PRESENT、有 ambiguous ticket、仍有 pending，或 completed 超出“空或仅 OCC_FLUSHED”时返回 0。
   protected function bit destroy_recovery_restore_ready(
     rdma_recovery_record recovery
   );
@@ -2920,9 +2888,9 @@ class rdma_control_plane extends uvm_object;
             recovery.completed_steps[0] == RDMA_CTRL_STEP_HW_OCC_FLUSHED);
   endfunction
 
-  // 功能：执行 restore_destroy_recovery 指定的测试或恢复状态变更，更新受控账本并保留可回滚的故障证据。
-  // 输入/输出及副作用：resource_h（输入）、recovery（输入）、result（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：restore_destroy_recovery 仅允许测试/恢复范围内的状态变更；代际或资源不匹配时拒绝并保留原账本。
+  // 功能：把 destroy 失败的 MR 恢复为 ACTIVE。
+  // 输入/输出及副作用：resource_h、recovery、result 为输入；调用 manager.restore_active，成功时更新 result 为 ACTIVE。
+  // 失败/边界：restore 失败时经 retain_recovery_failure 保留 recovery 并发布 RECOVERY_REQUIRED。
   protected function void restore_destroy_recovery(
     rdma_handle resource_h,
     rdma_recovery_record recovery,
@@ -2948,13 +2916,11 @@ class rdma_control_plane extends uvm_object;
     result.recovery_required = 1'b0;
   endfunction
 
-  // Reserved-only ERROR MRs use the resource manager's atomic completion
-  // transition.  In particular, do not publish a locally RELEASED mapping
-  // before complete_reserved_error() succeeds: the adapter's opaque release
-  // seal is the durable proof that makes a retry idempotent.
-  // 功能：在 rdma_control_plane 中，recover_reserved_error 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：resource_h（输入）、recovery（输入）、result（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：recover_reserved_error 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 设计说明：仅预留的 ERROR MR 使用 resource manager 的原子 complete 迁移；在 complete_reserved_error()
+  // 成功前不得发布本地 RELEASED 映射——适配器的 opaque release seal 是使重试幂等的持久证据。
+  // 功能：恢复仅预留的 ERROR MR：必要时释放 owned backing，再原子完成 reserved error。
+  // 输入/输出及副作用：resource_h、recovery、result 为输入；经 host_mem release 与 manager 迁移，更新 result。
+  // 失败/边界：适配器缺失、释放失败、lookup 失败或锁/超时/generation 变化时保持原状态，并持久化失败后发布 RECOVERY_REQUIRED。
   protected function void recover_reserved_error(
     rdma_handle resource_h,
     rdma_recovery_record recovery,
@@ -3029,9 +2995,8 @@ class rdma_control_plane extends uvm_object;
       );
     end
     if (!status.ok()) begin
-      // A successful host release mutates only this working clone.  Refresh
-      // the canonical record before appending the new failure so the retry
-      // keeps the reserved-error schema and consumes the opaque release seal.
+      // 成功的 host release 只改变这份工作副本；追加新失败前先刷新权威记录，
+      // 使重试保持 reserved-error 形状并消费 opaque release seal。
       durable_recovery = null;
       lookup_status = manager.lookup_recovery(
         resource_h, durable_recovery
@@ -3083,9 +3048,9 @@ class rdma_control_plane extends uvm_object;
     result.recovery_required = 1'b0;
   endfunction
 
-  // 功能：在 rdma_control_plane 中，execute_recovery_hardware_step 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：error_mr（输入）、owner（输入）、step（输入）、ticket（输出）、completion（输出）、status（输出）；execute_recovery_hardware_step 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：execute_recovery_hardware_step 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：为恢复流程执行一个 pending 硬件阶段。
+  // 输入/输出及副作用：error_mr、owner、step 为输入；ticket、completion、status 为输出；构造 CMQ 命令并 execute。
+  // 失败/边界：error_mr 或 owner 为空返回 INVALID_STATE；step 不被支持返回 UNSUPPORTED_OPCODE。
   protected task execute_recovery_hardware_step(
     rdma_mr error_mr,
     rdma_function_handle owner,
@@ -3119,9 +3084,10 @@ class rdma_control_plane extends uvm_object;
     );
   endtask
 
-  // 功能：在 rdma_control_plane 中，recover_resource 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：binding（输入）、resource_h（输入）、result（输出）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：recover_resource 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：恢复 ERROR 资源：按 recovery 记录继续硬件阶段、释放 HMC/backing 并 finalize_release；
+  //   QP 与队列类资源分派给对应 executor。
+  // 输入/输出及副作用：binding、resource_h 为输入；result 输出事务结果；全程在 Function 锁内。
+  // 失败/边界：锁、超时、generation 变化或提交证据不完整时保持原状态；不可恢复条件继续发布 RECOVERY_REQUIRED。
   task recover_resource(
     rdma_function_binding binding,
     rdma_handle resource_h,
@@ -3187,10 +3153,8 @@ class rdma_control_plane extends uvm_object;
       if (!status.ok())
         break;
 
-      // QP recovery has its own lifecycle executor because QPC images,
-      // query-buffer authority, and ordered backing cleanup differ from the
-      // generic queue/MR recovery protocol.  Dispatch while the per-Function
-      // lock is held, exactly like create/modify/destroy.
+      // QP recovery 使用独立的 lifecycle executor（QPC image、query-buffer authority 与有序 backing 清理
+      // 不同于通用 queue/MR 恢复协议）；与 create/modify/destroy 一样在持有 Function 锁时派发。
       if (resource_h.kind == RDMA_RESOURCE_QP) begin
         rdma_qp error_qp;
         if (qp_executor == null) begin
@@ -3218,9 +3182,8 @@ class rdma_control_plane extends uvm_object;
         break;
       end
 
-      // Queue recovery is policy-driven and lives in the queue executor.  Do
-      // this dispatch while the same per-Function lock used by create/destroy
-      // is held; the executor never allocates IDs or acquires another lock.
+      // 队列恢复由 queue executor 按策略执行；在持有与 create/destroy 相同的 Function 锁时派发，
+      // executor 自己不分配事务号，也不再取其它锁。
       if (resource_h.kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
                                   RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}) begin
         if (queue_executor == null) begin

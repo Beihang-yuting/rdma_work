@@ -1513,10 +1513,9 @@ function automatic bit rdma_cmq_append_dma_mapping_public_v1(
   return rdma_cmq_commit_child_writer(writer, child);
 endfunction
 
-// 功能：按 FUNCTION-BINDING-V1 编码已 detached binding 的全部公开 authority projection。
+// 功能：按 FUNCTION-BINDING-V1 编码已 detached binding 的公开 authority 投影。
 // 输入/输出及副作用：writer/binding 为输入；内部取得 detached identity 后追加值。
-// 失败/边界：binding/PCIe/BAR/identity 缺失、state 含 X/Z 或大于 RDMA_BIND_ERROR、
-//   snapshot status 非 OK 或 owner subtype 非法时拒绝；不读取 protected identity 引用本身。
+// 失败/边界：binding/PCIe/BAR/identity 缺失、state 非法、snapshot status 非 OK 或 owner 非法时拒绝。
 function automatic bit rdma_cmq_append_function_binding_v1(
   input rdma_cmq_canonical_writer writer,
   input rdma_function_binding binding
@@ -1608,11 +1607,10 @@ function automatic bit rdma_cmq_append_function_binding_v1(
 endfunction
 
 // 功能：按 CMQ-COMMAND-V1 编码命令 shell，并在 body 位置插入 profile 输出；
-//   CONTEXT-IMAGE-V1 用于已注册 MRT/CQC/SRQC/CEQC/AEQC context command，
-//   其字段由 engine 从 detached SQE image 提供。
+//   已注册 context command 用 CONTEXT-IMAGE-V1，字段由 engine 从 detached SQE image 提供。
 // 输入/输出及副作用：writer/command/body tag/field bytes 为输入；成功原子追加。
 // 失败/边界：未知 body tag、无效 Function/opcode/owner/image 或空 body 拒绝；
-//   model 层不 cast codec 具体 body，且只信任唯一注册 wrapper 身份而非类型名字符串。
+//   model 层不 cast codec 具体 body，只信任注册 wrapper 身份。
 function automatic bit rdma_cmq_append_command_v1(
   input rdma_cmq_canonical_writer writer,
   input rdma_cmq_command_desc command,
@@ -1685,10 +1683,9 @@ function automatic rdma_cmq_journal_digest_t rdma_cmq_digest_bytes(
 endfunction
 
 // 功能：分别计算 CMQ image 与 authority 两个 V1 domain digest。
-// 输入/输出及副作用：读取 command/body projection、ticket、owner、Function、DMA
-//   与两份 image；成功同时发布 image_digest/authority_digest，不保留源引用。
+// 输入/输出及副作用：读取 command/ticket/owner/Function/DMA/image；成功同时发布两个 digest。
 // 失败/边界：输出先清零；required value 缺失、owner 非同一 canonical source、
-//   frozen provenance/身份/metadata 非法或编码失败时不发布任一 digest。
+//   provenance/身份/metadata 非法或编码失败时不发布任一 digest。
 function automatic rdma_status rdma_cmq_compute_item_digests(
   input rdma_cmq_command_desc command,
   input string command_body_schema_tag,
@@ -1805,11 +1802,9 @@ function automatic rdma_status rdma_cmq_compute_item_digests(
   return rdma_cmq_direct_status(RDMA_SC_OK);
 endfunction
 
-// 功能：计算跨 record/recovery request 共用的 CMQ-BATCH-V1 authority digest。
-// 输入/输出及副作用：读取 Function、binding、CMQ、doorbell、sequence 与有序
-//   item digest tuple；成功发布 batch_digest，并只使用 detached binding snapshot。
-// 失败/边界：输出先清零；空/不等长 tuple、无效 snapshot/identity/image/sequence
-//   或 canonicalization 失败时不发布 partial digest。
+// 功能：计算 record 与 recovery request 共用的 CMQ-BATCH-V1 authority digest。
+// 输入/输出及副作用：读取 Function/binding/CMQ/doorbell/sequence 与有序 item digest；发布 batch_digest。
+// 失败/边界：输出先清零；tuple 空或不等长、snapshot/identity/image 非法或编码失败时不发布。
 function automatic rdma_status rdma_cmq_compute_batch_digest(
   input rdma_function_identity function_identity,
   input rdma_function_binding binding,
@@ -1900,10 +1895,8 @@ function automatic rdma_status rdma_cmq_compute_batch_digest(
 endfunction
 
 // 功能：计算 CMQ-RESET-PROOF-V1 的稳定 isolation tuple digest。
-// 输入/输出及副作用：读取 proof/batch/attempt/engine identity、isolated Function、
-//   batch digest 与有序四字段 item tuple；成功发布 proof_digest。
-// 失败/边界：输出先清零；任一 ID/键为零空、tuple 空/不等长、identity/owner
-//   非法或编码失败时拒绝；replacement/state/release 不在本接口输入中。
+// 输入/输出及副作用：读取 proof/batch/attempt/engine identity、Function、batch digest 与 item tuple。
+// 失败/边界：输出先清零；ID/键为零或空、tuple 空/不等长、identity 非法或编码失败时拒绝。
 function automatic rdma_status rdma_cmq_compute_reset_proof_digest(
   input string proof_key,
   input longint unsigned proof_id,
@@ -2172,11 +2165,10 @@ function automatic bit rdma_cmq_fold_attempt_effect(
   return 1'b1;
 endfunction
 
-// 功能：按冻结 lifetime state/phase/effect/proof 表推导 conservative recovery bit。
-// 输入/输出及副作用：五个证据输入只读，recovery_required 成功时一次性更新。
-// 失败/边界：X/Z/spare 或不可能的 state/phase/effect 组合返回非 OK 且保持
-//   预置输出；UNOBSERVED 接受未观测、未 arm 的 Host-visible evidence 或既有
-//   Host/MMIO 累积证据并始终需要 reconcile，只有可靠终态/确认 reset 才清零。
+// 功能：按冻结的 state/phase/effect/proof 表推导保守的 recovery bit。
+// 输入/输出及副作用：五个证据输入只读，成功时一次性更新 recovery_required。
+// 失败/边界：X/Z/spare 或不可能组合返回非 OK 且输出不变；UNOBSERVED 始终需要 reconcile，
+//   只有可靠终态或确认 reset 才清零。
 function automatic rdma_status rdma_cmq_classify_recovery_required(
   input rdma_cmq_submission_state_e state,
   input rdma_cmq_completion_phase_e completion_phase,

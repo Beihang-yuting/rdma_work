@@ -1,7 +1,7 @@
 // 目录：核心执行层 core/rdma_sq_payload_writer.sv。
-// 职责：实现 rdma_sq_payload_writer 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：staged non-inline SQ payload 的 mapping 注册、Host-memory 写入与逐字节回读校验。
+// 依赖：host_mem API、function binding、DMA request context 与 mapping/SGE 值类型。
+// 所有权与生命周期：writer 保存 mapping 副本；receipt 为 detached 快照，释放能力只绑定签发它的 writer。
 
 // 中文说明：本文件实现 staged non-inline payload 的注册、写入和逐字节回读校验。
 // 生命周期约束：writer 只借用 caller-owned mapping，不取得 host_mem.release() 权限。
@@ -23,9 +23,9 @@ class rdma_sq_payload_write_receipt extends uvm_object;
   // uvm_object::copy().
   local uvm_object release_owner;
 
-  // 功能：构造 rdma_sq_payload_write_receipt，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：verified=1'b0；released=1'b0；function_h=null；function_generation='0；release_owner=null。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_sq_payload_write_receipt 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 receipt，verified/released 置 0，function_h/release_owner 置 null。
+  // 输入/输出及副作用：name 传给 UVM 父类；不绑定外部依赖。
+  // 失败/边界：无；依赖须由后续 configure 注入。
   function new(string name = "rdma_sq_payload_write_receipt");
     super.new(name);
     verified = 1'b0;
@@ -37,24 +37,24 @@ class rdma_sq_payload_write_receipt extends uvm_object;
 
   // The writer is the only production caller of these helpers.  The
   // one-shot bind prevents a receipt copy from acquiring the capability.
-  // 功能：在 rdma_sq_payload_write_receipt 中，bind_release_owner 把 bind_release_owner 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：owner（输入）；bind_release_owner 先依据 release_owner == null && owner != null 校验 owner；成功时更新本对象配置/状态并保存非拥有引用，返回 void。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 功能：一次性绑定 release owner（仅 writer 调用），防止 receipt 拷贝获得释放能力。
+  // 输入/输出及副作用：owner 为输入；仅当 release_owner 为空且 owner 非空时记录。
+  // 失败/边界：已绑定或 owner 为空时静默忽略。
   function void bind_release_owner(uvm_object owner);
     if (release_owner == null && owner != null)
       release_owner = owner;
   endfunction
 
-  // 功能：在 rdma_sq_payload_write_receipt 中，release_authority_matches 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：owner（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release_authority_matches 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：判断 owner 是否为该 receipt 绑定的 release owner。
+  // 输入/输出及副作用：owner 为输入；返回 bit，无副作用。
+  // 失败/边界：任一方为 null 返回 0。
   function bit release_authority_matches(uvm_object owner);
     return release_owner != null && owner != null && release_owner == owner;
   endfunction
 
-  // 功能：将 rhs 中 rdma_sq_payload_write_receipt 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（payload receipt copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的值字段复制为隔离快照（SGE/mapping 深拷贝）。
+  // 输入/输出及副作用：rhs 为源对象；覆盖本对象字段，不修改 rhs。
+  // 失败/边界：类型不匹配或 clone/cast 失败时触发 UVM fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_sq_payload_write_receipt source;
     rdma_sge sge_copy;
@@ -105,40 +105,40 @@ endclass
 virtual class rdma_sq_payload_writer extends uvm_object;
   // 抽象接口把“注册映射”和“写入验证”与队列数据引擎解耦。
 
-  // 功能：构造 rdma_sq_payload_writer，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_sq_payload_writer 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造抽象 writer 基类。
+  // 输入/输出及副作用：name 传给 UVM 父类；不绑定外部依赖。
+  // 失败/边界：无；依赖须由后续 configure 注入。
   function new(string name = "rdma_sq_payload_writer");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_sq_payload_writer 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
-  // 输入/输出及副作用：api（输入）、binding（输入）、timeout（输入）；configure 先依据 依赖存在性、authority 和 generation 条件 校验 api、binding、timeout；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：注入 host_mem API、binding 与访问超时（纯虚接口）。
+  // 输入/输出及副作用：api/binding/timeout 为输入；返回 status。
+  // 失败/边界：由具体实现定义。
   pure virtual function rdma_status configure(
     rdma_host_mem_api api,
     rdma_function_binding binding,
     time timeout
   );
 
-  // 功能：在 rdma_sq_payload_writer 中，register_mapping 把 register_mapping 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：mapping（输入）、registration_id（输出）；register_mapping 先依据 依赖存在性、authority 和 generation 条件 校验 mapping、registration_id；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 功能：登记一个 DMA mapping，返回 registration_id（纯虚接口）。
+  // 输入/输出及副作用：mapping 为输入；registration_id 为输出。
+  // 失败/边界：由具体实现定义。
   pure virtual function rdma_status register_mapping(
     rdma_dma_mapping mapping,
     output longint unsigned registration_id
   );
 
-  // 功能：在 rdma_sq_payload_writer 中，unregister_mapping unregister_mapping 解除指定资源绑定并隔离 runtime/映射，避免旧句柄在删除后访问后端。
-  // 输入/输出及副作用：registration_id（输入）；unregister_mapping 读取 registration_id 并使用字段 name、next_id、api、binding、timeout；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：unregister_mapping 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：按 registration_id 注销 mapping（纯虚接口）。
+  // 输入/输出及副作用：registration_id 为输入；返回 status。
+  // 失败/边界：由具体实现定义。
   pure virtual function rdma_status unregister_mapping(
     longint unsigned registration_id
   );
 
-  // 功能：在 rdma_sq_payload_write_receipt 中，stage_and_verify 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
-  // 输入/输出及副作用：request_context（输入）、sges（输入）、payload（输入）、receipt（输出）；stage_and_verify 读取 request_context、sges、payload、receipt 并使用字段 name、next_id、api、binding、timeout，并写入 receipt；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：stage_and_verify 无返回值，仅执行 name="rdma_host_mem_sq_payload_writer")、next_id=1、api=null、binding=null；调用方须保证前置依赖已经绑定，函数不自动重试或接管外部资源。
+  // 功能：预检、写入并回读校验 payload，产出 receipt（纯虚接口）。
+  // 输入/输出及副作用：request_context/sges/payload 为输入；receipt 为输出；写 Host-memory。
+  // 失败/边界：由具体实现定义。
   pure virtual function rdma_status stage_and_verify(
     rdma_dma_request_context request_context,
     rdma_sge sges[$],
@@ -146,9 +146,9 @@ virtual class rdma_sq_payload_writer extends uvm_object;
     output rdma_sq_payload_write_receipt receipt
   );
 
-  // 功能：在 rdma_sq_payload_writer 中，release_receipt 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：receipt（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release_receipt 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：释放 receipt 持有的 mapping 引用（纯虚接口）。
+  // 输入/输出及副作用：receipt 为输入；返回 status。
+  // 失败/边界：由具体实现定义。
   pure virtual function rdma_status release_receipt(
     rdma_sq_payload_write_receipt receipt
   );
@@ -172,9 +172,9 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
 
   // registration_t 的 refs 记录仍被 receipt 引用的注册项数量。
 
-  // 功能：构造 rdma_host_mem_sq_payload_writer，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：next_id=1；api=null；binding=null；timeout=0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_host_mem_sq_payload_writer 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 writer，next_id=1，api/binding 为 null，timeout=0。
+  // 输入/输出及副作用：name 传给 UVM 父类；不绑定外部依赖。
+  // 失败/边界：无；依赖须由后续 configure 注入。
   function new(string name = "rdma_host_mem_sq_payload_writer");
     super.new(name);
     next_id = 1;
@@ -183,9 +183,9 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     timeout = 0;
   endfunction
 
-  // 功能：在 rdma_host_mem_sq_payload_writer 中，configure 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
-  // 输入/输出及副作用：api（输入）、binding（输入）、timeout（输入）；configure 先依据 api == null || binding == null 校验 api、binding、timeout；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：保存 host_mem API、binding 与访问超时。
+  // 输入/输出及副作用：api/binding/timeout 为输入；保存引用，不取得所有权。
+  // 失败/边界：api 或 binding 为 null 返回 INVALID_ARGUMENT，不覆盖旧配置。
   function rdma_status configure(
     rdma_host_mem_api api,
     rdma_function_binding binding,
@@ -201,9 +201,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   endfunction
 
   // 注册只保存 detached authority；重叠区间和溢出必须在登记阶段拒绝。
-  // 功能：在 rdma_host_mem_sq_payload_writer 中，register_mapping 把 register_mapping 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：mapping（输入）、registration_id（输出）；register_mapping 先依据 mapping == null；mapping.state != RDMA_MAPPING_ACTIVE || mapping.size == 0；mapping.iova.value > (64'hffff_ffff_ffff_ffff - (mapping.size - 1'b1 校验 mapping、registration_id；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 功能：校验并登记 mapping 副本，分配 registration_id。
+  // 输入/输出及副作用：mapping 为输入；registration_id 为输出（失败为 0）；写 regs，next_id 自增。
+  // 失败/边界：null、非 ACTIVE 或空返回 INVALID_ARGUMENT/INVALID_STATE；区间溢出返回
+  //   DMA_TRANSLATION；与已登记区间重叠返回 RESOURCE_BUSY；clone 失败返回 INVALID_STATE。
   function rdma_status register_mapping(
     rdma_dma_mapping mapping,
     output longint unsigned registration_id
@@ -244,9 +245,9 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_host_mem_sq_payload_writer 中，unregister_mapping unregister_mapping 解除指定资源绑定并隔离 runtime/映射，避免旧句柄在删除后访问后端。
-  // 输入/输出及副作用：registration_id（输入）；unregister_mapping 读取 registration_id 并使用字段 rdma_status、regs、id、refs；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：unregister_mapping 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：注销 registration_id 对应的 mapping。
+  // 输入/输出及副作用：registration_id 为输入；从 regs 删除条目。
+  // 失败/边界：仍被 live receipt 引用返回 RESOURCE_BUSY；未知 ID 返回 INVALID_ARGUMENT。
   function rdma_status unregister_mapping(longint unsigned registration_id);
     foreach (regs[i]) begin
       if (regs[i].id != registration_id)
@@ -261,9 +262,9 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
                              "unknown registration id");
   endfunction
 
-  // 功能：contains_id 比较 ids、id 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
-  // 输入/输出及副作用：ids（输入）、id（输入）；contains_id 读取 ids、id 并使用字段 i；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：contains_id 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：判断 ids 中是否包含 id。
+  // 输入/输出及副作用：ids/id 为输入；返回 bit，无副作用。
+  // 失败/边界：无。
   function automatic bit contains_id(
     longint unsigned ids[$],
     longint unsigned id
@@ -274,9 +275,10 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return 1'b0;
   endfunction
 
-  // 功能：identity_status 校验 request_context 与当前对象状态的一致性，并显式处理“writer binding is not configured”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：request_context（输入）；identity_status 读取 request_context 并使用字段 expected；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：identity_status 返回 RDMA_SC_INVALID_STATE、RDMA_SC_DMA_TRANSLATION、RDMA_SC_STALE_GENERATION；典型拒绝条件为“writer binding is not configured”“request Function does not match binding”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 request_context 与 binding 的 Function、generation、BDF、PASID、DMA domain 一致。
+  // 输入/输出及副作用：request_context 为输入；返回 status，无副作用。
+  // 失败/边界：binding 未配置返回 INVALID_STATE；generation 过期返回 STALE_GENERATION；
+  //   其余不一致返回 DMA_TRANSLATION。
   function automatic rdma_status identity_status(
     rdma_dma_request_context request_context
   );
@@ -308,17 +310,11 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::success();
   endfunction
 
-  // 功能：build_receipt_candidate 依据已通过权限/范围预检的请求数据建立
-  // receipt 值快照，一次性完成 receipt、Function、SGE 和 mapping 的
-  // 工厂/clone 检查。
-  // 输入/输出及副作用：request_context、sges、payload、registration_ids
-  // （输入）；candidate（输出）；函数只创建本地 detached 对象，不修改
-  // regs.ref、Host-memory 或调用方输入；成功时返回含 payload、registration_ids、
-  // function_h、sges、mappings 和 release owner 的候选 receipt。
-  // 失败/边界：request_context/Function/SGE/mapping 为空、registration_ids
-  // 为空、任一 UVM 工厂返回 null、copy/clone 失败或映射查找失败时返回明确
-  // 失败；candidate 在任何失败分支保持 null，调用方不得在该阶段发布引用或
-  // 写入 Host-memory。
+  // 功能：由已预检的请求数据构建 detached receipt 候选，并检查各 factory/clone。
+  // 输入/输出及副作用：request_context/sges/payload/registration_ids 为输入；candidate 为输出；
+  //   只创建本地对象，不改 regs.ref 或 Host-memory。
+  // 失败/边界：输入为空、factory 返回 null、clone 失败或 mapping 查找失败时返回失败，
+  //   candidate 保持 null，调用方不得发布引用或写 Host-memory。
   function rdma_status build_receipt_candidate(
     rdma_dma_request_context request_context,
     rdma_sge sges[$],
@@ -413,10 +409,12 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_host_mem_sq_payload_writer 中，stage_and_verify 预检输入并预留事务所需的槽位、映射或中间状态，失败时保留可恢复证据。
-  // 输入/输出及副作用：request_context（输入）、sges（输入）、payload（输入）、receipt（输出）；stage_and_verify 读取 request_context、sges、payload、receipt 并使用字段 receipt、status、total、permissions、permissions.device_read、map_index、access_failure、payload_offset，并写入 receipt；函数返回 rdma_status，不取得调用方资源所有权。
-  // 设计约束：先完成 context、长度、注册项、权限和地址范围检查，再产生任何 host 写入。
-  // 失败/边界：stage_and_verify 返回 RDMA_SC_INVALID_STATE、RDMA_SC_INVALID_ARGUMENT、RDMA_SC_DMA_TRANSLATION；典型拒绝条件为“writer is not configured”“request context is null”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 context、SGE、权限与 mapping 覆盖后写 Host-memory 并逐字节回读，产出 receipt。
+  // 输入/输出及副作用：request_context/sges/payload 为输入；receipt 为输出；成功时写 Host-memory
+  //   并递增所覆盖 mapping 的 refs。
+  // 设计约束：所有检查与 receipt 快照构建先于任何 host 写入。
+  // 失败/边界：未配置返回 INVALID_STATE；context/SGE/长度非法返回 INVALID_ARGUMENT；
+  //   mapping 未覆盖、长度溢出、写读失败或回读不一致返回 DMA_TRANSLATION 或底层错误。
   function rdma_status stage_and_verify(
     rdma_dma_request_context request_context,
     rdma_sge sges[$],
@@ -520,8 +518,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
         registration_ids.push_back(regs[map_index].id);
     end
 
-    // 上面的预检和 receipt 快照构建全部完成后才触碰 host memory，并发布
-    // registration 引用；这样 late factory/clone 失败不会留下引用或写入。
+    // 预检与 receipt 构建全部完成后才触碰 host memory 并发布引用，避免 late 失败留下残留。
     status = build_receipt_candidate(
       request_context,
       sges,
@@ -536,8 +533,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     if (!status.ok())
       return status;
 
-    // All candidate factories/clones are complete before any host-memory I/O
-    // or registration reference publication.
+    // 同上：所有 factory/clone 完成后才进行 Host-memory I/O 与引用发布。
     foreach (registration_ids[k]) begin
       foreach (regs[j])
         if (regs[j].id == registration_ids[k])
@@ -604,9 +600,9 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_host_mem_sq_payload_writer 中，release_ids 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：ids（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release_ids 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：对每个 registration id 递减一次 refs。
+  // 输入/输出及副作用：ids 为输入；修改 regs[].refs。
+  // 失败/边界：未知 ID 或 refs 已为 0 时忽略。
   function void release_ids(longint unsigned ids[$]);
     foreach (ids[i]) begin
       foreach (regs[j]) begin
@@ -619,9 +615,9 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
   endfunction
 
   // abort 或 SQ record retire 时调用；released 标志保证引用只递减一次。
-  // 功能：在 rdma_host_mem_sq_payload_writer 中，release_receipt 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：receipt（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release_receipt 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：释放 receipt 持有的 mapping 引用，released 标志保证只递减一次。
+  // 输入/输出及副作用：receipt 为输入；递减 refs 并置 receipt.released。
+  // 失败/边界：null 或已释放视为成功；release owner 不是本 writer 返回 INVALID_ARGUMENT。
   function rdma_status release_receipt(rdma_sq_payload_write_receipt receipt);
     if (receipt == null || receipt.released)
       return rdma_status::success();

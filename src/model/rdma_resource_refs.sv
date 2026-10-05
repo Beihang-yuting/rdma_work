@@ -2,10 +2,6 @@
 // 职责：实现 rdma_resource_refs 在本层的职责和对外接口。
 // 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_resource_refs.sv 属于模型层，描述语义请求、资源快照、DMA 映射及生命周期数据。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
 typedef enum bit [2:0] {
   RDMA_RESOURCE_NEW        = 3'd0,
   RDMA_RESOURCE_ALLOCATED  = 3'd1,
@@ -34,9 +30,9 @@ class rdma_backing_ref extends uvm_object;
   rdma_resource_ownership_e ownership;
   bit release_complete;
 
-  // 功能：构造 rdma_backing_ref，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：mapping=null；ownership=RDMA_OWNERSHIP_BORROWED；release_complete=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_backing_ref 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 backing reference，默认无 mapping、借用所有权、未释放。
+  // 输入/输出及副作用：name 为 UVM 对象名。
+  // 失败/边界：无。
   function new(string name = "rdma_backing_ref");
     super.new(name);
     mapping = null;
@@ -44,9 +40,10 @@ class rdma_backing_ref extends uvm_object;
     release_complete = 1'b0;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“backing reference mapping is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、mapping、mapping.state、release_complete、ownership 并使用字段 rdma_status、mapping、mapping.state、release_complete、ownership；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；具体拒绝条件包括 “backing reference mapping is null”；“live backing reference mapping is not active”；“borrowed backing cannot be marked released”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：校验 backing reference 的 mapping 与释放状态。
+  // 输入/输出及副作用：只读对象字段，返回 rdma_status。
+  // 失败/边界：mapping 为 null 为 INVALID_ARGUMENT；未释放时 mapping 非 ACTIVE、
+  //   或借用 backing 被标记 released 为 INVALID_STATE。
   virtual function rdma_status validate();
     if (mapping == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -60,9 +57,9 @@ class rdma_backing_ref extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：将 rhs 中 rdma_backing_ref 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（backing reference copy mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象，mapping 深拷贝。
+  // 输入/输出及副作用：覆盖当前对象字段，不修改 rhs。
+  // 失败/边界：rhs 类型不匹配时 uvm_fatal（backing reference copy mismatch）。
   virtual function void do_copy(uvm_object rhs);
     rdma_backing_ref rhs_ref;
 
@@ -84,19 +81,15 @@ class rdma_hmc_ref extends uvm_object;
   rdma_hmc_fvm_addr_t address;
   longint unsigned size;
   int unsigned first_pbl_index;
-  // 驱动的 PBLE allocator 允许 index=0；该模型元数据位记录 index
-  // 是否来自 allocator lease，而不是把 0 当作“未设置”哨兵。它不进入
-  // CMQ/MRT wire image，只用于 authority/快照完整性校验。
+  // 驱动的 PBLE allocator 允许 index=0，故用 index_valid 记录 index 是否来自 allocator
+  // lease，而非把 0 当“未设置”；不进入 CMQ/MRT wire image，仅用于快照完整性校验。
   bit index_valid;
   rdma_resource_ownership_e ownership;
   bit release_complete;
 
-  // 功能：构造 rdma_hmc_ref，调用 super.new 建立 UVM 对象，并把默认值设为
-  //   owner=null、object_kind=RDMA_RESOURCE_MR、address='0、size=0、
-  //   first_pbl_index=0、index_valid=1'b0、
-  //   ownership=RDMA_OWNERSHIP_BORROWED、release_complete=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hmc_ref 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 HMC reference，默认 MR、借用所有权、index_valid=0，其余清零。
+  // 输入/输出及副作用：name 为 UVM 对象名。
+  // 失败/边界：无。
   function new(string name = "rdma_hmc_ref");
     super.new(name);
     owner = null;
@@ -109,14 +102,10 @@ class rdma_hmc_ref extends uvm_object;
     release_complete = 1'b0;
   endfunction
 
-  // 功能：validate 校验当前字段与 HMC reference 状态的一致性，并显式处理
-  //   “HMC reference owner is invalid”等拒绝条件，返回 rdma_status。
-  // 输入/输出及副作用：无显式参数；读取 owner、object_kind、size、
-  //   first_pbl_index、index_valid、release_complete 和 ownership，返回状态，
-  //   不取得调用方资源所有权。
-  // 失败/边界：owner/metadata 无效或 allocator index validity 缺失时返回
-  //   RDMA_SC_INVALID_ARGUMENT；借用引用已释放时返回 RDMA_SC_INVALID_STATE；
-  //   index_valid=1 时 index=0 合法。
+  // 功能：校验 HMC reference 的 owner、MR 元数据与释放状态。
+  // 输入/输出及副作用：只读对象字段，返回 rdma_status。
+  // 失败/边界：owner 非 Function、非 MR、size==0 或 index_valid==0 为 INVALID_ARGUMENT；
+  //   借用引用已 release_complete 为 INVALID_STATE；index_valid=1 时 index=0 合法。
   virtual function rdma_status validate();
     if (owner == null || owner.kind != RDMA_RESOURCE_FUNCTION)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -130,9 +119,9 @@ class rdma_hmc_ref extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：将 rhs 中 rdma_hmc_ref 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（HMC reference copy mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象，owner 深拷贝。
+  // 输入/输出及副作用：覆盖当前对象字段，不修改 rhs。
+  // 失败/边界：rhs 类型不匹配时 uvm_fatal（HMC reference copy mismatch）。
   virtual function void do_copy(uvm_object rhs);
     rdma_hmc_ref rhs_ref;
 

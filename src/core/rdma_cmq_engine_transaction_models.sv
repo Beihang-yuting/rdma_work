@@ -1,15 +1,14 @@
 // 目录：核心执行层 core/rdma_cmq_engine_transaction_models.sv。
 // 职责：集中定义 CMQ runtime 提交/完成、复位候选、slot 记录和 MMIO arm observer 等事务值模型，
-//   让 rdma_cmq_engine 只负责状态机、账本所有权和跨组件协调。
-// 依赖：依赖 rdma_model_pkg 的 CMQ 快照/提交记录、rdma_adapter_pkg 的 Host-memory 与
-//   scheduler 契约，以及 rdma_doorbell_scheduler.sv 中的 observer 基类。
-// 所有权与生命周期：本文件中的 UVM 对象和候选 struct 只描述事务值或 staging 图；
+//   rdma_cmq_engine 只负责状态机、账本所有权和跨组件协调。
+// 依赖：rdma_model_pkg 的 CMQ 快照/提交记录、rdma_adapter_pkg 的 Host-memory/scheduler 契约、
+//   rdma_doorbell_scheduler.sv 中的 observer 基类。
+// 所有权与生命周期：本文件的 UVM 对象和候选 struct 只描述事务值或 staging 图；
 //   engine 仍是 runtime、journal、fence 和外部 facade 的唯一可变所有者。
 
-// 设计说明：transaction model 与 engine 实现物理分离，但不改变任何字段布局、
-//   UVM factory 注册或 observer 的非拥有引用语义。跨文件的 engine 回调通过前置类声明连接。
-// 设计说明：slot 状态只描述 CMQ ring 中单个位置的可回收阶段；完整的
-//   publication/recovery authority 仍由 engine 的 journal、counter 和锁共同维护。
+// 设计说明：本文件与 engine 物理分离，不改变字段布局、factory 注册或 observer 的非拥有语义；
+//   engine 回调经前置类声明连接。slot 状态只描述单个 ring 位置的可回收阶段，
+//   publication/recovery authority 仍由 engine 的 journal、counter 和锁维护。
 typedef enum bit [2:0] {
   CMQ_SLOT_FREE,
   CMQ_SLOT_PUBLISHED,
@@ -19,12 +18,10 @@ typedef enum bit [2:0] {
   CMQ_SLOT_RESET_CANCELLED
 } rdma_cmq_slot_state_e;
 
-// 功能：把完整 Function incarnation 与 engine/batch 单调身份编码为固定宽度、
-//   小写十六进制的外部 journal key，避免同 route 或同 Function 的 engine 实例串线。
-// 输入/输出及副作用：identity、engine_instance_id、engine_incarnation 和 batch_id
-//   为只读输入；batch_key/failure_reason 入口清空，成功仅发布 batch_key。
-// 失败/边界：identity 为空、runtime subtype/route/UID/generation 非法，或三个
-//   engine/batch 标量任一为零时返回 0；不保留 partial key、不调用 factory。
+// 功能：把 Function incarnation 与 engine/batch 单调身份编码为定宽小写十六进制 journal key。
+// 输入/输出及副作用：入参只读；batch_key/failure_reason 入口清空，成功仅发布 batch_key。
+// 失败/边界：identity 为空、runtime subtype/route/UID/generation 非法或任一 engine/batch
+//   标量为零时返回 0；不保留 partial key。
 function automatic bit rdma_cmq_format_batch_key(
   input rdma_function_identity identity,
   input longint unsigned engine_instance_id,
@@ -91,17 +88,14 @@ class rdma_cmq_slot_record extends uvm_object;
   rdma_cmq_ticket ticket;
   rdma_cmq_expected_response expected;
   bit [4:0] command_token;
-  // 设计说明：runtime slot 只保存到 retained journal authority 的稳定定位值；
-  //   batch_key 与压缩后的 item 下标必须成对安装，禁止从 request_index 或
-  //   当前 Function/runtime 重新推断，以免 timeout/reset 跨批次回写。
+  // 设计说明：slot 只保存到 retained journal 的稳定定位值；batch_key 与压缩后的 item 下标
+  //   必须成对安装，不得从 request_index 或当前 Function 推断，以免 timeout/reset 跨批次回写。
   string batch_key;
   int unsigned journal_item_index;
 
-  // 功能：构造空闲 slot record，并把 journal locator 初始化为空 key/零下标。
-  // 输入/输出及副作用：name 传给 uvm_object；清零 slot/ticket/token/locator，
-  //   不登记 runtime 或 retained journal 行。
-  // 失败/边界：默认对象没有发布 authority；batch_key 为空时即使下标为零也
-  //   不能定位 journal，不接管 Host-memory、PCIe 或 manager 生命周期。
+  // 功能：构造空闲 slot record，journal locator 置空 key/零下标。
+  // 输入/输出及副作用：name 传给 uvm_object；清零 slot/ticket/token/locator。
+  // 失败/边界：默认对象无发布 authority；batch_key 为空时下标零不能定位 journal。
   function new(string name = "rdma_cmq_slot_record");
     super.new(name);
     slot_sequence = 0;
@@ -115,9 +109,9 @@ class rdma_cmq_slot_record extends uvm_object;
     journal_item_index = 0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_cmq_slot_record 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ slot record copy mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的值字段复制到当前对象，得到与源隔离的快照。
+  // 输入/输出及副作用：rhs 为源，只读；覆盖当前字段，嵌套句柄 clone 或保持非拥有引用。
+  // 失败/边界：源为空、clone/cast 失败或类型不符时 UVM fatal（CMQ slot record copy mismatch）。
   virtual function void do_copy(uvm_object rhs);
     rdma_cmq_slot_record rhs_record;
 
@@ -142,8 +136,8 @@ class rdma_cmq_slot_record extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：单项预分配发布值把 journal request index 与既有 slot/registry
-//   发布键绑定；它只由 engine 锁内拥有，不形成第二份提交 authority。
+// 设计说明：单项预分配发布值把 journal request index 与 slot/registry 发布键绑定；
+//   仅在 engine 锁内持有，不形成第二份提交 authority。
 class rdma_cmq_preallocated_publish_item extends uvm_object;
   `uvm_object_utils(rdma_cmq_preallocated_publish_item)
 
@@ -153,9 +147,9 @@ class rdma_cmq_preallocated_publish_item extends uvm_object;
   string entry_key;
   bit [4:0] command_token;
 
-  // 功能：构造空的 CMQ 预分配发布单项，等待原子安装入口填入完整 slot 与键。
-  // 输入/输出及副作用：name 传给 uvm_object；清零 request/token 并清空引用和文本。
-  // 失败/边界：默认对象是 partial value，不能安装或发布到 runtime registry。
+  // 功能：构造空的预分配发布单项。
+  // 输入/输出及副作用：name 传给 uvm_object；清零 request/token，清空引用和文本。
+  // 失败/边界：默认对象为 partial value，不能安装或发布。
   function new(string name = "rdma_cmq_preallocated_publish_item");
     super.new(name);
     request_index = 0;
@@ -166,9 +160,8 @@ class rdma_cmq_preallocated_publish_item extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：批次预分配发布值保存 authentic MMIO arm 原子提交所需的固定
-//   sequence/profile 格式和有序单项；安装后由 arm 消费，PRE rollback、
-//   journal 删除或 reset 也会回收。arm 后 journal 仍可继续保留恢复证据。
+// 设计说明：批次预分配发布值保存 MMIO arm 原子提交所需的 sequence/profile 格式和有序单项；
+//   安装后由 arm 消费，PRE rollback、journal 删除或 reset 也会回收；arm 后 journal 仍保留证据。
 class rdma_cmq_preallocated_publish_batch extends uvm_object;
   `uvm_object_utils(rdma_cmq_preallocated_publish_batch)
 
@@ -180,9 +173,9 @@ class rdma_cmq_preallocated_publish_batch extends uvm_object;
   int unsigned profile_hardware_version;
   rdma_cmq_preallocated_publish_item items[$];
 
-  // 功能：构造空的 CMQ 批次预分配发布值，默认没有有效 profile 格式或单项。
-  // 输入/输出及副作用：name 传给 uvm_object；清空 key/items 并将计数与格式置零。
-  // 失败/边界：默认对象不能安装；必须与同批 journal record 一一匹配后才可发布。
+  // 功能：构造空的批次预分配发布值，无 profile 格式或单项。
+  // 输入/输出及副作用：name 传给 uvm_object；清空 key/items，计数与格式置零。
+  // 失败/边界：默认对象不能安装；须与同批 journal record 一一匹配后才可发布。
   function new(string name = "rdma_cmq_preallocated_publish_batch");
     super.new(name);
     batch_key = "";
@@ -195,15 +188,14 @@ class rdma_cmq_preallocated_publish_batch extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：reset candidate 把每个将被隔离的 runtime slot 与其 retained
-//   journal item 的稳定定位、取消 completion 一起预建；它不拥有 runtime
-//   registry，commit 前不会把任何句柄写回 engine。
+// 设计说明：reset candidate 预建每个将被隔离的 runtime slot 与其 retained journal item 的
+//   定位和取消 completion；不拥有 runtime registry，commit 前不写回 engine。
 class rdma_cmq_reset_item_candidate extends uvm_object;
   `uvm_object_utils(rdma_cmq_reset_item_candidate)
 
   string batch_key;
-  // journal_item_index 是压紧后的 admitted-item 位置；它必须与调用方提供的
-  // request_index 分开保存，因为本地拒绝后 request_index 允许出现空洞。
+  // journal_item_index 为压紧后的 admitted-item 位置，须与 request_index 分开保存
+  // （本地拒绝后 request_index 可有空洞）。
   int unsigned journal_item_index;
   int unsigned request_index;
   int unsigned slot_index;
@@ -211,9 +203,9 @@ class rdma_cmq_reset_item_candidate extends uvm_object;
   string entry_key;
   rdma_cmq_completion cancellation_completion;
 
-  // 功能：构造一个未绑定 journal 的 reset 单项候选，清空定位键和取消结果。
-  // 输入/输出及副作用：name 仅设置 UVM 名称；本构造不修改 engine ledger，也不取得外部 backing 所有权。
-  // 失败/边界：默认候选没有 batch/slot authority，不能直接提交；调用方必须在 release 前完成全部字段校验。
+  // 功能：构造未绑定 journal 的 reset 单项候选，清空定位键和取消结果。
+  // 输入/输出及副作用：name 设置 UVM 名；不修改 engine ledger。
+  // 失败/边界：默认候选无 batch/slot authority，release 前须完成字段校验。
   function new(string name = "rdma_cmq_reset_item_candidate");
     super.new(name);
     batch_key = "";
@@ -226,8 +218,8 @@ class rdma_cmq_reset_item_candidate extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：reset batch candidate 保存一个 batch 的旧 journal 行、完整 proof
-//   和 detached 返回 proof；proof 只在 backing release 成功后安装到 retained row。
+// 设计说明：reset batch candidate 保存一个 batch 的旧 journal 行、完整 proof 与 detached
+//   返回 proof；proof 仅在 backing release 成功后安装到 retained row。
 class rdma_cmq_reset_batch_candidate extends uvm_object;
   `uvm_object_utils(rdma_cmq_reset_batch_candidate)
 
@@ -237,9 +229,9 @@ class rdma_cmq_reset_batch_candidate extends uvm_object;
   rdma_cmq_reset_isolation_proof returned_proof;
   rdma_cmq_submission_state_e reduced_state;
 
-  // 功能：构造一个未提交的 reset batch 候选，初始化 proof/record 句柄和 reducer 结果。
-  // 输入/输出及副作用：name 仅设置 UVM 名称；构造不插入 journal、不推进 proof counter。
-  // 失败/边界：空 batch_key 或 null proof/record 只能作为 staging 中间值，不能进入 commit。
+  // 功能：构造未提交的 reset batch 候选，初始化 proof/record 句柄和 reducer 结果。
+  // 输入/输出及副作用：name 设置 UVM 名；不插入 journal、不推进 proof counter。
+  // 失败/边界：空 batch_key 或 null proof/record 只能作 staging 中间值，不能 commit。
   function new(string name = "rdma_cmq_reset_batch_candidate");
     super.new(name);
     batch_key = "";
@@ -250,16 +242,15 @@ class rdma_cmq_reset_batch_candidate extends uvm_object;
   endfunction
 endclass
 
-// 设计说明：reset candidate 是 release 前唯一的本地事务图，聚合旧 backing
-//   authority、逐项取消结果、逐 batch proof 及 caller 输出；commit 只消费这张图。
+// 设计说明：reset candidate 是 release 前唯一的本地事务图，聚合旧 backing authority、
+//   逐项取消结果、逐 batch proof 及 caller 输出；commit 只消费这张图。
 class rdma_cmq_reset_candidate extends uvm_object;
   `uvm_object_utils(rdma_cmq_reset_candidate)
 
   rdma_function_identity isolated_identity;
   rdma_dma_mapping backing_release_authority;
-  // 以下句柄只是 release 返回后的非拥有见证值，用于重新核对 engine runtime；
-  // 上方 detached authority 才是唯一传给 release 的值，这些句柄不会进入 engine
-  // 可达状态，也不延长外部资源生命周期。
+  // 以下句柄是 release 返回后用于重新核对 runtime 的非拥有见证值；传给 release 的只有
+  // 上方 detached authority，这些句柄不进入 engine 可达状态，也不延长外部资源生命周期。
   rdma_dma_mapping runtime_backing_mapping;
   rdma_host_mem_api backing_release_service;
   rdma_host_mem_api runtime_host_mem;
@@ -289,9 +280,9 @@ class rdma_cmq_reset_candidate extends uvm_object;
   rdma_cmq_reset_batch_candidate batches[$];
   rdma_cmq_completion returned_completions[$];
 
-  // 功能：构造空 reset candidate，准备承载旧 incarnation 的 detached staging 图。
-  // 输入/输出及副作用：name 仅设置 UVM 名称；所有队列清空，不触碰 engine 或 Host-memory。
-  // 失败/边界：默认 candidate 不含 release authority，不能调用 release/commit；失败 staging 必须整体丢弃。
+  // 功能：构造空 reset candidate，承载旧 incarnation 的 detached staging 图。
+  // 输入/输出及副作用：name 设置 UVM 名；队列清空，不触碰 engine 或 Host-memory。
+  // 失败/边界：默认 candidate 无 release authority；失败 staging 须整体丢弃。
   function new(string name = "rdma_cmq_reset_candidate");
     super.new(name);
     isolated_identity = null;
@@ -329,9 +320,8 @@ endclass
 
 typedef class rdma_cmq_engine;
 
-// 设计说明：observer 是 scheduler 进入 MMIO_MAYBE_VISIBLE 前的一次性
-//   capability；它仅保存 engine 非拥有句柄和冻结标量，真实 authority
-//   由 engine 内 exact-object registry 与 journal 联合认证。
+// 设计说明：observer 是 scheduler 进入 MMIO_MAYBE_VISIBLE 前的一次性 capability，仅保存
+//   engine 非拥有句柄和冻结标量，真实 authority 由 engine 的 exact-object registry 与 journal 认证。
 class rdma_cmq_mmio_arm_observer
   extends rdma_doorbell_submission_observer;
   local rdma_cmq_engine owner;
@@ -341,10 +331,9 @@ class rdma_cmq_mmio_arm_observer
   local longint unsigned engine_incarnation;
   local bit configured;
 
-  // 功能：构造尚未配置的 MMIO arm observer，建立空 authority 起点。
-  // 输入/输出及副作用：name 传给父类；owner/key 清空，ID 和 configured 清零。
-  // 失败/边界：构造不登记 capability、不取得 engine 所有权；configure 成功前
-  //   回调只能报稳定非法调用诊断。
+  // 功能：构造未配置的 MMIO arm observer。
+  // 输入/输出及副作用：name 传给父类；owner/key 清空，ID 与 configured 清零。
+  // 失败/边界：configure 成功前回调只报稳定的非法调用诊断。
   function new(string name = "rdma_cmq_mmio_arm_observer");
     super.new(name);
     owner = null;
@@ -355,11 +344,10 @@ class rdma_cmq_mmio_arm_observer
     configured = 1'b0;
   endfunction
 
-  // 功能：一次性冻结 observer 的 owner、capability/batch key 和 attempt/incarnation。
-  // 输入/输出及副作用：五个 *_arg 为输入；首次完整配置时写入
-  //   local 字段并返回 OK，owner_arg 仍由外部拥有。
-  // 失败/边界：已配置返回 RESOURCE_BUSY；null owner、空 key 或零 ID
-  //   返回 INVALID_ARGUMENT，两类失败均不改写任何 local 字段。
+  // 功能：一次性冻结 owner、capability/batch key 和 attempt/incarnation。
+  // 输入/输出及副作用：*_arg 为输入；成功写入 local 字段，owner 仍由外部拥有。
+  // 失败/边界：已配置返回 RESOURCE_BUSY；null owner、空 key 或零 ID 返回 INVALID_ARGUMENT；
+  //   失败均不改 local 字段。
   function rdma_status configure(
     input rdma_cmq_engine owner_arg,
     input string capability_key_arg,
@@ -388,60 +376,58 @@ class rdma_cmq_mmio_arm_observer
     return rdma_cmq_direct_status(RDMA_SC_OK);
   endfunction
 
-  // 功能：查询 configure() 是否已成功冻结完整 capability 字段。
-  // 输入/输出及副作用：无输入；只读并返回 configured，不修改 observer。
-  // 失败/边界：初始或失败 configure 后返回 0，不根据其他字段推测。
+  // 功能：查询 configure() 是否已成功。
+  // 输入/输出及副作用：只读 configured。
+  // 失败/边界：未配置或 configure 失败后返回 0。
   function bit is_configured();
     return configured;
   endfunction
 
-  // 功能：返回 configure() 冻结的 engine 非拥有 owner 句柄供 identity 认证。
-  // 输入/输出及副作用：无输入；只读 owner 并返回 exact handle。
-  // 失败/边界：未配置时返回 null，不接管 engine 生命周期。
+  // 功能：返回冻结的 engine owner 句柄（非拥有）。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：未配置时返回 null。
   function rdma_cmq_engine owner_handle();
     return owner;
   endfunction
 
-  // 功能：返回冻结的 registry capability key 值供 exact-row 查找。
-  // 输入/输出及副作用：无输入；只读 capability_key，不修改 registry。
-  // 失败/边界：未配置时返回空字符串，字符串知识本身不授权。
+  // 功能：返回冻结的 registry capability key。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：未配置时返回空串；key 本身不授权。
   function string get_capability_key();
     return capability_key;
   endfunction
 
-  // 功能：返回冻结的 journal batch key 值供 record 查找。
-  // 输入/输出及副作用：无输入；只读 batch_key，不查询 engine 状态。
-  // 失败/边界：未配置时返回空字符串，不用 key 重建 owner authority。
+  // 功能：返回冻结的 journal batch key。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：未配置时返回空串。
   function string get_batch_key();
     return batch_key;
   endfunction
 
-  // 功能：返回冻结的 submission attempt ID 供 journal tuple 认证。
-  // 输入/输出及副作用：无输入；只读 attempt_id，不推进 engine counter。
-  // 失败/边界：未配置时返回零，零值不是有效 authority。
+  // 功能：返回冻结的 submission attempt ID。
+  // 输入/输出及副作用：只读，不推进 engine counter。
+  // 失败/边界：未配置时返回零，零非有效 authority。
   function longint unsigned get_attempt_id();
     return attempt_id;
   endfunction
 
-  // 功能：返回冻结的 engine incarnation 供拒绝 reset/reprepare 后旧能力。
-  // 输入/输出及副作用：无输入；只读 engine_incarnation，无外部副作用。
-  // 失败/边界：未配置时返回零，不回退查询 owner 当前代际。
+  // 功能：返回冻结的 engine incarnation，用于拒绝 reset/reprepare 后的旧能力。
+  // 输入/输出及副作用：只读。
+  // 失败/边界：未配置时返回零，不回退查询 owner。
   function longint unsigned get_engine_incarnation();
     return engine_incarnation;
   endfunction
 
-  // 功能：在 scheduler 即将使 MMIO 可见时同步委托 owner 消费本 capability。
-  // 输入/输出及副作用：无输入/返回值；配置完整时传入 this，
-  //   由 owner 原子安装预分配 runtime 账本。
-  // 失败/边界：未配置或 null owner 只发布稳定 UVM_ERROR 并返回，
-  //   不解引用 owner；实现不得等待、分配、取锁或重入 scheduler/service。
+  // 功能：scheduler 即将使 MMIO 可见时，同步委托 owner 消费本 capability。
+  // 输入/输出及副作用：配置完整时传入 this，由 owner 原子安装预分配 runtime 账本。
+  // 失败/边界：未配置或 null owner 只发布稳定 UVM_ERROR 并返回；实现不得等待、分配、
+  //   取锁或重入 scheduler/service。
   extern virtual function void before_mmio_maybe_visible();
 endclass
 
-// 设计说明：observed submit 只在一次持锁提交中暂存 transport 原始证据与
-//   分类结果；operation_status 是本次调用独占的直接复制值，其他字段是纯标量。
-//   这里不保存 journal、observer 或外部服务句柄，PRE rollback 与最终账本
-//   写入仍由 engine 的 submit task 在原有提交点完成。
+// 设计说明：observed submit 只在一次持锁提交中暂存 transport 原始证据与分类结果；
+//   operation_status 为本次调用独占的复制值。不保存 journal、observer 或外部句柄，
+//   PRE rollback 与最终账本写入仍由 engine submit task 在原提交点完成。
 typedef struct {
   rdma_status operation_status;
   rdma_status_code_e observation_code;
@@ -454,11 +440,9 @@ typedef struct {
   bit publication_retry_safe;
 } rdma_cmq_submit_transport_decision_t;
 
-// 设计说明：逐项 candidate staging 在 submit_batch_observed 的同一锁内持有
-//   两个尚未安装的候选句柄、依赖队列和格式/失败游标。struct 本身不是 UVM
-//   对象或第二份 journal；候选对象仍由调用方创建，函数仅在调用期间借用。
-//   函数结束后把借用候选对象中暂存的条目、dependencies 与格式交给原
-//   task 的后续阶段；失败时整图随本次调用丢弃，不能留在持久账本中。
+// 设计说明：逐项 candidate staging 在 submit_batch_observed 的同一锁内持有两个未安装候选
+//   句柄、依赖队列和格式/失败游标；struct 不是 UVM 对象或第二份 journal，候选由调用方创建、
+//   调用期间借用，成功后交给原 task 后续阶段，失败则整图随调用丢弃。
 typedef struct {
   rdma_cmq_batch_submission_record record_candidate;
   rdma_cmq_preallocated_publish_batch preallocated_candidate;
@@ -470,10 +454,9 @@ typedef struct {
   bit transaction_failed;
 } rdma_cmq_submit_candidate_stage_t;
 
-// 设计说明：RETRY candidate staging 只在唯一 recovery 调用内借用 descriptor、
-//   dependency、observer 和 deadline 证据；它不是 journal/runtime 第二份账本。
-//   helper 成功后由原 task 在同一锁内执行 expected-attempt 重验和 CAS，失败时
-//   candidate 图不进入 engine registry，保留 pre-MMIO 的可回收生命周期。
+// 设计说明：RETRY candidate staging 只在唯一 recovery 调用内借用 descriptor、dependency、
+//   observer 和 deadline 证据；成功后由原 task 同锁内重验 expected-attempt 并 CAS，
+//   失败时候选图不进入 registry，保留 pre-MMIO 可回收生命周期。
 typedef struct {
   rdma_doorbell_dependency dependencies[$];
   rdma_doorbell_desc doorbell_snapshot_desc;
@@ -483,10 +466,9 @@ typedef struct {
   string capability_key;
 } rdma_cmq_recovery_candidate_stage_t;
 
-// 设计说明：terminal-transition candidate stage 把 expiry timeout 和 generation
-//   cancel 共用的逐 slot completion、journal detached 图集中保存，确保后续 slot
-//   的 snapshot/reducer 失败时不会提前写入 engine ledger。它只是锁内调用期
-//   context，不拥有 slot、journal 或 FIFO；两种 policy 仅由 caller 决定候选内容。
+// 设计说明：terminal-transition candidate stage 集中保存 expiry timeout 与 generation cancel
+//   共用的逐 slot completion/journal detached 图，后续 slot 的 snapshot/reducer 失败时不会
+//   提前写 engine ledger；仅为锁内调用期 context，两种 policy 由 caller 决定候选内容。
 typedef struct {
   rdma_cmq_slot_record staged_records[$];
   rdma_cmq_completion staged_completions[$];
@@ -498,9 +480,8 @@ typedef struct {
   string staged_command_keys[$];
 } rdma_cmq_terminal_transition_candidate_stage_t;
 
-// 设计说明：ready CQE 完成匹配后，只把已认证的 slot 引用、命令 key、token 与
-//   prospective retire cursor 交给原 engine 提交点；不拥有 slot，不构造 UVM 对象，
-//   不保留 profile/adapter。仅在同一次 engine_lock 调用内有效，不能跨 poll/reset 缓存。
+// 设计说明：ready CQE 匹配后只把已认证的 slot 引用、命令 key、token 和 prospective retire
+//   cursor 交给 engine 提交点；不拥有 slot，仅在同一次 engine_lock 内有效，不能跨 poll/reset 缓存。
 typedef struct {
   rdma_cmq_slot_record record;
   string software_key;

@@ -3,17 +3,16 @@
 // 依赖：types/model、runtime/data transaction value 类型及 UVM raw factory；不依赖 engine 实例。
 // 所有权与生命周期：无字段、缓存、锁或 UVM 注册，不持有 engine/runtime/manager/adapter 引用。
 //   调用方管理输入与返回对象的生命周期；CQ result 会修改并复用传入的 detached release slots，
-//   不能传入 live ledger。attachment 参数只用于读取其值字段，绝不查询或修改借用 runtime。
-// 设计说明：业务 owner 继续决定 admission、I/O、commit 与恢复；本类只处理显式输入的值。
-//   static automatic 保持每次调用局部变量独立，不建立第二账本，也不增加 factory 对象层。
-//   “无状态”不代表“无分配/无回调”：raw factory 和 AEQE profile 设置保留原调用窗口；
-//   post-scheduler 使用 rdma_status::copy_fields_noalloc/set_fields_noalloc 等无分配值操作。
+//   不能传入 live ledger；attachment 参数只读其值字段，不查询或修改借用 runtime。
+// 设计说明：admission、I/O、commit 与恢复仍由业务 owner 决定，本类只处理显式输入的值。
+//   static automatic 使每次调用局部变量独立。“无状态”不等于“无分配/无回调”：raw factory 和
+//   AEQE profile 设置保留原调用窗口；post-scheduler 用 rdma_status 的 *_noalloc 值操作。
 
 class rdma_queue_data_projector;
 
-  // 功能：直接调用 raw factory，允许调用方显式处理 null/错误动态类型，避免 typed-create fatal。
-  // 输入/输出及副作用：requested_type/name 为输入；返回 raw 对象，保留一次 create 请求及实例名。
-  // 失败/边界：type/factory 为空返回 null；不捕获 provider 自身 fatal，不校验类型/alias；factory 可重入。
+  // 功能：直接调用 raw factory，由调用方处理 null/错误动态类型，避免 typed-create fatal。
+  // 输入/输出及副作用：requested_type/name 输入；返回 raw 对象，保留一次 create 请求及实例名。
+  // 失败/边界：type/factory 为空返回 null；不捕获 provider 自身 fatal，不校验类型；factory 可重入。
   static function automatic uvm_object factory_create_object_nonfatal(
     uvm_object_wrapper requested_type,
     string name
@@ -29,9 +28,9 @@ class rdma_queue_data_projector;
     return factory.create_object_by_type(requested_type, "", name);
   endfunction
 
-  // 功能：make_status_nonfatal 用 raw factory 创建状态并复用原位初始化，清除旧诊断字段。
-  // 输入/输出及副作用：code/message 决定状态分类、严重性和文案；只写 factory 返回的 status。
-  // 失败/边界：null/错型返回 null，无隐藏 new/fallback；不验证 factory 对象 alias，不能在无分配窗口调用。
+  // 功能：用 raw factory 创建 status 并原位初始化，清除旧诊断字段。
+  // 输入/输出及副作用：code/message 决定分类、严重性和文案；只写 factory 返回的 status。
+  // 失败/边界：null/错型返回 null，无隐藏 new/fallback；不能在无分配窗口调用。
   static function automatic rdma_status make_status_nonfatal(
     rdma_status_code_e code,
     string message = ""
@@ -47,9 +46,9 @@ class rdma_queue_data_projector;
     return result;
   endfunction
 
-  // 功能：为 consumer candidate 逐字段物化 kind/Function/object/generation 句柄，不调用 clone。
-  // 输入/输出及副作用：source/label 为输入，copy 先清空，再写 raw factory 创建的 handle；不修改 source。
-  // 失败/边界：source 为空或 raw 对象 null/错型时 copy=null；返回状态也可分配失败，此时 copy 可能已填充。
+  // 功能：为 consumer candidate 逐字段物化 kind/Function/object/generation 句柄，不 clone。
+  // 输入/输出及副作用：source/label 输入；copy 先清空，再写 raw factory 创建的 handle。
+  // 失败/边界：source 为空或 raw 对象 null/错型时 copy=null；返回 status 创建失败时 copy 可能已填充。
   static function automatic rdma_status clone_poll_handle_nonfatal(
     rdma_handle source,
     string label,
@@ -76,10 +75,9 @@ class rdma_queue_data_projector;
   endfunction
 
   // 功能：物化 poll 镜像的 metadata、bytes 和 field_summary，供 consumer pending 保存重放值。
-  // 输入/输出及副作用：source 输入，copy 先清空；复用模型元数据复制，再向 factory 镜像
-  //   追加两组队列，不调用 clone，也不检测 hostile factory 的 source alias。
-  // 失败/边界：空 source、零 length、bytes 数不符、null/错型工厂拒绝；不清空 override 预填队列，
-  //   保留既有创建契约；最终状态创建失败时 copy 可非空，调用方仍必须检查 status。
+  // 输入/输出及副作用：source 输入，copy 先清空；复用模型元数据复制，再向镜像追加两组队列，不 clone。
+  // 失败/边界：空 source、零 length、bytes 数不符、null/错型 factory 均拒绝；不清空 override 预填
+  //   队列；最终 status 创建失败时 copy 可非空，调用方须检查 status。
   static function automatic rdma_status clone_poll_image_nonfatal(
     rdma_hw_image source,
     output rdma_hw_image copy
@@ -105,9 +103,9 @@ class rdma_queue_data_projector;
     return make_status_nonfatal(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：按已计算的 index/wrap 物化 consumer old/next cursor，不读取 live runtime。
-  // 输入/输出及副作用：index/wrap/label 输入，copy 先清空再填入 raw factory 的 cursor，保留创建名。
-  // 失败/边界：null/错型 cursor 拒绝；不校验 depth/index；最终 status 分配失败时已填充 copy 不回滚。
+  // 功能：按已计算的 index/wrap 物化 consumer old/next cursor，不读 live runtime。
+  // 输入/输出及副作用：index/wrap/label 输入；copy 先清空再填入 raw factory 的 cursor。
+  // 失败/边界：null/错型 cursor 拒绝；不校验 depth/index；status 分配失败时已填充 copy 不回滚。
   static function automatic rdma_status make_poll_cursor_nonfatal(
     int unsigned index,
     bit wrap,
@@ -129,10 +127,10 @@ class rdma_queue_data_projector;
     return make_status_nonfatal(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：在 consumer barrier 前创建 nested status，并逐字段复制全部原始诊断，不重新分类。
-  // 输入/输出及副作用：source/label 输入，copy 先清空；创建候选并在字段复制成功后发布 output。
-  // 失败/边界：source=null、raw null/错型或字段复制拒绝均返回失败；错误/成功 status 自身也可为 null，
-  //   不存在本地 fallback，返回状态分配失败不撤销已填充 copy，调用方必须以 status 为准。
+  // 功能：在 consumer barrier 前创建 nested status，逐字段复制原始诊断，不重新分类。
+  // 输入/输出及副作用：source/label 输入，copy 先清空；字段复制成功后才发布 output。
+  // 失败/边界：source=null、raw null/错型或字段复制拒绝均失败；无本地 fallback；返回 status
+  //   分配失败不撤销已填充 copy，以 status 为准。
   static function automatic rdma_status allocate_poll_status_nonfatal(
     rdma_status source,
     string label,
@@ -157,13 +155,13 @@ class rdma_queue_data_projector;
     return make_status_nonfatal(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：在 CQ barrier 前组装完整 CQE 语义、payload、完成状态和已冻结 release slot 的结果图。
+  // 功能：在 CQ barrier 前组装 CQE 语义、payload、完成状态和已冻结 release slot 的结果图。
   // 输入/输出及副作用：cq_h/decoded_cqe/result_qp_h/completion_status/release_snapshots 输入；
   //   candidate/final_success 先清空；新建 CQE/handle/status，并原位更新传入 detached slot 的
-  //   posted/consumed/completion_status，结果复用这些 slot 引用；禁止传入 live runtime ledger。
-  // 失败/边界：必要输入/末项/中途 slot 为空、raw factory null/错型或 nested status 失败均拒绝；
-  //   失败时 final_success、已处理 slot 或最终已组装 candidate 可能保留，调用方必须丢弃失败输出，
-  //   不能将构造结果或 slot 标志视为 CI/WQE 已提交；本方法不校验 route/epoch，也不提交资源。
+  //   posted/consumed/completion_status；禁止传入 live runtime ledger。
+  // 失败/边界：必要输入/slot 为空、raw factory null/错型或 nested status 失败均拒绝；失败时
+  //   final_success/已处理 slot/candidate 可能残留，调用方须丢弃，不能视为已提交；
+  //   不校验 route/epoch，不提交资源。
   static function automatic rdma_status prepare_cq_completion_candidate(
     rdma_handle cq_h,
     rdma_hw_cqe_model decoded_cqe,
@@ -245,10 +243,9 @@ class rdma_queue_data_projector;
       end
     end
     cqe_candidate.status = cqe_status_copy;
-    // CQE 的 detached 结果必须保留完整驱动投影，而不是只复制当前 poll
-    // 分支用于释放 WQE 的公共字段。variant、flags、qword2 的 typed/raw
-    // overlay、UD qword3 以及 inline payload 都是原始 entry 的可观察值；
-    // 丢失其中任一项都会使 poll 后的审计/异常处理与驱动 image 不一致。
+    // CQE detached 结果须保留完整驱动投影，而非只复制 poll 释放 WQE 用的公共字段：
+    // variant、flags、qword2 typed/raw overlay、UD qword3 和 inline payload 都是可观察值，
+    // 丢失任一项会使 poll 后的审计/异常处理与驱动 image 不一致。
     cqe_candidate.variant = decoded_cqe.variant;
     cqe_candidate.byte_len = decoded_cqe.byte_len;
     cqe_candidate.immediate_data = decoded_cqe.immediate_data;
@@ -311,8 +308,7 @@ class rdma_queue_data_projector;
   // 输入/输出及副作用：queue_h/decoded_event/routed_target_h/event_status/secondary_target_h 输入；
   //   candidate/final_success 先清空；构造独立 handle/status/model，并调用 AEQE profile owner 设置。
   // 失败/边界：必要输入缺失、flush 无 live owner 或 CQ/QP kind 不符、非 flush 含 secondary、事件
-  //   类型/primary kind 不匹配、raw factory null/错型或 profile owner 拒绝均失败；失败可能留下
-  //   final_success，最终状态分配失败也可留下 candidate，调用方必须按 status 丢弃，不能进入 scheduler。
+  //   类型/primary kind 不匹配、factory 或 profile owner 拒绝均失败；失败输出可能残留，须丢弃。
   static function automatic rdma_status prepare_event_result_candidate_ex(
     rdma_handle queue_h,
     rdma_hw_model decoded_event,
@@ -418,8 +414,7 @@ class rdma_queue_data_projector;
       ceqe_candidate.cq_pi = source_ceqe.cq_pi;
       ceqe_candidate.cq_pi_wrap = source_ceqe.cq_pi_wrap;
       ceqe_candidate.valid = source_ceqe.valid;
-      // CEQE qword1 是 RC/URC 双布局；候选快照必须复制 URC 的全部字段，
-      // 否则 poll 成功后上层看到的 detached model 会丢失驱动异常上下文。
+      // CEQE qword1 是 RC/URC 双布局；快照须复制 URC 全部字段，否则丢失驱动异常上下文。
       ceqe_candidate.urc_flag = source_ceqe.urc_flag;
       ceqe_candidate.urc_sq_cqe_valid = source_ceqe.urc_sq_cqe_valid;
       ceqe_candidate.urc_rq_cqe_valid = source_ceqe.urc_rq_cqe_valid;
@@ -481,8 +476,8 @@ class rdma_queue_data_projector;
       if (raw_model == null || !$cast(aeqe_candidate, raw_model))
         return make_status_nonfatal(
           RDMA_SC_RESOURCE_EXHAUSTED, "AEQ event model allocation failed");
-      // CQ flush 的 primary miss 是可交付 partial 状态；target_copy 保持 null，
-      // secondary QP 单独写入 result，不能把 QP 投影成 canonical CQ owner。
+      // CQ flush 的 primary miss 是可交付 partial 状态：target_copy 保持 null，
+      // secondary QP 单独写入 result，不能投影成 canonical CQ owner。
       aeqe_candidate.target_h = target_copy;
       aeqe_candidate.event_code = source_aeqe.event_code;
       aeqe_candidate.syndrome = source_aeqe.syndrome;
@@ -494,8 +489,7 @@ class rdma_queue_data_projector;
       aeqe_candidate.wqe_index = source_aeqe.wqe_index;
       aeqe_candidate.wqe_wrap = source_aeqe.wqe_wrap;
       aeqe_candidate.valid = source_aeqe.valid;
-      // AEQE 字段全部来自 defs.h/event.c 的逐位布局。尤其 flags 与拆分
-      // CQN/EQN 必须按原字段传播，不能只保留 qpn/ecode 这组公共标识。
+      // AEQE 字段来自 defs.h/event.c 的逐位布局；flags 与拆分 CQN/EQN 须按原字段传播。
       aeqe_candidate.srfq_en = source_aeqe.srfq_en;
       aeqe_candidate.overflow_flag = source_aeqe.overflow_flag;
       aeqe_candidate.urc_flag = source_aeqe.urc_flag;
@@ -508,9 +502,8 @@ class rdma_queue_data_projector;
       aeqe_candidate.srfqn = source_aeqe.srfqn;
       aeqe_candidate.srfqe_idx = source_aeqe.srfqe_idx;
 
-      // 解码得到的两个物理 qword 是 detached event 的证据，不能因结果物化
-      // 而丢失。与此同时，candidate 的 canonical owner 必须由本次 route
-      // 决策重新冻结，不能从 projected QP target 或默认 enum 猜测。
+      // 解码得到的两个物理 qword 是 detached event 的证据，不能丢失；canonical owner 须由本次
+      // route 决策重新冻结，不能从 projected QP target 或默认 enum 猜测。
       aeqe_candidate.raw_qwords_valid = source_aeqe.raw_qwords_valid;
       aeqe_candidate.raw_qword0 = source_aeqe.raw_qword0;
       aeqe_candidate.raw_qword1 = source_aeqe.raw_qword1;
@@ -538,10 +531,10 @@ class rdma_queue_data_projector;
     return make_status_nonfatal(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：保留单 owner event 值构造入口，显式以 secondary_target_h=null 调用完整投影。
-  // 输入/输出及副作用：queue_h/decoded_event/routed_target_h/event_status 输入，candidate/final_success
-  //   输出；创建结果图但不接触 engine、runtime 或 backing，所有分配顺序沿用 ex 入口。
-  // 失败/边界：沿用 ex 的输入、kind、factory 和 profile 拒绝；不猜测 flush secondary，失败输出须丢弃。
+  // 功能：单 owner event 构造入口，以 secondary_target_h=null 调用完整投影。
+  // 输入/输出及副作用：queue_h/decoded_event/routed_target_h/event_status 输入，candidate/
+  //   final_success 输出；不接触 engine、runtime 或 backing。
+  // 失败/边界：沿用 ex 入口的拒绝条件；不猜测 flush secondary，失败输出须丢弃。
   static function automatic rdma_status prepare_event_result_candidate(
     rdma_handle queue_h,
     rdma_hw_model decoded_event,
@@ -556,12 +549,9 @@ class rdma_queue_data_projector;
     );
   endfunction
 
-  // 功能：identity_key 把 handle 的 kind、Function UID、object ID 和 generation
-  //   编码为 engine associative table 的完整身份键。
-  // 输入/输出及副作用：handle 为输入；返回稳定字符串，只读 handle，不修改索引
-  //   或取得资源所有权。
-  // 失败/边界：handle=null 返回空键；key 不含 cursor/route/reset epoch，相关
-  //   authority 必须由 attachment/runtime 另行校验，不能用空键回退到默认 Function。
+  // 功能：把 handle 的 kind、Function UID、object ID、generation 编码为 engine 表的身份键。
+  // 输入/输出及副作用：handle 输入，返回字符串，只读。
+  // 失败/边界：handle=null 返回空键；键不含 cursor/route/reset epoch，这些由 attachment/runtime 另验。
   static function automatic string identity_key(rdma_handle handle);
     if (handle == null)
       return "";
@@ -570,12 +560,9 @@ class rdma_queue_data_projector;
                      handle.generation);
   endfunction
 
-  // 功能：attachment_key 在完整 handle identity 后追加 runtime kind，使同一 QP 的
-  //   SQ/RQ attachment 使用不同索引且不会共享 logical offset namespace。
-  // 输入/输出及副作用：handle、kind 为输入；返回字符串，只读输入，不插入或删除
-  //   attachment，也不拥有 handle。
-  // 失败/边界：handle=null 返回空键；函数不验证 kind 与 handle resource kind 的
-  //   合法组合，create/lookup attachment 必须在使用前完成该校验。
+  // 功能：在 identity_key 后追加 runtime kind，使同一 QP 的 SQ/RQ attachment 索引互不共享。
+  // 输入/输出及副作用：handle、kind 输入，返回字符串，只读。
+  // 失败/边界：handle=null 返回空键；不校验 kind 与 handle 的组合，由 create/lookup 校验。
   static function automatic string attachment_key(
     rdma_handle handle, rdma_queue_runtime_kind_e kind
   );
@@ -584,11 +571,9 @@ class rdma_queue_data_projector;
     return {identity_key(handle), $sformatf(":%0d", kind)};
   endfunction
 
-  // 功能：cq_recovery_key 为 CQ resize recovery 生成跨 generation 稳定的索引键。
-  // 输入/输出及副作用：handle 为输入；函数只读取 kind、Function UID 和 object ID，
-  // 返回稳定字符串，不修改 attachment、runtime 或 manager。
-  // 失败/边界：空句柄或非 CQ 句柄返回空键；同一 Function/object 的旧代际记录在
-  // cleanup 完成前不得与新的 resize 事务并存。
+  // 功能：为 CQ resize recovery 生成跨 generation 稳定的索引键。
+  // 输入/输出及副作用：只读 kind、Function UID、object ID，返回字符串。
+  // 失败/边界：空句柄或非 CQ 句柄返回空键；旧代际记录在 cleanup 完成前不得与新 resize 事务并存。
   static function automatic string cq_recovery_key(rdma_handle handle);
     if (handle == null || handle.kind != RDMA_RESOURCE_CQ)
       return "";
@@ -597,11 +582,9 @@ class rdma_queue_data_projector;
                      RDMA_QUEUE_RUNTIME_CQ);
   endfunction
 
-  // 功能：same_cq_recovery_identity 比较 CQ recovery 所需的不可变身份，忽略
-  // Function generation，以便 reset 后仍可定位旧 backing 的清理记录。
-  // 输入/输出及副作用：lhs/rhs 为输入；函数只读取句柄字段并返回 bit，不修改任何状态。
-  // 失败/边界：任一句柄为空、类型不是 CQ 或 Function/object identity 不一致时返回 0；
-  // generation 不参与比较，代际合法性由 retry_cq_resize_cleanup 另行约束。
+  // 功能：比较 CQ recovery 的不可变身份，忽略 generation，使 reset 后仍能定位旧 backing 清理记录。
+  // 输入/输出及副作用：lhs/rhs 只读，返回 bit。
+  // 失败/边界：句柄为空、非 CQ 或 Function/object 不一致返回 0；generation 由 retry_cq_resize_cleanup 约束。
   static function automatic bit same_cq_recovery_identity(
     rdma_handle lhs, rdma_handle rhs
   );
@@ -612,15 +595,10 @@ class rdma_queue_data_projector;
            lhs.object_id == rhs.object_id;
   endfunction
 
-  // 功能：same_handle_instance 统一比较 queue-data engine 中两个资源句柄的完整
-  //   incarnation，供 CQE/CEQE/SQE authority 和 attachment 索引复用同一身份谓词。
-  // 输入/输出及副作用：lhs、rhs 为只读 rdma_handle；函数先检查空值，再转发
-  //   rdma_handle::same_instance，返回 kind、Function UID、object ID 与 generation
-  //   的比较结果，不修改 engine、attachment、runtime 或任何资源账本。
-  // 失败/边界：任一句柄为空时返回 0；非空句柄沿用 same_instance 的完整身份
-  //   语义。
-  //   本 helper 不验证 route、reset epoch、attachment 状态或对象 alias，调用方必须
-  //   保留各自的 valid/status 门禁及错误优先级。
+  // 功能：比较两个资源句柄的完整 incarnation，供 CQE/CEQE/SQE authority 和 attachment 索引复用。
+  // 输入/输出及副作用：lhs、rhs 只读；判空后转发 rdma_handle::same_instance，无副作用。
+  // 失败/边界：任一为空返回 0；不验证 route、reset epoch、attachment 状态或 alias，调用方保留
+  //   各自的 valid/status 门禁和错误优先级。
   static function automatic bit same_handle_instance(
     rdma_handle lhs,
     rdma_handle rhs
@@ -630,16 +608,11 @@ class rdma_queue_data_projector;
     return lhs.same_instance(rhs);
   endfunction
 
-  // 功能：attachment_matches_queue_identity 判断 attachment 携带的 queue handle
-  //   是否与 recover_queue 当前目标句柄属于同一完整 incarnation，集中复用
-  //   unclaimed、claimed 和 reservation-only recovery 扫描的身份门禁。
-  // 输入/输出及副作用：attachment、queue_h 为只读输入；函数只读取
-  //   attachment.queue_h 并调用 same_handle_instance，返回 bit，不修改 attachment、
-  //   runtime、recovery、cursor 或任何资源账本，也不取得外部资源所有权。
-  // 失败/边界：attachment、attachment.queue_h 或 queue_h 任一为空返回 0；非空句柄
-  //   必须同时满足 kind、function_uid、object_id 和 generation 完整 identity。该
-  //   helper 不检查 runtime/state、pending/reservation、route 或 reset epoch，调用方
-  //   必须保留各 recovery 分支的状态门禁、错误码和首错顺序。
+  // 功能：判断 attachment.queue_h 与 recover_queue 目标是否同一完整 incarnation，供各 recovery
+  //   扫描复用身份门禁。
+  // 输入/输出及副作用：attachment、queue_h 只读，调用 same_handle_instance，无副作用。
+  // 失败/边界：attachment、attachment.queue_h 或 queue_h 为空返回 0；不检查 runtime/状态/
+  //   reservation/route/epoch，调用方保留各分支的状态门禁和首错顺序。
   static function automatic bit attachment_matches_queue_identity(
     rdma_queue_data_attachment attachment,
     rdma_handle queue_h
@@ -649,16 +622,11 @@ class rdma_queue_data_projector;
     return same_handle_instance(attachment.queue_h, queue_h);
   endfunction
 
-  // 功能：pending_queue_handle_matches_attachment 判断 recovery pending 携带的
-  //   queue handle 与 attachment.queue_h 是否属于同一完整 incarnation，供 device
-  //   producer 与 consumer replay 共用纯 queue-h identity 门禁。
-  // 输入/输出及副作用：pending、attachment 为只读输入；函数只读取两侧 queue_h，
-  //   委托 same_handle_instance 比较 kind、Function UID、object ID 和 generation，
-  //   返回 bit，不修改 pending、attachment、runtime、reservation、route 或 ledger。
-  // 失败/边界：pending、attachment 或任一 queue_h 为空返回 0；非空时只比较完整
-  //   handle incarnation，不比较 pending.kind、producer/device_producer、状态、
-  //   cursor、reservation、route/epoch 或 geometry，调用方必须保留这些阶段门禁及
-  //   原错误码和短路顺序。
+  // 功能：判断 recovery pending 的 queue_h 与 attachment.queue_h 是否同一完整 incarnation，
+  //   供 device producer 与 consumer replay 共用。
+  // 输入/输出及副作用：pending、attachment 只读，委托 same_handle_instance，无副作用。
+  // 失败/边界：任一对象或 queue_h 为空返回 0；只比较句柄 incarnation，不比较 kind/producer/状态/
+  //   cursor/route/epoch/geometry，调用方保留这些门禁与短路顺序。
   static function automatic bit pending_queue_handle_matches_attachment(
     rdma_queue_pending_operation pending,
     rdma_queue_data_attachment attachment
@@ -669,16 +637,11 @@ class rdma_queue_data_projector;
     return same_handle_instance(pending.queue_h, attachment.queue_h);
   endfunction
 
-  // 功能：qp_link_cq_route_matches 按 CQE 的 receive 标志选择 QP link 的唯一
-  //   CQ route，并集中执行 CQ handle 的空值与完整 incarnation 比较，供精确
-  //   QPN、超宽 QPN 投影和 poll 防御性重查共用同一方向谓词。
-  // 输入/输出及副作用：link、cq_h、rq_cqe 为只读输入；函数返回 bit，不修改
-  //   qp link、CQ handle、qp_links、attachment、runtime、cursor 或任何资源账本，
-  //   也不取得外部资源所有权。
-  // 失败/边界：link 或 cq_h 为空时返回 0；rq_cqe=0 只比较 send_cq_h，rq_cqe=1
-  //   只比较 recv_cq_h，所选 route 为空或完整 handle incarnation 不一致时返回 0。
-  //   helper 不检查 QPN 宽度、duplicate 命中、transport、SRQ、route/epoch 或
-  //   caller 的错误码，调用方必须保留这些门禁及其首错顺序。
+  // 功能：按 CQE 的 receive 标志选择 QP link 的唯一 CQ route 并比较 CQ handle 完整 incarnation，
+  //   供精确 QPN、超宽 QPN 投影和 poll 重查共用。
+  // 输入/输出及副作用：link、cq_h、rq_cqe 只读，返回 bit，无副作用。
+  // 失败/边界：link 或 cq_h 为空返回 0；rq_cqe=0 只比 send_cq_h，=1 只比 recv_cq_h，所选 route
+  //   为空或不一致返回 0；不检查 QPN 宽度/duplicate/transport/SRQ/route/epoch，由调用方保留。
   static function automatic bit qp_link_cq_route_matches(
     rdma_queue_data_qp_link link,
     rdma_handle cq_h,
@@ -693,10 +656,9 @@ class rdma_queue_data_projector;
            same_handle_instance(link.send_cq_h, cq_h);
   endfunction
 
-  // 功能：比较两个完整 route key 的 Host/root/segment/BDF 字段，确认 recovery
-  // 仍位于原 Function 的 fabric 路径。
-  // 输入/输出及副作用：lhs/rhs 为输入值；函数只读路由字段并返回 bit。
-  // 失败/边界：任一路由字段不一致时返回 0，不修改 recovery 或 attachment。
+  // 功能：比较两个 route key 的 Host/root/segment/BDF 字段，确认 recovery 仍在原 Function 路径。
+  // 输入/输出及副作用：lhs/rhs 只读，返回 bit。
+  // 失败/边界：任一字段不一致返回 0。
   static function automatic bit same_route(rdma_route_key_t lhs,
                                     rdma_route_key_t rhs);
     return lhs.host_topology_key == rhs.host_topology_key &&
@@ -704,16 +666,11 @@ class rdma_queue_data_projector;
            rdma_bdf_same(lhs.bdf, rhs.bdf);
   endfunction
 
-  // 功能：cqc_shadow_context_geometry_valid 集中校验 CQC shadow context
-  //   backing 的资源类型、CQ local ID、slot 大小以及 shadow view 的固定偏移和长度，
-  //   确认该 context_ref 可以作为驱动 CQC shadow ABI 的几何 authority。
-  // 输入/输出及副作用：context_ref、local_id 为只读输入；函数仅读取
-  //   resource_kind、local_id、slot_length、shadow_view_offset 和
-  //   shadow_view_length，返回 bit，不创建对象、不访问 runtime/backing、不修改
-  //   context_ref 或任何 engine 状态，也不取得外部资源所有权。
-  // 失败/边界：context_ref 为空，或五个几何字段任一不符合 CQ/固定 ABI 值时返回
-  //   0；本 helper 不检查 context_backing、attachment kind、pending 阶段、owner、
-  //   route/epoch 或 release authority，调用方必须保留这些门禁及各自错误优先级。
+  // 功能：校验 CQC shadow context backing 的资源类型、CQ local ID、slot 大小及 shadow view 固定
+  //   偏移和长度，确认 context_ref 可作 CQC shadow ABI 的几何 authority。
+  // 输入/输出及副作用：context_ref、local_id 只读，返回 bit，无副作用。
+  // 失败/边界：context_ref 为空或任一几何字段不符合 CQ/固定 ABI 值返回 0；不检查 context_backing、
+  //   attachment kind、pending 阶段、owner、route/epoch，调用方保留这些门禁。
   static function automatic bit cqc_shadow_context_geometry_valid(
     rdma_context_backing_ref context_ref,
     int unsigned local_id
@@ -727,16 +684,11 @@ class rdma_queue_data_projector;
            context_ref.shadow_view_length == RDMA_CQC_SHADOW_AREA_SIZE;
   endfunction
 
-  // 功能：cqc_shadow_context_owner_matches 比较 CQC shadow context 冻结的
-  //   Function owner 与当前 binding handle 的三项生命周期身份，统一 prepare
-  //   与 replay 两条 shadow 路径的 stale-owner 判定。
-  // 输入/输出及副作用：context_ref、function_h 为只读输入；函数读取 owner 的
-  //   function_uid、object_id 和 generation 并返回 bit，不创建或修改 handle、
-  //   context、runtime、pending、backing 或任何账本，也不取得资源所有权。
-  // 失败/边界：context_ref、context_ref.owner 或 function_h 为空时返回 0；任一
-  //   三字段不相等时返回 0。该 helper 刻意不比较 owner.kind、CQC 几何、route、
-  //   reset epoch、release authority 或 context_backing，调用方必须保留现有 null
-  //   短路、geometry/route/epoch 门禁以及 STALE_GENERATION 错误优先级。
+  // 功能：比较 CQC shadow context 冻结的 Function owner 与当前 binding 的三项生命周期身份，
+  //   统一 prepare 与 replay 的 stale-owner 判定。
+  // 输入/输出及副作用：context_ref、function_h 只读，比较 function_uid/object_id/generation。
+  // 失败/边界：context_ref、owner 或 function_h 为空、任一字段不等返回 0；不比较 owner.kind、
+  //   几何、route、epoch 等，调用方保留 null 短路与 STALE_GENERATION 错误优先级。
   static function automatic bit cqc_shadow_context_owner_matches(
     rdma_context_backing_ref context_ref,
     rdma_function_handle function_h
@@ -748,13 +700,11 @@ class rdma_queue_data_projector;
            context_ref.owner.generation == function_h.generation;
   endfunction
 
-  // 功能：same_cursor_value 比较两个 reservation/cursor 快照的 index 与 wrap
-  //   值，供 device publish、device recovery 和 unclaimed abort 复用同一游标值判断。
-  // 输入/输出及副作用：lhs、rhs 为输入快照；函数只读取两个字段并返回 bit，不查询
-  //   runtime、不验证 reservation owner、不取得锁，也不修改 cursor、pending 或账本。
-  // 失败/边界：任一快照为空时返回 0；函数不判断 reservation_valid、queue identity、
-  //   route/epoch 或 runtime state，调用方必须先保留这些 authority/status 门禁，不能
-  //   将相同的 index/wrap 当作拥有同一 reservation 的证明。
+  // 功能：比较两个 reservation/cursor 快照的 index 与 wrap，供 device publish/recovery 和
+  //   unclaimed abort 复用。
+  // 输入/输出及副作用：lhs、rhs 只读，返回 bit，无副作用。
+  // 失败/边界：任一为空返回 0；不判断 reservation_valid/identity/route/epoch，相同 index/wrap
+  //   不能证明拥有同一 reservation。
   static function automatic bit same_cursor_value(
     rdma_queue_cursor_snapshot lhs,
     rdma_queue_cursor_snapshot rhs
@@ -764,16 +714,11 @@ class rdma_queue_data_projector;
     return lhs.index == rhs.index && lhs.wrap == rhs.wrap;
   endfunction
 
-  // 功能：pending_route_epoch_matches 对比 recovery pending 冻结的 route/epoch
-  //   与 runtime 当前查询结果，集中复用 device/consumer retry 的 authority 门禁。
-  // 输入/输出及副作用：pending、runtime_route、runtime_route_valid、runtime_epoch
-  //   和 runtime_epoch_valid 为输入；函数只读取 valid 位、route 与 reset_epoch，
-  //   返回 bit，不查询 runtime、不修改 pending/attachment，也不触碰 backing 或账本；
-  //   route 字段由 same_route 统一比较，避免各调用点重复展开 Host/root/segment/BDF
-  //   的完整路径语义。
-  // 失败/边界：pending 为空、任一 route/epoch valid 位为 0、或 same_route/epoch
-  //   比较失败时返回 0；函数不额外验证 route key 内容，调用方保留原有 status
-  //   和错误优先级，并负责在查询失败时先行返回。
+  // 功能：对比 recovery pending 冻结的 route/epoch 与 runtime 当前查询结果，复用于
+  //   device/consumer retry 的 authority 门禁。
+  // 输入/输出及副作用：pending、runtime_route/epoch 及 valid 位只读；route 由 same_route 比较。
+  // 失败/边界：pending 为空、任一 valid 位为 0 或 route/epoch 不符返回 0；不验证 route key
+  //   内容，调用方保留错误优先级并先处理查询失败。
   static function automatic bit pending_route_epoch_matches(
     rdma_queue_pending_operation pending,
     rdma_route_key_t runtime_route,
@@ -788,15 +733,12 @@ class rdma_queue_data_projector;
            pending.reset_epoch == runtime_epoch;
   endfunction
 
-  // 功能：apply_host_producer_pending_route_epoch 把 reservation admission 时冻结的
-  //   route/reset epoch 写入刚构造的 host-producer pending，覆盖 make_pending 对
-  //   当前 runtime 的兼容查询结果。
-  // 输入/输出及副作用：pending 为待发布的本地 evidence；route、epoch 和 valid 位为
-  //   caller 在 reserve 前取得的值。函数只修改 pending 的四个 authority 字段，不
-  //   访问 runtime/backing/ledger，也不取得任何生命周期所有权。
-  // 失败/边界：pending 为空、valid 位不全、route 非法时返回 0 并清空 pending
-  //   authority；成功后 replay 可区分 reservation incarnation，不能把当前 runtime
-  //   查询结果当作旧事务的原始证据。
+  // 功能：把 reservation admission 时冻结的 route/reset epoch 写入新建的 host-producer pending，
+  //   覆盖 make_pending 对当前 runtime 的兼容查询结果。
+  // 输入/输出及副作用：pending 为待发布 evidence；route、epoch、valid 位为 caller 在 reserve 前取得；
+  //   只修改 pending 的四个 authority 字段。
+  // 失败/边界：pending 为空、valid 位不全或 route 非法返回 0 并清空 authority；成功后 replay 可
+  //   区分 reservation incarnation。
   static function automatic bit apply_host_producer_pending_route_epoch(
     rdma_queue_pending_operation pending,
     rdma_route_key_t route,

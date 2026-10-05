@@ -46,83 +46,65 @@ class rdma_queue_backing_access extends uvm_object;
     qp_ref = null;
   endfunction
 
-  // 功能：把调用方提供的参数拒绝原因封装为 INVALID_ARGUMENT status，供 backing
-  //   access 的公开入口保持一致错误类别。
-  // 输入/输出及副作用：message 为输入；函数只创建并返回包含该文本的 rdma_status，
-  //   不修改 access、mapping、账本或外部 adapter。
-  // 失败/边界：status 工厂本身不在此处追加校验；任意 message（包括空文本）都会被
-  //   作为 INVALID_ARGUMENT 返回，调用方负责决定具体拒绝条件。
+  // 功能：构造 INVALID_ARGUMENT status。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status，无其他副作用。
+  // 失败/边界：无；任意 message（含空）都返回 INVALID_ARGUMENT。
   protected function rdma_status invalid(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：把当前 access 尚未配置、后端返回 null 等生命周期/内部状态拒绝封装为
-  //   INVALID_STATE status，保留调用方的诊断文本。
-  // 输入/输出及副作用：message 为输入；函数只创建并返回 rdma_status，不修改 access、
-  //   mapping、账本或外部 adapter。
-  // 失败/边界：无论 message 内容如何都返回 INVALID_STATE；本 helper 不判断状态原因，
-  //   具体拒绝条件仍由调用方负责说明。
+  // 功能：构造 INVALID_STATE status（未配置、后端返回 null 等）。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无；不判断状态原因。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：把 logical span、mapping 或 IOVA 范围无法转换的原因封装为
-  //   DMA_TRANSLATION status，供访问路径统一报告地址错误。
-  // 输入/输出及副作用：message 为输入；函数只创建并返回 rdma_status，不修改 access、
-  //   mapping、账本或外部 adapter。
-  // 失败/边界：任意 message 都按 DMA_TRANSLATION 返回；本 helper 不自行判断溢出或对齐，
-  //   调用方必须在调用前完成对应检查。
+  // 功能：构造 DMA_TRANSLATION status（span/mapping/IOVA 无法转换）。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无；溢出和对齐由调用方先检查。
   protected function rdma_status dma_error(string message);
     return rdma_status::make(RDMA_SC_DMA_TRANSLATION, message);
   endfunction
 
-  // 功能：检查从 first 开始、长度为 length 的半开地址范围是否为非空且满足本层
-  //   的 64-bit exclusive-end 上限，用于 backing coverage 和 mapping-relative span。
-  // 输入/输出及副作用：first、length 为输入；函数返回 bit，只做算术比较，不修改
-  //   access、账本、mapping 或外部资源。
-  // 失败/边界：length 为 0 或 first 大于 `64'hffff_ffff_ffff_ffff-length` 时返回 0；
-  //   该 helper 不检查 qword 对齐，也不把调用方的单位转换为 bytes。
+  // 功能：检查半开范围 [first, first+length) 非空且不超过 64-bit exclusive-end 上限。
+  // 输入/输出及副作用：纯算术，返回 bit。
+  // 失败/边界：length 为 0 或 first 大于 `64'hffff_ffff_ffff_ffff-length` 返回 0；不检查对齐。
   protected function bit add_ok(longint unsigned first,
                                 longint unsigned length);
     return length != 0 && first <= 64'hffff_ffff_ffff_ffff - length;
   endfunction
 
-  // 功能：检查 first 加 length 的地址计算不会超过本层允许的 64-bit exclusive-end
-  //   上限，供 IOVA 起点和 span coverage 的溢出门禁复用。
-  // 输入/输出及副作用：first、length 为输入；函数返回 bit，不修改 access、账本、
-  //   mapping 或外部资源。
-  // 失败/边界：仅当 first 大于 `64'hffff_ffff_ffff_ffff-length` 时返回 0；length=0
-  //   可通过此纯算术检查，是否允许空范围由调用方另行决定。
+  // 功能：检查 first+length 不超过 64-bit exclusive-end 上限，用于 IOVA 起点和 span 溢出门禁。
+  // 输入/输出及副作用：纯算术，返回 bit。
+  // 失败/边界：仅 first 大于 `64'hffff_ffff_ffff_ffff-length` 返回 0；length=0 通过，是否允许由调用方定。
   protected function bit add_no_overflow(longint unsigned first,
                                          longint unsigned length);
     return first <= 64'hffff_ffff_ffff_ffff - length;
   endfunction
 
-  // 功能：校验一次 logical backing access 的长度、exclusive-end 和 qword 对齐，使后续
-  //   span 解析可以按固定 DMA transaction 边界工作。
-  // 输入/输出及副作用：offset、length 为输入；函数返回 rdma_status，只读本地算术，不
-  //   修改 backing、cursor、账本或外部 adapter。
+  // 功能：校验一次 logical backing access 的长度、exclusive-end 和 qword 对齐。
+  // 输入/输出及副作用：offset、length 输入，返回 status，无副作用。
   // 失败/边界：length=0 返回 INVALID_ARGUMENT；offset+length 超界返回 DMA_TRANSLATION；
-  //   offset 或 length 非 8-byte 对齐返回 INVALID_ARGUMENT；通过时返回 success。
+  //   offset 或 length 非 8-byte 对齐返回 INVALID_ARGUMENT。
   protected function rdma_status range_shape(longint unsigned offset,
                                               longint unsigned length);
     if (length == 0)
       return invalid("logical backing access length is zero");
     if (!add_ok(offset, length))
       return dma_error("logical backing access range overflows");
-    // 中文设计：所有受支持的固定 queue image 至少为一个 qword 且按 qword 对齐；
-    // 同时拒绝调用方在任意 byte 位置切分 span，保证 DMA transaction 边界确定。
+    // 固定 queue image 至少一个 qword 且按 qword 对齐；拒绝在任意 byte 处切分 span，
+    // 保证 DMA transaction 边界确定。
     if ((offset & 64'h7) != 0 || (length & 64'h7) != 0)
       return invalid("logical backing access range is unaligned");
     return rdma_status::success();
   endfunction
 
-  // 功能：验证 Function owner 与 Host-memory adapter，建立 backing access 的运行边界，
-  //   并把 owner 保存为 detached handle snapshot。
-  // 输入/输出及副作用：function_h、api 为输入；成功时更新 owner、host_mem 并清空旧
-  //   queue_ref/qp_ref，host_mem 仍为调用方拥有的非拥有引用，返回 success status。
-  // 失败/边界：Function 为空/类型非 FUNCTION、generation 为 0、api 为空或 owner
-  //   snapshot 失败时返回对应 INVALID_ARGUMENT/STALE_GENERATION/INVALID_STATE，旧配置保持不变。
+  // 功能：验证 Function owner 与 Host-memory adapter，建立运行边界并保存 owner 的 detached 快照。
+  // 输入/输出及副作用：function_h、api 输入；成功时更新 owner/host_mem 并清空旧 queue_ref/qp_ref，
+  //   host_mem 为非拥有引用。
+  // 失败/边界：Function 为空/非 FUNCTION、generation 为 0、api 为空或快照失败时返回
+  //   INVALID_ARGUMENT/STALE_GENERATION/INVALID_STATE，旧配置不变。
   function rdma_status configure(rdma_function_handle function_h,
                                  rdma_host_mem_api api);
     rdma_function_handle snapshot;
@@ -144,12 +126,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：校验 queue backing reference 的完整性和 Function incarnation，并把它挂接到
-  //   access 作为后续 logical span 的非拥有来源。
-  // 输入/输出及副作用：backing 为输入；成功时只写 queue_ref，不复制或释放 backing
-  //   mapping，返回 success status。
-  // 失败/边界：access 未 configure、已有 queue/QP attachment、backing 为空、validate
-  //   返回 null/失败、mapping/Function 缺失或 Function instance 不一致时拒绝，旧引用保持不变。
+  // 功能：校验 queue backing reference 与 Function incarnation，挂接为 logical span 的非拥有来源。
+  // 输入/输出及副作用：backing 输入；成功时只写 queue_ref，不复制或释放 mapping。
+  // 失败/边界：未 configure、已有 queue/QP attachment、backing 为空、validate 失败/null、
+  //   mapping/Function 缺失或 Function instance 不一致时拒绝，旧引用不变。
   function rdma_status attach_queue(rdma_queue_backing_ref backing);
     rdma_status status;
     if (owner == null || host_mem == null)
@@ -173,12 +153,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：校验 QP backing reference 的完整性和 Function incarnation，并把它挂接到
-  //   access 作为统一 queue-view 解析的非拥有来源。
-  // 输入/输出及副作用：backing 为输入；成功时只写 qp_ref，不复制或释放 backing
-  //   mapping，返回 success status。
-  // 失败/边界：access 未 configure、已有 queue/QP attachment、backing 为空、validate
-  //   返回 null/失败、mapping/Function 缺失或 Function instance 不一致时拒绝，旧引用保持不变。
+  // 功能：校验 QP backing reference 与 Function incarnation，挂接为 queue-view 解析的非拥有来源。
+  // 输入/输出及副作用：backing 输入；成功时只写 qp_ref，不复制或释放 mapping。
+  // 失败/边界：同 attach_queue：未 configure、已有 attachment、backing 无效或 Function 不一致时
+  //   拒绝，旧引用不变。
   function rdma_status attach_qp(rdma_qp_backing_ref backing);
     rdma_status status;
     if (owner == null || host_mem == null)
@@ -199,24 +177,18 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：清除当前 access 对 queue/QP backing 的借用引用，使后续 resolve 在重新
-  //   attach 前 fail-closed。
-  // 输入/输出及副作用：无输入；函数把 queue_ref、qp_ref 置 null，不修改 owner、
-  //   host_mem、mapping 内容或外部生命周期账本。
-  // 失败/边界：clear 是无条件幂等操作，没有 owner/generation 错误分支；调用方若在
-  //   clear 后继续访问，resolve 会报告未附着 backing。
+  // 功能：清除 queue/QP backing 借用引用，之后 resolve 在重新 attach 前 fail-closed。
+  // 输入/输出及副作用：queue_ref、qp_ref 置 null；不改 owner、host_mem、mapping。
+  // 失败/边界：无条件幂等；clear 后 resolve 报告未附着 backing。
   function void clear();
     queue_ref = null;
     qp_ref = null;
   endfunction
 
-  // 功能：计算 queue backing primary segment 与 additional segments 的连续 logical
-  //   coverage 总长度，供 resolve_ref 判断请求是否落在完整 backing 内。
-  // 输入/输出及副作用：backing_ref 为输入，total 为输出；函数只读 segment 元数据，
-  //   不推进 cursor、不改 backing 或外部资源所有权。
-  // 失败/边界：backing/mapping 缺失、primary logical offset 非零、segment 为空/长度为零/
-  //   不连续或 coverage 溢出时返回 INVALID_STATE、INVALID_ARGUMENT 或 DMA_TRANSLATION；
-  //   成功时 total 包含 primary 与所有 additional segment 长度。
+  // 功能：计算 queue backing primary 与 additional segments 的连续 logical coverage 总长度。
+  // 输入/输出及副作用：backing_ref 输入，total 输出；只读 segment 元数据。
+  // 失败/边界：backing/mapping 缺失、primary logical offset 非零、segment 为空/长度零/不连续或
+  //   溢出时返回 INVALID_STATE、INVALID_ARGUMENT 或 DMA_TRANSLATION。
   protected function rdma_status reference_total(
       rdma_queue_backing_ref backing_ref,
       output longint unsigned total);
@@ -238,13 +210,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：把 QP backing 及其 additional segments 包装成 queue backing 视图，使公共
-  //   resolve_ref 能按统一 logical offset 解析 SQ/RQ/URC span。
-  // 输入/输出及副作用：backing_ref 为输入，projected 为输出；函数创建新的 projected
-  //   ref，但其中 mapping/segment 仍为非拥有引用，不取得或释放 QP backing 所有权。
-  // 失败/边界：backing/mapping 缺失或长度为零返回 INVALID_STATE，projection factory
-  //   失败返回 RESOURCE_EXHAUSTED，任一 additional segment 为空返回 INVALID_ARGUMENT；
-  //   函数不在此处验证 segment 连续性，后续 reference_total 负责该门禁。
+  // 功能：把 QP backing 及 additional segments 包装成 queue backing 视图，供 resolve_ref 统一解析。
+  // 输入/输出及副作用：backing_ref 输入，projected 输出；新建 ref，mapping/segment 仍为非拥有引用。
+  // 失败/边界：backing/mapping 缺失或长度为零返回 INVALID_STATE；factory 失败返回
+  //   RESOURCE_EXHAUSTED；additional segment 为空返回 INVALID_ARGUMENT；连续性由 reference_total 查。
   protected function rdma_status qp_reference_as_queue(
       rdma_qp_backing_ref backing_ref,
       output rdma_queue_backing_ref projected);
@@ -271,12 +240,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：按 primary→additional 的规范顺序，把 logical offset/length 切分为一个或
-  //   多个 mapping-relative DMA span，并将每个 span 的 logical 与 mapping 偏移写入输出数组。
-  // 输入/输出及副作用：backing_ref、offset、length 为输入，spans 为输出；函数先清空
-  //   spans，只读 backing 元数据并返回 status，不取得 mapping 或 Host-memory 所有权。
-  // 失败/边界：range shape、coverage、请求边界、mapping-relative 加法或 span factory
-  //   失败时返回错误并保持 spans 为空/不完整；没有重排 segment，也不接受空洞覆盖。
+  // 功能：按 primary→additional 顺序把 logical offset/length 切成 mapping-relative DMA span。
+  // 输入/输出及副作用：backing_ref、offset、length 输入，spans 输出（先清空）；只读 backing 元数据。
+  // 失败/边界：range shape、coverage、边界、mapping-relative 加法或 span factory 失败时返回错误，
+  //   spans 为空/不完整；不重排 segment，不接受空洞。
   protected function rdma_status resolve_ref(
       rdma_queue_backing_ref backing_ref,
       longint unsigned offset,
@@ -305,8 +272,7 @@ class rdma_queue_backing_access extends uvm_object;
       return dma_error("logical backing access is outside backing coverage");
     request_end = offset + length;
 
-    // 中文设计：严格按 primary 后接 additional segment 的规范顺序遍历；
-    // reference_total 已证明逻辑覆盖连续，因此生成的 span 不允许出现空洞。
+    // 严格按 primary 后接 additional 遍历；reference_total 已证明覆盖连续，span 不应有空洞。
     segment_start = 0;
     mapping = backing_ref.mapping;
     mapping_offset = backing_ref.mapping_offset;
@@ -344,12 +310,10 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：根据当前 access 已附着的 queue 或 QP backing，解析一次 logical offset/length
-  //   请求并返回可供 Host-memory 访问的 DMA spans。
-  // 输入/输出及副作用：offset、length 为输入，spans 为输出；函数先清空 spans，必要时
-  //   创建临时 QP projection，不修改 backing、cursor 或外部资源所有权。
-  // 失败/边界：owner/host_mem 缺失或没有 attachment 时返回 INVALID_STATE；range、
-  //   projection、coverage 或 span 解析失败时原样返回错误，不能回退到另一种 backing。
+  // 功能：按已附着的 queue 或 QP backing 解析 logical offset/length，返回 DMA spans。
+  // 输入/输出及副作用：offset、length 输入，spans 输出（先清空）；QP 时创建临时 projection。
+  // 失败/边界：owner/host_mem 缺失或无 attachment 返回 INVALID_STATE；其余解析失败原样返回，
+  //   不回退到另一种 backing。
   function rdma_status resolve(
       longint unsigned offset,
       longint unsigned length,
@@ -369,12 +333,10 @@ class rdma_queue_backing_access extends uvm_object;
     return resolve_ref(projected, offset, length, spans);
   endfunction
 
-  // 功能：检查单个 span 的 mapping-relative 范围、IOVA 加法和 direction 对应权限，
-  //   再调用 mapping.check_access 证明 owner 可执行该 DMA 操作。
-  // 输入/输出及副作用：span、direction 为输入；函数读取 owner 和 mapping authority，
-  //   返回 rdma_status，不修改 span、mapping、cursor 或外部资源。
-  // 失败/边界：span/mapping 为空或长度为零返回 INVALID_ARGUMENT；超出 mapping、IOVA
-  //   溢出返回 DMA_TRANSLATION；check_access 返回 null 时返回 INVALID_STATE，其余状态原样传播。
+  // 功能：检查单个 span 的 mapping-relative 范围、IOVA 加法和方向权限，再调 mapping.check_access。
+  // 输入/输出及副作用：span、direction 输入；读取 owner 和 mapping authority，无写副作用。
+  // 失败/边界：span/mapping 为空或长度为零返回 INVALID_ARGUMENT；超 mapping 或 IOVA 溢出返回
+  //   DMA_TRANSLATION；check_access 返回 null 为 INVALID_STATE，其余状态原样传播。
   protected function rdma_status check_span(
       rdma_queue_backing_span span,
       rdma_dma_direction_e direction);
@@ -411,12 +373,9 @@ class rdma_queue_backing_access extends uvm_object;
     return status;
   endfunction
 
-  // 功能：逐个检查 spans 的 DMA 权限并累计其 logical coverage，作为真正 Host-memory
-  //   读写前的无副作用预检。
-  // 输入/输出及副作用：spans、direction 为输入；函数只调用 check_span 并返回 status，
-  //   不预留 slot、不修改 mapping、cursor 或外部账本。
-  // 失败/边界：任一 span 校验失败、累计 coverage 溢出、spans 为空或总长度为零时返回
-  //   对应错误；全部通过才返回 success，且不会替后续 backend 操作回滚副作用。
+  // 功能：逐个检查 spans 的 DMA 权限并累计 logical coverage，作为读写前的无副作用预检。
+  // 输入/输出及副作用：spans、direction 输入；只调用 check_span。
+  // 失败/边界：任一 span 失败、coverage 溢出、spans 为空或总长为零时返回错误；不回滚后端副作用。
   protected function rdma_status preflight_spans(
       rdma_queue_backing_span spans[$],
       rdma_dma_direction_e direction);
@@ -436,13 +395,13 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 设计说明：两种写入口的预检/空状态策略不同，继续留在入口；这里只共用 payload
-  //   切片和 backend 循环。每个 span 的字段仍在实际调用时读取，不跨 adapter 回调缓存。
-  // 功能：write_spans 把 data 按已准入 spans 的顺序切片并写入 Host-memory。
-  // 输入/输出及副作用：spans/data/null_message 输入；backend_write_started 先置 0，
-  //   首次调用 host_mem.write 前置 1；可能留下成功写入前缀，不修改 cursor 或 ownership。
-  // 失败/边界：caller 必须完整预检 spans；后端 null 用原 null_message 返回 INVALID_STATE，
-  //   非成功状态原引用返回且不继续后续 span；不回滚已发生写入，不创建恢复记录。
+  // 设计说明：两种写入口的预检/空状态策略不同，留在入口；此处只共用 payload 切片和 backend 循环，
+  //   span 字段在调用时读取，不跨 adapter 回调缓存。
+  // 功能：按 spans 顺序切片 data 并写入 Host-memory。
+  // 输入/输出及副作用：spans/data/null_message 输入；backend_write_started 先置 0，首次 host_mem.write
+  //   前置 1；可能留下成功写入的前缀。
+  // 失败/边界：caller 须已预检；后端 null 以 null_message 返回 INVALID_STATE，非成功状态原样返回
+  //   且不继续后续 span；不回滚、不建恢复记录。
   protected function rdma_status write_spans(
     rdma_queue_backing_span spans[$], byte data[], string null_message,
     output bit backend_write_started
@@ -468,11 +427,13 @@ class rdma_queue_backing_access extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 设计说明：access 实例由 UVM factory 创建；保留 virtual 分派可让隔离测试替换
-  //   未开始 backend 的预检结果，而生产实现仍在本函数集中执行完整 span 校验。
-  // 功能：write_device 按 RDMA_DMA_DEVICE_WRITE 方向预检并将调用方 payload 依次写入所有 backing span，供 Host-memory device producer 发布使用。
-  // 输入/输出及副作用：offset、data 为输入，backend_write_started 为输出；函数先解析并完整预检 spans，再按逻辑顺序调用 host_mem.write()，首次进入 backend 前将 backend_write_started 置 1；不更新 runtime、mapping ownership 或 cursor。
-  // 失败/边界：resolve/preflight 或任一 backend write 返回 null status 时统一为 RDMA_SC_INVALID_STATE；预检失败时 backend_write_started 保持 0 且不发起任何写调用，backend 非成功状态原样传播且后续 span 不再写入。
+  // 设计说明：access 由 UVM factory 创建；保留 virtual 使隔离测试可替换未开始 backend 的预检结果。
+  // 功能：write_device 按 RDMA_DMA_DEVICE_WRITE 预检并把 payload 依次写入所有 backing span，
+  //   供 Host-memory device producer 发布使用。
+  // 输入/输出及副作用：offset、data 输入，backend_write_started 输出；先解析并完整预检，再顺序
+  //   host_mem.write，首次进入 backend 前置 1；不更新 runtime、ownership 或 cursor。
+  // 失败/边界：resolve/preflight 或后端返回 null status 时为 INVALID_STATE；预检失败时
+  //   backend_write_started 保持 0 且不写；后端非成功状态原样传播，后续 span 不再写。
   virtual function rdma_status write_device(
       longint unsigned offset,
       byte data[],
@@ -496,11 +457,10 @@ class rdma_queue_backing_access extends uvm_object;
                        backend_write_started);
   endfunction
 
-  // 功能：write 为 host 发布 SQ/RQ 等条目，按 DEVICE_READ 权限预检后写入所有 spans。
-  // 输入/输出及副作用：offset/data 输入，返回后端或范围/权限 status；只写 backing bytes，
-  //   不推进 PI/CI、不修改 ledger/pending，也不取得 mapping 所有权。
-  // 失败/边界：resolve/preflight 失败零写入，沿用其非空 status 契约；后端 null 归一化
-  //   INVALID_STATE，其他错误原样返回；中途失败可留下前缀，恢复由调用方处理。
+  // 功能：host 发布 SQ/RQ 等条目，按 DEVICE_READ 权限预检后写入所有 spans。
+  // 输入/输出及副作用：offset/data 输入；只写 backing bytes，不推进 PI/CI。
+  // 失败/边界：resolve/preflight 失败零写入；后端 null 为 INVALID_STATE，其他错误原样返回；
+  //   中途失败可留下前缀，恢复由调用方处理。
   function rdma_status write(longint unsigned offset, byte data[]);
     rdma_queue_backing_span spans[$];
     rdma_status status;
@@ -516,8 +476,8 @@ class rdma_queue_backing_access extends uvm_object;
                        backend_write_started);
   endfunction
 
-  // 设计说明：consumer read 与 host readback 的搬运相同，区别仅为 caller 指定的
-  //   DMA 权限和原诊断。先预检全部 spans，再按顺序读取，禁止交付失败的部分 payload。
+  // 设计说明：consumer read 与 host readback 搬运相同，仅 caller 指定的 DMA 权限和诊断不同；
+  //   先预检全部 spans 再读取，禁止交付失败的部分 payload。
   // 功能：read_with_permission 解析 offset/length，以 direction 完整预检后拼接各段 bytes。
   // 输入/输出及副作用：offset/length/direction/operation_name 输入，data 先清空；成功输出
   //   独立字节数组，只调用 Host-memory read，不修改 mapping/cursor/ledger。

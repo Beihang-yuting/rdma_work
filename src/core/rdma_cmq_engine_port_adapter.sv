@@ -1,10 +1,7 @@
 // 目录：核心执行层 core/rdma_cmq_engine_port_adapter.sv。
-// 职责：实现 rdma_cmq_engine_port_adapter 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_cmq_engine_port_adapter.sv 属于核心执行层，负责队列、控制面、资源和恢复流程。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：把 rdma_cmq_port 适配到按 Function 绑定的 rdma_cmq_engine，并校验 engine 返回的 observed result。
+// 依赖：rdma_cmq_engine、rdma_cmq_port 及 CMQ 共享值比较/shape 契约。
+// 所有权与生命周期：engines 只保存非拥有引用；result/ticket/completion 由调用方持有。
 
 class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
   `uvm_object_utils(rdma_cmq_engine_port_adapter)
@@ -16,46 +13,46 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
   // hardware boundary.
   protected bit last_execute_no_submit_proven;
 
-  // 功能：构造 rdma_cmq_engine_port_adapter，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：last_execute_no_submit_proven=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_cmq_engine_port_adapter 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 adapter，清除 no-submit 证明标志。
+  // 输入/输出及副作用：name 为对象名。
+  // 失败/边界：无。
   function new(string name = "rdma_cmq_engine_port_adapter");
     super.new(name);
     last_execute_no_submit_proven = 1'b0;
   endfunction
 
-  // 功能：在 rdma_cmq_engine_port_adapter 中，last_execute_definitive_no_submit 只读查询当前运行时/测试账本，返回槽位、对象或恢复记录的快照而不推进事务。
-  // 输入/输出及副作用：无显式参数；last_execute_definitive_no_submit 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：last_execute_definitive_no_submit 的结果直接由 return last_execute_no_submit_proven 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：返回最近一次 execute 是否确定未提交。
+  // 输入/输出及副作用：只读 last_execute_no_submit_proven。
+  // 失败/边界：无。
   virtual function bit last_execute_definitive_no_submit();
     return last_execute_no_submit_proven;
   endfunction
 
-  // 功能：在 rdma_cmq_engine_port_adapter 中，function_key 把 Function/对象身份、代际和游标字段拼成稳定的查找键，供登记表去重和恢复路由使用。
-  // 输入/输出及副作用：owner（输入）；function_key 读取 owner 并使用输入参数和固定枚举/常量；函数返回 string，不取得调用方资源所有权。
-// 失败/边界：function_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：由 Function handle 生成绑定表 key（UID:object_id:generation）。
+  // 输入/输出及副作用：owner 只读；返回字符串。
+  // 失败/边界：调用方须保证 owner 非空。
   protected function string function_key(rdma_function_handle owner);
     return $sformatf("%016h:%08h:%08h", owner.function_uid,
                      owner.object_id, owner.generation);
   endfunction
 
-  // 功能：在 rdma_cmq_engine_port_adapter 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；invalid_argument 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_ARGUMENT 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：在 rdma_cmq_engine_port_adapter 中，invalid_state 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；invalid_state 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_state 返回 RDMA_SC_INVALID_STATE；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_STATE 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_state(string message);
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：保留 adapter 的 protected detached-handle 比较 seam，转发到 CMQ 共享值契约。
-  // 输入/输出及副作用：lhs/rhs 为只读 handle；返回 kind、Function UID、object ID 与 generation 比较结果，不修改 adapter。
-  // 失败/边界：null 或任一字段含 X/Z 时共享契约返回 0；转发不推断 observed graph 的 alias topology。
+  // 功能：转发到 CMQ 共享契约，比较两个 handle 的值。
+  // 输入/输出及副作用：lhs/rhs 只读；返回比较结果。
+  // 失败/边界：null 或字段含 X/Z 时返回 0。
   protected function bit same_handle_value(
     input rdma_handle lhs,
     input rdma_handle rhs
@@ -63,12 +60,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     return rdma_cmq_same_handle_value(lhs, rhs);
   endfunction
 
-  // 功能：比较两个 detached ticket 的完整公开值，确认 completion 与 operation
-  //   result 指向同一 immutable command authority。
-  // 输入/输出及副作用：lhs/rhs 为只读 ticket；比较 command、Function/CMQ handle、
-  //   slot、opcode key 和 deadline，不执行 I/O 或修改对象。
-  // 失败/边界：任一 ticket shape 非法、嵌套值不一致或字段未知时返回 0；本函数
-  //   不要求对象别名，别名关系由 observed_result_semantics_valid 单独验证。
+  // 功能：比较两个 ticket 的公开值（command、handle、slot、opcode key、deadline）。
+  // 输入/输出及副作用：lhs/rhs 只读；不要求对象别名。
+  // 失败/边界：任一 ticket shape 非法、嵌套值不等或含未知值返回 0。
   protected function bit same_ticket_value(
     input rdma_cmq_ticket lhs,
     input rdma_cmq_ticket rhs
@@ -89,9 +83,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
            lhs.absolute_deadline == rhs.absolute_deadline;
   endfunction
 
-  // 功能：保留 adapter 的 protected status 比较 seam，委托 CMQ 共享契约检查完整诊断值。
-  // 输入/输出及副作用：lhs/rhs 为只读 status；返回 shape 与全部现有字段的比较结果，不修改 adapter 或 status。
-  // 失败/边界：null、不支持 subtype 或非法 required-status shape 返回 0；对象 alias 仍由 observed-result 边界检查。
+  // 功能：转发到 CMQ 共享契约，比较两个 status 的全部诊断字段。
+  // 输入/输出及副作用：lhs/rhs 只读；返回比较结果。
+  // 失败/边界：null、不支持的 subtype 或非法 shape 返回 0。
   protected function bit same_status_value(
     input rdma_status lhs,
     input rdma_status rhs
@@ -99,12 +93,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     return rdma_cmq_same_status_value(lhs, rhs);
   endfunction
 
-  // 功能：检查 observed envelope 中 command identity 的标量字段是否构成可追踪的
-  //   Function/opcode 身份，供 completion 与 ticket 交叉校验使用。
-  // 输入/输出及副作用：identity 为只读 command identity；返回 bit，不分配对象或修改
-  //   adapter 状态。
-  // 失败/边界：null、非 Function kind、零 UID/代际、未知 opcode 或空/含分隔符的
-  //   profile/variant 均返回 0；global_function_id 可为零，由上游 route 契约解释。
+  // 功能：检查 command identity 的标量字段能否构成可追踪的 Function/opcode 身份。
+  // 输入/输出及副作用：identity 只读；返回 bit。
+  // 失败/边界：null、非 Function kind、零 UID/generation、未知 opcode、profile/variant 为空或含分隔符返回 0。
   protected function bit command_identity_shape_valid(
     input rdma_cmq_command_identity identity
   );
@@ -119,11 +110,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
            !rdma_cmq_string_has_separator(identity.variant);
   endfunction
 
-  // 功能：比较 command identity 与 result ticket 的 Function/opcode 字段，确认
-  //   observed envelope 未将另一个 command 的诊断身份拼接进当前 ticket。
-  // 输入/输出及副作用：identity/ticket 为只读输入；返回值相等 bit，不创建快照。
-  // 失败/边界：任一对象为空、identity shape 非法或 profile/variant/UID/代际漂移
-  //   时返回 0；该函数不推断 batch 或恢复状态。
+  // 功能：确认 command identity 与 ticket 的 Function/opcode 字段一致。
+  // 输入/输出及副作用：identity/ticket 只读；返回 bit。
+  // 失败/边界：任一为空、identity shape 非法或字段不一致返回 0。
   protected function bit command_identity_matches_ticket(
     input rdma_cmq_command_identity identity,
     input rdma_cmq_ticket ticket
@@ -141,12 +130,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
            identity.variant == ticket.opcode_key.variant;
   endfunction
 
-  // 功能：判断 observed result 是否完全没有提交身份图，供本地 PRE 拒绝和
-  //   delegated UNOBSERVED 两种零 identity 形状共用。
-  // 输入/输出及副作用：value 为只读 execution result；返回 bit，不修改对象或
-  //   adapter 状态，也不访问 engine/外部资源。
-  // 失败/边界：value 为 null 时返回 0；只要 ticket、identity、owner、DMA 或
-  //   completion 任一存在，或 batch/attempt 有任一非零值，就不再视为空图。
+  // 功能：判断 observed result 是否完全没有提交身份图。
+  // 输入/输出及副作用：value 只读；返回 bit。
+  // 失败/边界：value 为 null 返回 0；ticket/identity/owner/DMA/completion 任一存在或 batch/attempt 非零即非空。
   protected function bit observed_identity_graph_empty(
     input rdma_cmq_execution_result value
   );
@@ -158,12 +144,10 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
            value.batch_id == 0 && value.attempt_id == 0;
   endfunction
 
-  // 功能：验证 admitted observed result 的完整身份图，确保 ticket、Function/
-  //   opcode identity、recovery owner、DMA context 和 batch attempt 可互相追溯。
-  // 输入/输出及副作用：value 为只读结果图；返回 bit，不冻结、复制或
-  //   提交 authority；DMA validate 只读取 context 的公开约束。
-  // 失败/边界：任何半成品图、零 batch/attempt、ticket/identity 漂移、legacy owner
-  //   以外的 owner reset/generation 不一致，或 DMA context 校验失败均返回 0。
+  // 功能：校验 observed result 的身份图完整且 ticket、identity、owner、DMA context 互相一致。
+  // 输入/输出及副作用：value 只读；调用 dma_context.validate()，不复制或提交 authority。
+  // 失败/边界：半成品图、零 batch/attempt、ticket/identity 漂移、非 legacy owner 的 generation/reset epoch 不一致或 DMA
+  //   校验失败返回 0。
   protected function bit observed_identity_graph_complete(
     input rdma_cmq_execution_result value
   );
@@ -205,14 +189,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
              value.recovery_owner.function_identity.reset_epoch;
   endfunction
 
-  // 功能：确认 legacy execute 返回的结果确实是 adapter 在 engine 前确定拒绝的
-  //   PRE_SUBMIT_REJECTED envelope，作为 deprecated no-submit compatibility proof。
-  // 输入/输出及副作用：value 为只读 observed result；返回 bit，不读写共享
-  //   seam。
-  // 失败/边界：status/observation 缺失、观察失败、非 PRE effect、任何身份
-  //   半成品、
-  //   completion 或 recovery 标志存在时均返回 0，避免把 delegated malformed result
-  //   误报为“确定未提交”。
+  // 功能：确认结果是 adapter 在 engine 之前确定拒绝的 PRE_SUBMIT_REJECTED envelope。
+  // 输入/输出及副作用：value 只读；返回 bit。
+  // 失败/边界：status/observation 缺失或失败、effect 非 PRE、身份图非空、有 completion 或 recovery 标志均返回 0。
   protected function bit legacy_no_submit_result_valid(
     input rdma_cmq_execution_result value
   );
@@ -230,12 +209,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     return 1'b1;
   endfunction
 
-  // 功能：对 observed result 执行完整 effect/phase/recovery 语义交叉校验，并确认
-  //   completion、ticket、status 和 identity 的 alias topology。
-  // 输入/输出及副作用：value 为只读 engine 输出；返回布尔形状判定，不修改 value。
-  // 失败/边界：未知枚举、PRE 与非 NONE phase 混用、UNOBSERVED 携带 completion、
-  //   terminal phase 缺 completion、ticket/owner/DMA/identity 漂移或 completion 未
-  //   alias result ticket/status 均拒绝；operation status/effects 不被改写。
+  // 功能：对 observed result 做 effect/phase/recovery 语义交叉校验，并检查 completion 的别名拓扑。
+  // 输入/输出及副作用：value 只读；返回 bit。
+  // 失败/边界：枚举未知、phase 与 effect 组合非法、completion 缺失/多余或未别名 result 的 ticket/status、身份图漂移均返回 0。
   protected function bit observed_result_semantics_valid(
     input rdma_cmq_execution_result value
   );
@@ -333,9 +309,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     endcase
   endfunction
 
-  // 功能：在 rdma_cmq_engine_port_adapter 中，bind_engine 把 bind_engine 指定的资源或后端能力绑定到当前对象索引，并校验 Function、generation 和队列类型一致。
-  // 输入/输出及副作用：owner（输入）、engine（输入）；bind_engine 先依据 owner == null || owner.kind != RDMA_RESOURCE_FUNCTION || engine == null；$isunknown(owner.function_uid；engines.exists(key 校验 owner、engine；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：资源不存在、类型不符、重复登记或跨 Function 串线时拒绝绑定并保持索引不变。
+  // 功能：把 engine 绑定到 Function handle。
+  // 输入/输出及副作用：成功时写入 engines，不接管 engine 所有权。
+  // 失败/边界：owner/engine 为空、owner 非 Function 或含 X/Z 返回 INVALID_ARGUMENT；重复绑定返回 INVALID_STATE。
   function rdma_status bind_engine(
     rdma_function_handle owner,
     rdma_cmq_engine engine
@@ -355,9 +331,9 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_cmq_engine_port_adapter 中，execute 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：command（输入）、ticket（输出）、completion（输出）、status（输出）；execute 驱动下游事务，并写入 ticket、completion、status；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：execute 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：legacy execute 入口，包装 execute_observed 并回填 ticket/completion/status。
+  // 输入/输出及副作用：先清空输出和 no-submit 标志；仅当结果通过 legacy_no_submit_result_valid 才置标志。
+  // 失败/边界：observed result 为 null 时 status 为 INVALID_STATE。
   virtual task execute(
     rdma_cmq_command_desc command,
     output rdma_cmq_ticket ticket,
@@ -385,12 +361,10 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
       last_execute_no_submit_proven = 1'b1;
   endtask
 
-  // 功能：production adapter 直接执行 observed route，并将 pre-engine 校验
-  //   或 engine 返回的 detached result 传递给调用方。
-  // 输入/输出及副作用：command 为非拥有输入，result 为 caller-owned 输出；
-  //   成功绑定时恰好调用一次 engine.execute_observed，不调用 super fallback。
-  // 失败/边界：Function 缺失/未绑定返回 PRE_SUBMIT_REJECTED；engine null 或
-  //   缺失 status 时保留可用字段并补 INVALID_STATE，observed 不读写共享 bit。
+  // 功能：按 command 的 Function 找到 engine 并执行 observed 路径，返回 detached result。
+  // 输入/输出及副作用：result 为调用方持有输出；成功绑定时恰好调用一次 engine.execute_observed。
+  // 失败/边界：Function 缺失或未绑定返回 PRE_SUBMIT_REJECTED；engine 返回 null 或缺 status 时补 INVALID_STATE；envelope
+  //   非法时标记 observation_status。
   virtual task execute_observed(
     input rdma_cmq_command_desc command,
     output rdma_cmq_execution_result result
@@ -437,10 +411,10 @@ class rdma_cmq_engine_port_adapter extends rdma_cmq_port;
       );
   endtask
 
-  // 功能：在 rdma_cmq_engine_port_adapter 中，reconcile 执行受控事务并按后端提交证据推进状态机，同时保留失败阶段和 generation 证据。
-  // 输入/输出及副作用：ticket（输入）、terminal_known（输出）、completion（输出）、status（输出）；输入 action/epoch/handle
-  //   决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：reconcile 遇到锁、超时、generation 变化或提交证据不完整时保持原状态，不推进游标。
+  // 功能：把 ticket 对账转发给对应 engine 的 reconcile_ticket。
+  // 输入/输出及副作用：terminal_known/completion/status 为输出；status 为 engine status 的克隆。
+  // 失败/边界：ticket 或 Function 缺失、未绑定、engine status 为 null、克隆失败、terminal 却无 completion 均返回
+  //   INVALID_STATE 并清除输出。
   virtual task reconcile(
     rdma_cmq_ticket ticket,
     output bit terminal_known,

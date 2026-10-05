@@ -1,15 +1,15 @@
-// 目录：模型层 model/rdma_cmq_body_value_contract.sv。
+// 目录/层次：模型层 model/rdma_cmq_body_value_contract.sv。
 // 职责：集中 CMQ 核心 body 的 exact runtime shape、稳定值键与对象图节点枚举契约。
-// 依赖：依赖 queue/context model 定义和 UVM object wrapper identity；不依赖 codec 或 profile。
-// 所有权与生命周期：全部 helper 无状态且只读输入；append 只向调用方拥有的 queue
-// 追加非拥有引用，不清空、不去重，也不延长对象生命周期。
+// 依赖：依赖 queue/context model 与 UVM object wrapper identity；不依赖 codec 或 profile。
+// 所有权与生命周期：helper 无状态且只读输入；append 只向调用方拥有的 queue 追加非拥有引用，
+//   不清空、不去重，不延长对象生命周期。
 
-// 设计说明：该层只承载 model-visible 的形状和值投影。需要 profile 扩展判断的
-// same_body_value 与 body_graph_detached 继续由 engine/core 层组合，避免 model 反向依赖 codec。
+// 设计说明：本层只承载 model 可见的形状与值投影；需要 profile 扩展判断的 same_body_value
+// 与 body_graph_detached 留在 engine/core 层，避免 model 反向依赖 codec。
 
-// 功能：按 kind、function_uid、object_id、generation 的既有顺序生成稳定 handle 值键。
-// 输入/输出及副作用：handle 为只读输入；返回格式化 string，不修改 handle、engine 或外部账本。
-// 失败/边界：handle 为 null 时返回 "<null-handle>"；不校验 X/Z，也不补默认 Function 或资源值。
+// 功能：按 kind、function_uid、object_id、generation 顺序生成稳定 handle 值键。
+// 输入/输出及副作用：handle 只读；返回格式化 string。
+// 失败/边界：handle 为 null 时返回 "<null-handle>"；不校验 X/Z，不补默认值。
 function automatic string rdma_cmq_handle_value_key(input rdma_handle handle);
   if (handle == null)
     return "<null-handle>";
@@ -18,9 +18,9 @@ function automatic string rdma_cmq_handle_value_key(input rdma_handle handle);
                    handle.generation);
 endfunction
 
-// 功能：用 UVM registry wrapper identity 判断 value 是否恰为 expected_type，而非其 subtype。
-// 输入/输出及副作用：value/expected_type 为只读输入；读取 get_object_type() 并返回 bit，不修改对象。
-// 失败/边界：value、expected_type 或实际 wrapper 为 null 时返回 0；可 cast 的 subtype 仍返回 0。
+// 功能：用 UVM registry wrapper identity 判断 value 是否恰为 expected_type（排除 subtype）。
+// 输入/输出及副作用：value/expected_type 只读；返回 bit。
+// 失败/边界：value、expected_type 或实际 wrapper 为 null 返回 0；可 cast 的 subtype 也返回 0。
 function automatic bit rdma_cmq_has_exact_object_type(
   input uvm_object value,
   input uvm_object_wrapper expected_type
@@ -33,9 +33,9 @@ function automatic bit rdma_cmq_has_exact_object_type(
   return actual_type != null && actual_type == expected_type;
 endfunction
 
-// 功能：判断 optional value 为空，或其 UVM registry wrapper identity 恰为 expected_type。
-// 输入/输出及副作用：value/expected_type 为只读输入；返回 bit，不创建对象或修改引用。
-// 失败/边界：value 为 null 时始终返回 1，包括 expected_type 也为 null；非空 value 遵循 exact-type 拒绝。
+// 功能：判断 optional value 为空，或其 wrapper identity 恰为 expected_type。
+// 输入/输出及副作用：value/expected_type 只读；返回 bit。
+// 失败/边界：value 为 null 恒返回 1（含 expected_type 也为 null）；非空 value 按 exact-type 判定。
 function automatic bit rdma_cmq_has_optional_exact_object_type(
   input uvm_object value,
   input uvm_object_wrapper expected_type
@@ -43,10 +43,10 @@ function automatic bit rdma_cmq_has_optional_exact_object_type(
   return value == null || rdma_cmq_has_exact_object_type(value, expected_type);
 endfunction
 
-// 功能：确认七类核心 CMQ body 及其 required/optional 嵌套对象都使用规定的精确 runtime wrapper。
-// 输入/输出及副作用：body 为只读输入；检查 SQE/QPC/CQC/MRT/SRQC/CEQC/AEQC shell 并返回 bit。
-// 失败/边界：null、未知/subtype body、缺失 required 对象、错误 nested subtype 或 URC queues 非精确类型时返回 0；
-// RC/UD transport、optional target/SRQ/CEQ 的原接受语义保持不变。
+// 功能：确认七类核心 CMQ body 及其 required/optional 嵌套对象都是规定的精确 runtime 类型。
+// 输入/输出及副作用：body 只读；检查 SQE/QPC/CQC/MRT/SRQC/CEQC/AEQC 外壳，返回 bit。
+// 失败/边界：null、未知/subtype body、缺失 required 对象、嵌套 subtype 错误或 URC queues 非精确类型
+//   返回 0；RC/UD transport 与 optional target/SRQ/CEQ 的原接受语义不变。
 function automatic bit rdma_cmq_core_body_shell_is_exact(
   input rdma_hw_model body
 );
@@ -174,10 +174,10 @@ function automatic bit rdma_cmq_core_body_shell_is_exact(
   return 1'b0;
 endfunction
 
-// 功能：按既有字段顺序为 handle、ring、page、AV、URC queue、MR page 与 QPC 扩展生成稳定值键。
-// 输入/输出及副作用：value 为只读输入；使用局部 cast/result 返回 string，不修改 nested model 或外部状态。
-// 失败/边界：null 返回 "<null-object>"，未知或非精确 subtype 返回空串；字段中的 X/Z 只参与格式化，
-// URC 扩展继续递归生成 queues 键，不新增校验、canonicalization 或资源所有权。
+// 功能：按固定字段顺序为 handle、ring、page、AV、URC queue、MR page 与 QPC 扩展生成稳定值键。
+// 输入/输出及副作用：value 只读；返回 string，不修改 nested model。
+// 失败/边界：null 返回 "<null-object>"，未知或非精确 subtype 返回空串；X/Z 只参与格式化；
+//   URC 扩展递归生成 queues 键，不新增校验。
 function automatic string rdma_cmq_nested_value_key(input uvm_object value);
   rdma_handle handle;
   rdma_ring_position ring;
@@ -274,10 +274,10 @@ function automatic string rdma_cmq_nested_value_key(input uvm_object value);
   return "";
 endfunction
 
-// 功能：按既有字段顺序为 SQE/QPC/CQC/MRT/SRQC/CEQC/AEQC 生成稳定 body 值键。
-// 输入/输出及副作用：body 为只读输入；返回 string；SQE 的 context_model 递归调用本 helper。
-// 失败/边界：null 返回 "<null-body>"，未知或非精确 subtype 返回空串，null SQE context 使用
-// "<null-context>"；保留无环检测语义，调用方不得传入循环 context graph。
+// 功能：按固定字段顺序为 SQE/QPC/CQC/MRT/SRQC/CEQC/AEQC 生成稳定 body 值键。
+// 输入/输出及副作用：body 只读；返回 string；SQE 的 context_model 递归调用本函数。
+// 失败/边界：null 返回 "<null-body>"，未知或非精确 subtype 返回空串，null context 用 "<null-context>"；
+//   不做环检测，调用方不得传入循环 context graph。
 function automatic string rdma_cmq_body_value_key(input rdma_hw_model body);
   rdma_cmq_sqe_model sqe;
   rdma_qpc_model qpc;
@@ -362,10 +362,10 @@ function automatic string rdma_cmq_body_value_key(input rdma_hw_model body);
   return "";
 endfunction
 
-// 功能：按既有 body 分支顺序向 caller-owned nodes queue 追加 root 与直接 nested 对象引用。
-// 输入/输出及副作用：body 为只读输入；nodes 以 ref 传入并只在尾部追加非拥有引用，不清空或去重。
+// 功能：向调用方拥有的 nodes queue 追加 root 与直接 nested 对象引用。
+// 输入/输出及副作用：body 只读；nodes 为 ref，仅尾部追加非拥有引用，不清空或去重。
 // 失败/边界：null 不追加，未知非空 body 只追加 root；SQE 不追加 context_model；QPC 的 URC queues
-// 仍由 $cast 成功且 queues 非 null 时追加，已有前缀、alias 与重复项全部保留。
+//   在 $cast 成功且非 null 时追加；已有前缀、alias 与重复项全部保留。
 function automatic void rdma_cmq_append_body_graph_nodes(
   input rdma_hw_model body,
   ref uvm_object nodes[$]

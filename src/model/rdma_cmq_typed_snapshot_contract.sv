@@ -9,13 +9,11 @@
 // 设计说明：六条路径分别保留自身的 cast、runtime type、factory、
 // clone 与恢复顺序；不合并成无类型 helper，避免改变错误优先级或可观测次数。
 
-// 功能：为 Function handle 构造保留 runtime type name 与四个公开身份字段的独立 clone 快照。
-// 输入/输出及副作用：source/label/failure_code 为输入；snapshot 入口先清空，
-// 成功时输出非 source 的 Function handle；clone 后按 kind、function_uid、
-// object_id、generation 的原顺序恢复 source。
-// 失败/边界：source 为 null，clone 为 null/不能 cast/自别名/runtime type name
-// 改变，或 source/snapshot 四字段不等时用 failure_code 和原消息拒绝；
-// 不比较 subtype 扩展字段，且保留对第三个等值对象的接受语义。
+// 功能：为 Function handle 构造保留 runtime type 与四个公开身份字段的独立 clone 快照。
+// 输入/输出及副作用：snapshot 先清空；成功输出非 source 的 handle；clone 后按 kind、
+//   function_uid、object_id、generation 的原顺序恢复 source。
+// 失败/边界：source 为 null，clone 为 null/不能 cast/自别名/type 改变，或四字段不等时按
+//   failure_code 拒绝；不比较 subtype 扩展字段，仍接受第三个等值对象。
 function automatic rdma_status rdma_cmq_checked_function_snapshot(
   input rdma_function_handle source,
   input string label,
@@ -65,13 +63,11 @@ function automatic rdma_status rdma_cmq_checked_function_snapshot(
   return rdma_status::success();
 endfunction
 
-// 功能：为通用 RDMA handle 构造保留 runtime type name 与四个公开身份字段的独立 clone 快照。
-// 输入/输出及副作用：source/label/failure_code 为输入；snapshot 入口先清空，
-// 成功时输出非 source 的 handle；clone 后按 kind、function_uid、
-// object_id、generation 的原顺序恢复 source。
-// 失败/边界：source 为 null，clone 为 null/不能 cast/自别名/runtime type name
-// 改变，或 source/snapshot 四字段不等时用 failure_code 和原消息拒绝；
-// 不比较 subtype 扩展字段，且保留对第三个等值对象的接受语义。
+// 功能：为通用 handle 构造保留 runtime type 与四个公开身份字段的独立 clone 快照。
+// 输入/输出及副作用：snapshot 先清空；成功输出非 source 的 handle；clone 后按 kind、
+//   function_uid、object_id、generation 的原顺序恢复 source。
+// 失败/边界：source 为 null，clone 为 null/不能 cast/自别名/type 改变，或四字段不等时按
+//   failure_code 拒绝；不比较 subtype 扩展字段，仍接受第三个等值对象。
 function automatic rdma_status rdma_cmq_checked_handle_snapshot(
   input rdma_handle source,
   input string label,
@@ -121,13 +117,11 @@ function automatic rdma_status rdma_cmq_checked_handle_snapshot(
   return rdma_status::success();
 endfunction
 
-// 功能：先验证 CMQ opcode key，再构造保留 profile_name、opcode 与 variant 的独立 clone 快照。
-// 输入/输出及副作用：source/label/failure_code 为输入；snapshot 入口先清空，
-// 成功时输出非 source 的 opcode key；validate 可构造状态，clone 后
-// 按原顺序恢复 source 的三个字段。
-// 失败/边界：source 为 null 或 validate 返回 null 时按 failure_code 拒绝；
-// source validate 失败优先原样返回且不 clone；clone 为 null/不能 cast/自别名、
-// 三字段漂移、snapshot validate 为 null 或失败均不发布 snapshot；不拒绝可 cast subtype。
+// 功能：先验证 CMQ opcode key，再构造保留 profile_name、opcode、variant 的 clone 快照。
+// 输入/输出及副作用：snapshot 先清空；成功输出非 source 的 key；clone 后按原顺序恢复 source。
+// 失败/边界：source 为 null 或 validate 返回 null 时按 failure_code 拒绝；source validate
+//   失败原样返回且不 clone；clone 为 null/不能 cast/自别名、字段漂移或 snapshot 校验失败
+//   均不发布；可 cast 的 subtype 不被拒绝。
 function automatic rdma_status rdma_cmq_checked_opcode_snapshot(
   input rdma_cmq_opcode_key source,
   input string label,
@@ -186,14 +180,11 @@ function automatic rdma_status rdma_cmq_checked_opcode_snapshot(
   return status;
 endfunction
 
-// 功能：验证 expected-response 后执行一次 clone，锁存 hostile clone 对 caller
-// source 的篡改，并只发布两个公开字段等值的独立 candidate。
-// 输入/输出及副作用：source/label/failure_code 为输入；snapshot 入口先清空；
-// clone 后立即锁存 source 漂移，再按 hardware_opcode、variant 顺序恢复 source；
-// 成功时 snapshot 接收非 source 的合法 candidate，helper 不保存或取得对象所有权。
-// 失败/边界：source 为 null，source/candidate validate 返回 null 或失败，clone
-// 为 null/不能 cast/self，source 曾被 clone 篡改，或 candidate 字段漂移时不发布
-// snapshot；clone-contract 优先于值漂移，第三个独立等值对象仍可接受。
+// 功能：验证 expected-response 后 clone 一次，锁存 clone 对 source 的篡改，只发布等值 candidate。
+// 输入/输出及副作用：snapshot 先清空；clone 后立即锁存 source 漂移，再按 hardware_opcode、
+//   variant 顺序恢复 source。
+// 失败/边界：source 为 null、validate 为 null/失败、clone 为 null/不能 cast/self、source 被篡改
+//   或 candidate 字段漂移时不发布；clone 契约优先于值漂移，第三个等值对象仍可接受。
 function automatic rdma_status rdma_cmq_checked_expected_snapshot(
   input rdma_cmq_expected_response source,
   input string label,
@@ -255,16 +246,12 @@ function automatic rdma_status rdma_cmq_checked_expected_snapshot(
   return status;
 endfunction
 
-// 功能：通过 rdma_hw_image factory 捕获原值，再 clone image 并校验
-// 全部公开 byte、metadata、target 与 summary 投影。
-// 输入/输出及副作用：source/label/failure_code 为输入；snapshot 入口先清空，
-// 成功时输出非自别名、可转换且公开值相等的 clone，不要求保留
-// source runtime subtype；saved_value 由 factory 创建，clone 后按原字段与 queue
-// 顺序恢复 source；捕获与恢复只复用无回调的模型元数据操作，不替换 clone 窗口。
-// 失败/边界：source 为 null、saved-value factory 返回 null、clone 为 null/不能
-// cast/自别名，或 source/snapshot 公开值与 saved_value 不等时按 failure_code 和原消息
-// 拒绝；本函数不执行 image shape 校验，保留对非 canonical 等值 image 的接受语义。
-// saved-value typed factory 错型仍报 FCTTYP fatal，不改成 raw factory 的 non-fatal 策略。
+// 功能：经 rdma_hw_image factory 捕获原值，再 clone image 并校验公开 byte/metadata/target/summary。
+// 输入/输出及副作用：snapshot 先清空；成功输出非自别名、公开值相等的 clone（不要求保留
+//   source subtype）；clone 后按原字段与 queue 顺序恢复 source；捕获与恢复只用无回调的元数据操作。
+// 失败/边界：source 为 null、factory/clone 返回 null、不能 cast/自别名，或公开值与 saved_value
+//   不等时按 failure_code 拒绝；不做 image shape 校验，仍接受非 canonical 等值 image；
+//   saved-value 错型仍报 FCTTYP fatal。
 function automatic rdma_status rdma_cmq_checked_image_snapshot(
   input rdma_hw_image source,
   input string label,
@@ -306,14 +293,11 @@ function automatic rdma_status rdma_cmq_checked_image_snapshot(
   return rdma_status::success();
 endfunction
 
-// 功能：先完整消费 image factory/clone 契约，再构造 exact rdma_hw_image
-// 作为 submission/journal 的 canonical 快照。
-// 输入/输出及副作用：source/label/failure_code 为输入；snapshot 入口先清空，
-// 成功时输出与 source 及 factory_snapshot 无别名的 exact base image；字节 queue、
-// metadata、targets 与 summary 逐项复制到 new 对象。
-// 失败/边界：底层 image helper 返回 null/失败状态时原样传播；必须在其
-// clone 之后才检查 canonical shape 与全值等价，不满足时按 failure_code 和原消息
-// 拒绝，不发布 partial snapshot。
+// 功能：先完整执行 image factory/clone 契约，再构造 exact rdma_hw_image 作为 canonical 快照。
+// 输入/输出及副作用：snapshot 先清空；成功输出与 source/factory_snapshot 无别名的 base image，
+//   byte queue、metadata、targets、summary 逐项复制。
+// 失败/边界：底层 helper 失败原样传播；clone 之后才检查 canonical shape 与全值等价，不满足时
+//   按 failure_code 拒绝，不发布 partial snapshot。
 function automatic rdma_status rdma_cmq_checked_canonical_image_snapshot(
   input rdma_hw_image source,
   input string label,

@@ -12,23 +12,18 @@
 class rdma_cq_shadow_replay_policy extends uvm_object;
   `uvm_object_utils(rdma_cq_shadow_replay_policy)
 
-  // 功能：构造无状态 CQ shadow replay policy 对象，不绑定 CQ、delegate 或 cache。
-  // 输入/输出及副作用：name（输入）；new 只建立 UVM 名称并返回不持有外部资源的 helper。
-  // 失败/边界：构造成功不代表 snapshot authority 合法；调用方仍必须检查 validate() 返回
-  //   状态，不能把 null/错误 CQ handle 当作 replay 授权。
+  // 功能：构造无状态的 CQ shadow replay policy 对象，不绑定 CQ、delegate 或 cache。
+  // 输入/输出及副作用：name 为 UVM 名；不持有外部资源。
+  // 失败/边界：构造成功不代表 snapshot authority 合法，调用方须检查 validate() 状态。
   function new(string name = "rdma_cq_shadow_replay_policy");
     super.new(name);
   endfunction
 
-  // 功能：validate 校验 snapshot 是否绑定到指定 shared CQ 的 Function UID、generation、
-  //   reset epoch 和 object ID，供首次 caller admission 与 replay cache integrity 共用。
-  // 输入/输出及副作用：snapshot、expected_cq_h、function_uid、generation、reset_epoch、
-  //   stale_message 和 mismatch_code 为只读输入；返回 rdma_status，不修改 snapshot、handle、
-  //   engine shadow、flush count 或外部 evidence。
-  // 失败/边界：snapshot/expected handle 缺失、handle kind 非 CQ、snapshot 或 handle 的
-  //   UID/generation/object ID 与 expected authority 不一致、snapshot reset epoch 漂移时
-  //   mismatch_code（默认 RDMA_SC_STALE_GENERATION）；expected authority 自身不完整时返回
-  //   RDMA_SC_INVALID_STATE。stale_message 仅保留 caller 的诊断上下文。
+  // 功能：校验 snapshot 是否绑定到指定 shared CQ 的 Function UID、generation、reset epoch 与 object ID。
+  // 输入/输出及副作用：snapshot/expected_cq_h/function_uid/generation/reset_epoch/stale_message/mismatch_
+  //   code 只读；返回 status，不改任何对象。
+  // 失败/边界：snapshot/handle 缺失、handle 非 CQ 或 UID/generation/object ID/reset epoch 不符返回
+  //   mismatch_code（默认 STALE_GENERATION）；expected authority 不完整返回 INVALID_STATE。
   static function rdma_status validate(
     rdma_cq_shadow_snapshot snapshot,
     rdma_handle expected_cq_h,

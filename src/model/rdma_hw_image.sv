@@ -1,8 +1,7 @@
 // 目录：协议值模型层 model/rdma_hw_image.sv。
 // 职责：保存硬件序列化字节、格式/代际/写入目标元数据与字段摘要，集中元数据值复制。
-// 依赖：UVM object、rdma_types_pkg 的 endian/image kind 与三个 packed 地址值类型。
-// 所有权与生命周期：对象拥有 bytes/field_summary 队列；target 是地址值，不是外部
-//   backing/BAR capability，不授予写权限。调用方负责对象寿命、分配及业务 shape 校验。
+// 依赖：UVM object、rdma_types_pkg 的 endian/image kind 与 packed 地址类型。
+// 所有权与生命周期：对象拥有 bytes/field_summary；target 仅为地址值，不授予写权限。
 
 typedef enum bit [1:0] {
   RDMA_HW_TARGET_NONE    = 2'd0,
@@ -11,8 +10,7 @@ typedef enum bit [1:0] {
   RDMA_HW_TARGET_BAR     = 2'd3
 } rdma_hw_target_kind_e;
 
-// 设计说明：模型只维护数据布局，不接管业务快照策略。元数据复制不分配或调用虚方法；
-//   bytes/summary 的替换、追加和 clone 后恢复仍由入口选择，避免改变原回调窗口。
+// 设计说明：模型只维护数据布局；元数据复制不分配、不调用虚方法，bytes/summary 由入口自行处理。
 class rdma_hw_image extends uvm_object;
   `uvm_object_utils(rdma_hw_image)
 
@@ -29,9 +27,9 @@ class rdma_hw_image extends uvm_object;
   rdma_bar_addr_t bar_target;
   string field_summary[$];
 
-  // 功能：构造空硬件镜像，默认 little endian、NONE image/target，长度/对齐/版本/代际为零。
-  // 输入/输出及副作用：name 设置 UVM 名称；清空自有 bytes/summary，三个 target 地址置零。
-  // 失败/边界：默认对象不是可提交镜像；构造不申请 backing，也不执行业务 shape 校验。
+  // 功能：构造空镜像（little endian、NONE kind/target，其余为零）。
+  // 输入/输出及副作用：name 为 UVM 名；清空 bytes/summary，地址置零。
+  // 失败/边界：默认对象不是可提交镜像。
   function new(string name = "rdma_hw_image");
     super.new(name);
     bytes.delete();
@@ -48,11 +46,9 @@ class rdma_hw_image extends uvm_object;
     field_summary.delete();
   endfunction
 
-  // 功能：把 source 的十项格式、代际与目标地址值按固定顺序写入 destination。
-  // 输入/输出及副作用：source/destination 为已存在的非空句柄；只修改 destination 元数据，
-  //   不触碰 bytes/field_summary、UVM 名称或 subtype 扩展字段，不分配对象或调用回调。
-  // 失败/边界：调用方必须保证两端非空；本 void 原语不做 shape/null 校验、不返回 status，
-  //   允许同一对象自复制，不把地址值复制视为 authority 验证或资源所有权转移。
+  // 功能：把 source 的十项元数据按序复制到 destination。
+  // 输入/输出及副作用：只改 destination 元数据，不动 bytes/field_summary，不分配对象。
+  // 失败/边界：不检查空句柄，无 status；允许自复制。
   static function automatic void copy_metadata_noalloc(
     rdma_hw_image source, rdma_hw_image destination
   );
@@ -68,11 +64,9 @@ class rdma_hw_image extends uvm_object;
     destination.bar_target = source.bar_target;
   endfunction
 
-  // 功能：在 UVM 基类复制后，将 rhs 的 bytes、公共元数据和 summary 替换到当前镜像。
-  // 输入/输出及副作用：rhs 输入；按 bytes→metadata→summary 顺序复制队列值，不调用 clone；
-  //   非自别名时源值不变，两个对象的队列可独立修改。
-  // 失败/边界：类型不兼容报 RDMA_COPY_TYPE fatal；要求 rhs 非空，不新增 null 降级，
-  //   不保证 fatal 被外部抑制后可继续；自复制保值，不校验长度、target 或 subtype 扩展字段。
+  // 功能：UVM copy 后复制 rhs 的 bytes、元数据与 summary。
+  // 输入/输出及副作用：按 bytes、metadata、summary 顺序复制值；队列相互独立。
+  // 失败/边界：类型不匹配触发 RDMA_COPY_TYPE fatal；rhs 须非空，不校验长度或 target。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_image rhs_image;
 

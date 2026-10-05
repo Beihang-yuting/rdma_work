@@ -1,10 +1,7 @@
 // 目录：硬件编解码层 codec/rdma_bit_packer.sv。
-// 职责：实现 rdma_bit_packer 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_bit_packer.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 职责：按 bit 偏移向硬件 image 写入/读取字段，并用 occupancy 检测字段重叠。
+// 依赖：依赖本层 types/model 契约（rdma_status 等）。
+// 所有权与生命周期：仅拥有 occupancy 位图；调用方 image 由外部持有，packer 不保存其引用。
 
 class rdma_bit_packer extends uvm_object;
   `uvm_object_utils(rdma_bit_packer)
@@ -13,9 +10,9 @@ class rdma_bit_packer extends uvm_object;
   protected int unsigned expected_byte_count;
   protected bit initialized;
 
-  // 功能：构造 rdma_bit_packer，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：occupancy=new[0]；expected_byte_count=0；initialized=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_bit_packer 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造未初始化的 packer。
+  // 输入/输出及副作用：name 为 UVM 对象名；occupancy 清空。
+  // 失败/边界：未 initialize 前 validate_access 返回 INVALID_STATE。
   function new(string name = "rdma_bit_packer");
     super.new(name);
     occupancy = new[0];
@@ -23,9 +20,9 @@ class rdma_bit_packer extends uvm_object;
     initialized = 1'b0;
   endfunction
 
-  // 功能：在 rdma_bit_packer 中，initialize 校验依赖和 binding 后建立运行边界，只保存非拥有引用并拒绝重复配置。
-  // 输入/输出及副作用：image_byte_count（输入）；initialize 先依据 image_byte_count > (32'h7fff_ffff / 8 校验 image_byte_count；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：按 image 字节数分配并清零 occupancy 位图，标记 packer 已初始化。
+  // 输入/输出及副作用：image_byte_count 为 image 字节数；成功时覆盖 occupancy/expected_byte_count。
+  // 失败/边界：字节数 * 8 超出 int 范围时返回 INVALID_ARGUMENT，且不改变旧状态。
   function rdma_status initialize(int unsigned image_byte_count);
     if (image_byte_count > (32'h7fff_ffff / 8))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -38,19 +35,16 @@ class rdma_bit_packer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_bit_packer 中，reset reset 清理当前运行状态并建立新的复位/代际边界，使旧句柄或旧事务不能继续生效。
-  // 输入/输出及副作用：image_byte_count（输入）；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：复位参数为零、代际回退或存在未处理 pending 事务时拒绝更新 authority。
+  // 功能：以新的 image 大小重新初始化，清除已占用位。
+  // 输入/输出及副作用：同 initialize。
+  // 失败/边界：同 initialize。
   function rdma_status reset(int unsigned image_byte_count);
     return initialize(image_byte_count);
   endfunction
 
-  // 功能：validate_access 验证 bit packer 已初始化、bytes 长度匹配，并计算
-  //   [bit_offset, end_exclusive) 是否落在 image 容量内。
-  // 输入/输出及副作用：bytes、bit_offset、width（输入），end_exclusive（输出）；先清零输出，
-  //   只读 expected_byte_count/initialized，不修改 bytes 或 occupancy。
-  // 失败/边界：packer 未初始化、image 长度不符、width 不在 1..64、位区间发生 64-bit 溢出
-  //   或超出 image 时返回 INVALID_STATE/CODEC_ERROR，失败不得让调用方写入。
+  // 功能：校验 image 长度与字段位区间，输出区间结束位置（不含）。
+  // 输入/输出及副作用：end_exclusive 先清零；只读状态，不修改 bytes/occupancy。
+  // 失败/边界：未初始化返回 INVALID_STATE；长度不符、width 非 1..64、64-bit 溢出或越界返回 CODEC_ERROR。
   protected function rdma_status validate_access(
     byte unsigned bytes[],
     longint unsigned bit_offset,
@@ -87,12 +81,9 @@ class rdma_bit_packer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：put_u64 把 value 的低 width 位按 bit_offset 写入 ref image，并同步标记 occupancy，
-  //   供后续字段重叠检查。
-  // 输入/输出及副作用：bytes（ref 输入/输出）、bit_offset、width、value（输入）；成功时修改
-  //   bytes 和本对象 occupancy，不拥有调用方 image 的生命周期。
-  // 失败/边界：几何校验失败、value 超出 width 或目标 occupancy 已占用时返回 CODEC_ERROR；
-  //   所有检查先于写入，失败保持 bytes/occupancy 不变。
+  // 功能：把 value 低 width 位写入 bytes 的 bit_offset 处，并标记 occupancy。
+  // 输入/输出及副作用：bytes 为 ref；成功时修改 bytes 与 occupancy。
+  // 失败/边界：几何非法、value 超出 width 或与已写字段重叠时返回 CODEC_ERROR；全部检查先于写入。
   function rdma_status put_u64(
     ref byte unsigned bytes[],
     input longint unsigned bit_offset,
@@ -130,10 +121,9 @@ class rdma_bit_packer extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_bit_packer 中，get_u64 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：bytes（输入）、bit_offset（输入）、width（输入）、value（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
-  //   快照，读取不取得外部资源所有权。
-  // 失败/边界：get_u64 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：从 bytes 的 bit_offset 处读取 width 位。
+  // 输入/输出及副作用：value 先清零，成功时写入读取值；不修改 bytes/occupancy。
+  // 失败/边界：几何校验失败时返回其错误，value 保持 0。
   function rdma_status get_u64(
     byte unsigned bytes[],
     longint unsigned bit_offset,

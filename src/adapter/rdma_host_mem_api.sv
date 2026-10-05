@@ -2,17 +2,11 @@
 // 职责：实现 rdma_host_mem_api 在本层的职责和对外接口。
 // 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
-
-// 中文说明：rdma_host_mem_api.sv 属于适配器接口层，定义主机内存、PCIe、网络及上下文后端接口。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
 virtual class rdma_host_mem_api extends uvm_object;
 
-  // 功能：把 UMEM/PBL 下游返回的状态统一规范化为可安全消费的对象。
-  // 输入/输出及副作用：candidate、operation 为输入；非空状态原样返回，null 状态
-  //       转换为带 Host-memory 边界诊断的 INVALID_STATE；不修改 UMEM/PBL 或 mapping。
-  // 失败/边界：null 表示模型对象或扩展实现违反状态返回契约；调用方必须停止读取
-  //       output、清理本地半成品并向上层传播确定失败。
+  // 功能：规范化 UMEM/PBL 下游返回的状态，null 转为 INVALID_STATE。
+  // 输入/输出及副作用：operation 用作诊断前缀；非空状态原样返回。
+  // 失败/边界：null 违反状态返回契约，调用方应停止读取 output 并清理本地半成品。
   protected function automatic rdma_status normalize_status(
     rdma_status candidate,
     string operation
@@ -22,19 +16,17 @@ virtual class rdma_host_mem_api extends uvm_object;
     );
   endfunction
 
-  // 功能：构造 rdma_host_mem_api，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_host_mem_api 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 Host-memory API 基对象。
+  // 输入/输出及副作用：name 为 UVM 对象名。
+  // 失败/边界：无。
   function new(string name = "rdma_host_mem_api");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_host_mem_api 中，allocate 检查容量后预留资源并返回带 owner 证据的句柄/计划；失败时回滚已登记的局部状态。
-  // 输入/输出及副作用：request_context（输入）、size（输入）、alignment（输入）、direction（输入）、mapping（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
-  //   output 发布新句柄/映射，且成功返回时 mapping 必须为非空的 opaque allocation identity。
-  // 失败/边界：容量不足、范围非法、重复占用或身份过期时返回错误；失败不得泄漏半分配资源。
-  //   实现若返回 success，则不得保留一个未通过 mapping 暴露的 allocation；success+null
-  //   属于 adapter contract violation，调用方必须拒绝该结果并报告 INVALID_STATE。
+  // 功能：按 size/alignment/direction 分配资源并返回 opaque mapping。
+  // 输入/输出及副作用：mapping 输出新分配的 allocation identity；成功时必须非空。
+  // 失败/边界：容量不足、范围非法或身份过期返回错误且不泄漏半分配资源；success+null 属
+  //   adapter contract violation，调用方应按 INVALID_STATE 拒绝。
   pure virtual function rdma_status allocate(
     rdma_dma_request_context request_context,
     int unsigned size,
@@ -43,20 +35,18 @@ virtual class rdma_host_mem_api extends uvm_object;
     output rdma_dma_mapping mapping
   );
 
-  // 功能：在 rdma_host_mem_api 中，write 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：mapping（输入）、offset（输入）、data（输入）；输入 request/image/cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending
-  //   journal，并通过 output 返回结果。
-  // 失败/边界：write 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：把 data 写入 mapping 的 offset 处。
+  // 输入/输出及副作用：成功才允许调用方推进本地游标。
+  // 失败/边界：后端拒绝、范围溢出或 DMA 权限不足时返回错误，不推进游标。
   pure virtual function rdma_status write(
     rdma_dma_mapping mapping,
     longint unsigned offset,
     byte data[]
   );
 
-  // 功能：在 rdma_host_mem_api 中，read 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：mapping（输入）、offset（输入）、size（输入）、data（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output 为 detached
-  //   快照，读取不取得外部资源所有权。
-  // 失败/边界：read 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：读取 mapping 中 offset 起 size 字节，返回 detached 快照。
+  // 输入/输出及副作用：data 输出为拷贝，不取得外部资源所有权。
+  // 失败/边界：mapping 缺失、范围非法或 generation/reset epoch 过期时返回错误。
   pure virtual function rdma_status read(
     rdma_dma_mapping mapping,
     longint unsigned offset,
@@ -64,14 +54,14 @@ virtual class rdma_host_mem_api extends uvm_object;
     output byte data[]
   );
 
-  // 功能：在 rdma_host_mem_api 中，release 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：mapping（输入）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按 adapter 契约释放。
-  // 失败/边界：release 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：按 owner/generation/幂等规则释放 mapping 并删除账本引用。
+  // 输入/输出及副作用：成功时更新账本与生命周期，外部资源按 adapter 契约释放。
+  // 失败/边界：owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果。
   pure virtual function rdma_status \release (rdma_dma_mapping mapping);
 
-  // 功能：只读确认本 manager 对指定 opaque allocation 提供 failure-atomic release 契约。
-  // 输入/输出及副作用：mapping 为待验证 authority；基类不访问 backing、不 release 或改 ledger。
-  // 失败/边界：基类无法证明 concrete release 顺序，始终返回 UNSUPPORTED_OPCODE 以 fail closed。
+  // 功能：只读确认指定 allocation 的 release 满足 failure-atomic 契约。
+  // 输入/输出及副作用：基类不访问 backing，不改 ledger。
+  // 失败/边界：基类无法证明 release 顺序，始终返回 UNSUPPORTED_OPCODE（fail closed）。
   virtual function rdma_status validate_failure_atomic_release(
     rdma_dma_mapping mapping
   );
@@ -81,22 +71,18 @@ virtual class rdma_host_mem_api extends uvm_object;
     );
   endfunction
 
-  // 功能：release_opaque 在调用方发现 public mapping 字段异常时，仍使用
-  //       manager 内部的不透明 allocation identity 完成一次回滚释放。
-  // 输入/输出及副作用：mapping（输入）；成功时释放 manager 所拥有的 backing，
-  //       不依赖调用方可修改的 route/geometry 字段；不改变 router 自身账本。
-  // 失败/边界：默认实现回退到普通 release()，具体 manager 若维护独立 token/identity
-  //       应覆盖本函数；mapping 为空、token 不存在或释放失败时返回明确错误。
+  // 功能：用 manager 内部的不透明 allocation identity 做回滚释放。
+  // 输入/输出及副作用：成功时释放 manager 拥有的 backing，不依赖调用方可改的 route/geometry。
+  // 失败/边界：默认回退到 release()；有独立 token 的 manager 应覆盖；mapping 为空或 token
+  //   不存在时返回错误。
   virtual function rdma_status release_opaque(rdma_dma_mapping mapping);
     return \release (mapping);
   endfunction
 
-  // 功能：pin_umem 为用户态 VA 范围建立 UMEM 页描述和 pin 引用。
-  // 输入/输出及副作用：function_h、user_va、length 为输入，umem 为输出；
-  //       默认实现只建立模型页，不触碰外部 host-mem。
-  // 失败/边界：空 Function、零长度、地址溢出和 generation 不匹配返回错误；
-  //       非页对齐范围按 Linux ib_umem 语义保留首页 offset，成功返回的
-  //       UMEM 必须已 pin。
+  // 功能：为用户态 VA 范围创建 UMEM 描述并 pin 页。
+  // 输入/输出及副作用：umem 输出；默认实现只建立模型页，不触碰外部 host-mem。
+  // 失败/边界：function_h 非法为 INVALID_ARGUMENT；pin 失败时 umem=null；非页对齐范围
+  //   保留首页 offset（Linux ib_umem 语义）。
   virtual function rdma_status pin_umem(
     rdma_function_handle function_h,
     longint unsigned user_va,
@@ -126,9 +112,9 @@ virtual class rdma_host_mem_api extends uvm_object;
     return status;
   endfunction
 
-  // 功能：unpin_umem 释放由 pin_umem 返回的 UMEM pin 引用。
-  // 输入/输出及副作用：umem 为输入；默认实现调用 UMEM exactly-once unpin，不释放 borrowed 外部页。
-  // 失败/边界：空 UMEM 返回 INVALID_ARGUMENT；重复调用保持幂等成功。
+  // 功能：释放 pin_umem 建立的 UMEM pin 引用。
+  // 输入/输出及副作用：调用 umem.unpin_pages()，不释放 borrowed 外部页。
+  // 失败/边界：umem 为空返回 INVALID_ARGUMENT；重复调用保持幂等成功。
   virtual function rdma_status unpin_umem(rdma_umem umem);
     rdma_status status;
 
@@ -139,9 +125,9 @@ virtual class rdma_host_mem_api extends uvm_object;
     return normalize_status(status, "UMEM unpin");
   endfunction
 
-  // 功能：build_umem_pbl 组合 PBL 构建并把非拥有引用写入 DMA mapping。
-  // 输入/输出及副作用：umem 为输入，mapping 为输出；成功时 mapping 仅保存 UMEM/PBL 引用，不改变其所有权。
-  // 失败/边界：PBL 构建失败时不返回半成品 mapping，且不会隐式释放调用方已有 UMEM。
+  // 功能：基于 UMEM 构建 PBL，并生成指向 UMEM/PBL 的 DMA mapping。
+  // 输入/输出及副作用：mapping 输出仅保存 UMEM/PBL 非拥有引用。
+  // 失败/边界：umem 为空、PBL 构建失败、无可用页或偏移溢出时 mapping=null 并返回错误；不释放 umem。
   virtual function rdma_status build_umem_pbl(
     rdma_umem umem,
     output rdma_dma_mapping mapping
@@ -191,6 +177,6 @@ virtual class rdma_host_mem_api extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // ABI v5 生命周期约束：host-mem mapping 的 release 只能由 owned record
-  // 触发一次；borrowed mapping 的所有权仍留在外部 host-mem manager。
+  // ABI v5 生命周期约束：mapping 的 release 只能由 owned record 触发一次；
+  // borrowed mapping 的所有权仍留在外部 host-mem manager。
 endclass

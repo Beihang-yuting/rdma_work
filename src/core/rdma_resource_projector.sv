@@ -197,9 +197,9 @@ class rdma_resource_projector;
   endfunction
 
   // 功能：核对 source、clone 与 authority snapshot 三方对象图未因 hook 发生值或别名污染。
-  // 输入/输出及副作用：source/result 对照 saved_value/source_type；
-  //   authority_snapshot 对照 saved_authority/authority_type。
-  // 失败/边界：三方对象或 handle 共享、类型和值变化返回 0；只调用类型查询，不执行释放或账本写入。
+  // 输入/输出及副作用：source/result 对照 saved_value/source_type，authority_snapshot 对照
+  //   saved_authority/authority_type。
+  // 失败/边界：三方对象或 handle 共享、类型或值变化返回 0；只做类型查询，不释放、不写账本。
   static function automatic bit owned_mapping_hook_graph_intact(
     rdma_dma_mapping source,
     rdma_dma_mapping result,
@@ -220,10 +220,10 @@ class rdma_resource_projector;
            mapping_handles_detached(result, authority_snapshot);
   endfunction
 
-  // 功能：保留 owned mapping 的具体 release capability，并在 snapshot、clone 和双侧 authority hook 后校验对象图。
-  // 输入/输出及副作用：source 为 adapter 拥有的 mapping，copy_label 命名检查快照，result 输出同类型 detached clone；不释放资源。
-  // 失败/边界：空源、未注册/基类类型、无效 authority、clone 失败、字段/类型/别名变化返回 INVALID_ARGUMENT；
-  //   值投影失败传播 status；所有失败清空 result，hook/factory 可同步重入，调用方须复核 epoch/source。
+  // 功能：克隆 owned mapping 并保留其具体 release capability，在 snapshot/clone/双侧 authority hook 后校验对象图。
+  // 输入/输出及副作用：source 为 adapter 拥有的 mapping，copy_label 命名检查快照；result 输出同类型 detached clone；不释放资源。
+  // 失败/边界：空源、未注册/基类类型、authority 无效、clone 失败或字段/类型/别名变化返回 INVALID_ARGUMENT；值投影失败传播 status；失败清空
+  //   result；hook/factory 可重入，调用方须复核 epoch/source。
   static function automatic rdma_status clone_owned_mapping_value(
     rdma_dma_mapping source,
     string copy_label,
@@ -328,10 +328,10 @@ class rdma_resource_projector;
     return rdma_status::success();
   endfunction
 
-  // 功能：按 ownership 复制 backing 引用：owned 保留受验证 release capability，borrowed 仅投影值，再校验新引用。
-  // 输入/输出及副作用：source/copy_label 为输入，
-  //   result 输出含 ownership/release_complete 的独立 backing reference；validate 可回调。
-  // 失败/边界：空源成功/null；mapping 或 validate 失败清空 result 并传播状态，null validation status 返回 INVALID_STATE。
+  // 功能：按 ownership 复制 backing 引用：owned 保留已验证的 release capability，borrowed 仅投影值，并校验新引用。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出含 ownership/release_complete 的独立引用；validate 可回调。
+  // 失败/边界：空源成功且 result 为 null；mapping 或 validate 失败清空 result 并传播状态；validation status 为 null 返回
+  //   INVALID_STATE。
   static function automatic rdma_status project_backing_ref_value(
     rdma_backing_ref source,
     string copy_label,
@@ -461,11 +461,11 @@ class rdma_resource_projector;
     return rdma_status::success();
   endfunction
 
-  // 功能：复制 Function binding，包括受保护 identity snapshot、PCIe、DMA/caps/vector 和 readiness 镜像。
-  // 输入/输出及副作用：source/copy_label 为输入，
-  //   result 输出新 binding；调用 identity snapshot/configure_identity 保留已有 authority。
-  // 失败/边界：空 binding/PCIe/BAR、identity 配置或 owner 投影失败清空 result 并传播 status；
-  //   不登记 binding 或刷新 generation。
+  // 功能：复制 Function binding（受保护 identity snapshot、PCIe、DMA/caps/vector、readiness 镜像）。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出新 binding；调用 identity snapshot/configure_identity
+  //   保留已有 authority。
+  // 失败/边界：binding/PCIe/BAR 为空、identity 配置或 owner 投影失败时清空 result 并传播 status；不登记 binding、不刷新
+  //   generation。
   static function automatic rdma_status project_binding_value(
     rdma_function_binding source,
     string copy_label,
@@ -852,11 +852,10 @@ class rdma_resource_projector;
     return rdma_status::success();
   endfunction
 
-  // 功能：复制 queue/QP 附加 segment 的 role、ownership、偏移和长度，按所有权复制 mapping。
-  // 输入/输出及副作用：source、segment_label、null_error、owned_mapping_label、borrowed_mapping_label
-  //   为输入；result 输出独立 segment。
-  // 失败/边界：空 source 按 null_error 返回 INVALID_ARGUMENT；mapping 失败清空 result；不额外校验几何/role，
-  //   borrowed null mapping 可保留。
+  // 功能：复制 queue/QP 附加 segment 的 role、ownership、偏移、长度，并按所有权复制 mapping。
+  // 输入/输出及副作用：source、各 label、null_error 输入；result 输出独立 segment。
+  // 失败/边界：空 source 按 null_error 返回 INVALID_ARGUMENT；mapping 失败清空 result；不额外校验几何/role；borrowed 的
+  //   null mapping 可保留。
   static function automatic rdma_status project_backing_segment_value(
     rdma_queue_backing_segment source,
     string segment_label,
@@ -891,10 +890,9 @@ class rdma_resource_projector;
     return rdma_status::success();
   endfunction
 
-  // 功能：复制 queue backing 主引用和附加 segments，保留 cleanup_complete 及逻辑队列偏移。
-  // 输入/输出及副作用：source/copy_label 为输入，result 输出独立引用；owned mapping 走 authority clone，
-  //   borrowed mapping 只复制值。
-  // 失败/边界：空主引用成功/null；空 segment 或 mapping 复制失败清空 result 并传播 status，不执行 cleanup 或推进完成标志。
+  // 功能：复制 queue backing 主引用及附加 segments，保留 cleanup_complete 与逻辑队列偏移。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出独立引用；owned mapping 走 authority clone，borrowed 只复制值。
+  // 失败/边界：空主引用成功且 result 为 null；segment 或 mapping 复制失败清空 result 并传播 status；不执行 cleanup、不推进完成标志。
   static function automatic rdma_status project_queue_backing_ref_value(
     rdma_queue_backing_ref source,
     string copy_label,
@@ -978,10 +976,10 @@ class rdma_resource_projector;
     return rdma_status::success();
   endfunction
 
-  // 功能：复制 context 的 owner、slot token、HMC 及 shadow/slot 布局和释放标志。
-  // 输入/输出及副作用：source/copy_label 为输入，
-  //   result 输出独立 context reference；仅 token 内 completion_authority 按契约共享。
-  // 失败/边界：空源成功/null；owner/token/HMC 复制失败清空 result 并传播 status；不证明 slot 当前可释放。
+  // 功能：复制 context 的 owner、slot token、HMC、shadow/slot 布局与释放标志。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出独立 context reference；仅 token 内 completion_authority
+  //   按契约共享。
+  // 失败/边界：空源成功且 result 为 null；owner/token/HMC 复制失败清空 result 并传播 status；不证明 slot 当前可释放。
   static function automatic rdma_status project_queue_context_value(
     rdma_context_backing_ref source,
     string copy_label,
@@ -1123,10 +1121,10 @@ class rdma_resource_projector;
     return rdma_status::success();
   endfunction
 
-  // 功能：为失败恢复保留 mapping 的具体 clone 和 completion 查询能力，绕过正常 owned authority hooks。
-  // 输入/输出及副作用：source/copy_label 为输入，result 输出 clone；先后查询 source/result completion，保持原回调顺序。
-  // 失败/边界：空源/未注册类型/clone 空或类型、值、别名、完成状态变化返回 INVALID_ARGUMENT；null 查询返回 INVALID_STATE，
-  //   失败查询 status 原样传播；clone 首次别名拒绝可能留下 source 于 result，调用方必须按 status 丢弃。
+  // 功能：为失败恢复保留 mapping 的具体 clone 与 completion 查询能力，绕过正常 owned authority hooks。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出 clone；先后查询 source/result 的 completion，保持原回调顺序。
+  // 失败/边界：空源、未注册类型、clone 为空或类型/值/别名/完成状态变化返回 INVALID_ARGUMENT；查询为 null 返回 INVALID_STATE，失败
+  //   status 原样传播；首次别名拒绝后 result 可能仍指向 source，调用方须丢弃。
   static function automatic rdma_status clone_recovery_mapping_value(
     rdma_dma_mapping source,
     string copy_label,
@@ -1188,10 +1186,10 @@ class rdma_resource_projector;
     return rdma_status::success();
   endfunction
 
-  // 功能：按 recovery_only、owned、borrowed 优先级复制 QP 主 mapping，再复制角色、释放标志和附加 segments。
-  // 输入/输出及副作用：source/copy_label 为输入，
-  //   result 输出独立 QP backing reference；恢复 clone 不调用正常 authority hooks。
-  // 失败/边界：空引用成功/null；主 mapping 或任一 segment 失败清空 result 并传播 status；附加 segment 仍按各自 ownership 处理。
+  // 功能：按 recovery_only、owned、borrowed 优先级复制 QP 主 mapping，再复制角色、释放标志与附加 segments。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出独立 QP backing 引用；恢复 clone 不调用正常 authority hooks。
+  // 失败/边界：空引用成功且 result 为 null；主 mapping 或任一 segment 失败清空 result 并传播 status；segment 仍按各自
+  //   ownership 处理。
   static function automatic rdma_status project_qp_backing_ref_value(
     rdma_qp_backing_ref source,
     string copy_label,
@@ -1510,9 +1508,9 @@ class rdma_resource_projector;
   endfunction
 
   // 功能：复制 QP 恢复意图、完成标志、前后 QPC、plan/context、staging/query mapping 与命令/ticket。
-  // 输入/输出及副作用：source/copy_label 为输入，
-  //   result 输出独立 recovery state；query_mapping_recovery_only 决定 query clone 契约。
-  // 失败/边界：空源成功/null；staging 始终用 owned clone，query 按恢复标志选路；任一子图失败清空 result，不推进恢复。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出独立 recovery state；query_mapping_recovery_only 决定
+  //   query 的 clone 契约。
+  // 失败/边界：空源成功且 result 为 null；staging 始终按 owned clone，query 按恢复标志选路；任一子图失败清空 result，不推进恢复。
   static function automatic rdma_status project_qp_recovery_value(
     rdma_qp_recovery_state source,
     string copy_label,
@@ -1612,11 +1610,10 @@ class rdma_resource_projector;
     return status;
   endfunction
 
-  // 功能：按 handle.kind 分派 Function/PD/MR/CQ/QP/SRQ/CMQ/CEQ/AEQ，复制基础字段和业务子图。
-  // 输入/输出及副作用：source/copy_label 为输入，result 输出内建资源副本；CQ 的 programmed_cqc 保留 checked clone，
-  //   其它子图遵守各自契约。
-  // 失败/边界：空 source/handle、无效 kind、carrier 类型不符返回 INVALID_ARGUMENT；kind 中途变化也拒绝；
-  //   CQC clone 空/错型/别名或 null status 返回 INVALID_STATE；子图失败清空 result，不做 registry 提交。
+  // 功能：按 handle.kind 分派 Function/PD/MR/CQ/QP/SRQ/CMQ/CEQ/AEQ，复制基础字段与业务子图。
+  // 输入/输出及副作用：source/copy_label 输入；result 输出内建资源副本；CQ 的 programmed_cqc 保留 checked clone，其余子图遵守各自契约。
+  // 失败/边界：空 source/handle、无效 kind、carrier 类型不符或 kind 中途变化返回 INVALID_ARGUMENT；CQC clone
+  //   为空/错型/别名或 status 为 null 返回 INVALID_STATE；子图失败清空 result，不做 registry 提交。
   static function automatic rdma_status project_resource_value(
     rdma_resource source,
     string copy_label,
@@ -2031,10 +2028,10 @@ class rdma_resource_projector;
     return 1'b1;
   endfunction
 
-  // 功能：检查资源副本与 authoritative 的身份、owner、依赖、outstanding IDs 及各 kind 的 manager-owned 字段。
-  // 输入/输出及副作用：candidate/authoritative 为只读资源；返回 status，不查询 registry，也不允许调用方借此绕过提交门禁。
-  // 失败/边界：空资源/handle、身份/拓扑变化、kind 类型转换失败或各类固定 ID/依赖/binding 变化返回 INVALID_ARGUMENT；
-  //   不比较可更新业务字段，不证明 epoch/source 新鲜度；status factory 仍可能同步重入。
+  // 功能：检查资源副本与 authoritative 在身份、owner、依赖、outstanding IDs 及各 kind 的 manager-owned 字段上一致。
+  // 输入/输出及副作用：candidate/authoritative 只读；返回 status；不查询 registry，不能借此绕过提交门禁。
+  // 失败/边界：空资源/handle、身份或拓扑变化、kind 转换失败或固定 ID/依赖/binding 变化返回 INVALID_ARGUMENT；不比较可更新业务字段，不证明
+  //   epoch/source 新鲜度。
   static function automatic rdma_status publication_identity_status(
     rdma_resource candidate,
     rdma_resource authoritative

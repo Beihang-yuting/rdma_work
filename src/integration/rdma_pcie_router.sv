@@ -17,19 +17,18 @@ class rdma_pcie_route_entry extends uvm_object;
   protected longint unsigned m_verified_uid;
   protected int unsigned m_verified_global_id;
   protected int unsigned m_verified_generation;
-  // 功能：构造空 route entry，清零 route/authority 并标记尚未验证 provenance。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
+  // 功能：构造空 route entry，清零 route/authority 并标记 provenance 未验证。
+  // 输入/输出及副作用：name 为 UVM 对象名；只写默认字段。
+  // 失败/边界：无。
   function new(string name="rdma_pcie_route_entry");
     super.new(name);
     route='0; endpoint=null; function_uid=0; global_function_id=0;
     generation=0; m_identity_verified=0; m_verified_route='0;
     m_verified_uid=0; m_verified_global_id=0; m_verified_generation=0;
   endfunction
-  // 功能：从经过校验的 identity 一次性投影 route 和完整 authority 三元组，并记录
-  //       provenance；后续 configure() 可据此拒绝调用方手写或篡改的字段。
-  // 输入/输出及副作用：identity（输入）；调用方必须先完成输入对象的空值、authority 和 generation 校验；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：identity 为空或 validate() 失败时不修改已验证状态并返回错误。
+  // 功能：从已校验的 identity 一次性投影 route 与完整 authority 三元组，并记录 provenance。
+  // 输入/输出及副作用：identity 输入（调用方须先校验空值/authority/generation）；成功时更新本对象，后续 configure() 据此拒绝手写或篡改的字段。
+  // 失败/边界：identity 为空或 validate() 失败时返回错误，不改已验证状态。
   function rdma_status set_identity(rdma_function_identity identity);
     rdma_status s;
 
@@ -52,10 +51,9 @@ class rdma_pcie_route_entry extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 返回：字段未验证、route 非法或任一 authority 被篡改时返回 0。
-  // 功能：验证当前公开 route/authority 仍与 set_identity() 保存的快照完全一致。
-  // 输入/输出及副作用：无显式参数；返回 bit，不更新 entry、endpoint 或外部 authority。
-  // 失败/边界：尚未 set_identity、route 非法或 uid/global id/generation 任一不匹配时返回 0。
+  // 功能：验证当前公开 route/authority 仍与 set_identity() 保存的快照一致。
+  // 输入/输出及副作用：无参数；只读，返回 bit。
+  // 失败/边界：尚未 set_identity、route 非法或 uid/global id/generation 任一不符返回 0。
   function bit identity_authority_valid();
     return m_identity_verified &&
            rdma_route_key_valid(route) &&
@@ -65,10 +63,9 @@ class rdma_pcie_route_entry extends uvm_object;
            generation == m_verified_generation;
   endfunction
 
-  // 功能：比较两个 route key 的 Host/root/segment/BDF 值，不比较对象句柄或 authority。
-  // 输入/输出及副作用：lhs/rhs（输入值）；只读比较 Host/root/segment/BDF 标量字段，不更新
-  //   entry、endpoint 或外部 authority；该值类型比较没有失败返回路径。
-  // 失败/边界：lhs 或 rhs 中的路由字段任一不相等时返回 0；packed route 本身不会触发异常。
+  // 功能：比较两个 route key 的 Host/root/segment/BDF 值（不比较句柄或 authority）。
+  // 输入/输出及副作用：lhs/rhs 只读；返回 bit。
+  // 失败/边界：任一路由字段不等返回 0。
   protected function bit same_route_value(rdma_route_key_t lhs,
                                            rdma_route_key_t rhs);
     return lhs.host_topology_key == rhs.host_topology_key &&
@@ -80,19 +77,17 @@ endclass
 class rdma_pcie_router extends rdma_pcie_api;
   `uvm_object_utils(rdma_pcie_router)
   protected rdma_pcie_route_entry m_entries[$];
-  // 功能：构造空 PCIe router；实际 endpoint 表由 configure() 事务性发布。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：构造过程不分配 Host-memory、PCIe endpoint 或 manager 资源；空 name 也必须得到可配置对象。
+  // 功能：构造空 PCIe router；endpoint 表由 configure() 事务性发布。
+  // 输入/输出及副作用：name 为 UVM 对象名；只写默认字段。
+  // 失败/边界：无。
   function new(string name="rdma_pcie_router");
     super.new(name);
   endfunction
 
-  // 功能：校验并原子替换 route entry 表，确保每条 route、authority 和 endpoint BDF
-  //       一一对应；发现重复、歧义或 provenance 缺失时保留旧配置。
-  // 输入/输出及副作用：entries（输入）；成功时以非拥有 endpoint 引用原子替换 m_entries，
-  //   失败时保持旧表不变；不修改 entry 或 endpoint 对象。
-  // 失败/边界：空 entry/endpoint、非法 route、provenance/authority 缺失、重复 route/authority，
-  //   或 endpoint BDF 不匹配时返回错误并保留旧配置。
+  // 功能：校验并原子替换 route entry 表，保证 route、authority 与 endpoint BDF 一一对应。
+  // 输入/输出及副作用：entries 输入；成功时以非拥有 endpoint 引用替换 m_entries，失败保持旧表；不改 entry/endpoint。
+  // 失败/边界：空 entry/endpoint、route 非法、provenance/authority 缺失、route/authority 重复或 endpoint BDF
+  //   不符返回错误并保留旧配置。
   function rdma_status configure(rdma_pcie_route_entry entries[$]);
     rdma_pcie_route_entry new_entries[$];
 
@@ -131,11 +126,9 @@ class rdma_pcie_router extends rdma_pcie_api;
     m_entries = new_entries;
     return rdma_status::success();
   endfunction
-  // 功能：按 BDF 解析唯一 endpoint 并转发 32-bit PCIe 配置空间读；BDF 歧义或不存在
-  //       时返回错误且 data 清零。
-  // 输入/输出及副作用：target/offset（输入）、data/status（输出）；入口先清零 data，再按
-  //   裸 BDF 解析唯一 endpoint 并转发配置读；本 router 不修改 route 表。
-  // 失败/边界：BDF 不存在或多 Host 歧义时 status 返回错误且 data 保持零值。
+  // 功能：按 BDF 解析唯一 endpoint 并转发 32 位配置读。
+  // 输入/输出及副作用：target/offset 输入；data/status 输出；入口先清零 data；不改 route 表。
+  // 失败/边界：BDF 不存在或多 Host 歧义时返回错误，data 保持 0。
   task cfg_read32(
     rdma_bdf_t target,
     rdma_cfg_offset_t offset,
@@ -150,10 +143,9 @@ class rdma_pcie_router extends rdma_pcie_api;
       return;
     ep.cfg_read32(target, offset, data, status);
   endtask
-  // 功能：按 BDF 解析 endpoint 并转发带 byte-enable 的配置空间写访问。
-  // 输入/输出及副作用：target/offset/data/byte_enable（输入）、status（输出）；解析唯一 endpoint
-  //   后转发配置写，router 自身仅发布 status。
-  // 失败/边界：BDF 不存在或多 Host 歧义时不调用 endpoint，并返回对应错误状态。
+  // 功能：按 BDF 解析 endpoint 并转发带 byte-enable 的配置写。
+  // 输入/输出及副作用：target/offset/data/byte_enable 输入；status 输出。
+  // 失败/边界：BDF 不存在或多 Host 歧义时不调用 endpoint，返回错误。
   task cfg_write32(
     rdma_bdf_t target,
     rdma_cfg_offset_t offset,
@@ -168,10 +160,9 @@ class rdma_pcie_router extends rdma_pcie_api;
       return;
     ep.cfg_write32(target, offset, data, byte_enable, status);
   endtask
-  // 功能：使用完整 Function handle authority 选择 endpoint，并转发 MMIO 写数据。
-  // 输入/输出及副作用：function_h/address/data（输入）、status（输出）；先校验完整 Function
-  //   authority，再将 MMIO 写转发到匹配 endpoint；router 不拥有调用方 data 缓冲区。
-  // 失败/边界：不完整/过期/歧义 handle 会在 endpoint_for_handle() 被拒绝。
+  // 功能：用完整 Function handle authority 选择 endpoint 并转发 MMIO 写。
+  // 输入/输出及副作用：function_h/address/data 输入；status 输出；router 不拥有 data 缓冲区。
+  // 失败/边界：不完整/过期/歧义的 handle 在 endpoint_for_handle() 被拒绝。
   task mmio_write(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -185,10 +176,9 @@ class rdma_pcie_router extends rdma_pcie_api;
       return;
     ep.mmio_write(function_h, address, data, status);
   endtask
-  // 功能：按 Function handle 转发 DMA 可见性屏障，保证 Host-memory 写入对设备可见。
-  // 输入/输出及副作用：function_h（输入）、status（输出）；按完整 authority 选择 endpoint 并
-  //   转发可见性屏障，router 不修改 handle。
-  // 失败/边界：空/非 Function handle、authority 未命中或多命中时 status 返回错误，endpoint 不被调用。
+  // 功能：按 Function handle 转发 DMA 可见性屏障。
+  // 输入/输出及副作用：function_h 输入；status 输出；router 不改 handle。
+  // 失败/边界：handle 为空/非 Function、authority 未命中或多命中时返回错误，不调用 endpoint。
   task dma_visibility_barrier(rdma_function_handle function_h, output rdma_status status);
     rdma_pcie_api ep;
 
@@ -197,10 +187,9 @@ class rdma_pcie_router extends rdma_pcie_api;
       return;
     ep.dma_visibility_barrier(function_h, status);
   endtask
-  // 功能：按 Function handle 转发 MMIO 顺序屏障，保证 doorbell/寄存器写序列有序。
-  // 输入/输出及副作用：function_h（输入）、status（输出）；按完整 authority 选择 endpoint 并
-  //   转发 MMIO 顺序屏障，router 不修改 handle。
-  // 失败/边界：空/非 Function handle、authority 未命中或多命中时 status 返回错误，endpoint 不被调用。
+  // 功能：按 Function handle 转发 MMIO 顺序屏障。
+  // 输入/输出及副作用：function_h 输入；status 输出；router 不改 handle。
+  // 失败/边界：handle 为空/非 Function、authority 未命中或多命中时返回错误，不调用 endpoint。
   task mmio_ordering_barrier(rdma_function_handle function_h, output rdma_status status);
     rdma_pcie_api ep;
 
@@ -209,10 +198,9 @@ class rdma_pcie_router extends rdma_pcie_api;
       return;
     ep.mmio_ordering_barrier(function_h, status);
   endtask
-  // 功能：按 BDF 查询 endpoint 的 Function capability/info；歧义 BDF 不会被静默选择。
-  // 输入/输出及副作用：bdf（输入）、info（输出）；按裸 BDF 解析唯一 endpoint，再由 endpoint
-  //   发布 capability/info；入口将 info 置空，读取路径不取得 endpoint 所有权。
-  // 失败/边界：BDF 不存在或歧义时返回错误且 info 保持 null。
+  // 功能：按 BDF 查询 endpoint 的 Function capability/info。
+  // 输入/输出及副作用：bdf 输入；info 输出，入口先置 null；不取得 endpoint 所有权。
+  // 失败/边界：BDF 不存在或歧义时返回错误，info 保持 null，不静默选择。
   function rdma_status get_function_info(
     rdma_bdf_t bdf,
     output rdma_pcie_function_info info
@@ -226,12 +214,9 @@ class rdma_pcie_router extends rdma_pcie_api;
       return status;
     return ep.get_function_info(bdf, info);
   endfunction
-  // 功能：在所有 endpoint 中尝试解码 BAR 地址；仅唯一命中才返回结果，多命中视为
-  //       地址缺少 route authority 并返回错误。
-  // 输入/输出及副作用：address（输入）、result（输出）；逐个 endpoint 尝试解码并仅在唯一命中时
-  //   发布结果；不修改 address 或 route 表。
-  // 失败/边界：无 endpoint 命中时返回 DMA_TRANSLATION；多个 endpoint 命中时清空 result 并返回
-  //   INVALID_ARGUMENT，避免在缺少 route authority 时任意选择一个解码结果。
+  // 功能：在所有 endpoint 中解码 BAR 地址，仅唯一命中才返回结果。
+  // 输入/输出及副作用：address 输入；result 输出；不改 route 表。
+  // 失败/边界：无命中返回 DMA_TRANSLATION；多命中清空 result 并返回 INVALID_ARGUMENT（缺少 route authority）。
   function rdma_status decode_bar(
     rdma_bar_addr_t address,
     output rdma_bar_decode result
@@ -260,10 +245,9 @@ class rdma_pcie_router extends rdma_pcie_api;
     return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                              "BAR address route not found");
   endfunction
-  // 功能：按完整 route key 查找 endpoint，并将非拥有引用写入 endpoint；未命中返回 0。
-  // 输入/输出及副作用：route（输入）、endpoint（输出）；按完整 Host/root/segment/BDF 键查找
-  //   并发布非拥有 endpoint 引用；不修改 route 表。
-  // 失败/边界：未命中时返回 0 且 endpoint 为 null；完整键比较避免跨 Host 串路由。
+  // 功能：按完整 route key 查找 endpoint。
+  // 输入/输出及副作用：route 输入；endpoint 输出非拥有引用；不改 route 表。
+  // 失败/边界：未命中返回 0 且 endpoint 为 null。
   function bit resolve_route(rdma_route_key_t route, output rdma_pcie_api endpoint);
     endpoint = null;
     foreach (m_entries[i]) begin
@@ -275,19 +259,16 @@ class rdma_pcie_router extends rdma_pcie_api;
     return 0;
   endfunction
   // 功能：比较 router 内部 route key 的 Host/root/segment/BDF 完整值。
-  // 输入/输出及副作用：a/b（输入值）；只读比较 Host/root/segment/BDF 标量字段，不更新 route
-  //   表或 endpoint；该值类型比较没有失败返回路径。
-  // 失败/边界：a 或 b 的任一 Host/root/segment/BDF 字段不匹配时返回 0，不修改 m_entries。
+  // 输入/输出及副作用：a/b 只读；返回 bit。
+  // 失败/边界：任一字段不等返回 0。
   protected function bit same_route(rdma_route_key_t a, rdma_route_key_t b);
     return a.host_topology_key == b.host_topology_key &&
            a.root_id == b.root_id && a.segment == b.segment &&
            rdma_bdf_same(a.bdf, b.bdf);
   endfunction
-  // 功能：把裸 BDF 解析成唯一 endpoint；多 Host 相同 BDF 时明确返回歧义错误，
-  //       强制调用方改用完整 route。
-  // 输入/输出及副作用：bdf（输入）、status（输出）；扫描 route 表并返回唯一 endpoint 的非拥有
-  //   引用；多命中明确报告歧义。
-  // 失败/边界：BDF 不存在返回 DMA_TRANSLATION，多命中返回 INVALID_ARGUMENT，均不调用 endpoint。
+  // 功能：把裸 BDF 解析为唯一 endpoint；多 Host 同 BDF 时报歧义，迫使调用方改用完整 route。
+  // 输入/输出及副作用：bdf 输入；扫描 route 表，返回唯一 endpoint 的非拥有引用；status 输出。
+  // 失败/边界：BDF 不存在返回 DMA_TRANSLATION；多命中返回 INVALID_ARGUMENT；均不调用 endpoint。
   protected function rdma_pcie_api endpoint_for_bdf(
     rdma_bdf_t bdf,
     output rdma_status status
@@ -315,11 +296,10 @@ class rdma_pcie_router extends rdma_pcie_api;
       status = rdma_status::success();
     return ep;
   endfunction
-  // 功能：使用 {function_uid, global_function_id, generation} 完整 authority 查找
-  //       唯一 endpoint，防止仅凭局部 object_id 跨 Function 串路由。
-  // 输入/输出及副作用：h（输入）、status（输出）；按 function_uid、global ID 和 generation
-  //   三元组查找唯一 endpoint 的非拥有引用。
-  // 失败/边界：空/非 Function handle 或零/多命中时返回 INVALID_ARGUMENT，不调用 endpoint。
+  // 功能：用 {function_uid, global_function_id, generation} 完整 authority 查找唯一 endpoint，防止仅凭
+  //   object_id 串路由。
+  // 输入/输出及副作用：h 输入；返回唯一 endpoint 的非拥有引用；status 输出。
+  // 失败/边界：空/非 Function handle 或零/多命中返回 INVALID_ARGUMENT，不调用 endpoint。
   protected function rdma_pcie_api endpoint_for_handle(
     rdma_function_handle h,
     output rdma_status status

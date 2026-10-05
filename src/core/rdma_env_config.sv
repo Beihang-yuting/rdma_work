@@ -1,7 +1,7 @@
 // 目录：核心执行层 src/core/rdma_env_config.sv。
 // 职责：保存 rdma_env 的模式、适配器能力、超时、队列 profile 和 responder 配置。
-// 依赖：依赖 rdma_types_pkg、rdma_model_pkg 和 rdma_responder_registry 的值类型；不拥有外部 adapter。
-// 所有权与生命周期：配置对象由调用方创建；rdma_env.build_phase 通过 clone 拥有冻结快照，原始对象可独立销毁或修改。
+// 依赖：rdma_types_pkg、rdma_model_pkg、rdma_responder_registry 的值类型；不拥有外部 adapter。
+// 所有权与生命周期：由调用方创建；rdma_env.build_phase 通过 clone 持有冻结快照，原对象可独立修改。
 
 typedef enum bit [1:0] {
   RDMA_ENV_CORE_ONLY  = 2'd0,
@@ -25,11 +25,9 @@ class rdma_env_config extends uvm_object;
   rdma_function_identity function_identity;
   rdma_function_binding function_binding;
 
-  // 功能：构造默认 core-only 配置，关闭全部外部适配器并建立确定的超时/profile。
-  // 输入/输出及副作用：name 为 UVM 对象名；初始化标量、队列能力和空 region 列表，
-  //   不取得外部 adapter、responder 或 Function snapshot 的所有权。
-  // 失败/边界：构造不会验证 mode、route 或 region；调用 validate() 或 env.configure()
-  //   时才报告非法配置，默认 core-only 模式不启用任何 adapter。
+  // 功能：构造默认 core-only 配置，关闭全部外部适配器。
+  // 输入/输出及副作用：name 为 UVM 对象名；初始化标量、queue profile 和空 region 列表。
+  // 失败/边界：不校验配置，非法配置在 validate() 或 env.configure() 时报告。
   function new(string name = "rdma_env_config");
     super.new(name);
     mode = RDMA_ENV_CORE_ONLY;
@@ -47,11 +45,10 @@ class rdma_env_config extends uvm_object;
     function_binding = null;
   endfunction
 
-  // 功能：校验模式、adapter enable/required 关系、超时和每个 responder region 的地址边界。
-  // 输入/输出及副作用：读取当前配置并返回 rdma_status；不修改配置或外部账本。
-  // 失败/边界：required 未同时 enabled、timeout/硬件版本为零、region 为空 owner、
-  // 非法 route、size=0 或 65-bit 末地址溢出时拒绝；嵌套 validator 返回 null
-  // 时 fail-closed。
+  // 功能：校验模式、adapter enable/required 关系、超时、responder region 和 Function 快照。
+  // 输入/输出及副作用：只读当前配置，返回 rdma_status。
+  // 失败/边界：required 未 enabled、timeout/硬件版本为零、region owner 为空/route 非法/
+  //   size=0/65-bit 末地址溢出、嵌套 validator 返回 null 时均拒绝。
   function rdma_status validate();
     bit [64:0] end_ext;
     rdma_status identity_status;
@@ -124,11 +121,9 @@ class rdma_env_config extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：深拷贝配置对象，尤其是 responder value region 和 Function identity，形成 detached snapshot。
-  // 输入/输出及副作用：rhs 为源 uvm_object；函数覆盖当前对象的标量、queue profile、
-  //   detached responder region 和 Function identity/binding clone，源配置及其句柄不被修改。
-  // 失败/边界：rhs 不能 cast 为 rdma_env_config、region/identity/binding clone 或 region
-  //   factory 失败时触发 UVM fatal；本函数不返回 status，fatal 前的部分写入不应被发布。
+  // 功能：深拷贝配置（含 responder region 与 Function identity/binding），形成 detached snapshot。
+  // 输入/输出及副作用：rhs 为源对象，只读；覆盖当前对象全部字段。
+  // 失败/边界：rhs 类型不符或 region/identity/binding clone 失败时 UVM fatal，无 status 返回。
   virtual function void do_copy(uvm_object rhs);
     rdma_env_config source;
     rdma_responder_region region_copy;

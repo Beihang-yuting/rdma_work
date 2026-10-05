@@ -7,17 +7,13 @@
 // 所有权与生命周期：policy 只读取调用方提供的 plan 快照，不拥有 plan、target、ref、
 //   mapping 或 queue 生命周期；返回的 cardinality/index 由调用方消费。
 
-// 中文设计说明：flush completion 和 local cleanup 都把 role 作为逻辑键，而不是数组位置。
-// role 缺失或重复时必须在任何字段解引用前拒绝。两种数组元素类型不同，业务语义却相同，
-// 因此只把扫描和索引规则集中在这里，避免 resource manager 的两份循环逐渐漂移。
+// 设计说明：flush completion 与 local cleanup 以 role 为逻辑键而非数组位置；
+// 两类元素类型不同但语义相同，集中扫描规则以免 resource manager 中两份循环漂移。
 class rdma_queue_role_cardinality_policy;
 
-  // 功能：count_flush_targets 扫描 detached queue plan 的 flush_targets，统计 expected_role
-  //   出现次数，并在命中时返回最后一个匹配索引供 caller 做 cardinality==1 检查。
-  // 输入/输出及副作用：plan、expected_role（输入）提供快照和目标 role；target_index（输出）
-  //   接收匹配索引；函数不修改 plan、target、registry、recovery 或外部 backing。
-  // 失败/边界：plan 为空、数组为空、元素为 null 或没有匹配 role 时返回 0 且 index=0；
-  //   重复 role 返回实际数量，index 仅用于诊断，caller 必须拒绝非 1 的结果。
+  // 功能：统计 plan.flush_targets 中 role==expected_role 的数量，并给出最后匹配的下标。
+  // 输入/输出及副作用：target_index 输出最后匹配下标；只读，不修改 plan。
+  // 失败/边界：plan 为 null、数组为空、元素为 null 或无匹配时返回 0 且 index=0；caller 须拒绝非 1。
   static function int unsigned count_flush_targets(
     rdma_queue_backing_plan plan,
     rdma_queue_backing_role_e expected_role,
@@ -39,12 +35,9 @@ class rdma_queue_role_cardinality_policy;
     return count;
   endfunction
 
-  // 功能：count_backing_refs 扫描 detached queue plan 的 refs，统计 expected_role 出现次数，
-  //   并在命中时返回最后一个匹配索引供 caller 做 cardinality==1 检查。
-  // 输入/输出及副作用：plan、expected_role（输入）提供快照和目标 role；ref_index（输出）
-  //   接收匹配索引；函数不修改 plan、ref、registry、recovery 或外部 backing。
-  // 失败/边界：plan 为空、数组为空、元素为 null 或没有匹配 role 时返回 0 且 index=0；
-  //   重复 role 返回实际数量，index 仅用于诊断，caller 必须拒绝非 1 的结果。
+  // 功能：统计 plan.refs 中 role==expected_role 的数量，并给出最后匹配的下标。
+  // 输入/输出及副作用：ref_index 输出最后匹配下标；只读，不修改 plan。
+  // 失败/边界：plan 为 null、数组为空、元素为 null 或无匹配时返回 0 且 index=0；caller 须拒绝非 1。
   static function int unsigned count_backing_refs(
     rdma_queue_backing_plan plan,
     rdma_queue_backing_role_e expected_role,

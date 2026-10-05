@@ -1,76 +1,72 @@
 // 目录：硬件编解码层 codec/rdma/rdma_context_body_codecs.sv。
-// 职责：实现 rdma_hw_context_body_codecs 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：实现 CQC/MRT/SRQC/CEQC/AEQC 的 64 字节 context body 编解码，并注册到 codec registry。
+// 依赖：本层公共 types/model/adapter 契约、qword builder 与 codec registry。
+// 所有权与生命周期：codec 对象只持有值状态；输入模型只读，输出 image/model 为新建 detached 对象。
 
-// 中文说明：rdma_context_body_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// 说明：所有 body 先经 qword builder 写入并校验 occupancy mask，失败路径不发布部分 image/model。
 
 virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
   localparam int unsigned BODY_BYTES = 64;
 
-  // 功能：构造 rdma_hw_context_body_codec_base，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_context_body_codec_base 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_context_body_codec_base");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，expected_image_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_image_kind 读取 对象字段：rdma_status、message 并使用字段 rdma_status、message；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_image_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：（纯虚）返回该 codec 对应的 image kind。
+  // 输入/输出及副作用：无输入；返回 rdma_image_kind_e。
+  // 失败/边界：无。
   protected pure virtual function rdma_image_kind_e expected_image_kind();
-  // 功能：在 rdma_hw_context_body_codec_base 中，expected_opcode 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_opcode 返回具体 context codec 固定的硬件 opcode，不读取可变对象字段；函数返回 bit [7:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_opcode 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：（纯虚）返回该 codec 对应的硬件 opcode。
+  // 输入/输出及副作用：无输入；返回 bit [7:0]。
+  // 失败/边界：无。
   protected pure virtual function bit [7:0] expected_opcode();
-  // 功能：model_pbl_mode 按函数体读取当前字段并生成 rdma_mr_pbl_mode_e 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：model（输入）；model_pbl_mode 读取 model.page_layout.pbl_mode，返回 MRT 的 PBL 编码模式；函数返回 rdma_mr_pbl_mode_e，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：（纯虚）返回 model 对应的 PBL 编码模式。
+  // 输入/输出及副作用：model 为输入；返回 rdma_mr_pbl_mode_e。
+  // 失败/边界：无。
   protected pure virtual function rdma_mr_pbl_mode_e model_pbl_mode(
     rdma_hw_model model
   );
-  // 功能：在 rdma_hw_context_body_codec_base 中，owner_generation 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
-  // 输入/输出及副作用：model（输入）；owner_generation 读取 model 绑定句柄的 generation，返回用于拒绝旧代际请求的值；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：owner_generation 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：（纯虚）返回 model 绑定句柄的 generation。
+  // 输入/输出及副作用：model 为输入；返回 int unsigned。
+  // 失败/边界：无。
   protected pure virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
-  // 功能：在 rdma_hw_context_body_codec_base 中，encode_body 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：（纯虚）把 model 的字段经 builder 写入 context body。
+  // 输入/输出及副作用：model、builder 为输入；写入 builder。
+  // 失败/边界：失败返回非 OK status，调用方不得发布 image。
   protected pure virtual function rdma_status encode_body(
     rdma_hw_model model,
     rdma_hw_qword_builder builder
   );
-  // 功能：在 rdma_hw_context_body_codec_base 中，decode_body 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：（纯虚）从 builder 中解码字段构造 model。
+  // 输入/输出及副作用：builder 为输入，model 为输出。
+  // 失败/边界：失败返回非 OK status。
   protected pure virtual function rdma_status decode_body(
     rdma_hw_qword_builder builder,
     output rdma_hw_model model
   );
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；invalid_argument 用 message 构造 RDMA_SC_INVALID_ARGUMENT，不更新 codec 或外部资源；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_ARGUMENT 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，codec_error 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
-  // 输入/输出及副作用：message（输入）；codec_error 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：codec_error 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 CODEC_ERROR 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：context_status_or_error 将 context-body 编码链中来自 virtual 或
-  //       后端 builder 的状态统一归一化，给调用方一个可安全解引用的结果。
-  // 输入/输出及副作用：status 和 label 为输入；非空 status 原样返回，null
-  //       status 转为 INVALID_STATE；不修改 model、image、builder 或资源账本。
-  // 失败/边界：下游违反“状态必须非空”的契约时返回带 label 的确定性错误，调用
-  //       方必须停止当前 encode/decode 阶段，不能继续读取 status.message。
+  // 功能：把编码链中的 null status 归一化为 INVALID_STATE，保证调用方可安全解引用。
+  // 输入/输出及副作用：status、label 为输入；非空原样返回，不改其他状态。
+  // 失败/边界：status 为 null 时返回带 label 的 INVALID_STATE。
   protected function rdma_status context_status_or_error(
     rdma_status status,
     string label
@@ -83,9 +79,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，put 把请求数据写入指定后端并保留返回状态；只有写入成功才允许本地游标继续推进。
-  // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输入）；put 读取 builder、word_byte_offset、lsb、width、value 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：put 遇到后端拒绝、范围溢出或 DMA 权限不足时保留失败证据，不推进本地游标。
+  // 功能：经 builder 写入一个位域。
+  // 输入/输出及副作用：builder、word_byte_offset、lsb、width、value 为输入；写 builder 内部缓冲。
+  // 失败/边界：builder 为空或 put_field 失败/返回 null 时返回 CODEC_ERROR。
   protected function rdma_status put(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -109,10 +105,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，get 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output
-  //   为 detached 快照，读取不取得外部资源所有权。
-  // 失败/边界：get 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：经 builder 读取一个位域。
+  // 输入/输出及副作用：builder、word_byte_offset、lsb、width 为输入；value 为 inout 输出。
+  // 失败/边界：builder 为空或 get_field 失败/返回 null 时返回 CODEC_ERROR。
   protected function rdma_status get(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -136,9 +131,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，encode_log2 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：value（输入）、width（输入）、label（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_log2 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 2 的幂 value 编码为 log2 码。
+  // 输入/输出及副作用：value、width、label 为输入；code 为输出。
+  // 失败/边界：value 非零 2 的幂或 log2 超出 width 位宽时返回 INVALID_ARGUMENT。
   protected function rdma_status encode_log2(
     int unsigned value,
     int unsigned width,
@@ -159,9 +154,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，encode_page 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：backing（输入）、label（输入）、page（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_page 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 4KiB 对齐的 backing 地址编码为页号。
+  // 输入/输出及副作用：backing、label 为输入；page 为输出（地址 [63:12]）。
+  // 失败/边界：地址未 4KiB 对齐时返回 INVALID_ARGUMENT。
   protected function rdma_status encode_page(
     rdma_backing_addr_t backing,
     string label,
@@ -174,9 +169,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，encode_context_state 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：state（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_context_state 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 context 状态枚举编码为 2 位码。
+  // 输入/输出及副作用：state 为输入；code 为输出（INVALID/VALID/ERROR 对应 0/1/2）。
+  // 失败/边界：其他状态返回 INVALID_ARGUMENT。
   protected function rdma_status encode_context_state(
     rdma_context_state_e state,
     output bit [1:0] code
@@ -190,9 +185,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，decode_context_state 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：code（输入）、state（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_context_state 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 2 位状态码解码为 context 状态枚举。
+  // 输入/输出及副作用：code 为输入；state 为输出。
+  // 失败/边界：码值非 0/1/2 时返回 CODEC_ERROR。
   protected function rdma_status decode_context_state(
     bit [1:0] code,
     output rdma_context_state_e state
@@ -206,9 +201,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，projected_handle 构造或投影带完整 kind、Function UID、object ID 和 generation 的资源句柄。
-  // 输入/输出及副作用：name（输入）、kind（输入）、object_id（输入）；projected_handle 读取 name、kind、object_id 并使用字段 handle、handle.kind、handle.object_id、handle.function_uid、handle.generation；函数返回 rdma_handle，不取得调用方资源所有权。
-  // 失败/边界：projected_handle 的结果直接由 return handle 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：构造只含 kind/object_id 的句柄投影。
+  // 输入/输出及副作用：name、kind、object_id 为输入；返回新 rdma_handle，function_uid 与 generation 置 0。
+  // 失败/边界：无。
   protected function rdma_handle projected_handle(
     string name,
     rdma_resource_kind_e kind,
@@ -223,9 +218,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return handle;
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，image_pbl_mode 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
-  // 输入/输出及副作用：builder（输入）、pbl_mode（输出）；image_pbl_mode 读取 builder、pbl_mode 并使用字段 pbl_mode，并写入 pbl_mode；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：image_pbl_mode 的结果直接由 return rdma_status::success() 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：返回 image 的 PBL 模式；默认实现固定为 RDMA_MR_PBL0。
+  // 输入/输出及副作用：builder 为输入；pbl_mode 为输出。
+  // 失败/边界：无。
   protected virtual function rdma_status image_pbl_mode(
     rdma_hw_qword_builder builder,
     output rdma_mr_pbl_mode_e pbl_mode
@@ -234,9 +229,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_encode_mask 校验 builder、pbl_mode 与当前对象状态的一致性，并显式处理“context-body encode mask validation failed: ”；“context-body occupancy is not eight qwords”；“context-body encode mask lookup failed”；“context-body qword %0d authorship 0x%016x differs from mask 0x%016x”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：builder（输入）、pbl_mode（输入）；validate_encode_mask 读取 builder、pbl_mode 并使用字段 status、allowed；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate_encode_mask 返回 RDMA_SC_CODEC_ERROR；典型拒绝条件为“context-body occupancy is not eight qwords”“context-body encode mask lookup failed”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 builder 已写位域与该 image/opcode/PBL 模式的允许 mask 完全一致。
+  // 输入/输出及副作用：builder、pbl_mode 为输入；只读 builder 的 occupancy。
+  // 失败/边界：builder 为空、mask 校验失败、occupancy 非 8 个 qword 或与 mask 不等时返回 CODEC_ERROR。
   protected function rdma_status validate_encode_mask(
     rdma_hw_qword_builder builder,
     rdma_mr_pbl_mode_e pbl_mode
@@ -273,9 +268,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，finish_body 提交当前事务阶段并发布 detached 结果，只有成功路径才推进游标或状态。
-  // 输入/输出及副作用：builder（输入）、pbl_mode（输入）、owner_generation（输入）、image（输出）；finish_body 读取 builder、pbl_mode、owner_generation、image 并使用字段 image、status、payload、candidate、candidate.length、candidate.alignment、candidate.endian、candidate.image_kind，并写入 image；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：finish_body 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 mask 并序列化 builder，发布 64 字节 detached image。
+  // 输入/输出及副作用：builder、pbl_mode、owner_generation 为输入；image 为输出，失败时为 null。
+  // 失败/边界：builder 为空、mask 校验或序列化失败时返回错误且不发布 image。
   protected function rdma_status finish_body(
     rdma_hw_qword_builder builder,
     rdma_mr_pbl_mode_e pbl_mode,
@@ -322,9 +317,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：校验 model、写 body 并生成 image。
+  // 输入/输出及副作用：model 为输入；image 为输出，失败时为 null；内部新建临时 builder。
+  // 失败/边界：validate_model、builder reset 或 encode_body 失败时返回错误。
   virtual function rdma_status encode(
     rdma_hw_model model,
     output rdma_hw_image image
@@ -358,9 +353,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
                        owner_generation(model), image);
   endfunction
 
-  // 功能：validate_image 校验 image 与当前对象状态的一致性，并显式处理“context-body image is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：image（输入）；validate_image 读取 image 并使用字段 payload、builder、status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 image 的长度、元数据、反序列化结果与保留位 mask。
+  // 输入/输出及副作用：image 为输入；只读。
+  // 失败/边界：image 为空、非 64 字节、元数据不符、反序列化或 mask 校验失败时返回 CODEC_ERROR。
   virtual function rdma_status validate_image(rdma_hw_image image);
     rdma_hw_qword_builder builder;
     rdma_mr_pbl_mode_e pbl_mode;
@@ -405,9 +400,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codec_base 中，decode 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：image（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：校验 image 后解码并验证 model。
+  // 输入/输出及副作用：image 为输入；model 为输出，失败时为 null。
+  // 失败/边界：validate_image、反序列化、decode_body 失败、候选为空或语义校验失败时返回错误。
   virtual function rdma_status decode(
     rdma_hw_image image,
     output rdma_hw_model model
@@ -456,9 +451,9 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_context_body_codecs 中由 serialized_equal 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）、equal（输出）、mismatch（输出）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：serialized_equal 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：编码两个 model 并逐字节比较序列化结果。
+  // 输入/输出及副作用：lhs、rhs 为输入；equal、mismatch 为输出。
+  // 失败/边界：任一侧编码失败时返回其状态并在 mismatch 标明哪一侧；字节差异时 equal=0 且 status OK。
   virtual function rdma_status serialized_equal(
     rdma_hw_model lhs,
     rdma_hw_model rhs,
@@ -500,16 +495,16 @@ virtual class rdma_hw_context_body_codec_base extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：hardware_endian 使用 当前对象字段 计算并返回 rdma_byte_endian_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；hardware_endian 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_byte_endian_e，不取得调用方资源所有权。
-  // 失败/边界：hardware_endian 是只读访问器，返回 RDMA_ENDIAN_BIG；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回硬件端序 RDMA_ENDIAN_BIG。
+  // 输入/输出及副作用：无输入。
+  // 失败/边界：无。
   virtual function rdma_byte_endian_e hardware_endian();
     return RDMA_ENDIAN_BIG;
   endfunction
 
-  // 功能：describe_fields 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；describe_fields 读取局部计算结果，并使用字段 kind、opcode；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回描述 image kind 与 opcode 的稳定文本。
+  // 输入/输出及副作用：无输入；返回 string。
+  // 失败/边界：无。
   virtual function string describe_fields();
     return $sformatf("rdma 64-byte sparse body kind=%s opcode=%02x",
                      expected_image_kind().name(), expected_opcode());
@@ -520,39 +515,39 @@ class rdma_hw_cqc_create_body_codec
     extends rdma_hw_context_body_codec_base;
   `uvm_object_utils(rdma_hw_cqc_create_body_codec)
 
-  // 功能：构造 rdma_hw_cqc_create_body_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_cqc_create_body_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_cqc_create_body_codec");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，expected_image_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_image_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_image_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_IMAGE_CQC。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function rdma_image_kind_e expected_image_kind();
     return RDMA_IMAGE_CQC;
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，expected_opcode 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_opcode 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit [7:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_opcode 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_OP_CQC_CREATE。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function bit [7:0] expected_opcode();
     return RDMA_OP_CQC_CREATE;
   endfunction
 
-  // 功能：model_pbl_mode 按函数体读取当前字段并生成 rdma_mr_pbl_mode_e 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：model（输入）；model_pbl_mode 读取 model 并使用输入参数和固定枚举/常量；函数返回 rdma_mr_pbl_mode_e，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回 RDMA_MR_PBL0（该类 context 不使用 PBL）。
+  // 输入/输出及副作用：model 为输入但未使用。
+  // 失败/边界：无。
   protected virtual function rdma_mr_pbl_mode_e model_pbl_mode(
     rdma_hw_model model
   );
     return RDMA_MR_PBL0;
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，owner_generation 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
-  // 输入/输出及副作用：model（输入）；owner_generation 读取 model 并使用字段 generation；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：owner_generation 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：返回 model.cq_h.generation，用作 image 的 function_generation。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败或 cq_h 为空时返回 0。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -561,9 +556,9 @@ class rdma_hw_cqc_create_body_codec
     return cqc.cq_h.generation;
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，encode_cqe_size 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：bytes（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_cqe_size 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 CQE 字节数（32/64/128）编码为 2 位码。
+  // 输入/输出及副作用：bytes 为输入；code 为输出。
+  // 失败/边界：其他大小返回 INVALID_ARGUMENT。
   protected function rdma_status encode_cqe_size(
     int unsigned bytes,
     output bit [1:0] code
@@ -577,9 +572,9 @@ class rdma_hw_cqc_create_body_codec
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，decode_cqe_size 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：code（输入）、bytes（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_cqe_size 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 2 位码解码为 CQE 字节数。
+  // 输入/输出及副作用：code 为输入；bytes 为输出。
+  // 失败/边界：码值非 0/1/2 时返回 CODEC_ERROR。
   protected function rdma_status decode_cqe_size(
     bit [1:0] code,
     output int unsigned bytes
@@ -593,9 +588,9 @@ class rdma_hw_cqc_create_body_codec
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“rdma CQC codec requires rdma_cqc_model”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 CQC model 能被硬件字段表示。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败、model.validate 失败、对象模式不支持、深度/CQE 大小/页对齐/标量越界时返回 INVALID_ARGUMENT。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_cqc_model cqc;
     rdma_status status;
@@ -633,9 +628,9 @@ class rdma_hw_cqc_create_body_codec
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，encode_body 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 CQC model 的 CQN、SD/当前/下一页 PBA、深度、CQE 大小、producer/consumer、arm 状态等 字段按硬件位域写入 builder。
+  // 输入/输出及副作用：model、builder 为输入；经 put() 写 builder，不改 model。
+  // 失败/边界：cast 失败、字段编码失败或 put 失败时返回错误，不继续写后续字段。
   protected virtual function rdma_status encode_body(
     rdma_hw_model model,
     rdma_hw_qword_builder builder
@@ -699,9 +694,9 @@ class rdma_hw_cqc_create_body_codec
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，decode_body 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：从 builder 解码 CQC model：CQ/CEQ 句柄、深度、页地址、CQE 大小、producer/consumer、arm 状态。
+  // 输入/输出及副作用：builder 为输入，model 为输出，失败时保持 null；get() 读字段。
+  // 失败/边界：字段码非法或 get 失败时返回错误且不发布 model。
   protected virtual function rdma_status decode_body(
     rdma_hw_qword_builder builder,
     output rdma_hw_model model
@@ -773,28 +768,28 @@ endclass
 virtual class rdma_hw_mrt_body_codec_base
     extends rdma_hw_context_body_codec_base;
 
-  // 功能：构造 rdma_hw_mrt_body_codec_base，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_mrt_body_codec_base 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_mrt_body_codec_base");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，is_key_alloc 判断 is_key_alloc 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：无显式参数；is_key_alloc 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：is_key_alloc 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：（纯虚）区分 KEY_ALLOC 与 MR_REGISTER 两种 MRT body。
+  // 输入/输出及副作用：无输入；返回 bit。
+  // 失败/边界：无。
   protected pure virtual function bit is_key_alloc();
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，expected_image_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_image_kind 返回 MRT codec 固定的 RDMA_IMAGE_MRT 类型，不读取可变对象字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_image_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_IMAGE_MRT。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function rdma_image_kind_e expected_image_kind();
     return RDMA_IMAGE_MRT;
   endfunction
 
-  // 功能：model_pbl_mode 按函数体读取当前字段并生成 rdma_mr_pbl_mode_e 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：model（输入）；model_pbl_mode 读取 model 并使用字段 pbl_mode；函数返回 rdma_mr_pbl_mode_e，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回 MRT 的 page_layout.pbl_mode。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败或 page_layout 为空时返回 RDMA_MR_PBL0。
   protected virtual function rdma_mr_pbl_mode_e model_pbl_mode(
     rdma_hw_model model
   );
@@ -803,9 +798,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return mrt.page_layout.pbl_mode;
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，owner_generation 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
-  // 输入/输出及副作用：model（输入）；owner_generation 读取 model 并使用字段 generation；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：owner_generation 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：返回 model.mr_h.generation，用作 image 的 function_generation。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败或 mr_h 为空时返回 0。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -814,9 +809,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return mrt.mr_h.generation;
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，image_pbl_mode 返回 profile 固定的镜像字段或长度常量，供编码和断言使用。
-  // 输入/输出及副作用：builder（输入）、pbl_mode（输出）；image_pbl_mode 读取 builder、pbl_mode 并使用字段 pbl_mode、value、status，并写入 pbl_mode；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：image_pbl_mode 返回 RDMA_SC_CODEC_ERROR；典型拒绝条件为“rdma MRT PBL mode code is invalid”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：从 MRT body 的 PBL_MODE 字段读取 PBL 模式。
+  // 输入/输出及副作用：builder 为输入；pbl_mode 为输出（先置 PBL0）；经 get() 读字段。
+  // 失败/边界：get 失败返回其错误；码值大于 PBL2 时返回 CODEC_ERROR。
   protected virtual function rdma_status image_pbl_mode(
     rdma_hw_qword_builder builder,
     output rdma_mr_pbl_mode_e pbl_mode
@@ -835,10 +830,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，encode_mr_state 将 MRT 专用
-  //       INVLD/FREE/VLD 枚举映射为驱动 mr.h 的 0/1/2 状态码。
-  // 输入/输出及副作用：state（输入）、code（输出）；只读取 state 并写入 output code，不修改 MRT、image 或外部资源。
-  // 失败/边界：state 为未定义的 2'b11 时返回 INVALID_ARGUMENT；合法三态均成功，调用方负责在写 image 前处理失败。
+  // 功能：把 MRT 状态枚举编码为驱动 mr.h 的 0/1/2 状态码。
+  // 输入/输出及副作用：state 为输入；code 为输出。
+  // 失败/边界：未定义状态返回 INVALID_ARGUMENT。
   protected function rdma_status encode_mr_state(
     rdma_mr_state_e state,
     output bit [1:0] code
@@ -852,10 +846,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，decode_mr_state 将硬件 0/1/2
-  //       状态码还原为 MRT 专用 INVALID/FREE/VALID 枚举。
-  // 输入/输出及副作用：code（输入）、state（输出）；只读取 code 并写入 output state，不接管 image 或外部资源。
-  // 失败/边界：code 为 2'b11 或驱动未定义值时返回 CODEC_ERROR，禁止发布一个伪造的 MRT 状态。
+  // 功能：把 0/1/2 状态码还原为 MRT 状态枚举。
+  // 输入/输出及副作用：code 为输入；state 为输出。
+  // 失败/边界：未定义码值（含 2'b11）返回 CODEC_ERROR，不发布伪造状态。
   protected function rdma_status decode_mr_state(
     bit [1:0] code,
     output rdma_mr_state_e state
@@ -869,9 +862,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，encode_host_page 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：page_size（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_host_page 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 host page 大小（4K/2M/1G）编码为 2 位码。
+  // 输入/输出及副作用：page_size 为输入；code 为输出。
+  // 失败/边界：其他大小返回 INVALID_ARGUMENT。
   protected function rdma_status encode_host_page(
     rdma_mr_host_page_size_e page_size,
     output bit [1:0] code
@@ -885,9 +878,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，decode_host_page 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：code（输入）、page_size（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_host_page 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 2 位码解码为 host page 大小。
+  // 输入/输出及副作用：code 为输入；page_size 为输出。
+  // 失败/边界：未定义码值返回 CODEC_ERROR。
   protected function rdma_status decode_host_page(
     bit [1:0] code,
     output rdma_mr_host_page_size_e page_size
@@ -901,9 +894,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，encode_address_mode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：address_mode（输入）、code（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_address_mode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把地址模式（VA-based/zero-based）编码为 1 位码。
+  // 输入/输出及副作用：address_mode 为输入；code 为输出。
+  // 失败/边界：其他模式返回 INVALID_ARGUMENT。
   protected function rdma_status encode_address_mode(
     rdma_mr_address_mode_e address_mode,
     output bit code
@@ -916,9 +909,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，decode_address_mode 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：code（输入）、address_mode（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_address_mode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 1 位码解码为地址模式。
+  // 输入/输出及副作用：code 为输入；address_mode 为输出。
+  // 失败/边界：未定义码值返回 CODEC_ERROR。
   protected function rdma_status decode_address_mode(
     bit code,
     output rdma_mr_address_mode_e address_mode
@@ -931,9 +924,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_cqc_create_body_codec 中，normalized_rights 把访问方向或请求权限规范化为 Host-memory/DMA 校验使用的权限位集合。
-  // 输入/输出及副作用：access（输入）；normalized_rights 读取 access 并使用字段 rights；函数返回 bit [4:0]，不取得调用方资源所有权。
-  // 失败/边界：normalized_rights 是只读访问器，返回 rights；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：把访问权限规整为硬件 rights 位图。
+  // 输入/输出及副作用：access 为输入；返回 5 位 rights；remote write/atomic 隐含 LOCAL_WRITE。
+  // 失败/边界：无。
   protected function bit [4:0] normalized_rights(rdma_rdma_access_t access);
     bit [4:0] rights;
     rights = '0;
@@ -946,9 +939,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rights;
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“rdma MRT codec requires rdma_mrt_model”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 MRT model 能被硬件字段表示。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败、model.validate 失败、状态/页大小/地址模式不支持、标量越界或 PBA 未对齐时返回错误。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_mrt_model mrt;
     rdma_status status;
@@ -986,9 +979,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，encode_body 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 MRT model 的 MR 状态、host page、地址模式、访问权限、PBA0/PBA1 或 first PBL 等 字段按硬件位域写入 builder。
+  // 输入/输出及副作用：model、builder 为输入；经 put() 写 builder，不改 model。
+  // 失败/边界：cast 失败、字段编码失败或 put 失败时返回错误，不继续写后续字段。
   protected virtual function rdma_status encode_body(
     rdma_hw_model model,
     rdma_hw_qword_builder builder
@@ -1066,9 +1059,9 @@ virtual class rdma_hw_mrt_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_mrt_body_codec_base 中，decode_body 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：从 builder 解码 MRT model：STAG、PD 句柄、权限、host page、PBL 模式、状态镜像及 PBA/first PBL。
+  // 输入/输出及副作用：builder 为输入，model 为输出，失败时保持 null；get() 读字段。
+  // 失败/边界：字段码非法或 get 失败时返回错误且不发布 model。
   protected virtual function rdma_status decode_body(
     rdma_hw_qword_builder builder,
     output rdma_hw_model model
@@ -1099,9 +1092,8 @@ virtual class rdma_hw_mrt_body_codec_base
     `MRT_GET(RDMA_MRT_BODY_NXT_ST, next_state_code)
     `MRT_GET(RDMA_MRT_BODY_STAG_KEY, stag_key)
     `MRT_GET(RDMA_MRT_BODY_PARENT_STAG_IDX, parent_stag_index)
-    // A nonzero self-parent distinguishes KEY_ALLOC from MR_REGISTER. STAG
-    // zero is ambiguous in an isolated body, so the caller must authenticate
-    // the codec using the exact opcode/registry identity.
+    // 非零的 self-parent 用于区分 KEY_ALLOC 与 MR_REGISTER；孤立 body 中 STAG 0 有歧义，
+    // 调用方须按精确的 opcode/registry 身份认证 codec。
     if ((is_key_alloc() && parent_stag_index != stag_index) ||
         (!is_key_alloc() && parent_stag_index != 0))
       return codec_error("rdma MRT parent STAG does not match opcode");
@@ -1184,19 +1176,19 @@ class rdma_hw_mrt_key_alloc_body_codec
     extends rdma_hw_mrt_body_codec_base;
   `uvm_object_utils(rdma_hw_mrt_key_alloc_body_codec)
 
-  // 功能：构造 rdma_hw_mrt_key_alloc_body_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_mrt_key_alloc_body_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_mrt_key_alloc_body_codec");
     super.new(name);
   endfunction
-  // 功能：在 rdma_hw_mrt_key_alloc_body_codec 中，is_key_alloc 判断 is_key_alloc 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：无显式参数；is_key_alloc 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：is_key_alloc 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：返回 1：本 codec 为 KEY_ALLOC。
+  // 输入/输出及副作用：无输入。
+  // 失败/边界：无。
   protected virtual function bit is_key_alloc(); return 1'b1; endfunction
-  // 功能：在 rdma_hw_mrt_key_alloc_body_codec 中，expected_opcode 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_opcode 返回 key-alloc codec 固定的 RDMA_OP_KEY_ALLOC opcode，不读取可变对象字段；函数返回 bit [7:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_opcode 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_OP_KEY_ALLOC。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function bit [7:0] expected_opcode();
     return RDMA_OP_KEY_ALLOC;
   endfunction
@@ -1206,19 +1198,19 @@ class rdma_hw_mrt_register_body_codec
     extends rdma_hw_mrt_body_codec_base;
   `uvm_object_utils(rdma_hw_mrt_register_body_codec)
 
-  // 功能：构造 rdma_hw_mrt_register_body_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_mrt_register_body_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_mrt_register_body_codec");
     super.new(name);
   endfunction
-  // 功能：在 rdma_hw_mrt_register_body_codec 中，is_key_alloc 判断 is_key_alloc 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：无显式参数；is_key_alloc 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：is_key_alloc 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：返回 0：本 codec 为 MR_REGISTER。
+  // 输入/输出及副作用：无输入。
+  // 失败/边界：无。
   protected virtual function bit is_key_alloc(); return 1'b0; endfunction
-  // 功能：在 rdma_hw_mrt_register_body_codec 中，expected_opcode 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_opcode 返回 MR-register codec 固定的 RDMA_OP_MR_REGISTER opcode，不读取可变对象字段；函数返回 bit [7:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_opcode 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_OP_MR_REGISTER。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function bit [7:0] expected_opcode();
     return RDMA_OP_MR_REGISTER;
   endfunction
@@ -1228,35 +1220,35 @@ class rdma_hw_srqc_create_body_codec
     extends rdma_hw_context_body_codec_base;
   `uvm_object_utils(rdma_hw_srqc_create_body_codec)
 
-  // 功能：构造 rdma_hw_srqc_create_body_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_srqc_create_body_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_srqc_create_body_codec");
     super.new(name);
   endfunction
-  // 功能：在 rdma_hw_srqc_create_body_codec 中，expected_image_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_image_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_image_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_IMAGE_SRQC。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function rdma_image_kind_e expected_image_kind();
     return RDMA_IMAGE_SRQC;
   endfunction
-  // 功能：在 rdma_hw_srqc_create_body_codec 中，expected_opcode 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_opcode 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit [7:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_opcode 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_OP_SRFQC_CREATE。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function bit [7:0] expected_opcode();
     return RDMA_OP_SRFQC_CREATE;
   endfunction
-  // 功能：model_pbl_mode 按函数体读取当前字段并生成 rdma_mr_pbl_mode_e 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：model（输入）；model_pbl_mode 读取 model 并使用输入参数和固定枚举/常量；函数返回 rdma_mr_pbl_mode_e，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回 RDMA_MR_PBL0（该类 context 不使用 PBL）。
+  // 输入/输出及副作用：model 为输入但未使用。
+  // 失败/边界：无。
   protected virtual function rdma_mr_pbl_mode_e model_pbl_mode(
     rdma_hw_model model
   );
     return RDMA_MR_PBL0;
   endfunction
-  // 功能：在 rdma_hw_srqc_create_body_codec 中，owner_generation 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
-  // 输入/输出及副作用：model（输入）；owner_generation 读取 model 并使用字段 generation；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：owner_generation 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：返回 model.srq_h.generation，用作 image 的 function_generation。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败或 srq_h 为空时返回 0。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -1265,9 +1257,9 @@ class rdma_hw_srqc_create_body_codec
     return srqc.srq_h.generation;
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“rdma SRQC codec requires rdma_srqc_model”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 SRQC model 能被硬件字段表示。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败、model.validate 失败、深度或页对齐不合法、阈值/producer 越界时返回 INVALID_ARGUMENT。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_srqc_model srqc;
     rdma_status status;
@@ -1293,9 +1285,9 @@ class rdma_hw_srqc_create_body_codec
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_srqc_create_body_codec 中，encode_body 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 SRQC model 的 SRQ 状态、深度、backing/shadow 页、阈值、producer 等 字段按硬件位域写入 builder。
+  // 输入/输出及副作用：model、builder 为输入；经 put() 写 builder，不改 model。
+  // 失败/边界：cast 失败、字段编码失败或 put 失败时返回错误，不继续写后续字段。
   protected virtual function rdma_status encode_body(
     rdma_hw_model model,
     rdma_hw_qword_builder builder
@@ -1337,9 +1329,9 @@ class rdma_hw_srqc_create_body_codec
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_srqc_create_body_codec 中，decode_body 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：从 builder 解码 SRQC model：SRQ/PD 句柄、状态、深度、backing/shadow 页和阈值。
+  // 输入/输出及副作用：builder 为输入，model 为输出，失败时保持 null；get() 读字段。
+  // 失败/边界：字段码非法或 get 失败时返回错误且不发布 model。
   protected virtual function rdma_status decode_body(
     rdma_hw_qword_builder builder,
     output rdma_hw_model model
@@ -1388,19 +1380,16 @@ endclass
 virtual class rdma_hw_eq_create_body_codec_base
     extends rdma_hw_context_body_codec_base;
 
-  // 功能：构造 rdma_hw_eq_create_body_codec_base，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_eq_create_body_codec_base 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_eq_create_body_codec_base");
     super.new(name);
   endfunction
 
-  // 功能：validate_eq_layout 校验 EQC 的 page-table mode、next backing、depth 编码、page
-  //   对齐以及 MSI/vector、producer/consumer 字段宽度。
-  // 输入/输出及副作用：depth、vector_id、layout、producer、consumer（输入）；只读布局和值
-  //   字段，不写 image、model 或 backing owner，返回规范化 rdma_status。
-  // 失败/边界：mode 不支持、next_valid 为假、depth/page 编码失败或 vector/环指针超出硬件
-  //   位宽时返回 INVALID_ARGUMENT/相应 helper 错误；失败不得继续 encode_eq_layout。
+  // 功能：校验 EQC 的页表模式、next backing、深度、页对齐及 vector/环指针位宽。
+  // 输入/输出及副作用：depth、vector_id、layout、producer、consumer 为输入；只读。
+  // 失败/边界：模式不支持、next_valid 为假、编码失败或字段越界时返回 INVALID_ARGUMENT/helper 错误。
   protected function rdma_status validate_eq_layout(
     int unsigned depth,
     int unsigned vector_id,
@@ -1428,10 +1417,9 @@ virtual class rdma_hw_eq_create_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_eq_create_body_codec_base 中，encode_eq_layout 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：builder（输入）、eqn（输入）、state（输入）、depth（输入）、vector_id（输入）、layout（输入）、producer（输入）、consumer（输入）；输入模型只读；成功时通过返回值或
-  //   output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_eq_layout 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 EQ 通用字段经 builder 写入 EQC body。
+  // 输入/输出及副作用：builder、eqn、state、depth、vector_id、layout、producer、consumer 为输入；经 put() 写 builder。
+  // 失败/边界：状态/深度/页编码或 put 失败时返回错误。
   protected function rdma_status encode_eq_layout(
     rdma_hw_qword_builder builder,
     int unsigned eqn,
@@ -1476,10 +1464,9 @@ virtual class rdma_hw_eq_create_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_eq_create_body_codec_base 中，decode_eq_layout 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、eqn（输出）、state（输出）、depth（输出）、vector_id（输出）、layout（输入）、producer（输入）、consumer（输入）；输入
-  //   image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_eq_layout 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：从 builder 解码 EQC 通用字段。
+  // 输入/输出及副作用：builder 为输入；eqn、state、depth、vector_id 为输出，layout/producer/consumer 为就地填充的 input 句柄。
+  // 失败/边界：get、状态码或模式解码失败时返回错误。
   protected function rdma_status decode_eq_layout(
     rdma_hw_qword_builder builder,
     output int unsigned eqn,
@@ -1523,9 +1510,9 @@ virtual class rdma_hw_eq_create_body_codec_base
     return rdma_status::success();
   endfunction
 
-  // 功能：model_pbl_mode 按函数体读取当前字段并生成 rdma_mr_pbl_mode_e 结果，供调用方进行诊断或分支决策；不修改外部资源。
-  // 输入/输出及副作用：model（输入）；model_pbl_mode 读取 model 并使用输入参数和固定枚举/常量；函数返回 rdma_mr_pbl_mode_e，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回 RDMA_MR_PBL0（该类 context 不使用 PBL）。
+  // 输入/输出及副作用：model 为输入但未使用。
+  // 失败/边界：无。
   protected virtual function rdma_mr_pbl_mode_e model_pbl_mode(
     rdma_hw_model model
   );
@@ -1537,27 +1524,27 @@ class rdma_hw_ceqc_create_body_codec
     extends rdma_hw_eq_create_body_codec_base;
   `uvm_object_utils(rdma_hw_ceqc_create_body_codec)
 
-  // 功能：构造 rdma_hw_ceqc_create_body_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_ceqc_create_body_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_ceqc_create_body_codec");
     super.new(name);
   endfunction
-  // 功能：在 rdma_hw_ceqc_create_body_codec 中，expected_image_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_image_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_image_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_IMAGE_CEQC。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function rdma_image_kind_e expected_image_kind();
     return RDMA_IMAGE_CEQC;
   endfunction
-  // 功能：在 rdma_hw_ceqc_create_body_codec 中，expected_opcode 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_opcode 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit [7:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_opcode 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_OP_CEQC_CREATE。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function bit [7:0] expected_opcode();
     return RDMA_OP_CEQC_CREATE;
   endfunction
-  // 功能：在 rdma_hw_ceqc_create_body_codec 中，owner_generation 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
-  // 输入/输出及副作用：model（输入）；owner_generation 读取 model 并使用字段 generation；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：owner_generation 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：返回 model.ceq_h.generation，用作 image 的 function_generation。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败或 ceq_h 为空时返回 0。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -1566,9 +1553,9 @@ class rdma_hw_ceqc_create_body_codec
     return ceqc.ceq_h.generation;
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“rdma CEQC codec requires rdma_ceqc_model”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 CEQC model，并复用 validate_eq_layout。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败、model.validate 失败或 EQ 布局校验失败时返回 INVALID_ARGUMENT。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_ceqc_model ceqc;
     rdma_status status;
@@ -1582,9 +1569,9 @@ class rdma_hw_ceqc_create_body_codec
     return validate_eq_layout(ceqc.depth, ceqc.vector_id, ceqc.page_layout,
                               ceqc.producer, ceqc.consumer);
   endfunction
-  // 功能：在 rdma_hw_ceqc_create_body_codec 中，encode_body 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 CEQC model 经 encode_eq_layout 写入 builder。
+  // 输入/输出及副作用：model、builder 为输入；不改 model。
+  // 失败/边界：cast 失败或 encode_eq_layout 失败时返回错误。
   protected virtual function rdma_status encode_body(
     rdma_hw_model model,
     rdma_hw_qword_builder builder
@@ -1596,9 +1583,9 @@ class rdma_hw_ceqc_create_body_codec
                             ceqc.depth, ceqc.vector_id, ceqc.page_layout,
                             ceqc.producer, ceqc.consumer);
   endfunction
-  // 功能：在 rdma_hw_ceqc_create_body_codec 中，decode_body 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：经 decode_eq_layout 解码 CEQC model 并投影 EQ 句柄。
+  // 输入/输出及副作用：builder 为输入，model 为输出，失败时保持 null。
+  // 失败/边界：decode_eq_layout 失败时返回错误且不发布 model。
   protected virtual function rdma_status decode_body(
     rdma_hw_qword_builder builder,
     output rdma_hw_model model
@@ -1622,27 +1609,27 @@ class rdma_hw_aeqc_create_body_codec
     extends rdma_hw_eq_create_body_codec_base;
   `uvm_object_utils(rdma_hw_aeqc_create_body_codec)
 
-  // 功能：构造 rdma_hw_aeqc_create_body_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_aeqc_create_body_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 codec 对象。
+  // 输入/输出及副作用：name 为对象名；仅调用 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_aeqc_create_body_codec");
     super.new(name);
   endfunction
-  // 功能：在 rdma_hw_aeqc_create_body_codec 中，expected_image_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_image_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_image_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_image_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_IMAGE_AEQC。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function rdma_image_kind_e expected_image_kind();
     return RDMA_IMAGE_AEQC;
   endfunction
-  // 功能：在 rdma_hw_aeqc_create_body_codec 中，expected_opcode 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_opcode 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit [7:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_opcode 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：返回固定的 RDMA_OP_AEQC_CREATE。
+  // 输入/输出及副作用：无输入；不读取对象字段。
+  // 失败/边界：无。
   protected virtual function bit [7:0] expected_opcode();
     return RDMA_OP_AEQC_CREATE;
   endfunction
-  // 功能：在 rdma_hw_aeqc_create_body_codec 中，owner_generation 读取并校验 Function generation/reset epoch，拒绝旧 binding 或跨 Function 请求。
-  // 输入/输出及副作用：model（输入）；owner_generation 读取 model 并使用字段 generation；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：owner_generation 比较或前置条件不满足时返回 0/false；该路径不隐式重试，也不转移未声明资源。
+  // 功能：返回 model.aeq_h.generation，用作 image 的 function_generation。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败或 aeq_h 为空时返回 0。
   protected virtual function int unsigned owner_generation(
     rdma_hw_model model
   );
@@ -1651,9 +1638,9 @@ class rdma_hw_aeqc_create_body_codec
     return aeqc.aeq_h.generation;
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“rdma AEQC codec requires rdma_aeqc_model”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 AEQC model，并复用 validate_eq_layout。
+  // 输入/输出及副作用：model 为输入；只读。
+  // 失败/边界：cast 失败、model.validate 失败或 EQ 布局校验失败时返回 INVALID_ARGUMENT。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_aeqc_model aeqc;
     rdma_status status;
@@ -1667,9 +1654,9 @@ class rdma_hw_aeqc_create_body_codec
     return validate_eq_layout(aeqc.depth, aeqc.vector_id, aeqc.page_layout,
                               aeqc.producer, aeqc.consumer);
   endfunction
-  // 功能：在 rdma_hw_aeqc_create_body_codec 中，encode_body 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、builder（输入）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 AEQC model 经 encode_eq_layout 写入 builder。
+  // 输入/输出及副作用：model、builder 为输入；不改 model。
+  // 失败/边界：cast 失败或 encode_eq_layout 失败时返回错误。
   protected virtual function rdma_status encode_body(
     rdma_hw_model model,
     rdma_hw_qword_builder builder
@@ -1681,9 +1668,9 @@ class rdma_hw_aeqc_create_body_codec
                             aeqc.depth, aeqc.vector_id, aeqc.page_layout,
                             aeqc.producer, aeqc.consumer);
   endfunction
-  // 功能：在 rdma_hw_aeqc_create_body_codec 中，decode_body 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：builder（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode_body 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：经 decode_eq_layout 解码 AEQC model 并投影 EQ 句柄。
+  // 输入/输出及副作用：builder 为输入，model 为输出，失败时保持 null。
+  // 失败/边界：decode_eq_layout 失败时返回错误且不发布 model。
   protected virtual function rdma_status decode_body(
     rdma_hw_qword_builder builder,
     output rdma_hw_model model
@@ -1703,9 +1690,9 @@ class rdma_hw_aeqc_create_body_codec
   endfunction
 endclass
 
-// 功能：在 rdma_hw_aeqc_create_body_codec 中，rdma_register_context_body_codecs 把 XTR v1 对应对象类型、opcode 和 variant 的 codec 注册到 profile registry，并拒绝重复键。
-// 输入/输出及副作用：registry（输入）；rdma_register_context_body_codecs 读取 registry 并使用字段 key.hw_version、key.variant、key.image_kind、key.object_type、key.opcode、status；函数返回 rdma_status，不取得调用方资源所有权。
-// 失败/边界：registry 为空、重复 codec key 或 body codec 自身校验失败时返回错误，不发布半成品注册表。
+// 功能：把 CQC/MRT(key_alloc、register)/SRQC/CEQC/AEQC codec 注册到 registry。
+// 输入/输出及副作用：registry 为输入；按 key 逐个注册新建 codec 对象。
+// 失败/边界：registry 为空返回 INVALID_ARGUMENT；任一注册返回 null 或失败时立即返回该错误。
 function automatic rdma_status rdma_register_context_body_codecs(
   rdma_codec_registry registry
 );

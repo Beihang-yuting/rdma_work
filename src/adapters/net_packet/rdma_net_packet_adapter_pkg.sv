@@ -5,9 +5,8 @@
 
 // 中文说明：本文件只在 RDMA_NET_PACKET suite 编译，避免 RDMA core 依赖外部协议实现。
 package rdma_net_packet_adapter_pkg;
-  // net_packet 上游将 packet/header 声明在编译单元作用域，VCS 不允许 package
-  // 内的 forward typedef 绑定到外部 $unit 类。这里在本 package 内包含固定版本
-  // packet.sv，使所有协议类型拥有同一 package 作用域；不修改也不复制外部源码。
+  // 上游 packet/header 声明在编译单元作用域，VCS 不允许 package 内 forward typedef 绑定
+  // 外部 $unit 类；故在本 package 内 include packet.sv，使协议类型同处一个作用域。
   `include "packet.sv"
   import uvm_pkg::*;
   import rdma_types_pkg::*;
@@ -15,15 +14,10 @@ package rdma_net_packet_adapter_pkg;
   import rdma_adapter_pkg::*;
   `include "uvm_macros.svh"
 
-  // 功能：rdma_net_packet_work_opcode_supported_for_transport 描述本适配器
-  //   实际拥有的 RoCEv2 wire capability，供 queue-data 上层在提交前区分
-  //   “语义模型支持”与“外部网络 profile 支持”。
-  // 输入/输出及副作用：transport、opcode 为输入；返回 bit，不修改任何
-  //   packet、sink 或队列账本。
-  // 失败/边界：UD 仅开放 SEND/SEND_WITH_IMM，URC 仅开放 UC wire 的
-  //   SEND/SEND_WITH_IMM/WRITE/WRITE_WITH_IMM；RC 开放本适配器已有的
-  //   READ/ATOMIC request/response。控制 WQE 和 SEND_WITH_INV 没有网络头
-  //   映射时返回 0，调用方必须在 encode 前 fail-closed。
+  // 功能：判断 transport/opcode 是否在本适配器的 RoCEv2 wire 能力内，供上层提交前预检。
+  // 输入/输出及副作用：transport、opcode 输入；返回 bit，无副作用。
+  // 失败/边界：UD 仅 SEND/SEND_WITH_IMM；URC 仅 SEND/WRITE 及 WITH_IMM；RC 另含 READ/ATOMIC；
+  //   其余（控制 WQE、SEND_WITH_INV 等）返回 0，调用方须在 encode 前 fail-closed。
   function automatic bit rdma_net_packet_work_opcode_supported_for_transport(
     rdma_transport_e transport,
     rdma_work_opcode_e opcode
@@ -342,19 +336,16 @@ package rdma_net_packet_adapter_pkg;
           roce.reth_dma_len = value.payload.size();
         extension_offset += 16;
       end
-      // AETH 位于 RETH 之后、AtomicETH/AtomicAckETH 之前。响应类 opcode
-      // 即使使用默认 syndrome/MSN，也必须消费这 4 个字节，保证后续扩展
-      // 字段按 wire layout 对齐；否则 Atomic ACK 会把 AETH 前四字节误当作
-      // 原值高半部。
+      // AETH 位于 RETH 之后、AtomicETH/AtomicAckETH 之前；响应类 opcode 即使用默认
+      // syndrome/MSN 也须消费这 4 字节，否则 Atomic ACK 会把 AETH 误当原值高半部。
       if (roce.has_aeth()) begin
         aeth_word = read_be32(value.header_bytes, extension_offset);
         roce.aeth_syndrome = aeth_word[31:24];
         roce.aeth_msn = aeth_word[23:0];
         extension_offset += 4;
       end
-      // AtomicETH 顺序严格遵循 IB/RoCEv2：VA(8B)、r_key(4B)、
-      // swap/add(8B)、compare(8B)。FetchAdd 的 compare 字段按协议置零，
-      // 但仍消费完整 28B 扩展以保持后续 ICRC/payload 偏移正确。
+      // AtomicETH 顺序：VA(8B)、r_key(4B)、swap/add(8B)、compare(8B)；FetchAdd 的 compare
+      // 置零，仍消费完整 28B 以保持后续 ICRC/payload 偏移正确。
       if (roce.has_atomic_eth()) begin
         roce.atomic_va = read_be64(value.header_bytes, extension_offset);
         roce.atomic_r_key = read_be32(value.header_bytes, extension_offset + 8);
@@ -674,9 +665,8 @@ package rdma_net_packet_adapter_pkg;
         status = decode_roce_header(roce, value);
         if (status == null || !status.ok())
           return status;
-        // 对外暴露的 header_bytes 与 encode_packet 的输入契约保持一致：
-        // 只保存 BTH 之后的扩展字段，不重复携带 BTH 和尾部 ICRC。这样
-        // decode→encode 可以直接复用 RETH/AETH/AtomicETH/DETH 等字段。
+        // header_bytes 与 encode_packet 输入契约一致：只存 BTH 之后的扩展字段，
+        // 不含 BTH 和尾部 ICRC，使 decode→encode 可直接复用。
         value.header_bytes.delete();
         frame_end = payload_offset;
         if (roce.icrc_enable && frame_end >= 4)

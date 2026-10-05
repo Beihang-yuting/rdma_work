@@ -1,10 +1,9 @@
 // 目录：硬件编解码层 codec/rdma/rdma_queue_page_codec.sv。
-// 职责：实现 rdma_hw_queue_page_codec 在本层的职责和对外接口。
-// 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
-// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
+// 职责：把 queue 的 DMA page 引用编码为 PD 表项（8 字节/页）和整张 PD 表。
+// 依赖：本层公共 types/model/adapter 契约及其上游快照。
+// 所有权与生命周期：对象只拥有显式创建的值快照；外部资源仅保存非拥有引用，生命周期由调用方管理。
 
-// 中文说明：rdma_queue_page_codec.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
+// // 阅读提示：先看公开接口，再看实现；失败路径应保持状态与资源所有权可追踪。
 
 class rdma_hw_queue_pd_entry extends uvm_object;
   `uvm_object_utils(rdma_hw_queue_pd_entry)
@@ -13,9 +12,9 @@ class rdma_hw_queue_pd_entry extends uvm_object;
   int unsigned rdma_vf_id;
   bit valid;
 
-  // 功能：构造 rdma_hw_queue_pd_entry，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：page_iova='0；rdma_vf_id=0；valid=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_queue_pd_entry 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 queue PD 表项，默认 page_iova=0、rdma_vf_id=0、valid=0。
+  // 输入/输出及副作用：name 传给 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_queue_pd_entry");
     super.new(name);
     page_iova = '0;
@@ -31,16 +30,16 @@ class rdma_hw_queue_pd_codec extends uvm_object;
   localparam int unsigned MAX_PAGES = 512;
   localparam int unsigned TABLE_BYTES = MAX_PAGES * 8;
 
-  // 功能：构造 rdma_hw_queue_pd_codec，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_queue_pd_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 queue PD 表项/表 codec。
+  // 输入/输出及副作用：name 传给 super.new。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_queue_pd_codec");
     super.new(name);
   endfunction
 
-  // 功能：在 rdma_hw_queue_pd_codec 中，encode_entry 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：entry（输入）、bytes（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_entry 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把一个 PD 表项编码为 8 字节（页 IOVA、VF ID、valid）。
+  // 输入/输出及副作用：entry 只读；bytes 成功时输出 8 字节。
+  // 失败/边界：entry 为空、IOVA 未按 4KB 对齐或 VF ID 超过 8 位返回 INVALID_ARGUMENT，不改 bytes。
   virtual function rdma_status encode_entry(
     rdma_hw_queue_pd_entry entry,
     inout byte unsigned bytes[]
@@ -68,9 +67,9 @@ class rdma_hw_queue_pd_codec extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_queue_pd_codec 中，encode_table 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：pages（输入）、rdma_vf_id（输入）、bytes（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode_table 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 DMA page 列表编码为整张 PD 表（TABLE_BYTES，按逻辑页下标放置各表项）。
+  // 输入/输出及副作用：pages、rdma_vf_id 输入；bytes 成功时输出整表。
+  // 失败/边界：VF ID 超 8 位、页数不在 1..512、页为空/校验失败/偏移不连续返回 INVALID_ARGUMENT；表项编码失败或字节数异常返回对应错误，不发布部分表。
   function rdma_status encode_table(
     rdma_queue_dma_page_ref pages[$],
     int unsigned rdma_vf_id,
@@ -90,7 +89,7 @@ class rdma_hw_queue_pd_codec extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "queue PD table page count is outside 1..512");
 
-    // Preflight every page before allocating or publishing any output.
+    // // 先预检所有页，再分配并发布输出。
     foreach (pages[i]) begin
       if (pages[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,

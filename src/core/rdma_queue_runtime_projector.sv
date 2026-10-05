@@ -1,20 +1,16 @@
 // 目录/层次：src/core 的 runtime 值投影层。
 // 职责：深复制 request/slot/pending 对象图并比较恢复证据，保留 runtime 状态构造策略。
 // 依赖：types/model、runtime transaction 值类型与 UVM raw factory；不依赖 runtime 实例。
-// 所有权/生命周期：无字段、锁、缓存、UVM 注册或 provider 实例；只处理显式输入值。
-//   调用方拥有输入和结果，runtime 仍唯一负责锁、authority、PI/CI/credit 与恢复阶段提交。
-// 设计：static automatic 保证每次调用局部值独立；无状态不等于无分配/无回调。
-//   raw factory 的调用顺序、对象名与 status fallback 保持原契约；不检测恶意工厂 alias。
-//   输入为 live ledger 时，调用方必须维持原锁窗口；本层不保证跨 owner 原子快照。
+// 所有权/生命周期：无字段、锁、缓存、UVM 注册或 provider 实例；只处理显式输入值，调用方拥有输入与结果，
+//  runtime 仍唯一负责锁、authority、PI/CI/credit 与恢复阶段提交。
+// 设计：static automatic 保证每次调用局部值独立；无状态不等于无分配/无回调，raw factory 的调用顺序、
+//  对象名与 status fallback 保持原契约，不检测恶意工厂 alias；输入为 live ledger 时调用方须维持原锁窗口。
 
 class rdma_queue_runtime_projector;
 
-  // 功能：factory_create_object_nonfatal 绕过 registry::create() 的 FCTTYP fatal，
-  //   从 UVM factory 获取原始对象，由各值副本边界显式执行类型转换。
-  // 输入/输出及副作用：requested_type/name（输入）；返回 factory 创建的
-  //   uvm_object，不修改 runtime 或转移其它对象的所有权。
-  // 失败/边界：requested_type 或全局 factory 为 null、factory 返回 null 时，本
-  //   helper 不报 fatal；动态类型转换由调用方显式检查，失败必须归一化为非成功状态。
+  // 功能：绕过 registry::create() 的 FCTTYP fatal，从 UVM factory 取原始对象，由调用方显式类型转换。
+  // 输入/输出及副作用：requested_type/name 输入；返回 factory 创建的 uvm_object，不改 runtime。
+  // 失败/边界：requested_type、全局 factory 或创建结果为 null 时返回 null，不报 fatal；转换失败由调用方归一为非成功。
   static function automatic uvm_object factory_create_object_nonfatal(
     uvm_object_wrapper requested_type,
     string name
@@ -29,20 +25,17 @@ class rdma_queue_runtime_projector;
     return factory.create_object_by_type(requested_type, "", name);
   endfunction
 
-  // 功能：make_runtime_status 统一构造 runtime 对外状态；UVM factory
-  //   被注入 null/错误类型时，改用直接构造的非空 fallback。
-  // 输入/输出及副作用：code、message（输入）；通过 rdma_status 的无分配 setter
-  //   初始化非空结果的全部字段；不修改 runtime 账本或外部资源。
-  // 失败/边界：factory 创建失败时仍返回同一 code/message；fallback 只初始化
-  //   诊断字段，不会把错误码伪造成成功。
+  // 功能：统一构造 runtime 对外 status；factory 被注入 null/错类型时改用直接构造的非空 fallback。
+  // 输入/输出及副作用：code/message 输入；经 rdma_status 的无分配 setter 初始化全部字段。
+  // 失败/边界：factory 失败时仍返回同一 code/message，不把错误码伪造成成功。
   static function automatic rdma_status make_runtime_status(
     rdma_status_code_e code, string message = ""
   );
     rdma_status result;
     uvm_object raw_result;
 
-    // 不调用 rdma_status::make()/type_id::create：两者都会在 null 或
-    // 错误 factory 类型上先报 FCTTYP fatal，使调用方无法获得错误码。
+    // // 不调用 rdma_status::make()/type_id::create：二者在 null 或错类型 factory 上会先报 FCTTYP fatal，
+    // // 使调用方拿不到错误码。
     raw_result = factory_create_object_nonfatal(rdma_status::get_type(),
                                                  "runtime_status");
     if (raw_result == null || !$cast(result, raw_result)) begin
@@ -52,16 +45,16 @@ class rdma_queue_runtime_projector;
     return result;
   endfunction
 
-  // 功能：status_is_ok 对可能为空的下游状态执行安全成功判断，避免 recovery/clone 异常路径解引用 null handle。
-  // 输入/输出及副作用：value（输入）；仅读取 value.code 并返回布尔结果，不修改任何状态。
-  // 失败/边界：value 为 null 时返回 0；只有明确的 RDMA_SC_OK 才视为成功。
+  // 功能：对可能为空的下游 status 做安全成功判断。
+  // 输入/输出及副作用：value 只读。
+  // 失败/边界：value 为 null 返回 0；仅 RDMA_SC_OK 视为成功。
   static function automatic bit status_is_ok(rdma_status value);
     return value != null && value.ok();
   endfunction
 
-  // 功能：clone_handle_value_nonfatal 按字段复制 queue/function handle，避免 UVM clone 在异常路径触发 fatal。
-  // 输入/输出及副作用：source（输入）、copy（输出）；copy 先置 null，成功时发布独立 handle 值副本，不接管 source 所有权。
-  // 失败/边界：source 为空视为合法空引用；对象工厂分配失败返回 RESOURCE_EXHAUSTED，任何失败均不发布半成品。
+  // 功能：复制 queue/function handle 的值，避免 UVM clone 在异常路径触发 fatal。
+  // 输入/输出及副作用：source 输入；copy 先置 null，成功发布独立副本。
+  // 失败/边界：source 为空是合法空引用；factory 分配失败返回 RESOURCE_EXHAUSTED，不发布半成品。
   static function automatic rdma_status clone_handle_value_nonfatal(
     rdma_handle source, output rdma_handle copy
   );
@@ -84,9 +77,9 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：clone_cursor_value_nonfatal 复制 producer/consumer cursor 的 index/wrap 值。
-  // 输入/输出及副作用：source（输入）、copy（输出）先置 null；成功时 copy 是与 source 隔离的新快照。
-  // 失败/边界：source 为空返回成功空值；快照分配失败返回 RESOURCE_EXHAUSTED 且不保留部分字段。
+  // 功能：复制 producer/consumer cursor 的 index/wrap。
+  // 输入/输出及副作用：source 输入；copy 先置 null，成功为独立快照。
+  // 失败/边界：source 为空返回成功空值；分配失败返回 RESOURCE_EXHAUSTED。
   static function automatic rdma_status clone_cursor_value_nonfatal(
     rdma_queue_cursor_snapshot source,
     output rdma_queue_cursor_snapshot copy
@@ -108,11 +101,10 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：clone_image_value_nonfatal 深复制硬件镜像 metadata、bytes 和 field_summary，保证 recovery 可重放原始内容。
-  // 输入/输出及副作用：source 输入、copy 先置 null；复用模型元数据复制，清空再重填
-  //   factory 镜像的 bytes/summary；正常 factory 返回独立副本，不调用 source.clone/copy。
-  // 失败/边界：source 为空返回成功空值；image factory 空/错型返回 RESOURCE_EXHAUSTED。
-  //   不检测 factory alias，返回 source 时会清空源队列；仿真器内存耗尽不转为 status。
+  // 功能：深复制硬件镜像的 metadata、bytes 与 field_summary，使 recovery 可重放原始内容。
+  // 输入/输出及副作用：source 输入；copy 先置 null；复用模型元数据复制，清空再重填 bytes/summary，
+  //  不调用 source.clone/copy。
+  // 失败/边界：source 为空返回成功空值；factory 空/错型返回 RESOURCE_EXHAUSTED；不检测 factory alias。
   static function automatic rdma_status clone_image_value_nonfatal(
     rdma_hw_image source, output rdma_hw_image copy
   );
@@ -136,10 +128,9 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：clone_status_value_nonfatal 复制 rdma_status 的完整诊断字段，保留错误码、硬件上下文和 retry 语义。
-  // 输入/输出及副作用：source（输入）、copy（输出）先置 null；成功时使用 rdma_status 的
-  //   无分配字段复制发布独立快照，不调用 source.clone/do_copy。
-  // 失败/边界：source 为空返回成功空值；status 对象分配失败返回 RESOURCE_EXHAUSTED，失败不伪造 OK 状态。
+  // 功能：复制 rdma_status 的完整诊断字段（错误码、硬件上下文、retry 语义）。
+  // 输入/输出及副作用：source 输入；copy 先置 null，经无分配字段复制发布快照，不调用 clone/do_copy。
+  // 失败/边界：source 为空返回成功空值；分配失败返回 RESOURCE_EXHAUSTED。
   static function automatic rdma_status clone_status_value_nonfatal(
     rdma_status source, output rdma_status copy
   );
@@ -159,12 +150,10 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：clone_slot_value_nonfatal 为一个已校验的 host WQE ledger entry 建立
-  //   完整 detached 值副本，供 CQ poll 在任何 consumer 副作用前预物化结果。
-  // 输入/输出及副作用：source 为输入、copy 为输出并先置 null；复制 slot 标量、
-  //   request_snapshot、image 与 completion_status，不修改 runtime-owned source。
-  // 失败/边界：source 为空、raw factory 返回 null/错误类型，或任一 nested value
-  //   复制失败时返回非成功且 copy=null；调用方必须丢弃整个 range candidate。
+  // 功能：为已校验的 host WQE ledger entry 建立 detached 值副本，供 CQ poll 在 consumer 副作用前预物化。
+  // 输入/输出及副作用：source 输入；copy 先置 null；复制 slot 标量、request_snapshot、image 与
+  //  completion_status，不改 source。
+  // 失败/边界：source 为空、factory 返回 null/错类型或嵌套复制失败时返回非成功且 copy=null，调用方须丢弃整个 candidate。
   static function automatic rdma_status clone_slot_value_nonfatal(
     rdma_queue_slot_ledger_entry source,
     output rdma_queue_slot_ledger_entry copy
@@ -212,9 +201,9 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：clone_address_vector_value_nonfatal 复制 UD address-vector 的固定数组和所有路由字段，形成 detached 值快照。
-  // 输入/输出及副作用：source（输入）、copy（输出）先置 null；成功时 copy 与 source 完全隔离，调用方继续拥有 source。
-  // 失败/边界：source 为空返回空成功；对象工厂分配失败返回 RESOURCE_EXHAUSTED，失败时不发布半成品 address vector。
+  // 功能：复制 UD address-vector 的固定数组与全部路由字段。
+  // 输入/输出及副作用：source 输入；copy 先置 null，成功后与 source 隔离。
+  // 失败/边界：source 为空返回成功空值；分配失败返回 RESOURCE_EXHAUSTED，不发布半成品。
   static function automatic rdma_status clone_address_vector_value_nonfatal(
     rdma_address_vector source, output rdma_address_vector copy
   );
@@ -254,12 +243,11 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：clone_request_value_nonfatal 复制 send/receive 请求的标量、owner、
-  //   目标句柄、地址向量和 nullable SGE 列表，形成独立的值对象图。
-  // 输入/输出及副作用：source 输入、copy 输出并先置 null；正常工厂下深复制 send/recv
-  //   对象图，不修改源请求；source.owner 为空时保留工厂 candidate 的既有 owner 字段。
-  // 失败/边界：source 为空返回成功空值；非 send/recv 返回 INVALID_ARGUMENT；factory
-  //   空/错型或 nested clone 失败返回相应错误且 copy=null；不验证 hostile alias/预填 owner。
+  // 功能：复制 send/receive 请求的标量、owner、目标句柄、地址向量与 nullable SGE 列表。
+  // 输入/输出及副作用：source 输入；copy 先置 null；深复制对象图，不改源；source.owner 为空时保留 factory
+  //  candidate 的既有 owner 字段。
+  // 失败/边界：source 为空返回成功空值；非 send/recv 返回 INVALID_ARGUMENT；factory 空/错型或嵌套 clone
+  //  失败返回相应错误且 copy=null。
   static function automatic rdma_status clone_request_value_nonfatal(
     rdma_semantic_request source, output rdma_semantic_request copy
   );
@@ -429,11 +417,9 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：handle_value_equal 对两个 nullable handle 执行完整 identity 值比较，
-  //   供 prepared recovery 区分同一对象与跨 kind/Function/generation 的证据。
-  // 输入/输出及副作用：lhs/rhs（输入）；只读四个 identity 字段并返回 bit，
-  //   不 clone、修改或接管任一 handle。
-  // 失败/边界：两个 null 视为相等；仅一侧 null 或任一 identity 字段不等时返回 0。
+  // 功能：完整比较两个 nullable handle 的 identity。
+  // 输入/输出及副作用：lhs/rhs 只读，比较 kind/function_uid/object_id/generation。
+  // 失败/边界：两个 null 相等；仅一侧 null 或任一字段不等返回 0。
   static function automatic bit handle_value_equal(rdma_handle lhs, rdma_handle rhs);
     if (lhs == null || rhs == null)
       return lhs == null && rhs == null;
@@ -443,14 +429,10 @@ class rdma_queue_runtime_projector;
            lhs.generation == rhs.generation;
   endfunction
 
-  // 功能：handle_value_matches_snapshot 将 target handle 与 copy_ring_state 在
-  // source lock 内冻结的四元 identity 值比较，复用与普通 handle 比较相同的字段语义。
-  // 输入/输出及副作用：candidate（输入）为当前 target 的非拥有句柄；expected_kind、
-  // expected_function_uid、expected_object_id、expected_generation（输入）是 source
-  // 的 detached scalar snapshot；函数只读参数并返回 bit，不修改任何对象或 runtime。
-  // 失败/边界：candidate 为空时返回 0；调用方必须先拒绝 source 为空并保证 snapshot
-  // 已由 source 的有效 queue_h 填充；kind、Function UID、object ID 或 generation
-  // 任一不等都返回 0，避免在释放 source lock 后重新读取可变对象。
+  // 功能：把 target handle 与 copy_ring_state 在 source lock 内冻结的四元 identity 值比较。
+  // 输入/输出及副作用：candidate 为非拥有句柄；expected_* 为 source 的 detached 标量快照；只读，返回 bit。
+  // 失败/边界：candidate 为空返回 0；调用方须先拒绝 source 为空并保证快照来自有效 queue_h；任一字段不等返回 0，
+  //  避免释放 source lock 后重读可变对象。
   static function automatic bit handle_value_matches_snapshot(
     rdma_handle candidate,
     rdma_resource_kind_e expected_kind,
@@ -466,14 +448,9 @@ class rdma_queue_runtime_projector;
            candidate.generation == expected_generation;
   endfunction
 
-  // 功能：same_route_epoch_value 比较两个已由调用方取得的 route/epoch 值快照，
-  //   为 ring copy 与 prepared recovery 复用同一组值字段相等语义。
-  // 输入/输出及副作用：lhs_route/lhs_epoch 与 rhs_route/rhs_epoch（输入）是
-  //   两组 packed route key 和 reset epoch；函数只读这些值并返回 bit，不修改
-  //   runtime、valid-bit、锁或任何外部 authority。
-  // 失败/边界：任一路由 key 或 reset epoch 不等即返回 0；本 helper 不检查
-  //   route/epoch valid-bit、route key 格式或 reset freshness，相关拒绝条件仍由
-  //   copy_ring_state 与 enter_recovery_prepared 的调用方先行处理。
+  // 功能：比较两组已取得的 route/epoch 值快照，供 ring copy 与 prepared recovery 共用。
+  // 输入/输出及副作用：lhs/rhs 的 route key 与 reset epoch 只读；返回 bit。
+  // 失败/边界：route 或 epoch 不等返回 0；不检查 valid-bit、格式或 reset freshness，由调用方先处理。
   static function automatic bit same_route_epoch_value(
     rdma_route_key_t lhs_route,
     rdma_reset_epoch_t lhs_epoch,
@@ -483,10 +460,9 @@ class rdma_queue_runtime_projector;
     return lhs_route == rhs_route && lhs_epoch == rhs_epoch;
   endfunction
 
-  // 功能：image_value_equal 比较 recovery image 的全部 metadata、目标地址、
-  //   原始 bytes 与 field_summary，防止不同硬件事务共享同一 cursor 后合并阶段。
-  // 输入/输出及副作用：lhs/rhs（输入）；逐值只读并返回 bit，不修改动态队列。
-  // 失败/边界：两个 null 视为相等；长度、任一 metadata/byte/summary 不同均返回 0。
+  // 功能：比较 recovery image 的 metadata、目标地址、bytes 与 field_summary。
+  // 输入/输出及副作用：lhs/rhs 只读；返回 bit。
+  // 失败/边界：两个 null 相等；长度或任一 metadata/byte/summary 不同返回 0。
   static function automatic bit image_value_equal(rdma_hw_image lhs, rdma_hw_image rhs);
     if (lhs == null || rhs == null)
       return lhs == null && rhs == null;
@@ -509,10 +485,9 @@ class rdma_queue_runtime_projector;
     return 1'b1;
   endfunction
 
-  // 功能：status_value_equal 比较原始 failure_status 的错误分类、硬件上下文、
-  //   transaction identity、严重度、retry 属性与诊断文本。
-  // 输入/输出及副作用：lhs/rhs（输入）；只读 status 并返回 bit，不改写错误快照。
-  // 失败/边界：两个 null 视为相等；仅一侧 null 或任一诊断字段不等时返回 0。
+  // 功能：比较 failure_status 的分类、硬件上下文、transaction identity、严重度、retry 属性与文本。
+  // 输入/输出及副作用：lhs/rhs 只读；返回 bit。
+  // 失败/边界：两个 null 相等；仅一侧 null 或任一字段不等返回 0。
   static function automatic bit status_value_equal(rdma_status lhs, rdma_status rhs);
     if (lhs == null || rhs == null)
       return lhs == null && rhs == null;
@@ -528,10 +503,9 @@ class rdma_queue_runtime_projector;
            lhs.message == rhs.message;
   endfunction
 
-  // 功能：address_vector_value_equal 比较 post-send request 内完整 UD
-  //   address-vector，包括固定 destination_ip 数组和全部转发/封装属性。
-  // 输入/输出及副作用：lhs/rhs（输入）；逐字段只读并返回 bit，不修改 AV。
-  // 失败/边界：两个 null 视为相等；仅一侧 null 或任一路由字段不等时返回 0。
+  // 功能：比较 post-send 请求内的完整 UD address-vector（含 destination_ip 数组与转发/封装属性）。
+  // 输入/输出及副作用：lhs/rhs 只读；返回 bit。
+  // 失败/边界：两个 null 相等；仅一侧 null 或任一字段不等返回 0。
   static function automatic bit address_vector_value_equal(
     rdma_address_vector lhs, rdma_address_vector rhs
   );
@@ -560,12 +534,9 @@ class rdma_queue_runtime_projector;
     return 1'b1;
   endfunction
 
-  // 功能：request_value_equal 按实际 post-send/post-recv subclass 比较 semantic
-  //   base、owner、nested handles/address-vector、payload 与每个 nullable SGE。
-  // 输入/输出及副作用：lhs/rhs（输入）；只读完整 request object graph 并返回 bit，
-  //   不 clone 或改变 caller/runtime 持有的 request。
-  // 失败/边界：两个 null 视为相等；subclass 不同、不支持的 subclass、任一 nested
-  //   null 形态或值字段不同均返回 0。
+  // 功能：按实际 post-send/post-recv 子类比较 request（semantic base、owner、handle、address-vector、payload、SGE）。
+  // 输入/输出及副作用：lhs/rhs 只读；返回 bit。
+  // 失败/边界：两个 null 相等；子类不同/不支持、嵌套 null 形态或值字段不同返回 0。
   static function automatic bit request_value_equal(
     rdma_semantic_request lhs, rdma_semantic_request rhs
   );
@@ -658,13 +629,10 @@ class rdma_queue_runtime_projector;
     return 1'b0;
   endfunction
 
-  // 功能：pending_immutable_evidence_equal 比较 prepared 重入不可借用的完整
-  //   transaction evidence；MMIO enum 与阶段位由后续单调 merge 规则单独处理。
-  // 输入/输出及副作用：lhs/rhs（输入）；只读 pending 及嵌套值对象并返回 bit，
-  //   不投影 MMIO、不分配对象、不改变当前 pending。
-  // 失败/边界：pending 或必需 cursor/next 为空返回 0；其它 nullable 对象两侧均空可相等。
-  //   identity/image/status/request/WR/completion/routed-QP/route-epoch 值不等返回 0；
-  //   不比较可单调推进的 MMIO/完成阶段位，不能单独据此授权 recovery merge。
+  // 功能：比较 prepared 重入时不可借用的完整 transaction evidence；MMIO enum 与阶段位由后续单调 merge 单独处理。
+  // 输入/输出及副作用：lhs/rhs 只读 pending 及嵌套值对象；返回 bit，不投影 MMIO、不分配、不改 pending。
+  // 失败/边界：pending 或必需 cursor/next 为空返回 0；identity/image/status/request/WR/completion/
+  //  routed-QP/route-epoch 不等返回 0；不比较可推进的 MMIO/完成阶段位，不能据此单独授权 merge。
   static function automatic bit pending_immutable_evidence_equal(
     rdma_queue_pending_operation lhs,
     rdma_queue_pending_operation rhs
@@ -701,11 +669,10 @@ class rdma_queue_runtime_projector;
            lhs.epoch_valid == rhs.epoch_valid;
   endfunction
 
-  // 功能：clone_pending_value 先构造整份 pending evidence，全部 nested clone 成功后交付。
-  // 输入/输出及副作用：source 输入、copy 输出并先置 null；复制嵌套值、route/epoch 与
-  //   阶段位，不提交 runtime 状态；跨工厂窗口的一致性仍由调用方的锁/admission 维护。
-  // 失败/边界：source 空或 device-producer 缺 queue/cursor/next/image 返回 INVALID_ARGUMENT；
-  //   factory 空/错型返回 RESOURCE_EXHAUSTED，nested 错误原样透传且 copy=null。
+  // 功能：先构造整份 pending evidence，嵌套 clone 全部成功后才交付。
+  // 输入/输出及副作用：source 输入；copy 先置 null；复制嵌套值、route/epoch 与阶段位，不提交 runtime 状态。
+  // 失败/边界：source 空或 device-producer 缺 queue/cursor/next/image 返回 INVALID_ARGUMENT；factory 空/错型返回
+  //   RESOURCE_EXHAUSTED；嵌套错误透传且 copy=null。
   static function automatic rdma_status clone_pending_value(
     rdma_queue_pending_operation source,
     output rdma_queue_pending_operation copy
@@ -807,10 +774,9 @@ class rdma_queue_runtime_projector;
     return make_runtime_status(RDMA_SC_OK, "");
   endfunction
 
-  // 功能：cursor_equal 将两组 index/wrap 作为完整 ring cursor 比较。
-  // 输入/输出及副作用：a/aw 与 b/bw（输入）；两字段均相等时返回 1，纯读取且
-  //   不修改 runtime、ledger 或调用方变量。
-  // 失败/边界：任一 index 或 wrap 不等即返回 0；本 helper 不验证 index<depth。
+  // 功能：把两组 index/wrap 作为完整 ring cursor 比较。
+  // 输入/输出及副作用：a/aw 与 b/bw 只读；返回 bit。
+  // 失败/边界：不等返回 0；不验证 index<depth。
   static function automatic bit cursor_equal(
     int unsigned a,
     bit aw,

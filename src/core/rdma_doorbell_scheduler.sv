@@ -281,11 +281,10 @@ class rdma_doorbell_submission_result extends uvm_object;
     before_mmio_maybe_visible_called = 1'b0;
   endfunction
 
-  // 功能：copy_status_fields 先执行 legacy 专属的枚举准入，再复用公共无分配字段复制。
-  // 输入/输出及副作用：source/destination 为输入；准入通过后覆盖 destination 全部诊断，
-  //   不重新分类、不修改 source，也不调用 clone/factory；不根据 status 推导 submission_effect。
-  // 失败/边界：任一对象为空，或 category/code/source_engine 含未知或超过各自最大枚举值时
-  //   返回 0 且不写 destination；不检查 severity 或 category/code 的配对，自复制允许。
+  // 功能：先做 legacy 专属的枚举准入，再复用公共无分配字段复制。
+  // 输入/输出及副作用：source/destination 输入；准入通过后覆盖 destination 全部诊断；不 clone、不改 source、不推导
+  //   submission_effect。
+  // 失败/边界：任一对象为空或 category/code/source_engine 超出枚举最大值返回 0 且不写 destination；不检查 severity 与配对，允许自复制。
   protected static function bit copy_status_fields(
     rdma_status source,
     rdma_status destination
@@ -358,11 +357,10 @@ class rdma_doorbell_submission_result extends uvm_object;
       source.before_mmio_maybe_visible_called;
   endfunction
 
-  // 功能：将 observed status 和可选 doorbell result 单向投影为旧 submit 输出。
-  // 输入/输出及副作用：projected_result/projected_status/failure_reason
-  //   均为输出；只读取本 envelope 并直接创建 detached 值。
-  // 失败/边界：null/畸形 status 或非空 result 缺少 Function/target 时返回
-  //   0、result=null 和直接构造 INVALID_STATE；null result 是合法失败形状。
+  // 功能：把 observed status 与可选 doorbell result 单向投影为旧 submit 输出。
+  // 输入/输出及副作用：projected_result/projected_status/failure_reason 为输出；只读本 envelope，直接创建 detached 值。
+  // 失败/边界：status 为 null/畸形或非空 result 缺 Function/target 时返回 0、result=null、INVALID_STATE；null
+  //   result 是合法的失败形状。
   function bit try_project_legacy(
     output rdma_doorbell_result projected_result,
     output rdma_status projected_status,
@@ -447,10 +445,9 @@ class rdma_doorbell_scheduler extends uvm_object;
     return make_status_direct(RDMA_SC_OK);
   endfunction
 
-  // 功能：直接构造独立 rdma_status，供 entry fallback 和外部 I/O 后 factory 故障降级。
-  // 输入/输出及副作用：code/message 为输入；直接 new doorbell_direct_status，
-  //   再由 rdma_status 的无分配 setter 初始化全部字段并返回非空结果。
-  // 失败/边界：不调用 type_id::create/clone，故 null/错误 factory override 不会把恢复证据变成 fatal。
+  // 功能：直接构造独立 rdma_status，供入口兜底和外部 I/O 后的 factory 故障降级。
+  // 输入/输出及副作用：code/message 输入；直接 new 后用无分配 setter 初始化，返回非空结果。
+  // 失败/边界：不调用 type_id::create/clone，null 或错误的 factory override 不会把恢复证据变成 fatal。
   protected function rdma_status make_status_direct(
     rdma_status_code_e code,
     string message = ""
@@ -462,11 +459,9 @@ class rdma_doorbell_scheduler extends uvm_object;
     return status;
   endfunction
 
-  // 功能：把任一内部/外部 status 结果归一化为可安全解引用的非空值。
-  // 输入/输出及副作用：candidate 为被检查的 status，fallback_code/operation
-  //   提供空返回时的诊断；返回 candidate 或 scheduler 直接构造的 detached status。
-  // 失败/边界：candidate==null 时绝不调用 candidate.ok()，而是 fail-closed 为
-  //   fallback_code；非空 status 原样保留其硬件诊断字段和错误码。
+  // 功能：把内部/外部 status 归一化为可安全解引用的非空值。
+  // 输入/输出及副作用：candidate 为被检查 status，fallback_code/operation 在其为空时提供诊断。
+  // 失败/边界：candidate 为 null 时不调用 ok()，fail-closed 为 fallback_code；非空 status 原样保留。
   protected function rdma_status normalize_status(
     rdma_status candidate,
     rdma_status_code_e fallback_code,
@@ -481,9 +476,8 @@ class rdma_doorbell_scheduler extends uvm_object;
   endfunction
 
   // 功能：在尚未触发外部 I/O 的路径把 validator/lock/snapshot status 写入初始 observed slot。
-  // 输入/输出及副作用：source/result 为输入；只改写 result.status，非空槽原位复用，空槽直接补建。
-  // 失败/边界：result=null 时不处理；status slot=null 时直接补建；source=null 时
-  //   将 slot 重置为 INVALID_STATE，非空 source 原样复制且不执行 legacy 枚举准入。
+  // 输入/输出及副作用：只改写 result.status：非空槽原位复用，空槽直接补建。
+  // 失败/边界：result 为 null 不处理；source 为 null 时槽置 INVALID_STATE；不做 legacy 枚举准入。
   protected function void capture_pre_submit_status(
     rdma_status source,
     rdma_doorbell_submission_result result
@@ -516,11 +510,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return factory.create_object_by_type(requested_type, "", name);
   endfunction
 
-  // 功能：在一次 adapter 调用结束后把其 status 捕获为 observed envelope 独占快照。
-  // 输入/输出及副作用：source/result/operation_context 为输入；result 非空时尝试一次 raw 创建并替换其 status。
-  // 失败/边界：result=null 返回 0 且不创建对象；raw factory null/错型直接安装
-  //   INVALID_STATE，source=null 则复用 candidate 写入 INVALID_STATE；不回退 effect，
-  //   不执行 legacy 枚举准入，原始 adapter 诊断与旧接口投影策略分开。
+  // 功能：adapter 调用结束后，把其 status 捕获为 observed envelope 独占的快照。
+  // 输入/输出及副作用：source/result/operation_context 输入；result 非空时尝试一次 raw 创建并替换其 status。
+  // 失败/边界：result 为 null 返回 0；raw factory 返回 null/错型则装入 INVALID_STATE；source 为 null 同样写
+  //   INVALID_STATE；不回退 effect。
   protected function bit capture_external_status(
     rdma_status source,
     rdma_doorbell_submission_result result,
@@ -585,11 +578,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return destination;
   endfunction
 
-  // 功能：在成功 MMIO 后经 raw factory 构造并填充 detached doorbell result。
-  // 输入/输出及副作用：desc/address/result 为输入；成功发布
-  //   result.doorbell_result，不修改 desc。
-  // 失败/边界：raw factory 返回 null/错误类型或 handle 复制不完整时保持
-  //   doorbell_result=null、安装 INVALID_STATE；保留 MMIO_VISIBLE effect。
+  // 功能：MMIO 成功后经 raw factory 构造并填充 detached doorbell result。
+  // 输入/输出及副作用：desc/address/result 输入；成功时发布 result.doorbell_result，不改 desc。
+  // 失败/边界：raw factory 返回 null/错型或 handle 复制不全时 doorbell_result 保持 null 并装入 INVALID_STATE；保留
+  //   MMIO_VISIBLE effect。
   protected function bit publish_doorbell_result(
     rdma_doorbell_desc desc,
     rdma_bar_addr_t address,
@@ -676,12 +668,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：通过 binding 的 nonfatal authority seam 建立锁内只读 detached snapshot，
-  //   供 preflight 和执行统一消费，并绕过可覆盖的 UVM clone/type_id 路径。
-  // 输入/输出及副作用：source 为输入，snapshot 先置 null；成功输出完整 value
-  //   graph 和 OK，source 的动态 validate 会在 seam 内再次参与校验。
-  // 失败/边界：source=null 返回 INVALID_ARGUMENT；嵌套 authority 缺失、动态
-  //   subtype 不支持、候选不等值或 validator 返回 null 时返回非空错误，snapshot 保持 null。
+  // 功能：经 binding 的 nonfatal authority seam 建立锁内只读 detached 快照，绕过可覆盖的 UVM clone。
+  // 输入/输出及副作用：source 输入；snapshot 先置 null，成功输出完整值图与 OK；动态 validate 在 seam 内再次参与校验。
+  // 失败/边界：source 为 null 返回 INVALID_ARGUMENT；嵌套 authority 缺失、subtype 不支持、候选不等值或 validator 返回
+  //   null 时返回错误且 snapshot 为 null。
   protected function rdma_status clone_binding_snapshot(
     rdma_function_binding source,
     output rdma_function_binding snapshot
@@ -790,13 +780,11 @@ class rdma_doorbell_scheduler extends uvm_object;
   // 设计：DMA visibility 与 MMIO ordering 共用等待/取消机制，但不合并业务阶段。
   //   worker/timer 必须放在本次调用独占的子进程内，disable fork 只取消其后代，
   //   不能使用具名 disable 影响另一 Function 的并发 activation；不捕获或推进 effect。
-  // 功能：barrier_before_deadline 按 dma_visibility 选择一次 PCIe DMA 或 MMIO barrier，
-  //   消耗 caller 提供的总 deadline 剩余预算，不为各阶段重新计时。
-  // 输入/输出及副作用：function_h 为非拥有输入，dma_visibility=1 选择 DMA、0 选择 MMIO；
-  //   deadline 输入，status 输出原始后端引用或直接构造的本地错误；不写 Host-memory/MMIO。
-  // 失败/边界：caller 须先完成配置与 authority 预检；入口已到期时零后端调用，等待超时
-  //   返回 TIMEOUT 并终止本次 worker；后端 null 返回 INVALID_STATE，非空状态原样交付。
-  //   此处取消仿真 worker 不证明真实外部 barrier 可回滚；锁释放与可见性证据由 caller 管理。
+  // 功能：按 dma_visibility 执行一次 PCIe DMA 或 MMIO barrier，消耗调用方给定的总 deadline 剩余预算。
+  // 输入/输出及副作用：function_h 非拥有；dma_visibility=1 选 DMA，0 选 MMIO；status 输出后端原始引用或本地错误；不写
+  //   Host-memory/MMIO。
+  // 失败/边界：入口已到期则零后端调用；等待超时返回 TIMEOUT 并终止 worker；后端 null 返回 INVALID_STATE。取消仿真 worker 不代表真实
+  //   barrier 可回滚。
   protected task barrier_before_deadline(
     rdma_function_handle function_h,
     bit dma_visibility,
@@ -846,12 +834,11 @@ class rdma_doorbell_scheduler extends uvm_object;
     status = worker_status;
   endtask
 
-  // 功能：在最终 deadline 检查后发布 MMIO_MAYBE_VISIBLE 边界，并限时执行
-  //   一次 PCIe MMIO write。
-  // 输入/输出及副作用：function_h/address/data/deadline、非拥有 observer 和
-  //   call-local result 为输入；写 status，并在回调/成功时推进 result effect。
-  // 失败/边界：最终检查失败保持 HOST_MEMORY_ORDERED 且不回调；进入 PCIe
-  //   后的错误/超时保持 MMIO_MAYBE_VISIBLE；只有明确 OK 才推进 MMIO_VISIBLE。
+  // 功能：最终 deadline 检查后发布 MMIO_MAYBE_VISIBLE 边界，并限时执行一次 PCIe MMIO write。
+  // 输入/输出及副作用：function_h/address/data/deadline、observer、result 输入；写 status，并在回调/成功时推进 result
+  //   effect。
+  // 失败/边界：最终检查失败保持 HOST_MEMORY_ORDERED 且不回调；进入 PCIe 后的错误/超时保持 MMIO_MAYBE_VISIBLE；仅明确 OK 才推进
+  //   MMIO_VISIBLE。
   protected task mmio_write_before_deadline(
     rdma_function_handle function_h,
     rdma_bar_addr_t address,
@@ -935,10 +922,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     );
   endfunction
 
-  // 功能：校验 hardware image 的长度、alignment、endian、metadata 和 Function generation 基本形状。
-  // 输入/输出及副作用：image/function_generation 为只读输入；返回检查 status，不修改 bytes 或 metadata。
-  // 失败/边界：null/空长/长度不符/非二次幂 alignment/非法 endian/
-  //   不完整 metadata 返回 INVALID_ARGUMENT；generation 不符返回 STALE_GENERATION。
+  // 功能：校验 hardware image 的长度、alignment、endian、metadata 与 Function generation。
+  // 输入/输出及副作用：image/function_generation 只读；返回检查 status，不改 bytes/metadata。
+  // 失败/边界：null/空/长度不符/alignment 非 2 的幂/endian 非法/metadata 不全返回 INVALID_ARGUMENT；generation 不符返回
+  //   STALE_GENERATION。
   protected function rdma_status image_shape_status(
     rdma_hw_image image,
     int unsigned function_generation
@@ -967,10 +954,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return make_status_direct(RDMA_SC_OK);
   endfunction
 
-  // 功能：校验 doorbell payload 的 image/width/endian/BAR target、alignment
-  //   和 notify aperture，并计算绝对 BAR 地址。
-  // 输入/输出及副作用：binding/desc 为只读输入，absolute_address 先清零；成功写入 notify_base+relative_offset。
-  // 失败/边界：image 形状/类型/target/offset 不符、aperture 越界或任一 64-bit 地址加法溢出时返回错误，地址不作为有效结果消费。
+  // 功能：校验 doorbell payload 的 image、width、endian、BAR target、alignment 与 notify aperture，并算出绝对
+  //   BAR 地址。
+  // 输入/输出及副作用：binding/desc 只读；absolute_address 先清零，成功写入 notify_base+relative_offset。
+  // 失败/边界：image 形状/类型/target/offset 不符、aperture 越界或 64 位地址加法溢出时返回错误，地址不得使用。
   protected function rdma_status payload_status(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -1050,11 +1037,11 @@ class rdma_doorbell_scheduler extends uvm_object;
     return make_status_direct(RDMA_SC_OK);
   endfunction
 
-  // 功能：校验单条 dependency 的 identity/stage/readiness、backing image 和 queue-DMA read authority。
-  // 输入/输出及副作用：binding/desc/dependency 为只读输入；
-  //   通过 mapping.check_access 验证完整 requester/PASID/domain/IOVA 范围。
-  // 失败/边界：null/零 ID/非法 stage/not-ready/null mapping/image/错 target/alignment
-  //   返回参数或状态错误；IOVA 溢出/authority 失败原样返回。
+  // 功能：校验单条 dependency 的 identity/stage/readiness、backing image 与 queue-DMA 读权限。
+  // 输入/输出及副作用：binding/desc/dependency 只读；经 mapping.check_access 校验完整
+  //   requester/PASID/domain/IOVA 范围。
+  // 失败/边界：null、零 ID、非法 stage、未 ready、mapping/image 缺失、target/alignment 错误返回参数或状态错误；IOVA
+  //   溢出/authority 失败原样返回。
   protected function rdma_status dependency_status(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -1133,12 +1120,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     return status;
   endfunction
 
-  // 功能：在任何外部 I/O 前完整验证配置、锁定 identity、binding lifecycle、
-  //       doorbell/target、payload 和全部 dependency。
-  // 输入/输出及副作用：binding/desc/locked Function identity/reset epoch 为只读输入；
-  //       absolute_address 先清零，成功写入已验证 BAR 地址。
-  // 失败/边界：scheduler 未配置，identity/generation/handle/policy/payload/dependency
-  //       非法、reset epoch 漂移、status 为空或 dependency ID 重复时返回对应错误，且不触发 adapter。
+  // 功能：任何外部 I/O 之前完整验证配置、锁定 identity、binding lifecycle、doorbell/target、payload 与全部 dependency。
+  // 输入/输出及副作用：binding/desc/identity/reset epoch 只读；absolute_address 先清零，成功写入已验证 BAR 地址。
+  // 失败/边界：未配置，identity/generation/handle/policy/payload/dependency 非法，reset epoch 漂移，status 为空或
+  //   dependency ID 重复时返回错误，且不触发 adapter。
   protected function rdma_status preflight(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -1275,12 +1260,10 @@ class rdma_doorbell_scheduler extends uvm_object;
       data[i] = image.bytes[i];
   endfunction
 
-  // 功能：按 descriptor 内顺序写完指定 dependency stage，并在每个真实
-  //   write 前发布 MAYBE_VISIBLE。
-  // 输入/输出及副作用：desc/stage 和 call-local result 为输入；调用
-  //   host_mem.write，并把 detached status/effect 写入 result。
-  // 失败/边界：image 本地准备失败前不推进 effect；任一 write 拒绝、返回
-  //   null 或 status 构造失败时立即停止，保持 HOST_MEMORY_MAYBE_VISIBLE。
+  // 功能：按 descriptor 内顺序写完指定 dependency stage，每次真实 write 前发布 MAYBE_VISIBLE。
+  // 输入/输出及副作用：desc/stage/result 输入；调用 host_mem.write，并把 detached status/effect 写入 result。
+  // 失败/边界：image 本地准备失败前不推进 effect；任一 write 被拒、返回 null 或 status 构造失败立即停止，保持
+  //   HOST_MEMORY_MAYBE_VISIBLE。
   protected task write_dependency_stage(
     rdma_doorbell_desc desc,
     rdma_doorbell_dependency_stage_e stage,
@@ -1307,12 +1290,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     end
   endtask
 
-  // 功能：在 Function lock 内完成 preflight、两阶段依赖写、barrier 和 MMIO，
-  //   并单调推进 per-call effect。
-  // 输入/输出及副作用：binding/desc/锁定 identity/deadline、非拥有 observer
-  //   和 call-local result 为输入；驱动 Host-memory/PCIe 并更新 result。
-  // 失败/边界：preflight 保持 PRE_SUBMIT_REJECTED；写/barrier/MMIO 失败保留
-  //   对应高水位；MMIO 成功后 nested 构造失败仍保持 MMIO_VISIBLE。
+  // 功能：在 Function lock 内完成 preflight、两阶段依赖写、barrier 与 MMIO，并单调推进 per-call effect。
+  // 输入/输出及副作用：binding/desc/锁定 identity/deadline、observer、result 输入；驱动 Host-memory/PCIe 并更新 result。
+  // 失败/边界：preflight 失败保持 PRE_SUBMIT_REJECTED；写/barrier/MMIO 失败保留对应高水位；MMIO 成功后嵌套构造失败仍为
+  //   MMIO_VISIBLE。
   protected task submit_locked(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -1387,12 +1368,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     void'(publish_doorbell_result(desc, absolute_address, result));
   endtask
 
-  // 功能：为一次 doorbell 调用直接建立 observed envelope，冻结入口依赖数，
-  //   再在 Function lock 内执行并发布 effect。
-  // 输入/输出及副作用：binding/desc 和非拥有 observer 为输入，result 为独占
-  //   输出；可能驱动 Host-memory/PCIe，observer 至多同步调用一次。
-  // 失败/边界：null/timeout/snapshot/preflight/锁失败返回非空
-  //   PRE_SUBMIT_REJECTED envelope；取得锁后的退出都释放 token，effect 不回退。
+  // 功能：为一次 doorbell 调用直接建立 observed envelope，冻结入口依赖数，在 Function lock 内执行并发布 effect。
+  // 输入/输出及副作用：binding/desc/observer 输入，result 独占输出；可能驱动 Host-memory/PCIe，observer 至多同步回调一次。
+  // 失败/边界：null/timeout/snapshot/preflight/锁失败返回非空 PRE_SUBMIT_REJECTED envelope；取得锁后的退出都释放 token，
+  //   effect 不回退。
   virtual task submit_observed(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,
@@ -1488,11 +1467,10 @@ class rdma_doorbell_scheduler extends uvm_object;
     function_lock.put(1);
   endtask
 
-  // 功能：兼容旧调用方，把 submit_observed 的一次调用结果单向投影为 detached result/status。
-  // 输入/输出及副作用：binding/desc 为输入，result/status 为输出；内部只调用
-  //   一次 submit_observed 且不保存 last_* 状态。
-  // 失败/边界：observed envelope/status/result 畸形时返回 result=null 和直接构造
-  //   INVALID_STATE；合法失败 envelope 可独立投影 null result 与原 status。
+  // 功能：兼容旧调用方：把一次 submit_observed 的结果单向投影为 detached result/status。
+  // 输入/输出及副作用：binding/desc 输入，result/status 输出；只调用一次 submit_observed，不保存 last_* 状态。
+  // 失败/边界：envelope/status/result 畸形时返回 result=null 与 INVALID_STATE；合法失败 envelope 可独立投影 null
+  //   result 与原 status。
   task submit(
     rdma_function_binding binding,
     rdma_doorbell_desc desc,

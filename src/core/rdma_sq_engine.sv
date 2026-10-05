@@ -16,11 +16,9 @@ class rdma_sq_engine extends rdma_queue_facade;
     super.new(name, "SQ");
   endfunction
 
-  // 功能：validate_transport 在发送入口验证请求 transport/opcode 与 facade 当前
-  //   绑定状态，阻断 RC-only 字段串入 UD/URC。
-  // 输入/输出及副作用：request（输入）；返回校验状态，不修改 request、队列游标或外部资源。
-  // 失败/边界：未配置、空请求、unsupported transport 或请求自身字段不一致时返回
-  //   明确错误；成功不代表已提交 WQE。
+  // 功能：在发送入口校验 transport 与请求字段，阻断 RC-only 字段串入 UD/URC。
+  // 输入/输出及副作用：request 为输入；只返回状态，不修改队列游标或资源。
+  // 失败/边界：未配置、空请求、transport 非 RC/UD/URC 或 request.validate() 失败；成功不代表已提交。
   function rdma_status validate_transport(rdma_post_send_req request);
     rdma_status status;
     if (!configured || delegate == null)
@@ -41,15 +39,10 @@ class rdma_sq_engine extends rdma_queue_facade;
     return status;
   endfunction
 
-  // 功能：将发送请求交给共享 engine 执行完整的预检、WQE 写入、doorbell 和
-  //   提交流程。
-  // 输入/输出及副作用：request（输入）、result/status（输出）；输入 request/image/
-  //   cursor 决定写入内容；成功时更新 PI/CI、slot ledger 或 pending journal，
-  //   并通过 output 返回结果。
-  // 失败/边界：未配置、空请求、跨 Function handle、队列耗尽或 ambiguous MMIO
-  //   时原样返回具体错误；authority/request/delegate 返回 null status 时统一返回
-  //   INVALID_STATE；delegate 返回非空失败状态时保留其 code/message。任一失败都
-  //   清空 result，调用方不会观察到没有成功状态支撑的提交结果。
+  // 功能：校验后把发送请求委托给共享 engine（预检、WQE 写入、doorbell、提交）。
+  // 输入/输出及副作用：request 输入；result/status 输出；成功时由 delegate 更新 PI/CI 与 ledger。
+  // 失败/边界：授权或 transport 校验失败直接返回；delegate 的 null status 归一为
+  //   INVALID_STATE，其余失败保留 code/message；任一失败都清空 result。
   task post_send(
     rdma_post_send_req request,
     output rdma_queue_post_result result,

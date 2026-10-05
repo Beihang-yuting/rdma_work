@@ -56,11 +56,9 @@ class rdma_sriov_enumerator extends uvm_object;
     return result;
   endfunction
 
-  // 功能：把 PCIe/allocator 边界返回的 status 统一规范化为可安全消费的对象。
-  // 输入/输出及副作用：candidate、operation、pf_bdf 为输入；非空 status 原样返回，
-  //       null status 转换为带 PCIe 来源和 PF 诊断的 INVALID_STATE，不修改 sequence 状态。
-  // 失败/边界：null 表示外部 virtual task/function 违反状态返回契约；调用方收到确定失败后
-  //       必须停止当前阶段并按需要执行 rollback，不能继续读取 output 或发布 lease。
+  // 功能：把 PCIe/allocator 返回的 status 规范化为非空对象。
+  // 输入/输出及副作用：非空原样返回；null 转为带 PF 诊断的 INVALID_STATE；不改 sequence 状态。
+  // 失败/边界：null 视为外部违反返回契约；调用方须停止当前阶段并按需 rollback，不得读取 output 或发布 lease。
   protected function automatic rdma_status normalize_status(
     rdma_status candidate,
     string operation,
@@ -161,10 +159,8 @@ class rdma_sriov_enumerator extends uvm_object;
   endtask
 
   // 功能：把已分配的 64-bit BAR base 写回 low/high 配置 DWORD。
-  // 输入/输出及副作用：target/low_offset/base/flags（输入）；成功时更新 canonical config image。
-  // 失败/边界：高 DWORD offset 溢出或任一 cfg_write 失败时返回错误；low DWORD
-  //   可能已经写入并暂时形成部分地址，调用方必须沿用 rollback_pf 恢复原始
-  //   PF/VF BAR image，不能把 status 错误误解为底层配置已自动回滚。
+  // 输入/输出及副作用：target/low_offset/base/flags 输入；成功时更新 canonical config image。
+  // 失败/边界：高 DWORD offset 溢出或 cfg_write 失败返回错误；low DWORD 可能已写入，调用方须用 rollback_pf 恢复，状态不会自动回滚。
   protected task automatic program_bar(
     rdma_bdf_t target,
     rdma_cfg_offset_t low_offset,
@@ -241,17 +237,9 @@ class rdma_sriov_enumerator extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：在失败路径先关闭 PF VFE/VF-MSE、清除 NumVFs，再按逆序恢复本次
-  //   sequence 读到的 PF/VF BAR low/high DWORD，最后释放所有已发布 lease，
-  //   使配置 image、canonical route 和 allocator 账本回到枚举前状态。
-  // 输入/输出及副作用：pf_bdf/cap_offset、pf_bar_original/pf_bar_original_valid、
-  //   vf_bar_original/vf_bar_original_valid、leases（输入），discovered（输入/输出）；
-  //   向目标 PF 发送 cleanup/restore config writes，从 allocator 移除 leases，并清空
-  //   本次 sequence 已暂存的 Function 快照；只恢复成功读到的 descriptor，不覆盖未读
-  //   或不属于本次 sequence 的配置。
-  // 失败/边界：任一 cleanup/restore 写失败只保留诊断并继续后续恢复和 lease release；
-  //   调用方保留原始业务失败状态作为主错误。未取得对应 valid 位时不猜测旧 BAR 值；
-  //   discovered 清空是失败原子性的一部分，即使 lease release 或配置恢复失败也执行。
+  // 功能：失败路径：关闭 PF VFE/VF-MSE、清 NumVFs，逆序恢复读到的 PF/VF BAR，释放已发布 lease。
+  // 输入/输出及副作用：向目标 PF 发 cleanup/restore 写，从 allocator 移除 leases，清空 discovered；只恢复成功读到的 descriptor。
+  // 失败/边界：任一写失败只记录诊断并继续后续恢复与 lease 释放；调用方保留原始业务失败为主错误；未取得 valid 位不猜测旧 BAR。
   protected task automatic rollback_pf(
     rdma_bdf_t pf_bdf,
     bit [11:0] cap_offset,
@@ -314,12 +302,11 @@ class rdma_sriov_enumerator extends uvm_object;
     discovered.delete();
   endtask
 
-  // 功能：执行标准 SR-IOV PF 枚举和配置流程，输出每个已验证 VF 的 detached Function 快照。
-  // 输入/输出及副作用：pf_bdf/requested_vfs（输入）、discovered/status（输出）；按 PCIe
-  //   config 顺序修改目标 PF 的 BAR/NumVFs/Control，并在成功时保留 allocator leases。
-  // 失败/边界：任何 capability/config/BAR/Function 校验失败均关闭 VFE、清零 NumVFs、释放
-  //   本次 leases 并清空 discovered；不修改其他 PF 的已生效配置；所有地址和 RID 算术
-  //   均执行 65-bit 检查，失败时绝不发布部分成功的 VF 快照。
+  // 功能：执行标准 SR-IOV PF 枚举配置，输出每个已验证 VF 的 detached Function 快照。
+  // 输入/输出及副作用：pf_bdf/requested_vfs 输入；discovered/status 输出；按序修改目标 PF 的 BAR/NumVFs/Control，成功时保留
+  //   leases。
+  // 失败/边界：任一 capability/config/BAR/Function 校验失败即关闭 VFE、清 NumVFs、释放 leases 并清空 discovered；RID
+  //   与地址运算做 65 位检查，不发布部分成功的 VF。
   task enumerate_and_configure_pf(
     rdma_bdf_t pf_bdf,
     int unsigned requested_vfs,

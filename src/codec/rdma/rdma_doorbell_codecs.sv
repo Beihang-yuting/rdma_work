@@ -3,9 +3,6 @@
 // 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
-// 中文说明：rdma_doorbell_codecs.sv 属于编码层，将模型字段转换为硬件图像并执行反向校验。
-// 阅读提示：先看公开类型和接口，再看实现细节；失败路径应保持状态与资源所有权可追踪。
-
 typedef enum bit {
   RDMA_SRQ_DB_PI    = 1'b0,
   RDMA_SRQ_DB_LIMIT = 1'b1
@@ -19,17 +16,17 @@ typedef enum bit {
 virtual class rdma_hw_doorbell_model_base extends rdma_hw_model;
   rdma_handle target_h;
 
-  // 功能：构造 rdma_hw_doorbell_model_base，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：target_h=null。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_doorbell_model_base 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_doorbell_model_base。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_doorbell_model_base");
     super.new(name);
     target_h = null;
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_model_base 中，do_copy 将 rhs 中 rdma_hw_doorbell_model_base 的字段复制到当前对象，建立与源对象隔离的值快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（doorbell model copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_doorbell_model_base rhs_model;
     super.do_copy(rhs);
@@ -39,9 +36,9 @@ virtual class rdma_hw_doorbell_model_base extends rdma_hw_model;
                                        "rdma doorbell target");
   endfunction
 
-  // 功能：target_status 校验 expected_kind、label 与当前对象状态的一致性，并显式处理“target handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：expected_kind（输入）、label（输入）；target_status 读取 expected_kind、label 并使用字段 rdma_status、target_h、target_h.kind、target_h.generation；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：target_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 doorbell 的 target handle 与期望资源类型。
+  // 输入/输出及副作用：target_h 只读；label 用于错误文本。
+  // 失败/边界：handle 为空或 kind 不符返回 INVALID_ARGUMENT；generation 为 0 返回 STALE_GENERATION。
   protected function rdma_status target_status(
     rdma_resource_kind_e expected_kind,
     string label
@@ -58,9 +55,9 @@ virtual class rdma_hw_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：width_status 校验 value、width、label 与当前对象状态的一致性，并显式处理“%s exceeds %0d bits”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：value（输入）、width（输入）、label（输入）；width_status 读取 value、width、label 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：width_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：检查 value 是否放得进 width 位。
+  // 输入/输出及副作用：只读；label 用于错误文本。
+  // 失败/边界：width 小于 64 且 value 超出该位宽时返回 INVALID_ARGUMENT。
   protected function rdma_status width_status(
     longint unsigned value,
     int unsigned width,
@@ -74,9 +71,9 @@ virtual class rdma_hw_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：target_id_status 校验 expected_id、label 与当前对象状态的一致性，并显式处理“target object ID does not match”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：expected_id（输入）、label（输入）；target_id_status 读取 expected_id、label 并使用字段 rdma_status、target_h.object_id；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：target_id_status 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：检查 target handle 的 object_id 是否等于 expected_id。
+  // 输入/输出及副作用：target_h 只读（调用方须已校验非空）。
+  // 失败/边界：object_id 不等返回 INVALID_ARGUMENT。
   protected function rdma_status target_id_status(
     int unsigned expected_id,
     string label
@@ -87,9 +84,9 @@ virtual class rdma_hw_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“rdma doorbell target handle is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、target_h、target_h.generation 并使用字段 rdma_status、target_h、target_h.generation；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_STALE_GENERATION；典型拒绝条件为“rdma doorbell target handle is null”“rdma doorbell target generation is stale”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：基类校验：target handle 非空且 generation 非 0。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：handle 为空返回 INVALID_ARGUMENT；generation 为 0 返回 STALE_GENERATION。
   virtual function rdma_status validate();
     if (target_h == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
@@ -100,14 +97,14 @@ virtual class rdma_hw_doorbell_model_base extends rdma_hw_model;
     return rdma_status::success();
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取 对象字段：pi 并使用字段 name、pi、polarity；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，按对象字段返回固定值；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回该 model 对应的 doorbell 类别（子类实现）。
+  // 输入/输出及副作用：无参数；只读。
+  // 失败/边界：无。
   pure virtual function rdma_doorbell_kind_e doorbell_kind();
 
-  // 功能：在 rdma_hw_doorbell_model_base 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 返回具体 doorbell codec 的 profile 名称，不读取 name、pi 或 polarity 运行时字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，按对象字段返回固定值；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：按当前 variant 返回 codec 变体名。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   pure virtual function string codec_variant();
 endclass
 
@@ -118,18 +115,18 @@ class rdma_hw_cmq_sq_doorbell_model
   int unsigned pi;
   bit polarity;
 
-  // 功能：构造 rdma_hw_cmq_sq_doorbell_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：pi=0；polarity=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_cmq_sq_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_cmq_sq_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_cmq_sq_doorbell_model");
     super.new(name);
     pi = 0;
     polarity = 1'b0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_cmq_sq_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CMQ doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_cmq_sq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -139,9 +136,9 @@ class rdma_hw_cmq_sq_doorbell_model
     polarity = rhs_model.polarity;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CMQ doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：pi 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：校验 rdma_hw_cmq_sq_doorbell_model 的 target 与各字段位宽。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 为空/类型或 generation 不符、字段超位宽或 object ID 不匹配时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_CMQ, "CMQ doorbell");
@@ -149,23 +146,23 @@ class rdma_hw_cmq_sq_doorbell_model
     return width_status(pi, RDMA_CMQ_DB_PI_WIDTH, "CMQ doorbell PI");
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 RDMA_DOORBELL_CMQ_SQ；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_DOORBELL_CMQ_SQ。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_CMQ_SQ;
   endfunction
 
-  // 功能：在 rdma_hw_cmq_sq_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，返回 "cmq_sq"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 "cmq_sq"。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function string codec_variant();
     return "cmq_sq";
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：生成该 model 的诊断文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("rdma CMQ doorbell(pi=%0d polarity=%0b)",
                      pi, polarity);
@@ -178,17 +175,17 @@ class rdma_hw_sq_doorbell_model
 
   byte unsigned sqe_header[$];
 
-  // 功能：构造 rdma_hw_sq_doorbell_model，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_sq_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_sq_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_sq_doorbell_model");
     super.new(name);
     sqe_header.delete();
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_sq_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（SQ doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_sq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -197,9 +194,9 @@ class rdma_hw_sq_doorbell_model
     sqe_header = rhs_model.sqe_header;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“SQ doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “SQ doorbell header is not exactly eight bytes”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：校验 SQ doorbell 的 target 与 8 字节 header。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 非法或 sqe_header 长度不是 RDMA_DB_BYTES 时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_QP, "SQ doorbell");
@@ -210,23 +207,23 @@ class rdma_hw_sq_doorbell_model
     return rdma_status::success();
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 RDMA_DOORBELL_SQ；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_DOORBELL_SQ。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_SQ;
   endfunction
 
-  // 功能：在 rdma_hw_sq_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，返回 "sq"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 "sq"。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function string codec_variant();
     return "sq";
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回 "rdma opaque SQ doorbell header"。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function string describe();
     return "rdma opaque SQ doorbell header";
   endfunction
@@ -241,9 +238,9 @@ class rdma_hw_rq_doorbell_model
   int unsigned pi;
   bit wrap;
 
-  // 功能：构造 rdma_hw_rq_doorbell_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：qpn=0；icos=0；pi=0；wrap=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_rq_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_rq_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_rq_doorbell_model");
     super.new(name);
     qpn = 0;
@@ -252,9 +249,9 @@ class rdma_hw_rq_doorbell_model
     wrap = 1'b0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_rq_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（RQ doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_rq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -266,9 +263,9 @@ class rdma_hw_rq_doorbell_model
     wrap = rhs_model.wrap;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“RQ doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：qpn 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：校验 rdma_hw_rq_doorbell_model 的 target 与各字段位宽。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 为空/类型或 generation 不符、字段超位宽或 object ID 不匹配时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_QP, "RQ doorbell");
@@ -285,23 +282,23 @@ class rdma_hw_rq_doorbell_model
     return target_id_status(qpn, "RQ doorbell");
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 RDMA_DOORBELL_RQ；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_DOORBELL_RQ。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_RQ;
   endfunction
 
-  // 功能：在 rdma_hw_rq_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，返回 "rq"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 "rq"。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function string codec_variant();
     return "rq";
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：生成该 model 的诊断文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("rdma RQ doorbell(qpn=%0d pi=%0d wrap=%0b)",
                      qpn, pi, wrap);
@@ -319,9 +316,9 @@ class rdma_hw_srq_doorbell_model
   int unsigned limit;
   int unsigned arm_sn;
 
-  // 功能：构造 rdma_hw_srq_doorbell_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：variant=RDMA_SRQ_DB_PI；srqn=0；pi=0；wrap=1'b0；limit=0；arm_sn=0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_srq_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_srq_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_srq_doorbell_model");
     super.new(name);
     variant = RDMA_SRQ_DB_PI;
@@ -332,9 +329,9 @@ class rdma_hw_srq_doorbell_model
     arm_sn = 0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_srq_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（SRQ doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_srq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -348,9 +345,9 @@ class rdma_hw_srq_doorbell_model
     arm_sn = rhs_model.arm_sn;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“SRQ doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、srqn、variant 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“SRQ doorbell variant is invalid”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 rdma_hw_srq_doorbell_model 的 target 与各字段位宽。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 为空/类型或 generation 不符、variant 非法、字段超位宽或 object ID 不匹配时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_SRQ, "SRQ doorbell");
@@ -377,23 +374,23 @@ class rdma_hw_srq_doorbell_model
     return target_id_status(srqn, "SRQ doorbell");
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 RDMA_DOORBELL_SRQ；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_DOORBELL_SRQ。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_SRQ;
   endfunction
 
-  // 功能：在 rdma_hw_srq_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取 对象字段：variant 并使用字段 variant；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，返回 (variant == RDMA_SRQ_DB_PI) ? "srq_pi" : "srq_limit"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：按当前 variant 返回 codec 变体名。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string codec_variant();
     return (variant == RDMA_SRQ_DB_PI) ? "srq_pi" : "srq_limit";
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：生成该 model 的诊断文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("rdma SRQ doorbell(variant=%s srqn=%0d)",
                      codec_variant(), srqn);
@@ -419,11 +416,9 @@ class rdma_hw_cq_doorbell_model
   int unsigned arm_state;
   int unsigned arm_sn;
 
-  // 功能：构造 rdma_hw_cq_doorbell_model，建立同时覆盖 RC/UD 与 URC 线布局的
-  //       独立 doorbell 快照；invalid 标志也在模型中保留，避免丢失驱动字段。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：构造只建立本地初始状态，不接管 CQ、Host-memory、PCIe 或 manager；
-  //       未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_cq_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_cq_doorbell_model");
     super.new(name);
     variant = RDMA_CQ_DB_RC_UD;
@@ -442,9 +437,9 @@ class rdma_hw_cq_doorbell_model
     arm_sn = 0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_cq_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CQ doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_cq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -466,9 +461,9 @@ class rdma_hw_cq_doorbell_model
     arm_sn = rhs_model.arm_sn;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CQ doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、cqn、variant 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；典型拒绝条件为“CQ doorbell variant is invalid”；失败路径不提交部分状态或转移未声明资源。
+  // 功能：校验 rdma_hw_cq_doorbell_model 的 target 与各字段位宽。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 为空/类型或 generation 不符、variant 非法、字段超位宽或 object ID 不匹配时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_CQ, "CQ doorbell");
@@ -505,23 +500,23 @@ class rdma_hw_cq_doorbell_model
     return target_id_status(cqn, "CQ doorbell");
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 RDMA_DOORBELL_CQ；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_DOORBELL_CQ。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_CQ;
   endfunction
 
-  // 功能：在 rdma_hw_cq_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取 对象字段：variant 并使用字段 variant；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，返回 (variant == RDMA_CQ_DB_RC_UD) ? "cq_rc_ud" : "cq_urc"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：按当前 variant 返回 codec 变体名。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string codec_variant();
     return (variant == RDMA_CQ_DB_RC_UD) ? "cq_rc_ud" : "cq_urc";
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：生成该 model 的诊断文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("rdma CQ doorbell(variant=%s cqn=%0d)",
                      codec_variant(), cqn);
@@ -536,9 +531,9 @@ class rdma_hw_ceq_doorbell_model
   int unsigned ci;
   bit wrap;
 
-  // 功能：构造 rdma_hw_ceq_doorbell_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：ceqn=0；ci=0；wrap=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_ceq_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_ceq_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_ceq_doorbell_model");
     super.new(name);
     ceqn = 0;
@@ -546,9 +541,9 @@ class rdma_hw_ceq_doorbell_model
     wrap = 1'b0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_ceq_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（CEQ doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_ceq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -559,9 +554,9 @@ class rdma_hw_ceq_doorbell_model
     wrap = rhs_model.wrap;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“CEQ doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：ceqn 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：校验 rdma_hw_ceq_doorbell_model 的 target 与各字段位宽。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 为空/类型或 generation 不符、字段超位宽或 object ID 不匹配时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_CEQ, "CEQ doorbell");
@@ -575,23 +570,23 @@ class rdma_hw_ceq_doorbell_model
     return target_id_status(ceqn, "CEQ doorbell");
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 RDMA_DOORBELL_CEQ；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_DOORBELL_CEQ。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_CEQ;
   endfunction
 
-  // 功能：在 rdma_hw_ceq_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，返回 "ceq"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 "ceq"。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function string codec_variant();
     return "ceq";
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：生成该 model 的诊断文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("rdma CEQ doorbell(ceqn=%0d ci=%0d wrap=%0b)",
                      ceqn, ci, wrap);
@@ -606,9 +601,9 @@ class rdma_hw_aeq_doorbell_model
   int unsigned ci;
   bit wrap;
 
-  // 功能：构造 rdma_hw_aeq_doorbell_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：aeqn=0；ci=0；wrap=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_aeq_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_aeq_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_aeq_doorbell_model");
     super.new(name);
     aeqn = 0;
@@ -616,9 +611,9 @@ class rdma_hw_aeq_doorbell_model
     wrap = 1'b0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_aeq_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（AEQ doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_aeq_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -629,9 +624,9 @@ class rdma_hw_aeq_doorbell_model
     wrap = rhs_model.wrap;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“AEQ doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：aeqn 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 下游操作失败时原样传播其 status/result，不伪造成功；该路径不隐式重试，也不转移未声明资源。
+  // 功能：校验 rdma_hw_aeq_doorbell_model 的 target 与各字段位宽。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 为空/类型或 generation 不符、字段超位宽或 object ID 不匹配时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_AEQ, "AEQ doorbell");
@@ -645,23 +640,23 @@ class rdma_hw_aeq_doorbell_model
     return target_id_status(aeqn, "AEQ doorbell");
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 RDMA_DOORBELL_AEQ；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_DOORBELL_AEQ。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return RDMA_DOORBELL_AEQ;
   endfunction
 
-  // 功能：在 rdma_hw_aeq_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 是只读访问器，返回 "aeq"；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 "aeq"。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function string codec_variant();
     return "aeq";
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：生成该 model 的诊断文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("rdma AEQ doorbell(aeqn=%0d ci=%0d wrap=%0b)",
                      aeqn, ci, wrap);
@@ -678,9 +673,9 @@ class rdma_hw_qp_control_doorbell_model
   int unsigned qp_sn;
   int unsigned icos;
 
-  // 功能：构造 rdma_hw_qp_control_doorbell_model，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：kind=RDMA_DOORBELL_QP_FLUSH；qpn=0；dst_port=0；qp_sn=0；icos=0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_qp_control_doorbell_model 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_qp_control_doorbell_model。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_qp_control_doorbell_model");
     super.new(name);
     kind = RDMA_DOORBELL_QP_FLUSH;
@@ -690,9 +685,9 @@ class rdma_hw_qp_control_doorbell_model
     icos = 0;
   endfunction
 
-  // 功能：将 rhs 中 rdma_hw_qp_control_doorbell_model 的值字段复制到当前对象，建立与源对象隔离的快照。
-  // 输入/输出及副作用：rhs（输入）；rhs 是源对象；当前对象字段会被覆盖，嵌套句柄按实现执行 clone 或保持非拥有引用，源对象不被修改。
-  // 失败/边界：do_copy 在源对象为空、clone/cast 失败或类型不匹配时触发 UVM fatal（QP-control doorbell copy type mismatch），不保留部分有效快照。
+  // 功能：把 rhs 的字段复制到当前对象。
+  // 输入/输出及副作用：rhs 只读；写入当前对象字段。
+  // 失败/边界：rhs 类型不符时 uvm_fatal。
   virtual function void do_copy(uvm_object rhs);
     rdma_hw_qp_control_doorbell_model rhs_model;
     super.do_copy(rhs);
@@ -705,9 +700,9 @@ class rdma_hw_qp_control_doorbell_model
     icos = rhs_model.icos;
   endfunction
 
-  // 功能：validate 校验 当前对象字段 与当前对象状态的一致性，并显式处理“QP-control doorbell”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：无显式参数；validate 读取 对象字段：rdma_status、kind、dst_port、qp_sn、icos 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate 返回 RDMA_SC_INVALID_ARGUMENT；具体拒绝条件包括 “QP-control doorbell kind is invalid”；“TX-flush doorbell requires fixed destination, sequence, and ICOS”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：校验 rdma_hw_qp_control_doorbell_model 的 target 与各字段位宽。
+  // 输入/输出及副作用：只读；返回 status。
+  // 失败/边界：target 为空/类型或 generation 不符、kind 非法、字段超位宽或 object ID 不匹配时返回非成功状态。
   virtual function rdma_status validate();
     rdma_status status;
     status = target_status(RDMA_RESOURCE_QP, "QP-control doorbell");
@@ -740,16 +735,16 @@ class rdma_hw_qp_control_doorbell_model
     return rdma_status::success();
   endfunction
 
-  // 功能：doorbell_kind 使用 当前对象字段 计算并返回 rdma_doorbell_kind_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：doorbell_kind 是只读访问器，返回 kind；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 kind。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_doorbell_kind_e doorbell_kind();
     return kind;
   endfunction
 
-  // 功能：在 rdma_hw_qp_control_doorbell_model 中，codec_variant 返回该实现声明的固定 profile/资源属性，供注册表和上层选择正确的 codec 或生命周期策略。
-  // 输入/输出及副作用：无显式参数；codec_variant 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：codec_variant 按 case(输入字段) 的固定映射计算 string（RDMA_DOORBELL_RTS2SQD→"rts2sqd"；RDMA_DOORBELL_SQD2RTS→"sqd2rts"；RDMA_DOORBELL_QP_FLUSH→"qp_flush"；RDMA_DOORBELL_TX_FLUSH→"tx_flush"；default→"invalid"）；未列出的输入走 default，不修改运行时账本。
+  // 功能：按当前 variant 返回 codec 变体名。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string codec_variant();
     case (kind)
       RDMA_DOORBELL_RTS2SQD:  return "rts2sqd";
@@ -760,9 +755,9 @@ class rdma_hw_qp_control_doorbell_model
     endcase
   endfunction
 
-  // 功能：describe 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；无显式输入；返回 string，只读取对象字段，不修改模型或资源账本。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：生成该 model 的诊断文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe();
     return $sformatf("rdma QP-control doorbell(kind=%s qpn=%0d)",
                      kind.name(), qpn);
@@ -774,32 +769,32 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
 
   protected string variant_name;
 
-  // 功能：构造 rdma_hw_doorbell_codec，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：this.variant_name=variant_name。
-  // 输入/输出及副作用：name、variant_name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_doorbell_codec 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_doorbell_codec。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_doorbell_codec",
                string variant_name = "rq");
     super.new(name);
     this.variant_name = variant_name;
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，invalid_argument 把错误消息、硬件码或注入故障封装为统一 rdma_status，保留原事务的诊断证据。
-  // 输入/输出及副作用：message（输入）；invalid_argument 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：invalid_argument 返回 RDMA_SC_INVALID_ARGUMENT；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 INVALID_ARGUMENT 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，codec_error 根据输入错误信息构造带正确 category/code 的 rdma_status，供上层保留失败证据。
-  // 输入/输出及副作用：message（输入）；codec_error 读取 message 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：codec_error 返回 RDMA_SC_CODEC_ERROR；失败路径不提交部分状态或转移未声明资源。
+  // 功能：构造 CODEC_ERROR 状态。
+  // 输入/输出及副作用：message 为诊断文本；返回新 status。
+  // 失败/边界：无。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
-  // 功能：判断 supported_variant 对应的状态、能力或账本条件，并返回确定的布尔/计数结果，不修改状态。
-  // 输入/输出及副作用：无显式参数；supported_variant 读取 对象字段：variant_name 并使用字段 variant_name；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：supported_variant 只读取现有账本；输入未初始化时返回保守结果，不得借助默认 Function/root 猜测。
+  // 功能：判断 variant_name 是否为已登记的 doorbell 变体。
+  // 输入/输出及副作用：只读；返回 bit。
+  // 失败/边界：不在 13 个变体名内返回 0。
   protected function bit supported_variant();
     return variant_name inside {
       "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
@@ -808,9 +803,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     };
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，expected_relative_offset 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_relative_offset 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 bit [63:0]，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_relative_offset 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：按 variant_name 返回 doorbell 窗口内的期望偏移。
+  // 输入/输出及副作用：只读；返回 64 位偏移。
+  // 失败/边界：未知 variant 返回全 1。
   protected function bit [63:0] expected_relative_offset();
     case (variant_name)
       "cmq_sq":   return RDMA_DB_CMQ_OFFSET;
@@ -843,9 +838,8 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
       "rq":       return 64'h0000_ffff_00ff_ffff;
       "srq_pi":   return 64'h4000_ffff_0000_ffff;
       "srq_limit":return 64'h8000_0000_ffff_ffff;
-      // cq.h:108-113 define the top fields, including the two explicit invalid
-      // markers.  They are authored by the driver even when the corresponding
-      // cursor is not valid, so both CQ variants must include them in the mask.
+      // cq.h:108-113 的顶部字段含两个 invalid 标记；即使对应游标无效驱动也会写入，
+      // 因此两种 CQ variant 的 mask 都必须包含它们。
       "cq_rc_ud": return 64'hff00_ffff_ffff_ffff;
       "cq_urc":   return 64'hffff_ffff_ffff_ffff;
       "ceq":      return 64'h0007_ffff_003f_ffff;
@@ -858,9 +852,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，expected_doorbell_kind 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_doorbell_kind 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_doorbell_kind_e，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_doorbell_kind 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：按 variant_name 返回期望的 doorbell 类别。
+  // 输入/输出及副作用：只读；返回 rdma_doorbell_kind_e。
+  // 失败/边界：未列出的 variant 落入 default，返回 TX_FLUSH。
   protected function rdma_doorbell_kind_e expected_doorbell_kind();
     case (variant_name)
       "cmq_sq": return RDMA_DOORBELL_CMQ_SQ;
@@ -877,9 +871,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，expected_db_type 在测试中检查调用结果、状态码和副作用是否符合契约；失败时报告可定位的验证信息。
-  // 输入/输出及副作用：无显式参数；expected_db_type 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 int unsigned，不取得调用方资源所有权。
-  // 失败/边界：测试函数 expected_db_type 缺少前置对象时报告断言错误，并停止依赖该对象的后续检查。
+  // 功能：按 variant_name 返回 QP 控制类 doorbell 的 db_type。
+  // 输入/输出及副作用：只读；返回 int。
+  // 失败/边界：非 QP 控制类 variant 返回 0。
   protected function int unsigned expected_db_type();
     case (variant_name)
       "rts2sqd":  return RDMA_DB_TYPE_RTS2SQD;
@@ -890,12 +884,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     endcase
   endfunction
 
-  // 功能：put 通过 qword builder 写入 doorbell image 的一个字段，并将字段 authorship 检查
-  //   结果转换为 doorbell codec status。
-  // 输入/输出及副作用：builder、word_byte_offset、lsb、width、value（输入）；成功时更新
-  //   builder 的 words/occupancy，不修改源 model 或外部 MMIO 资源。
-  // 失败/边界：builder 未初始化、字段越界、值宽度不符或与既有写入重叠时返回 CODEC_ERROR；
-  //   失败时不应发布部分 doorbell image。
+  // 功能：通过 qword builder 写入 doorbell 的一个字段。
+  // 输入/输出及副作用：builder 被更新（words/occupancy）；不修改源 model。
+  // 失败/边界：越界、宽度不符或与既有写入重叠时返回 CODEC_ERROR。
   protected function rdma_status put(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -911,10 +902,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，get 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：builder（输入）、word_byte_offset（输入）、lsb（输入）、width（输入）、value（输出）；输入 handle/key/cursor 用于选择读取范围；返回值或 output
-  //   为 detached 快照，读取不取得外部资源所有权。
-  // 失败/边界：get 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：从 builder 的 qword 中读取一个字段。
+  // 输入/输出及副作用：builder 只读；value 输出提取值。
+  // 失败/边界：提取失败时返回 CODEC_ERROR 并带原因。
   protected function rdma_status get(
     rdma_hw_qword_builder builder,
     int unsigned word_byte_offset,
@@ -933,9 +923,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return status;
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，decoded_target 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：kind（输入）、object_id（输入）、generation（输入）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decoded_target 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：为解码结果构造 target handle。
+  // 输入/输出及副作用：返回新建 rdma_handle；function_uid 置 0，其余取自入参。
+  // 失败/边界：无。
   protected function rdma_handle decoded_target(
     rdma_resource_kind_e kind,
     int unsigned object_id,
@@ -950,9 +940,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return handle;
   endfunction
 
-  // 功能：validate_model 校验 model 与当前对象状态的一致性，并显式处理“rdma doorbell codec variant is unsupported”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：model（输入）；validate_model 读取 model 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：必需对象/句柄/快照为空，或身份、范围、generation 和生命周期检查失败时返回非成功状态。
+  // 功能：校验 model 的 variant、动态类型和字段内容。
+  // 输入/输出及副作用：model 只读；返回 status。
+  // 失败/边界：variant 不支持返回 UNSUPPORTED_OPCODE；类型转换失败或字段非法返回对应错误。
   virtual function rdma_status validate_model(rdma_hw_model model);
     rdma_hw_doorbell_model_base doorbell;
     rdma_hw_cmq_sq_doorbell_model cmq;
@@ -1116,9 +1106,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：validate_encode_mask 校验 builder 与当前对象状态的一致性，并显式处理“doorbell field authorship differs from selected mask”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：builder（输入）；validate_encode_mask 读取 builder 并使用字段 rdma_status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：validate_encode_mask 返回 函数体规定的失败状态；具体拒绝条件包括 “doorbell field authorship differs from selected mask”；失败路径不提交部分状态、不隐式重试，也不转移未声明资源。
+  // 功能：检查 builder 已写入的字段位与 selected_mask 一致。
+  // 输入/输出及副作用：builder 只读；读取 occupancy。
+  // 失败/边界：occupancy 不是单个 qword 或与 selected_mask 不同时返回 CODEC_ERROR。
   protected function rdma_status validate_encode_mask(
     rdma_hw_qword_builder builder
   );
@@ -1129,9 +1119,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 doorbell model 编码为 8 字节 BAR 写入 image。
+  // 输入/输出及副作用：model 只读；image 输出新建 image，失败时为 null。
+  // 失败/边界：model 校验、字段写入、mask 校验或序列化失败时返回错误且不发布 image。
   virtual function rdma_status encode(
     rdma_hw_model model,
     output rdma_hw_image image
@@ -1217,9 +1207,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中，decode 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：image（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：把 8 字节 doorbell image 解码为 typed model。
+  // 输入/输出及副作用：image 只读；model 输出新建 model，失败时为 null。
+  // 失败/边界：image 校验、反序列化、字段读取或解码结果语义校验失败时返回错误。
   virtual function rdma_status decode(
     rdma_hw_image image,
     output rdma_hw_model model
@@ -1381,9 +1371,9 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec 中由 serialized_equal 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：lhs（输入）、rhs（输入）、equal（输出）、mismatch（输出）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：serialized_equal 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：编码两个 model 并逐字节比较序列化结果。
+  // 输入/输出及副作用：lhs/rhs 只读；equal 与 mismatch 输出比较结论。
+  // 失败/边界：任一侧编码失败时返回其错误并在 mismatch 注明左/右；字节不同时 equal=0。
   virtual function rdma_status serialized_equal(
     rdma_hw_model lhs,
     rdma_hw_model rhs,
@@ -1417,16 +1407,16 @@ class rdma_hw_doorbell_codec extends rdma_codec_base;
     return rdma_status::success();
   endfunction
 
-  // 功能：hardware_endian 使用 当前对象字段 计算并返回 rdma_byte_endian_e 结果；不修改对象字段或外部资源。
-  // 输入/输出及副作用：无显式参数；hardware_endian 读取固定返回值或局部计算结果，不使用对象成员字段；函数返回 rdma_byte_endian_e，不取得调用方资源所有权。
-  // 失败/边界：hardware_endian 是只读访问器，返回 RDMA_ENDIAN_BIG；未覆盖枚举沿 default/类型默认分支返回，不改变对象和外部资源。
+  // 功能：返回 RDMA_ENDIAN_BIG。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   virtual function rdma_byte_endian_e hardware_endian();
     return RDMA_ENDIAN_BIG;
   endfunction
 
-  // 功能：describe_fields 把 当前对象字段 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：无显式参数；describe_fields 读取 对象字段：variant_name 并使用字段 variant_name；函数返回 string，不取得调用方资源所有权。
-  // 失败/边界：枚举未定义或对象未配置时返回 UNKNOWN/UNCONFIGURED 表示，同时保留数值上下文。
+  // 功能：返回含 variant_name 的 codec 描述文本。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
   virtual function string describe_fields();
     return {"rdma 8-byte doorbell variant ", variant_name};
   endfunction
@@ -1437,17 +1427,17 @@ class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
 
   protected bit defaults_registered;
 
-  // 功能：构造 rdma_hw_doorbell_codec_registry，调用 super.new 建立 UVM 对象，并把构造体直接写入的默认值设为：defaults_registered=1'b0。
-  // 输入/输出及副作用：name（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
-  // 失败/边界：rdma_hw_doorbell_codec_registry 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
+  // 功能：构造 rdma_hw_doorbell_codec_registry。
+  // 输入/输出及副作用：name 为 UVM 对象名；字段置为默认值。
+  // 失败/边界：无。
   function new(string name = "rdma_hw_doorbell_codec_registry");
     super.new(name);
     defaults_registered = 1'b0;
   endfunction
 
-  // 功能：make_key 把 variant 与当前对象的身份/状态字段编码为稳定文本，供日志、查找或恢复索引使用。
-  // 输入/输出及副作用：variant（输入）；make_key 读取 variant 并使用字段 key.hw_version、key.image_kind、key.object_type、key.variant、key.opcode；函数返回 rdma_codec_key，不取得调用方资源所有权。
-// 失败/边界：make_key 只按函数体列出的身份、generation、kind、object_id 或 cursor 字段拼接键；调用方须先完成空句柄校验，函数本身不分配资源、不自动回退到 root0。
+  // 功能：构造 doorbell 变体的 codec registry 键。
+  // 输入/输出及副作用：variant 输入；返回 rdma_codec_key。
+  // 失败/边界：无。
   protected function rdma_codec_key make_key(string variant);
     rdma_codec_key key;
     key.hw_version = "rdma";
@@ -1458,17 +1448,17 @@ class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
     return key;
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec_registry 中，clear 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
-  // 输入/输出及副作用：无显式参数；输入 action/epoch/handle 决定迁移目标；成功时更新状态或恢复证据，外部资源仍由其拥有者管理。
-  // 失败/边界：clear 发现 owner/generation 不匹配、记录未知或重复释放时返回错误或幂等结果，不重新激活旧句柄。
+  // 功能：清空 registry 并复位默认注册标志。
+  // 输入/输出及副作用：调用 super.clear 后 defaults_registered=0。
+  // 失败/边界：无。
   virtual function void clear();
     super.clear();
     defaults_registered = 1'b0;
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec_registry 中，register_defaults 将输入对象登记或挂接到当前集合/依赖图，并同步维护对应账本和生命周期引用。
-  // 输入/输出及副作用：无显式参数；register_defaults 先依据 defaults_registered；!status.ok(；codecs.exists(canonical_keys[i] 校验 函数体读取的依赖；成功时更新本对象配置/状态并保存非拥有引用，返回 rdma_status。
-  // 失败/边界：实现中的空依赖、重复登记、状态或 generation/authority 校验失败时返回错误；失败时保留旧配置。
+  // 功能：登记全部 13 个 doorbell codec 变体。
+  // 输入/输出及副作用：写入 registry；先预检所有键，冲突时不改动已有键集。
+  // 失败/边界：已登记过或任一键冲突/规范化失败时返回错误。
   function rdma_status register_defaults();
     string variants[13] = '{
       "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
@@ -1482,8 +1472,7 @@ class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
     if (defaults_registered)
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "rdma doorbell codecs are already registered");
-    // Preflight every canonical key before mutating the registry. A collision
-    // at any position must preserve the exact prior key set.
+    // 先预检全部规范键再修改 registry；任一位置冲突都必须保持原键集不变。
     foreach (variants[i]) begin
       status = canonicalize(make_key(variants[i]), canonical_keys[i]);
       if (!status.ok())
@@ -1503,9 +1492,9 @@ class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec_registry 中，find_codec 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：variant（输入）、codec（输出）；find_codec 读取 variant、codec 并使用输入参数和固定枚举/常量，并写入 codec；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：find_codec 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：返回 lookup(make_key(variant), codec)。
+  // 输入/输出及副作用：无副作用。
+  // 失败/边界：无。
   protected function rdma_status find_codec(
     string variant,
     output rdma_codec_base codec
@@ -1513,9 +1502,9 @@ class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
     return lookup(make_key(variant), codec);
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec_registry 中，encode 按硬件布局把输入模型编码到 image/缓冲区，并在写入前检查范围、重叠、端序和保留位。
-  // 输入/输出及副作用：model（输入）、image（输出）；输入模型只读；成功时通过返回值或 output 发布完整 image/bytes，不修改源模型。
-  // 失败/边界：encode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：按 model 的 codec_variant 查找 codec 并编码。
+  // 输入/输出及副作用：model 只读；image 输出。
+  // 失败/边界：model 为空或找不到 codec 时返回错误；其余由 codec 决定。
   function rdma_status encode(
     rdma_hw_doorbell_model_base model,
     output rdma_hw_image image
@@ -1531,9 +1520,9 @@ class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
     return codec.encode(model, image);
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec_registry 中，decode 从硬件 image/缓冲区解码字段，验证长度、布局和完整性后返回模型或状态。
-  // 输入/输出及副作用：variant（输入）、image（输入）、model（输出）；输入 image/bytes 只读；成功时通过返回值或 output 发布 detached 解码快照，不接管调用方缓冲区。
-  // 失败/边界：decode 遇到 image/model 为空、长度/对齐/保留位非法或 codec 校验失败时不发布部分字段。
+  // 功能：按 variant 查找 codec 并解码。
+  // 输入/输出及副作用：image 只读；model 输出。
+  // 失败/边界：找不到 codec 时返回错误；其余由 codec 决定。
   function rdma_status decode(
     string variant,
     rdma_hw_image image,
@@ -1547,9 +1536,9 @@ class rdma_hw_doorbell_codec_registry extends rdma_codec_registry;
     return codec.decode(image, model);
   endfunction
 
-  // 功能：在 rdma_hw_doorbell_codec_registry 中由 serialized_equal 逐字段比较输入值，返回结构、身份或序列化内容是否一致。
-  // 输入/输出及副作用：variant（输入）、lhs（输入）、rhs（输入）、equal（输出）、mismatch（输出）；比较对象/数组只读；返回 bit 或状态结果，不更新 runtime、账本或外部 adapter。
-  // 失败/边界：serialized_equal 的任一比较对象为空或类型不符时返回确定的 false/不等结果，不抛出未处理异常。
+  // 功能：按 variant 查找 codec 并比较序列化结果。
+  // 输入/输出及副作用：lhs/rhs 只读；equal/mismatch 输出。
+  // 失败/边界：找不到 codec 时返回错误；其余由 codec 决定。
   function rdma_status serialized_equal(
     string variant,
     rdma_hw_model lhs,

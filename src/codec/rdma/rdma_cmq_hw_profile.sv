@@ -17,12 +17,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   protected rdma_hw_doorbell_codec_registry doorbell_codecs;
   protected rdma_status doorbell_registration_status;
 
-  // 功能：构造 RDMA CMQ profile 的 request/completion/error codec 和 doorbell registry，
-  //   并注册默认 doorbell variants。
-  // 输入/输出及副作用：name 设置 UVM 实例名；四个 child 通过 factory 创建，
-  // registry 非空时执行 register_defaults() 并保留其精确 status。
-  // 失败/边界：任一 child 缺失或默认注册返回 null/错误时构造仍完成，
-  // validate_profile() 后续以 INVALID_STATE 或保留 status 拒绝使用。
+  // 功能：构造 CMQ profile 的 request/completion/error codec 与 doorbell registry，并注册默认 doorbell variants。
+  // 输入/输出及副作用：name 为 UVM 实例名；四个 child 经 factory 创建；registry 非空时执行 register_defaults() 并保留其 status。
+  // 失败/边界：child 缺失或默认注册失败时构造仍完成，validate_profile() 之后会拒绝使用。
   function new(string name = "rdma_hw_cmq_hw_profile");
     rdma_status status;
     super.new(name);
@@ -62,11 +59,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::make(RDMA_SC_INVALID_STATE, message);
   endfunction
 
-  // 功能：把 handle 的 kind/Function UID/object ID/generation 组成 body 值比较专用文本片段。
-  // 输入/输出及副作用：handle 为非拥有只读输入；返回固定宽度十六进制 string，
-  // 不修改句柄或注册任何 key。
-  // 失败/边界：null 返回明确的 "<null-handle>" sentinel；本 helper 仅用于类型化
-  // 相等比较，不可作为安全/恢复 digest。
+  // 功能：把 handle 的 kind/UID/object ID/generation 拼成 body 值比较用的文本片段。
+  // 输入/输出及副作用：handle 只读；返回固定宽度十六进制 string。
+  // 失败/边界：null 返回 "<null-handle>"；仅用于类型化相等比较，不是安全/恢复 digest。
   protected function string command_handle_value_key(rdma_handle handle);
     if (handle == null)
       return "<null-handle>";
@@ -75,12 +70,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
                      handle.generation);
   endfunction
 
-  // 功能：使用与 CQC_CREATE 相同的驱动 codec，把 CQC context 的 64B wire
-  //   projection 转成稳定十六进制值，供 CQC_DELETE body 的值比较使用。
-  // 输入/输出及副作用：context 为非拥有只读输入；返回包含所有已编码 context
-  //   bytes 的 string，不修改 context、profile 或外部资源。
-  // 失败/边界：null、非 exact rdma_cqc_model、codec/metadata/长度校验失败时
-  //   返回明确的 invalid sentinel；调用方必须把该 sentinel 视为不可比较。
+  // 功能：用与 CQC_CREATE 相同的 codec 把 CQC context 的 64B 投影转成稳定十六进制值，供 CQC_DELETE body 比较。
+  // 输入/输出及副作用：context 只读；返回已编码 bytes 的 string。
+  // 失败/边界：null、非 exact rdma_cqc_model 或 codec/长度校验失败返回 invalid sentinel，调用方须视为不可比较。
   protected function string cqc_context_value_key(rdma_cqc_model ctx_snapshot);
     rdma_hw_cqc_create_body_codec codec;
     rdma_hw_image image;
@@ -104,11 +96,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return result;
   endfunction
 
-  // 功能：将五种受支持 CMQ body 的全部标量/句柄字段投影为可比较文本。
-  // 输入/输出及副作用：body 为非拥有只读输入；返回 QPC/object/MR/OCC/empty
-  // 的类型化值投影，不保存 body 或嵌套 handle。
-  // 失败/边界：null 返回 "<null-body>"；未知 subtype 返回空串；本文本只用于
-  // snapshot 值验证，不是 canonical V1 字节或 journal authority。
+  // 功能：把五种受支持 CMQ body 的全部标量/句柄字段投影为可比较文本。
+  // 输入/输出及副作用：body 只读；返回 QPC/object/MR/OCC/empty 的类型化投影。
+  // 失败/边界：null 返回 "<null-body>"；未知 subtype 返回空串；仅用于 snapshot 值验证，不是 canonical 字节。
   protected function string command_body_value_key(rdma_hw_model body);
     rdma_hw_qpc_command_body qpc_body;
     rdma_hw_cqc_delete_body cqc_delete_body;
@@ -177,10 +167,8 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   endfunction
 
   // 功能：枚举 body 图中必须与 snapshot 分离的外层节点和嵌套 handle。
-  // 输入/输出及副作用：body 只读，nodes 为调用方 queue；非空 body 首先追加自身，
-  // 再对 QPC/object/MR body 追加其非空句柄，不修改 profile。
-  // 失败/边界：null body 是无操作；OCC/empty 无嵌套对象；未知 body 仅追加外层，
-  // 后续 command_body_value_key()=="" 会使 detachment 检查失败。
+  // 输入/输出及副作用：body 只读；nodes 为调用方 queue；先追加 body 自身，再追加 QPC/object/MR body 的非空句柄。
+  // 失败/边界：null 为无操作；OCC/empty 无嵌套对象；未知 body 只追加外层，随后 value_key 为空会使 detachment 检查失败。
   protected function void append_command_body_nodes(
     rdma_hw_model body,
     ref uvm_object nodes[$]
@@ -226,11 +214,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     end
   endfunction
 
-  // 功能：对 exact 同类型 RDMA CMQ body 比较完整字段投影，验证 snapshot 值不漂移。
-  // 输入/输出及副作用：lhs/rhs 只读；先要求注册 wrapper 身份一致，再比较
-  // command_body_value_key() 的非空结果，不修改任一 body。
-  // 失败/边界：任一句柄为 null、wrapper 不同或未知 subtype 投影为空时返回 0；
-  //   可覆盖 get_type_name 不参与判断，本检查不证明图已 detached。
+  // 功能：对 exact 同类型 CMQ body 比较完整字段投影，验证 snapshot 值未漂移。
+  // 输入/输出及副作用：lhs/rhs 只读；先比较注册 wrapper 身份，再比较 command_body_value_key。
+  // 失败/边界：任一为 null、wrapper 不同或投影为空返回 0；不证明图已 detached。
   virtual function bit same_command_body_value(
     rdma_hw_model lhs,
     rdma_hw_model rhs
@@ -246,11 +232,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return lhs_value != "" && lhs_value == rhs_value;
   endfunction
 
-  // 功能：确认 source/snapshot 的外层 body 和所有受支持嵌套 handle 没有交叉别名。
-  // 输入/输出及副作用：只读两个 body 图，各自收集节点后做笛卡尔句柄比较；
-  // 无任一共享节点时返回 1，不保存临时 queue。
-  // 失败/边界：任一 body 为 null/未知类型或发现外层/嵌套句柄相同时返回 0；
-  // 本检查不替代字段值相等检查。
+  // 功能：确认 source 与 snapshot 的外层 body 及嵌套 handle 之间没有别名。
+  // 输入/输出及副作用：只读两个 body 图，收集节点后两两比较句柄。
+  // 失败/边界：任一 body 为 null/未知类型或发现共享句柄返回 0；不替代值相等检查。
   virtual function bit command_body_graph_detached(
     rdma_hw_model source,
     rdma_hw_model snapshot
@@ -271,11 +255,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return 1'b1;
   endfunction
 
-  // 功能：直接复制 body 嵌套 handle，保留 exact base/Function subtype 并绕开 factory。
-  // 输入/输出及副作用：source/label 为输入，snapshot 为输出且入口清空；
-  //   成功发布 detached handle，不修改源句柄。
-  // 失败/边界：null、未知 subtype、复制后类型/字段漂移返回 INVALID_ARGUMENT；
-  //   不调用 clone/copy/type_id::create，也不发布 partial handle。
+  // 功能：直接复制 body 嵌套 handle，保留 exact base/Function subtype，绕开 factory。
+  // 输入/输出及副作用：source/label 输入；snapshot 输出（入口清空），成功发布 detached handle。
+  // 失败/边界：null、未知 subtype 或复制后类型/字段漂移返回 INVALID_ARGUMENT；不发布部分 handle。
   protected function rdma_status checked_command_handle_snapshot(
     rdma_handle source,
     string label,
@@ -294,12 +276,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：直接复制 CQC_DELETE 所需的完整 CQC context 及其嵌套 handle/layout，
-  //   建立不依赖 factory override 的 detached snapshot。
-  // 输入/输出及副作用：source 为非拥有只读 CQC context；snapshot 为输出且入口
-  //   清空；成功时发布新建 rdma_cqc_model 及 page/ring/handle 子对象。
-  // 失败/边界：source 非 exact 类型、任一嵌套对象缺失、validation/handle snapshot
-  //   失败或 candidate 仍与源图共享节点时返回非 OK，绝不发布 partial snapshot。
+  // 功能：直接复制 CQC_DELETE 所需的完整 CQC context 及嵌套 handle/layout，不依赖 factory override。
+  // 输入/输出及副作用：source 只读；snapshot 输出（入口清空），成功发布新建 rdma_cqc_model 及 page/ring/handle 子对象。
+  // 失败/边界：source 非 exact 类型、嵌套对象缺失、校验/handle 快照失败或候选与源共享节点时返回非 OK，不发布部分快照。
   protected function rdma_status checked_cqc_context_snapshot(
     rdma_cqc_model source,
     output rdma_cqc_model snapshot
@@ -395,11 +374,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：对五种 exact RDMA CMQ body 直接构造 typed detached snapshot。
-  // 输入/输出及副作用：source 为输入，snapshot 为输出且入口清空；逐字段复制
-  //   scalar/fixed-array，并为嵌套 handle 直接构造新值，不修改 source。
-  // 失败/边界：null、未知/派生 body、坏 handle、source/candidate validation 失败
-  //   或 graph 未分离时返回非空错误；不调用 raw factory、clone 或 copy。
+  // 功能：对五种 exact CMQ body 直接构造 typed detached 快照。
+  // 输入/输出及副作用：source 输入；snapshot 输出（入口清空）；逐字段复制标量/定长数组，嵌套 handle 直接构造新值。
+  // 失败/边界：null、未知/派生 body、坏 handle、校验失败或图未分离时返回错误；不调用 raw factory/clone/copy。
   virtual function rdma_status snapshot_command_body(
     rdma_hw_model source,
     output rdma_hw_model snapshot
@@ -573,12 +550,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：把 exact 五种 RDMA CMQ body 编码为稳定 V1 tag 后的字段 bytes。
-  // 输入/输出及副作用：source 为输入；schema_tag/canonical_field_bytes 入口清空，
-  //   成功时发布 fresh tag/array，不保留 source handle。
-  // 失败/边界：null、未知/派生 subtype、body validation、QPC next_state 的
-  //   X/Z/7..15 spare 或任一字段编码失败时返回 INVALID_ARGUMENT 且输出保持空；
-  //   不进入 raw factory。
+  // 功能：把五种 exact CMQ body 编码为 V1 tag 与字段 bytes。
+  // 输入/输出及副作用：source 输入；schema_tag/canonical_field_bytes 入口清空，成功时发布新 tag/array。
+  // 失败/边界：null、未知/派生 subtype、body 校验失败、QPC next_state 含 X/Z/7..15 或字段编码失败返回 INVALID_ARGUMENT，输出保持空。
   virtual function rdma_status canonicalize_command_body(
     input rdma_hw_model source,
     output string schema_tag,
@@ -734,11 +708,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：直接复制 exact rdma_hw_cmq_completion 的标量和 payload bytes，并在发布前执行源不变/等值/分离三道门禁。
-  // 输入/输出及副作用：source 为非拥有输入，snapshot 入口清空；直接 new guard
-  // 和 candidate，逐字节复制 object_payload，全部检查通过后只发布 candidate。
-  // 失败/边界：null/非 exact subtype、快照期间源值变化、candidate 不等值或外层别名
-  // 均返回 INVALID_ARGUMENT/null；不调用 factory、clone 或 copy。
+  // 功能：直接复制 exact rdma_hw_cmq_completion 的标量与 payload bytes，发布前做源不变/等值/分离三道门禁。
+  // 输入/输出及副作用：source 输入；snapshot 入口清空；逐字节复制 object_payload，通过检查后只发布 candidate。
+  // 失败/边界：null/非 exact subtype、快照期间源变化、候选不等值或外层别名返回 INVALID_ARGUMENT/null。
   virtual function rdma_status snapshot_completion_payload(
     uvm_object source,
     output uvm_object snapshot
@@ -788,11 +760,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：逐字段比较两个 RDMA CMQ completion payload，包括所有 object_payload 字节。
-  // 输入/输出及副作用：lhs/rhs 只读；比较 owner/opcode/ecode/index/wrap、数组长度
-  // 和每个 byte，返回 bit，不修改 payload。
-  // 失败/边界：任一输入 wrapper 非 exact completion、无法 cast，或长度/任一字段
-  //   不同时返回 0；伪造 get_type_name 的注册子类不能参与等值门禁。
+  // 功能：逐字段比较两个 CMQ completion payload（含全部 object_payload 字节）。
+  // 输入/输出及副作用：lhs/rhs 只读；比较 owner/opcode/ecode/index/wrap、数组长度与每个字节。
+  // 失败/边界：wrapper 非 exact completion、cast 失败或任一字段/长度不同返回 0。
   virtual function bit same_completion_payload_value(
     uvm_object lhs,
     uvm_object rhs
@@ -818,9 +788,8 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
   endfunction
 
   // 功能：确认 completion snapshot 是与 source 不同的 typed 外层对象。
-  // 输入/输出及副作用：source/snapshot 只读；两者均可 cast 且句柄不同时返回 1。
-  // 失败/边界：任一 wrapper 非 exact completion、cast 失败或外层句柄相同时返回
-  //   0；payload 只含动态 byte array，无其他句柄需遍历。
+  // 输入/输出及副作用：source/snapshot 只读。
+  // 失败/边界：wrapper 非 exact、cast 失败或句柄相同返回 0；payload 只含动态数组，无其他句柄。
   virtual function bit completion_payload_graph_detached(
     uvm_object source,
     uvm_object snapshot
@@ -837,10 +806,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
            source_payload != snapshot_payload;
   endfunction
 
-  // 功能：构造 RDMA doorbell registry 查找键，把调用方 variant 放入固定域。
-  // 输入/输出及副作用：variant 为输入；返回 hw_version="rdma"、DOORBELL image、
-  // object_type="doorbell"、opcode=0 的 rdma_codec_key 值，不修改 registry。
-  // 失败/边界：本 helper 不校验空/未知 variant；lookup 是否命中由调用方检查并返回 status。
+  // 功能：构造 doorbell registry 查找键，variant 置于固定域。
+  // 输入/输出及副作用：variant 输入；返回 hw_version="rdma"、DOORBELL、object_type="doorbell"、opcode=0 的 key。
+  // 失败/边界：不校验空/未知 variant，lookup 是否命中由调用方检查。
   protected function rdma_codec_key doorbell_key(string variant);
     rdma_codec_key key;
     key.hw_version = "rdma";
@@ -851,12 +819,10 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return key;
   endfunction
 
-  // 功能：确认三个 CMQ codec、doorbell registry/初始注册 status、CMQ opcode registry
-  //   和 13 个 doorbell variant 全部就绪。
-  // 输入/输出及副作用：无参数；只读 profile 拥有的 child/status，调用全局 CMQ registry
-  // validate() 并逐个 lookup doorbell key，返回首个失败或 OK。
-  // 失败/边界：任一 child/status 为 null、默认注册失败、CMQ registry 无效，
-  // 或任一 variant lookup 非 OK/null codec 时拒绝；校验不自动重新注册。
+  // 功能：确认三个 CMQ codec、doorbell registry 及其注册 status、CMQ opcode registry 与 13 个 doorbell variant
+  //   均就绪。
+  // 输入/输出及副作用：只读 child/status；调用全局 CMQ registry validate() 并逐个 lookup doorbell key；返回首个失败或 OK。
+  // 失败/边界：任一 child/status 为 null、默认注册失败、registry 无效或 variant lookup 失败时拒绝；不自动重新注册。
   virtual function rdma_status validate_profile();
     string variants[13] = '{
       "cmq_sq", "sq", "rq", "srq_pi", "srq_limit", "cq_rc_ud",
@@ -905,20 +871,18 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
            lhs.generation == rhs.generation;
   endfunction
 
-  // 功能：判断 opcode 的 composed body 是否按协议不携带 Function generation。
-  // 输入/输出及副作用：opcode 为八位输入；OCC_FLUSH/TQ_FLUSH 或 CMQ registry 标记的
-  // generationless opcode 返回 1，不修改 registry。
-  // 失败/边界：未知/未注册 opcode 通常返回 0；该结果仅决定 image generation 校验，不表示 opcode 受支持。
+  // 功能：判断 opcode 的 body 是否按协议不携带 Function generation。
+  // 输入/输出及副作用：opcode 输入；OCC_FLUSH/TQ_FLUSH 或 registry 标记的 generationless opcode 返回 1。
+  // 失败/边界：未知/未注册 opcode 通常返回 0；该结果只决定 generation 校验，不表示 opcode 受支持。
   protected function bit generationless_opcode(bit [7:0] opcode);
     return opcode inside {RDMA_OP_OCC_FLUSH, RDMA_OP_TQ_FLUSH} ||
            rdma_cmq_codec_registry::is_generationless(opcode);
   endfunction
 
-  // 功能：验证 request composer 产生未定址的标准 64B big-endian CMQ SQE 及 generation 规则。
-  // 输入/输出及副作用：image/opcode/function_generation 只读；检查 image metadata 和指定 opcode
-  // 的 generationless/绑定约束，返回 status，不改写 image target。
-  // 失败/边界：null image 返回 INVALID_STATE；长度/bytes/对齐/端序/kind/version/target
-  // 不符返回 CODEC_ERROR；generationless 非零返回 CODEC_ERROR，其他 generation 不同返回 STALE_GENERATION。
+  // 功能：验证 composer 生成的未定址标准 64B 大端 CMQ SQE 及 generation 规则。
+  // 输入/输出及副作用：image/opcode/function_generation 只读；检查 metadata 与 generationless 约束，不改 image target。
+  // 失败/边界：image 为 null 返回 INVALID_STATE；长度/对齐/端序/kind/version/target 不符返回 CODEC_ERROR；
+  //   generationless 非零返回 CODEC_ERROR，其余 generation 不符返回 STALE_GENERATION。
   protected function rdma_status validate_composed_sqe(
     rdma_hw_image image,
     bit [7:0] opcode,
@@ -954,11 +918,10 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：将受支持 command body 包装进 CMQ envelope，定位到 slot backing，并产生 CQE 期望键。
-  // 输入/输出及副作用：command/slot 为非拥有只读输入；sqe/expected 入口清空；
-  // 成功时发布 detached 64B SQE（BACKING target）和 opcode/variant expected response。
-  // 失败/边界：profile/command/slot 无效、Function/profile/opcode/VFID 不匹配、target 溢出、
-  // body/envelope codec 失败或产生 null/非法 image 时原子拒绝；QPC_CREATE 必须保持 driver-fixed VFID 为零。
+  // 功能：把受支持的 command body 包进 CMQ envelope，定位到 slot backing，并产生 CQE 期望键。
+  // 输入/输出及副作用：command/slot 只读；sqe/expected 入口清空；成功发布 detached 64B SQE（BACKING target）与期望响应。
+  // 失败/边界：profile/command/slot 无效、Function/opcode/VFID 不符、target 溢出或 codec 失败时原子拒绝；QPC_CREATE 的
+  //   VFID 须为 0。
   virtual function rdma_status compose_sqe(
     rdma_cmq_command_desc command,
     rdma_cmq_slot_context slot,
@@ -1061,11 +1024,10 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：在 completion codec 解码前校验 raw image 是未定址的 64B CMQ CQE。
-  // 输入/输出及副作用：raw_cqe 为只读 image；检查 length/bytes、image_kind 和
-  // NONE/zero target metadata，返回 rdma_status，不解码或修改 bytes。
+  // 功能：解码前校验 raw image 是未定址的 64B CMQ CQE。
+  // 输入/输出及副作用：raw_cqe 只读；检查 length/bytes、image_kind 与 NONE/零 target metadata。
   // 失败/边界：null、非 64B 或 kind/target metadata 非法统一返回 CODEC_ERROR；
-  // alignment/endian/version/generation 由下游 completion 和 engine authority 约束。
+  //   alignment/endian/version/generation 由下游约束。
   protected function rdma_status validate_raw_cqe(rdma_hw_image raw_cqe);
     if (raw_cqe == null)
       return rdma_status::make(RDMA_SC_CODEC_ERROR,
@@ -1083,11 +1045,10 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：通过 RDMA completion/error codec 解码一个 owner-ready CQE，并组装 decoded CQE 值。
-  // 输入/输出及副作用：raw_cqe/expected_owner 只读；ready 先置 0、decoded 先置 null；
-  // not-ready 返回 OK/ready=0，ready 时克隆 completion payload、绑定 command_status 并发布 candidate。
-  // 失败/边界：profile/raw image/codec 失败，ready 却返回 null completion/status，payload clone
-  // 失败，candidate allocation/validation 失败时保持 ready=0/decoded=null；operation 失败 status 作为数据保留。
+  // 功能：经 completion/error codec 解码一个 owner-ready CQE，并组装 decoded CQE 值。
+  // 输入/输出及副作用：raw_cqe/expected_owner 只读；ready 先置 0、decoded 先置 null；not-ready 返回 OK 且 ready=0。
+  // 失败/边界：profile/image/codec 失败、ready 却返回 null、payload 克隆或 candidate 构造/校验失败时保持
+  //   ready=0/decoded=null；operation 失败 status 作为数据保留。
   virtual function rdma_status inspect_cqe(
     rdma_hw_image raw_cqe,
     bit expected_owner,
@@ -1148,11 +1109,9 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     return rdma_status::success();
   endfunction
 
-  // 功能：构造 CMQ-SQ doorbell model，通过 registry 编码 final PI/polarity，并发布 detached image。
-  // 输入/输出及副作用：cmq_h/final_pi/polarity 只读；image 入口清空；克隆 handle
-  // 到临时 model，registry encode 成功后再 copy 为调用方拥有的 image，不写 MMIO。
-  // 失败/边界：profile 无效、cmq_h 为 null/非 CMQ、final_pi>=32、handle clone 失败、
-  // registry encode 失败或返回 null image 时不发布部分 output。
+  // 功能：构造 CMQ-SQ doorbell model，经 registry 编码 final PI/polarity，发布 detached image。
+  // 输入/输出及副作用：cmq_h/final_pi/polarity 只读；image 入口清空；不写 MMIO。
+  // 失败/边界：profile 无效、cmq_h 为 null/非 CMQ、final_pi>=32、克隆或 registry 编码失败时不发布部分输出。
   virtual function rdma_status encode_doorbell(
     rdma_handle cmq_h,
     int unsigned final_pi,
