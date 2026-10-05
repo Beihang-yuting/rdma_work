@@ -285,13 +285,14 @@ class rdma_drv_cq extends uvm_object;
   endtask
 
   // 功能：xtrdma_ib_destroy_cq：CQC_DELETE（携带 HMC 中的 56B CQC）失败只记录；HUGE 缓冲无 PD flush；
-  //   释放缓冲与 CQN。
+  //   cleanup_ceqes 清除所属 CEQ 中该 CQ 的 CEQE；释放缓冲与 CQN。
   // 输入/输出及副作用：下发命令，释放资源。
   // 失败/边界：status 返回 CQC_DELETE 的结果，资源总是释放（与驱动一致）。
   task destroy(rdma_drv_dev dev, output rdma_status status);
     rdma_bytes_t sqe;
     rdma_bytes_t ctx;
     rdma_bytes_t cqe_bytes;
+    rdma_status cleanup_status;
 
     sqe = rdma_drv_cmq::new_sqe(RDMA_OP_CQC_DELETE);
     status = dev.hw.read(ctx_page, ctx_offset, RDMA_CQC_BYTES - 8, ctx);
@@ -300,6 +301,9 @@ class rdma_drv_cq extends uvm_object;
     `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQN, cqn)
     if (status.ok())
       dev.cmq.exec(sqe, cqe_bytes, status);
+    foreach (dev.ceqs[i])
+      if (dev.ceqs[i].eqn == ceqn)
+        dev.ceqs[i].cleanup(dev.hw, cqn, cleanup_status);
     void'(mem_kbuf.free(dev.hw));
     dev.cq_ids.free(cqn);
     dev.cq_table.delete(cqn);

@@ -672,7 +672,6 @@ class rdma_drv_wr extends uvm_object;
   static task process_ceq(rdma_drv_dev dev, rdma_drv_eq eq, inout int unsigned cqns[$],
                           output rdma_status status);
     rdma_bytes_t ceqe;
-    bit [63:0] db;
     int unsigned cqn;
 
     status = rdma_status::success();
@@ -689,11 +688,7 @@ class rdma_drv_wr extends uvm_object;
       eq.tail++;
       if (eq.tail % eq.entries == 0)
         eq.polarity = !eq.polarity;
-      db = '0;
-      db[RDMA_NOTIFY_CEQ_CI_WRAP_LSB] = (eq.tail / eq.entries) & 1;
-      db[RDMA_NOTIFY_CEQ_CI_LSB +: RDMA_NOTIFY_CEQ_CI_WIDTH] = eq.tail % eq.entries;
-      db[RDMA_NOTIFY_CEQ_CEQN_LSB +: RDMA_NOTIFY_CEQ_CEQN_WIDTH] = eq.eqn;
-      dev.hw.notify(RDMA_DB_CEQ_OFFSET, db, status);
+      eq.ack(dev.hw, status);
       if (!status.ok())
         return;
     end

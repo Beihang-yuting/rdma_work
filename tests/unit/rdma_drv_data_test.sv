@@ -3,7 +3,7 @@
 // 职责：两节点数据端到端（驱动模型 + 设备模型，仅经 CMQ/doorbell/DMA 交互）：RC 的 SEND（多 MTU、
 //   3 SGE 走 SGB、inline）、WRITE、WRITE_IMM、READ、FAA、CAS、rkey 错误 NAK，CQ arm 产生 CEQE，
 //   SEND 进 SRQ（post_srq_recv、SRFQ 环、CQE 的 SRFQ 回查与槽位释放），CQ resize 时未消费 CQE 迁移，
-//   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE；
+//   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE，CQ destroy 的 cleanup_ceqes；
 //   每项逐字节比对目的内存并检查完成的 wr_id/方向/状态。
 // 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
@@ -102,6 +102,7 @@ class rdma_drv_data_test extends uvm_test;
     check_cq_resize();
     check_flush();
     check_srq_limit();
+    check_ceq_cleanup();
     if (a.dev.nic.errors.size() != 0 || b.dev.nic.errors.size() != 0)
       `uvm_error("DATA", $sformatf("device protocol errors: a=%p b=%p",
                                    a.dev.nic.errors, b.dev.nic.errors))
@@ -605,10 +606,11 @@ class rdma_drv_data_test extends uvm_test;
       `uvm_error("FLUSH", $sformatf("%0d completions after destroy", wcs.size()))
   endtask
 
-  // 功能：新建一对已连接的 RC QP：qb 在 B（可绑定 srq），qa 在 A，均使用节点默认 PD/CQ。
+  // 功能：新建一对已连接的 RC QP：qb 在 B（可绑定 srq），qa 在 A（a_cq 为空时用节点默认 CQ）。
   // 输入/输出及副作用：qa/qb 输出。
   // 失败/边界：失败报告 UVM_FATAL。
-  task make_pair(rdma_drv_srq srq, output rdma_drv_qp qa, output rdma_drv_qp qb);
+  task make_pair(rdma_drv_srq srq, output rdma_drv_qp qa, output rdma_drv_qp qb,
+                 input rdma_drv_cq a_cq = null);
     rdma_drv_qp_init_attr attr;
     rdma_status status;
 
@@ -621,8 +623,8 @@ class rdma_drv_data_test extends uvm_test;
     expect_ok("create pair QP on B", status);
     attr = rdma_drv_qp_init_attr::type_id::create("pair_attr");
     attr.pd = a.pd;
-    attr.send_cq = a.cq;
-    attr.recv_cq = a.cq;
+    attr.send_cq = a_cq == null ? a.cq : a_cq;
+    attr.recv_cq = attr.send_cq;
     rdma_drv_qp::create_qp(a.drv, attr, qa, status);
     expect_ok("create pair QP on A", status);
     connect_qp(a.drv, qa, qb.qpn, b.mac);
@@ -675,5 +677,47 @@ class rdma_drv_data_test extends uvm_test;
     if (events.size() != 1 || events[0] != {RDMA_ECODE_XTRDMA_CQE_ECODE_SRFQ_OVER_LIMIT_TH,
                                             24'(srq.srqn)})
       `uvm_error("SRQ_LIMIT", $sformatf("AEQ events %p for SRQ %0d", events, srq.srqn))
+  endtask
+
+  // 功能：A 上新 CQ c2 与默认 CQ 各 arm 后依次产生 CEQE（先 c2 后默认 CQ），不处理 CEQ 即销毁 c2 的
+  //   QP 与 c2：cleanup_ceqes 移除 c2 的 CEQE 并前移其后条目，随后 process_ceq 只得到默认 CQ。
+  // 输入/输出及副作用：创建并销毁 c2 与一对 QP。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task check_ceq_cleanup();
+    rdma_drv_cq c2;
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
+    rdma_drv_send_wr wr;
+    int unsigned cqns[$];
+    rdma_bytes_t scratch;
+    rdma_status status;
+
+    rdma_drv_cq::create_cq(a.drv, 64, 0, c2, status);
+    expect_ok("create c2", status);
+    make_pair(null, qa, qb, c2);
+    scratch = fill(a, 'h300, 'h10, 8'hf1);
+    c2.arm(a.drv, 1'b0, status);
+    expect_ok("arm c2", status);
+    wr = send_wr(a, RDMA_DRV_WR_WRITE, '{'h300}, '{'h10});
+    wr.remote_va = b.data_buf.iova + 'h300;
+    wr.rkey = b.mr.key();
+    rdma_drv_wr::post_send(a.drv, qa, wr, status);
+    expect_ok("post WRITE on c2 QP", status);
+    #5us;
+    a.cq.arm(a.drv, 1'b0, status);
+    expect_ok("arm A CQ", status);
+    wr = send_wr(a, RDMA_DRV_WR_WRITE, '{'h300}, '{'h10});
+    wr.remote_va = b.data_buf.iova + 'h300;
+    wr.rkey = b.mr.key();
+    send_and_wait("WRITE on A CQ", wr);
+    qa.destroy(a.drv, status);
+    expect_ok("destroy c2 QP", status);
+    c2.destroy(a.drv, status);
+    expect_ok("destroy c2", status);
+    rdma_drv_wr::process_ceq(a.drv, a.drv.ceqs[0], cqns, status);
+    expect_ok("process CEQ", status);
+    if (cqns.size() != 1 || cqns[0] != a.cq.cqn)
+      `uvm_error("CEQ_CLEANUP", $sformatf("CEQ delivered %p (c2 %0d, A CQ %0d)", cqns, c2.cqn,
+                                          a.cq.cqn))
   endtask
 endclass

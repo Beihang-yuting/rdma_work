@@ -101,6 +101,63 @@ class rdma_drv_eq extends uvm_object;
     tail = 0;
     polarity = 1'b1;
   endfunction
+
+  // 功能：xtrdma_sc_ceq_ack：敲 CEQ doorbell 报告 CI（CI_WRAP|CI|CEQN）。
+  // 输入/输出及副作用：MMIO 写。
+  // 失败/边界：写失败经 status 返回。
+  task ack(rdma_drv_hw hw, output rdma_status status);
+    bit [63:0] db;
+
+    db = '0;
+    db[RDMA_NOTIFY_CEQ_CI_WRAP_LSB] = (tail / entries) & 1;
+    db[RDMA_NOTIFY_CEQ_CI_LSB +: RDMA_NOTIFY_CEQ_CI_WIDTH] = tail % entries;
+    db[RDMA_NOTIFY_CEQ_CEQN_LSB +: RDMA_NOTIFY_CEQ_CEQN_WIDTH] = eqn;
+    hw.notify(RDMA_DB_CEQ_OFFSET, db, status);
+  endtask
+
+  // 功能：xtrdma_sc_cleanup_ceqes：从 tail 起找到最后一个有效 CEQE，倒序遍历：CQN 匹配的丢弃，其余
+  //   向后平移已丢弃数（跨圈时翻转 bit63）；tail 前移丢弃数，polarity 按新 tail 重算并 ack。
+  // 输入/输出及副作用：改写 CEQ 缓冲、CI 状态并敲 doorbell。
+  // 失败/边界：读写失败返回错误。
+  task cleanup(rdma_drv_hw hw, int unsigned cqn, output rdma_status status);
+    rdma_bytes_t ceqe;
+    longint unsigned prod;
+    int unsigned removed;
+
+    status = rdma_status::success();
+    prod = tail;
+    forever begin
+      status = mem_kbuf.read(hw, (prod % entries) * RDMA_CEQE_BYTES, RDMA_CEQE_BYTES, ceqe);
+      if (!status.ok())
+        return;
+      if (ceqe[0][7] != !((prod / entries) & 1) || prod > tail + entries)
+        break;
+      prod++;
+    end
+    removed = 0;
+    while (prod > tail) begin
+      prod--;
+      status = mem_kbuf.read(hw, (prod % entries) * RDMA_CEQE_BYTES, RDMA_CEQE_BYTES, ceqe);
+      if (!status.ok())
+        return;
+      if (rdma_be::field(ceqe, RDMA_CEQE_CQN_WORD_BYTE_OFFSET, RDMA_CEQE_CQN_LSB,
+                         RDMA_CEQE_CQN_WIDTH) == cqn) begin
+        removed++;
+      end
+      else if (removed != 0) begin
+        if (((prod + removed) / entries) % 2 != (prod / entries) % 2)
+          ceqe[0][7] = !ceqe[0][7];
+        status = mem_kbuf.write(hw, ((prod + removed) % entries) * RDMA_CEQE_BYTES, ceqe);
+        if (!status.ok())
+          return;
+      end
+    end
+    if (removed == 0)
+      return;
+    tail += removed;
+    polarity = !((tail / entries) & 1);
+    ack(hw, status);
+  endtask
 endclass
 
 class rdma_drv_dev extends uvm_object;
