@@ -116,7 +116,9 @@ package rdma_codec_pkg;
   `include "rdma/rdma_doorbell_codecs.sv"
   `include "rdma/rdma_qpc_codecs.sv"
   `include "rdma/rdma_context_body_codecs.sv"
+  `include "rdma/rdma_cmq_request_fields.svh"
   `include "rdma/rdma_cmq_codecs.sv"
+  `include "rdma/rdma_cmq_field_codec.sv"
   `include "rdma/rdma_error_codec.sv"
   `include "rdma/rdma_cmq_hw_profile.sv"
 endpackage

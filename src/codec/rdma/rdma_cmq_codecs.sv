@@ -64,6 +64,9 @@ function automatic bit rdma_cmq_is_context_opcode(input bit [7:0] opcode);
   return key.image_kind != RDMA_IMAGE_NONE;
 endfunction
 
+// 表驱动的通用字段 codec 定义在 rdma_cmq_field_codec.sv（本文件之后 include）。
+typedef class rdma_hw_cmq_field_codec;
+
 class rdma_hw_cmq_envelope extends uvm_object;
   `rdma_object_utils(rdma_hw_cmq_envelope)
 
@@ -204,6 +207,10 @@ class rdma_hw_cmq_completion_codec extends uvm_object;
   // 输入/输出及副作用：opcode 为输入；只读固定支持集合，返回 bit。
   // 失败/边界：未知 opcode 或仅有 request body 而无 CQE payload 定义的命令返回 0。
   local function bit supported_opcode(bit [7:0] opcode);
+    rdma_cmq_field_spec_t specs[$];
+
+    if (rdma_cmq_request_field_specs(opcode, specs))
+      return 1'b1;
     return opcode inside {
       RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
       RDMA_OP_QPC_DELETE, RDMA_OP_QPC_QUERY,
@@ -1773,6 +1780,7 @@ class rdma_hw_cmq_light_body_codec extends uvm_object;
   `rdma_object_utils(rdma_hw_cmq_light_body_codec)
 
   protected rdma_hw_cmq_light_layout_codec codecs[256];
+  protected rdma_hw_cmq_field_codec field_codec;
 
   // 功能：构造 light body codec，并登记各 opcode 对应的 layout codec。
   // 输入/输出及副作用：name 为 UVM 实例名；创建 QPC/MR/OCC/object-ID/CQC_DELETE/空 body 的 codec 并填入 codecs 表。
@@ -1786,6 +1794,7 @@ class rdma_hw_cmq_light_body_codec extends uvm_object;
     rdma_hw_cmq_empty_layout_codec empty_codec;
     super.new(name);
     foreach (codecs[i]) codecs[i] = null;
+    field_codec = new("cmq_field_codec");
     qpc_codec = new("cmq_qpc_layout");
     codecs[RDMA_OP_QPC_CREATE] = qpc_codec;
     codecs[RDMA_OP_QPC_MODIFY] = qpc_codec;
@@ -1839,6 +1848,8 @@ class rdma_hw_cmq_light_body_codec extends uvm_object;
     output rdma_hw_image image
   );
     image = null;
+    if (codecs[opcode] == null && field_codec.supports(opcode))
+      return field_codec.encode(opcode, model, image);
     if (codecs[opcode] == null)
       return rdma_status::make(
         RDMA_SC_UNSUPPORTED_OPCODE,
@@ -2089,6 +2100,10 @@ class rdma_cmq_codec_registry extends uvm_object;
   // 输入/输出及副作用：opcode 为输入；只读固定登记集合，返回 bit。
   // 失败/边界：仅 context/light codec 已登记的命令返回 1；只有 request mask 或 completion decoder 的返回 0。
   static function bit has_request_encoder(bit [7:0] opcode);
+    rdma_cmq_field_spec_t specs[$];
+
+    if (rdma_cmq_request_field_specs(opcode, specs))
+      return 1'b1;
     return opcode inside {
       RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
       RDMA_OP_QPC_DELETE, RDMA_OP_QPC_QUERY,
@@ -2631,6 +2646,7 @@ function automatic rdma_status rdma_register_cmq_request_bodies(
   rdma_hw_cmq_body_registry registry
 );
   bit [63:0] masks[8];
+  rdma_cmq_field_spec_t specs[$];
   rdma_status status;
 
   if (registry == null)
@@ -2683,6 +2699,14 @@ function automatic rdma_status rdma_register_cmq_request_bodies(
   `CMQ_REGISTER_BODY(RDMA_OP_SRFQC_QUERY, RDMA_IMAGE_CMQ_SQE,
                      RDMA_SRQ_OBJECT_ID_BODY_OWNERSHIP)
 `undef CMQ_REGISTER_BODY
+  // 表驱动 opcode 的所有权直接取 opcode descriptor 的请求掩码。
+  for (int unsigned op = 0; op <= RDMA_OP_OCC_PD_KICKOUT; op++) begin
+    if (!rdma_cmq_request_field_specs(op[7:0], specs))
+      continue;
+    foreach (masks[q]) masks[q] = rdma_cmq_codec_registry::request_mask(op[7:0], q);
+    status = registry.register_body(op[7:0], RDMA_IMAGE_CMQ_SQE, masks);
+    if (!status.ok()) return status;
+  end
   return rdma_status::success();
 endfunction
 
@@ -3260,6 +3284,15 @@ class rdma_hw_cmq_request_composer extends uvm_object;
       foreach (qpc_signature_source.bytes[i])
         signature ^= qpc_signature_source.bytes[i];
       candidate.bytes[signature_byte] = ~signature;
+    end
+    merged_word = image_word(candidate, 1);
+    if (envelope_snapshot.opcode == RDMA_OP_SD_UPDATE &&
+        merged_word[RDMA_CMQ_SIGN_EN_LSB]) begin
+      // 驱动 update_sd 的签名覆盖整条 WQE；field codec 已给出不含信封的部分签名。
+      signature_byte = RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET +
+                       (7 - (RDMA_CMQ_SIGNATURE_LSB >> 3));
+      foreach (envelope_image.bytes[i])
+        candidate.bytes[signature_byte] ^= envelope_image.bytes[i];
     end
 
     for (int unsigned q = 0; q < 8; q++) begin

@@ -8,5 +8,6 @@ rdma_doorbell_scheduler_test
 rdma_queue_data_engine_post_test
 rdma_cmq_engine_test
 rdma_cmq_port_test
+rdma_cmq_request_golden_test
 rdma_control_plane_cmq_engine_test
 rdma_cmq_driver_field_mutation_test

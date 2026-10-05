@@ -2386,15 +2386,16 @@ class rdma_cmq_codec_test extends uvm_test;
     envelope = make_envelope(RDMA_OP_QP_FLUSH);
     expect_compose_failure("QP_FLUSH_UNREGISTERED", composer, envelope,
                            empty_body, null, RDMA_SC_UNSUPPORTED_OPCODE);
+    // 驱动不为 *_MODIFY 填充 body：这些 opcode 已登记为仅信封，但不接受其它 opcode 铸造的 body。
     envelope = make_envelope(8'h11);
-    expect_compose_failure("CEQC_MODIFY_UNREGISTERED", composer, envelope,
-                           empty_body, null, RDMA_SC_UNSUPPORTED_OPCODE);
+    expect_compose_failure("CEQC_MODIFY_FOREIGN_BODY", composer, envelope,
+                           empty_body, null, RDMA_SC_CODEC_ERROR);
     envelope = make_envelope(8'h15);
-    expect_compose_failure("AEQC_MODIFY_UNREGISTERED", composer, envelope,
-                           empty_body, null, RDMA_SC_UNSUPPORTED_OPCODE);
+    expect_compose_failure("AEQC_MODIFY_FOREIGN_BODY", composer, envelope,
+                           empty_body, null, RDMA_SC_CODEC_ERROR);
     envelope = make_envelope(8'h36);
-    expect_compose_failure("SRFQC_MODIFY_UNREGISTERED", composer, envelope,
-                           empty_body, null, RDMA_SC_UNSUPPORTED_OPCODE);
+    expect_compose_failure("SRFQC_MODIFY_FOREIGN_BODY", composer, envelope,
+                           empty_body, null, RDMA_SC_CODEC_ERROR);
 
     bad_envelope_codec = new("bad_envelope_codec");
     bad_envelope_composer = new("bad_envelope_composer", ownership,
@@ -2565,7 +2566,8 @@ class rdma_cmq_codec_test extends uvm_test;
       8'h40, 8'h41, 8'h42, 8'h43, 8'h44, 8'h46,
       8'h47, 8'h48
     };
-    bit [7:0] request_opcodes[] = '{
+    // 专用编码器的 21 个 opcode；其余驱动 opcode 由表驱动字段 codec 覆盖，合计 70 个。
+    bit [7:0] dedicated_opcodes[] = '{
       RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY,
       RDMA_OP_QPC_DELETE, RDMA_OP_QPC_QUERY,
       RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER,
@@ -2578,10 +2580,20 @@ class rdma_cmq_codec_test extends uvm_test;
       RDMA_OP_SRFQC_CREATE, RDMA_OP_SRFQC_DELETE,
       RDMA_OP_SRFQC_QUERY
     };
+    bit [7:0] request_opcodes[$];
+    rdma_cmq_field_spec_t field_specs[$];
     rdma_cmq_opcode_descriptor descriptor;
     rdma_status status;
     bit [7:0] listed_request_opcodes[$];
 
+    for (int unsigned op = 0; op <= RDMA_OP_OCC_PD_KICKOUT; op++)
+      if (op[7:0] inside {dedicated_opcodes} ||
+          rdma_cmq_request_field_specs(op[7:0], field_specs))
+        request_opcodes.push_back(op[7:0]);
+    if (request_opcodes.size() != 70)
+      `uvm_error("CMQ_REQUEST_CAPABILITY",
+                 $sformatf("driver dispatches 70 opcodes, model covers %0d",
+                           request_opcodes.size()))
     rdma_cmq_codec_registry::list_request_supported(listed_request_opcodes);
     if (listed_request_opcodes.size() != request_opcodes.size())
       `uvm_error("CMQ_REQUEST_CAPABILITY",
@@ -2640,15 +2652,15 @@ class rdma_cmq_codec_test extends uvm_test;
       `uvm_error("CMQ_GENERATIONLESS_REGISTRY",
                  "TQ_FLUSH must be generationless in the opcode registry")
 
-    status = rdma_cmq_codec_registry::lookup(RDMA_OP_IFA_UPDATE,
+    status = rdma_cmq_codec_registry::lookup(RDMA_OP_OCC_PD_SEARCH,
                                              descriptor);
-    expect_ok("CMQ_IFA_UPDATE_RESPONSE_ONLY", status);
+    expect_ok("CMQ_OCC_PD_SEARCH_RESPONSE_ONLY", status);
     if (descriptor != null && descriptor.request_allowed)
       `uvm_error("CMQ_REQUEST_CAPABILITY",
-                 "IFA_UPDATE has no body encoder but is request-supported")
-    if (rdma_cmq_codec_registry::is_request_supported(RDMA_OP_IFA_UPDATE))
+                 "OCC_PD_SEARCH has no body encoder but is request-supported")
+    if (rdma_cmq_codec_registry::is_request_supported(RDMA_OP_OCC_PD_SEARCH))
       `uvm_error("CMQ_REQUEST_CAPABILITY",
-                 "IFA_UPDATE incorrectly appears in request capability")
+                 "OCC_PD_SEARCH incorrectly appears in request capability")
 
     begin
       rdma_hw_image unsupported_body;
@@ -2656,13 +2668,14 @@ class rdma_cmq_codec_test extends uvm_test;
       rdma_hw_image forged_result;
       rdma_hw_cmq_envelope response_only_envelope;
       unsupported_body = null;
-      status = composer.build_body(RDMA_OP_IFA_UPDATE, null,
+      status = composer.build_body(RDMA_OP_OCC_PD_SEARCH, null,
                                    unsupported_body);
-      expect_status("CMQ_IFA_UPDATE_BUILD_REJECTED", status,
+      expect_status("CMQ_OCC_PD_SEARCH_BUILD_REJECTED", status,
                     RDMA_SC_UNSUPPORTED_OPCODE);
       if (status != null &&
           status.message !=
-            "CMQ request opcode 0x39 has no body encoder")
+            $sformatf("CMQ request opcode 0x%02x has no body encoder",
+                      RDMA_OP_OCC_PD_SEARCH))
         `uvm_error("CMQ_REQUEST_CAPABILITY",
                    {"unexpected response-only rejection: ",
                     status.message})
@@ -2673,7 +2686,7 @@ class rdma_cmq_codec_test extends uvm_test;
       forged_body = null;
       status = composer.build_body(RDMA_OP_TQ_FLUSH, null, forged_body);
       expect_ok("CMQ_FORGED_RESPONSE_ONLY_BODY", status);
-      response_only_envelope = make_envelope(RDMA_OP_IFA_UPDATE);
+      response_only_envelope = make_envelope(RDMA_OP_OCC_PD_SEARCH);
       forged_result = null;
       status = composer.compose_request(response_only_envelope, forged_body,
                                         null, forged_result);

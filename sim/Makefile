@@ -83,7 +83,7 @@ cmq_gate:
 	manifest=cmq_gate.list; \
 	[[ -r "$$manifest" ]] || { echo "CMQ gate manifest is missing" >&2; exit 2; }; \
 	mapfile -t cmq_tests < <(sed -e 's/[[:space:]]*#.*$$//' -e '/^[[:space:]]*$$/d' "$$manifest"); \
-	(( $${#cmq_tests[@]} == 11 )) || { echo "CMQ gate requires exactly eleven tests" >&2; exit 2; }; \
+	(( $${#cmq_tests[@]} == 12 )) || { echo "CMQ gate requires exactly twelve tests" >&2; exit 2; }; \
 	declare -A seen=(); \
 	for test_name in "$${cmq_tests[@]}"; do \
 		[[ "$$test_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]] || { echo "invalid CMQ test name" >&2; exit 2; }; \
@@ -157,7 +157,12 @@ rdma_defs:
 		--capabilities ../hw/rdma/cmq_capabilities.tsv \
 		--oracle-root ../hw/rdma/c_oracle/cases \
 		--mutation-manifest ../hw/rdma/cmq_field_mutation.tsv \
-		--sv-root ../src
+		--sv-root ../src; \
+	python3 ../tools/gen_cmq_request_fields.py --driver-root "$$kernel_root" --check \
+		--tsv ../hw/rdma/cmq_request_fields.tsv \
+		--svh ../src/codec/rdma/rdma_cmq_request_fields.svh; \
+	python3 ../tools/cmq_request_oracle.py --driver-root "$$kernel_root" --check \
+		--golden ../hw/rdma/golden_vectors/cmq_requests.hex --cc /usr/bin/gcc
 
 host_mem_preflight:
 	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \

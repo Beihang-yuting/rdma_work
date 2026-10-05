@@ -693,15 +693,15 @@ class rdma_cmq_profile_test extends uvm_test;
 
     // 已在 driver 中定义但尚无精确 body codec 的命令，必须在 compose
     //   阶段返回 UNSUPPORTED_OPCODE，禁止生成全零假 body。
-    command.opcode_key.opcode = RDMA_OP_CEQC_MODIFY;
-    command.opcode_key.variant = "modify";
+    command.opcode_key.opcode = RDMA_OP_OCC_PD_SEARCH;
+    command.opcode_key.variant = "search";
     sqe = null;
     expected = null;
     status = profile.compose_sqe(command, slot, sqe, expected);
-    expect_status("COMPOSE_UNIMPLEMENTED_034_OPCODE", status,
+    expect_status("COMPOSE_UNDISPATCHED_OPCODE", status,
                   RDMA_SC_UNSUPPORTED_OPCODE);
     if (sqe != null || expected != null)
-      `uvm_error("COMPOSE_UNIMPLEMENTED_034_OPCODE",
+      `uvm_error("COMPOSE_UNDISPATCHED_OPCODE",
                  "unsupported body codec published an image")
     command.opcode_key.opcode = RDMA_OP_CQC_DELETE;
     command.opcode_key.variant = "delete";
