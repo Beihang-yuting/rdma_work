@@ -142,8 +142,10 @@ class rdma_drv_cmq_test extends uvm_test;
                        qpc_buf.iova >> RDMA_CMQ_QPC_BUFFER_ADDR_LSB);
     cmq.exec_signed(sqe, 1'b1, qpc, cqe, status);
     expect_ok("QPC_CREATE", status);
-    if (!dev.cmq.lookup(RDMA_DEV_QP, 3, obj) || obj.bytes != qpc)
-      `uvm_error("QPC_CREATE", "device did not store the signed QPC")
+    if (!dev.cmq.lookup(RDMA_DEV_QP, 3, obj))
+      `uvm_fatal("QPC_CREATE", "device did not store the signed QPC")
+    if (obj.bytes != qpc)
+      `uvm_error("QPC_CREATE", "device QPC differs from the signed buffer")
     expect_ok("free QPC buffer", hw.free_dma(qpc_buf));
   endtask
 endclass

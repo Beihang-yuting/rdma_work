@@ -123,6 +123,9 @@ class rdma_drv_dev extends uvm_object;
   rdma_drv_bitmap cq_ids;
   rdma_drv_bitmap mr_ids;
   rdma_drv_bitmap pd_ids;
+  rdma_drv_bitmap srq_ids;
+  // rf->qp_sn[qpn]：每次分配该 QPN 时后增（u8）。
+  bit [7:0] qp_sn[int unsigned];
   rdma_drv_eq ceqs[$];
   rdma_drv_eq aeq;
   bit probed;
@@ -195,7 +198,8 @@ class rdma_drv_dev extends uvm_object;
       status = one;
   endfunction
 
-  // 功能：xtrdma_initialize_hw_rsrc：QP/CQ/MR/PD 位图，QPN 0/1 预留给 SMI/GSI。
+  // 功能：xtrdma_initialize_hw_rsrc：QP/CQ/MR/PD 位图，QPN 0/1 预留给 SMI/GSI；SRQN（驱动由 GRM
+  //   分配）用本地位图代替。
   // 输入/输出及副作用：重建位图。
   // 失败/边界：无。
   protected function void init_bitmaps();
@@ -203,12 +207,14 @@ class rdma_drv_dev extends uvm_object;
     cq_ids = rdma_drv_bitmap::type_id::create("cq_ids");
     mr_ids = rdma_drv_bitmap::type_id::create("mr_ids");
     pd_ids = rdma_drv_bitmap::type_id::create("pd_ids");
+    srq_ids = rdma_drv_bitmap::type_id::create("srq_ids");
     qp_ids.init(cfg.max_qp, cfg.first_qp);
     qp_ids.reserve(0);
     qp_ids.reserve(1);
     cq_ids.init(cfg.max_cq);
     mr_ids.init(cfg.max_mr);
     pd_ids.init(cfg.max_pd);
+    srq_ids.init(cfg.max_srq);
   endfunction
 
   // 功能：xtrdma_hmc_setup：计算各类对象区（QPC、CQC、MRT、PBL 依次排列，各自按 SD 对齐），

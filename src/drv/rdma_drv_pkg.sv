@@ -20,4 +20,6 @@ package rdma_drv_pkg;
   `include "rdma_drv_cmq.sv"
   `include "rdma_drv_mem.sv"
   `include "rdma_drv_dev.sv"
+  `include "rdma_drv_verbs.sv"
+  `include "rdma_drv_qp.sv"
 endpackage
