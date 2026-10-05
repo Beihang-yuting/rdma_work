@@ -2036,6 +2036,46 @@ class rdma_resource_manager extends uvm_object;
     candidate.clear();
   endfunction
 
+  // 功能：为新预留的资源候选填入 identity 的 handle/owner，并置为 ALLOCATED。
+  // 输入/输出及副作用：只写 authoritative 的三个基础字段；identity 只读。
+  // 失败/边界：调用方保证两者非空；不发布、不改账本。
+  protected function void init_candidate(
+    rdma_resource_identity_candidate identity,
+    rdma_resource authoritative
+  );
+    authoritative.handle = identity.handle;
+    authoritative.owner = identity.owner;
+    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+  endfunction
+
+  // 功能：把依赖句柄复制进候选资源的类型化字段，并另复制一份追加到 dependencies。
+  // 输入/输出及副作用：typed_h 输出类型化副本；成功时 authoritative.dependencies 追加一项。
+  // 失败/边界：任一投影失败时回滚 identity 预留并返回该失败状态。
+  protected function rdma_status attach_dependency(
+    rdma_resource_identity_candidate identity,
+    rdma_resource authoritative,
+    rdma_handle dependency_h,
+    string label,
+    output rdma_handle typed_h
+  );
+    rdma_status status;
+    rdma_handle dependency_copy;
+
+    status = rdma_resource_projector::project_handle_value(
+      dependency_h, label, typed_h
+    );
+    if (status.ok())
+      status = rdma_resource_projector::project_handle_value(
+        dependency_h, {label, " dependency"}, dependency_copy
+      );
+    if (!status.ok()) begin
+      rollback_identity_candidate(identity);
+      return status;
+    end
+    authoritative.dependencies.push_back(dependency_copy);
+    return status;
+  endfunction
+
   // 功能：publish_identity_candidate 统一普通资源 create_* 的 detached candidate
   //   发布阶段：校验 identity 与 authoritative 形状，登记 registry/代际快照，并在
   //   register_resource 失败时撤销尚未发布的 allocator reservation。
@@ -2926,9 +2966,7 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("pd");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_pd_id = identity.local_id;
     authoritative.global_pd_id = identity.handle.object_id;
     status = publish_identity_candidate(identity, authoritative,
@@ -2952,11 +2990,10 @@ class rdma_resource_manager extends uvm_object;
     output rdma_mr mr
   );
     rdma_status status;
+    rdma_function_handle owner;
     rdma_resource_identity_candidate identity;
     rdma_mr authoritative;
     rdma_resource published;
-    rdma_handle dependency_copy;
-    rdma_function_handle owner;
 
     mr = null;
     status = active_binding_status(binding, owner);
@@ -2969,23 +3006,17 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("mr");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_mr_id = identity.local_id;
     authoritative.global_mr_id = identity.handle.object_id;
     // reservation 已拥有 local index，但尚未申请 hardware key byte。先保留 index、
     // 将低 8 位 key 置零，使未 staged 的非零 ID MR 也能发布本地 ERROR cleanup。
     // 该值不是可用 MPT key：ALLOCATED/ERROR 均不能承载数据面访问，stage 仍须提供正式 key。
     authoritative.lkey = {identity.local_id[23:0], 8'h00};
-    status = rdma_resource_projector::project_handle_value(pd_h, "MR PD", authoritative.pd_h);
-    if (status.ok())
-      status = rdma_resource_projector::project_handle_value(pd_h, "MR dependency", dependency_copy);
-    if (!status.ok()) begin
-      rollback_identity_candidate(identity);
+    status = attach_dependency(identity, authoritative, pd_h, "MR PD",
+                               authoritative.pd_h);
+    if (!status.ok())
       return status;
-    end
-    authoritative.dependencies.push_back(dependency_copy);
     status = publish_identity_candidate(identity, authoritative,
                                         "create MR", published);
     if (!status.ok())
@@ -3008,7 +3039,6 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource_identity_candidate identity;
     rdma_cq authoritative;
     rdma_resource published;
-    rdma_handle dependency_copy;
 
     cq = null;
     status = active_binding_status(binding, owner);
@@ -3021,21 +3051,14 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("cq");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_cq_id = identity.local_id;
     authoritative.global_cq_id = identity.handle.object_id;
     if (ceq_h != null) begin
-      status = rdma_resource_projector::project_handle_value(ceq_h, "CQ CEQ", authoritative.ceq_h);
-      if (status.ok())
-        status = rdma_resource_projector::project_handle_value(ceq_h, "CQ dependency",
-                                   dependency_copy);
-      if (!status.ok()) begin
-        rollback_identity_candidate(identity);
+      status = attach_dependency(identity, authoritative, ceq_h, "CQ CEQ",
+                                 authoritative.ceq_h);
+      if (!status.ok())
         return status;
-      end
-      authoritative.dependencies.push_back(dependency_copy);
     end
     status = publish_identity_candidate(identity, authoritative,
                                         "create CQ", published);
@@ -3063,7 +3086,6 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource_identity_candidate identity;
     rdma_qp authoritative;
     rdma_resource published;
-    rdma_handle dependency_copy;
     string sequence_key;
 
     qp = null;
@@ -3086,47 +3108,22 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("qp");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_qp_id = identity.local_id;
     authoritative.global_qp_id = identity.handle.object_id;
-    status = rdma_resource_projector::project_handle_value(pd_h, "QP PD", authoritative.pd_h);
+    status = attach_dependency(identity, authoritative, pd_h, "QP PD",
+                               authoritative.pd_h);
     if (status.ok())
-      status = rdma_resource_projector::project_handle_value(send_cq_h, "QP send CQ",
-                                 authoritative.send_cq_h);
+      status = attach_dependency(identity, authoritative, send_cq_h,
+                                 "QP send CQ", authoritative.send_cq_h);
     if (status.ok())
-      status = rdma_resource_projector::project_handle_value(recv_cq_h, "QP receive CQ",
-                                 authoritative.recv_cq_h);
-    if (status.ok())
-      status = rdma_resource_projector::project_handle_value(pd_h, "QP PD dependency", dependency_copy);
-    if (status.ok()) begin
-      authoritative.dependencies.push_back(dependency_copy);
-      status = rdma_resource_projector::project_handle_value(send_cq_h, "QP send CQ dependency",
-                                 dependency_copy);
-    end
-    if (status.ok()) begin
-      authoritative.dependencies.push_back(dependency_copy);
-      status = rdma_resource_projector::project_handle_value(recv_cq_h, "QP receive CQ dependency",
-                                 dependency_copy);
-    end
-    if (status.ok())
-      authoritative.dependencies.push_back(dependency_copy);
-    if (!status.ok()) begin
-      rollback_identity_candidate(identity);
+      status = attach_dependency(identity, authoritative, recv_cq_h,
+                                 "QP receive CQ", authoritative.recv_cq_h);
+    if (status.ok() && srq_h != null)
+      status = attach_dependency(identity, authoritative, srq_h, "QP SRQ",
+                                 authoritative.srq_h);
+    if (!status.ok())
       return status;
-    end
-    if (srq_h != null) begin
-      status = rdma_resource_projector::project_handle_value(srq_h, "QP SRQ", authoritative.srq_h);
-      if (status.ok())
-        status = rdma_resource_projector::project_handle_value(srq_h, "QP SRQ dependency",
-                                   dependency_copy);
-      if (!status.ok()) begin
-        rollback_identity_candidate(identity);
-        return status;
-      end
-      authoritative.dependencies.push_back(dependency_copy);
-    end
     status = publish_identity_candidate(identity, authoritative,
                                         "create QP", published);
     if (!status.ok())
@@ -3187,7 +3184,6 @@ class rdma_resource_manager extends uvm_object;
     rdma_resource_identity_candidate identity;
     rdma_srq authoritative;
     rdma_resource published;
-    rdma_handle dependency_copy;
 
     srq = null;
     status = active_binding_status(binding, owner);
@@ -3200,19 +3196,13 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("srq");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_srq_id = identity.local_id;
     authoritative.global_srq_id = identity.handle.object_id;
-    status = rdma_resource_projector::project_handle_value(pd_h, "SRQ PD", authoritative.pd_h);
-    if (status.ok())
-      status = rdma_resource_projector::project_handle_value(pd_h, "SRQ dependency", dependency_copy);
-    if (!status.ok()) begin
-      rollback_identity_candidate(identity);
+    status = attach_dependency(identity, authoritative, pd_h, "SRQ PD",
+                               authoritative.pd_h);
+    if (!status.ok())
       return status;
-    end
-    authoritative.dependencies.push_back(dependency_copy);
     status = publish_identity_candidate(identity, authoritative,
                                         "create SRQ", published);
     if (!status.ok())
@@ -3239,9 +3229,7 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("cmq");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_cmq_id = identity.local_id;
     authoritative.global_cmq_id = identity.handle.object_id;
     status = publish_identity_candidate(identity, authoritative,
@@ -3270,9 +3258,7 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("ceq");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_ceq_id = identity.local_id;
     authoritative.global_ceq_id = identity.handle.object_id;
     status = publish_identity_candidate(identity, authoritative,
@@ -3301,9 +3287,7 @@ class rdma_resource_manager extends uvm_object;
     if (!status.ok())
       return status;
     authoritative = new("aeq");
-    authoritative.handle = identity.handle;
-    authoritative.owner = identity.owner;
-    authoritative.state = RDMA_RESOURCE_ALLOCATED;
+    init_candidate(identity, authoritative);
     authoritative.local_aeq_id = identity.local_id;
     authoritative.global_aeq_id = identity.handle.object_id;
     status = publish_identity_candidate(identity, authoritative,

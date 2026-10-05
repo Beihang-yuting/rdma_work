@@ -735,24 +735,6 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：request_status 校验 request、owner 与当前对象状态的一致性，并显式处理“create PD request is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
-  // 输入/输出及副作用：request（输入）、owner（输入）；request_status 读取 request、owner 并使用字段 status；函数返回 rdma_status，不取得调用方资源所有权。
-  // 失败/边界：request_status 返回 RDMA_SC_INVALID_ARGUMENT、RDMA_SC_INVALID_STATE；典型拒绝条件为“create PD request is null”“create PD request validation returned null”；失败路径不提交部分状态或转移未声明资源。
-  protected function rdma_status request_status(
-    rdma_create_pd_req request,
-    rdma_function_handle owner
-  );
-    rdma_status status;
-
-    if (request == null)
-      return invalid_argument("create PD request is null");
-    status = request.validate();
-    if (status == null)
-      return invalid_state("create PD request validation returned null");
-    if (!status.ok())
-      return rdma_cmq_clone_status_value(status);
-    return same_owner_status(request.owner, owner, "create PD request");
-  endfunction
 
   // 功能：register_mr_request_status 校验 request、owner 与当前对象状态的一致性，并显式处理“register MR request is null”等拒绝条件，返回 rdma_status 供上层决定是否提交。
   // 输入/输出及副作用：request（输入）、owner（输入）；register_mr_request_status 可能更新本对象明确拥有的状态；函数返回 rdma_status，不取得调用方资源所有权。
@@ -1305,6 +1287,85 @@ class rdma_control_plane extends uvm_object;
     return rdma_status::success();
   endfunction
 
+  // 功能：校验请求合法且属于 owner；target 非 NONE 时再从请求中重新读取目标句柄，
+  //   校验其 Function/generation 归属，destroy 目标还须为 expected_kind 类型。
+  // 输入/输出及副作用：只读 request/owner，每次调用都重新读取请求字段（锁后复验依赖此点）；
+  //   label 作为诊断前缀；返回非 null 的独立 status。
+  // 失败/边界：请求/目标类型不符返回 INVALID_ARGUMENT，归属不符返回 INVALID_ARGUMENT
+  //   或 STALE_GENERATION，子校验返回 null 时为 INVALID_STATE。
+  protected function rdma_status request_target_status(
+    rdma_semantic_request request,
+    rdma_control_target_e target,
+    rdma_resource_kind_e expected_kind,
+    rdma_function_handle owner,
+    string label
+  );
+    rdma_destroy_resource_req destroy_request;
+    rdma_modify_qp_req modify_request;
+    rdma_handle target_h;
+    rdma_status status;
+
+    status = checked_status(queue_request_status(request, owner, label),
+                            {label, " request returned null"});
+    if (!status.ok() || target == RDMA_CTRL_TARGET_NONE)
+      return status;
+    if (target == RDMA_CTRL_TARGET_DESTROY && $cast(destroy_request, request))
+      target_h = destroy_request.target_h;
+    else if (target == RDMA_CTRL_TARGET_MODIFY_QP &&
+             $cast(modify_request, request))
+      target_h = modify_request.qp_h;
+    else
+      return invalid_argument({label, " request type is invalid"});
+    if (target == RDMA_CTRL_TARGET_DESTROY &&
+        (target_h == null || target_h.kind != expected_kind))
+      return invalid_argument({label, " target kind is invalid"});
+    return checked_status(
+      queue_target_owner_status(target_h, owner, {label, " target"}),
+      {label, " target returned null"}
+    );
+  endfunction
+
+  // 功能：控制面锁内操作的统一准入：锁前校验 binding 与请求/目标，获取 Function 锁，
+  //   再以锁内 binding 重新校验身份并重新读取请求/目标完成复验。
+  // 输入/输出及副作用：owner 输出锁前 binding 推导的 Function 句柄；function_lock 输出
+  //   已取得的锁（未取得时为 null），由调用方在退出前释放；status 输出非 null 结果。
+  // 失败/边界：任一校验失败立即返回该状态；锁内 binding 漂移为非同一 Function/generation
+  //   时返回 INVALID_ARGUMENT/STALE_GENERATION，调用方不得继续执行副作用。
+  protected task admit_locked_request(
+    rdma_function_binding binding,
+    rdma_semantic_request request,
+    rdma_control_target_e target,
+    rdma_resource_kind_e expected_kind,
+    string label,
+    output rdma_function_handle owner,
+    output semaphore function_lock,
+    output rdma_status status
+  );
+    rdma_function_handle locked_owner;
+
+    function_lock = null;
+    status = checked_status(binding_owner_status(binding, owner),
+                            {label, " Function binding returned null"});
+    if (!status.ok())
+      return;
+    status = request_target_status(request, target, expected_kind, owner, label);
+    if (!status.ok())
+      return;
+    acquire_function_lock(owner, function_lock);
+    status = checked_status(binding_owner_status(binding, locked_owner),
+                            {"post-lock ", label, " Function returned null"});
+    if (!status.ok())
+      return;
+    status = checked_status(
+      same_owner_status(locked_owner, owner, {"post-lock ", label, " Function"}),
+      {"post-lock ", label, " identity returned null"}
+    );
+    if (!status.ok())
+      return;
+    status = request_target_status(request, target, expected_kind,
+                                   locked_owner, {"post-lock ", label});
+  endtask
+
   // 功能：create_queue_facade 创建独立的 无直接返回值；根据 binding、request、requires_context、expected_kind、queue、result 设置字段 queue、result、function_lock、result.transaction_id、status，返回对象仅由调用方持有，不转移外部资源所有权。
   // 输入/输出及副作用：binding（输入）、request（输入）、requires_context（输入）、expected_kind（输入）、queue（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或
   //   output 发布新句柄/映射。
@@ -1318,7 +1379,6 @@ class rdma_control_plane extends uvm_object;
     output rdma_control_result result
   );
     rdma_function_handle owner;
-    rdma_function_handle locked_owner;
     rdma_status status;
     semaphore function_lock;
     longint unsigned transaction_id;
@@ -1346,20 +1406,11 @@ class rdma_control_plane extends uvm_object;
         );
         break;
       end
-      status = binding_owner_status(binding, owner);
-      `RDMA_BREAK_IF_FAILED(status, "queue Function binding check returned null")
-      status = queue_request_status(request, owner, "queue create request");
-      `RDMA_BREAK_IF_FAILED(status, "queue create request check returned null")
-
-      acquire_function_lock(owner, function_lock);
-      status = binding_owner_status(binding, locked_owner);
-      `RDMA_BREAK_IF_FAILED(status, "post-lock queue Function check returned null")
-      status = same_owner_status(locked_owner, owner,
-                                 "post-lock queue Function");
-      `RDMA_BREAK_IF_FAILED(status, "post-lock queue Function identity returned null")
-      status = queue_request_status(request, locked_owner,
-                                    "post-lock queue create request");
-      `RDMA_BREAK_IF_FAILED(status, "post-lock queue request check returned null")
+      admit_locked_request(binding, request, RDMA_CTRL_TARGET_NONE,
+                           expected_kind, "queue create", owner,
+                           function_lock, status);
+      if (!status.ok())
+        break;
       queue_executor.create_locked(binding, owner, request, transaction_id,
                                    queue, result);
       if (result != null && result.ok() &&
@@ -1386,6 +1437,73 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
+  // 功能：queue（CQ/SRQ/CEQ/AEQ）与 QP destroy 共用的事务外壳：分配事务号、经
+  //   admit_locked_request 完成锁前/锁内准入，然后在 Function 锁内调用对应 executor。
+  // 输入/输出及副作用：expected_kind 为 destroy 目标类型，use_qp_executor 选择 QP executor；
+  //   result 输出事务结果；退出前释放 Function 锁。
+  // 失败/边界：准入失败或 executor 返回 null/改写事务号时以 INVALID_STATE 等发布结果；
+  //   executor 已调用后的失败由其自身 result 承载，外壳不覆盖。
+  protected task run_destroy_operation(
+    rdma_function_binding binding,
+    rdma_destroy_resource_req request,
+    rdma_resource_kind_e expected_kind,
+    bit use_qp_executor,
+    output rdma_control_result result
+  );
+    rdma_function_handle owner;
+    rdma_status status;
+    semaphore function_lock;
+    longint unsigned transaction_id;
+    string op;
+    bit executor_called;
+
+    op = use_qp_executor ? "QP destroy" : "queue destroy";
+    result = make_result();
+    function_lock = null;
+    executor_called = 1'b0;
+    reserve_transaction_id(transaction_id, status);
+    result.transaction_id = transaction_id;
+    do begin
+      `RDMA_BREAK_IF_FAILED(status, {op, " transaction ID returned null"})
+      status = configured_status();
+      `RDMA_BREAK_IF_FAILED(status, {op, " configuration check returned null"})
+      admit_locked_request(binding, request, RDMA_CTRL_TARGET_DESTROY,
+                           expected_kind, op, owner, function_lock, status);
+      if (!status.ok())
+        break;
+      executor_called = 1'b1;
+      if (use_qp_executor)
+        qp_executor.destroy_locked(binding, owner, request, transaction_id,
+                                   result);
+      else
+        queue_executor.destroy_locked(binding, owner, request,
+                                      transaction_id, result);
+      if (result == null)
+        status = invalid_state({op, " executor returned null result"});
+      else if (use_qp_executor && result.transaction_id != transaction_id) begin
+        status = invalid_state({op, " executor changed transaction ID"});
+        finish_result(result, status);
+      end
+      else
+        status = checked_status(result.status,
+                                {op, " executor result status is null"});
+      break;
+    end while (1'b0);
+    if (result == null) begin
+      result = make_result();
+      result.transaction_id = transaction_id;
+      if (status == null || status.ok())
+        status = invalid_state({op, " executor returned null result"});
+      executor_called = 1'b0;
+    end
+    // QP executor 自行发布最终结果；queue executor 的失败结果沿用原契约由外壳
+    //   以其 status 重新归一化 status/primary_status。
+    if (!status.ok() && (!executor_called || !use_qp_executor))
+      finish_result(result, status);
+    if (function_lock != null)
+      function_lock.put(1);
+  endtask
+
   // 功能：在 rdma_control_plane 中，destroy_queue_facade 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
   // 输入/输出及副作用：binding（输入）、request（输入）、expected_kind（输入）、result（输出）；输入 handle/mapping/token 指定释放目标；成功时更新账本和生命周期，外部资源只按
   //   adapter 契约释放。
@@ -1396,56 +1514,7 @@ class rdma_control_plane extends uvm_object;
     rdma_resource_kind_e expected_kind,
     output rdma_control_result result
   );
-    rdma_function_handle owner;
-    rdma_function_handle locked_owner;
-    rdma_status status;
-    semaphore function_lock;
-    longint unsigned transaction_id;
-
-    result = make_result();
-    function_lock = null;
-    reserve_transaction_id(transaction_id, status);
-    result.transaction_id = transaction_id;
-    do begin
-      `RDMA_BREAK_IF_FAILED(status, "queue destroy transaction ID returned null")
-      status = configured_status();
-      `RDMA_BREAK_IF_FAILED(status, "queue destroy configuration check returned null")
-      status = binding_owner_status(binding, owner);
-      `RDMA_BREAK_IF_FAILED(status, "queue destroy Function check returned null")
-      status = queue_request_status(request, owner, "queue destroy request");
-      `RDMA_BREAK_IF_FAILED(status, "queue destroy request check returned null")
-      if (request.target_h.kind != expected_kind) begin
-        status = invalid_argument("queue destroy target kind is invalid");
-        break;
-      end
-      status = queue_target_owner_status(request.target_h, owner,
-                                         "queue destroy target");
-      if (status == null || !status.ok()) break;
-
-      acquire_function_lock(owner, function_lock);
-      status = binding_owner_status(binding, locked_owner);
-      `RDMA_BREAK_IF_FAILED(status, "post-lock queue destroy Function returned null")
-      status = same_owner_status(locked_owner, owner,
-                                 "post-lock queue destroy Function");
-      if (status == null || !status.ok()) break;
-      if (request.target_h.kind != expected_kind) begin
-        status = invalid_argument("post-lock queue destroy target kind is invalid");
-        break;
-      end
-      status = queue_target_owner_status(request.target_h, locked_owner,
-                                         "post-lock queue destroy target");
-      if (status == null || !status.ok()) break;
-      queue_executor.destroy_locked(binding, owner, request,
-                                    transaction_id, result);
-      status = (result == null) ?
-        invalid_state("queue destroy executor returned null result") :
-        rdma_cmq_clone_status_value(result.status);
-      break;
-    end while (1'b0);
-    if (status == null || !status.ok())
-      finish_result(result, status);
-    if (function_lock != null)
-      function_lock.put(1);
+    run_destroy_operation(binding, request, expected_kind, 1'b0, result);
   endtask
 
   // 功能：create_cq 创建独立的 无直接返回值；根据 binding、request、cq、result 设置字段 cq，返回对象仅由调用方持有，不转移外部资源所有权。
@@ -1528,23 +1597,31 @@ class rdma_control_plane extends uvm_object;
     end
   endtask
 
-  // 功能：create_qp 创建独立的 无直接返回值；根据 binding、request、qp、result 设置字段 qp、result、function_lock、executor_called、result.transaction_id、status、qp_validation_status，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：binding（输入）、request（输入）、qp（输出）、result（输出）；输入请求/句柄定义资源属性；成功时更新账本并通过返回值或 output 发布新句柄/映射。
-  // 失败/边界：create_qp 失败或超时通过 qp、result 明确发布；该路径不隐式重试，也不转移未声明资源。
-  task create_qp(
+  // 功能：QP create/modify 共用的控制面事务外壳：分配事务号，锁前/锁后校验 binding、
+  //   请求与（modify 时）目标 QP 归属，在 Function 锁内调用 QP executor，并校验返回的
+  //   事务号与类型化 QP 投影（create 必须为 RESET 态）。
+  // 输入/输出及副作用：request 为 rdma_create_qp_req 或 rdma_modify_qp_req，is_modify
+  //   选择执行器入口；qp/result 为输出，失败时 qp 为 null；退出前释放 Function 锁。
+  // 失败/边界：未配置或缺少 host-memory/context-backing/QP executor 时 INVALID_STATE；
+  //   校验失败沿用子检查状态；executor 改写事务号或返回非法 QP 投影时 INVALID_STATE。
+  protected task run_qp_operation(
     rdma_function_binding binding,
-    rdma_create_qp_req request,
+    rdma_semantic_request request,
+    bit is_modify,
     output rdma_qp qp,
     output rdma_control_result result
   );
+    rdma_create_qp_req create_request;
+    rdma_modify_qp_req modify_request;
     rdma_function_handle owner;
-    rdma_function_handle locked_owner;
     rdma_status status;
     rdma_status qp_validation_status;
     semaphore function_lock;
     longint unsigned transaction_id;
+    string op;
     bit executor_called;
 
+    op = is_modify ? "QP modify" : "QP create";
     qp = null;
     result = make_result();
     function_lock = null;
@@ -1552,56 +1629,48 @@ class rdma_control_plane extends uvm_object;
     reserve_transaction_id(transaction_id, status);
     result.transaction_id = transaction_id;
     do begin
-      `RDMA_BREAK_IF_FAILED(status, "QP transaction ID allocation returned null")
+      `RDMA_BREAK_IF_FAILED(status, {op, " transaction ID allocation returned null"})
       status = configured_status();
-      `RDMA_BREAK_IF_FAILED(status, "QP control-plane configuration returned null")
-      if (host_mem == null || context_backing == null) begin
+      `RDMA_BREAK_IF_FAILED(status, {op, " control-plane configuration returned null"})
+      if (host_mem == null || context_backing == null || qp_executor == null) begin
         status = invalid_state(
-          "QP create requires host-memory and context-backing adapters"
+          {op, " requires host-memory, context-backing and QP executor"}
         );
         break;
       end
-      if (qp_executor == null) begin
-        status = invalid_state("QP lifecycle executor is unavailable");
+      admit_locked_request(binding, request,
+                           is_modify ? RDMA_CTRL_TARGET_MODIFY_QP :
+                                       RDMA_CTRL_TARGET_NONE,
+                           RDMA_RESOURCE_QP, op, owner, function_lock, status);
+      if (!status.ok())
         break;
-      end
-      status = binding_owner_status(binding, owner);
-      `RDMA_BREAK_IF_FAILED(status, "QP Function binding returned null")
-      status = queue_request_status(request, owner, "QP create request");
-      `RDMA_BREAK_IF_FAILED(status, "QP create request returned null")
-
-      acquire_function_lock(owner, function_lock);
-      status = binding_owner_status(binding, locked_owner);
-      `RDMA_BREAK_IF_FAILED(status, "post-lock QP Function returned null")
-      status = same_owner_status(locked_owner, owner,
-                                 "post-lock QP Function");
-      `RDMA_BREAK_IF_FAILED(status, "post-lock QP identity returned null")
-      status = queue_request_status(request, locked_owner,
-                                    "post-lock QP create request");
-      `RDMA_BREAK_IF_FAILED(status, "post-lock QP request returned null")
 
       executor_called = 1'b1;
-      qp_executor.create_locked(binding, owner, request, transaction_id,
-                                qp, result);
+      if (is_modify && $cast(modify_request, request))
+        qp_executor.modify_locked(binding, owner, modify_request,
+                                  transaction_id, qp, result);
+      else if (!is_modify && $cast(create_request, request))
+        qp_executor.create_locked(binding, owner, create_request,
+                                  transaction_id, qp, result);
       if (result == null) begin
-        status = invalid_state("QP executor returned a null result");
+        status = invalid_state({op, " executor returned a null result"});
         break;
       end
       if (result.transaction_id != transaction_id) begin
         qp = null;
-        status = invalid_state("QP executor changed the transaction ID");
+        status = invalid_state({op, " executor changed the transaction ID"});
         finish_result(result, status);
         break;
       end
       status = checked_status(result.status,
-                              "QP executor result status is null");
+                              {op, " executor result status is null"});
       if (status.ok()) begin
         qp_validation_status = qp == null ? null : qp.validate();
         if (qp == null || qp.state != RDMA_RESOURCE_ACTIVE ||
-            qp.qp_state != RDMA_QPS_RESET || qp_validation_status == null ||
-            !qp_validation_status.ok()) begin
+            (!is_modify && qp.qp_state != RDMA_QPS_RESET) ||
+            qp_validation_status == null || !qp_validation_status.ok()) begin
           qp = null;
-          status = invalid_state("typed QP projection is invalid");
+          status = invalid_state({"typed ", op, " projection is invalid"});
           finish_result(result, status);
         end
       end
@@ -1620,95 +1689,29 @@ class rdma_control_plane extends uvm_object;
       function_lock.put(1);
   endtask
 
-  // 功能：在 rdma_control_plane 中，modify_qp 在代际和状态机保护下修改 QP 上下文，提交硬件命令后才发布新的软件状态。
-  // 输入/输出及副作用：binding（输入）、request（输入）、qp（输出）、result（输出）；modify_qp 驱动下游事务，并写入 qp、result；函数返回 无直接返回值，不取得调用方资源所有权。
-  // 失败/边界：modify_qp 失败或超时通过 qp、result 明确发布；该路径不隐式重试，也不转移未声明资源。
+
+  // 功能：创建 QP：经 run_qp_operation 在 Function 锁内调用 QP executor 的 create 路径。
+  // 输入/输出及副作用：request 为创建请求；qp 输出 RESET 态 ACTIVE QP，result 输出事务结果。
+  // 失败/边界：失败时 qp 为 null，错误与恢复要求经 result 发布。
+  task create_qp(
+    rdma_function_binding binding,
+    rdma_create_qp_req request,
+    output rdma_qp qp,
+    output rdma_control_result result
+  );
+    run_qp_operation(binding, request, 1'b0, qp, result);
+  endtask
+
+  // 功能：修改 QP 状态/属性：经 run_qp_operation 在 Function 锁内调用 QP executor 的 modify 路径。
+  // 输入/输出及副作用：request 携带目标 qp_h；qp 输出修改后的 ACTIVE QP，result 输出事务结果。
+  // 失败/边界：目标不属于 owner 或执行失败时 qp 为 null，错误与恢复要求经 result 发布。
   task modify_qp(
     rdma_function_binding binding,
     rdma_modify_qp_req request,
     output rdma_qp qp,
     output rdma_control_result result
   );
-    rdma_function_handle owner;
-    rdma_function_handle locked_owner;
-    rdma_status status;
-    rdma_status qp_validation_status;
-    semaphore function_lock;
-    longint unsigned transaction_id;
-    bit executor_called;
-
-    qp = null;
-    result = make_result();
-    function_lock = null;
-    executor_called = 1'b0;
-    reserve_transaction_id(transaction_id, status);
-    result.transaction_id = transaction_id;
-    do begin
-      `RDMA_BREAK_IF_FAILED(status, "QP modify transaction ID allocation returned null")
-      status = configured_status();
-      `RDMA_BREAK_IF_FAILED(status, "QP modify control-plane configuration returned null")
-      if (host_mem == null || context_backing == null || qp_executor == null) begin
-        status = invalid_state("QP modify requires a configured QP executor");
-        break;
-      end
-      status = binding_owner_status(binding, owner);
-      `RDMA_BREAK_IF_FAILED(status, "QP modify Function binding returned null")
-      status = queue_request_status(request, owner, "QP modify request");
-      `RDMA_BREAK_IF_FAILED(status, "QP modify request returned null")
-      status = queue_target_owner_status(request.qp_h, owner,
-                                         "QP modify target");
-      if (status == null || !status.ok()) break;
-
-      acquire_function_lock(owner, function_lock);
-      status = binding_owner_status(binding, locked_owner);
-      `RDMA_BREAK_IF_FAILED(status, "post-lock QP modify Function returned null")
-      status = same_owner_status(locked_owner, owner,
-                                 "post-lock QP modify Function");
-      if (status == null || !status.ok()) break;
-      status = queue_request_status(request, locked_owner,
-                                    "post-lock QP modify request");
-      `RDMA_BREAK_IF_FAILED(status, "post-lock QP modify request returned null")
-      status = queue_target_owner_status(request.qp_h, locked_owner,
-                                         "post-lock QP modify target");
-      if (status == null || !status.ok()) break;
-
-      executor_called = 1'b1;
-      qp_executor.modify_locked(binding, owner, request, transaction_id,
-                                qp, result);
-      if (result == null) begin
-        status = invalid_state("QP modify executor returned a null result");
-        break;
-      end
-      if (result.transaction_id != transaction_id) begin
-        qp = null;
-        status = invalid_state("QP modify executor changed the transaction ID");
-        finish_result(result, status);
-        break;
-      end
-      status = checked_status(result.status,
-                              "QP modify executor result status is null");
-      if (status.ok()) begin
-        qp_validation_status = qp == null ? null : qp.validate();
-        if (qp == null || qp.state != RDMA_RESOURCE_ACTIVE ||
-            qp_validation_status == null || !qp_validation_status.ok()) begin
-          qp = null;
-          status = invalid_state("typed QP modify projection is invalid");
-          finish_result(result, status);
-        end
-      end
-      break;
-    end while (1'b0);
-    if (result == null) begin
-      result = make_result();
-      result.transaction_id = transaction_id;
-    end
-    if (status == null || !status.ok()) begin
-      qp = null;
-      if (!executor_called)
-        finish_result(result, status);
-    end
-    if (function_lock != null)
-      function_lock.put(1);
+    run_qp_operation(binding, request, 1'b1, qp, result);
   endtask
 
   // 功能：在 rdma_control_plane 中，destroy_qp 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
@@ -1719,39 +1722,7 @@ class rdma_control_plane extends uvm_object;
     rdma_destroy_resource_req request,
     output rdma_control_result result
   );
-    rdma_function_handle owner, locked_owner;
-    rdma_status status;
-    semaphore function_lock;
-    longint unsigned transaction_id;
-    bit executor_called;
-    result = make_result(); function_lock = null; executor_called = 1'b0;
-    reserve_transaction_id(transaction_id, status);
-    result.transaction_id = transaction_id;
-    do begin
-      if (status == null || !status.ok()) begin status = checked_status(status,
-        "QP destroy transaction ID allocation returned null"); break; end
-      status = configured_status(); if (status == null || !status.ok()) begin
-        status = checked_status(status, "QP destroy control-plane configuration returned null"); break; end
-      status = binding_owner_status(binding, owner); if (status == null || !status.ok()) begin
-        status = checked_status(status, "QP destroy Function binding returned null"); break; end
-      status = queue_request_status(request, owner, "QP destroy request");
-      if (status == null || !status.ok()) begin status = checked_status(status, "QP destroy request returned null"); break; end
-      if (request.target_h.kind != RDMA_RESOURCE_QP) begin status = invalid_argument("QP destroy target kind is invalid"); break; end
-      status = queue_target_owner_status(request.target_h, owner, "QP destroy target"); if (status == null || !status.ok()) break;
-      acquire_function_lock(owner, function_lock);
-      status = binding_owner_status(binding, locked_owner); if (status == null || !status.ok()) break;
-      status = same_owner_status(locked_owner, owner, "post-lock QP destroy Function"); if (status == null || !status.ok()) break;
-      status = queue_target_owner_status(request.target_h, locked_owner, "post-lock QP destroy target"); if (status == null || !status.ok()) break;
-      executor_called = 1'b1;
-      qp_executor.destroy_locked(binding, owner, request, transaction_id, result);
-      if (result == null) status = invalid_state("QP destroy executor returned null result");
-      else if (result.transaction_id != transaction_id) begin status = invalid_state("QP destroy executor changed transaction ID"); finish_result(result, status); end
-      else status = checked_status(result.status, "QP destroy executor result status is null");
-      break;
-    end while (1'b0);
-    if (result == null) begin result = make_result(); result.transaction_id = transaction_id; end
-    if ((status == null || !status.ok()) && !executor_called) finish_result(result, status);
-    if (function_lock != null) function_lock.put(1);
+    run_destroy_operation(binding, request, RDMA_RESOURCE_QP, 1'b1, result);
   endtask
 
   // 功能：在 rdma_control_plane 中，destroy_cq 按 owner、generation 和幂等规则释放/隔离记录，并同步删除其账本引用。
@@ -1808,7 +1779,6 @@ class rdma_control_plane extends uvm_object;
     output rdma_control_result result
   );
     rdma_function_handle owner;
-    rdma_function_handle locked_owner;
     rdma_pd reserved_pd;
     rdma_resource active_resource;
     rdma_status status;
@@ -1826,20 +1796,11 @@ class rdma_control_plane extends uvm_object;
       `RDMA_BREAK_IF_FAILED(status, "transaction ID allocation returned null status")
       status = configured_status();
       `RDMA_BREAK_IF_FAILED(status, "control-plane configuration check returned null")
-      status = binding_owner_status(binding, owner);
-      `RDMA_BREAK_IF_FAILED(status, "Function binding check returned null")
-      status = request_status(request, owner);
-      `RDMA_BREAK_IF_FAILED(status, "create PD request check returned null")
-
-      acquire_function_lock(owner, function_lock);
-      status = binding_owner_status(binding, locked_owner);
-      `RDMA_BREAK_IF_FAILED(status, "post-lock Function binding check returned null")
-      status = same_owner_status(
-        locked_owner, owner, "post-lock create PD binding"
-      );
-      `RDMA_BREAK_IF_FAILED(status, "post-lock Function identity check returned null")
-      status = request_status(request, locked_owner);
-      `RDMA_BREAK_IF_FAILED(status, "post-lock create PD request check returned null")
+      admit_locked_request(binding, request, RDMA_CTRL_TARGET_NONE,
+                           RDMA_RESOURCE_PD, "create PD", owner,
+                           function_lock, status);
+      if (!status.ok())
+        break;
       status = manager.create_pd(binding, reserved_pd);
       `RDMA_BREAK_IF_FAILED(status, "resource manager create PD returned null")
       if (reserved_pd == null || reserved_pd.handle == null ||

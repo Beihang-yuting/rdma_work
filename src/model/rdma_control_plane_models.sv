@@ -22,6 +22,14 @@ typedef enum bit [3:0] {
   RDMA_CTRL_STEP_HW_CONTEXT_DELETED
 } rdma_control_step_e;
 
+// 控制面准入时需要从请求中复验的目标句柄来源：无目标、destroy 请求的 target_h、
+//   modify QP 请求的 qp_h。
+typedef enum bit [1:0] {
+  RDMA_CTRL_TARGET_NONE,
+  RDMA_CTRL_TARGET_DESTROY,
+  RDMA_CTRL_TARGET_MODIFY_QP
+} rdma_control_target_e;
+
 // 功能：rdma_control_step_valid 比较 step 与当前 authority/状态字段，返回布尔结果供上层执行精确分支。
 // 输入/输出及副作用：step（输入）；rdma_control_step_valid 读取 step 并使用输入参数和固定枚举/常量；函数返回 bit，不取得调用方资源所有权。
 // 失败/边界：rdma_control_step_valid 只读输入并返回 bit；边界由函数体现有分支决定，不修改状态或转移资源。
