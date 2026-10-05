@@ -2,7 +2,8 @@
 // 层：单元测试。
 // 职责：两节点数据端到端（驱动模型 + 设备模型，仅经 CMQ/doorbell/DMA 交互）：RC 的 SEND（多 MTU、
 //   3 SGE 走 SGB、inline）、WRITE、WRITE_IMM、READ、FAA、CAS、rkey 错误 NAK，CQ arm 产生 CEQE，
-//   SEND 进 SRQ（post_srq_recv、SRFQ 环、CQE 的 SRFQ 回查与槽位释放），CQ resize 时未消费 CQE 迁移；
+//   SEND 进 SRQ（post_srq_recv、SRFQ 环、CQE 的 SRFQ 回查与槽位释放），CQ resize 时未消费 CQE 迁移，
+//   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE；
 //   每项逐字节比对目的内存并检查完成的 wr_id/方向/状态。
 // 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
@@ -99,6 +100,8 @@ class rdma_drv_data_test extends uvm_test;
     check_cq_event();
     check_srq();
     check_cq_resize();
+    check_flush();
+    check_srq_limit();
     if (a.dev.nic.errors.size() != 0 || b.dev.nic.errors.size() != 0)
       `uvm_error("DATA", $sformatf("device protocol errors: a=%p b=%p",
                                    a.dev.nic.errors, b.dev.nic.errors))
@@ -485,7 +488,6 @@ class rdma_drv_data_test extends uvm_test;
   // 失败/边界：不符报告 UVM_ERROR。
   task check_srq();
     rdma_drv_srq srq;
-    rdma_drv_qp_init_attr attr;
     rdma_drv_qp qa;
     rdma_drv_qp qb;
     rdma_drv_recv_wr rwr;
@@ -497,21 +499,7 @@ class rdma_drv_data_test extends uvm_test;
 
     rdma_drv_srq::create_srq(b.drv, b.pd, 16, 0, srq, status);
     expect_ok("create SRQ", status);
-    attr = rdma_drv_qp_init_attr::type_id::create("srq_attr");
-    attr.pd = b.pd;
-    attr.send_cq = b.cq;
-    attr.recv_cq = b.cq;
-    attr.srq = srq;
-    rdma_drv_qp::create_qp(b.drv, attr, qb, status);
-    expect_ok("create SRQ QP", status);
-    attr = rdma_drv_qp_init_attr::type_id::create("peer_attr");
-    attr.pd = a.pd;
-    attr.send_cq = a.cq;
-    attr.recv_cq = a.cq;
-    rdma_drv_qp::create_qp(a.drv, attr, qa, status);
-    expect_ok("create peer QP", status);
-    connect_qp(a.drv, qa, qb.qpn, b.mac);
-    connect_qp(b.drv, qb, qa.qpn, a.mac);
+    make_pair(srq, qa, qb);
     foreach (rids[k]) begin
       rwr = rdma_drv_recv_wr::type_id::create("srq_recv");
       rwr.wr_id = next_wr_id++;
@@ -566,5 +554,126 @@ class rdma_drv_data_test extends uvm_test;
       expect_wc("CQ_RESIZE pending", wcs[k], wrs[k].wr_id, 1'b0);
     send_and_wait("WRITE after resize", wrs[3]);
     expect_mem("CQ_RESIZE data", b, 'h3fc0, data);
+  endtask
+
+  // 功能：新建一对 QP；B 投 3 个 RECV 后转 ERR：设备写 flush CQE，驱动为 3 个 RECV 依序生成 FLUSH 完成，
+  //   之后不再有完成；销毁两端 QP（cq_clean 清除残留 flush CQE），两端 CQ 再轮询无错误、无完成。
+  // 输入/输出及副作用：创建并销毁一对 QP。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task check_flush();
+    rdma_drv_qp_attr mod;
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
+    rdma_drv_recv_wr rwr;
+    rdma_drv_wc wcs[$];
+    longint unsigned rids[3];
+    rdma_status status;
+
+    make_pair(null, qa, qb);
+    foreach (rids[k]) begin
+      rwr = rdma_drv_recv_wr::type_id::create("flush_recv");
+      rwr.wr_id = next_wr_id++;
+      rwr.sges.push_back(rdma_drv_sge::make(b.data_buf.iova + 'h100, 'h10, b.mr.key()));
+      rdma_drv_wr::post_recv(b.drv, qb, rwr, status);
+      expect_ok("post_recv before flush", status);
+      rids[k] = rwr.wr_id;
+    end
+    mod = rdma_drv_qp_attr::type_id::create("to_err");
+    mod.mask = rdma_drv_qp_attr::M_STATE;
+    mod.state = RDMA_DRV_QPS_ERR;
+    qb.modify(b.drv, mod, status);
+    expect_ok("modify to ERR", status);
+    wait_wcs(b, 3, wcs);
+    foreach (rids[k])
+      expect_wc("FLUSH rq", wcs[k], rids[k], 1'b1, RDMA_DRV_WC_FLUSH_ERR);
+    #1us;
+    rdma_drv_wr::poll_cq(b.drv, b.cq, 4, wcs, status);
+    expect_ok("poll after flush", status);
+    if (wcs.size() != 3)
+      `uvm_error("FLUSH", $sformatf("%0d completions after the RQ drained", wcs.size() - 3))
+    qa.destroy(a.drv, status);
+    expect_ok("destroy flush peer", status);
+    qb.destroy(b.drv, status);
+    expect_ok("destroy flush QP", status);
+    #1us;
+    wcs.delete();
+    rdma_drv_wr::poll_cq(a.drv, a.cq, 4, wcs, status);
+    expect_ok("poll A after destroy", status);
+    rdma_drv_wr::poll_cq(b.drv, b.cq, 4, wcs, status);
+    expect_ok("poll B after destroy", status);
+    if (wcs.size() != 0)
+      `uvm_error("FLUSH", $sformatf("%0d completions after destroy", wcs.size()))
+  endtask
+
+  // 功能：新建一对已连接的 RC QP：qb 在 B（可绑定 srq），qa 在 A，均使用节点默认 PD/CQ。
+  // 输入/输出及副作用：qa/qb 输出。
+  // 失败/边界：失败报告 UVM_FATAL。
+  task make_pair(rdma_drv_srq srq, output rdma_drv_qp qa, output rdma_drv_qp qb);
+    rdma_drv_qp_init_attr attr;
+    rdma_status status;
+
+    attr = rdma_drv_qp_init_attr::type_id::create("pair_attr");
+    attr.pd = b.pd;
+    attr.send_cq = b.cq;
+    attr.recv_cq = b.cq;
+    attr.srq = srq;
+    rdma_drv_qp::create_qp(b.drv, attr, qb, status);
+    expect_ok("create pair QP on B", status);
+    attr = rdma_drv_qp_init_attr::type_id::create("pair_attr");
+    attr.pd = a.pd;
+    attr.send_cq = a.cq;
+    attr.recv_cq = a.cq;
+    rdma_drv_qp::create_qp(a.drv, attr, qa, status);
+    expect_ok("create pair QP on A", status);
+    connect_qp(a.drv, qa, qb.qpn, b.mac);
+    connect_qp(b.drv, qb, qa.qpn, a.mac);
+  endtask
+
+  // 功能：SRQ 投 8 个 RECV，limit 设为 4：消费 4 个后（剩 4）无事件，第 5 个后（剩 3）AEQ 上报一个
+  //   {0x78, SRQN} 事件，之后不再重复。
+  // 输入/输出及副作用：创建 SRQ 与一对 QP。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task check_srq_limit();
+    rdma_drv_srq srq;
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
+    rdma_drv_recv_wr rwr;
+    rdma_drv_send_wr wr;
+    rdma_drv_wc wcs[$];
+    bit [31:0] events[$];
+    rdma_bytes_t scratch;
+    rdma_status status;
+
+    rdma_drv_srq::create_srq(b.drv, b.pd, 16, 0, srq, status);
+    expect_ok("create limit SRQ", status);
+    make_pair(srq, qa, qb);
+    for (int k = 0; k < 8; k++) begin
+      rwr = rdma_drv_recv_wr::type_id::create("limit_recv");
+      rwr.wr_id = next_wr_id++;
+      rwr.sges.push_back(rdma_drv_sge::make(b.data_buf.iova + 'h200, 'h10, b.mr.key()));
+      rdma_drv_wr::post_srq_recv(b.drv, srq, rwr, status);
+      expect_ok("post_srq_recv", status);
+    end
+    srq.modify_limit(b.drv, 4, status);
+    expect_ok("modify SRQ limit", status);
+    scratch = fill(a, 'h200, 'h10, 8'he1);
+    for (int k = 0; k < 5; k++) begin
+      if (k == 4) begin
+        rdma_drv_wr::process_aeq(b.drv, events, status);
+        expect_ok("process AEQ", status);
+        if (events.size() != 0)
+          `uvm_error("SRQ_LIMIT", $sformatf("AEQ events %p with 4 WQEs left", events))
+      end
+      wr = send_wr(a, RDMA_DRV_WR_SEND, '{'h200}, '{'h10});
+      rdma_drv_wr::post_send(a.drv, qa, wr, status);
+      expect_ok("post SEND to limit SRQ", status);
+      wait_wcs(a, 1, wcs);
+      wait_wcs(b, 1, wcs);
+    end
+    rdma_drv_wr::process_aeq(b.drv, events, status);
+    expect_ok("process AEQ", status);
+    if (events.size() != 1 || events[0] != {RDMA_ECODE_XTRDMA_CQE_ECODE_SRFQ_OVER_LIMIT_TH,
+                                            24'(srq.srqn)})
+      `uvm_error("SRQ_LIMIT", $sformatf("AEQ events %p for SRQ %0d", events, srq.srqn))
   endtask
 endclass

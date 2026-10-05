@@ -305,6 +305,86 @@ class rdma_drv_cq extends uvm_object;
     dev.cq_table.delete(cqn);
   endtask
 
+  // 功能：move_cq_ring_tail：tail 加一，回绕时翻转 polarity 与 ci_wrap。
+  // 输入/输出及副作用：修改软件 CI 状态。
+  // 失败/边界：无。
+  function void advance_tail();
+    tail++;
+    if (tail % size == 0) begin
+      polarity = !polarity;
+      ci_wrap = !ci_wrap;
+    end
+  endfunction
+
+  // 功能：xtrdma_kernel_update_cq_shadow_ci：CQ shadow（CQC+52）写 be32(ci_wrap<<23 | CI)。
+  // 输入/输出及副作用：写 HMC 中的 CQ shadow。
+  // 失败/边界：写失败返回错误。
+  function rdma_status update_shadow_ci(rdma_drv_dev dev);
+    rdma_bytes_t ci;
+    bit [31:0] word;
+
+    word = (32'(ci_wrap) << 23) | (tail % size);
+    ci = rdma_be::zeros(4);
+    foreach (ci[i])
+      ci[i] = word[31 - 8 * i -: 8];
+    return dev.hw.write(ctx_page, ctx_offset + RDMA_CQC_RUNTIME_SHADOW_BYTE_OFFSET, ci);
+  endfunction
+
+  // 功能：__xtrdma_cq_clean：从 tail 起找到最后一个有效 CQE，倒序遍历：属于 qpn 的丢弃（SRQ 接收释放
+  //   槽位），其余向后平移 nfreed 格（跨圈时翻转 polarity）；最后 tail 前移 nfreed，ci_wrap/polarity 按
+  //   新 tail 重算并更新 shadow CI。
+  // 输入/输出及副作用：改写 CQ 缓冲与软件 CI 状态。
+  // 失败/边界：读写失败返回错误。
+  task clean(rdma_drv_dev dev, int unsigned qpn, rdma_drv_srq srq, output rdma_status status);
+    rdma_bytes_t entry;
+    longint unsigned prod;
+    int unsigned nfreed;
+    int unsigned idx;
+
+    status = rdma_status::success();
+    prod = tail;
+    forever begin
+      status = mem_kbuf.read(dev.hw, (prod % size) * CQE_BYTES, CQE_BYTES, entry);
+      if (!status.ok())
+        return;
+      if (entry[0][7] != !((prod / size) & 1) || prod > tail + size)
+        break;
+      prod++;
+    end
+    nfreed = 0;
+    while (prod > tail) begin
+      prod--;
+      status = mem_kbuf.read(dev.hw, (prod % size) * CQE_BYTES, CQE_BYTES, entry);
+      if (!status.ok())
+        return;
+      if (rdma_be::field(entry, RDMA_CQE_QPN_WORD_BYTE_OFFSET, RDMA_CQE_QPN_LSB,
+                         RDMA_CQE_QPN_WIDTH) == qpn) begin
+        if (srq != null &&
+            rdma_be::field(entry, RDMA_CQE_RQ_CQE_WORD_BYTE_OFFSET, RDMA_CQE_RQ_CQE_LSB, 1) &&
+            rdma_be::field(entry, RDMA_CQE_SRFQ_WORD_BYTE_OFFSET, RDMA_CQE_SRFQ_LSB, 1)) begin
+          idx = rdma_be::field(entry, RDMA_CQE_WQE_INDEX_WORD_BYTE_OFFSET,
+                               RDMA_CQE_WQE_INDEX_LSB, RDMA_CQE_WQE_INDEX_WIDTH);
+          srq.slot_used[idx % srq.depth] = 1'b0;
+          srq.tail++;
+        end
+        nfreed++;
+      end
+      else if (nfreed != 0) begin
+        if (((prod + nfreed) / size) % 2 != (prod / size) % 2)
+          entry[0][7] = !entry[0][7];
+        status = mem_kbuf.write(dev.hw, ((prod + nfreed) % size) * CQE_BYTES, entry);
+        if (!status.ok())
+          return;
+      end
+    end
+    if (nfreed == 0)
+      return;
+    tail += nfreed;
+    ci_wrap = (tail / size) & 1;
+    polarity = !ci_wrap;
+    status = update_shadow_ci(dev);
+  endtask
+
   // 功能：xtrdma_ib_resize_cq（内核）：cqe 小于当前 ibcq.cqe 拒绝、相等直接返回；n=roundup_pow2(cqe*2)，
   //   新缓冲按 init_resize_cq_polarity 初始化（[0..CI] 为当前 polarity，其后取反），CQC_RESIZE 携带新
   //   PBA/尺寸/OM 与旧 CI/CI_WRAP；随后 copy_resize_cqes：从旧 CI 起把未消费 CQE 复制到新缓冲 CI+1 起

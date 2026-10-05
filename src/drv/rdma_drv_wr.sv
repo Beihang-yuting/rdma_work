@@ -563,22 +563,24 @@ class rdma_drv_wr extends uvm_object;
 
   // 功能：xtrdma_ib_poll_cq（普通 CQ）：取 polarity 匹配的 32B CQE，按 QPN 找 QP，按 WQE_INDEX 回查
   //   wr_id 并把 SQ/RQ 尾推进到该 WR 之后，映射 ecode 到 WC 状态；推进 CQ 尾（回绕翻转 polarity 与
-  //   ci_wrap），最后把 be32(ci_wrap<<23|CI) 写入 CQ shadow（CQC+52）。
+  //   ci_wrap），最后把 be32(ci_wrap<<23|CI) 写入 CQ shadow（CQC+52）。flush CQE（0x08/0x8F）按
+  //   flush_err_prepare_fake_wc 为每个未完成 WQE 生成 FLUSH 完成，环空后跳过。
   // 输入/输出及副作用：wcs 追加完成；更新 QP/CQ 软件状态与 shadow。
   // 失败/边界：CQE 指向未知 QP 返回 INVALID_STATE；读写失败返回错误。
   static task poll_cq(rdma_drv_dev dev, rdma_drv_cq cq, int unsigned max_wc,
                       inout rdma_drv_wc wcs[$], output rdma_status status);
     rdma_bytes_t cqe;
-    rdma_bytes_t ci;
     rdma_drv_wc wc;
     rdma_drv_qp qp;
     bit [7:0] ecode;
     int unsigned idx;
     int unsigned n;
-    bit [31:0] ci_word;
+    bit moved;
+    bit move_ci;
 
     status = rdma_status::success();
     n = 0;
+    moved = 1'b0;
     while (n < max_wc) begin
       status = cq.mem_kbuf.read(dev.hw, (cq.tail % cq.size) * rdma_drv_cq::CQE_BYTES,
                                 rdma_drv_cq::CQE_BYTES, cqe);
@@ -600,6 +602,25 @@ class rdma_drv_wr extends uvm_object;
       ecode = rdma_be::field(cqe, RDMA_CQE_ECODE_WORD_BYTE_OFFSET, RDMA_CQE_ECODE_LSB,
                              RDMA_CQE_ECODE_WIDTH);
       wc.is_recv = rdma_be::field(cqe, RDMA_CQE_RQ_CQE_WORD_BYTE_OFFSET, RDMA_CQE_RQ_CQE_LSB, 1);
+      move_ci = 1'b1;
+      if (ecode inside {RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR,
+                        RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR}) begin
+        // flush_err_prepare_fake_wc：环非空时以环当前 CI 为 WQE 下标且不推进 CQ（同一 flush CQE 为
+        //   每个未完成 WQE 生成 WC）；环空（或 SRQ 接收）则跳过该 CQE。
+        if (wc.is_recv && qp.srq == null && qp.rq_head != qp.rq_tail) begin
+          idx = qp.rq_tail % qp.rq_depth;
+          move_ci = 1'b0;
+        end
+        else if (!wc.is_recv && qp.sq_head != qp.sq_tail) begin
+          idx = qp.sq_tail % qp.sq_depth;
+          move_ci = 1'b0;
+        end
+        else begin
+          cq.advance_tail();
+          moved = 1'b1;
+          continue;
+        end
+      end
       wc.pkt_opcode = rdma_be::field(cqe, RDMA_CQE_PKT_OPCODE_WORD_BYTE_OFFSET,
                                      RDMA_CQE_PKT_OPCODE_LSB, RDMA_CQE_PKT_OPCODE_WIDTH);
       wc.byte_len = rdma_be::field(cqe, RDMA_CQE_PAYLOAD_LEN_WORD_BYTE_OFFSET,
@@ -635,19 +656,13 @@ class rdma_drv_wr extends uvm_object;
         wc.status = RDMA_DRV_WC_REM_INV_REQ_ERR;
       wcs.push_back(wc);
       n++;
-      cq.tail++;
-      if (cq.tail % cq.size == 0) begin
-        cq.polarity = !cq.polarity;
-        cq.ci_wrap = !cq.ci_wrap;
+      if (move_ci) begin
+        cq.advance_tail();
+        moved = 1'b1;
       end
     end
-    if (n == 0)
-      return;
-    ci_word = (32'(cq.ci_wrap) << 23) | (cq.tail % cq.size);
-    ci = rdma_be::zeros(4);
-    foreach (ci[i])
-      ci[i] = ci_word[31 - 8 * i -: 8];
-    status = dev.hw.write(cq.ctx_page, cq.ctx_offset + RDMA_CQC_RUNTIME_SHADOW_BYTE_OFFSET, ci);
+    if (moved)
+      status = cq.update_shadow_ci(dev);
   endtask
 
   // 功能：xtrdma_process_ceq：取有效 CEQE（bit63 与当前圈 polarity 一致），记录 CQN 并递增该 CQ 的
@@ -684,8 +699,9 @@ class rdma_drv_wr extends uvm_object;
     end
   endtask
 
-  // 功能：xtrdma_process_aeq：取有效 AEQE，记录 {ECODE, QPN}，推进 CI 并敲 AEQ doorbell。
-  // 输入/输出及副作用：events 追加 {ecode[7:0], qpn[23:0]}；更新 EQ 状态与 doorbell。
+  // 功能：xtrdma_process_aeq：取有效 AEQE，记录 {ECODE, QPN}（SRFQ 事件记录 SRFQN），推进 CI 并敲
+  //   AEQ doorbell。
+  // 输入/输出及副作用：events 追加 {ecode[7:0], qpn 或 srqn[23:0]}；更新 EQ 状态与 doorbell。
   // 失败/边界：读写失败返回错误。
   static task process_aeq(rdma_drv_dev dev, inout bit [31:0] events[$],
                           output rdma_status status);
@@ -702,7 +718,12 @@ class rdma_drv_wr extends uvm_object;
       if (!status.ok() || aeqe[0][7] != eq.polarity)
         return;
       word0 = rdma_be::qword(aeqe, 0);
-      events.push_back({word0[31:24], 6'b0, word0[17:0]});
+      if (rdma_be::field(aeqe, RDMA_AEQE_SRFQ_EN_WORD_BYTE_OFFSET, RDMA_AEQE_SRFQ_EN_LSB, 1))
+        events.push_back({word0[31:24], 12'b0,
+                          12'(rdma_be::field(aeqe, RDMA_AEQE_SRFQN_WORD_BYTE_OFFSET,
+                                             RDMA_AEQE_SRFQN_LSB, RDMA_AEQE_SRFQN_WIDTH))});
+      else
+        events.push_back({word0[31:24], 6'b0, word0[17:0]});
       eq.tail++;
       if (eq.tail % eq.entries == 0)
         eq.polarity = !eq.polarity;

@@ -553,7 +553,7 @@ class rdma_drv_qp extends uvm_object;
   endtask
 
   // 功能：xtrdma_ib_destroy_qp：非 ERR 先转 ERR（仅状态 + flush doorbell），OCC_FLUSH（EIRQE/ORQE/UAQE，
-  //   错误忽略），QPC_DELETE（失败即返回），释放缓冲与 QPN。
+  //   错误忽略），QPC_DELETE（失败即返回），cq_clean 收/发 CQ 中该 QP 的 CQE，释放缓冲与 QPN。
   // 输入/输出及副作用：下发命令，释放资源。
   // 失败/边界：转 ERR 或删除失败返回错误且不释放（与驱动一致）。
   task destroy(rdma_drv_dev dev, output rdma_status status);
@@ -578,6 +578,11 @@ class rdma_drv_qp extends uvm_object;
     `RDMA_DRV_SET(sqe, RDMA_CMQ_OCC_UAQE, 1)
     dev.cmq.exec(sqe, cqe, ignored);
     hw_qpc_cmd(dev, RDMA_OP_QPC_DELETE, 1'b0, status);
+    if (!status.ok())
+      return;
+    recv_cq.clean(dev, qpn, srq, status);
+    if (status.ok() && send_cq != recv_cq)
+      send_cq.clean(dev, qpn, null, status);
     if (!status.ok())
       return;
     free_buffers(dev);

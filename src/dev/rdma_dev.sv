@@ -54,6 +54,10 @@ class rdma_dev extends uvm_object;
         nic.sq_doorbell(value);
       if (offset == RDMA_DB_CQ_OFFSET)
         nic.cq_doorbell(value);
+      if (offset == RDMA_DB_QP_FLUSH_OFFSET)
+        nic.qp_flush(value);
+      if (offset == RDMA_DB_SRFQ_OFFSET)
+        nic.srq_doorbell(value);
       return rdma_status::success();
     end
     return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,

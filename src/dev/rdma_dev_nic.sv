@@ -31,6 +31,8 @@ class rdma_dev_qp_rt extends uvm_object;
   longint unsigned sq_ci;
   longint unsigned rq_ci;
   int unsigned sq_doorbells;
+  // 已投递 TX 但尚未 drain 完的 SQ doorbell 数（flush 据此决定立即执行或排队）。
+  int unsigned kicks_pending;
   bit [23:0] send_psn;
   bit [23:0] expected_psn;
   bit [23:0] msn;
@@ -57,6 +59,7 @@ class rdma_dev_qp_rt extends uvm_object;
     sq_ci = 0;
     rq_ci = 0;
     sq_doorbells = 0;
+    kicks_pending = 0;
     send_psn = '0;
     expected_psn = '0;
     msn = '0;
@@ -74,6 +77,8 @@ class rdma_dev_nic extends uvm_object;
   localparam int unsigned PAYLOAD_OFFSET = 32;
   localparam int unsigned QP_SHADOW_OFFSET = 504;
   localparam int unsigned HMC_PBL = 3;
+  // TX 队列中标记 QP flush（与 SQ doorbell 共用队列以保持顺序）。
+  localparam int unsigned FLUSH_TAG = 32'h8000_0000;
   // 设备保存的 CQC 从 SQE 字节 8 起、EQC 从 SQE 字节 16 起。
   localparam int unsigned CQC_BASE = 8;
   localparam int unsigned EQC_BASE = 16;
@@ -91,6 +96,8 @@ class rdma_dev_nic extends uvm_object;
   protected int unsigned cq_armed[int unsigned];
   protected longint unsigned eq_pi[int unsigned];
   protected longint unsigned srq_ci[int unsigned];
+  // SRQ limit：SRFQ doorbell 武装的阈值（WQE 数）；可用 WQE 低于阈值时写 AEQE（0x78）并解除。
+  protected int unsigned srq_limit[int unsigned];
   protected mailbox #(int unsigned) sq_kicks;
   protected mailbox #(rdma_packet) rx_mb;
   // 观测：设备检测到的协议错误（签名、地址翻译、超时等）。
@@ -118,6 +125,7 @@ class rdma_dev_nic extends uvm_object;
     cq_armed.delete();
     eq_pi.delete();
     srq_ci.delete();
+    srq_limit.delete();
     errors.delete();
   endfunction
 
@@ -129,7 +137,32 @@ class rdma_dev_nic extends uvm_object;
 
     qpn = value[RDMA_SQ_WQE_QPN_LSB +: RDMA_SQ_WQE_QPN_WIDTH];
     qp_rt(qpn).sq_doorbells++;
+    qp_rt(qpn).kicks_pending++;
     void'(sq_kicks.try_put(qpn));
+  endfunction
+
+  // 功能：QP flush doorbell（转 ERR）：该 QP 没有待处理的 SQ 工作时立即写 flush CQE（先于随后的 CMQ
+  //   命令，如 QPC_DELETE），否则排入 TX 队列在之前的 SQ doorbell 处理完后执行。
+  // 输入/输出及副作用：写 CQE 或投递 TX 任务。
+  // 失败/边界：无。
+  function void qp_flush(bit [63:0] value);
+    int unsigned qpn;
+
+    qpn = value[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH];
+    if (qp_rt(qpn).kicks_pending == 0)
+      flush_qp(qpn);
+    else
+      void'(sq_kicks.try_put(FLUSH_TAG | qpn));
+  endfunction
+
+  // 功能：SRFQ doorbell：LIMIT_INVLD=0 时（modify_srq）按 LIMIT（4 个 WQE 为单位）武装 SRQ limit 事件；
+  //   post_srq_recv 的 doorbell（LIMIT_INVLD=1）只更新 PI，设备从 shadow 读取，此处无动作。
+  // 输入/输出及副作用：修改 srq_limit。
+  // 失败/边界：无。
+  function void srq_doorbell(bit [63:0] value);
+    if (!value[RDMA_NOTIFY_SRQ_LIMIT_INVALID_LSB])
+      srq_limit[value[RDMA_NOTIFY_SRFQN_LSB +: RDMA_NOTIFY_SRFQN_WIDTH]] =
+        value[RDMA_NOTIFY_SRQ_LIMIT_LSB +: RDMA_NOTIFY_SRQ_LIMIT_WIDTH] * 4;
   endfunction
 
   // 功能：CQ doorbell：ARM 置位时记录 arm 状态（下一个 CQE 触发 CEQE）。
@@ -160,7 +193,7 @@ class rdma_dev_nic extends uvm_object;
     join
   endtask
 
-  // 功能：TX 循环：按 doorbell 顺序 drain 对应 QP 的 SQ。
+  // 功能：TX 循环：按 doorbell 顺序 drain 对应 QP 的 SQ 或执行 QP flush。
   // 输入/输出及副作用：永久循环。
   // 失败/边界：无。
   protected task tx_loop();
@@ -168,7 +201,13 @@ class rdma_dev_nic extends uvm_object;
 
     forever begin
       sq_kicks.get(qpn);
-      drain_sq(qpn);
+      if (qpn & FLUSH_TAG) begin
+        flush_qp(qpn & ~FLUSH_TAG);
+      end
+      else begin
+        drain_sq(qpn);
+        qp_rt(qpn).kicks_pending--;
+      end
     end
   endtask
 
@@ -421,6 +460,22 @@ class rdma_dev_nic extends uvm_object;
   endfunction
 
   // ---------------------------------------------------------------- TX
+  // 功能：QP flush：向 SQ CQ 写一个 SQ flush CQE（0x08），非 SRQ 时向 RQ CQ 写一个 RQ flush CQE（0x8F）；
+  //   驱动以每个 flush CQE 为对应环中全部未完成 WQE 生成 FLUSH 完成。
+  // 输入/输出及副作用：写 CQE。
+  // 失败/边界：QP 不存在时报告协议错误。
+  protected function void flush_qp(int unsigned qpn);
+    rdma_dev_object obj;
+
+    if (!ctx.lookup(RDMA_DEV_QP, qpn, obj)) begin
+      protocol_error($sformatf("flush doorbell for absent QP %0d", qpn));
+      return;
+    end
+    write_cqe(qpn, 1'b0, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR, 0, '0, 0);
+    if (!`RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ))
+      write_cqe(qpn, 1'b1, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR, 0, '0, 0);
+  endfunction
+
   // 功能：drain SQ：从设备游标起处理所有 polarity 有效的 SQE；完毕后把 HW_DROP_DB_CNT 写为已见
   //   doorbell 数（驱动据此判断可再次敲 doorbell）。
   // 输入/输出及副作用：处理 WQE、写 shadow。
@@ -785,7 +840,7 @@ class rdma_dev_nic extends uvm_object;
   // 功能：按 CQC 写一个 32B CQE（polarity 首圈为 1），CQ 已 arm 时按 CEQN 写 CEQE 并解除 arm。
   // 输入/输出及副作用：DMA 写 CQ/CEQ。
   // 失败/边界：CQ 不存在或写失败报告协议错误。
-  protected task write_cqe(int unsigned qpn, bit rq, int unsigned wqe_index, bit wqe_wrap,
+  protected function void write_cqe(int unsigned qpn, bit rq, int unsigned wqe_index, bit wqe_wrap,
                            bit [7:0] ecode, int unsigned byte_len, bit [31:0] imm,
                            int unsigned src_qpn);
     int unsigned cqn;
@@ -841,7 +896,7 @@ class rdma_dev_nic extends uvm_object;
       cq_armed.delete(cqn);
       write_ceqe(cqn, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE));
     end
-  endtask
+  endfunction
 
   // 功能：CQC_RESIZE 的数据面部分（命令完成前执行）：在旧 CQ 的当前 PI 槽写 RESIZE CQE（不推进 PI），
   //   未被驱动消费的 CQE 数 pending = PI - (OLD_CI_WRAP*old + OLD_CI)（模 2*old）；驱动把它们复制到
@@ -885,39 +940,66 @@ class rdma_dev_nic extends uvm_object;
                  `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI) + 1 + pending;
   endfunction
 
-  // 功能：向 CEQ 写一个 16B CEQE（CQN，polarity 首圈为 1）。
+  // 功能：向 CEQ 写一个 16B CEQE（CQN）。
   // 输入/输出及副作用：DMA 写 CEQ。
-  // 失败/边界：EQ 不存在或写失败报告协议错误。
-  protected task write_ceqe(int unsigned cqn, int unsigned ceqn);
+  // 失败/边界：见 write_eqe。
+  protected function void write_ceqe(int unsigned cqn, int unsigned ceqn);
+    rdma_bytes_t ceqe;
+
+    ceqe = rdma_be::zeros(RDMA_CEQE_BYTES);
+    `RDMA_BE_SET(ceqe, RDMA_CEQE_CQN, cqn)
+    write_eqe(RDMA_DEV_CEQ, ceqn, ceqe);
+  endfunction
+
+  // 功能：向 AEQ 写一个 16B AEQE（ECODE、QPN；SRQ 事件带 SRFQ_EN/SRFQN）。AEQN 为本 Function 的
+  //   vf_id，单 Function 设备固定为 0。
+  // 输入/输出及副作用：DMA 写 AEQ。
+  // 失败/边界：见 write_eqe。
+  protected function void write_aeqe(int unsigned qpn, bit [7:0] ecode, bit srfq,
+                                     int unsigned srfqn);
+    rdma_bytes_t aeqe;
+
+    aeqe = rdma_be::zeros(RDMA_AEQE_BYTES);
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_ECODE, ecode)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_QPN, qpn)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_SRFQ_EN, srfq)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_SRFQN, srfqn)
+    write_eqe(RDMA_DEV_AEQ, 0, aeqe);
+  endfunction
+
+  // 功能：按 EQC 向 CEQ/AEQ 的当前 PI 槽写一个 16B 事件（bit63 polarity 首圈为 1），PI 加一。
+  // 输入/输出及副作用：DMA 写 EQ。
+  // 失败/边界：EQ 不存在、不可翻译或写失败报告协议错误。
+  protected function void write_eqe(rdma_dev_kind_e kind, int unsigned eqn, rdma_bytes_t entry);
     rdma_dev_object eqc;
     int unsigned entries;
+    int unsigned key;
     bit [63:0] slot;
-    rdma_bytes_t ceqe;
     longint unsigned pi;
     rdma_status status;
 
-    if (!ctx.lookup(RDMA_DEV_CEQ, ceqn, eqc)) begin
-      protocol_error($sformatf("CQ %0d notifies absent CEQ %0d", cqn, ceqn));
+    if (!ctx.lookup(kind, eqn, eqc)) begin
+      protocol_error($sformatf("event for absent %s %0d", kind.name(), eqn));
       return;
     end
+    // CEQ 与 AEQ 的 PI 分开计数。
+    key = (kind == RDMA_DEV_AEQ) ? 32'h8000_0000 | eqn : eqn;
     entries = 1 << `RDMA_BE_GET_AT(eqc.bytes, RDMA_EQC_BODY_EQ_SIZE, EQC_BASE);
-    if (!eq_pi.exists(ceqn))
-      eq_pi[ceqn] = 0;
-    pi = eq_pi[ceqn];
+    if (!eq_pi.exists(key))
+      eq_pi[key] = 0;
+    pi = eq_pi[key];
     status = ctx.buffer_addr(`RDMA_BE_GET_AT(eqc.bytes, RDMA_EQC_BODY_EQ_OM, EQC_BASE),
                              `RDMA_BE_GET_AT(eqc.bytes, RDMA_EQC_BODY_CUR_EQ_PBA, EQC_BASE),
                              (pi % entries) * RDMA_CEQE_BYTES, slot);
     if (!status.ok()) begin
-      protocol_error($sformatf("CEQ %0d buffer is not translatable", ceqn));
+      protocol_error($sformatf("%s %0d buffer is not translatable", kind.name(), eqn));
       return;
     end
-    ceqe = rdma_be::zeros(RDMA_CEQE_BYTES);
-    ceqe[0][7] = !((pi / entries) & 1);
-    `RDMA_BE_SET(ceqe, RDMA_CEQE_CQN, cqn)
-    if (!dma_write(slot, ceqe))
-      protocol_error($sformatf("CEQ %0d write failed", ceqn));
-    eq_pi[ceqn] = pi + 1;
-  endtask
+    entry[0][7] = !((pi / entries) & 1);
+    if (!dma_write(slot, entry))
+      protocol_error($sformatf("%s %0d write failed", kind.name(), eqn));
+    eq_pi[key] = pi + 1;
+  endfunction
 
   // ---------------------------------------------------------------- RX
   // 功能：处理一个收到的报文：响应类交给请求方 QP，请求类按 opcode 处理。
@@ -1043,6 +1125,12 @@ class rdma_dev_nic extends uvm_object;
       return 1'b0;
     end
     srq_ci[srqn] = ci + 1;
+    if (srq_limit.exists(srqn) &&
+        ((pi[15] * depth + pi[14:0]) + 2 * depth - (ci + 1) % (2 * depth)) % (2 * depth) <
+          srq_limit[srqn]) begin
+      srq_limit.delete(srqn);
+      write_aeqe(qpn, RDMA_ECODE_XTRDMA_CQE_ECODE_SRFQ_OVER_LIMIT_TH, 1'b1, srqn);
+    end
     index = `RDMA_BE_GET(rqe, RDMA_RQE_INDEX);
     wrap = `RDMA_BE_GET(rqe, RDMA_RQE_WRAP);
     parse_sges(rdma_be::slice(rqe, PAYLOAD_OFFSET, 32), `RDMA_BE_GET(rqe, RDMA_RQE_SGE_NUM), sges);
