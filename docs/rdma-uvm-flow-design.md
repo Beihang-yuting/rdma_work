@@ -1,73 +1,49 @@
-# RDMA UVM 验证流程设计（seq → 报文 → 内存）
+# RDMA UVM 验证流程设计（seq → 驱动 → 设备 → 报文 → 内存）
 
-日期：2026-10-05。分支：`feature/rdma-arch-slim`。范围：P1–P4（verb agent、NIC 行为模型、
-记分板、MTU 分段与 WRITE/READ/ATOMIC）。当前没有 RTL DUT，NIC 行为模型先作为“设备”，
-接入 DUT 后退为预测器。
+日期：2026-10-06（取代 2026-10-05 的 NIC 行为模型版本）。分支：`feature/rdma-arch-slim`。
+当前没有 RTL DUT，`src/dev` 设备模型作为“设备”；接入 DUT 后设备模型可退为预测器。
 
-## 1. 现状问题
-
-- 仓库只有 host 侧驱动模型（WQE 写入、doorbell、CQ 消费）和报文编解码，没有设备侧：
-  E2E 测试手工构造报文、手工把 payload 写进接收 buffer、手工发布 CQE。
-- 没有 sequence/driver/monitor/scoreboard；`rdma_env` 只是 engine 容器。
-- `rdma_packet` 只有 opcode/QPN/PSN/payload，扩展头只是原始 `header_bytes`，也没有
-  FIRST/MIDDLE/LAST 分段语义。
-
-## 2. 目标结构
+## 1. 结构
 
 ```
 test
  └ rdma_tb_env (uvm_env)
-    ├ rdma_verb_agent[n]   seq → rdma_verb_item → driver → queue_data_engine.post_send/post_recv
-    │                      monitor：poll CQ → rdma_verb_completion → analysis
-    ├ rdma_nic_model[n]    TX：SQ PI 变化 → 读 SQE(host_mem) → 解码 → MR 转换 → DMA 读
-    │                          → 按 MTU 分段 → wire；RC 等 ACK/READ 响应/ATOMIC ACK 后发布 SQ CQE
-    │                      RX：wire → QPN→QP → SEND 取 RQE / WRITE 按 RETH / READ 回读 /
-    │                          ATOMIC 读改写 → DMA 写 → 发布 RQ CQE、回 ACK/NAK
-    ├ rdma_wire            点到点交付报文；analysis 端口观测全部报文；可替换为经 net_packet
-    │                      帧编解码的实现（E2E）
-    └ rdma_tb_scoreboard   影子内存预测（SEND/WRITE/READ/ATOMIC）+ 完成比对（wr_id/status/len）
+    ├ rdma_verb_agent[n]   seq → rdma_verb_item → driver → rdma_drv_wr.post_send/post_recv
+    │                      monitor：rdma_drv_wr.poll_cq → rdma_verb_completion → analysis
+    ├ rdma_wire            按目的 MAC 路由设备 NIC 发出的报文；analysis 端口观测全部报文；
+    │                      可替换为经 net_packet 帧编解码的实现（E2E）
+    └ rdma_tb_scoreboard   影子内存预测（SEND/WRITE/READ/ATOMIC）+ 完成比对（wr_id/status/len/imm）
+
+每个节点（测试创建，经 rdma_tb_node_cfg 交给 env）：
+  host_mem ── rdma_drv_dev（probe：CMQ、HMC、EQ）── BAR ── rdma_dev（CMQ 消费者 + context 存储 + NIC）
 ```
 
-新代码放在 `src/tb`（`rdma_tb_pkg`），只依赖 core/model/adapter 抽象接口；net_packet 等外部
-实现只在测试侧通过 wire 子类接入。
+主机与设备之间只有真实硬件边界：CMQ 环（命令与 context 经 DMA 读取）、MMIO doorbell
+（BAR+0x2000 窗口）和按 IOVA 的 DMA。设备不调用任何主机对象。
 
-## 3. 关键约定
+## 2. 关键约定
 
-- **节点配置** `rdma_tb_node_cfg`：engine、resource manager、host_mem、Function owner、
-  QP 列表与连接表（本地 QP → 对端节点/QP）、CQ、数据 MR（含 backing mapping）、MTU。
-  节点资源仍由测试/fixture 创建（Function/PD/CQ/QP/MR），tb 组件只借用句柄。
-- **WQE 读取**：SQE/RQE 均为 64B，地址 = `qp_plan.sq_ref/rq_ref.mapping` +
-  `mapping_offset + index*64`；用 codec registry 解码（SQE variant rc/ud/urc，RQE default）。
-  SQ 超过 2 个 SGE 或 UD 非零 payload 走外部 SGB：driver 把 `sgb_iova` 设为当前 SQ PI × 512B 槽，
-  NIC 读该槽并按 16B 大端描述符（length/lkey/iova）解析。UD/URC SQE codec 不支持仅凭 64B 镜像
-  解码：URC 与 RC 同布局，用 RC codec；UD 由 `rdma_tb_dma` 按 `rdma_defs.svh` 字段直接解析。
-  RQ 外部 SGB：`rdma_create_qp_req.rq_sgb_backing`（默认 null 不启用，仅 RC 私有 RQ 且 max_recv_sge>2）
-  分配角色 `QP_RQ_SGB`（rq_depth×512，4KiB 取整）；post_recv 有效 SGE>2 时把描述符写入 index×512 槽，
-  RQE 的 SGB_PA 指向该槽（与 SQ 一致使用设备 DMA 地址），recovery 重放时重写该槽。NIC 读 SGB 后用
-  `decode_with_sgb_descriptor_bytes` 解码（RQE 签名覆盖 SGB 内容）。
-- **地址转换**：key 高 24 位为 MR local ID，经 `lookup_local_resource(owner, MR, id)`
-  取 MR，校验低 8 位 key、范围与访问权限，DMA 偏移 = va − backing mapping.iova。
-- **报文**：`rdma_packet` 增加 segment（ONLY/FIRST/MIDDLE/LAST）和结构化扩展头
-  （RETH、AETH、ImmDt、AtomicETH、AtomicAckETH），`pack_headers()/unpack_headers()`
-  与 `header_bytes` 互转，net_packet adapter 只负责 BTH opcode 与字节搬运。
-- **PSN/ACK**：每 QP 维护 send PSN 与 expected PSN；RC 每条消息最后一个包后回 ACK，
-  READ 以 READ RESPONSE FIRST/MIDDLE/LAST/ONLY 返回，ATOMIC 以 ATOMIC ACK 返回原值。
-  key/范围/权限错误时回 NAK（remote access error），请求方 CQE 带错误 ecode。
-- **CQE**：沿用 `queue_data_engine.publish_cqe`（设备侧生产者接口），polarity 取自
-  `query_runtime_producer_polarity`。
+- **节点配置** `rdma_tb_node_cfg`：MAC、`rdma_dev`、`rdma_drv_dev`、CQ、QP 连接表（本地 QP →
+  对端节点/QP 下标）、数据 MR（`rdma_drv_mr`，覆盖整个 `data_buf`，VA = IOVA）、MTU、UD Q_Key。
+- **投递**：driver 把源数据写入 `data_buf`，按 `rdma_drv_wr` 填 64B WQE（inline/SGE/SGB、签名、
+  polarity）并按 `hw_drop_db_cnt` 规则敲 SQ doorbell；RECV 写 RQE、shadow PI 与 RQ doorbell。
+- **设备 TX**（`rdma_dev_nic`）：SQ doorbell → 从 QPC 的 SQ PBA/OM 读 SQE → 校验签名 → MRT 校验
+  （key、状态、PD、权限、范围，PBL 模式 0/1/2）→ DMA 读 → 按 PMTU 分段发包；RC 等 ACK、READ 响应
+  或 ATOMIC ACK 后写 SQ CQE；drain 后回写 `hw_drop_db_cnt`。
+- **设备 RX**：SEND 取 RQE（shadow PI）散写，WRITE 按 RETH/rkey 写入（WRITE_IMM 消费 RQE），
+  READ 读出回包，ATOMIC 读改写；RC 响应的目的 QPN 取自本端 QPC（BTH 不带源 QPN）。
+  访问错误回 NAK，请求方 CQE 带错误 ecode。
+- **完成**：设备按 CQC 写 32B CQE（polarity），CQ armed 时写 CEQE；驱动 `poll_cq` 按 WQE_INDEX
+  回查 wr_id 并更新 shadow CI。
 
-## 4. 验收
+## 3. 验收
 
-- core suite 新增 `rdma_tb_flow_test`：两节点、mock host_mem、loopback wire，跑
-  SEND/RECV（含跨 MTU 多包）、WRITE(+IMM)、READ、CMP_SWAP、FETCH_ADD 与 rkey 错误场景，
-  记分板零错误且内存逐字节一致。
-- e2e suite 新增 `rdma_tb_e2e_test`：真实 host_mem + net_packet 帧编解码 wire，同一组 sequence。
+- core：`rdma_drv_data_test`（两节点、逐项操作与 CQ arm 事件）、`rdma_tb_flow_test`（mock host_mem，
+  loopback wire，完整流量序列）。
+- e2e：`rdma_tb_e2e_test`：真实 host_mem + net_packet RoCEv2 帧编解码 wire，同一组 sequence。
+- 传输矩阵：RC/UD（qp_index 0/1）。状态：两项均通过（28 项检查零错误）。
 
-- 传输矩阵：每节点 RC/UD/URC 三个 QP（qp_index 0/1/2）。URC 发出即完成，UD 单包且 RQ CQE 用 RQ/SRFQ
-  overlay（engine 约束，不携带源 QPN），接收 buffer 不预留 GRH。
+## 4. 后续
 
-状态：两项均已通过（33 项检查零错误）。
-
-## 5. 后续
-
-UD GRH/Q_Key 校验、PSN 乱序重传、RNR 重试、AEQE 错误上报、接入 DUT（NIC 模型退为预测器）。
+URC（驱动与设备）、SRQ 接收、CQ resize、AEQE 错误上报、flush、UD GRH/Q_Key 校验、
+PSN 乱序重传、RNR 重试、接入 DUT。

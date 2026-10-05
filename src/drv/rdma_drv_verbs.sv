@@ -305,6 +305,79 @@ class rdma_drv_cq extends uvm_object;
     dev.cq_table.delete(cqn);
   endtask
 
+  // 功能：xtrdma_ib_resize_cq（内核）：cqe 小于当前 ibcq.cqe 拒绝、相等直接返回；n=roundup_pow2(cqe*2)，
+  //   新缓冲按 init_resize_cq_polarity 初始化（[0..CI] 为当前 polarity，其后取反），CQC_RESIZE 携带新
+  //   PBA/尺寸/OM 与旧 CI/CI_WRAP；随后 copy_resize_cqes：从旧 CI 起把未消费 CQE 复制到新缓冲 CI+1 起
+  //   （源下标 ≥ 旧尺寸的翻转 polarity），直到遇到 RESIZE CQE；tail = ci_wrap*n + CI + 1，换用新缓冲。
+  // 输入/输出及副作用：分配新缓冲、下发命令、释放旧缓冲；更新 size/tail。
+  // 失败/边界：参数非法返回 INVALID_ARGUMENT；命令失败释放新缓冲并返回错误；未找到 RESIZE CQE 返回
+  //   INVALID_STATE（驱动的 "Ring wraped"）。
+  task resize(rdma_drv_dev dev, int unsigned cqe, output rdma_status status);
+    rdma_drv_kbuf new_buf;
+    rdma_bytes_t init;
+    rdma_bytes_t sqe;
+    rdma_bytes_t cqe_bytes;
+    rdma_bytes_t entry;
+    int unsigned n;
+    int unsigned old_ci;
+    longint unsigned ci;
+
+    status = rdma_status::success();
+    if (cqe < size / 2) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "CQ depth reduction is unsupported");
+      return;
+    end
+    if (cqe == size / 2)
+      return;
+    n = 1 << $clog2(cqe * 2);
+    old_ci = tail % size;
+    new_buf = rdma_drv_kbuf::type_id::create("cq_resize_buf");
+    status = new_buf.alloc(dev.hw, n * CQE_BYTES, 1'b1, dev.cfg.vf_id);
+    if (!status.ok())
+      return;
+    init = rdma_be::zeros(n * CQE_BYTES);
+    for (int unsigned i = 0; i < n; i++)
+      init[i * CQE_BYTES][7] = (i <= old_ci) ? polarity : !polarity;
+    status = new_buf.write(dev.hw, 0, init);
+    if (status.ok()) begin
+      sqe = rdma_drv_cmq::new_sqe(RDMA_OP_CQC_RESIZE);
+      `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQN, cqn)
+      `RDMA_DRV_SET(sqe, RDMA_CQC_RESIZE_CQ_SD_OR_PD_PBA, new_buf.base_iova() >> 12)
+      `RDMA_DRV_SET(sqe, RDMA_CQC_RESIZE_CQ_SIZE, $clog2(n))
+      `RDMA_DRV_SET(sqe, RDMA_CQC_RESIZE_CQ_OM, new_buf.alloc_type)
+      `RDMA_DRV_SET(sqe, RDMA_CQC_RESIZE_LOAD_CQ_CI_TH, 2)
+      `RDMA_DRV_SET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI_WRAP, ci_wrap)
+      `RDMA_DRV_SET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI, old_ci)
+      dev.cmq.exec(sqe, cqe_bytes, status);
+    end
+    if (!status.ok()) begin
+      void'(new_buf.free(dev.hw));
+      return;
+    end
+    ci = old_ci;
+    forever begin
+      status = mem_kbuf.read(dev.hw, (ci % size) * CQE_BYTES, CQE_BYTES, entry);
+      if (!status.ok())
+        return;
+      if (rdma_be::field(entry, RDMA_CQE_RESIZE_CQE_WORD_BYTE_OFFSET, RDMA_CQE_RESIZE_CQE_LSB, 1))
+        break;
+      if (ci >= size)
+        entry[0][7] = !entry[0][7];
+      status = new_buf.write(dev.hw, ((ci + 1) % n) * CQE_BYTES, entry);
+      if (!status.ok())
+        return;
+      ci++;
+      if (ci % size == old_ci) begin
+        status = rdma_status::make(RDMA_SC_INVALID_STATE, "resize CQE not found in the old CQ");
+        return;
+      end
+    end
+    void'(mem_kbuf.free(dev.hw));
+    mem_kbuf = new_buf;
+    size = n;
+    tail = longint'(ci_wrap) * n + old_ci + 1;
+  endtask
+
   // 功能：xtrdma_uk_cq_request_notification：比较 shadow 中硬件记录的 ARM_SN 与本地 arm_sn，
   //   已武装同级事件则跳过；否则写 shadow arm 字节并敲 CQ doorbell（ARM、ST、SN、CI、CQN）。
   // 输入/输出及副作用：写 shadow、doorbell。
@@ -361,10 +434,11 @@ class rdma_drv_srq extends uvm_object;
   rdma_drv_kbuf srfq_kbuf;
   rdma_drv_dma ctx_page;
   int unsigned ctx_offset;
-  // post_srq_recv 状态：WQE 槽位图、SRFQ 生产者计数与 polarity、wr_id。
+  // post_srq_recv 状态：WQE 槽位图、SRFQ 生产者/消费者计数与 polarity、wr_id。
   bit slot_used[];
   int unsigned next_slot;
   longint unsigned pi;
+  longint unsigned tail;
   bit polarity;
   longint unsigned wr_ids[];
 
@@ -379,6 +453,7 @@ class rdma_drv_srq extends uvm_object;
     arm_sn = 0;
     next_slot = 0;
     pi = 0;
+    tail = 0;
     polarity = 1'b0;
   endfunction
 

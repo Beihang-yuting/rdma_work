@@ -77,6 +77,10 @@ class rdma_dev_nic extends uvm_object;
   // 设备保存的 CQC 从 SQE 字节 8 起、EQC 从 SQE 字节 16 起。
   localparam int unsigned CQC_BASE = 8;
   localparam int unsigned EQC_BASE = 16;
+  // SRFQC 从 SQE 字节 16 起；SRQ shadow 在 context 页 + (srqn%128)*32 + 28。
+  localparam int unsigned SRQC_BASE = 16;
+  localparam int unsigned SRQ_CTX_BYTES = 32;
+  localparam int unsigned SRQ_SHADOW_OFFSET = 28;
 
   rdma_dev_cmq ctx;
   rdma_host_mem_api host_mem;
@@ -86,6 +90,7 @@ class rdma_dev_nic extends uvm_object;
   protected longint unsigned cq_pi[int unsigned];
   protected int unsigned cq_armed[int unsigned];
   protected longint unsigned eq_pi[int unsigned];
+  protected longint unsigned srq_ci[int unsigned];
   protected mailbox #(int unsigned) sq_kicks;
   protected mailbox #(rdma_packet) rx_mb;
   // 观测：设备检测到的协议错误（签名、地址翻译、超时等）。
@@ -112,6 +117,7 @@ class rdma_dev_nic extends uvm_object;
     cq_pi.delete();
     cq_armed.delete();
     eq_pi.delete();
+    srq_ci.delete();
     errors.delete();
   endfunction
 
@@ -822,6 +828,10 @@ class rdma_dev_nic extends uvm_object;
     if (src_qpn != 0) begin
       `RDMA_BE_SET(cqe, RDMA_CQE_UD_SRC_QPN, src_qpn)
     end
+    if (rq && `RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ)) begin
+      `RDMA_BE_SET(cqe, RDMA_CQE_SRFQ, 1)
+      `RDMA_BE_SET(cqe, RDMA_CQE_SRFQN, `RDMA_QPC(qpn, RDMA_QPC_RC_SRFQN))
+    end
     if (!dma_write(slot, cqe)) begin
       protocol_error($sformatf("CQ %0d CQE write failed", cqn));
       return;
@@ -832,6 +842,48 @@ class rdma_dev_nic extends uvm_object;
       write_ceqe(cqn, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE));
     end
   endtask
+
+  // 功能：CQC_RESIZE 的数据面部分（命令完成前执行）：在旧 CQ 的当前 PI 槽写 RESIZE CQE（不推进 PI），
+  //   未被驱动消费的 CQE 数 pending = PI - (OLD_CI_WRAP*old + OLD_CI)（模 2*old）；驱动把它们复制到
+  //   新 CQ 的 OLD_CI+1 起，故新生产者位置 = OLD_CI_WRAP*new + OLD_CI + 1 + pending。
+  // 输入/输出及副作用：DMA 写旧 CQ；更新 cq_pi。
+  // 失败/边界：CQ 不存在或旧缓冲不可翻译时报告协议错误。
+  function void resize_cq(int unsigned cqn, byte unsigned sqe[]);
+    rdma_dev_object cqc;
+    int unsigned old_size;
+    int unsigned new_size;
+    longint unsigned pi;
+    longint unsigned consumed;
+    longint unsigned pending;
+    bit [63:0] slot;
+    rdma_bytes_t cqe;
+    rdma_status status;
+
+    if (!ctx.lookup(RDMA_DEV_CQ, cqn, cqc)) begin
+      protocol_error($sformatf("resize of absent CQ %0d", cqn));
+      return;
+    end
+    old_size = 1 << `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_SIZE, CQC_BASE);
+    new_size = 1 << `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_CQ_SIZE);
+    if (!cq_pi.exists(cqn))
+      cq_pi[cqn] = 0;
+    pi = cq_pi[cqn];
+    status = ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
+                             `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
+                             (pi % old_size) * CQE_BYTES, slot);
+    cqe = rdma_be::zeros(CQE_BYTES);
+    `RDMA_BE_SET(cqe, RDMA_CQE_POLARITY, !((pi / old_size) & 1))
+    `RDMA_BE_SET(cqe, RDMA_CQE_RESIZE_CQE, 1)
+    if (!status.ok() || !dma_write(slot, cqe)) begin
+      protocol_error($sformatf("CQ %0d resize CQE write failed", cqn));
+      return;
+    end
+    consumed = `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI_WRAP) * old_size +
+               `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI);
+    pending = (pi + 2 * old_size - consumed) % (2 * old_size);
+    cq_pi[cqn] = `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI_WRAP) * new_size +
+                 `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI) + 1 + pending;
+  endfunction
 
   // 功能：向 CEQ 写一个 16B CEQE（CQN，polarity 首圈为 1）。
   // 输入/输出及副作用：DMA 写 CEQ。
@@ -907,6 +959,8 @@ class rdma_dev_nic extends uvm_object;
     index = 0;
     wrap = 1'b0;
     sges.delete();
+    if (`RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ))
+      return fetch_srqe(qpn, `RDMA_QPC(qpn, RDMA_QPC_RC_SRFQN), index, wrap, sges);
     if (!dma_read(qp_shadow(qpn) + 6, 2, shadow) || !wq_slot(qpn, 1'b1, rt.rq_ci, slot, depth))
       return 1'b0;
     pi = {shadow[0], shadow[1]};
@@ -937,6 +991,61 @@ class rdma_dev_nic extends uvm_object;
       end
     end
     parse_sges(area, sge_num, sges);
+    return 1'b1;
+  endfunction
+
+  // 功能：从 SRQ 的 SRFQ 环取下一个 RQE：SRQ shadow 的 be16 PI|wrap<<15 与设备 SRQ CI 比较判断
+  //   可用，校验 polarity，解析 WQE 内 SGE。
+  // 输入/输出及副作用：推进该 SRQ 的 CI；index/wrap 输出 RQE 头中的 INDEX（驱动 bitmap 槽）/WRAP。
+  // 失败/边界：无可用 RQE 或校验失败返回 0；SGE>2（SRQ SGB）未建模，报告协议错误。
+  protected function bit fetch_srqe(int unsigned qpn, int unsigned srqn,
+                                    output int unsigned index, output bit wrap,
+                                    output bit [63:0] sges[$]);
+    rdma_dev_object srqc;
+    rdma_bytes_t shadow;
+    rdma_bytes_t rqe;
+    bit [63:0] shadow_pa;
+    bit [63:0] slot;
+    bit [15:0] pi;
+    int unsigned depth;
+    longint unsigned ci;
+    rdma_status status;
+
+    index = 0;
+    wrap = 1'b0;
+    sges.delete();
+    if (!ctx.lookup(RDMA_DEV_SRQ, srqn, srqc)) begin
+      protocol_error($sformatf("QP %0d uses absent SRQ %0d", qpn, srqn));
+      return 1'b0;
+    end
+    if (!srq_ci.exists(srqn))
+      srq_ci[srqn] = 0;
+    ci = srq_ci[srqn];
+    depth = 1 << `RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_SIZE, SRQC_BASE);
+    shadow_pa = (`RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SHADOW_PA, SRQC_BASE) << 12) +
+                (srqn % 128) * SRQ_CTX_BYTES + SRQ_SHADOW_OFFSET;
+    if (!dma_read(shadow_pa, 2, shadow))
+      return 1'b0;
+    pi = {shadow[0], shadow[1]};
+    if (pi[14:0] == ci % depth && pi[15] == ((ci / depth) & 1))
+      return 1'b0;
+    status = ctx.buffer_addr(`RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_OM, SRQC_BASE),
+                             `RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_PBA, SRQC_BASE),
+                             (ci % depth) * RDMA_RQE_BYTES, slot);
+    if (!status.ok() || !dma_read(slot, RDMA_RQE_BYTES, rqe))
+      return 1'b0;
+    if (rdma_be::field(rqe, 0, RDMA_RQE_VALID_LSB, 1) != !((ci / depth) & 1)) begin
+      protocol_error($sformatf("SRQ %0d RQE polarity does not match the posted PI", srqn));
+      return 1'b0;
+    end
+    if (`RDMA_BE_GET(rqe, RDMA_RQE_SGE_NUM) > 2) begin
+      protocol_error($sformatf("SRQ %0d RQE uses an SGB, which is not modeled", srqn));
+      return 1'b0;
+    end
+    srq_ci[srqn] = ci + 1;
+    index = `RDMA_BE_GET(rqe, RDMA_RQE_INDEX);
+    wrap = `RDMA_BE_GET(rqe, RDMA_RQE_WRAP);
+    parse_sges(rdma_be::slice(rqe, PAYLOAD_OFFSET, 32), `RDMA_BE_GET(rqe, RDMA_RQE_SGE_NUM), sges);
     return 1'b1;
   endfunction
 

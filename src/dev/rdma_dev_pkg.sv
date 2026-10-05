@@ -12,6 +12,8 @@ package rdma_dev_pkg;
   import rdma_codec_pkg::*;
   import rdma_adapter_pkg::*;
 
+  typedef class rdma_dev_nic;
+
   `include "rdma_dev_cmq.sv"
   `include "rdma_dev_nic.sv"
   `include "rdma_dev.sv"

@@ -47,6 +47,8 @@ class rdma_dev_cmq extends uvm_object;
   localparam int unsigned EQ_CTX_OFFSET = 16;
   localparam int unsigned EQ_CTX_BYTES = 32;
 
+  // 数据面：CQC_RESIZE 需在命令完成前由 NIC 在旧 CQ 写 RESIZE CQE 并切换生产者位置。
+  rdma_dev_nic nic;
   protected rdma_host_mem_api host_mem;
   protected bit [63:0] sq_pa;
   protected bit enabled;
@@ -510,13 +512,35 @@ class rdma_dev_cmq extends uvm_object;
     end
     case (opcode)
       RDMA_OP_CQC_MODIFY: obj.modify_word = rdma_be::qword(sqe, 0);
-      RDMA_OP_CQC_RESIZE: obj.resize_sqe = sqe;
+      RDMA_OP_CQC_RESIZE: begin
+        obj.resize_sqe = sqe;
+        resize_cq(cqn, obj, sqe);
+      end
       RDMA_OP_CQC_QUERY: begin
         foreach (obj.bytes[i])
           cqe[CQC_QUERY_OFFSET + i] = obj.bytes[i];
       end
       default: objects[RDMA_DEV_CQ].delete(cqn);
     endcase
+  endfunction
+
+  // 功能：CQC_RESIZE：NIC 先在旧 CQ 写 RESIZE CQE 并把生产者位置接到新 CQ，再把 CQC 的
+  //   CUR_CQ_PD_PBA/CQ_SIZE/CQ_OM 改为命令中的新值。
+  // 输入/输出及副作用：修改 obj.bytes；经 NIC DMA 写旧 CQ。
+  // 失败/边界：未接 NIC（纯控制面测试）时只更新 CQC。
+  protected function void resize_cq(int unsigned cqn, rdma_dev_object obj, byte unsigned sqe[]);
+    if (nic != null)
+      nic.resize_cq(cqn, sqe);
+    rdma_be::set_field(obj.bytes,
+                       RDMA_CQC_BODY_CUR_CQ_PD_PBA_WORD_BYTE_OFFSET - CQC_QUERY_OFFSET,
+                       RDMA_CQC_BODY_CUR_CQ_PD_PBA_LSB, RDMA_CQC_BODY_CUR_CQ_PD_PBA_WIDTH,
+                       `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_CQ_SD_OR_PD_PBA));
+    rdma_be::set_field(obj.bytes, RDMA_CQC_BODY_CQ_SIZE_WORD_BYTE_OFFSET - CQC_QUERY_OFFSET,
+                       RDMA_CQC_BODY_CQ_SIZE_LSB, RDMA_CQC_BODY_CQ_SIZE_WIDTH,
+                       `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_CQ_SIZE));
+    rdma_be::set_field(obj.bytes, RDMA_CQC_BODY_CQ_OM_WORD_BYTE_OFFSET - CQC_QUERY_OFFSET,
+                       RDMA_CQC_BODY_CQ_OM_LSB, RDMA_CQC_BODY_CQ_OM_WIDTH,
+                       `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_CQ_OM));
   endfunction
 
   // 功能：CEQ/AEQ 命令：context 在 SQE/CQE 字节 16..47，EQN 在 qword0 低 12 位。

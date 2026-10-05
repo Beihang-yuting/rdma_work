@@ -20,6 +20,7 @@ class rdma_dev extends uvm_object;
     cmq = rdma_dev_cmq::type_id::create({name, "_cmq"});
     nic = rdma_dev_nic::type_id::create({name, "_nic"});
     nic.ctx = cmq;
+    cmq.nic = nic;
   endfunction
 
   // 功能：绑定设备 DMA 使用的主机内存并复位。

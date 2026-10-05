@@ -485,6 +485,82 @@ class rdma_drv_wr extends uvm_object;
     dev.hw.notify(RDMA_DB_RQ_OFFSET, db, status);
   endtask
 
+  // 功能：xtrdma_post_srq_recv（单个 WR）：get_srq_wqe 从 next_slot 起轮转取空闲槽（bitmap），SGE
+  //   写入 WQE 字节 32 起，+8 TPL，SRFQ 首槽翻转 polarity，头 QPN=SRQN|QP_SN|RQ_WQE|IDX=槽|WRAP|VALID，
+  //   写入 SRQ 缓冲槽并复制到 SRFQ 环 PI 槽；PI++，shadow（context+28）写 be16(wrap<<15|PI)，
+  //   敲 SRFQ doorbell（LIMIT_INVLD|WRAP|PI|SRFQN）。
+  // 输入/输出及副作用：写 SRQ/SRFQ/shadow/doorbell；推进 pi。
+  // 失败/边界：SGE>2（SRQ SGB）未建模返回 INVALID_ARGUMENT；SRFQ 或槽位满返回 QUEUE_FULL。
+  static task post_srq_recv(rdma_drv_dev dev, rdma_drv_srq srq, rdma_drv_recv_wr wr,
+                            output rdma_status status);
+    rdma_bytes_t wqe;
+    rdma_bytes_t data;
+    rdma_bytes_t half;
+    bit [63:0] hdr;
+    bit [63:0] db;
+    int unsigned idx;
+    int unsigned slot;
+    longint unsigned payload;
+    bit [15:0] pi;
+    bit found;
+
+    data = sge_descriptors(wr.sges);
+    if (data.size() / SGE_BYTES > S_SGE_MAX) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SRQ SGB is not modeled");
+      return;
+    end
+    found = 1'b0;
+    for (int unsigned k = 0; k < srq.depth && !found; k++) begin
+      idx = (srq.next_slot + k) % srq.depth;
+      found = !srq.slot_used[idx];
+    end
+    if (!found || srq.pi - srq.tail >= srq.depth) begin
+      status = rdma_status::make(RDMA_SC_QUEUE_FULL, "shared receive queue is full");
+      return;
+    end
+    srq.next_slot = (idx + 1) % srq.depth;
+    wqe = rdma_be::zeros(RDMA_RQE_BYTES);
+    foreach (data[i])
+      wqe[PAYLOAD_OFFSET + i] = data[i];
+    payload = 0;
+    foreach (wr.sges[i])
+      payload += wr.sges[i].length;
+    slot = srq.pi % srq.depth;
+    if (slot == 0)
+      srq.polarity = !srq.polarity;
+    `RDMA_DRV_SET(wqe, RDMA_RQE_PAYLOAD_LEN, payload)
+    `RDMA_DRV_SET(wqe, RDMA_RQE_SGE_NUM, data.size() / SGE_BYTES)
+    hdr = '0;
+    hdr[RDMA_RQE_QPN_LSB +: RDMA_RQE_QPN_WIDTH] = srq.srqn;
+    hdr[RDMA_RQE_QP_SN_LSB +: RDMA_RQE_QP_SN_WIDTH] = srq.srq_sn;
+    hdr[RDMA_RQE_OPCODE_LSB +: RDMA_RQE_OPCODE_WIDTH] = RQE_OPCODE;
+    hdr[RDMA_RQE_INDEX_LSB +: RDMA_RQE_INDEX_WIDTH] = idx;
+    hdr[RDMA_RQE_WRAP_LSB] = (srq.pi / srq.depth) & 1;
+    hdr[RDMA_RQE_VALID_LSB] = srq.polarity;
+    rdma_be::put_qword(wqe, 0, hdr);
+    status = srq.srq_kbuf.write(dev.hw, idx * RDMA_RQE_BYTES, wqe);
+    if (status.ok())
+      status = srq.srfq_kbuf.write(dev.hw, slot * RDMA_RQE_BYTES, wqe);
+    if (!status.ok())
+      return;
+    srq.slot_used[idx] = 1'b1;
+    srq.wr_ids[idx] = wr.wr_id;
+    srq.pi++;
+    pi = (srq.pi % srq.depth) | (((srq.pi / srq.depth) & 1) << 15);
+    half = rdma_be::zeros(2);
+    half[0] = pi[15:8];
+    half[1] = pi[7:0];
+    status = dev.hw.write(srq.ctx_page, srq.ctx_offset + rdma_drv_srq::SHADOW_OFFSET, half);
+    if (!status.ok())
+      return;
+    db = '0;
+    db[RDMA_NOTIFY_SRQ_LIMIT_INVALID_LSB] = 1'b1;
+    db[RDMA_NOTIFY_SRFQ_WRAP_LSB] = pi[15];
+    db[RDMA_NOTIFY_SRFQ_PI_LSB +: RDMA_NOTIFY_SRFQ_PI_WIDTH] = pi[14:0];
+    db[RDMA_NOTIFY_SRFQN_LSB +: RDMA_NOTIFY_SRFQN_WIDTH] = srq.srqn;
+    dev.hw.notify(RDMA_DB_SRFQ_OFFSET, db, status);
+  endtask
+
   // 功能：xtrdma_ib_poll_cq（普通 CQ）：取 polarity 匹配的 32B CQE，按 QPN 找 QP，按 WQE_INDEX 回查
   //   wr_id 并把 SQ/RQ 尾推进到该 WR 之后，映射 ecode 到 WC 状态；推进 CQ 尾（回绕翻转 polarity 与
   //   ci_wrap），最后把 be32(ci_wrap<<23|CI) 写入 CQ shadow（CQC+52）。
@@ -534,7 +610,14 @@ class rdma_drv_wr extends uvm_object;
       if (qp.qp_type == RDMA_DRV_QPT_UD)
         wc.src_qp = rdma_be::field(cqe, RDMA_CQE_UD_SRC_QPN_WORD_BYTE_OFFSET,
                                    RDMA_CQE_UD_SRC_QPN_LSB, RDMA_CQE_UD_SRC_QPN_WIDTH);
-      if (wc.is_recv) begin
+      if (wc.is_recv &&
+          rdma_be::field(cqe, RDMA_CQE_SRFQ_WORD_BYTE_OFFSET, RDMA_CQE_SRFQ_LSB, 1)) begin
+        // SRQ：IDX 为 SRQ 槽位图下标；释放槽位并推进 SRFQ 消费者计数。
+        wc.wr_id = qp.srq.wr_ids[idx % qp.srq.depth];
+        qp.srq.slot_used[idx % qp.srq.depth] = 1'b0;
+        qp.srq.tail++;
+      end
+      else if (wc.is_recv) begin
         wc.wr_id = qp.rq_wr_id[idx % qp.rq_depth];
         qp.rq_tail = qp.rq_ring_head[idx % qp.rq_depth];
       end
