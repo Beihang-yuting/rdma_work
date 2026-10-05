@@ -856,7 +856,6 @@ class rdma_queue_backing_planner extends uvm_object;
     rdma_queue_backing_slice page_slice;
     rdma_queue_backing_segment segment;
     rdma_dma_mapping segment_mapping;
-    uvm_object cloned_object;
     longint unsigned next_logical_offset;
     longint unsigned slice_relative_offset;
     longint unsigned page_end;
@@ -901,10 +900,7 @@ class rdma_queue_backing_planner extends uvm_object;
       end
       if (match_count != 1 || next_slice == null)
         return invalid_argument("borrowed queue segments are not contiguous");
-      cloned_object = next_slice.mapping.clone();
-      if (cloned_object == null ||
-          !$cast(segment_mapping, cloned_object) ||
-          segment_mapping == next_slice.mapping)
+      if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(next_slice.mapping, segment_mapping))
         return invalid_state("borrowed queue segment mapping clone failed");
       segment = rdma_queue_backing_segment::type_id::create(
         $sformatf("queue_borrowed_segment_%0d_%0d", ring.role,

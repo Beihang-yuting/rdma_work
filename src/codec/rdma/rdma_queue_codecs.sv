@@ -2686,7 +2686,6 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
     rdma_hw_sqe_model source;
     rdma_hw_sqe_model candidate;
     rdma_sqe_rc_ext ext;
-    uvm_object cloned_object;
     rdma_status s;
     rdma_sq_payload_mode_e mode;
     byte unsigned signature_sgb[$];
@@ -2696,8 +2695,7 @@ class rdma_hw_sqe_rc_codec extends rdma_hw_sqe_codec_base;
 
     if (!$cast(source, model))
       return err("RC SQE model type mismatch");
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(candidate, cloned_object))
+    if (!rdma_deep_copy#(rdma_hw_sqe_model)::try_of(source, candidate))
       return rdma_status::make(
           RDMA_SC_RESOURCE_EXHAUSTED,
           "RC SQE detached candidate allocation failed");

@@ -1093,7 +1093,6 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
     rdma_hw_cmq_completion completion;
     rdma_hw_cmq_completion payload;
     rdma_cmq_decoded_cqe candidate;
-    uvm_object cloned_object;
     bit completion_ready;
 
     ready = 1'b0;
@@ -1123,8 +1122,7 @@ class rdma_hw_cmq_hw_profile extends rdma_cmq_hw_profile;
       return status;
     if (command_status == null)
       return invalid_state("rdma error codec published null");
-    cloned_object = completion.clone();
-    if (cloned_object == null || !$cast(payload, cloned_object))
+    if (!rdma_deep_copy#(rdma_hw_cmq_completion)::try_of(completion, payload))
       return invalid_state("rdma completion payload clone failed");
 
     candidate = rdma_cmq_decoded_cqe::type_id::create("decoded_cqe");

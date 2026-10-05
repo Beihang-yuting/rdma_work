@@ -264,7 +264,6 @@ class rdma_abi_v5_api extends uvm_object;
     rdma_context_backing_api context_api = null,
     rdma_host_mem_api host_mem_api = null
   );
-    uvm_object cloned;
     rdma_function_binding configured;
     rdma_function_handle configured_handle;
     rdma_reset_epoch_t configured_epoch;
@@ -277,8 +276,7 @@ class rdma_abi_v5_api extends uvm_object;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "ABI source Function authority is invalid");
     configured_epoch = source.function_reset_epoch();
-    cloned = source.clone();
-    if (cloned == null || !$cast(configured, cloned))
+    if (!rdma_deep_copy#(rdma_function_binding)::try_of(source, configured))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "ABI source binding clone failed");
     binding = configured;

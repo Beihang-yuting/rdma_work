@@ -209,7 +209,6 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     output longint unsigned registration_id
   );
     registration_t registration;
-    uvm_object cloned;
     rdma_dma_mapping mapping_copy;
     longint unsigned mapping_last;
     longint unsigned other_last;
@@ -232,8 +231,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
         return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                  "mapping overlaps registration");
     end
-    cloned = mapping.clone();
-    if (cloned == null || !$cast(mapping_copy, cloned))
+    if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(mapping, mapping_copy))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "mapping clone failed");
 
@@ -332,7 +330,6 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
     rdma_function_handle function_copy;
     rdma_sge sge_copy;
     rdma_dma_mapping mapping_copy;
-    uvm_object cloned;
     bit found;
 
     candidate = null;
@@ -399,8 +396,7 @@ class rdma_host_mem_sq_payload_writer extends rdma_sq_payload_writer;
           return rdma_status::make_direct(
               RDMA_SC_INVALID_STATE,
               "receipt candidate mapping is null");
-        cloned = regs[j].mapping.clone();
-        if (cloned == null || !$cast(mapping_copy, cloned))
+        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(regs[j].mapping, mapping_copy))
           return rdma_status::make_direct(
               RDMA_SC_INVALID_STATE,
               "receipt candidate mapping snapshot failed");

@@ -268,7 +268,6 @@ class rdma_function_binding extends uvm_object;
   // clone/cast 失败返回 RESOURCE_EXHAUSTED。identity 发布后若 pcie==null，
   // 会通过 legacy factory 重建 PCIe 投影。
   function rdma_status configure_identity(rdma_function_identity source);
-    uvm_object cloned_object;
     rdma_function_identity configured;
     rdma_pcie_identity pcie_candidate;
     rdma_status status;
@@ -284,8 +283,7 @@ class rdma_function_binding extends uvm_object;
       );
     if (!status.ok())
       return status;
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(configured, cloned_object))
+    if (!rdma_deep_copy#(rdma_function_identity)::try_of(source, configured))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "Function identity clone failed");
     // PCIe identity 是同一 owner route 的兼容投影，不建立第二份 authority。

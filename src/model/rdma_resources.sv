@@ -166,13 +166,11 @@ function automatic rdma_status rdma_qp_partial_ref_status(
   string label
 );
   rdma_qp_backing_ref validation_ref;
-  uvm_object cloned_object;
   rdma_status status;
 
   if (backing_ref == null)
     return rdma_status::success();
-  cloned_object = backing_ref.clone();
-  if (cloned_object == null || !$cast(validation_ref, cloned_object))
+  if (!rdma_deep_copy#(rdma_qp_backing_ref)::try_of(backing_ref, validation_ref))
     return rdma_status::make(RDMA_SC_INVALID_STATE,
                              {label, " clone failed"});
   if (validation_ref.cleanup_complete) begin

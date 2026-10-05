@@ -106,7 +106,6 @@ package rdma_net_packet_adapter_pkg;
     // 输入/输出及副作用：identity（输入）；成功时克隆 identity 并替换本地快照，不修改输入对象。
     // 失败/边界：identity 为空、UID/generation/route 非法或 clone/cast 失败时保持旧快照并返回错误。
     function rdma_status configure_function(rdma_function_identity identity);
-      uvm_object cloned_object;
       rdma_function_identity candidate;
       rdma_status status;
 
@@ -119,9 +118,7 @@ package rdma_net_packet_adapter_pkg;
                rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "Function identity validation returned null") :
                status;
-      cloned_object = identity.clone();
-      if (cloned_object == null || !$cast(candidate, cloned_object) ||
-          candidate == identity)
+      if (!rdma_deep_copy#(rdma_function_identity)::try_of(identity, candidate))
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "Function identity clone failed");
       authority = candidate;
@@ -176,14 +173,12 @@ package rdma_net_packet_adapter_pkg;
     virtual function rdma_status configure_response_policy(
       rdma_net_response_policy policy
     );
-      uvm_object cloned_object;
       rdma_net_response_policy candidate;
 
       if (policy == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "network response policy is null");
-      cloned_object = policy.clone();
-      if (cloned_object == null || !$cast(candidate, cloned_object))
+      if (!rdma_deep_copy#(rdma_net_response_policy)::try_of(policy, candidate))
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "network response policy clone failed");
       response_policy = candidate;
@@ -207,14 +202,12 @@ package rdma_net_packet_adapter_pkg;
     // 输入/输出及副作用：fault（输入）；成功时替换 pending_fault 快照，不修改调用方故障对象。
     // 失败/边界：fault 为空或 clone/cast 失败时返回错误；不会部分注入故障。
     virtual function rdma_status inject_fault(rdma_net_fault fault);
-      uvm_object cloned_object;
       rdma_net_fault candidate;
 
       if (fault == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "network fault is null");
-      cloned_object = fault.clone();
-      if (cloned_object == null || !$cast(candidate, cloned_object))
+      if (!rdma_deep_copy#(rdma_net_fault)::try_of(fault, candidate))
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "network fault clone failed");
       pending_fault = candidate;
@@ -775,7 +768,6 @@ package rdma_net_packet_adapter_pkg;
     virtual task send_packet(rdma_packet packet, output rdma_status status);
       rdma_net_packet_adapter_pkg::packet net_value;
       rdma_packet observer_value;
-      uvm_object cloned_object;
       bit drop;
       bit corrupt;
       longint unsigned delay;
@@ -815,8 +807,7 @@ package rdma_net_packet_adapter_pkg;
       if (status == null || !status.ok())
         return;
       observer_value = rdma_packet::type_id::create("sent_observer_packet");
-      cloned_object = packet.clone();
-      if (cloned_object == null || !$cast(observer_value, cloned_object)) begin
+      if (!rdma_deep_copy#(rdma_packet)::try_of(packet, observer_value)) begin
         status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                    "sent observer packet clone failed");
         return;

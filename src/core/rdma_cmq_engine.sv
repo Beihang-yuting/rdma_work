@@ -3899,7 +3899,6 @@ class rdma_cmq_engine extends uvm_object;
     output rdma_cmq_ticket ticket
   );
     rdma_status status;
-    uvm_object cloned_object;
     rdma_cmq_ticket detached_ticket;
     rdma_cmq_ticket canonical_ticket;
     rdma_handle function_snapshot_base;
@@ -3941,10 +3940,7 @@ class rdma_cmq_engine extends uvm_object;
       ticket = null;
       return invalid_state("CMQ ticket validation failed");
     end
-    cloned_object = ticket.clone();
-    if (cloned_object == null ||
-        !$cast(detached_ticket, cloned_object) ||
-        detached_ticket == ticket ||
+    if (!rdma_deep_copy#(rdma_cmq_ticket)::try_of(ticket, detached_ticket) ||
         !same_ticket_value(detached_ticket, ticket) ||
         detached_ticket.function_h == ticket.function_h ||
         detached_ticket.cmq_h == ticket.cmq_h ||
@@ -4030,7 +4026,6 @@ class rdma_cmq_engine extends uvm_object;
     rdma_cmq_slot_record source,
     output rdma_cmq_slot_record snapshot
   );
-    uvm_object cloned_object;
     rdma_cmq_slot_record factory_snapshot;
     rdma_cmq_slot_record canonical_snapshot;
     rdma_cmq_ticket canonical_ticket;
@@ -4044,9 +4039,7 @@ class rdma_cmq_engine extends uvm_object;
     snapshot = null;
     if (source == null)
       return invalid_state("CMQ slot record source is null");
-    cloned_object = source.clone();
-    if (cloned_object == null || !$cast(factory_snapshot, cloned_object) ||
-        factory_snapshot == source) begin
+    if (!rdma_deep_copy#(rdma_cmq_slot_record)::try_of(source, factory_snapshot)) begin
       snapshot = null;
       return invalid_state("CMQ slot record snapshot clone contract failed");
     end

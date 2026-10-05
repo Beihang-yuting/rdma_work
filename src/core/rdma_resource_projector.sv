@@ -1642,7 +1642,6 @@ class rdma_resource_projector;
     rdma_mr result_mr;
     rdma_cq source_cq;
     rdma_cq result_cq;
-    uvm_object cloned_object;
     rdma_cqc_model cloned_cqc;
     rdma_qp source_qp;
     rdma_qp result_qp;
@@ -1800,9 +1799,8 @@ class rdma_resource_projector;
             source_cq.ceq_h, {copy_label, "_ceq"}, result_cq.ceq_h
           );
         if (status.ok() && source_cq.programmed_cqc != null) begin
-          cloned_object = source_cq.programmed_cqc.clone();
-          if (cloned_object == null || !$cast(cloned_cqc, cloned_object) ||
-              cloned_cqc == source_cq.programmed_cqc) begin
+          if (!rdma_deep_copy#(rdma_cqc_model)::try_of(
+                source_cq.programmed_cqc, cloned_cqc)) begin
             status = rdma_status::make(
               RDMA_SC_INVALID_STATE,
               {copy_label, " programmed CQC clone failed"}

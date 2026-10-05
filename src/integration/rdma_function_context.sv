@@ -236,7 +236,6 @@ class rdma_function_context extends uvm_object;
     rdma_function_context candidate_context;
     rdma_resource_manager manager;
     rdma_function_identity binding_identity;
-    uvm_object cloned_object;
     rdma_status status;
     rdma_reset_coordinator selected_coordinator;
     rdma_function_identity identities[$];
@@ -250,14 +249,12 @@ class rdma_function_context extends uvm_object;
     if (status == null || !status.ok() || !source_resources.is_frozen())
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "Function context snapshot invalid");
-    cloned_object = source_identity.clone();
-    if (cloned_object == null || !$cast(identity_copy, cloned_object))
+    if (!rdma_deep_copy#(rdma_function_identity)::try_of(source_identity, identity_copy))
       return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                "Function identity clone failed");
 
     if (source_binding != null) begin
-      cloned_object = source_binding.clone();
-      if (cloned_object == null || !$cast(binding_copy, cloned_object))
+      if (!rdma_deep_copy#(rdma_function_binding)::try_of(source_binding, binding_copy))
         return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
                                  "Function binding clone failed");
       binding_identity = binding_copy.identity_snapshot();
@@ -452,7 +449,6 @@ class rdma_function_context extends uvm_object;
     rdma_function_identity next_identity;
     rdma_function_binding next_binding;
     rdma_function_identity next_binding_identity;
-    uvm_object cloned_object;
     rdma_status status;
 
     candidate = null;
@@ -495,9 +491,7 @@ class rdma_function_context extends uvm_object;
         );
     end
     else begin
-      cloned_object = binding.clone();
-      if (cloned_object == null || !$cast(next_binding, cloned_object) ||
-          next_binding == binding)
+      if (!rdma_deep_copy#(rdma_function_binding)::try_of(binding, next_binding))
         return rdma_status::make(
           RDMA_SC_RESOURCE_EXHAUSTED,
           "reset binding clone failed"

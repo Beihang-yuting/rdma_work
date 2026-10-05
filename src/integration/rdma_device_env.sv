@@ -833,13 +833,11 @@ class rdma_device_env extends uvm_object;
   // 失败/边界：key 未枚举或 clone/cast 失败时返回 null；调用方不得把 null 当作有效身份。
   function rdma_function_identity get_identity(dpu_function_key_t key);
     rdma_function_identity copy;
-    uvm_object cloned_object;
     string key_name;
     key_name = dpu_function_key_name(key);
     if (!m_identities.exists(key_name))
       return null;
-    cloned_object = m_identities[key_name].clone();
-    if (cloned_object == null || !$cast(copy, cloned_object))
+    if (!rdma_deep_copy#(rdma_function_identity)::try_of(m_identities[key_name], copy))
       return null;
     return copy;
   endfunction

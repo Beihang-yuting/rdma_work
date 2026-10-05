@@ -406,9 +406,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
             spec.slices[i].role != role ||
             spec.slices[i].logical_queue_offset != covered)
           return invalid_argument("QP borrowed backing is not contiguous");
-        cloned = spec.slices[i].mapping.clone();
-        if (cloned == null || !$cast(mapping_clone, cloned) ||
-            mapping_clone == spec.slices[i].mapping)
+        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(spec.slices[i].mapping, mapping_clone))
           return invalid_state("QP borrowed segment clone failed");
         segment = rdma_queue_backing_segment::type_id::create("qp_borrowed_segment");
         if (segment == null) return rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED,
@@ -1351,7 +1349,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     rdma_status release_status;
     bit fresh_mapping;
     bit ambiguous;
-    uvm_object cloned;
 
     query_mapping = retained_mapping;
     presence = RDMA_HW_PRESENCE_UNKNOWN;
@@ -1471,8 +1468,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                "QP presence query", release_status,
                                release_complete);
       else begin
-        cloned = query_mapping.clone();
-        if (cloned == null || !$cast(release_probe, cloned)) begin
+        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(query_mapping, release_probe)) begin
           release_status = invalid_state(
             "QP retained presence query release probe clone failed");
           release_complete = 1'b0;
@@ -2249,7 +2245,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     rdma_hw_image image;
     rdma_resource published;
     uvm_object detached_object;
-    uvm_object cloned_binding_object;
     rdma_cmq_command_desc command;
     rdma_cmq_ticket ticket;
     rdma_cmq_ticket recovery_ticket;
@@ -2292,9 +2287,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     end
     status = live_binding_fence(binding, expected_owner);
     if (status.ok()) begin
-      cloned_binding_object = binding.clone();
-      if (cloned_binding_object == null ||
-          !$cast(binding_snapshot, cloned_binding_object) ||
+      if (!rdma_deep_copy#(rdma_function_binding)::try_of(binding, binding_snapshot) ||
           binding_snapshot.make_handle() == null ||
           !binding_snapshot.make_handle().same_instance(expected_owner))
         status = invalid_state("QP binding snapshot is invalid");
@@ -2772,13 +2765,11 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       return;
     end
     if (status.ok()) begin
-      cloned = authoritative.programmed_qpc.clone();
-      if (cloned == null || !$cast(prior_qpc, cloned))
+      if (!rdma_deep_copy#(rdma_qpc_model)::try_of(authoritative.programmed_qpc, prior_qpc))
         status = invalid_state("QP prior QPC clone failed");
     end
     if (status.ok()) begin
-      cloned = prior_qpc.clone();
-      if (cloned == null || !$cast(candidate_qpc, cloned))
+      if (!rdma_deep_copy#(rdma_qpc_model)::try_of(prior_qpc, candidate_qpc))
         status = invalid_state("QP candidate QPC clone failed");
       else begin
         candidate_qpc.state = request.new_state;
@@ -2929,8 +2920,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     end
     begin
       rdma_qp candidate;
-      cloned = authoritative.clone();
-      if (cloned == null || !$cast(candidate, cloned)) status = invalid_state("QP candidate resource clone failed");
+      if (!rdma_deep_copy#(rdma_qp)::try_of(authoritative, candidate))
+        status = invalid_state("QP candidate resource clone failed");
       else begin
         candidate.state = RDMA_RESOURCE_ACTIVE;
         candidate.qp_state = request.new_state;
@@ -3285,7 +3276,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     rdma_hw_presence_e query_presence;
     rdma_dma_mapping query_mapping;
     rdma_qp_ambiguous_operation_e reconciled_operation;
-    uvm_object cloned;
 
     result = rdma_control_result::type_id::create("qp_destroy_recover_result");
     result.transaction_id = transaction_id;
@@ -3308,8 +3298,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                         record.qp_recovery == null))
       status = invalid_state("QP destroy recovery record is missing");
     if (status.ok()) begin
-      cloned = record.qp_recovery.clone();
-      if (cloned == null || !$cast(recovery, cloned))
+      if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, recovery))
         status = invalid_state("QP destroy recovery snapshot clone failed");
     end
     if (status.ok() &&
@@ -3356,8 +3345,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         if (recovery.query_mapping != null) begin
           rdma_dma_mapping retained_probe;
           retained_probe = null;
-          cloned = recovery.query_mapping.clone();
-          if (cloned == null || !$cast(retained_probe, cloned)) begin
+          if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
+                recovery.query_mapping, retained_probe)) begin
             status = invalid_state(
               "QP persisted presence query release probe clone failed");
             query_release_complete = 1'b0;
@@ -3414,8 +3403,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
               recovery.query_mapping != null) begin
             rdma_dma_mapping malformed_probe;
             malformed_probe = null;
-            cloned = recovery.query_mapping.clone();
-            if (cloned == null || !$cast(malformed_probe, cloned)) begin
+            if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
+                  recovery.query_mapping, malformed_probe)) begin
               status = invalid_state(
                 "QP destroy malformed query release probe clone failed");
               query_release_complete = 1'b0;
@@ -3575,8 +3564,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
           status = normalize_status(manager.lookup_recovery(resource_h, record),
                                     "QP destroy recovery refresh returned null");
           if (status.ok() && record != null && record.qp_recovery != null) begin
-            cloned = record.qp_recovery.clone();
-            if (cloned == null || !$cast(recovery, cloned))
+            if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, recovery))
               status = invalid_state("QP destroy recovery refresh failed");
           end
         end
@@ -3596,8 +3584,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     // completion seal while leaving the persisted authority immutable.
     if (create_rollback && recovery.staging_mapping != null) begin
       staging_probe = null;
-      cloned = recovery.staging_mapping.clone();
-      if (cloned == null || !$cast(staging_probe, cloned)) begin
+      if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
+            recovery.staging_mapping, staging_probe)) begin
         status = invalid_state("QP create staging release probe clone failed");
         release_complete = 1'b0;
       end
@@ -3630,8 +3618,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     else if (!recovery.error_modify_complete) begin
       status = live_binding_fence(binding, expected_owner);
       if (status.ok()) begin
-        cloned = destroy_qpc.clone();
-        if (cloned == null || !$cast(error_qpc, cloned))
+        if (!rdma_deep_copy#(rdma_qpc_model)::try_of(destroy_qpc, error_qpc))
           status = invalid_state("QP destroy ERROR QPC clone failed");
         else begin
           error_qpc.state = RDMA_QPS_ERROR;
@@ -3703,8 +3690,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         status = normalize_status(manager.lookup_recovery(resource_h, record),
                                   "QP create absent flush refresh returned null");
         if (status.ok() && record != null && record.qp_recovery != null) begin
-          cloned = record.qp_recovery.clone();
-          if (cloned == null || !$cast(recovery, cloned)) begin
+          if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(
+                record.qp_recovery, recovery)) begin
             status = invalid_state("QP create absent flush refresh failed");
             break;
           end
@@ -3743,8 +3730,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       if (!status.ok()) break;
       status = manager.lookup_recovery(resource_h, record);
       if (status.ok() && record != null && record.qp_recovery != null) begin
-        cloned = record.qp_recovery.clone();
-        if (cloned == null || !$cast(recovery, cloned)) begin
+        if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(
+              record.qp_recovery, recovery)) begin
           status = invalid_state("QP destroy recovery flush refresh failed");
           break;
         end
@@ -3833,8 +3820,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         return;
       end
       if (record != null && record.qp_recovery != null) begin
-        cloned = record.qp_recovery.clone();
-        if (cloned == null || !$cast(recovery, cloned))
+        if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, recovery))
           status = invalid_state("QP destroy recovery context refresh failed");
       end
       if (!status.ok()) begin
@@ -3863,8 +3849,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       status = live_binding_fence(binding, expected_owner);
       if (status.ok()) begin
         probe = null;
-        cloned = refs[i].mapping.clone();
-        if (cloned == null || !$cast(probe, cloned))
+        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(refs[i].mapping, probe))
           status = invalid_state("QP destroy backing release probe clone failed");
         else
           release_mapping_fenced(binding, expected_owner, probe,
@@ -3880,8 +3865,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       if (!status.ok()) break;
       status = manager.lookup_recovery(resource_h, record);
       if (status.ok() && record != null && record.qp_recovery != null) begin
-        cloned = record.qp_recovery.clone();
-        if (cloned == null || !$cast(recovery, cloned)) begin
+        if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(
+              record.qp_recovery, recovery)) begin
           status = invalid_state("QP destroy recovery backing refresh failed");
           break;
         end
@@ -3947,7 +3932,6 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     bit query_unresolved;
     bit query_release_complete;
     bit query_mapping_retained;
-    uvm_object cloned;
     fresh_query_mapping = 1'b0;
     query_unresolved = 1'b0;
 
@@ -3974,8 +3958,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                         record.qp_recovery == null))
       status = invalid_state("QP recovery record is missing");
     if (status.ok()) begin
-      cloned = record.qp_recovery.clone();
-      if (cloned == null || !$cast(recovery, cloned))
+      if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, recovery))
         status = invalid_state("QP recovery snapshot clone failed");
     end
     // Let the destroy-style recipe own CREATE ambiguity as well.  It can
@@ -4020,8 +4003,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         // mapping, so completion remains durable while no public state is
         // mutated on the persisted recovery snapshot.
         query_release_probe = null;
-        cloned = recovery.query_mapping.clone();
-        if (cloned == null || !$cast(query_release_probe, cloned)) begin
+        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
+              recovery.query_mapping, query_release_probe)) begin
           status = invalid_state(
             "QP recovery malformed query release probe clone failed"
           );
@@ -4237,8 +4220,8 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                "QP recovery query", status,
                                release_complete);
       else begin
-        cloned = query_mapping.clone();
-        if (cloned == null || !$cast(query_release_probe, cloned)) begin
+        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
+              query_mapping, query_release_probe)) begin
           status = invalid_state("QP recovery query release probe clone failed");
           release_complete = 1'b0;
         end
@@ -4269,8 +4252,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
       // completion seal is shared by the probes and the retained mappings.
       if (staging != null) begin
         staging_release_probe = null;
-        cloned = staging.clone();
-        if (cloned == null || !$cast(staging_release_probe, cloned))
+        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(staging, staging_release_probe))
           status = invalid_state("QP recovery staging release probe clone failed");
         else
           release_mapping_fenced(binding, expected_owner,
@@ -4285,8 +4267,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                  release_complete);
         else begin
           query_release_probe = null;
-          cloned = query_mapping.clone();
-          if (cloned == null || !$cast(query_release_probe, cloned))
+          if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(query_mapping, query_release_probe))
             status = invalid_state("QP recovery query release probe clone failed");
           else
             release_mapping_fenced(binding, expected_owner,
@@ -4305,8 +4286,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     end
     if (status.ok()) begin
       rdma_qp replacement;
-      cloned = authoritative.clone();
-      if (cloned == null || !$cast(replacement, cloned))
+      if (!rdma_deep_copy#(rdma_qp)::try_of(authoritative, replacement))
         status = invalid_state("QP recovery resource clone failed");
       else begin
         replacement.state = RDMA_RESOURCE_ACTIVE;

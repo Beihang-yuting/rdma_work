@@ -1150,7 +1150,6 @@ class rdma_reset_coordinator extends uvm_object;
     rdma_function_identity staged_functions[string];
     rdma_reset_epoch_t staged_registration_epochs[string];
     rdma_function_identity snapshot;
-    uvm_object cloned_object;
     string name;
     bit input_seen[string];
     string input_uid_owner[string];
@@ -1287,8 +1286,7 @@ class rdma_reset_coordinator extends uvm_object;
         end
       end
 
-      cloned_object = identities[index].clone();
-      if (cloned_object == null || !$cast(snapshot, cloned_object))
+      if (!rdma_deep_copy#(rdma_function_identity)::try_of(identities[index], snapshot))
         return rdma_status::make(
           RDMA_SC_RESOURCE_EXHAUSTED,
           "reset coordinator Function identity clone failed"

@@ -22,4 +22,22 @@ class rdma_deep_copy #(type T = uvm_object);
       `uvm_fatal("RDMA_COPY_TYPE", what)
     return copy;
   endfunction
+
+  // 功能：非致命深拷贝：成功时 copy 为与 source 不同的同类型新对象并返回 1。
+  // 输入/输出及副作用：source 只读；copy 为输出副本，失败时为 null。
+  // 失败/边界：source 为 null、clone 返回 null、类型不符或返回源对象本身时返回 0，
+  //   由调用方决定错误码；不发布 UVM 报告。
+  static function bit try_of(T source, output T copy);
+    uvm_object cloned;
+
+    copy = null;
+    if (source == null)
+      return 1'b0;
+    cloned = source.clone();
+    if (cloned == null || !$cast(copy, cloned) || copy == source) begin
+      copy = null;
+      return 1'b0;
+    end
+    return 1'b1;
+  endfunction
 endclass

@@ -1207,7 +1207,6 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
     rdma_cq cq;
     rdma_hw_cqc_delete_body delete_body;
     rdma_cqc_model delete_context;
-    uvm_object cloned_object;
     rdma_status status;
 
     command = null;
@@ -1233,8 +1232,7 @@ class rdma_cq_lifecycle_policy extends rdma_queue_lifecycle_policy;
       if (!status.ok())
         return status;
 
-      cloned_object = delete_context.clone();
-      if (cloned_object == null || !$cast(delete_context, cloned_object) ||
+      if (!rdma_deep_copy#(rdma_cqc_model)::try_of(delete_context, delete_context) ||
           delete_context == cq.programmed_cqc)
         return invalid_state("CQC delete context clone failed");
 

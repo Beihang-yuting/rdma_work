@@ -234,7 +234,6 @@ package rdma_host_mem_adapter_pkg;
       rdma_host_mem_mapping candidate;
       rdma_function_handle function_copy;
       rdma_handle owner_copy;
-      uvm_object cloned_object;
 
       snapshot = null;
       if (allocation_identity == null)
@@ -254,9 +253,7 @@ package rdma_host_mem_adapter_pkg;
           "DMA mapping authority creation failed"
         );
 
-      cloned_object = function_h.clone();
-      if (cloned_object == null || !$cast(function_copy, cloned_object) ||
-          function_copy == function_h)
+      if (!rdma_deep_copy#(rdma_function_handle)::try_of(function_h, function_copy))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "DMA mapping Function clone failed");
       if (!function_copy.same_instance(function_h))
@@ -267,9 +264,7 @@ package rdma_host_mem_adapter_pkg;
 
       owner_copy = null;
       if (owner_h != null) begin
-        cloned_object = owner_h.clone();
-        if (cloned_object == null || !$cast(owner_copy, cloned_object) ||
-            owner_copy == owner_h)
+        if (!rdma_deep_copy#(rdma_handle)::try_of(owner_h, owner_copy))
           return rdma_status::make(RDMA_SC_INVALID_STATE,
                                    "DMA mapping owner clone failed");
         if (!owner_copy.same_instance(owner_h))
@@ -423,13 +418,11 @@ package rdma_host_mem_adapter_pkg;
     protected function rdma_function_handle clone_function_handle(
       rdma_function_handle source
     );
-      uvm_object cloned_object;
       rdma_function_handle result;
 
       if (source == null)
         return null;
-      cloned_object = source.clone();
-      if (cloned_object == null || !$cast(result, cloned_object))
+      if (!rdma_deep_copy#(rdma_function_handle)::try_of(source, result))
         return null;
       return result;
     endfunction
@@ -438,13 +431,11 @@ package rdma_host_mem_adapter_pkg;
     // 输入/输出及副作用：source（输入）；clone_owner_handle 读取 source 并使用字段 cloned_object；函数返回 rdma_handle，不取得调用方资源所有权。
     // 失败/边界：clone_owner_handle 输入对象为空或查找未命中时返回 null；该路径不隐式重试，也不转移未声明资源。
     protected function rdma_handle clone_owner_handle(rdma_handle source);
-      uvm_object cloned_object;
       rdma_handle result;
 
       if (source == null)
         return null;
-      cloned_object = source.clone();
-      if (cloned_object == null || !$cast(result, cloned_object))
+      if (!rdma_deep_copy#(rdma_handle)::try_of(source, result))
         return null;
       return result;
     endfunction

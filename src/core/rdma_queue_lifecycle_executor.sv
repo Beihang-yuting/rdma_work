@@ -166,7 +166,6 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_cq cq;
     rdma_cqc_model cqc;
     rdma_cqc_model cloned_cqc;
-    uvm_object cloned_object;
     rdma_status status;
 
     if (!$cast(cq, resource) || !$cast(cqc, context_model))
@@ -176,9 +175,7 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     if (status == null || !status.ok())
       return normalize_status(status, "CQ context snapshot validation failed");
 
-    cloned_object = cqc.clone();
-    if (cloned_object == null || !$cast(cloned_cqc, cloned_object) ||
-        cloned_cqc == cqc)
+    if (!rdma_deep_copy#(rdma_cqc_model)::try_of(cqc, cloned_cqc))
       return invalid_state("CQ context snapshot clone failed");
 
     cq.programmed_cqc = cloned_cqc;
@@ -325,14 +322,11 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_ceq ceq;
     rdma_handle projected_ceq;
     rdma_status status;
-    uvm_object cloned_object;
 
     builder_resource = null;
     if (!$cast(cq, authoritative))
       return invalid_argument("CQ builder projection requires a CQ");
-    cloned_object = cq.clone();
-    if (cloned_object == null || !$cast(builder_cq, cloned_object) ||
-        builder_cq == cq)
+    if (!rdma_deep_copy#(rdma_cq)::try_of(cq, builder_cq))
       return invalid_state("CQ builder projection clone failed");
     if (cq.ceq_h != null) begin
       status = normalize_status(manager.lookup(cq.ceq_h, dependency_resource),
@@ -365,14 +359,11 @@ class rdma_queue_lifecycle_executor extends uvm_object;
     rdma_pd pd;
     rdma_handle projected_pd;
     rdma_status status;
-    uvm_object cloned_object;
 
     builder_resource = null;
     if (!$cast(srq, authoritative) || srq.pd_h == null)
       return invalid_argument("SRQ builder projection requires SRQ PD");
-    cloned_object = srq.clone();
-    if (cloned_object == null || !$cast(builder_srq, cloned_object) ||
-        builder_srq == srq)
+    if (!rdma_deep_copy#(rdma_srq)::try_of(srq, builder_srq))
       return invalid_state("SRQ builder projection clone failed");
     status = normalize_status(manager.lookup(srq.pd_h, dependency_resource),
                               "SRQ PD lookup returned null");

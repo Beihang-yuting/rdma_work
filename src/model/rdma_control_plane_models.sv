@@ -541,7 +541,6 @@ class rdma_qp_recovery_state extends uvm_object;
   virtual function rdma_status validate();
     rdma_status status;
     rdma_qp_backing_plan validation_plan;
-    uvm_object cloned_plan_object;
     rdma_handle recovery_qp_h;
     rdma_function_handle recovery_owner;
     bit preprogram_publication;
@@ -703,9 +702,7 @@ class rdma_qp_recovery_state extends uvm_object;
         RDMA_SC_INVALID_STATE,
         "non-URC QP recovery has URC backing progress"
       );
-    cloned_plan_object = qp_plan.clone();
-    if (cloned_plan_object == null ||
-        !$cast(validation_plan, cloned_plan_object))
+    if (!rdma_deep_copy#(rdma_qp_backing_plan)::try_of(qp_plan, validation_plan))
       return rdma_status::make(RDMA_SC_INVALID_STATE,
                                "QP recovery plan clone failed");
     // 进度位只能由对应 ref 授权；缺失的可选 SQ-SGB 不能伪造完成进度。
