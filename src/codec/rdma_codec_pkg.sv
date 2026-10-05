@@ -9,6 +9,7 @@ package rdma_codec_pkg;
   import rdma_model_pkg::*;
   `include "uvm_macros.svh"
   `include "rdma/rdma_defs.svh"
+  `include "rdma/rdma_be_bytes.sv"
 
   typedef enum bit [1:0] {
     RDMA_CQE_32B = 2'd0,

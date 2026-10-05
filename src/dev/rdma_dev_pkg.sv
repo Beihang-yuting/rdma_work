@@ -13,4 +13,5 @@ package rdma_dev_pkg;
   import rdma_adapter_pkg::*;
 
   `include "rdma_dev_cmq.sv"
+  `include "rdma_dev.sv"
 endpackage

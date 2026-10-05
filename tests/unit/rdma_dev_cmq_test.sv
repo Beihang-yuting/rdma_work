@@ -16,7 +16,7 @@ class rdma_dev_cmq_test extends uvm_test;
   rdma_dma_mapping qpc_buf;
   longint unsigned posted;
   // 丢弃型调用的 CQE 接收变量（VCS 对 void'() 丢弃动态数组返回值会崩溃）。
-  rdma_dev_bytes_t scratch;
+  rdma_bytes_t scratch;
 
   // 功能：构造测试组件。
   // 输入/输出及副作用：name/parent 透传给 uvm_test。
@@ -101,21 +101,21 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：新建 64B SQE 并写 qword0 的 opcode 与低位对象号。
   // 输入/输出及副作用：返回新数组。
   // 失败/边界：无。
-  function rdma_dev_bytes_t make_sqe(bit [7:0] opcode, bit [63:0] low_fields = 0);
-    rdma_dev_bytes_t sqe;
+  function rdma_bytes_t make_sqe(bit [7:0] opcode, bit [63:0] low_fields = 0);
+    rdma_bytes_t sqe;
 
     sqe = new[64];
     foreach (sqe[i])
       sqe[i] = 0;
-    rdma_dev_cmq::put_qword(sqe, 0, low_fields | (64'(opcode) << RDMA_CMQ_OPCODE_LSB));
+    rdma_be::put_qword(sqe, 0, low_fields | (64'(opcode) << RDMA_CMQ_OPCODE_LSB));
     return sqe;
   endfunction
 
   // 功能：提交一条不带签名的 SQE。
   // 输入/输出及副作用：写 ring 下一个槽，posted 加 1。
   // 失败/边界：同 post_signed。
-  function void post(rdma_dev_bytes_t sqe);
-    rdma_dev_bytes_t none;
+  function void post(rdma_bytes_t sqe);
+    rdma_bytes_t none;
 
     post_signed(sqe, 1'b0, none);
   endfunction
@@ -123,24 +123,24 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：补 envelope（VALID=polarity、WRAP=!polarity、INDEX），可选按驱动规则计算 QPC 签名后写入环。
   // 输入/输出及副作用：sqe 为副本；写 ring，posted 加 1。
   // 失败/边界：内存写失败报告 UVM_FATAL。
-  function void post_signed(rdma_dev_bytes_t sqe, bit sign, rdma_dev_bytes_t qpc);
+  function void post_signed(rdma_bytes_t sqe, bit sign, rdma_bytes_t qpc);
     bit [63:0] word0;
     bit lap;
     bit [7:0] sum;
     byte data[];
 
     lap = (posted / DEPTH) & 1;
-    word0 = rdma_dev_cmq::qword(sqe, 0);
+    word0 = rdma_be::qword(sqe, 0);
     word0[RDMA_CMQ_VALID_LSB] = !lap;
     word0[RDMA_CMQ_WRAP_LSB] = lap;
     word0[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH] = posted % DEPTH;
-    rdma_dev_cmq::put_qword(sqe, 0, word0);
+    rdma_be::put_qword(sqe, 0, word0);
     if (sign) begin
-      rdma_dev_cmq::set_field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB, 1, 1);
-      rdma_dev_cmq::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
+      rdma_be::set_field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB, 1, 1);
+      rdma_be::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
                               8, 0);
-      sum = rdma_dev_cmq::xor_bytes(sqe) ^ rdma_dev_cmq::xor_bytes(qpc);
-      rdma_dev_cmq::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
+      sum = rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(qpc);
+      rdma_be::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
                               8, ~sum);
     end
     data = new[64];
@@ -165,17 +165,17 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：读第 seq 个 CQE 并检查 owner/wrap/index/opcode/ecode。
   // 输入/输出及副作用：返回 CQE 字节。
   // 失败/边界：字段不符报告 UVM_ERROR。
-  function rdma_dev_bytes_t check_cqe(string label, longint unsigned seq, bit [7:0] opcode,
+  function rdma_bytes_t check_cqe(string label, longint unsigned seq, bit [7:0] opcode,
                                       bit [7:0] ecode);
     byte data[];
-    rdma_dev_bytes_t cqe;
+    rdma_bytes_t cqe;
     bit [63:0] head;
 
     expect_ok("read CQE", mem.read(ring, CQ_OFFSET + (seq % DEPTH) * 64, 64, data));
     cqe = new[64];
     foreach (cqe[i])
       cqe[i] = data[i];
-    head = rdma_dev_cmq::qword(cqe, 0);
+    head = rdma_be::qword(cqe, 0);
     if (head[RDMA_CMQ_VALID_LSB] != !((seq / DEPTH) & 1) ||
         head[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH] != seq % DEPTH ||
         head[RDMA_CMQ_WRAP_LSB] != ((seq / DEPTH) & 1) ||
@@ -188,11 +188,11 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：提交单条命令、敲 doorbell 并检查其 CQE。
   // 输入/输出及副作用：返回 CQE 字节。
   // 失败/边界：doorbell 失败报告 UVM_FATAL，CQE 不符报告 UVM_ERROR。
-  function rdma_dev_bytes_t exec(string label, rdma_dev_bytes_t sqe,
+  function rdma_bytes_t exec(string label, rdma_bytes_t sqe,
                                 bit [7:0] ecode = RDMA_CMQ_SUCCESS_ECODE);
     bit [7:0] opcode;
 
-    opcode = rdma_dev_cmq::qword(sqe, 0) >> RDMA_CMQ_OPCODE_LSB;
+    opcode = rdma_be::qword(sqe, 0) >> RDMA_CMQ_OPCODE_LSB;
     post(sqe);
     expect_ok({label, " doorbell"}, ring_doorbell());
     return check_cqe(label, posted - 1, opcode, ecode);
@@ -201,8 +201,8 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：比较两段字节。
   // 输入/输出及副作用：只读。
   // 失败/边界：首个差异报告 UVM_ERROR。
-  function void expect_bytes(string label, rdma_dev_bytes_t got, int unsigned got_offset,
-                             rdma_dev_bytes_t want, int unsigned want_offset, int unsigned size);
+  function void expect_bytes(string label, rdma_bytes_t got, int unsigned got_offset,
+                             rdma_bytes_t want, int unsigned want_offset, int unsigned size);
     for (int unsigned i = 0; i < size; i++)
       if (got[got_offset + i] != want[want_offset + i]) begin
         `uvm_error(label, $sformatf("byte %0d: %02h != %02h", i, got[got_offset + i],
@@ -230,8 +230,8 @@ class rdma_dev_cmq_test extends uvm_test;
   // 输入/输出及副作用：修改 qpc_buf 与设备 QP 表。
   // 失败/边界：字节或状态不符报告 UVM_ERROR。
   function void check_qp();
-    rdma_dev_bytes_t qpc;
-    rdma_dev_bytes_t sqe;
+    rdma_bytes_t qpc;
+    rdma_bytes_t sqe;
     rdma_dev_object obj;
     byte data[];
     bit [63:0] layout;
@@ -244,7 +244,7 @@ class rdma_dev_cmq_test extends uvm_test;
     end
     expect_ok("write QPC", mem.write(qpc_buf, 0, data));
     sqe = make_sqe(RDMA_OP_QPC_CREATE, 5);
-    rdma_dev_cmq::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
+    rdma_be::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
                             qpc_buf.iova.value >> 9);
     post_signed(sqe, 1'b1, qpc);
@@ -255,10 +255,10 @@ class rdma_dev_cmq_test extends uvm_test;
     expect_bytes("QPC_CREATE", obj.bytes, 0, qpc, 0, 512);
 
     sqe = make_sqe(RDMA_OP_QPC_MODIFY, 5);
-    rdma_dev_cmq::set_field(sqe, RDMA_CMQ_NEXT_QP_STATE_WORD_BYTE_OFFSET,
+    rdma_be::set_field(sqe, RDMA_CMQ_NEXT_QP_STATE_WORD_BYTE_OFFSET,
                             RDMA_CMQ_NEXT_QP_STATE_LSB, RDMA_CMQ_NEXT_QP_STATE_WIDTH, 3);
     scratch = (exec("QPC_MODIFY_ST", sqe));
-    if (rdma_dev_cmq::field(obj.bytes, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
+    if (rdma_be::field(obj.bytes, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
                             RDMA_QPC_QP_ST_WIDTH) != 3)
       `uvm_error("QPC_MODIFY_ST", "QPC state field was not updated")
 
@@ -267,8 +267,8 @@ class rdma_dev_cmq_test extends uvm_test;
     layout[RDMA_CMQ_MODIFY_MODE_LSB +: 2] = 2;
     layout[RDMA_CMQ_MODIFY_START_QWORD0_LSB +: 6] = 2;
     layout[RDMA_CMQ_MODIFY_WBE0_LSB +: 8] = 8'b1000_0011;
-    rdma_dev_cmq::put_qword(sqe, RDMA_CMQ_MODIFY_MODE_WORD_BYTE_OFFSET, layout);
-    rdma_dev_cmq::put_qword(sqe, RDMA_CMQ_MODIFY_DATA0_WORD_BYTE_OFFSET, 64'h1122_3344_5566_7788);
+    rdma_be::put_qword(sqe, RDMA_CMQ_MODIFY_MODE_WORD_BYTE_OFFSET, layout);
+    rdma_be::put_qword(sqe, RDMA_CMQ_MODIFY_DATA0_WORD_BYTE_OFFSET, 64'h1122_3344_5566_7788);
     scratch = (exec("QPC_MODIFY_PARTIAL", sqe));
     if (obj.bytes[16] != 8'h11 || obj.bytes[22] != 8'h77 || obj.bytes[23] != 8'h88 ||
         obj.bytes[17] != qpc[17])
@@ -278,7 +278,7 @@ class rdma_dev_cmq_test extends uvm_test;
       data[i] = 0;
     expect_ok("clear QPC buffer", mem.write(qpc_buf, 0, data));
     sqe = make_sqe(RDMA_OP_QPC_QUERY, 5);
-    rdma_dev_cmq::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
+    rdma_be::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
                             qpc_buf.iova.value >> 9);
     scratch = (exec("QPC_QUERY", sqe));
@@ -298,8 +298,8 @@ class rdma_dev_cmq_test extends uvm_test;
   // 输入/输出及副作用：修改设备 MR 表。
   // 失败/边界：回填或删除不符报告 UVM_ERROR。
   function void check_mr();
-    rdma_dev_bytes_t sqe;
-    rdma_dev_bytes_t cqe;
+    rdma_bytes_t sqe;
+    rdma_bytes_t cqe;
 
     sqe = make_sqe(RDMA_OP_MR_REGISTER, 24'h42);
     for (int i = 8; i < 64; i++)
@@ -316,8 +316,8 @@ class rdma_dev_cmq_test extends uvm_test;
   // 输入/输出及副作用：修改设备 CQ/EQ/SRQ 表。
   // 失败/边界：回填、ecode 或删除不符报告 UVM_ERROR。
   function void check_cq_eq_srq();
-    rdma_dev_bytes_t sqe;
-    rdma_dev_bytes_t cqe;
+    rdma_bytes_t sqe;
+    rdma_bytes_t cqe;
 
     sqe = make_sqe(RDMA_OP_CQC_CREATE, 7);
     for (int i = 8; i < 64; i++)
@@ -335,7 +335,7 @@ class rdma_dev_cmq_test extends uvm_test;
     scratch = (exec("CEQC_CREATE", sqe));
     cqe = exec("CEQC_QUERY", make_sqe(RDMA_OP_CEQC_QUERY, 3));
     expect_bytes("CEQC_QUERY", cqe, 16, sqe, 16, 32);
-    if (rdma_dev_cmq::field(cqe, 0, 0, 12) != 3)
+    if (rdma_be::field(cqe, 0, 0, 12) != 3)
       `uvm_error("CEQC_QUERY", "CQE does not carry the EQN")
     scratch = (exec("CEQC_DELETE", make_sqe(RDMA_OP_CEQC_DELETE, 3)));
     scratch = (exec("AEQC_DELETE_GONE", make_sqe(RDMA_OP_AEQC_DELETE, 1),
@@ -356,8 +356,8 @@ class rdma_dev_cmq_test extends uvm_test;
   // 输入/输出及副作用：每例前复位并重新使能设备。
   // 失败/边界：设备接受非法命令时报告 UVM_ERROR。
   function void check_errors();
-    rdma_dev_bytes_t sqe;
-    rdma_dev_bytes_t qpc;
+    rdma_bytes_t sqe;
+    rdma_bytes_t qpc;
 
     dev.reset();
     post(make_sqe(RDMA_OP_TQ_FLUSH));
@@ -377,7 +377,7 @@ class rdma_dev_cmq_test extends uvm_test;
     foreach (qpc[i])
       qpc[i] = 0;
     sqe = make_sqe(RDMA_OP_QPC_CREATE, 6);
-    rdma_dev_cmq::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
+    rdma_be::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
                             qpc_buf.iova.value >> 9);
     post_signed(sqe, 1'b1, qpc);

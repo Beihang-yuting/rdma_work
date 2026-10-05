@@ -7,8 +7,6 @@
 // 设计说明：设备保存驱动下发的 context 原始字节（QPC 为 512B 缓冲区，其余为 SQE 中的 context 区），
 //   查询类命令按驱动 *_cqe_info 读取的偏移原样回填；数据面（NIC）按需解码这些字节。
 
-typedef byte unsigned rdma_dev_bytes_t[];
-
 typedef enum int {
   RDMA_DEV_QP,
   RDMA_DEV_CQ,
@@ -170,7 +168,7 @@ class rdma_dev_cmq extends uvm_object;
     status = read_bytes(sq_pa + (sq_seq % DEPTH) * RDMA_CMQE_BYTES, RDMA_CMQE_BYTES, sqe);
     if (!status.ok())
       return status;
-    word0 = qword(sqe, 0);
+    word0 = rdma_be::qword(sqe, 0);
     lap = (sq_seq / DEPTH) & 1;
     // cmq.c：VALID=polarity，WRAP=!polarity；polarity 每圈翻转，首圈为 1。
     if (word0[RDMA_CMQ_WRAP_LSB] != lap || word0[RDMA_CMQ_VALID_LSB] == lap ||
@@ -196,14 +194,14 @@ class rdma_dev_cmq extends uvm_object;
     bit [63:0] head;
     rdma_status status;
 
-    head = qword(cqe, 0);
+    head = rdma_be::qword(cqe, 0);
     head[RDMA_CMQ_VALID_LSB] = !((cq_seq / DEPTH) & 1);
     head[RDMA_CMQ_WRAP_LSB] = sqe_word0[RDMA_CMQ_WRAP_LSB];
     head[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH] =
       sqe_word0[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH];
     head[RDMA_CMQ_OPCODE_LSB +: 8] = sqe_word0[RDMA_CMQ_OPCODE_LSB +: 8];
     head[RDMA_CMQ_CMD_ECODE_LSB +: 8] = ecode;
-    put_qword(cqe, 0, head);
+    rdma_be::put_qword(cqe, 0, head);
     status = write_bytes(sq_pa + CQ_OFFSET + (cq_seq % DEPTH) * RDMA_CMQE_BYTES, cqe);
     if (status.ok())
       cq_seq++;
@@ -218,7 +216,7 @@ class rdma_dev_cmq extends uvm_object;
     bit [7:0] opcode;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
-    opcode = qword(sqe, 0) >> RDMA_CMQ_OPCODE_LSB;
+    opcode = rdma_be::qword(sqe, 0) >> RDMA_CMQ_OPCODE_LSB;
     case (opcode)
       RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY, RDMA_OP_QPC_QUERY, RDMA_OP_QPC_DELETE,
       RDMA_OP_QPC_FORCE_DELETE: begin
@@ -263,10 +261,11 @@ class rdma_dev_cmq extends uvm_object;
     rdma_status status;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
-    qpn = field(sqe, RDMA_CMQ_QPN_WORD_BYTE_OFFSET, RDMA_CMQ_QPN_LSB, RDMA_CMQ_QPN_WIDTH);
-    buffer = field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET, RDMA_CMQ_QPC_BUFFER_ADDR_LSB,
-                   RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH) << RDMA_CMQ_QPC_BUFFER_ADDR_LSB;
-    mode = field(sqe, RDMA_CMQ_MODIFY_MODE_WORD_BYTE_OFFSET, RDMA_CMQ_MODIFY_MODE_LSB,
+    qpn = rdma_be::field(sqe, RDMA_CMQ_QPN_WORD_BYTE_OFFSET, RDMA_CMQ_QPN_LSB, RDMA_CMQ_QPN_WIDTH);
+    buffer = rdma_be::field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
+                            RDMA_CMQ_QPC_BUFFER_ADDR_LSB,
+                            RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH) << RDMA_CMQ_QPC_BUFFER_ADDR_LSB;
+    mode = rdma_be::field(sqe, RDMA_CMQ_MODIFY_MODE_WORD_BYTE_OFFSET, RDMA_CMQ_MODIFY_MODE_LSB,
                  RDMA_CMQ_MODIFY_MODE_WIDTH);
     if (opcode == RDMA_OP_QPC_CREATE ||
         (opcode == RDMA_OP_QPC_MODIFY && mode == RDMA_QPC_MODIFY_FULL)) begin
@@ -277,7 +276,7 @@ class rdma_dev_cmq extends uvm_object;
       if (!status.ok())
         return status;
       // cmq.c：签名 = ~(SQE 其余字节异或 ^ QPC 字节异或)，故含签名的全体异或恒为 0xff。
-      if ((xor_bytes(sqe) ^ xor_bytes(obj.bytes)) != 8'hff)
+      if ((rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(obj.bytes)) != 8'hff)
         return rdma_status::make(RDMA_SC_CODEC_ERROR, "QPC command signature mismatch");
       objects[RDMA_DEV_QP][qpn] = obj;
       return rdma_status::success();
@@ -292,9 +291,11 @@ class rdma_dev_cmq extends uvm_object;
     end
     qpc = obj.bytes;
     if (mode == RDMA_QPC_MODIFY_STATE_ONLY)
-      set_field(qpc, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB, RDMA_QPC_QP_ST_WIDTH,
-                field(sqe, RDMA_CMQ_NEXT_QP_STATE_WORD_BYTE_OFFSET, RDMA_CMQ_NEXT_QP_STATE_LSB,
-                      RDMA_CMQ_NEXT_QP_STATE_WIDTH));
+      rdma_be::set_field(qpc, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
+                         RDMA_QPC_QP_ST_WIDTH,
+                         rdma_be::field(sqe, RDMA_CMQ_NEXT_QP_STATE_WORD_BYTE_OFFSET,
+                                        RDMA_CMQ_NEXT_QP_STATE_LSB,
+                                        RDMA_CMQ_NEXT_QP_STATE_WIDTH));
     else
       apply_partial(qpc, sqe);
     obj.bytes = qpc;
@@ -311,11 +312,11 @@ class rdma_dev_cmq extends uvm_object;
     bit [7:0] wbe;
     bit [63:0] data;
 
-    layout = qword(sqe, RDMA_CMQ_MODIFY_MODE_WORD_BYTE_OFFSET);
+    layout = rdma_be::qword(sqe, RDMA_CMQ_MODIFY_MODE_WORD_BYTE_OFFSET);
     for (int t = 0; t < 4; t++) begin
       start = layout[RDMA_CMQ_MODIFY_START_QWORD0_LSB - 16 * t +: 6];
       wbe = layout[RDMA_CMQ_MODIFY_WBE0_LSB - 16 * t +: 8];
-      data = qword(sqe, RDMA_CMQ_MODIFY_DATA0_WORD_BYTE_OFFSET + 8 * t);
+      data = rdma_be::qword(sqe, RDMA_CMQ_MODIFY_DATA0_WORD_BYTE_OFFSET + 8 * t);
       if (start * 8 + 8 > qpc.size())
         continue;
       for (int b = 0; b < 8; b++)
@@ -334,7 +335,7 @@ class rdma_dev_cmq extends uvm_object;
     rdma_dev_object obj;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
-    stag = field(sqe, RDMA_MRT_BODY_STAG_IDX_WORD_BYTE_OFFSET, RDMA_MRT_BODY_STAG_IDX_LSB,
+    stag = rdma_be::field(sqe, RDMA_MRT_BODY_STAG_IDX_WORD_BYTE_OFFSET, RDMA_MRT_BODY_STAG_IDX_LSB,
                  RDMA_MRT_BODY_STAG_IDX_WIDTH);
     if (opcode == RDMA_OP_KEY_ALLOC || opcode == RDMA_OP_MR_REGISTER) begin
       obj = rdma_dev_object::type_id::create($sformatf("mrt_%0d", stag));
@@ -349,7 +350,7 @@ class rdma_dev_cmq extends uvm_object;
         cqe[i] = obj.bytes[i];
       return rdma_status::success();
     end
-    if (field(sqe, RDMA_MRT_BODY_NXT_ST_WORD_BYTE_OFFSET, RDMA_MRT_BODY_NXT_ST_LSB,
+    if (rdma_be::field(sqe, RDMA_MRT_BODY_NXT_ST_WORD_BYTE_OFFSET, RDMA_MRT_BODY_NXT_ST_LSB,
               RDMA_MRT_BODY_NXT_ST_WIDTH) == RDMA_MR_ST_INVALID)
       objects[RDMA_DEV_MR].delete(stag);
     return rdma_status::success();
@@ -365,11 +366,11 @@ class rdma_dev_cmq extends uvm_object;
     rdma_dev_object obj;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
-    cqn = field(sqe, RDMA_CQC_BODY_CQN_WORD_BYTE_OFFSET, RDMA_CQC_BODY_CQN_LSB,
+    cqn = rdma_be::field(sqe, RDMA_CQC_BODY_CQN_WORD_BYTE_OFFSET, RDMA_CQC_BODY_CQN_LSB,
                 RDMA_CQC_BODY_CQN_WIDTH);
     if (opcode == RDMA_OP_CQC_CREATE) begin
       obj = rdma_dev_object::type_id::create($sformatf("cqc_%0d", cqn));
-      obj.bytes = slice(sqe, CQC_QUERY_OFFSET, RDMA_CMQE_BYTES - CQC_QUERY_OFFSET);
+      obj.bytes = rdma_be::slice(sqe, CQC_QUERY_OFFSET, RDMA_CMQE_BYTES - CQC_QUERY_OFFSET);
       objects[RDMA_DEV_CQ][cqn] = obj;
       return;
     end
@@ -378,7 +379,7 @@ class rdma_dev_cmq extends uvm_object;
       return;
     end
     case (opcode)
-      RDMA_OP_CQC_MODIFY: obj.modify_word = qword(sqe, 0);
+      RDMA_OP_CQC_MODIFY: obj.modify_word = rdma_be::qword(sqe, 0);
       RDMA_OP_CQC_RESIZE: obj.resize_sqe = sqe;
       RDMA_OP_CQC_QUERY: begin
         foreach (obj.bytes[i])
@@ -398,12 +399,12 @@ class rdma_dev_cmq extends uvm_object;
     rdma_dev_object obj;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
-    eqn = field(sqe, RDMA_EQC_BODY_EQN_WORD_BYTE_OFFSET, RDMA_EQC_BODY_EQN_LSB,
+    eqn = rdma_be::field(sqe, RDMA_EQC_BODY_EQN_WORD_BYTE_OFFSET, RDMA_EQC_BODY_EQN_LSB,
                 RDMA_EQC_BODY_EQN_WIDTH);
     if (opcode inside {RDMA_OP_CEQC_CREATE, RDMA_OP_AEQC_CREATE, RDMA_OP_CEQC_MODIFY,
                        RDMA_OP_AEQC_MODIFY}) begin
       obj = rdma_dev_object::type_id::create($sformatf("eqc_%0d", eqn));
-      obj.bytes = slice(sqe, EQ_CTX_OFFSET, EQ_CTX_BYTES);
+      obj.bytes = rdma_be::slice(sqe, EQ_CTX_OFFSET, EQ_CTX_BYTES);
       objects[kind][eqn] = obj;
       return;
     end
@@ -417,7 +418,7 @@ class rdma_dev_cmq extends uvm_object;
       objects[kind].delete(eqn);
       return;
     end
-    put_qword(cqe, 0, eqn);
+    rdma_be::put_qword(cqe, 0, eqn);
     foreach (obj.bytes[i])
       cqe[EQ_CTX_OFFSET + i] = obj.bytes[i];
   endfunction
@@ -431,11 +432,11 @@ class rdma_dev_cmq extends uvm_object;
     rdma_dev_object obj;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
-    srfqn = field(sqe, RDMA_SRQC_BODY_SRFQN_WORD_BYTE_OFFSET, RDMA_SRQC_BODY_SRFQN_LSB,
+    srfqn = rdma_be::field(sqe, RDMA_SRQC_BODY_SRFQN_WORD_BYTE_OFFSET, RDMA_SRQC_BODY_SRFQN_LSB,
                   RDMA_SRQC_BODY_SRFQN_WIDTH);
     if (opcode == RDMA_OP_SRFQC_CREATE || opcode == RDMA_OP_SRFQC_MODIFY) begin
       obj = rdma_dev_object::type_id::create($sformatf("srfqc_%0d", srfqn));
-      obj.bytes = slice(sqe, EQ_CTX_OFFSET, EQ_CTX_BYTES);
+      obj.bytes = rdma_be::slice(sqe, EQ_CTX_OFFSET, EQ_CTX_BYTES);
       objects[RDMA_DEV_SRQ][srfqn] = obj;
       return rdma_status::success();
     end
@@ -445,13 +446,13 @@ class rdma_dev_cmq extends uvm_object;
       objects[RDMA_DEV_SRQ].delete(srfqn);
       return rdma_status::success();
     end
-    put_qword(cqe, 0, srfqn);
+    rdma_be::put_qword(cqe, 0, srfqn);
     foreach (obj.bytes[i])
       cqe[EQ_CTX_OFFSET + i] = obj.bytes[i];
     return rdma_status::success();
   endfunction
 
-  // ---------------------------------------------------------------- DMA 与字节工具
+  // ---------------------------------------------------------------- DMA
   // 功能：DMA 读 size 字节到 out。
   // 输入/输出及副作用：读主机内存。
   // 失败/边界：DMA 失败返回其 status，out 为空。
@@ -480,88 +481,5 @@ class rdma_dev_cmq extends uvm_object;
     foreach (data[i])
       data[i] = bytes[i];
     return host_mem.dma_write(iova, data);
-  endfunction
-
-  // 功能：读取大端 qword。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：越界字节按 0。
-  static function bit [63:0] qword(byte unsigned b[], int unsigned offset);
-    bit [63:0] value;
-
-    value = '0;
-    for (int unsigned i = 0; i < 8; i++) begin
-      value = value << 8;
-      if (offset + i < b.size())
-        value[7:0] = b[offset + i];
-    end
-    return value;
-  endfunction
-
-  // 功能：写入大端 qword。
-  // 输入/输出及副作用：修改 b。
-  // 失败/边界：越界字节被忽略。
-  static function void put_qword(inout byte unsigned b[], input int unsigned offset,
-                                 input bit [63:0] value);
-    for (int unsigned i = 0; i < 8; i++)
-      if (offset + i < b.size())
-        b[offset + i] = value[63 - 8 * i -: 8];
-  endfunction
-
-  // 功能：取字段（rdma_defs 的 WORD_BYTE_OFFSET/LSB/WIDTH 三元组）。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：width>=64 取整个 qword。
-  static function bit [63:0] field(byte unsigned b[], int unsigned word_byte, int unsigned lsb,
-                                   int unsigned width);
-    bit [63:0] mask;
-
-    mask = '1;
-    if (width < 64)
-      mask = (64'd1 << width) - 1;
-    return (qword(b, word_byte) >> lsb) & mask;
-  endfunction
-
-  // 功能：写字段。
-  // 输入/输出及副作用：修改 b。
-  // 失败/边界：value 超宽部分被截断。
-  static function void set_field(inout byte unsigned b[], input int unsigned word_byte,
-                                 input int unsigned lsb, input int unsigned width,
-                                 input bit [63:0] value);
-    bit [63:0] mask;
-    bit [63:0] word;
-
-    mask = '1;
-    if (width < 64)
-      mask = (64'd1 << width) - 1;
-    mask = mask << lsb;
-    word = (qword(b, word_byte) & ~mask) | ((value << lsb) & mask);
-    put_qword(b, word_byte, word);
-  endfunction
-
-  // 功能：全部字节异或。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：空数组返回 0。
-  static function bit [7:0] xor_bytes(byte unsigned b[]);
-    bit [7:0] value;
-
-    value = '0;
-    foreach (b[i])
-      value ^= b[i];
-    return value;
-  endfunction
-
-  // 功能：截取 [offset, offset+size) 字节。
-  // 输入/输出及副作用：返回新数组。
-  // 失败/边界：越界部分按 0。
-  static function rdma_dev_bytes_t slice(byte unsigned b[], int unsigned offset,
-                                         int unsigned size);
-    rdma_dev_bytes_t out;
-
-    out = new[size];
-    foreach (out[i]) begin
-      out[i] = 8'h00;
-      if (offset + i < b.size())
-        out[i] = b[offset + i];
-    end
-    return out;
   endfunction
 endclass
