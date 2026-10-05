@@ -3,6 +3,19 @@
 // 依赖：依赖本层公共 types/model/adapter 契约及其上游快照。
 // 所有权与生命周期：对象只拥有显式创建的值快照；外部资源保存非拥有引用，生命周期由调用方管理。
 
+// QP destroy/create-rollback 恢复一次调用内各步骤共享的上下文。
+class rdma_qp_destroy_recovery_context;
+  rdma_function_binding binding;
+  rdma_function_handle expected_owner;
+  rdma_handle resource_h;
+  rdma_qp authoritative;
+  rdma_qp_recovery_state recovery;
+  rdma_qpc_model destroy_qpc;
+  rdma_control_result result;
+  bit create_rollback;
+  bit hardware_present;
+endclass
+
 class rdma_qp_lifecycle_executor extends uvm_object;
   // 生命周期执行器统一负责 QP backing 的分配、发布、恢复和最终清理。
   `rdma_object_utils(rdma_qp_lifecycle_executor)
@@ -3180,29 +3193,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     input bit create_rollback = 1'b0,
     input bit hardware_present = 1'b1
   );
+    rdma_qp_destroy_recovery_context ctx;
     rdma_status status;
-    rdma_status fence_status;
-    rdma_resource resource;
-    rdma_qp authoritative;
-    rdma_recovery_record record;
-    rdma_qp_recovery_state recovery;
-    rdma_cmq_ticket ticket;
-    rdma_cmq_completion completion;
-    rdma_cmq_command_desc command;
-    rdma_qpc_model error_qpc;
-    rdma_qpc_model destroy_qpc;
-    rdma_dma_mapping probe;
-    rdma_dma_mapping staging_probe;
-    rdma_qp_backing_ref refs[$];
-    rdma_queue_backing_role_e roles[$];
-    bit terminal_known;
-    bit release_complete;
-    bit ambiguous;
-    bit query_conclusive;
-    bit query_release_complete;
-    rdma_hw_presence_e query_presence;
-    rdma_dma_mapping query_mapping;
-    rdma_qp_ambiguous_operation_e reconciled_operation;
+    bit stop;
 
     result = rdma_control_result::type_id::create("qp_destroy_recover_result");
     result.transaction_id = transaction_id;
@@ -3210,615 +3203,711 @@ class rdma_qp_lifecycle_executor extends uvm_object;
                                                 "QP destroy recovery handle");
     result.primary_status = invalid_state("QP destroy recovery did not complete");
     result.status = result.primary_status;
-    status = live_binding_fence(binding, expected_owner);
-    if (status.ok()) status = normalize_status(
-      manager.lookup(resource_h, resource),
-      "QP destroy recovery lookup returned null");
-    if (status.ok() && (resource == null || !$cast(authoritative, resource)))
-      status = invalid_argument("QP destroy recovery target is not a QP");
-    if (status.ok() && authoritative.state != RDMA_RESOURCE_ERROR)
-      status = invalid_state("QP destroy recovery requires an ERROR QP");
-    if (status.ok()) status = normalize_status(
-      manager.lookup_recovery(resource_h, record),
-      "QP destroy recovery record lookup returned null");
-    if (status.ok() && (record == null || !record.qp_recovery_valid ||
-                        record.qp_recovery == null))
-      status = invalid_state("QP destroy recovery record is missing");
-    if (status.ok()) begin
-      if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, recovery))
-        status = invalid_state("QP destroy recovery snapshot clone failed");
+    ctx = new();
+    ctx.binding = binding;
+    ctx.expected_owner = expected_owner;
+    ctx.resource_h = resource_h;
+    ctx.result = result;
+    ctx.create_rollback = create_rollback;
+    ctx.hardware_present = hardware_present;
+    status = open_qp_destroy_recovery(ctx);
+    if (!status.ok()) begin
+      retain_qp_recovery_error(result, status);
+      return;
     end
+    // 只对账持久 ticket 所指的操作；reset 取消或缺少终态结果时保持 ticket 不动。
+    if (ctx.recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE) begin
+      reconcile_qp_destroy_ambiguity(ctx, stop);
+      if (stop)
+        return;
+    end
+    release_qp_create_staging(ctx, stop);
+    if (stop)
+      return;
+    retry_qp_error_transition(ctx, stop);
+    if (stop)
+      return;
+    flush_qp_destroy_roles(ctx, stop);
+    if (stop)
+      return;
+    delete_qp_hardware_context(ctx, stop);
+    if (stop)
+      return;
+    release_qp_destroy_context(ctx, stop);
+    if (stop)
+      return;
+    release_qp_destroy_backing(ctx);
+  endtask
+
+  // 功能：把结果发布为保留 ERROR 的恢复失败（primary/status 为 status，需要后续恢复）。
+  // 输入/输出及副作用：写 result。
+  // 失败/边界：无。
+  protected function void retain_qp_recovery_error(rdma_control_result result,
+                                                   rdma_status status);
+    publish_primary(result, status);
+    result.recovery_required = 1'b1;
+    result.final_resource_state = RDMA_RESOURCE_ERROR;
+    result.final_resource_state_known = 1'b1;
+  endfunction
+
+  // 功能：从 manager 重新读取持久 QP 恢复快照（manager 更新进度后使用）。
+  // 输入/输出及副作用：成功时替换 ctx.recovery 为 detached 副本。
+  // 失败/边界：lookup 失败返回其 status；clone 失败返回 INVALID_STATE(clone_failure)。
+  protected function rdma_status refresh_qp_recovery(rdma_qp_destroy_recovery_context ctx,
+                                                     string null_message,
+                                                     string clone_failure);
+    rdma_recovery_record record;
+    rdma_qp_recovery_state refreshed;
+    rdma_status status;
+
+    status = normalize_status(manager.lookup_recovery(ctx.resource_h, record), null_message);
+    if (!status.ok() || record == null || record.qp_recovery == null)
+      return status;
+    if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, refreshed))
+      return invalid_state(clone_failure);
+    ctx.recovery = refreshed;
+    return status;
+  endfunction
+
+  // 功能：克隆一个 detached mapping probe 后经 binding fence 释放（保留 adapter 的 opaque completion seal，
+  //   不改持久 authority）。
+  // 输入/输出及副作用：status/release_complete 输出。
+  // 失败/边界：克隆失败返回 INVALID_STATE(clone_failure) 且 release_complete=0。
+  protected task release_mapping_probe(rdma_qp_destroy_recovery_context ctx,
+                                       rdma_dma_mapping source,
+                                       string clone_failure,
+                                       string label,
+                                       output rdma_status status,
+                                       output bit release_complete);
+    rdma_dma_mapping probe;
+
+    probe = null;
+    release_complete = 1'b0;
+    if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(source, probe)) begin
+      status = invalid_state(clone_failure);
+      return;
+    end
+    release_mapping_fenced(ctx.binding, ctx.expected_owner, probe, label, status,
+                           release_complete);
+  endtask
+
+  // 功能：QPC_QUERY 缓冲不满足 512B 对齐/大小时只能作为 recovery-only 证据保留。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：无。
+  protected function bit qp_query_mapping_recovery_only(rdma_dma_mapping mapping);
+    return mapping.size != 512 || (mapping.iova.value & 64'h1ff) != 0 ||
+           (mapping.backing_addr.value & 64'h1ff) != 0;
+  endfunction
+
+  // 功能：清除恢复快照中的歧义操作与 ticket。
+  // 输入/输出及副作用：修改 ctx.recovery。
+  // 失败/边界：无。
+  protected function void clear_qp_destroy_ambiguity(rdma_qp_destroy_recovery_context ctx);
+    ctx.recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
+    ctx.recovery.ambiguous_ticket = null;
+  endfunction
+
+  // 功能：按已证明的硬件存在性收尾 CREATE/DELETE 歧义：DELETE 且已不存在时记为 delete 完成，清除歧义并持久化。
+  // 输入/输出及副作用：修改 ctx.hardware_present/recovery 并经 manager 持久化。
+  // 失败/边界：返回持久化 status。
+  protected function rdma_status settle_qp_presence(rdma_qp_destroy_recovery_context ctx,
+                                                    rdma_qp_ambiguous_operation_e operation,
+                                                    rdma_hw_presence_e presence,
+                                                    string null_message);
+    ctx.hardware_present = presence == RDMA_HW_PRESENCE_PRESENT;
+    if (operation == RDMA_QP_AMBIG_DELETE && !ctx.hardware_present)
+      ctx.recovery.delete_complete = 1'b1;
+    clear_qp_destroy_ambiguity(ctx);
+    ctx.recovery.has_pending_hardware_step = 1'b0;
+    return normalize_status(manager.update_qp_recovery_progress(ctx.resource_h, ctx.recovery),
+                            null_message);
+  endfunction
+
+  // 功能：校验 destroy/create-rollback 恢复入口：ERROR QP、恢复记录、intent 与要删除的 QPC。
+  // 输入/输出及副作用：成功时填 ctx.authoritative/recovery/destroy_qpc。
+  // 失败/边界：任一不符返回对应 INVALID_* status。
+  protected function rdma_status open_qp_destroy_recovery(rdma_qp_destroy_recovery_context ctx);
+    rdma_resource resource;
+    rdma_recovery_record record;
+    rdma_status status;
+
+    status = live_binding_fence(ctx.binding, ctx.expected_owner);
+    if (status.ok())
+      status = normalize_status(manager.lookup(ctx.resource_h, resource),
+                                "QP destroy recovery lookup returned null");
+    if (status.ok() && (resource == null || !$cast(ctx.authoritative, resource)))
+      status = invalid_argument("QP destroy recovery target is not a QP");
+    if (status.ok() && ctx.authoritative.state != RDMA_RESOURCE_ERROR)
+      status = invalid_state("QP destroy recovery requires an ERROR QP");
+    if (status.ok())
+      status = normalize_status(manager.lookup_recovery(ctx.resource_h, record),
+                                "QP destroy recovery record lookup returned null");
+    if (status.ok() && (record == null || !record.qp_recovery_valid || record.qp_recovery == null))
+      status = invalid_state("QP destroy recovery record is missing");
     if (status.ok() &&
-        recovery.intent != (create_rollback ?
+        !rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, ctx.recovery))
+      status = invalid_state("QP destroy recovery snapshot clone failed");
+    if (status.ok() && ctx.recovery.intent != (ctx.create_rollback ?
           RDMA_QP_RECOVER_CREATE_ROLLBACK : RDMA_QP_RECOVER_NORMAL_DESTROY))
-      status = create_rollback ?
+      status = ctx.create_rollback ?
         invalid_state("QP recovery intent is not create rollback") :
         invalid_state("QP recovery intent is not normal destroy");
     if (status.ok()) begin
-      destroy_qpc = create_rollback ? recovery.candidate_qpc : recovery.prior_qpc;
-      if (hardware_present && destroy_qpc == null)
-        status = create_rollback ?
+      ctx.destroy_qpc = ctx.create_rollback ? ctx.recovery.candidate_qpc :
+                                              ctx.recovery.prior_qpc;
+      if (ctx.hardware_present && ctx.destroy_qpc == null)
+        status = ctx.create_rollback ?
           invalid_state("QP create recovery lacks candidate QPC") :
           invalid_state("QP destroy recovery lacks prior QPC");
     end
-    if (!status.ok()) begin
-      result.recovery_required = 1'b1;
-      result.final_resource_state = RDMA_RESOURCE_ERROR;
-      result.final_resource_state_known = 1'b1;
-      publish_primary(result, status);
+    return status;
+  endfunction
+
+  // 功能：对账持久的歧义操作：已有认证的 QPC_QUERY 存在性证据时直接采用；否则 reconcile ticket，
+  //   CREATE/DELETE 缺终态时回退到 QPC_QUERY；最后按终态 completion 记录各操作进度并刷新快照。
+  // 输入/输出及副作用：stop=1 表示结果已发布；可能释放 query 缓冲、发 QPC_QUERY、更新持久进度。
+  // 失败/边界：无 ticket、无终态（非 CREATE/DELETE）、query 不可信或持久化失败时 fail-closed。
+  protected task reconcile_qp_destroy_ambiguity(rdma_qp_destroy_recovery_context ctx,
+                                                output bit stop);
+    rdma_qp_ambiguous_operation_e operation;
+    rdma_cmq_completion completion;
+    rdma_status status;
+    rdma_status fence_status;
+    bit terminal_known;
+    bit query_conclusive;
+    bit release_complete;
+
+    stop = 1'b1;
+    operation = ctx.recovery.ambiguous_operation;
+    if (ctx.recovery.ambiguous_ticket == null) begin
+      // 无 ticket 的歧义无法对账：保持 ERROR fail-closed，待后续恢复获得新证据。
+      retain_qp_recovery_error(ctx.result, rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+        "QP destroy ambiguity has no reconciliation ticket"));
       return;
     end
-
-    // 只对账持久 ticket 所指的操作；reset 取消或缺少终态结果时保持 ticket 不动。
-    if (recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE) begin
-      reconciled_operation = recovery.ambiguous_operation;
-      if (recovery.ambiguous_ticket == null) begin
-        // 无 ticket 的歧义无法对账：保持 ERROR fail-closed，待后续恢复获得新证据。
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
-        publish_primary(result, rdma_status::make(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "QP destroy ambiguity has no reconciliation ticket"));
-        return;
-      end
-      // 此前已认证的 QPC_QUERY 镜像是持久证据，可避免重复查询或重复原副作用。
-      if (recovery.query_presence_known &&
-          (reconciled_operation inside {RDMA_QP_AMBIG_CREATE,
-                                        RDMA_QP_AMBIG_DELETE})) begin
-        if (recovery.query_mapping != null) begin
-          rdma_dma_mapping retained_probe;
-          retained_probe = null;
-          if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
-                recovery.query_mapping, retained_probe)) begin
-            status = invalid_state(
-              "QP persisted presence query release probe clone failed");
-            query_release_complete = 1'b0;
-          end
-          else
-            release_mapping_fenced(
-              binding, expected_owner, retained_probe,
-              "QP persisted presence query", status,
-              query_release_complete);
-          if (!status.ok() || !query_release_complete) begin
-            if (status.ok()) status = rdma_status::make(
-              RDMA_SC_RECOVERY_REQUIRED,
+    query_conclusive = 1'b0;
+    completion = null;
+    terminal_known = 1'b0;
+    // 此前已认证的 QPC_QUERY 镜像是持久证据，可避免重复查询或重复原副作用。
+    if (ctx.recovery.query_presence_known &&
+        operation inside {RDMA_QP_AMBIG_CREATE, RDMA_QP_AMBIG_DELETE}) begin
+      if (ctx.recovery.query_mapping != null) begin
+        release_mapping_probe(ctx, ctx.recovery.query_mapping,
+          "QP persisted presence query release probe clone failed",
+          "QP persisted presence query", status, release_complete);
+        if (!status.ok() || !release_complete) begin
+          if (status.ok())
+            status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
               "QP persisted presence query release remains incomplete");
-            publish_primary(result, status);
-            result.recovery_required = 1'b1;
-            result.final_resource_state = RDMA_RESOURCE_ERROR;
-            result.final_resource_state_known = 1'b1;
-            return;
-          end
-        end
-        hardware_present = recovery.query_presence == RDMA_HW_PRESENCE_PRESENT;
-        if (reconciled_operation == RDMA_QP_AMBIG_DELETE && !hardware_present)
-          recovery.delete_complete = 1'b1;
-        recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
-        recovery.ambiguous_ticket = null;
-        recovery.has_pending_hardware_step = 1'b0;
-        status = normalize_status(
-          manager.update_qp_recovery_progress(resource_h, recovery),
-          "QP destroy persisted query presence returned null");
-      end
-      else begin
-        terminal_known = 1'b0;
-        completion = null;
-        status = live_binding_fence(binding, expected_owner);
-        if (status.ok()) begin
-          cmq.reconcile(recovery.ambiguous_ticket, terminal_known, completion,
-                        status);
-          fence_status = live_binding_fence(binding, expected_owner);
-          if (!fence_status.ok()) status = fence_status;
-        end
-        status = normalize_status(status,
-                                   "QP destroy reconciliation returned null");
-        if (status.ok() && !terminal_known) begin
-          // CREATE/DELETE 可由已认证的 QPC_QUERY 镜像消歧；其它 destroy 步骤无 ticket 时保持 fail-closed。
-          if (!(reconciled_operation inside {RDMA_QP_AMBIG_CREATE,
-                                             RDMA_QP_AMBIG_DELETE})) begin
-            publish_primary(result, rdma_status::make(
-              RDMA_SC_RECOVERY_REQUIRED,
-              "QP destroy ambiguity has no terminal result"));
-            return;
-          end
-          if (recovery.query_mapping_recovery_only &&
-              recovery.query_mapping != null) begin
-            rdma_dma_mapping malformed_probe;
-            malformed_probe = null;
-            if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
-                  recovery.query_mapping, malformed_probe)) begin
-              status = invalid_state(
-                "QP destroy malformed query release probe clone failed");
-              query_release_complete = 1'b0;
-            end
-            else
-              release_mapping_fenced(
-                binding, expected_owner, malformed_probe,
-                "QP destroy malformed query", status,
-                query_release_complete);
-            if (!status.ok() || !query_release_complete) begin
-              if (status.ok()) status = rdma_status::make(
-                RDMA_SC_RECOVERY_REQUIRED,
-                "QP destroy malformed query release remains incomplete");
-              publish_primary(result, status);
-              result.recovery_required = 1'b1;
-              result.final_resource_state = RDMA_RESOURCE_ERROR;
-              result.final_resource_state_known = 1'b1;
-              return;
-            end
-          end
-          query_mapping = recovery.query_mapping_recovery_only ? null :
-                          recovery.query_mapping;
-          query_qpc_presence(binding, expected_owner, destroy_qpc,
-                             query_mapping, query_mapping, query_presence,
-                             query_conclusive, query_release_complete, status);
-          if (!query_release_complete && query_mapping != null &&
-              !query_conclusive) begin
-            if (recovery.query_mapping == null) begin
-              rdma_status retain_status;
-              bit retain_query_only;
-              retain_query_only = query_mapping.size != 512 ||
-                (query_mapping.iova.value & 64'h1ff) != 0 ||
-                (query_mapping.backing_addr.value & 64'h1ff) != 0;
-              retain_status = manager.retain_qp_query_mapping(
-                resource_h, query_mapping, retain_query_only);
-              if (retain_status == null || !retain_status.ok())
-                status = retain_status == null ?
-                  invalid_state("QP destroy query retention returned null") :
-                  retain_status;
-            end
-          end
-          if (query_conclusive) begin
-            recovery.query_presence_known = 1'b1;
-            recovery.query_presence = query_presence;
-            if (!query_release_complete && recovery.query_mapping == null) begin
-              bit retain_query_only;
-              retain_query_only = query_mapping.size != 512 ||
-                (query_mapping.iova.value & 64'h1ff) != 0 ||
-                (query_mapping.backing_addr.value & 64'h1ff) != 0;
-              status = normalize_status(
-                manager.retain_qp_query_mapping(
-                  resource_h, query_mapping,
-                  retain_query_only),
-                "QP destroy query authority retention returned null");
-              if (status.ok()) begin
-                recovery.query_mapping = query_mapping;
-                recovery.query_mapping_recovery_only = retain_query_only;
-              end
-            end
-            if (!query_release_complete && recovery.query_mapping != null) begin
-              rdma_status persist_presence_status;
-              persist_presence_status = manager.update_qp_recovery_progress(
-                resource_h, recovery);
-              if (persist_presence_status == null ||
-                  !persist_presence_status.ok())
-                status = persist_presence_status == null ?
-                  invalid_state("QP destroy query presence persistence returned null") :
-                  persist_presence_status;
-            end
-          end
-          if (status.ok() && query_conclusive && query_release_complete) begin
-            hardware_present = query_presence == RDMA_HW_PRESENCE_PRESENT;
-            if (reconciled_operation == RDMA_QP_AMBIG_DELETE && !hardware_present)
-              recovery.delete_complete = 1'b1;
-            recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
-            recovery.ambiguous_ticket = null;
-            recovery.has_pending_hardware_step = 1'b0;
-            status = normalize_status(
-              manager.update_qp_recovery_progress(resource_h, recovery),
-              "QP destroy query presence progress returned null");
-          end
-          else begin
-            if (status.ok()) status = rdma_status::make(
-              RDMA_SC_RECOVERY_REQUIRED,
-              query_conclusive ?
-                "QP destroy query mapping release remains incomplete" :
-                "QP destroy ambiguity has no trustworthy presence result");
-          end
-        end
-        if (status.ok() && recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
-            (completion == null || completion.status == null))
-          status = invalid_state("QP destroy reconciliation completion is incomplete");
-        if (status.ok() && recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
-            completion != null && completion.status != null &&
-            completion.status.code inside {RDMA_SC_TIMEOUT,
-                                           RDMA_SC_RESET_CANCELLED}) begin
-          status = rdma_status::make(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "QP destroy reconciliation remains ambiguous");
-        end
-        // 终态 completion 失败仍是权威证据；reconcile 可能返回与 completion 相同的非 OK status，
-        // 只有超时/复位仍视为歧义。
-        if (status != null && recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE &&
-            completion != null && completion.status != null &&
-            !(completion.status.code inside {RDMA_SC_TIMEOUT,
-                                             RDMA_SC_RESET_CANCELLED}) &&
-            (terminal_known || query_conclusive))
-          status = rdma_status::success();
-      end
-      if (status.ok() &&
-          recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE) begin
-        if (reconciled_operation == RDMA_QP_AMBIG_CREATE)
-          hardware_present = completion.status.ok();
-        else if (reconciled_operation == RDMA_QP_AMBIG_DELETE) begin
-          hardware_present = !completion.status.ok();
-          if (!hardware_present) recovery.delete_complete = 1'b1;
-        end
-        if (reconciled_operation inside {RDMA_QP_AMBIG_CREATE,
-                                          RDMA_QP_AMBIG_DELETE}) begin
-          recovery.query_presence_known = 1'b1;
-          recovery.query_presence = hardware_present ?
-            RDMA_HW_PRESENCE_PRESENT : RDMA_HW_PRESENCE_ABSENT;
-        end
-        if (reconciled_operation == RDMA_QP_AMBIG_MODIFY)
-          recovery.error_modify_complete = completion.status.ok();
-        else if (reconciled_operation == RDMA_QP_AMBIG_DELETE)
-          recovery.delete_complete = completion.status.ok();
-        // 先清除操作 ticket 再记录操作相关进度；manager 强制该歧义迁移顺序。
-        recovery.ambiguous_operation = RDMA_QP_AMBIG_NONE;
-        recovery.ambiguous_ticket = null;
-        status = normalize_status(manager.mark_qp_error(resource_h, recovery),
-                                  "QP destroy recovery ambiguity clear returned null");
-        if (status.ok() && reconciled_operation == RDMA_QP_AMBIG_OCC_FLUSH &&
-            recovery.ambiguous_role inside {
-              RDMA_QUEUE_ROLE_QP_SQ_RING,
-              RDMA_QUEUE_ROLE_QP_SQ_PD,
-              RDMA_QUEUE_ROLE_QP_RQ_PD}) begin
-          if (completion.status.ok() &&
-              recovery.ambiguous_role != RDMA_QUEUE_ROLE_QP_SQ_RING)
-            status = normalize_status(manager.record_qp_flush_complete(
-              resource_h, recovery.ambiguous_role),
-              "QP destroy recovery flush progress returned null");
-          else if (completion.status.ok())
-            status = normalize_status(manager.record_qp_flush_complete(
-              resource_h, recovery.ambiguous_role),
-              "QP destroy recovery flush progress returned null");
-        end
-        if (status.ok() && reconciled_operation == RDMA_QP_AMBIG_DELETE &&
-            completion.status.ok())
-          status = normalize_status(
-            manager.update_qp_recovery_progress(resource_h, recovery),
-            "QP destroy recovery progress update returned null");
-        if (status.ok()) begin
-          // manager 更新进度后重新读取持久快照。
-          status = normalize_status(manager.lookup_recovery(resource_h, record),
-                                    "QP destroy recovery refresh returned null");
-          if (status.ok() && record != null && record.qp_recovery != null) begin
-            if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, recovery))
-              status = invalid_state("QP destroy recovery refresh failed");
-          end
+          retain_qp_recovery_error(ctx.result, status);
+          return;
         end
       end
-      if (!status.ok()) begin
-        publish_primary(result, status);
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
-        return;
-      end
+      status = settle_qp_presence(ctx, operation, ctx.recovery.query_presence,
+                                  "QP destroy persisted query presence returned null");
     end
-
-    // CREATE staging 是独立于 QP context 与 backing recipe 的临时 DMA authority；
-    // CREATE ticket 有终态证据后释放，detached probe 保留 adapter 的 opaque completion seal 且不改持久 authority。
-    if (create_rollback && recovery.staging_mapping != null) begin
-      staging_probe = null;
-      if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(
-            recovery.staging_mapping, staging_probe)) begin
-        status = invalid_state("QP create staging release probe clone failed");
-        release_complete = 1'b0;
-      end
-      else
-        release_mapping_fenced(binding, expected_owner, staging_probe,
-                               "QP create recovery staging", status,
-                               release_complete);
-      if (!status.ok() || !release_complete) begin
-        if (status.ok()) status = rdma_status::make(
-          RDMA_SC_RECOVERY_REQUIRED,
-          "QP create staging release remains incomplete");
-        publish_primary(result, status);
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
-        return;
-      end
-    end
-
-    // 若失败前尚未完成，则执行 ERROR 迁移。
-    if (!hardware_present) begin
-      // 终态 CREATE 失败证明未安装 QP context，没有合法的 ERROR 迁移或硬件 flush 可发。
-      recovery.error_modify_complete = 1'b1;
-      recovery.delete_complete = 1'b1;
-      status = normalize_status(
-        manager.update_qp_recovery_progress(resource_h, recovery),
-        "QP create absent progress update returned null");
-    end
-    else if (!recovery.error_modify_complete) begin
-      status = live_binding_fence(binding, expected_owner);
+    else begin
+      status = live_binding_fence(ctx.binding, ctx.expected_owner);
       if (status.ok()) begin
-        if (!rdma_deep_copy#(rdma_qpc_model)::try_of(destroy_qpc, error_qpc))
-          status = invalid_state("QP destroy ERROR QPC clone failed");
-        else begin
-          error_qpc.state = RDMA_QPS_ERROR;
-          status = build_qpc_command(expected_owner, error_qpc, null, null,
-                                     RDMA_OP_QPC_MODIFY, command);
-          if (status.ok()) begin
-            execute_terminal_command(binding, expected_owner, command,
-                                     status, ambiguous, ticket);
-            status = normalize_status(status,
-                                       "QP destroy ERROR retry returned null");
-            if (ambiguous) begin
-              recovery.ambiguous_operation = RDMA_QP_AMBIG_MODIFY;
-              recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
-              recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-                ticket, "QP destroy ERROR retry");
-              recovery.has_pending_hardware_step = ticket == null;
-              status = normalize_status(manager.mark_qp_error(resource_h,
-                                                               recovery),
-                                         "QP destroy ERROR ambiguity publication returned null");
-              if (!status.ok()) begin
-                publish_primary(result, status);
-                result.recovery_required = 1'b1;
-                result.final_resource_state = RDMA_RESOURCE_ERROR;
-                result.final_resource_state_known = 1'b1;
-                return;
-              end
-              publish_primary(result, rdma_status::make(
-                RDMA_SC_RECOVERY_REQUIRED,
-                "QP destroy ERROR transition remains ambiguous"));
-              result.recovery_required = 1'b1;
-              result.final_resource_state = RDMA_RESOURCE_ERROR;
-              result.final_resource_state_known = 1'b1;
-              return;
-            end
-            if (status.ok()) recovery.error_modify_complete = 1'b1;
-          end
-        end
+        cmq.reconcile(ctx.recovery.ambiguous_ticket, terminal_known, completion, status);
+        fence_status = live_binding_fence(ctx.binding, ctx.expected_owner);
+        if (!fence_status.ok())
+          status = fence_status;
       end
-      if (status.ok()) status = normalize_status(
-        manager.update_qp_recovery_progress(resource_h, recovery),
-        "QP destroy ERROR progress update returned null");
-      if (!status.ok()) begin
-        publish_primary(result, status);
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
+      status = normalize_status(status, "QP destroy reconciliation returned null");
+      if (status.ok() && !terminal_known) begin
+        // CREATE/DELETE 可由已认证的 QPC_QUERY 镜像消歧；其它 destroy 步骤无 ticket 时保持 fail-closed。
+        if (!(operation inside {RDMA_QP_AMBIG_CREATE, RDMA_QP_AMBIG_DELETE})) begin
+          publish_primary(ctx.result, rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+            "QP destroy ambiguity has no terminal result"));
+          return;
+        end
+        resolve_qp_presence_by_query(ctx, operation, status, query_conclusive, stop);
+        if (stop)
+          return;
+        stop = 1'b1;
+      end
+      status = check_qp_destroy_completion(ctx, completion, terminal_known, query_conclusive,
+                                           status);
+    end
+    if (status.ok() && ctx.recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE)
+      status = apply_qp_destroy_completion(ctx, operation, completion);
+    if (!status.ok()) begin
+      retain_qp_recovery_error(ctx.result, status);
+      return;
+    end
+    stop = 1'b0;
+  endtask
+
+  // 功能：ticket 无终态时用 QPC_QUERY 判定 CREATE/DELETE 后的硬件存在性：先释放此前 recovery-only 的
+  //   畸形 query 缓冲，查询后按需保留 query mapping 作为持久证据，结论性且缓冲已释放时收尾歧义。
+  // 输入/输出及副作用：status/conclusive 输出；stop=1 表示结果已发布。
+  // 失败/边界：畸形缓冲释放失败时 fail-closed；无结论或缓冲未释放时返回 RECOVERY_REQUIRED。
+  protected task resolve_qp_presence_by_query(rdma_qp_destroy_recovery_context ctx,
+                                              rdma_qp_ambiguous_operation_e operation,
+                                              output rdma_status status,
+                                              output bit conclusive,
+                                              output bit stop);
+    rdma_dma_mapping query_mapping;
+    rdma_hw_presence_e presence;
+    rdma_status retain_status;
+    bit release_complete;
+    bit recovery_only;
+
+    stop = 1'b1;
+    conclusive = 1'b0;
+    status = rdma_status::success();
+    if (ctx.recovery.query_mapping_recovery_only && ctx.recovery.query_mapping != null) begin
+      release_mapping_probe(ctx, ctx.recovery.query_mapping,
+        "QP destroy malformed query release probe clone failed",
+        "QP destroy malformed query", status, release_complete);
+      if (!status.ok() || !release_complete) begin
+        if (status.ok())
+          status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+            "QP destroy malformed query release remains incomplete");
+        retain_qp_recovery_error(ctx.result, status);
         return;
       end
     end
+    query_mapping = ctx.recovery.query_mapping_recovery_only ? null : ctx.recovery.query_mapping;
+    query_qpc_presence(ctx.binding, ctx.expected_owner, ctx.destroy_qpc, query_mapping,
+                       query_mapping, presence, conclusive, release_complete, status);
+    if (!release_complete && query_mapping != null && !conclusive &&
+        ctx.recovery.query_mapping == null) begin
+      retain_status = manager.retain_qp_query_mapping(
+        ctx.resource_h, query_mapping, qp_query_mapping_recovery_only(query_mapping));
+      if (retain_status == null || !retain_status.ok())
+        status = retain_status == null ?
+          invalid_state("QP destroy query retention returned null") : retain_status;
+    end
+    if (conclusive) begin
+      ctx.recovery.query_presence_known = 1'b1;
+      ctx.recovery.query_presence = presence;
+      if (!release_complete && ctx.recovery.query_mapping == null) begin
+        recovery_only = qp_query_mapping_recovery_only(query_mapping);
+        status = normalize_status(
+          manager.retain_qp_query_mapping(ctx.resource_h, query_mapping, recovery_only),
+          "QP destroy query authority retention returned null");
+        if (status.ok()) begin
+          ctx.recovery.query_mapping = query_mapping;
+          ctx.recovery.query_mapping_recovery_only = recovery_only;
+        end
+      end
+      if (!release_complete && ctx.recovery.query_mapping != null) begin
+        retain_status = manager.update_qp_recovery_progress(ctx.resource_h, ctx.recovery);
+        if (retain_status == null || !retain_status.ok())
+          status = retain_status == null ?
+            invalid_state("QP destroy query presence persistence returned null") :
+            retain_status;
+      end
+    end
+    if (status.ok() && conclusive && release_complete)
+      status = settle_qp_presence(ctx, operation, presence,
+                                  "QP destroy query presence progress returned null");
+    else if (status.ok())
+      status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED, conclusive ?
+        "QP destroy query mapping release remains incomplete" :
+        "QP destroy ambiguity has no trustworthy presence result");
+    stop = 1'b0;
+  endtask
 
-    // 按规范顺序 flush 各 role，跳过已持久化的。
+  // 功能：歧义仍存在时检查对账得到的 completion：缺失为 INVALID_STATE，超时/reset 仍是歧义；终态失败
+  //   本身是权威证据（reconcile 可能返回与 completion 相同的非 OK status），此时视为成功取得证据。
+  // 输入/输出及副作用：纯函数，返回调整后的 status。
+  // 失败/边界：无。
+  protected function rdma_status check_qp_destroy_completion(
+    rdma_qp_destroy_recovery_context ctx,
+    rdma_cmq_completion completion,
+    bit terminal_known,
+    bit query_conclusive,
+    rdma_status status
+  );
+    bit ambiguous;
+    bit has_completion;
+
+    ambiguous = ctx.recovery.ambiguous_operation != RDMA_QP_AMBIG_NONE;
+    has_completion = completion != null && completion.status != null;
+    if (status.ok() && ambiguous && !has_completion)
+      status = invalid_state("QP destroy reconciliation completion is incomplete");
+    if (status.ok() && ambiguous && has_completion &&
+        completion.status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED})
+      status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                 "QP destroy reconciliation remains ambiguous");
+    if (status != null && ambiguous && has_completion &&
+        !(completion.status.code inside {RDMA_SC_TIMEOUT, RDMA_SC_RESET_CANCELLED}) &&
+        (terminal_known || query_conclusive))
+      status = rdma_status::success();
+    return status;
+  endfunction
+
+  // 功能：按终态 completion 记录歧义操作的结果（CREATE/DELETE 的存在性、MODIFY 的 ERROR 迁移、OCC 的
+  //   role flush），先清除 ticket 再持久化（manager 强制该迁移顺序），最后刷新快照。
+  // 输入/输出及副作用：修改 ctx.hardware_present/recovery 并经 manager 持久化。
+  // 失败/边界：返回首个失败 status。
+  protected function rdma_status apply_qp_destroy_completion(
+    rdma_qp_destroy_recovery_context ctx,
+    rdma_qp_ambiguous_operation_e operation,
+    rdma_cmq_completion completion
+  );
+    rdma_status status;
+    bit completed;
+
+    completed = completion.status.ok();
+    if (operation == RDMA_QP_AMBIG_CREATE)
+      ctx.hardware_present = completed;
+    else if (operation == RDMA_QP_AMBIG_DELETE)
+      ctx.hardware_present = !completed;
+    if (operation inside {RDMA_QP_AMBIG_CREATE, RDMA_QP_AMBIG_DELETE}) begin
+      ctx.recovery.query_presence_known = 1'b1;
+      ctx.recovery.query_presence = ctx.hardware_present ?
+        RDMA_HW_PRESENCE_PRESENT : RDMA_HW_PRESENCE_ABSENT;
+    end
+    if (operation == RDMA_QP_AMBIG_MODIFY)
+      ctx.recovery.error_modify_complete = completed;
+    else if (operation == RDMA_QP_AMBIG_DELETE)
+      ctx.recovery.delete_complete = completed;
+    clear_qp_destroy_ambiguity(ctx);
+    status = normalize_status(manager.mark_qp_error(ctx.resource_h, ctx.recovery),
+                              "QP destroy recovery ambiguity clear returned null");
+    if (status.ok() && completed && operation == RDMA_QP_AMBIG_OCC_FLUSH &&
+        ctx.recovery.ambiguous_role inside {RDMA_QUEUE_ROLE_QP_SQ_RING,
+                                            RDMA_QUEUE_ROLE_QP_SQ_PD,
+                                            RDMA_QUEUE_ROLE_QP_RQ_PD})
+      status = normalize_status(
+        manager.record_qp_flush_complete(ctx.resource_h, ctx.recovery.ambiguous_role),
+        "QP destroy recovery flush progress returned null");
+    if (status.ok() && operation == RDMA_QP_AMBIG_DELETE && completed)
+      status = normalize_status(manager.update_qp_recovery_progress(ctx.resource_h, ctx.recovery),
+                                "QP destroy recovery progress update returned null");
+    if (status.ok())
+      status = refresh_qp_recovery(ctx, "QP destroy recovery refresh returned null",
+                                   "QP destroy recovery refresh failed");
+    return status;
+  endfunction
+
+  // 功能：CREATE ticket 有终态证据后释放 create staging（独立于 QP context 与 backing recipe 的临时 DMA
+  //   authority），detached probe 保留 adapter 的 opaque completion seal 且不改持久 authority。
+  // 输入/输出及副作用：stop=1 表示结果已发布。
+  // 失败/边界：释放失败或未完成时 fail-closed。
+  protected task release_qp_create_staging(rdma_qp_destroy_recovery_context ctx, output bit stop);
+    rdma_status status;
+    bit release_complete;
+
+    stop = 1'b0;
+    if (!ctx.create_rollback || ctx.recovery.staging_mapping == null)
+      return;
+    release_mapping_probe(ctx, ctx.recovery.staging_mapping,
+      "QP create staging release probe clone failed", "QP create recovery staging",
+      status, release_complete);
+    if (!status.ok() || !release_complete) begin
+      if (status.ok())
+        status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                   "QP create staging release remains incomplete");
+      retain_qp_recovery_error(ctx.result, status);
+      stop = 1'b1;
+    end
+  endtask
+
+  // 功能：失败前尚未完成时执行 ERROR 迁移（QPC_MODIFY 到 ERROR）；终态 CREATE 失败证明未安装 QP context，
+  //   直接记为 ERROR 迁移与 delete 完成。
+  // 输入/输出及副作用：stop=1 表示结果已发布；歧义时保存 ticket 并发布 RECOVERY_REQUIRED。
+  // 失败/边界：命令构造/执行/持久化失败时 fail-closed。
+  protected task retry_qp_error_transition(rdma_qp_destroy_recovery_context ctx, output bit stop);
+    rdma_qpc_model error_qpc;
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_status status;
+    bit ambiguous;
+
+    stop = 1'b0;
+    if (!ctx.hardware_present) begin
+      ctx.recovery.error_modify_complete = 1'b1;
+      ctx.recovery.delete_complete = 1'b1;
+      status = normalize_status(manager.update_qp_recovery_progress(ctx.resource_h, ctx.recovery),
+                                "QP create absent progress update returned null");
+      return;
+    end
+    if (ctx.recovery.error_modify_complete)
+      return;
+    stop = 1'b1;
+    status = live_binding_fence(ctx.binding, ctx.expected_owner);
+    if (status.ok() && !rdma_deep_copy#(rdma_qpc_model)::try_of(ctx.destroy_qpc, error_qpc))
+      status = invalid_state("QP destroy ERROR QPC clone failed");
+    else if (status.ok()) begin
+      error_qpc.state = RDMA_QPS_ERROR;
+      status = build_qpc_command(ctx.expected_owner, error_qpc, null, null,
+                                 RDMA_OP_QPC_MODIFY, command);
+      if (status.ok()) begin
+        execute_terminal_command(ctx.binding, ctx.expected_owner, command, status, ambiguous,
+                                 ticket);
+        status = normalize_status(status, "QP destroy ERROR retry returned null");
+        if (ambiguous) begin
+          status = record_qp_destroy_ambiguity(ctx, RDMA_QP_AMBIG_MODIFY,
+            RDMA_QUEUE_ROLE_QP_SQ_RING, ticket, "QP destroy ERROR retry",
+            "QP destroy ERROR ambiguity publication returned null");
+          retain_qp_recovery_error(ctx.result, status.ok() ? rdma_status::make(
+            RDMA_SC_RECOVERY_REQUIRED, "QP destroy ERROR transition remains ambiguous") : status);
+          return;
+        end
+        if (status.ok())
+          ctx.recovery.error_modify_complete = 1'b1;
+      end
+    end
+    if (status.ok())
+      status = normalize_status(manager.update_qp_recovery_progress(ctx.resource_h, ctx.recovery),
+                                "QP destroy ERROR progress update returned null");
+    if (!status.ok()) begin
+      retain_qp_recovery_error(ctx.result, status);
+      return;
+    end
+    stop = 1'b0;
+  endtask
+
+  // 功能：记录一次歧义的恢复命令（操作、role、ticket；无 ticket 时标记有待办硬件步骤）并发布 ERROR 恢复记录。
+  // 输入/输出及副作用：修改 ctx.recovery 并经 manager.mark_qp_error 持久化。
+  // 失败/边界：返回发布 status。
+  protected function rdma_status record_qp_destroy_ambiguity(
+    rdma_qp_destroy_recovery_context ctx,
+    rdma_qp_ambiguous_operation_e operation,
+    rdma_queue_backing_role_e role,
+    rdma_cmq_ticket ticket,
+    string ticket_label,
+    string null_message
+  );
+    ctx.recovery.ambiguous_operation = operation;
+    ctx.recovery.ambiguous_role = role;
+    ctx.recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(ticket, ticket_label);
+    ctx.recovery.has_pending_hardware_step = ticket == null;
+    return normalize_status(manager.mark_qp_error(ctx.resource_h, ctx.recovery), null_message);
+  endfunction
+
+  // 功能：按规范顺序（SQ ring → SQ PD → 私有 RQ PD）对未完成的 role 发 OCC flush 并记录进度；
+  //   硬件不存在时只记录进度。
+  // 输入/输出及副作用：stop=1 表示结果已发布；每个 role 后刷新快照。
+  // 失败/边界：命令/执行/歧义/持久化/刷新失败时 fail-closed（歧义发布 RECOVERY_REQUIRED）。
+  protected task flush_qp_destroy_roles(rdma_qp_destroy_recovery_context ctx, output bit stop);
+    rdma_queue_backing_role_e roles[$];
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_qp_backing_ref pd_ref;
+    rdma_status status;
+    bit ambiguous;
+    bit done;
+
+    stop = 1'b0;
+    status = rdma_status::success();
     roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_RING);
     roles.push_back(RDMA_QUEUE_ROLE_QP_SQ_PD);
-    if (recovery.qp_plan.rq_source_h == null)
+    if (ctx.recovery.qp_plan.rq_source_h == null)
       roles.push_back(RDMA_QUEUE_ROLE_QP_RQ_PD);
     foreach (roles[i]) begin
-      bit done;
-      done = (roles[i] == RDMA_QUEUE_ROLE_QP_SQ_RING) ?
-        recovery.qp_plan.cleanup_complete :
-        roles[i] == RDMA_QUEUE_ROLE_QP_SQ_PD ?
-        recovery.qp_plan.sq_pd_flush_complete :
-        recovery.qp_plan.rq_pd_flush_complete;
-      if (done) continue;
-      if (!hardware_present) begin
-        status = normalize_status(
-          manager.record_qp_flush_complete(resource_h, roles[i]),
-          "QP create absent flush progress returned null");
-        if (!status.ok()) break;
-        status = normalize_status(manager.lookup_recovery(resource_h, record),
-                                  "QP create absent flush refresh returned null");
-        if (status.ok() && record != null && record.qp_recovery != null) begin
-          if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(
-                record.qp_recovery, recovery)) begin
-            status = invalid_state("QP create absent flush refresh failed");
-            break;
-          end
-        end
+      done = (roles[i] == RDMA_QUEUE_ROLE_QP_SQ_RING) ? ctx.recovery.qp_plan.cleanup_complete :
+             (roles[i] == RDMA_QUEUE_ROLE_QP_SQ_PD) ? ctx.recovery.qp_plan.sq_pd_flush_complete :
+                                                      ctx.recovery.qp_plan.rq_pd_flush_complete;
+      if (done)
+        continue;
+      if (!ctx.hardware_present) begin
+        status = normalize_status(manager.record_qp_flush_complete(ctx.resource_h, roles[i]),
+                                  "QP create absent flush progress returned null");
+        if (status.ok())
+          status = refresh_qp_recovery(ctx, "QP create absent flush refresh returned null",
+                                       "QP create absent flush refresh failed");
+        if (!status.ok())
+          break;
         continue;
       end
-      status = live_binding_fence(binding, expected_owner);
-      if (!status.ok()) break;
-      status = build_occ_command(expected_owner, authoritative.local_qp_id,
-                                 roles[i] == RDMA_QUEUE_ROLE_QP_SQ_PD ?
-                                   recovery.qp_plan.sq_pd_ref :
-                                 roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD ?
-                                   recovery.qp_plan.rq_pd_ref : null,
+      status = live_binding_fence(ctx.binding, ctx.expected_owner);
+      if (!status.ok())
+        break;
+      pd_ref = (roles[i] == RDMA_QUEUE_ROLE_QP_SQ_PD) ? ctx.recovery.qp_plan.sq_pd_ref :
+               (roles[i] == RDMA_QUEUE_ROLE_QP_RQ_PD) ? ctx.recovery.qp_plan.rq_pd_ref : null;
+      status = build_occ_command(ctx.expected_owner, ctx.authoritative.local_qp_id, pd_ref,
                                  command);
       if (status.ok()) begin
-        execute_terminal_command(binding, expected_owner, command,
-                                 status, ambiguous, ticket);
+        execute_terminal_command(ctx.binding, ctx.expected_owner, command, status, ambiguous,
+                                 ticket);
         status = normalize_status(status, "QP destroy OCC retry returned null");
         if (ambiguous) begin
-          recovery.ambiguous_operation = RDMA_QP_AMBIG_OCC_FLUSH;
-          recovery.ambiguous_role = roles[i];
-          recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-            ticket, "QP destroy OCC retry");
-          recovery.has_pending_hardware_step = ticket == null;
-          status = normalize_status(manager.mark_qp_error(resource_h, recovery),
-                                    "QP destroy OCC ambiguity publication returned null");
-          if (status.ok()) status = rdma_status::make(
-            RDMA_SC_RECOVERY_REQUIRED,
-            "QP destroy OCC flush remains ambiguous");
+          status = record_qp_destroy_ambiguity(ctx, RDMA_QP_AMBIG_OCC_FLUSH, roles[i], ticket,
+            "QP destroy OCC retry", "QP destroy OCC ambiguity publication returned null");
+          if (status.ok())
+            status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                       "QP destroy OCC flush remains ambiguous");
         end
         else if (status.ok())
-          status = normalize_status(
-            manager.record_qp_flush_complete(resource_h, roles[i]),
-            "QP destroy OCC progress returned null");
+          status = normalize_status(manager.record_qp_flush_complete(ctx.resource_h, roles[i]),
+                                    "QP destroy OCC progress returned null");
       end
-      if (!status.ok()) break;
-      status = manager.lookup_recovery(resource_h, record);
-      if (status.ok() && record != null && record.qp_recovery != null) begin
-        if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(
-              record.qp_recovery, recovery)) begin
-          status = invalid_state("QP destroy recovery flush refresh failed");
-          break;
-        end
-      end
+      if (status.ok())
+        status = refresh_qp_recovery(ctx, "QP destroy recovery flush refresh returned null",
+                                     "QP destroy recovery flush refresh failed");
+      if (!status.ok())
+        break;
     end
     if (!status.ok()) begin
-      publish_primary(result, status);
-      result.recovery_required = 1'b1;
-      result.final_resource_state = RDMA_RESOURCE_ERROR;
-      result.final_resource_state_known = 1'b1;
+      retain_qp_recovery_error(ctx.result, status);
+      stop = 1'b1;
+    end
+  endtask
+
+  // 功能：尚未 delete 时发 QPC_DELETE（硬件不存在时直接记为完成）并持久化进度。
+  // 输入/输出及副作用：stop=1 表示结果已发布；歧义时保存 ticket 并发布 RECOVERY_REQUIRED。
+  // 失败/边界：命令/执行/持久化失败时 fail-closed。
+  protected task delete_qp_hardware_context(rdma_qp_destroy_recovery_context ctx,
+                                            output bit stop);
+    rdma_cmq_command_desc command;
+    rdma_cmq_ticket ticket;
+    rdma_status status;
+    bit ambiguous;
+
+    stop = 1'b0;
+    if (ctx.recovery.delete_complete)
+      return;
+    if (!ctx.hardware_present) begin
+      ctx.recovery.delete_complete = 1'b1;
+      status = normalize_status(manager.update_qp_recovery_progress(ctx.resource_h, ctx.recovery),
+                                "QP create absent DELETE progress update returned null");
+    end
+    else begin
+      status = live_binding_fence(ctx.binding, ctx.expected_owner);
+      if (status.ok())
+        status = build_qpc_command(ctx.expected_owner, ctx.destroy_qpc, null, null,
+                                   RDMA_OP_QPC_DELETE, command);
+      if (status.ok()) begin
+        execute_terminal_command(ctx.binding, ctx.expected_owner, command, status, ambiguous,
+                                 ticket);
+        status = normalize_status(status, "QP destroy delete retry returned null");
+        if (ambiguous) begin
+          status = record_qp_destroy_ambiguity(ctx, RDMA_QP_AMBIG_DELETE,
+            RDMA_QUEUE_ROLE_QP_SQ_RING, ticket, "QP destroy delete retry",
+            "QP delete ambiguity publication returned null");
+          if (status.ok())
+            status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED, "QP delete remains ambiguous");
+        end
+        else if (status.ok())
+          ctx.recovery.delete_complete = 1'b1;
+      end
+      if (status.ok())
+        status = normalize_status(manager.update_qp_recovery_progress(ctx.resource_h,
+                                                                      ctx.recovery),
+                                  "QP destroy DELETE progress update returned null");
+    end
+    if (!status.ok()) begin
+      retain_qp_recovery_error(ctx.result, status);
+      stop = 1'b1;
+    end
+  endtask
+
+  // 功能：在全部 owned backing 之前释放 QP context 并记录进度，随后刷新快照。
+  // 输入/输出及副作用：stop=1 表示结果已发布。
+  // 失败/边界：释放/fence/进度/刷新失败或释放未完成时 fail-closed。
+  protected task release_qp_destroy_context(rdma_qp_destroy_recovery_context ctx,
+                                            output bit stop);
+    rdma_status status;
+    rdma_status fence_status;
+    bit release_complete;
+
+    stop = 1'b0;
+    if (ctx.recovery.context_ref == null || ctx.recovery.context_ref.release_complete)
+      return;
+    stop = 1'b1;
+    release_complete = 1'b0;
+    status = live_binding_fence(ctx.binding, ctx.expected_owner);
+    if (status.ok()) begin
+      status = release_context_opaque(ctx.recovery.context_ref, "QP destroy recovery context",
+                                      release_complete);
+      fence_status = live_binding_fence(ctx.binding, ctx.expected_owner);
+      if (!fence_status.ok())
+        status = fence_status;
+    end
+    if (status.ok())
+      status = normalize_status(manager.record_qp_context_cleanup_complete(ctx.resource_h),
+                                "QP destroy context progress returned null");
+    if (status.ok() && !release_complete)
+      status = rdma_status::make(RDMA_SC_RECOVERY_REQUIRED,
+                                 "QP destroy context release remains incomplete");
+    if (status.ok())
+      status = refresh_qp_recovery(ctx, "QP destroy recovery context refresh returned null",
+                                   "QP destroy recovery context refresh failed");
+    if (!status.ok()) begin
+      retain_qp_recovery_error(ctx.result, status);
       return;
     end
+    stop = 1'b0;
+  endtask
 
-    if (!recovery.delete_complete) begin
-      if (!hardware_present) begin
-        recovery.delete_complete = 1'b1;
-        status = normalize_status(
-          manager.update_qp_recovery_progress(resource_h, recovery),
-          "QP create absent DELETE progress update returned null");
-      end
-      else begin
-        status = live_binding_fence(binding, expected_owner);
-        if (status.ok()) begin
-          status = build_qpc_command(expected_owner, destroy_qpc,
-                                     null, null, RDMA_OP_QPC_DELETE,
-                                     command);
-          if (status.ok()) begin
-            execute_terminal_command(binding, expected_owner, command,
-                                     status, ambiguous, ticket);
-            status = normalize_status(status, "QP destroy delete retry returned null");
-            if (ambiguous) begin
-              recovery.ambiguous_operation = RDMA_QP_AMBIG_DELETE;
-              recovery.ambiguous_role = RDMA_QUEUE_ROLE_QP_SQ_RING;
-              recovery.ambiguous_ticket = rdma_cmq_clone_ticket_value(
-                ticket, "QP destroy delete retry");
-              recovery.has_pending_hardware_step = ticket == null;
-              status = normalize_status(manager.mark_qp_error(resource_h, recovery),
-                                        "QP delete ambiguity publication returned null");
-              if (status.ok()) status = rdma_status::make(
-                RDMA_SC_RECOVERY_REQUIRED, "QP delete remains ambiguous");
-            end
-            else if (status.ok()) recovery.delete_complete = 1'b1;
-          end
-        end
-        if (status.ok()) status = normalize_status(
-          manager.update_qp_recovery_progress(resource_h, recovery),
-          "QP destroy DELETE progress update returned null");
-      end
-      if (!status.ok()) begin
-        publish_primary(result, status);
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
-        return;
-      end
-    end
+  // 功能：按逆序释放 owned backing（URC → RQ PD → SQ PD → RQ → SQ → SQ/RQ SGB），每项记录进度并刷新快照，
+  //   最后 finalize_qp_release；成功时 result 为 RELEASED。
+  // 输入/输出及副作用：写 result。
+  // 失败/边界：释放/进度/刷新/最终释放失败时保留 ERROR；最终释放后 fence 失败仍报告 RELEASED 但发布 fence status。
+  protected task release_qp_destroy_backing(rdma_qp_destroy_recovery_context ctx);
+    rdma_qp_backing_plan plan;
+    rdma_qp_backing_ref refs[$];
+    rdma_status status;
+    rdma_status fence_status;
+    bit release_complete;
 
-    // context 的释放先于全部 owned backing。
-    if (recovery.context_ref != null && !recovery.context_ref.release_complete) begin
-      status = live_binding_fence(binding, expected_owner);
-      if (status.ok()) begin
-        status = release_context_opaque(recovery.context_ref,
-                                        "QP destroy recovery context",
-                                        release_complete);
-        fence_status = live_binding_fence(binding, expected_owner);
-        if (!fence_status.ok()) status = fence_status;
-      end
-      if (status.ok()) status = normalize_status(
-        manager.record_qp_context_cleanup_complete(resource_h),
-        "QP destroy context progress returned null");
-      if (!status.ok() || !release_complete) begin
-        if (status.ok()) status = rdma_status::make(
-          RDMA_SC_RECOVERY_REQUIRED, "QP destroy context release remains incomplete");
-        publish_primary(result, status);
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
-        return;
-      end
-      status = manager.lookup_recovery(resource_h, record);
-      if (!status.ok()) begin
-        publish_primary(result, status);
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
-        return;
-      end
-      if (record != null && record.qp_recovery != null) begin
-        if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(record.qp_recovery, recovery))
-          status = invalid_state("QP destroy recovery context refresh failed");
-      end
-      if (!status.ok()) begin
-        publish_primary(result, status);
-        result.recovery_required = 1'b1;
-        result.final_resource_state = RDMA_RESOURCE_ERROR;
-        result.final_resource_state_known = 1'b1;
-        return;
-      end
-    end
-
-    refs.delete();
-    for (int i = recovery.qp_plan.urc_refs.size()-1; i >= 0; i--)
-      refs.push_back(recovery.qp_plan.urc_refs[i]);
-    if (recovery.qp_plan.rq_source_h == null)
-      refs.push_back(recovery.qp_plan.rq_pd_ref);
-    refs.push_back(recovery.qp_plan.sq_pd_ref);
-    if (recovery.qp_plan.rq_source_h == null)
-      refs.push_back(recovery.qp_plan.rq_ref);
-    refs.push_back(recovery.qp_plan.sq_ref);
-    refs.push_back(recovery.qp_plan.sq_sgb_ref);
-    if (recovery.qp_plan.rq_source_h == null)
-      refs.push_back(recovery.qp_plan.rq_sgb_ref);
+    plan = ctx.recovery.qp_plan;
+    for (int i = plan.urc_refs.size() - 1; i >= 0; i--)
+      refs.push_back(plan.urc_refs[i]);
+    if (plan.rq_source_h == null)
+      refs.push_back(plan.rq_pd_ref);
+    refs.push_back(plan.sq_pd_ref);
+    if (plan.rq_source_h == null)
+      refs.push_back(plan.rq_ref);
+    refs.push_back(plan.sq_ref);
+    refs.push_back(plan.sq_sgb_ref);
+    if (plan.rq_source_h == null)
+      refs.push_back(plan.rq_sgb_ref);
+    status = rdma_status::success();
     foreach (refs[i]) begin
       if (refs[i] == null || refs[i].ownership == RDMA_OWNERSHIP_BORROWED ||
           refs[i].cleanup_complete)
         continue;
-      status = live_binding_fence(binding, expected_owner);
+      release_complete = 1'b0;
+      status = live_binding_fence(ctx.binding, ctx.expected_owner);
       if (status.ok()) begin
-        probe = null;
-        if (!rdma_deep_copy#(rdma_dma_mapping)::try_of(refs[i].mapping, probe))
-          status = invalid_state("QP destroy backing release probe clone failed");
-        else
-          release_mapping_fenced(binding, expected_owner, probe,
-                                 "QP destroy recovery backing", status,
-                                 release_complete);
-        fence_status = live_binding_fence(binding, expected_owner);
-        if (!fence_status.ok()) status = fence_status;
+        release_mapping_probe(ctx, refs[i].mapping,
+          "QP destroy backing release probe clone failed", "QP destroy recovery backing",
+          status, release_complete);
+        fence_status = live_binding_fence(ctx.binding, ctx.expected_owner);
+        if (!fence_status.ok())
+          status = fence_status;
       end
       if (status.ok() && release_complete)
-        status = normalize_status(
-          manager.record_qp_cleanup_complete(resource_h, refs[i].role),
-          "QP destroy backing progress returned null");
-      if (!status.ok()) break;
-      status = manager.lookup_recovery(resource_h, record);
-      if (status.ok() && record != null && record.qp_recovery != null) begin
-        if (!rdma_deep_copy#(rdma_qp_recovery_state)::try_of(
-              record.qp_recovery, recovery)) begin
-          status = invalid_state("QP destroy recovery backing refresh failed");
-          break;
-        end
-      end
+        status = normalize_status(manager.record_qp_cleanup_complete(ctx.resource_h, refs[i].role),
+                                  "QP destroy backing progress returned null");
+      if (status.ok())
+        status = refresh_qp_recovery(ctx, "QP destroy recovery backing refresh returned null",
+                                     "QP destroy recovery backing refresh failed");
+      if (!status.ok())
+        break;
     end
     if (status.ok()) begin
-      status = live_binding_fence(binding, expected_owner);
+      status = live_binding_fence(ctx.binding, ctx.expected_owner);
       if (status.ok()) begin
-        status = normalize_status(manager.finalize_qp_release(resource_h),
+        status = normalize_status(manager.finalize_qp_release(ctx.resource_h),
                                   "QP destroy recovery finalization returned null");
-        fence_status = live_binding_fence(binding, expected_owner);
+        fence_status = live_binding_fence(ctx.binding, ctx.expected_owner);
         if (status.ok() && !fence_status.ok()) begin
-          result.final_resource_state = RDMA_RESOURCE_RELEASED;
-          result.final_resource_state_known = 1'b1;
-          result.recovery_required = 1'b0;
-          publish_primary(result, fence_status);
+          ctx.result.final_resource_state = RDMA_RESOURCE_RELEASED;
+          ctx.result.final_resource_state_known = 1'b1;
+          ctx.result.recovery_required = 1'b0;
+          publish_primary(ctx.result, fence_status);
           return;
         end
-        if (!fence_status.ok()) status = fence_status;
+        if (!fence_status.ok())
+          status = fence_status;
       end
     end
     if (!status.ok()) begin
-      publish_primary(result, status);
-      result.recovery_required = 1'b1;
-      result.final_resource_state = RDMA_RESOURCE_ERROR;
-      result.final_resource_state_known = 1'b1;
+      retain_qp_recovery_error(ctx.result, status);
       return;
     end
-    result.final_resource_state = RDMA_RESOURCE_RELEASED;
-    result.final_resource_state_known = 1'b1;
-    result.recovery_required = 1'b0;
-    publish_primary(result, rdma_status::success());
+    ctx.result.final_resource_state = RDMA_RESOURCE_RELEASED;
+    ctx.result.final_resource_state_known = 1'b1;
+    ctx.result.recovery_required = 1'b0;
+    publish_primary(ctx.result, rdma_status::success());
   endtask
 
   // 功能：对 ERROR 状态的 QP 做恢复：按 recovery intent 对账 create/modify/destroy 的歧义操作。
