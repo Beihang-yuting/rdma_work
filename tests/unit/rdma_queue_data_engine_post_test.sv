@@ -3337,7 +3337,7 @@ class rdma_queue_data_engine_post_test extends uvm_test;
 
   // 功能：check_rq_external_sgb 验证私有 RQ 外部 SGB：启用 RQ SGB 的 QP 投递 4/3 个 SGE 的 RECV 时，
   //   RQE 的 SGE_NUM/SGB_PA 指向 index*512 槽、槽内为 16B 大端描述符且其余补零、带描述符可验签解码；
-  //   未启用时 >2 SGE 的 RECV 被拒且不推进 PI；request 在 max_recv_sge<=2 时拒绝 RQ SGB。
+  //   未启用时 >2 SGE 的 RECV 被拒且不推进 PI；request 在 max_recv_sge<=2 或非 RC 时拒绝 RQ SGB。
   // 输入/输出及副作用：建立两个独立 fixture 并在结束时 cleanup。
   // 失败/边界：任一观测与预期不符报告 RQ_SGB_* UVM_ERROR。
   task automatic check_rq_external_sgb();
@@ -3463,8 +3463,15 @@ class rdma_queue_data_engine_post_test extends uvm_test;
       qp_request.rq_sgb_backing = rdma_queue_backing_spec::type_id::create("rq_sgb_spec");
       status = qp_request.validate();
       if (status == null || status.ok() ||
-          status.message != "RQ SGB requires a private RQ with max_recv_sge > 2")
+          status.message != "RQ SGB requires an RC private RQ with max_recv_sge > 2")
         `uvm_error("RQ_SGB_VALIDATE", status == null ? "null validate status" :
+                   status.convert2string())
+      qp_request.transport = RDMA_TRANSPORT_UD;
+      qp_request.max_recv_sge = 4;
+      status = qp_request.validate();
+      if (status == null || status.ok() ||
+          status.message != "RQ SGB requires an RC private RQ with max_recv_sge > 2")
+        `uvm_error("RQ_SGB_VALIDATE_UD", status == null ? "null validate status" :
                    status.convert2string())
     end
     if (fixture.needs_cleanup()) begin

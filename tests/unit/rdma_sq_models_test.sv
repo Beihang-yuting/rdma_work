@@ -29,7 +29,7 @@ class rdma_sq_models_test extends uvm_test;
         rdma_qp_needs_sq_sgb(RDMA_TRANSPORT_RC, 2, 2) ||
         rdma_qp_needs_sq_sgb(RDMA_TRANSPORT_URC, 32, 32))
       `uvm_error("SQ_CAP", "RC/URC SQ SGB thresholds are incorrect")
-    s = rdma_qp_sq_sgb_geometry(16, logical_bytes, storage_bytes);
+    s = rdma_qp_sgb_geometry(16, logical_bytes, storage_bytes);
     if (s == null || !s.ok() || logical_bytes != 8192 || storage_bytes != 8192)
       `uvm_error("SQ_GEOMETRY", "16-slot SQ SGB geometry is incorrect")
     av = rdma_address_vector::type_id::create("av");

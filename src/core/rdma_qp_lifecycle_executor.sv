@@ -530,7 +530,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     longint unsigned storage_bytes;
     rdma_status status;
     // SQ-SGB 每个 slot 固定 512B，底层 storage 按 4KiB 向上取整。
-    status = rdma_qp_sq_sgb_geometry(depth, logical_bytes, storage_bytes);
+    status = rdma_qp_sgb_geometry(depth, logical_bytes, storage_bytes);
     ref_out = null;
     if (!status.ok()) return status;
     if (spec == null)
@@ -559,10 +559,10 @@ class rdma_qp_lifecycle_executor extends uvm_object;
 
     status = make_sgb_ref(binding, qp_h, role, depth, spec, ref_out);
     if (!status.ok()) return status;
-    void'(rdma_qp_sq_sgb_geometry(depth, logical_bytes, storage_bytes));
+    void'(rdma_qp_sgb_geometry(depth, logical_bytes, storage_bytes));
     status = make_dma_context(binding, qp_h, role, sgb_context);
     if (status.ok())
-      status = zero_sq_sgb_ref(sgb_context, ref_out, storage_bytes);
+      status = zero_sgb_ref(sgb_context, ref_out, storage_bytes);
     if (status.ok() && spec.mode == RDMA_QUEUE_BACKING_BORROWED)
       status = bind_borrowed_owner(ref_out, qp_h);
     return status;
@@ -571,7 +571,7 @@ class rdma_qp_lifecycle_executor extends uvm_object;
   // 功能：逐 slot（512B）把 SQ/RQ SGB backing 写零。
   // 输入/输出及副作用：request_context/backing_ref 只读；经 host_mem 写 mapping，可跨 segment 定位 slot。
   // 失败/边界：入参无效或 backing 过短返回 INVALID_ARGUMENT；某个 slot 跨 segment 边界时立即拒绝，不拆分写入。
-  protected function rdma_status zero_sq_sgb_ref(
+  protected function rdma_status zero_sgb_ref(
     rdma_dma_request_context request_context,
     rdma_qp_backing_ref backing_ref,
     longint unsigned length
@@ -581,10 +581,10 @@ class rdma_qp_lifecycle_executor extends uvm_object;
     longint unsigned total;
     // 逐 slot 清零；若一个 slot 跨 segment，立即拒绝而不是拆分写入。
     if (request_context == null || backing_ref == null || backing_ref.mapping == null || length == 0)
-      return invalid_argument("SQ SGB zero input is invalid");
+      return invalid_argument("SGB zero input is invalid");
     status = rdma_qp_backing_total_length(backing_ref, total);
     if (!status.ok() || total < length)
-      return status.ok() ? invalid_argument("SQ SGB backing is too short") : status;
+      return status.ok() ? invalid_argument("SGB backing is too short") : status;
     zeros = new[512];
     foreach (zeros[i]) zeros[i] = 0;
     for (longint unsigned slot = 0; slot < length; slot += 512) begin
@@ -606,9 +606,9 @@ class rdma_qp_lifecycle_executor extends uvm_object;
         end
       end
       if (m == null)
-        return invalid_argument("SQ SGB segment boundary splits a slot");
+        return invalid_argument("SGB segment boundary splits a slot");
       status = normalize_status(host_mem.write(m, off, zeros),
-                                "SQ SGB zero write returned null");
+                                "SGB zero write returned null");
       if (!status.ok()) return status;
     end
     return rdma_status::success();

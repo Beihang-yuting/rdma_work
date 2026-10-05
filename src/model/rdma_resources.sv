@@ -283,7 +283,7 @@ function automatic rdma_status rdma_qp_partial_plan_status(
   if (plan.rq_sgb_ref != null) begin
     status = rdma_qp_backing_total_length(plan.rq_sgb_ref, total_length);
     if (!status.ok()) return status;
-    if (total_length != rdma_qp_rq_sgb_storage_bytes(plan.rq_depth))
+    if (total_length != rdma_qp_sgb_storage_bytes(plan.rq_depth))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "partial QP RQ SGB geometry is invalid");
   end

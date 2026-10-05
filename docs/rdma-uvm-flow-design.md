@@ -41,7 +41,7 @@ test
   SQ 超过 2 个 SGE 或 UD 非零 payload 走外部 SGB：driver 把 `sgb_iova` 设为当前 SQ PI × 512B 槽，
   NIC 读该槽并按 16B 大端描述符（length/lkey/iova）解析。UD/URC SQE codec 不支持仅凭 64B 镜像
   解码：URC 与 RC 同布局，用 RC codec；UD 由 `rdma_tb_dma` 按 `rdma_defs.svh` 字段直接解析。
-  RQ 外部 SGB：`rdma_create_qp_req.rq_sgb_backing`（默认 null 不启用，要求私有 RQ 且 max_recv_sge>2）
+  RQ 外部 SGB：`rdma_create_qp_req.rq_sgb_backing`（默认 null 不启用，仅 RC 私有 RQ 且 max_recv_sge>2）
   分配角色 `QP_RQ_SGB`（rq_depth×512，4KiB 取整）；post_recv 有效 SGE>2 时把描述符写入 index×512 槽，
   RQE 的 SGB_PA 指向该槽（与 SQ 一致使用设备 DMA 地址），recovery 重放时重写该槽。NIC 读 SGB 后用
   `decode_with_sgb_descriptor_bytes` 解码（RQE 签名覆盖 SGB 内容）。

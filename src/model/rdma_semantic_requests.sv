@@ -507,7 +507,7 @@ class rdma_create_qp_req extends rdma_semantic_request;
   rdma_queue_backing_spec sq_backing;
   rdma_queue_backing_spec sq_sgb_backing;
   rdma_queue_backing_spec rq_backing;
-  // 可选（默认 null 不分配）：私有 RQ 外部 SGB，使 RECV 可携带超过 2 个 SGE；要求 max_recv_sge > 2。
+  // 可选（默认 null 不分配）：RC 私有 RQ 外部 SGB，使 RECV 可携带超过 2 个 SGE；要求 max_recv_sge > 2。
   rdma_queue_backing_spec rq_sgb_backing;
   rdma_qp_context_attributes context_attrs;
 
@@ -613,11 +613,11 @@ class rdma_create_qp_req extends rdma_semantic_request;
                                          rq_storage_bytes);
     if (!status.ok()) return status;
     if (rq_sgb_backing != null) begin
-      if (srq_h != null || max_recv_sge <= 2)
+      if (transport != RDMA_TRANSPORT_RC || srq_h != null || max_recv_sge <= 2)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "RQ SGB requires a private RQ with max_recv_sge > 2");
+                                 "RQ SGB requires an RC private RQ with max_recv_sge > 2");
       status = rdma_qp_backing_spec_status(rq_sgb_backing, RDMA_QUEUE_ROLE_QP_RQ_SGB,
-                                           rdma_qp_rq_sgb_storage_bytes(rq_depth));
+                                           rdma_qp_sgb_storage_bytes(rq_depth));
       if (!status.ok()) return status;
     end
     if (context_attrs == null)

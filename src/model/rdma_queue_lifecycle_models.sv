@@ -747,7 +747,7 @@ class rdma_queue_backing_ref extends uvm_object;
     if (rdma_queue_role_is_pd(role) && additional_segments.size() != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                "PD backing cannot contain additional segments");
-    align = (role == RDMA_QUEUE_ROLE_SRQ_SGB) ? 512 : 4096;
+    align = rdma_queue_role_alignment(role);
     s = rdma_queue_queue_range_status(mapping, mapping_offset, length, align);
     if (!s.ok())
       return s;
@@ -1203,24 +1203,24 @@ class rdma_qp_ring_layout extends uvm_object;
   endfunction
 endclass
 
-// 功能：计算 SQ SGB 的 logical/storage 字节数（每项 512B，storage 按 4KiB 向上取整）。
+// 功能：计算 SQ/RQ SGB 的 logical/storage 字节数（每项 512B，storage 按 4KiB 向上取整）。
 // 输入/输出及副作用：depth 为输入；logical_bytes/storage_bytes 为输出（失败时也已写入）。
 // 失败/边界：depth 为 0 或非 2 的幂返回 INVALID_ARGUMENT。
-function automatic rdma_status rdma_qp_sq_sgb_geometry(
+function automatic rdma_status rdma_qp_sgb_geometry(
   int unsigned depth, output longint unsigned logical_bytes,
   output longint unsigned storage_bytes);
   // logical bytes 描述有效 slot 总量，storage bytes 额外包含 4KiB 对齐填充。
   logical_bytes = longint'(depth) * 512;
   storage_bytes = ((logical_bytes + 4095) / 4096) * 4096;
   if (!rdma_qp_power_of_two(depth) || depth == 0)
-    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SQ SGB depth invalid");
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SGB depth invalid");
   return rdma_status::success();
 endfunction
 
-// 功能：RQ SGB 的 storage 字节数（每个 RQE 一个 512B slot，按 4KiB 向上取整）。
+// 功能：SQ/RQ SGB 的 storage 字节数（每个 RQE 一个 512B slot，按 4KiB 向上取整）。
 // 输入/输出及副作用：纯函数。
 // 失败/边界：无（depth 合法性由 QP plan/request 校验）。
-function automatic longint unsigned rdma_qp_rq_sgb_storage_bytes(int unsigned depth);
+function automatic longint unsigned rdma_qp_sgb_storage_bytes(int unsigned depth);
   return ((longint'(depth) * 512 + 4095) / 4096) * 4096;
 endfunction
 
@@ -1566,7 +1566,7 @@ class rdma_qp_backing_plan extends uvm_object;
       status = rdma_qp_backing_total_length(rq_sgb_ref, total_length);
       if (!status.ok()) return status;
       if (rq_sgb_ref.role != RDMA_QUEUE_ROLE_QP_RQ_SGB ||
-          total_length != rdma_qp_rq_sgb_storage_bytes(rq_depth))
+          total_length != rdma_qp_sgb_storage_bytes(rq_depth))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP RQ SGB geometry invalid");
     end
     if (context_ref == null)

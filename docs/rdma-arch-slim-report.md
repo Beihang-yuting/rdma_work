@@ -68,7 +68,7 @@ Python 门禁另删除约 4.8k 行（结构冻结类）。
    （真实 host_mem + net_packet 帧编解码 wire），覆盖 RC/UD/URC 与 SQ/RQ 外部 SGB，均为 33 项检查零错误；
    注入 NIC 缺陷可被记分板捕获。顺带修复 net_packet adapter decode 把 UD DETH 留在 header_bytes 中、
    导致 UD SEND_WITH_IMM 立即数被读成 Q_Key 的问题。
-11. **RQ 外部 SGB（engine）**：新增 backing 角色 `QP_RQ_SGB` 与 `rdma_create_qp_req.rq_sgb_backing`（可选），
+11. **RQ 外部 SGB（engine）**：新增 backing 角色 `QP_RQ_SGB` 与 `rdma_create_qp_req.rq_sgb_backing`（可选，仅 RC 私有 RQ），
    QP lifecycle executor 分配/清零/释放（释放顺序排在最后，不改变既有角色顺序），resource manager/projector/
    recovery 校验同步覆盖；queue-data engine 在 post_recv 有效 SGE>2 时写 SGB 槽并在 RQE 填 SGB_PA，host-producer
    recovery 重放时重写该槽。SQ/RQ 共用 `sgb_slot_iova` 槽位解析。新增 `check_rq_external_sgb` 单元检查。
