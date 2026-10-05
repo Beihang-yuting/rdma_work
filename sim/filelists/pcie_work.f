@@ -25,6 +25,7 @@
 +incdir+../src/model
 +incdir+../src/codec
 +incdir+../src/core
++incdir+../src/tb
 +incdir+../src/adapter
 +incdir+../src/adapters/pcie_work
 +incdir+../tests/mocks
@@ -33,6 +34,7 @@
 ../src/codec/rdma_codec_pkg.sv
 ../src/adapter/rdma_adapter_pkg.sv
 ../src/core/rdma_core_pkg.sv
+../src/tb/rdma_tb_pkg.sv
 ../src/adapters/pcie_work/rdma_pcie_work_adapter_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
 ../tests/tb_top.sv

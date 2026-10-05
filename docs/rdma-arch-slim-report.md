@@ -58,6 +58,15 @@ Python 门禁另删除约 4.8k 行（结构冻结类）。
    由 `rdma_cmq_result_no_submit_proven(result)` 按结果判定（与原 adapter 判据相同），后端 status
    对象 identity 不变。测试 mock 的 `execute()` 退化为 mock 内部实现，由其 `execute_observed()` 包装。
 
+10. **UVM 验证流程（seq → 报文 → 内存）**：新增 `src/tb`（`rdma_tb_pkg`），设计见
+   `docs/rdma-uvm-flow-design.md`。verb agent（sequence/driver/monitor）经 queue-data engine 投递 WQE、
+   轮询 CQ；NIC 行为模型读取并解码 SQE/RQE、按 MR 校验 key/范围/权限做 DMA、按 MTU 分段收发
+   SEND/WRITE(+IMM)/READ/ATOMIC，回 ACK/NAK/READ 响应/ATOMIC ACK 并经设备侧接口发布 CQE；
+   记分板用影子内存预测并逐字节比对。`rdma_packet` 增加 segment 与结构化扩展头
+   （RETH/AETH/AtomicETH/AtomicAckETH/ImmDt），net_packet adapter 按 IBTA 表做分段 opcode 映射。
+   测试：core `rdma_tb_flow_test`（mock host_mem + loopback wire）、e2e `rdma_tb_e2e_test`
+   （真实 host_mem + net_packet 帧编解码 wire），均为 18 项检查零错误；注入 NIC 缺陷可被记分板捕获。
+
 ## 验证
 
 每轮均为全量：Python 门禁、changed-SV style、驱动契约（rdma_defs）、core、CMQ gate、integration、
@@ -68,6 +77,8 @@ host_mem、PCIe、E2E（dual env / multi-VF / high traffic）。
 | baseline | 1ea354f | core 115 / CMQ 28 / integration 10 / host_mem 3 / PCIe 1 / E2E 3 全部 pristine |
 | v1 | e5d2da6 | 同上全部通过 |
 | v2 | 60082eb | 同上全部通过，E2E 编译告警 2 |
+| v4 | d898006 | 同上全部通过 |
+| v5 | 303730e | 同上全部通过 |
 
 后续轮次结果见对应提交说明。注释改写由脚本逐文件校验：去除注释与空白后的代码 token
 与改写前完全一致。

@@ -23,6 +23,7 @@ package rdma_unit_test_pkg;
   import rdma_codec_pkg::*;
   import rdma_core_pkg::*;
   import rdma_adapter_pkg::*;
+  import rdma_tb_pkg::*;
   // Disambiguate the shared recovery enum from the legacy core compatibility type.
   import rdma_model_pkg::rdma_queue_recovery_action_e;
 `ifdef RDMA_DPU_INTEGRATION
@@ -106,6 +107,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_hw_image_copy_contract_test.sv"
   `include "unit/rdma_queue_backing_access_test.sv"
   `include "unit/rdma_queue_data_engine_post_test.sv"
+  `include "unit/rdma_tb_flow_test.sv"
   `include "unit/rdma_queue_detached_snapshot_test.sv"
   `include "unit/rdma_queue_consumer_steps_test.sv"
   `include "unit/rdma_queue_data_engine_device_publish_test.sv"
@@ -180,8 +182,10 @@ endpackage
   // 都完成编译后再展开，避免把外部依赖复制进本仓库或形成循环 typedef。
   import rdma_net_packet_adapter_pkg::*;
   import rdma_net_packet_bridge_pkg::*;
+  import rdma_tb_pkg::*;
   `include "integration/rdma_end_to_end_dual_env_test.sv"
   `include "integration/rdma_end_to_end_transport_test.sv"
   `include "integration/rdma_end_to_end_high_traffic_test.sv"
+  `include "integration/rdma_tb_e2e_test.sv"
 `endif
 `endif

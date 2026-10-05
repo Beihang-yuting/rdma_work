@@ -17,6 +17,7 @@ VIP 和 `net_packet` 的对象由各自环境拥有。
 - `hw/rdma`：从驱动归档提取的只读来源清单和 golden vectors；不复制外部源码。
 - `docs/history/batch-reports`：历次结构重构 batch 报告归档（只读历史记录）。
 - `docs/rdma-arch-slim-report.md`：feature/rdma-arch-slim 精简重构的总报告。
+- `docs/rdma-uvm-flow-design.md`：seq → 报文 → 内存的 UVM 验证流程（`src/tb`：verb agent、NIC 行为模型、wire、记分板）。
 
 ## 固定依赖
 

@@ -5,6 +5,7 @@
 +incdir+../src/model
 +incdir+../src/codec
 +incdir+../src/core
++incdir+../src/tb
 +incdir+../src/adapter
 +incdir+../src/integration
 +incdir+../src/adapters/host_mem
@@ -20,6 +21,7 @@
 ../src/codec/rdma_codec_pkg.sv
 ../src/adapter/rdma_adapter_pkg.sv
 ../src/core/rdma_core_pkg.sv
+../src/tb/rdma_tb_pkg.sv
 ../src/adapters/host_mem/rdma_host_mem_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_net_packet_bridge.sv

@@ -244,54 +244,84 @@ package rdma_net_packet_adapter_pkg;
       return value;
     endfunction
 
-    // 功能：把 RDMA 网络 opcode 映射为 net_packet RoCEv2 opcode，并确认 transport 合法。
-    // 输入/输出及副作用：value（输入）、opcode（输出）；只做枚举映射，不修改 packet 或队列状态。
-    // 失败/边界：不支持的 transport/opcode 返回 UNSUPPORTED_OPCODE，调用方不得继续 pack。
+    // 功能：按 IBTA 表把 (opcode, segment) 映射为 BTH opcode 低 5 位（RC/UC/UD 共用编号）。
+    // 输入/输出及副作用：low 输出编号；纯函数。
+    // 失败/边界：组合不存在（如 READ 请求分段、ACK 分段）时返回 0。
+    static function bit roce_low_opcode(
+      rdma_network_opcode_e opcode,
+      rdma_packet_segment_e segment,
+      output bit [4:0] low
+    );
+      low = '0;
+      case (opcode)
+        RDMA_NET_SEND, RDMA_NET_SEND_WITH_IMM: begin
+          case (segment)
+            RDMA_SEG_FIRST:  low = 5'h00;
+            RDMA_SEG_MIDDLE: low = 5'h01;
+            RDMA_SEG_LAST:   low = (opcode == RDMA_NET_SEND) ? 5'h02 : 5'h03;
+            default:         low = (opcode == RDMA_NET_SEND) ? 5'h04 : 5'h05;
+          endcase
+        end
+        RDMA_NET_RDMA_WRITE, RDMA_NET_WRITE_WITH_IMM: begin
+          case (segment)
+            RDMA_SEG_FIRST:  low = 5'h06;
+            RDMA_SEG_MIDDLE: low = 5'h07;
+            RDMA_SEG_LAST:   low = (opcode == RDMA_NET_RDMA_WRITE) ? 5'h08 : 5'h09;
+            default:         low = (opcode == RDMA_NET_RDMA_WRITE) ? 5'h0a : 5'h0b;
+          endcase
+        end
+        RDMA_NET_RDMA_READ_RESP: begin
+          case (segment)
+            RDMA_SEG_FIRST:  low = 5'h0d;
+            RDMA_SEG_MIDDLE: low = 5'h0e;
+            RDMA_SEG_LAST:   low = 5'h0f;
+            default:         low = 5'h10;
+          endcase
+        end
+        RDMA_NET_RDMA_READ_REQUEST: low = 5'h0c;
+        RDMA_NET_ACK, RDMA_NET_NAK: low = 5'h11;
+        RDMA_NET_ATOMIC_ACK:        low = 5'h12;
+        RDMA_NET_ATOMIC_CMP_SWAP:   low = 5'h13;
+        RDMA_NET_ATOMIC_FETCH_ADD:  low = 5'h14;
+        default: return 1'b0;
+      endcase
+      if (segment != RDMA_SEG_ONLY &&
+          !(opcode inside {RDMA_NET_SEND, RDMA_NET_SEND_WITH_IMM,
+                           RDMA_NET_RDMA_WRITE, RDMA_NET_WRITE_WITH_IMM,
+                           RDMA_NET_RDMA_READ_RESP}))
+        return 1'b0;
+      return 1'b1;
+    endfunction
+
+    // 功能：把 RDMA 网络 opcode/segment 映射为 RoCEv2 BTH opcode，并确认 transport 支持该组合。
+    // 输入/输出及副作用：value（输入）、opcode（输出）；只做映射，不修改 packet。
+    // 失败/边界：UC 只支持 SEND/WRITE，UD 只支持单包 SEND；其它组合返回 UNSUPPORTED_OPCODE。
     static function rdma_status map_roce_opcode(
       rdma_packet value,
       output bit [7:0] opcode
     );
+      bit [4:0] low;
+
       opcode = 8'h04;
       if (value == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RDMA packet is null");
+      if (!roce_low_opcode(value.opcode, value.segment, low))
+        return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                 "unsupported network opcode/segment");
       case (value.transport)
-        RDMA_TRANSPORT_RC: begin
-          case (value.opcode)
-            RDMA_NET_SEND:              opcode = 8'h04;
-            RDMA_NET_SEND_WITH_IMM:     opcode = 8'h05;
-            RDMA_NET_RDMA_WRITE:        opcode = 8'h0a;
-            RDMA_NET_WRITE_WITH_IMM:    opcode = 8'h0b;
-            RDMA_NET_RDMA_READ_REQUEST: opcode = 8'h0c;
-            RDMA_NET_RDMA_READ_RESP:    opcode = 8'h10;
-            RDMA_NET_ACK:               opcode = 8'h11;
-            RDMA_NET_ATOMIC_ACK:        opcode = 8'h12;
-            RDMA_NET_ATOMIC_CMP_SWAP:  opcode = 8'h13;
-            RDMA_NET_ATOMIC_FETCH_ADD: opcode = 8'h14;
-            default:
-              return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                       "unsupported RC network opcode");
-          endcase
-        end
+        RDMA_TRANSPORT_RC: opcode = {3'b000, low};
         RDMA_TRANSPORT_URC: begin
-          case (value.opcode)
-            RDMA_NET_SEND:              opcode = 8'h24;
-            RDMA_NET_SEND_WITH_IMM:     opcode = 8'h25;
-            RDMA_NET_RDMA_WRITE:        opcode = 8'h2a;
-            RDMA_NET_WRITE_WITH_IMM:    opcode = 8'h2b;
-            default:
-              return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                       "unsupported URC network opcode");
-          endcase
+          if (low > 5'h0b)
+            return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                     "unsupported URC network opcode");
+          opcode = {3'b001, low};
         end
         RDMA_TRANSPORT_UD: begin
-          case (value.opcode)
-            RDMA_NET_SEND:          opcode = 8'h64;
-            RDMA_NET_SEND_WITH_IMM: opcode = 8'h65;
-            default:
-              return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                       "unsupported UD network opcode");
-          endcase
+          if (!(low inside {5'h04, 5'h05}))
+            return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                     "unsupported UD network opcode");
+          opcode = {3'b011, low};
         end
         default:
           return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
@@ -519,6 +549,19 @@ package rdma_net_packet_adapter_pkg;
       end
     endfunction
 
+    // 功能：把 SEND/WRITE 组内偏移（0..5：FIRST、MIDDLE、LAST、LAST_IMM、ONLY、ONLY_IMM）
+    //   转成报文分段。
+    // 输入/输出及副作用：纯函数。
+    // 失败/边界：越界偏移按 ONLY 处理（调用方只传 0..5）。
+    static function rdma_packet_segment_e seg_of(bit [4:0] offset);
+      case (offset)
+        5'd0: return RDMA_SEG_FIRST;
+        5'd1: return RDMA_SEG_MIDDLE;
+        5'd2, 5'd3: return RDMA_SEG_LAST;
+        default: return RDMA_SEG_ONLY;
+      endcase
+    endfunction
+
     // 功能：把解析出的 RoCEv2 opcode 投影回 RDMA transport/opcode，并恢复 DETH/PSN 字段。
     // 输入/输出及副作用：roce（输入）、value（输出）；只写入新建 rdma_packet，不修改外部 packet。
     // 失败/边界：未知硬件 opcode 返回 UNSUPPORTED_OPCODE，禁止把未知值伪造为 SEND。
@@ -526,6 +569,8 @@ package rdma_net_packet_adapter_pkg;
       rocev2_bth roce,
       output rdma_packet value
     );
+      bit [7:0] full;
+
       value = rdma_packet::type_id::create("decoded_rocev2");
       if (roce == null)
         return rdma_status::make(RDMA_SC_CODEC_ERROR,
@@ -533,53 +578,50 @@ package rdma_net_packet_adapter_pkg;
       value.destination_qpn = roce.dest_qp;
       value.source_qpn = roce.has_deth() ? roce.deth_src_qp : 0;
       value.psn = roce.psn;
-      case (roce.opcode)
-        RC_SEND_ONLY:          value.transport = RDMA_TRANSPORT_RC;
-        RC_SEND_ONLY_IMM:      value.transport = RDMA_TRANSPORT_RC;
-        RC_SEND_ONLY_INV:      value.transport = RDMA_TRANSPORT_RC;
-        RC_RDMA_WRITE_ONLY:    value.transport = RDMA_TRANSPORT_RC;
-        RC_RDMA_WRITE_ONLY_IMM:value.transport = RDMA_TRANSPORT_RC;
-        RC_RDMA_READ_REQ:      value.transport = RDMA_TRANSPORT_RC;
-        RC_RDMA_READ_RESP_ONLY:value.transport = RDMA_TRANSPORT_RC;
-        RC_ACK:                value.transport = RDMA_TRANSPORT_RC;
-        RC_ATOMIC_ACK:         value.transport = RDMA_TRANSPORT_RC;
-        RC_CMP_SWAP:           value.transport = RDMA_TRANSPORT_RC;
-        RC_FETCH_ADD:          value.transport = RDMA_TRANSPORT_RC;
-        UC_SEND_ONLY:          value.transport = RDMA_TRANSPORT_URC;
-        UC_SEND_ONLY_IMM:      value.transport = RDMA_TRANSPORT_URC;
-        UC_RDMA_WRITE_ONLY:    value.transport = RDMA_TRANSPORT_URC;
-        UC_RDMA_WRITE_ONLY_IMM:value.transport = RDMA_TRANSPORT_URC;
-        UD_SEND_ONLY:          value.transport = RDMA_TRANSPORT_UD;
-        UD_SEND_ONLY_IMM:      value.transport = RDMA_TRANSPORT_UD;
+      full = roce.opcode;
+      case (full[7:5])
+        3'b000: value.transport = RDMA_TRANSPORT_RC;
+        3'b001: value.transport = RDMA_TRANSPORT_URC;
+        3'b011: value.transport = RDMA_TRANSPORT_UD;
         default:
           return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                    "unknown RoCEv2 opcode");
       endcase
-      case (roce.opcode)
-        RC_SEND_ONLY, UC_SEND_ONLY, UD_SEND_ONLY:
-          value.opcode = RDMA_NET_SEND;
-        RC_SEND_ONLY_IMM, UC_SEND_ONLY_IMM, UD_SEND_ONLY_IMM:
-          value.opcode = RDMA_NET_SEND_WITH_IMM;
-        RC_RDMA_WRITE_ONLY, UC_RDMA_WRITE_ONLY:
-          value.opcode = RDMA_NET_RDMA_WRITE;
-        RC_RDMA_WRITE_ONLY_IMM, UC_RDMA_WRITE_ONLY_IMM:
-          value.opcode = RDMA_NET_WRITE_WITH_IMM;
-        RC_RDMA_READ_REQ:
-          value.opcode = RDMA_NET_RDMA_READ_REQUEST;
-        RC_RDMA_READ_RESP_ONLY:
+      value.segment = RDMA_SEG_ONLY;
+      case (full[4:0])
+        5'h00, 5'h01, 5'h02, 5'h03, 5'h04, 5'h05: begin
+          value.opcode = (full[4:0] inside {5'h03, 5'h05}) ?
+                         RDMA_NET_SEND_WITH_IMM : RDMA_NET_SEND;
+          value.segment = seg_of(full[4:0] - 5'h00);
+        end
+        5'h06, 5'h07, 5'h08, 5'h09, 5'h0a, 5'h0b: begin
+          value.opcode = (full[4:0] inside {5'h09, 5'h0b}) ?
+                         RDMA_NET_WRITE_WITH_IMM : RDMA_NET_RDMA_WRITE;
+          value.segment = seg_of(full[4:0] - 5'h06);
+        end
+        5'h0c: value.opcode = RDMA_NET_RDMA_READ_REQUEST;
+        5'h0d, 5'h0e, 5'h0f, 5'h10: begin
           value.opcode = RDMA_NET_RDMA_READ_RESP;
-        RC_ACK:
-          value.opcode = RDMA_NET_ACK;
-        RC_ATOMIC_ACK:
-          value.opcode = RDMA_NET_ATOMIC_ACK;
-        RC_CMP_SWAP:
-          value.opcode = RDMA_NET_ATOMIC_CMP_SWAP;
-        RC_FETCH_ADD:
-          value.opcode = RDMA_NET_ATOMIC_FETCH_ADD;
+          case (full[4:0])
+            5'h0d: value.segment = RDMA_SEG_FIRST;
+            5'h0e: value.segment = RDMA_SEG_MIDDLE;
+            5'h0f: value.segment = RDMA_SEG_LAST;
+            default: value.segment = RDMA_SEG_ONLY;
+          endcase
+        end
+        5'h11: value.opcode = RDMA_NET_ACK;
+        5'h12: value.opcode = RDMA_NET_ATOMIC_ACK;
+        5'h13: value.opcode = RDMA_NET_ATOMIC_CMP_SWAP;
+        5'h14: value.opcode = RDMA_NET_ATOMIC_FETCH_ADD;
         default:
           return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                    "RoCEv2 opcode projection is unsupported");
       endcase
+      if ((value.transport == RDMA_TRANSPORT_URC && full[4:0] > 5'h0b) ||
+          (value.transport == RDMA_TRANSPORT_UD &&
+           !(full[4:0] inside {5'h04, 5'h05})))
+        return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                 "RoCEv2 opcode is invalid for its transport");
       return rdma_status::success();
     endfunction
 

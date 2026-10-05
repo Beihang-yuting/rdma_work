@@ -3,6 +3,7 @@
 +incdir+../src/model
 +incdir+../src/codec
 +incdir+../src/core
++incdir+../src/tb
 +incdir+../src/adapter
 +incdir+../tests/mocks
 ../src/types/rdma_types_pkg.sv
@@ -10,5 +11,6 @@
 ../src/codec/rdma_codec_pkg.sv
 ../src/adapter/rdma_adapter_pkg.sv
 ../src/core/rdma_core_pkg.sv
+../src/tb/rdma_tb_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
 ../tests/tb_top.sv

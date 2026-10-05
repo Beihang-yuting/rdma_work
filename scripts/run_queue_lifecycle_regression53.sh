@@ -29,6 +29,7 @@ readonly CORE_TESTS=(
   rdma_hw_image_copy_contract_test
   rdma_queue_backing_access_test
   rdma_queue_data_engine_post_test
+  rdma_tb_flow_test
   rdma_queue_detached_snapshot_test
   rdma_queue_consumer_steps_test
   # device publish、route-consume 与真实 AEQE E2E 共享 lifecycle fixture，
