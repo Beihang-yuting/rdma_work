@@ -61,7 +61,6 @@ package rdma_core_pkg;
   `include "rdma_cmq_transport.sv"
   `include "rdma_cmq_engine.sv"
   `include "rdma_cmq_engine_port_adapter.sv"
-  `include "rdma_sq_payload_writer.sv"
   `include "rdma_env_config.sv"
   `include "rdma_env.sv"
 endpackage

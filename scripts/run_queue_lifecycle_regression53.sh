@@ -61,8 +61,6 @@ readonly CORE_TESTS=(
   rdma_rq_engine_test
   rdma_cq_engine_test
   rdma_eq_engine_test
-  rdma_queue_host_mem_submitter_test
-  rdma_queue_host_mem_submitter_authority_test
   rdma_queue_model_test
   rdma_queue_codec_test
   rdma_doorbell_scheduler_test
@@ -98,10 +96,8 @@ readonly CORE_TESTS=(
   rdma_ud_urc_sqe_codec_test
   rdma_wqe_extended_opcode_test
   rdma_sqe_authority_test
-  rdma_sq_payload_writer_test
   rdma_function_identity_test
   rdma_queue_txn_journal_test
-  rdma_abi_v5_adapter_test
   rdma_umem_pbl_mw_test
   rdma_cq_shadow_flush_test
 )

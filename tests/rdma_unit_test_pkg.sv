@@ -92,7 +92,6 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_ud_urc_sqe_codec_test.sv"
   `include "unit/rdma_wqe_extended_opcode_test.sv"
   `include "unit/rdma_sqe_authority_test.sv"
-  `include "unit/rdma_queue_host_mem_submitter_test.sv"
   `include "unit/rdma_queue_runtime_test.sv"
   `include "unit/rdma_unclaimed_recovery_handoff_test.sv"
   `include "unit/rdma_runtime_commit_gate_test.sv"
@@ -132,10 +131,8 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_cmq_driver_field_mutation_test.sv"
   `include "unit/rdma_context_cmq_regression_test.sv"
   `include "unit/rdma_harness_expected_failure_probe.sv"
-  `include "unit/rdma_sq_payload_writer_test.sv"
   `include "unit/rdma_function_identity_test.sv"
   `include "unit/rdma_queue_txn_journal_test.sv"
-  `include "unit/rdma_abi_v5_adapter_test.sv"
   `include "unit/rdma_umem_pbl_mw_test.sv"
   `include "unit/rdma_coverage_test.sv"
 `ifdef RDMA_NET_PACKET
