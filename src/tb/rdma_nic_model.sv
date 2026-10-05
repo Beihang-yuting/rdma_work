@@ -170,6 +170,7 @@ class rdma_nic_model extends uvm_component;
     rdma_nic_qp_state st;
     rdma_hw_model model;
     rdma_hw_sqe_model sqe;
+    rdma_packet stale;
     rdma_status status;
     byte unsigned payload[$];
     bit [7:0] ecode;
@@ -179,6 +180,10 @@ class rdma_nic_model extends uvm_component;
 
     qp = cfg.qps[i].qp;
     st = qps[i];
+    // 丢弃上一个请求超时后迟到的响应，避免被当作本请求的 ACK/响应。
+    while (st.responses.try_get(stale))
+      `uvm_warning("RDMA_NIC", $sformatf("node %0d QP%0d dropped late response PSN %0h",
+                   cfg.node_id, i, stale.psn))
     status = dma.read_wqe(qp, 1'b1, st.sq_index, model);
     wqe_index = st.sq_index;
     wqe_wrap = st.sq_wrap;
@@ -371,13 +376,17 @@ class rdma_nic_model extends uvm_component;
     pkt = null;
     got = 1'b0;
     fork
-      begin : wait_response
-        qps[i].responses.get(pkt);
-        got = 1'b1;
+      begin
+        fork
+          begin
+            qps[i].responses.get(pkt);
+            got = 1'b1;
+          end
+          #(cfg.response_timeout);
+        join_any
+        disable fork;
       end
-      #(cfg.response_timeout);
-    join_any
-    disable fork;
+    join
   endtask
 
   // 功能：等待 RC SEND/WRITE 的 ACK/NAK。
@@ -466,42 +475,37 @@ class rdma_nic_model extends uvm_component;
   endtask
 
   // 功能：向 QP i 的对端发送 ACK（syndrome=ACK）或 NAK。
-  // 输入/输出及副作用：推进 msn；经 wire 发包。
+  // 输入/输出及副作用：仅 ACK 推进 msn；经 wire 发包。
   // 失败/边界：无。
   protected task send_ack(int unsigned i, bit [23:0] psn, bit [7:0] syndrome);
     rdma_packet pkt;
 
     pkt = new_packet(i, syndrome == RDMA_AETH_ACK ? RDMA_NET_ACK : RDMA_NET_NAK,
                      RDMA_SEG_ONLY, psn);
-    qps[i].msn++;
+    if (syndrome == RDMA_AETH_ACK)
+      qps[i].msn++;
     pkt.aeth_syndrome = syndrome;
     pkt.aeth_msn = qps[i].msn;
     transmit(i, pkt);
   endtask
 
-  // 功能：取 QP i 的下一个 RQE（必要时等待 RECV 投递，至多 response_timeout）。
+  // 功能：取 QP i 的下一个 RQE；不等待（rx_loop 串行处理，阻塞会拖住同节点的响应报文）。
   // 输入/输出及副作用：rqe/index/wrap 输出；推进 RQ 设备游标。
-  // 失败/边界：超时或解码失败返回 0。
-  protected task fetch_rqe(int unsigned i, output rdma_hw_rqe_model rqe,
-                           output int unsigned index, output bit wrap, output bit got);
+  // 失败/边界：无可用 RQE 或解码失败返回 0，调用方回 RNR/NAK。
+  protected function bit fetch_rqe(int unsigned i, output rdma_hw_rqe_model rqe,
+                                   output int unsigned index, output bit wrap);
     rdma_hw_model model;
     rdma_status status;
-    time deadline;
 
     rqe = null;
-    got = 1'b0;
     index = qps[i].rq_index;
     wrap = qps[i].rq_wrap;
-    deadline = $time + cfg.response_timeout;
-    while (!ring_pending(i, 1'b0)) begin
-      if ($time >= deadline)
-        return;
-      #(cfg.poll_interval);
-    end
+    if (!ring_pending(i, 1'b0))
+      return 1'b0;
     status = dma.read_wqe(cfg.qps[i].qp, 1'b0, qps[i].rq_index, model);
     advance(qps[i].rq_index, qps[i].rq_wrap, cfg.qps[i].qp.rq_depth);
-    got = status != null && status.ok() && $cast(rqe, model);
-  endtask
+    return status != null && status.ok() && $cast(rqe, model);
+  endfunction
 
   // 功能：响应方处理一个请求报文（SEND/WRITE/READ 请求/ATOMIC），按 PSN 顺序推进 expected_psn。
   // 输入/输出及副作用：可能写本地内存、发布 RQ CQE、回 ACK/NAK 或 READ 响应。
@@ -521,11 +525,8 @@ class rdma_nic_model extends uvm_component;
     case (pkt.opcode)
       RDMA_NET_SEND, RDMA_NET_SEND_WITH_IMM: begin
         if (pkt.segment inside {RDMA_SEG_FIRST, RDMA_SEG_ONLY}) begin
-          bit got;
-
           st.rx_offset = 0;
-          fetch_rqe(i, st.rx_rqe, st.rx_index, st.rx_wrap, got);
-          st.rx_failed = !got;
+          st.rx_failed = !fetch_rqe(i, st.rx_rqe, st.rx_index, st.rx_wrap);
         end
         if (!st.rx_failed && !scatter(st.rx_rqe.sges, st.rx_offset, pkt.payload))
           st.rx_failed = 1'b1;
@@ -537,7 +538,8 @@ class rdma_nic_model extends uvm_component;
                                        RDMA_CMQ_SUCCESS_ECODE,
                         st.rx_offset, pkt.has_immdt() ? pkt.imm : '0);
           if (rc)
-            send_ack(i, pkt.psn, st.rx_failed ? RDMA_AETH_NAK_INVALID_REQUEST :
+            send_ack(i, pkt.psn, st.rx_rqe == null ? RDMA_AETH_RNR_NAK :
+                                 st.rx_failed ? RDMA_AETH_NAK_INVALID_REQUEST :
                                                 RDMA_AETH_ACK);
         end
       end
@@ -564,19 +566,21 @@ class rdma_nic_model extends uvm_component;
         end
         st.wr_offset += pkt.payload.size();
         if (last && !st.wr_failed) begin
+          bit got;
+
+          got = 1'b1;
           if (pkt.opcode == RDMA_NET_WRITE_WITH_IMM) begin
             rdma_hw_rqe_model rqe;
             int unsigned index;
             bit wrap;
-            bit got;
 
-            fetch_rqe(i, rqe, index, wrap, got);
+            got = fetch_rqe(i, rqe, index, wrap);
             if (got)
               publish_cqe(i, index, wrap, 1'b1, RDMA_CMQ_SUCCESS_ECODE,
                           st.wr_len, pkt.imm);
           end
           if (rc)
-            send_ack(i, pkt.psn, RDMA_AETH_ACK);
+            send_ack(i, pkt.psn, got ? RDMA_AETH_ACK : RDMA_AETH_RNR_NAK);
         end
       end
       RDMA_NET_RDMA_READ_REQUEST:
@@ -598,14 +602,15 @@ class rdma_nic_model extends uvm_component;
     int unsigned start;
     int unsigned take;
 
+    // 请求方已按响应包数推进 send_psn，NAK 时也须消耗同样的 PSN 区间。
+    count = (req.reth_len + cfg.mtu - 1) / cfg.mtu;
+    if (count == 0)
+      count = 1;
+    qps[i].expected_psn = req.psn + count;
     if (dma.read(req.reth_rkey, 1'b1, req.reth_va, req.reth_len, data) != RDMA_TB_DMA_OK) begin
       send_ack(i, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
       return;
     end
-    count = (data.size() + cfg.mtu - 1) / cfg.mtu;
-    if (count == 0)
-      count = 1;
-    qps[i].expected_psn = req.psn + count;
     qps[i].msn++;
     for (int unsigned k = 0; k < count; k++) begin
       pkt = new_packet(i, RDMA_NET_RDMA_READ_RESP, segment_of(k, count), req.psn + k);

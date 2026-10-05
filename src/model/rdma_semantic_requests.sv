@@ -66,7 +66,9 @@ typedef enum bit [1:0] {
 
 // AETH syndrome：0x00 为 ACK；0x60|code 为 NAK，code 3 表示 remote access error。
 localparam bit [7:0] RDMA_AETH_ACK = 8'h00;
-localparam bit [7:0] RDMA_AETH_NAK_REMOTE_ACCESS = 8'h63;
+localparam bit [7:0] RDMA_AETH_NAK_REMOTE_ACCESS = 8'h62;
+// RNR NAK（timer 字段取 0）。
+localparam bit [7:0] RDMA_AETH_RNR_NAK = 8'h20;
 localparam bit [7:0] RDMA_AETH_NAK_INVALID_REQUEST = 8'h61;
 
 typedef enum bit [5:0] {

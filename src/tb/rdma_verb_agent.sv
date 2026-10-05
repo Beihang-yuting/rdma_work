@@ -195,10 +195,14 @@ class rdma_verb_monitor extends uvm_monitor;
     deadline = $time + timeout;
     while (!seen.exists(wr_id)) begin
       fork
-        @(seen_event);
-        #(deadline - $time);
-      join_any
-      disable fork;
+        begin
+          fork
+            @(seen_event);
+            #(deadline - $time);
+          join_any
+          disable fork;
+        end
+      join
       if ($time >= deadline && !seen.exists(wr_id)) begin
         `uvm_error("RDMA_MON", $sformatf("node %0d wr_id %0h completion timeout",
                    cfg.node_id, wr_id))
