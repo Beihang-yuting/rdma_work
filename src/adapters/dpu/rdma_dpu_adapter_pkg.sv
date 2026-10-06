@@ -1,11 +1,13 @@
 // 目录：外部适配器实现层 adapters/dpu/rdma_dpu_adapter_pkg.sv。
 // 层：外部适配器。
-// 职责：把 dpu_common 的逻辑设备配置接入 RDMA 驱动/设备模型：按 Host/PF/VF 声明生成
+// 职责：dpu_common 是全局 Function 的唯一控制方。rdma_dpu_system 按快照为每个 Function 建立设备、
+//   主机内存域、BAR、驱动并 probe，并按快照的 PF→VF/Host 关系给出 FLR、PF FLR、Host 与整设备复位
+//   范围；下层把 dpu_common 的逻辑设备配置接入 RDMA 驱动/设备模型：按 Host/PF/VF 声明生成
 //   dpu_device_cfg（BAR 请求取 dut_caps.bar_profiles），经 dpu_device_resolver 解析并冻结快照；
 //   把快照中每个 Function 投影为 host_id、global Function ID（驱动 QPC/PD 的 VF_ID）、BDF、BAR，
 //   以及 net_packet 用的 rdma_function_identity；驱动的 MMIO 写按 BAR0 基址 + 偏移形成绝对地址，
 //   由快照 resolve_bar_address 解码到所属 Function 的设备。
-// 依赖：dpu_common（dpu_resource_pkg）、rdma_types/model、rdma_dev、rdma_drv。
+// 依赖：dpu_common（dpu_resource_pkg）、rdma_types/model/adapter（host_mem API）、rdma_dev、rdma_drv。
 // 所有权：快照与 cfg 由调用方持有；Function 投影为值快照；路由器只借用设备引用。
 // 生命周期：测试建立拓扑时创建，仿真期间常驻。
 package rdma_dpu_adapter_pkg;
@@ -14,6 +16,7 @@ package rdma_dpu_adapter_pkg;
   import dpu_resource_pkg::*;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
+  import rdma_adapter_pkg::*;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
 
@@ -291,12 +294,15 @@ package rdma_dpu_adapter_pkg;
     endfunction
   endclass
 
-  // 一个 Function 的驱动 BAR：偏移加 BAR0 基址成为该 Host domain 内的绝对地址，经路由器解码。
+  // 一个 Function 的驱动 BAR：偏移加 BAR0 基址成为该 Host domain 内的绝对地址，经路由器解码；记录
+  // 每次写的 BAR 内偏移与值供观测。
   class rdma_dpu_bar extends rdma_drv_bar;
     `uvm_object_utils(rdma_dpu_bar)
 
     rdma_dpu_bar_router router;
     rdma_dpu_function func;
+    bit [63:0] written_offsets[$];
+    bit [63:0] written_values[$];
 
     // 功能：构造未连接的 BAR。
     // 输入/输出及副作用：name 为 UVM 名。
@@ -307,15 +313,251 @@ package rdma_dpu_adapter_pkg;
       func = null;
     endfunction
 
-    // 功能：BAR0 内偏移的 64 位写。
+    // 功能：BAR0 内偏移的 64 位写（先记录）。
     // 输入/输出及副作用：见 rdma_dpu_bar_router.write。
     // 失败/边界：未连接返回 INVALID_STATE；偏移超出 BAR0 由路由器拒绝。
     virtual task write64(bit [63:0] offset, bit [63:0] value, output rdma_status status);
+      written_offsets.push_back(offset);
+      written_values.push_back(value);
       if (router == null || func == null) begin
         status = rdma_status::make(RDMA_SC_INVALID_STATE, "dpu BAR is not connected");
         return;
       end
       status = router.write(func.pcie_id.domain, func.bar0.base + offset, value);
+    endtask
+  endclass
+
+  // 一个 Function 的全部模型对象。
+  class rdma_dpu_node extends uvm_object;
+    `uvm_object_utils(rdma_dpu_node)
+
+    rdma_dpu_function func;
+    rdma_host_mem_api mem;
+    rdma_dev dev;
+    rdma_dpu_bar bar;
+    rdma_drv_hw hw;
+    rdma_drv_dev drv;
+    rdma_function_handle fn;
+
+    // 功能：构造空节点。
+    // 输入/输出及副作用：name 为 UVM 名。
+    // 失败/边界：无。
+    function new(string name = "rdma_dpu_node");
+      super.new(name);
+    endfunction
+  endclass
+
+  // Function 主机内存域的提供方（mock、真实 host_mem 或之后的 pcie_work 统一内存）。
+  virtual class rdma_dpu_mem_factory extends uvm_object;
+    // 功能：构造。
+    // 输入/输出及副作用：name 为 UVM 名。
+    // 失败/边界：无。
+    function new(string name = "rdma_dpu_mem_factory");
+      super.new(name);
+    endfunction
+
+    // 功能：为 Function f 提供主机内存。
+    // 输入/输出及副作用：返回内存对象。
+    // 失败/边界：由实现决定。
+    pure virtual function rdma_host_mem_api make(rdma_dpu_function f);
+  endclass
+
+  // 所有 Function 共用同一主机内存（同一 Host 地址域，如 tb 节点或 PCIe 统一内存）。
+  class rdma_dpu_fixed_mem_factory extends rdma_dpu_mem_factory;
+    `uvm_object_utils(rdma_dpu_fixed_mem_factory)
+
+    rdma_host_mem_api mem;
+
+    // 功能：构造。
+    // 输入/输出及副作用：name 为 UVM 名。
+    // 失败/边界：无。
+    function new(string name = "rdma_dpu_fixed_mem_factory");
+      super.new(name);
+      mem = null;
+    endfunction
+
+    // 功能：返回共用内存。
+    // 输入/输出及副作用：无。
+    // 失败/边界：未设置时返回 null（build 的 bind_hw 会拒绝）。
+    virtual function rdma_host_mem_api make(rdma_dpu_function f);
+      return mem;
+    endfunction
+  endclass
+
+  // 全局 Function 控制：dpu_common 拓扑 → 每个 Function 的设备/内存/BAR/驱动，复位范围由快照推出。
+  class rdma_dpu_system extends uvm_object;
+    `uvm_object_utils(rdma_dpu_system)
+
+    dpu_device_cfg cfg;
+    dpu_device_snapshot snapshot;
+    rdma_dpu_bar_router router;
+    rdma_dpu_mem_factory mem_factory;
+    rdma_dpu_node nodes[$];
+
+    // 功能：构造空拓扑。
+    // 输入/输出及副作用：name 为 UVM 名。
+    // 失败/边界：无。
+    function new(string name = "rdma_dpu_system");
+      super.new(name);
+      cfg = dpu_device_cfg::type_id::create({name, "_cfg"});
+      snapshot = null;
+      router = null;
+      mem_factory = null;
+    endfunction
+
+    // 功能：声明 Host（见 rdma_dpu_topology::add_host）。
+    // 输入/输出及副作用：写 cfg。
+    // 失败/边界：合法性由 build 时的 resolver 校验。
+    function void add_host(int unsigned host_id, int segment_id = -1);
+      rdma_dpu_topology::add_host(cfg, host_id, segment_id);
+    endfunction
+
+    // 功能：声明 PF/VF（见 rdma_dpu_topology::add_function）。
+    // 输入/输出及副作用：写 cfg。
+    // 失败/边界：合法性由 build 时的 resolver 校验。
+    function void add_function(int unsigned host_id, int unsigned pf_id, dpu_function_kind_e kind,
+                               int unsigned vf_id);
+      rdma_dpu_topology::add_function(cfg, host_id, pf_id, kind, vf_id);
+    endfunction
+
+    // 功能：解析冻结快照，按快照顺序为每个 Function 建立节点：主机内存（mem_factory）、设备、BAR
+    //   （经路由器）、驱动硬件绑定（Function UID 取自快照）。不启动 NIC、不 probe。
+    // 输入/输出及副作用：设置 snapshot/router/nodes。
+    // 失败/边界：未设 mem_factory 返回 INVALID_STATE；解析或绑定失败返回其 status。
+    function rdma_status build();
+      rdma_dpu_function funcs[$];
+      rdma_dpu_node n;
+      rdma_status status;
+      string name;
+
+      if (mem_factory == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "dpu system has no memory factory");
+      status = rdma_dpu_topology::resolve(cfg, snapshot, funcs);
+      if (!status.ok())
+        return status;
+      router = rdma_dpu_bar_router::type_id::create({get_name(), "_router"});
+      router.snapshot = snapshot;
+      nodes.delete();
+      foreach (funcs[i]) begin
+        name = $sformatf("%s_f%0d", get_name(), funcs[i].global_id);
+        n = rdma_dpu_node::type_id::create(name);
+        n.func = funcs[i];
+        n.mem = mem_factory.make(funcs[i]);
+        n.dev = rdma_dev::type_id::create({name, "_dev"});
+        n.dev.configure(n.mem);
+        router.attach(funcs[i], n.dev);
+        n.bar = rdma_dpu_bar::type_id::create({name, "_bar"});
+        n.bar.router = router;
+        n.bar.func = funcs[i];
+        n.fn = rdma_function_handle::type_id::create({name, "_fn"});
+        n.fn.kind = RDMA_RESOURCE_FUNCTION;
+        n.fn.function_uid = funcs[i].uid();
+        n.fn.generation = 1;
+        n.hw = rdma_drv_hw::type_id::create({name, "_hw"});
+        status = n.hw.bind_hw(n.bar, n.mem, n.fn);
+        if (!status.ok())
+          return status;
+        n.drv = null;
+        nodes.push_back(n);
+      end
+      return rdma_status::success();
+    endfunction
+
+    // 功能：启动全部节点的 NIC 收发循环（调用方须先设好各 NIC 的端口）。
+    // 输入/输出及副作用：fork 常驻进程。
+    // 失败/边界：无。
+    task start();
+      foreach (nodes[i]) begin
+        automatic rdma_dev d = nodes[i].dev;
+        fork
+          d.nic.run();
+        join_none
+      end
+    endtask
+
+    // 功能：probe 第 i 个节点的驱动：driver cfg（为 null 时用默认）的 host_id 与 vf_id（global
+    //   Function ID）取自快照。
+    // 输入/输出及副作用：替换节点驱动。
+    // 失败/边界：i 越界返回 INVALID_ARGUMENT；probe 失败返回其 status。
+    task probe(int unsigned i, output rdma_status status, input rdma_drv_config drv_cfg = null);
+      if (i >= nodes.size()) begin
+        status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "no such dpu node");
+        return;
+      end
+      if (drv_cfg == null)
+        drv_cfg = rdma_drv_config::type_id::create({nodes[i].get_name(), "_drv_cfg"});
+      drv_cfg.host_id = nodes[i].func.key.host_id;
+      drv_cfg.vf_id = nodes[i].func.global_id;
+      nodes[i].drv = rdma_drv_dev::type_id::create({nodes[i].get_name(), "_drv"});
+      nodes[i].drv.probe(drv_cfg, nodes[i].hw, status);
+    endtask
+
+    // 功能：快照中 key 对应的节点下标。
+    // 输入/输出及副作用：纯查询。
+    // 失败/边界：不存在返回 -1。
+    function int find(dpu_function_key_t key);
+      foreach (nodes[i])
+        if (dpu_function_key_name(nodes[i].func.key) == dpu_function_key_name(key))
+          return i;
+      return -1;
+    endfunction
+
+    // 功能：PF FLR 范围：Host host_id 上 PF pf_id 及其全部 VF。
+    // 输入/输出及副作用：scope 输出节点下标。
+    // 失败/边界：无匹配时为空。
+    function void pf_scope(int unsigned host_id, int unsigned pf_id, output int unsigned scope[$]);
+      scope.delete();
+      foreach (nodes[i])
+        if (nodes[i].func.key.host_id == host_id && nodes[i].func.key.pf_id == pf_id)
+          scope.push_back(i);
+    endfunction
+
+    // 功能：Host 范围：该 Host 的全部 Function。
+    // 输入/输出及副作用：scope 输出节点下标。
+    // 失败/边界：无匹配时为空。
+    function void host_scope(int unsigned host_id, output int unsigned scope[$]);
+      scope.delete();
+      foreach (nodes[i])
+        if (nodes[i].func.key.host_id == host_id)
+          scope.push_back(i);
+    endfunction
+
+    // 功能：整设备范围：全部 Function。
+    // 输入/输出及副作用：scope 输出节点下标。
+    // 失败/边界：无。
+    function void device_scope(output int unsigned scope[$]);
+      scope.delete();
+      foreach (nodes[i])
+        scope.push_back(i);
+    endfunction
+
+    // 功能：复位 scope 内的设备（FLR：context 与 NIC 运行态清空），不动驱动。
+    // 输入/输出及副作用：清空设备状态。
+    // 失败/边界：越界下标忽略。
+    function void flr(int unsigned scope[$]);
+      foreach (scope[k])
+        if (scope[k] < nodes.size())
+          nodes[scope[k]].dev.flr();
+    endfunction
+
+    // 功能：复位后恢复 scope：设备再 FLR（保证干净）、驱动 remove（after_reset，不再下发命令）、
+    //   重新 probe（drv_cfg 同 probe）。
+    // 输入/输出及副作用：替换 scope 内节点的驱动。
+    // 失败/边界：remove/probe 失败返回其 status。
+    task recover(int unsigned scope[$], output rdma_status status,
+                 input rdma_drv_config drv_cfg = null);
+      status = rdma_status::success();
+      foreach (scope[k]) begin
+        nodes[scope[k]].dev.flr();
+        if (nodes[scope[k]].drv != null) begin
+          nodes[scope[k]].drv.remove(status, 1'b1);
+          if (!status.ok())
+            return;
+        end
+        probe(scope[k], status, drv_cfg);
+        if (!status.ok())
+          return;
+      end
     endtask
   endclass
 endpackage

@@ -65,6 +65,8 @@ endclass
 class rdma_mf_func extends uvm_object;
   `uvm_object_utils(rdma_mf_func)
 
+  // rdma_dpu_system 中的节点下标与该 Function 的快照投影。
+  int unsigned idx;
   rdma_dpu_function dpu;
   bit [47:0] mac;
   rdma_mock_host_mem mem;
@@ -94,8 +96,8 @@ class rdma_multifunc_test extends uvm_test;
 
   rdma_mf_func funcs[$];
   rdma_mf_net net;
-  dpu_device_snapshot snapshot;
-  rdma_dpu_bar_router router;
+  // 全局 Function 控制（dpu_common）：拓扑、每个 Function 的设备/内存/BAR/驱动、复位范围。
+  rdma_dpu_system sys;
   longint unsigned next_wr_id;
 
   // 功能：构造测试组件。
@@ -126,9 +128,7 @@ class rdma_multifunc_test extends uvm_test;
     fault_cmq_stall();
     fault_bad_rkey();
     fault_packet_drop();
-    reset_scope("VF FLR", '{1});
-    reset_scope("PF FLR", '{0, 1, 2});
-    reset_scope("device reset", '{0, 1, 2, 3, 4});
+    run_resets();
     foreach (funcs[i])
       if (funcs[i].dev.nic.errors.size() != 0)
         `uvm_error("MF", $sformatf("%s device errors: %p", funcs[i].get_name(),
@@ -145,68 +145,57 @@ class rdma_multifunc_test extends uvm_test;
                  status == null ? "null" : status.convert2string()))
   endfunction
 
-  // 功能：用 dpu_common 声明并解析拓扑（Host0：PF0 + VF1/VF2；Host1：PF1 + VF1），按快照顺序
-  //   建立 Function（顺序须为 pf0、vf0_1、vf0_2、pf1、vf1_1，故障与复位用例按此下标）。
-  // 输入/输出及副作用：设置 snapshot/router，追加 funcs。
-  // 失败/边界：解析失败或顺序不符报告 UVM_FATAL。
+  // 功能：用 rdma_dpu_system 声明并 build 拓扑（Host0：PF0 + VF1/VF2；Host1：PF1 + VF1），按快照
+  //   顺序建立 Function（顺序须为 pf0、vf0_1、vf0_2、pf1、vf1_1，故障用例按此下标）。
+  // 输入/输出及副作用：设置 sys，追加 funcs。
+  // 失败/边界：build 失败或顺序不符报告 UVM_FATAL。
   task build_topology();
-    dpu_device_cfg cfg;
-    rdma_dpu_function dfuncs[$];
     string expected[$];
 
-    cfg = dpu_device_cfg::type_id::create("mf_dpu_cfg");
-    rdma_dpu_topology::add_host(cfg, 0);
-    rdma_dpu_topology::add_host(cfg, 1);
-    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_PF, 0);
-    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_VF, 1);
-    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_VF, 2);
-    rdma_dpu_topology::add_function(cfg, 1, 1, DPU_FUNCTION_PF, 0);
-    rdma_dpu_topology::add_function(cfg, 1, 1, DPU_FUNCTION_VF, 1);
-    expect_ok("dpu_common resolve", rdma_dpu_topology::resolve(cfg, snapshot, dfuncs));
-    router = rdma_dpu_bar_router::type_id::create("mf_router");
-    router.snapshot = snapshot;
+    sys = rdma_dpu_system::type_id::create("mf_dpu");
+    sys.mem_factory = rdma_mock_mem_factory::type_id::create("mf_mem_factory");
+    sys.add_host(0);
+    sys.add_host(1);
+    sys.add_function(0, 0, DPU_FUNCTION_PF, 0);
+    sys.add_function(0, 0, DPU_FUNCTION_VF, 1);
+    sys.add_function(0, 0, DPU_FUNCTION_VF, 2);
+    sys.add_function(1, 1, DPU_FUNCTION_PF, 0);
+    sys.add_function(1, 1, DPU_FUNCTION_VF, 1);
+    expect_ok("dpu system build", sys.build());
     expected = '{"pf0", "vf0_1", "vf0_2", "pf1", "vf1_1"};
-    if (dfuncs.size() != expected.size())
-      `uvm_fatal("MF", $sformatf("snapshot has %0d Functions", dfuncs.size()))
-    foreach (dfuncs[i]) begin
-      if (dfuncs[i].key.host_id != (i < 3 ? 0 : 1) ||
-          (dfuncs[i].key.kind == DPU_FUNCTION_VF) != (i inside {1, 2, 4}))
+    if (sys.nodes.size() != expected.size())
+      `uvm_fatal("MF", $sformatf("snapshot has %0d Functions", sys.nodes.size()))
+    foreach (sys.nodes[i]) begin
+      if (sys.nodes[i].func.key.host_id != (i < 3 ? 0 : 1) ||
+          (sys.nodes[i].func.key.kind == DPU_FUNCTION_VF) != (i inside {1, 2, 4}))
         `uvm_fatal("MF", $sformatf("snapshot Function %0d is %s", i,
-                                   dpu_function_key_name(dfuncs[i].key)))
-      add_func(expected[i], dfuncs[i]);
+                                   dpu_function_key_name(sys.nodes[i].func.key)))
+      add_func(expected[i], i);
     end
   endtask
 
-  // 功能：建立一个 Function：独立 mock 内存域、设备、经 dpu 路由器的 BAR、端口并启动 NIC，随后
-  //   probe。MAC 为 02:00:00:00:<host>:<global ID>，host_mem 绑定用快照的 Function UID。
-  // 输入/输出及副作用：追加 funcs，注册到网络与路由器。
+  // 功能：接入 rdma_dpu_system 的第 i 个节点：MAC 为 02:00:00:00:<host>:<global ID>，挂到网络，启动
+  //   NIC，probe 驱动并建资源。
+  // 输入/输出及副作用：追加 funcs，注册到网络。
   // 失败/边界：失败报告 UVM_FATAL。
-  task add_func(string name, rdma_dpu_function d);
+  task add_func(string name, int unsigned i);
     rdma_mf_func f;
     rdma_mf_port port;
-    rdma_function_handle fn;
 
     f = rdma_mf_func::type_id::create(name);
-    f.dpu = d;
-    f.mac = {32'h0200_0000, 8'(d.key.host_id), 8'(d.global_id)};
-    f.mem = rdma_mock_host_mem::type_id::create({name, "_mem"});
-    f.dev = rdma_dev::type_id::create({name, "_dev"});
-    f.dev.configure(f.mem);
+    f.idx = i;
+    f.dpu = sys.nodes[i].func;
+    f.mac = {32'h0200_0000, 8'(f.dpu.key.host_id), 8'(f.dpu.global_id)};
+    if (!$cast(f.mem, sys.nodes[i].mem))
+      `uvm_fatal("MF", "dpu node memory is not the mock")
+    f.dev = sys.nodes[i].dev;
+    f.bar = sys.nodes[i].bar;
+    f.hw = sys.nodes[i].hw;
     port = rdma_mf_port::type_id::create({name, "_port"});
     port.net = net;
     port.src = f.mac;
     f.dev.nic.port = port;
     net.devs[f.mac] = f.dev;
-    router.attach(d, f.dev);
-    f.bar = rdma_dpu_bar::type_id::create({name, "_bar"});
-    f.bar.router = router;
-    f.bar.func = d;
-    fn = rdma_function_handle::type_id::create({name, "_fn"});
-    fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = d.uid();
-    fn.generation = 1;
-    f.hw = rdma_drv_hw::type_id::create({name, "_hw"});
-    expect_ok("bind", f.hw.bind_hw(f.bar, f.mem, fn));
     fork
       f.dev.nic.run();
     join_none
@@ -242,17 +231,17 @@ class rdma_multifunc_test extends uvm_test;
                                    funcs[i].get_name()))
       if (funcs[i].dev.doorbell_offsets.size() == 0)
         `uvm_error("MF", $sformatf("%s received no routed doorbell", funcs[i].get_name()))
-      routed = router.routed;
-      status = router.write(funcs[i].dpu.pcie_id.domain,
+      routed = sys.router.routed;
+      status = sys.router.write(funcs[i].dpu.pcie_id.domain,
                             funcs[i].dpu.mailbox.base + RDMA_NOTIFY_WINDOW_OFFSET, '0);
-      if (status.ok() || router.routed != routed)
+      if (status.ok() || sys.router.routed != routed)
         `uvm_error("MF", $sformatf("%s MAILBOX BAR write was routed to the RDMA device",
                                    funcs[i].get_name()))
     end
     domain = funcs[0].dpu.pcie_id.domain;
-    routed = router.routed;
-    status = router.write(domain, funcs[3].dpu.bar0.base + RDMA_NOTIFY_WINDOW_OFFSET, '0);
-    if (status.ok() || router.routed != routed)
+    routed = sys.router.routed;
+    status = sys.router.write(domain, funcs[3].dpu.bar0.base + RDMA_NOTIFY_WINDOW_OFFSET, '0);
+    if (status.ok() || sys.router.routed != routed)
       `uvm_error("MF", "Host1 BAR0 address was routed from the Host0 domain")
   endfunction
 
@@ -261,16 +250,21 @@ class rdma_multifunc_test extends uvm_test;
   // 输入/输出及副作用：替换 f 的驱动与资源。
   // 失败/边界：失败报告 UVM_FATAL。
   task probe(rdma_mf_func f);
-    rdma_drv_config cfg;
+    rdma_status status;
+
+    sys.probe(f.idx, status);
+    expect_ok({f.get_name(), " probe"}, status);
+    setup(f);
+  endtask
+
+  // 功能：probe 后的资源：PD、CQ、16KiB 数据缓冲与覆盖它的 MR；清空 QP 引用。
+  // 输入/输出及副作用：替换 f 的驱动引用与资源。
+  // 失败/边界：失败报告 UVM_FATAL。
+  task setup(rdma_mf_func f);
     bit [63:0] pages[$];
     rdma_status status;
 
-    cfg = rdma_drv_config::type_id::create("mf_cfg");
-    cfg.host_id = f.dpu.key.host_id;
-    cfg.vf_id = f.dpu.global_id;
-    f.drv = rdma_drv_dev::type_id::create({f.get_name(), "_drv"});
-    f.drv.probe(cfg, f.hw, status);
-    expect_ok({f.get_name(), " probe"}, status);
+    f.drv = sys.nodes[f.idx].drv;
     expect_ok("alloc PD", rdma_drv_pd::alloc(f.drv, f.pd));
     rdma_drv_cq::create_cq(f.drv, 64, 0, f.cq, status);
     expect_ok("create CQ", status);
@@ -599,6 +593,30 @@ class rdma_multifunc_test extends uvm_test;
     check_traffic("after packet drop", none);
   endtask
 
+  // 功能：按 dpu_common 快照的 Function 关系依次复位：VF FLR（vf0_1）、PF FLR（Host0 PF0 及其 VF）、
+  //   Host 复位（Host1 全部 Function）、整设备复位。
+  // 输入/输出及副作用：见 reset_scope。
+  // 失败/边界：范围与预期不符报告 UVM_ERROR。
+  task run_resets();
+    int unsigned scope[$];
+    int unsigned expected[$];
+
+    scope = '{sys.find(funcs[1].dpu.key)};
+    reset_scope("VF FLR", scope);
+    sys.pf_scope(0, 0, scope);
+    expected = '{0, 1, 2};
+    if (scope != expected)
+      `uvm_error("MF", $sformatf("PF FLR scope %p", scope))
+    reset_scope("PF FLR", scope);
+    sys.host_scope(1, scope);
+    expected = '{3, 4};
+    if (scope != expected)
+      `uvm_error("MF", $sformatf("Host1 scope %p", scope))
+    reset_scope("Host1 reset", scope);
+    sys.device_scope(scope);
+    reset_scope("device reset", scope);
+  endtask
+
   // 功能：复位 scope 内 Function（FLR/PF FLR/设备复位）：范围内 context 清空、范围外计数不变且
   //   不涉及范围的链路流量正常；随后 recover。
   // 输入/输出及副作用：复位并重建范围内 Function。
@@ -611,8 +629,7 @@ class rdma_multifunc_test extends uvm_test;
       qps[i] = funcs[i].dev.cmq.count(RDMA_DEV_QP);
       mrs[i] = funcs[i].dev.cmq.count(RDMA_DEV_MR);
     end
-    foreach (scope[k])
-      funcs[scope[k]].dev.flr();
+    sys.flr(scope);
     foreach (funcs[i]) begin
       if (in_scope(i, scope)) begin
         if (funcs[i].dev.cmq.count(RDMA_DEV_QP) != 0 ||
@@ -638,12 +655,10 @@ class rdma_multifunc_test extends uvm_test;
     int unsigned j;
     rdma_status status;
 
-    foreach (scope[k]) begin
-      funcs[scope[k]].dev.flr();
-      funcs[scope[k]].drv.remove(status, 1'b1);
-      expect_ok("remove after reset", status);
-      probe(funcs[scope[k]]);
-    end
+    sys.recover(scope, status);
+    expect_ok("recover after reset", status);
+    foreach (scope[k])
+      setup(funcs[scope[k]]);
     foreach (funcs[i]) begin
       j = (i + 1) % funcs.size();
       if (in_scope(i, scope) || in_scope(j, scope))

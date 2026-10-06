@@ -2,7 +2,7 @@
 // 职责：驱动 probe/remove（rdma_drv_dev）对设备模型的完整命令序列：CMQ 建立、4 类 HMC 对象
 //   IFA_UPDATE、带签名的 SD_UPDATE（设备校验扩展 SD 表签名）、CEQ/AEQ 创建与 EQC 内容、QP0 置 ERR，
 //   以及 remove 的 flush/删除/清 SD 顺序和 DMA 内存全部归还。
-// 依赖：rdma_drv_dev、rdma_dev、rdma_dpu_test_bar（dpu_common）、rdma_mock_host_mem。
+// 依赖：rdma_drv_dev、rdma_dev、rdma_dpu_system（dpu_common）、rdma_mock_host_mem。
 // 所有权与生命周期：测试拥有 mock 内存、设备与驱动对象。
 class rdma_drv_dev_test extends uvm_test;
   `uvm_component_utils(rdma_drv_dev_test)
@@ -22,35 +22,27 @@ class rdma_drv_dev_test extends uvm_test;
   // 输入/输出及副作用：持有 objection 直到结束。
   // 失败/边界：以 UVM_ERROR/FATAL 报告。
   task run_phase(uvm_phase phase);
-    rdma_dpu_test_bar bar;
-    rdma_drv_hw hw;
+    rdma_dpu_system sys;
+    rdma_dpu_function func;
     rdma_drv_config cfg;
-    rdma_function_handle fn;
     rdma_status status;
 
     phase.raise_objection(this);
-    mem = rdma_mock_host_mem::type_id::create("drv_dev_mem");
-    dev = rdma_dev::type_id::create("drv_dev_device");
-    dev.configure(mem);
     // Host0：PF0 + VF1..VF3，取 VF3（global Function ID 3）。
-    bar = rdma_dpu_test_bar::make("drv_dev_bar", dev, 3, 3);
-    if (bar.func.key.kind != DPU_FUNCTION_VF || bar.func.global_id != 3)
+    sys = rdma_dpu_test_system::single_host("drv_dev", 3);
+    func = sys.nodes[3].func;
+    if (func.key.kind != DPU_FUNCTION_VF || func.global_id != 3)
       `uvm_fatal("DRV_DEV", $sformatf("dpu_common Function %s has global ID %0d",
-                                      dpu_function_key_name(bar.func.key), bar.func.global_id))
-    fn = rdma_function_handle::type_id::create("drv_dev_fn");
-    fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = bar.func.uid();
-    fn.generation = 1;
-    hw = rdma_drv_hw::type_id::create("drv_dev_hw");
-    expect_ok("bind", hw.bind_hw(bar, mem, fn));
+                                      dpu_function_key_name(func.key), func.global_id))
+    if (!$cast(mem, sys.nodes[3].mem))
+      `uvm_fatal("DRV_DEV", "dpu node memory is not the mock")
+    dev = sys.nodes[3].dev;
     cfg = rdma_drv_config::type_id::create("drv_dev_cfg");
-    cfg.host_id = bar.func.key.host_id;
-    cfg.vf_id = bar.func.global_id;
     cfg.ceq_cnt = 2;
     cfg.first_ceqn = 4;
-    drv = rdma_drv_dev::type_id::create("drv_dev");
-    drv.probe(cfg, hw, status);
+    sys.probe(3, status, cfg);
     expect_ok("probe", status);
+    drv = sys.nodes[3].drv;
     check_probe();
     drv.remove(status);
     expect_ok("remove", status);

@@ -11,7 +11,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   localparam bit [63:0] IOVA_BASE = 64'h0000_0001_0000_0000;
 
   protected rdma_dma_mapping maps[$];
-  protected byte unsigned data[$][];
+  protected byte unsigned store[$][];
   protected bit [63:0] next_iova;
 
   // 功能：构造空 IOVA 域。
@@ -48,7 +48,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     next_iova += size;
     bytes = new[size];
     maps.push_back(mapping);
-    data.push_back(bytes);
+    store.push_back(bytes);
     return rdma_status::success();
   endfunction
 
@@ -56,31 +56,31 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
   // 输入/输出及副作用：写 backing。
   // 失败/边界：mapping 未知/已释放或越界返回 INVALID_ARGUMENT。
   virtual function rdma_status write(rdma_dma_mapping mapping, longint unsigned offset,
-                                     byte bytes[]);
+                                     byte data[]);
     int idx;
 
-    idx = locate(mapping, offset, bytes.size());
+    idx = locate(mapping, offset, data.size());
     if (idx < 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "write outside a live mapping");
-    foreach (bytes[i])
-      data[idx][offset + i] = bytes[i];
+    foreach (data[i])
+      store[idx][offset + i] = data[i];
     return rdma_status::success();
   endfunction
 
   // 功能：读 mapping 的 offset 处 size 字节。
-  // 输入/输出及副作用：bytes 输出副本。
+  // 输入/输出及副作用：data 输出副本。
   // 失败/边界：mapping 未知/已释放或越界返回 INVALID_ARGUMENT。
   virtual function rdma_status read(rdma_dma_mapping mapping, longint unsigned offset,
-                                    int unsigned size, output byte bytes[]);
+                                    int unsigned size, output byte data[]);
     int idx;
 
-    bytes = new[0];
+    data = new[0];
     idx = locate(mapping, offset, size);
     if (idx < 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "read outside a live mapping");
-    bytes = new[size];
-    foreach (bytes[i])
-      bytes[i] = data[idx][offset + i];
+    data = new[size];
+    foreach (data[i])
+      data[i] = store[idx][offset + i];
     return rdma_status::success();
   endfunction
 
@@ -94,7 +94,7 @@ class rdma_mock_host_mem extends rdma_host_mem_api;
     if (idx < 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "release of an unknown mapping");
     mapping.state = RDMA_MAPPING_RELEASED;
-    data[idx] = new[0];
+    store[idx] = new[0];
     return rdma_status::success();
   endfunction
 

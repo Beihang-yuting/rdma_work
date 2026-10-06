@@ -17,7 +17,8 @@ class rdma_tb_flow_test extends uvm_test;
 
   rdma_tb_env env;
   rdma_host_mem_api mems[2];
-  // 各节点 dpu_common 快照中的 PF（e2e 的 net_packet identity 也取自它）。
+  // 各节点（一台 DPU）的 dpu_common 系统及其 PF（e2e 的 net_packet identity 也取自它）。
+  rdma_dpu_system systems[2];
   rdma_dpu_function dpu_funcs[2];
   // QP 的 SQ/RQ 深度（子类可调小以覆盖环满与回绕）。
   int unsigned qp_depth;
@@ -77,10 +78,8 @@ class rdma_tb_flow_test extends uvm_test;
   // 输入/输出及副作用：返回节点配置；分配主机内存。
   // 失败/边界：任一步失败报 UVM_FATAL。
   task automatic make_node(int unsigned n, output rdma_tb_node_cfg cfg);
-    rdma_dpu_test_bar bar;
+    rdma_dpu_fixed_mem_factory factory;
     rdma_drv_hw hw;
-    rdma_drv_config dcfg;
-    rdma_function_handle fn;
     rdma_drv_pd pd;
     bit [63:0] pages[$];
     rdma_status status;
@@ -89,23 +88,20 @@ class rdma_tb_flow_test extends uvm_test;
     cfg.node_id = n;
     cfg.mac = 48'h02_00_00_00_10_00 + n;
     mems[n] = make_host_mem(n);
-    cfg.dev = rdma_dev::type_id::create($sformatf("tb_dev%0d", n));
-    cfg.dev.configure(mems[n]);
-    // 每个节点一台 DPU：dpu_common 解析 Host0 PF0，doorbell 经快照 BAR0 解码。
-    bar = rdma_dpu_test_bar::make($sformatf("tb_bar%0d", n), cfg.dev);
-    dpu_funcs[n] = bar.func;
-    fn = rdma_function_handle::type_id::create($sformatf("tb_fn%0d", n));
-    fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = dpu_funcs[n].uid();
-    fn.generation = 1;
-    hw = rdma_drv_hw::type_id::create($sformatf("tb_hw%0d", n));
-    expect_ok("bind", hw.bind_hw(bar, mems[n], fn));
-    dcfg = rdma_drv_config::type_id::create($sformatf("tb_drv_cfg%0d", n));
-    dcfg.host_id = dpu_funcs[n].key.host_id;
-    dcfg.vf_id = dpu_funcs[n].global_id;
-    cfg.drv = rdma_drv_dev::type_id::create($sformatf("tb_drv%0d", n));
-    cfg.drv.probe(dcfg, hw, status);
+    // 每个节点一台 DPU：dpu_common 解析 Host0 PF0，设备/驱动由 rdma_dpu_system 建立。
+    systems[n] = rdma_dpu_system::type_id::create($sformatf("tb_dpu%0d", n));
+    factory = rdma_dpu_fixed_mem_factory::type_id::create($sformatf("tb_mem_factory%0d", n));
+    factory.mem = mems[n];
+    systems[n].mem_factory = factory;
+    systems[n].add_host(0);
+    systems[n].add_function(0, 0, DPU_FUNCTION_PF, 0);
+    expect_ok("dpu system build", systems[n].build());
+    dpu_funcs[n] = systems[n].nodes[0].func;
+    cfg.dev = systems[n].nodes[0].dev;
+    hw = systems[n].nodes[0].hw;
+    systems[n].probe(0, status);
     expect_ok("probe", status);
+    cfg.drv = systems[n].nodes[0].drv;
     expect_ok("alloc PD", rdma_drv_pd::alloc(cfg.drv, pd));
     rdma_drv_cq::create_cq(cfg.drv, 256, 0, cfg.cq, status);
     expect_ok("create CQ", status);

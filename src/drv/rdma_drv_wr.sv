@@ -1100,7 +1100,8 @@ class rdma_drv_wr extends uvm_object;
   endtask
 
   // 功能：xtrdma_process_aeq：先交出 dev.aeq_backlog 中暂存的事件，再取有效 AEQE，记录 {ECODE, QPN}
-  //   （SRFQ 事件记录 SRFQN），推进 CI 并敲 AEQ doorbell。URC_FLAG 的 QP 错误（xtrdma_qp_event_process）先按异常类型把异常信息记入 QP 的
+  //   （SRFQ 事件记录 SRFQN），推进 CI 并敲 AEQ doorbell。URC_FLAG 的 QP 错误
+  //   （xtrdma_qp_event_process）先按异常类型把异常信息记入 QP 的
   //   SQ/RQ frag，再把 QP 转 ERR（硬件随后 flush）。
   // 输入/输出及副作用：events 追加 {ecode[7:0], qpn 或 srqn[23:0]}；更新 EQ 状态与 doorbell。
   // 失败/边界：读写失败返回错误。

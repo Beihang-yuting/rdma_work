@@ -40,7 +40,7 @@ package rdma_unit_test_pkg;
 
   `include "mocks/rdma_mock_host_mem.sv"
   `include "support/rdma_golden_reader.sv"
-  `include "support/rdma_dpu_test_bar.sv"
+  `include "support/rdma_dpu_test_system.sv"
   `include "unit/rdma_smoke_test.sv"
   `include "unit/rdma_types_test.sv"
   `include "unit/rdma_dev_cmq_test.sv"

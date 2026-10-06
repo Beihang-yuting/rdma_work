@@ -6,7 +6,7 @@
 //   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE，CQ destroy 的 cleanup_ceqes，
 //   URC（rc_to_urc：frag CQ、CEQE 上报 HW 完成下标、SQ 完成合成、RQ CQE 在 frag 槽、flush、销毁）；
 //   每项逐字节比对目的内存并检查完成的 wr_id/方向/状态。
-// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_test_bar（dpu_common）、rdma_mock_host_mem。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_system（dpu_common）、rdma_mock_host_mem。
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
 // 生命周期：run_phase 内建立并运行到结束。
 
@@ -58,6 +58,8 @@ class rdma_drv_data_node extends uvm_object;
   `uvm_object_utils(rdma_drv_data_node)
 
   bit [47:0] mac;
+  // 节点即一台 DPU：dpu_common 解析的 Host0 PF0。
+  rdma_dpu_system sys;
   rdma_mock_host_mem mem;
   rdma_dev dev;
   rdma_drv_dev drv;
@@ -148,34 +150,23 @@ class rdma_drv_data_test extends uvm_test;
   // 输入/输出及副作用：node 输出；注册到链路。
   // 失败/边界：任一步失败报告 UVM_FATAL。
   task build_node(string name, bit [47:0] mac, output rdma_drv_data_node node);
-    rdma_dpu_test_bar bar;
     rdma_drv_hw hw;
-    rdma_drv_config cfg;
-    rdma_function_handle fn;
     rdma_drv_qp_init_attr attr;
     bit [63:0] pages[$];
     rdma_status status;
 
     node = rdma_drv_data_node::type_id::create(name);
     node.mac = mac;
-    node.mem = rdma_mock_host_mem::type_id::create({name, "_mem"});
-    node.dev = rdma_dev::type_id::create({name, "_dev"});
-    node.dev.configure(node.mem);
+    node.sys = rdma_dpu_test_system::single_host(name);
+    if (!$cast(node.mem, node.sys.nodes[0].mem))
+      `uvm_fatal("DATA", "dpu node memory is not the mock")
+    node.dev = node.sys.nodes[0].dev;
     node.dev.nic.port = link;
     link.nodes[mac] = node.dev;
-    bar = rdma_dpu_test_bar::make({name, "_bar"}, node.dev);
-    fn = rdma_function_handle::type_id::create({name, "_fn"});
-    fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = bar.func.uid();
-    fn.generation = 1;
-    hw = rdma_drv_hw::type_id::create({name, "_hw"});
-    expect_ok("bind", hw.bind_hw(bar, node.mem, fn));
-    cfg = rdma_drv_config::type_id::create({name, "_cfg"});
-    cfg.host_id = bar.func.key.host_id;
-    cfg.vf_id = bar.func.global_id;
-    node.drv = rdma_drv_dev::type_id::create({name, "_drv"});
-    node.drv.probe(cfg, hw, status);
+    hw = node.sys.nodes[0].hw;
+    node.sys.probe(0, status);
     expect_ok("probe", status);
+    node.drv = node.sys.nodes[0].drv;
     expect_ok("alloc PD", rdma_drv_pd::alloc(node.drv, node.pd));
     rdma_drv_cq::create_cq(node.drv, 64, 0, node.cq, status);
     expect_ok("create CQ", status);
