@@ -50,6 +50,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_drv_verbs_test.sv"
   `include "unit/rdma_drv_data_test.sv"
   `include "unit/rdma_drv_reliability_test.sv"
+  `include "unit/rdma_drv_qp_lifecycle_test.sv"
   `include "unit/rdma_multifunc_test.sv"
   `include "unit/rdma_defs_test.sv"
   `include "unit/rdma_tb_flow_test.sv"

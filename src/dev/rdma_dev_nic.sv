@@ -99,6 +99,12 @@ class rdma_dev_nic extends uvm_object;
   localparam int unsigned HMC_PBL = 3;
   // TX 队列中标记 QP flush（与 SQ doorbell 共用队列以保持顺序）。
   localparam int unsigned FLUSH_TAG = 32'h8000_0000;
+  // RTS2SQD doorbell 在 TX 队列中的标记：排在此前的 SQ 工作之后处理（在途 WQE 完成后报 SQD_DONE）。
+  localparam int unsigned SQD_TAG = 32'h4000_0000;
+  // QPC QP_ST 编码（驱动 xtrdma_get_qp_st：INIT1、RTR2、RTS3、ERR4、SQD/SQE5）。
+  localparam int unsigned QP_ST_RTR = 2;
+  localparam int unsigned QP_ST_RTS = 3;
+  localparam int unsigned QP_ST_SQD = 5;
   localparam int unsigned URC_SERVICE_TYPE = 6;
   // 设备保存的 CQC 从 SQE 字节 8 起、EQC 从 SQE 字节 16 起。
   localparam int unsigned CQC_BASE = 8;
@@ -122,6 +128,8 @@ class rdma_dev_nic extends uvm_object;
   rdma_dev_port port;
   // 观测：因 Q_Key 不符被丢弃的 UD 报文数。
   int unsigned qkey_drops;
+  // 观测：QP 不在 RTR/RTS/SQD 时被丢弃的请求数。
+  int unsigned state_drops;
   // URC 异常上报通道：0 为 frag CQ 的 ABNML CEQE，1 为 AEQE（驱动两条路径都处理；硬件选择未知）。
   bit urc_abnormal_via_aeq;
   protected rdma_dev_qp_rt qps[int unsigned];
@@ -145,6 +153,7 @@ class rdma_dev_nic extends uvm_object;
     host_mem = null;
     port = null;
     qkey_drops = 0;
+    state_drops = 0;
     urc_abnormal_via_aeq = 1'b0;
     sq_kicks = new();
     rx_mb = new();
@@ -191,6 +200,13 @@ class rdma_dev_nic extends uvm_object;
     qp_rt(qpn).sq_doorbells++;
     qp_rt(qpn).kicks_pending++;
     void'(sq_kicks.try_put(qpn));
+  endfunction
+
+  // 功能：RTS2SQD doorbell：排入 TX 队列，待此前的 SQ 工作处理完后检查 QPC 状态（见 tx_loop）。
+  // 输入/输出及副作用：投递 TX 任务。
+  // 失败/边界：无。
+  function void rts2sqd(bit [63:0] value);
+    void'(sq_kicks.try_put(SQD_TAG | value[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH]));
   endfunction
 
   // 功能：QP flush doorbell（转 ERR）：该 QP 没有待处理的 SQ 工作时立即写 flush CQE（先于随后的 CMQ
@@ -245,7 +261,7 @@ class rdma_dev_nic extends uvm_object;
     join
   endtask
 
-  // 功能：TX 循环：按 doorbell 顺序 drain 对应 QP 的 SQ 或执行 QP flush。
+  // 功能：TX 循环：按 doorbell 顺序 drain 对应 QP 的 SQ、执行 QP flush 或完成 RTS2SQD。
   // 输入/输出及副作用：永久循环。
   // 失败/边界：无。
   protected task tx_loop();
@@ -255,6 +271,9 @@ class rdma_dev_nic extends uvm_object;
       sq_kicks.get(qpn);
       if (qpn & FLUSH_TAG) begin
         flush_qp(qpn & ~FLUSH_TAG);
+      end
+      else if (qpn & SQD_TAG) begin
+        finish_rts2sqd(qpn & ~SQD_TAG);
       end
       else begin
         drain_sq(qpn);
@@ -480,6 +499,45 @@ class rdma_dev_nic extends uvm_object;
   endfunction
 
   `define RDMA_QPC(QPN, STEM) qpc_field(QPN, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, STEM``_WIDTH)
+
+  // 功能：完成 RTS2SQD（在途 WQE 已在此前的 drain 中完成）：QPC 已是 SQD 则写 AEQE EC_RTS2SQD_DONE，
+  //   否则写 EC_RTS2SQD_DB_QP_ST_UNMATCH。
+  // 输入/输出及副作用：写 AEQE。
+  // 失败/边界：QP 不存在报告协议错误。
+  protected function void finish_rts2sqd(int unsigned qpn);
+    rdma_dev_object obj;
+
+    if (!ctx.lookup(RDMA_DEV_QP, qpn, obj)) begin
+      protocol_error($sformatf("RTS2SQD doorbell for absent QP %0d", qpn));
+      return;
+    end
+    if (`RDMA_QPC(qpn, RDMA_QPC_QP_ST) == QP_ST_SQD)
+      write_aeqe(qpn, RDMA_ECODE_EC_RTS2SQD_DONE, 1'b0, 0);
+    else
+      write_aeqe(qpn, RDMA_ECODE_EC_RTS2SQD_DB_QP_ST_UNMATCH, 1'b0, 0);
+  endfunction
+
+  // 功能：SQD2RTS doorbell：QPC 状态须已是 RTS（驱动先发 QPC_MODIFY），否则 AEQE
+  //   EC_SQD2RTS_DB_QP_ST_UNMATCH；状态正确时恢复取 SQE（重新 drain SQ）。
+  // 输入/输出及副作用：写 AEQE 或投递 TX 任务。
+  // 失败/边界：QP 不存在报告协议错误。
+  function void sqd2rts(bit [63:0] value);
+    int unsigned qpn;
+    rdma_dev_object obj;
+
+    qpn = value[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH];
+    if (!ctx.lookup(RDMA_DEV_QP, qpn, obj)) begin
+      protocol_error($sformatf("SQD2RTS doorbell for absent QP %0d", qpn));
+      return;
+    end
+    if (`RDMA_QPC(qpn, RDMA_QPC_QP_ST) != QP_ST_RTS) begin
+      write_aeqe(qpn, RDMA_ECODE_EC_SQD2RTS_DB_QP_ST_UNMATCH, 1'b0, 0);
+      return;
+    end
+    qp_rt(qpn).kicks_pending++;
+    void'(sq_kicks.try_put(qpn));
+  endfunction
+
 
   // 功能：QP 的 SQ/RQ 槽地址（QPC 的 PBA/OM，深度 2^SIZE）。
   // 输入/输出及副作用：iova/depth 输出。
@@ -721,7 +779,8 @@ class rdma_dev_nic extends uvm_object;
       end
       if (rdma_be::field(wqe, 0, RDMA_SQ_WQE_VALID_LSB, 1) != !((rt.sq_ci / depth) & 1))
         break;
-      if (rt.urc_error)
+      // 只在 RTS 取新的 SQE（SQD/ERR 等状态下已投递的 WQE 留在环上）。
+      if (rt.urc_error || `RDMA_QPC(qpn, RDMA_QPC_QP_ST) != QP_ST_RTS)
         break;
       process_sqe(qpn, rt, wqe);
       rt.sq_ci++;
@@ -1689,6 +1748,11 @@ class rdma_dev_nic extends uvm_object;
     int unsigned base;
 
     rt = qp_rt(qpn);
+    // 接收端只在 RTR/RTS/SQD 接受请求（RESET/INIT/ERR 丢弃，不回 ACK）。
+    if (!(`RDMA_QPC(qpn, RDMA_QPC_QP_ST) inside {QP_ST_RTR, QP_ST_RTS, QP_ST_SQD})) begin
+      state_drops++;
+      return;
+    end
     ud = `RDMA_QPC(qpn, RDMA_QPC_SERVICE_TYPE) == 3;
     pd = `RDMA_QPC(qpn, RDMA_QPC_PD_IDX);
     last = pkt.segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY};

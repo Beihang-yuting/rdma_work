@@ -109,6 +109,8 @@ class rdma_drv_qp extends uvm_object;
   localparam int unsigned MIN_URC_WR = 8;
   localparam int unsigned SERVICE_URC = 6;
   localparam int unsigned SGB_BYTES = 512;
+  // RTS2SQD_DONE 等待的轮询次数（每次 100ns）。
+  localparam int unsigned SQD_WAIT_POLLS = 1000;
   // rf->urc_rnr_code 默认值（qp.h:139，debugfs 可调未建模）。
   localparam int unsigned URC_RNR_CODE = 8;
   // rf->urc_rto_code 默认值（qp.h:136）。
@@ -177,9 +179,10 @@ class rdma_drv_qp extends uvm_object;
     rq_polarity = 1'b0;
   endfunction
 
-  // 功能：QPC 中的 qp_st 编码（INIT1、RTR2、RTS3、ERR4、SQD/SQE5）。
+  // 功能：QPC 中的 qp_st 编码（xtrdma_get_qp_st：INIT1、RTR2、RTS3、ERR4、SQD/SQE5）。
   // 输入/输出及副作用：纯函数。
-  // 失败/边界：RESET 编码为 0。
+  // 失败/边界：驱动不支持 RESET（default 分支报错并取 ERR），故 RESET 编码为 ERR(4)；QP 复用须
+  //   destroy 后重建。
   static function int unsigned qpc_state(rdma_drv_qp_state_e s);
     case (s)
       RDMA_DRV_QPS_INIT: return 1;
@@ -187,7 +190,7 @@ class rdma_drv_qp extends uvm_object;
       RDMA_DRV_QPS_RTS: return 3;
       RDMA_DRV_QPS_ERR: return 4;
       RDMA_DRV_QPS_SQD, RDMA_DRV_QPS_SQE: return 5;
-      default: return 0;
+      default: return 4;
     endcase
   endfunction
 
@@ -632,8 +635,11 @@ class rdma_drv_qp extends uvm_object;
       full = (cur_state == RDMA_DRV_QPS_INIT && next == RDMA_DRV_QPS_RTR) ||
              (cur_state == RDMA_DRV_QPS_RTR && next == RDMA_DRV_QPS_RTS);
       hw_qpc_cmd(dev, RDMA_OP_QPC_MODIFY, full, status);
-      if (status.ok() && cur_state == RDMA_DRV_QPS_RTS && next == RDMA_DRV_QPS_SQD)
+      if (status.ok() && cur_state == RDMA_DRV_QPS_RTS && next == RDMA_DRV_QPS_SQD) begin
         qp_doorbell(dev, RDMA_DB_RTS2SQD_OFFSET, RDMA_DB_TYPE_RTS2SQD, status);
+        if (status.ok())
+          wait_sqd_done(dev, status);
+      end
       if (status.ok() && cur_state == RDMA_DRV_QPS_SQD && next == RDMA_DRV_QPS_RTS)
         qp_doorbell(dev, RDMA_DB_SQD2RTS_OFFSET, RDMA_DB_TYPE_SQD2RTS, status);
       if (status.ok() && next == RDMA_DRV_QPS_ERR)
@@ -733,6 +739,35 @@ class rdma_drv_qp extends uvm_object;
     db[RDMA_NOTIFY_QP_DB_TYPE_LSB +: RDMA_NOTIFY_QP_DB_TYPE_WIDTH] = db_type;
     db[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH] = qpn;
     dev.hw.notify(offset, db, status);
+  endtask
+
+  // 功能：xtrdma_hw_modify_qp 的 wait_for_completion(rts2sqd_done)：处理 AEQ 直到收到本 QP 的
+  //   EC_RTS2SQD_DONE；期间收到的其它 AEQ 事件放回 dev.aeq_backlog，由下次 process_aeq 交出。
+  // 输入/输出及副作用：处理 AEQ。
+  // 失败/边界：SQD_WAIT_POLLS 次轮询（每次 100ns）仍未收到返回 TIMEOUT；AEQ 处理失败返回其 status。
+  protected task wait_sqd_done(rdma_drv_dev dev, output rdma_status status);
+    bit [31:0] events[$];
+    bit done;
+
+    done = 1'b0;
+    status = rdma_status::success();
+    for (int unsigned t = 0; t < SQD_WAIT_POLLS && !done; t++) begin
+      events.delete();
+      rdma_drv_wr::process_aeq(dev, events, status);
+      if (!status.ok())
+        return;
+      foreach (events[i]) begin
+        if (events[i] == {RDMA_ECODE_EC_RTS2SQD_DONE, 24'(qpn)} && !done)
+          done = 1'b1;
+        else
+          dev.aeq_backlog.push_back(events[i]);
+      end
+      if (!done)
+        #100ns;
+    end
+    if (!done)
+      status = rdma_status::make(RDMA_SC_TIMEOUT,
+                                 $sformatf("QP %0d RTS2SQD_DONE did not arrive", qpn));
   endtask
 
   // 功能：xtrdma_ib_destroy_qp：非 ERR 先转 ERR（仅状态 + flush doorbell），OCC_FLUSH（EIRQE/ORQE/UAQE，

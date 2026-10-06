@@ -19,6 +19,7 @@ package rdma_drv_pkg;
   typedef class rdma_drv_qp;
   typedef class rdma_drv_cq;
   typedef class rdma_drv_srq;
+  typedef class rdma_drv_wr;
 
   `include "rdma_drv_hw.sv"
   `include "rdma_drv_cmq.sv"

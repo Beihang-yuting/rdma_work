@@ -18,6 +18,7 @@ readonly CORE_TESTS=(
   rdma_drv_verbs_test
   rdma_drv_data_test
   rdma_drv_reliability_test
+  rdma_drv_qp_lifecycle_test
   rdma_multifunc_test
   rdma_defs_test
 )

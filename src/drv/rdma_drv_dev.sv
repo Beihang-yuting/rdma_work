@@ -191,6 +191,8 @@ class rdma_drv_dev extends uvm_object;
   rdma_drv_qp qp_table[int unsigned];
   rdma_drv_cq cq_table[int unsigned];
   rdma_drv_eq aeq;
+  // 驱动内部等待（如 RTS2SQD_DONE）时取出但不属于它的 AEQ 事件，下次 process_aeq 先交出。
+  bit [31:0] aeq_backlog[$];
   bit probed;
 
   // 功能：构造未 probe 的设备。
