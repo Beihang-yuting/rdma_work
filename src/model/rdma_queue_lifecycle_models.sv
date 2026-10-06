@@ -4,9 +4,6 @@
 // 所有权与生命周期：各对象为值快照，mapping 等外部资源仅保存非拥有引用，由调用方管理。
 
 
-typedef enum bit { RDMA_QUEUE_BACKING_OWNED, RDMA_QUEUE_BACKING_BORROWED }
-  rdma_queue_backing_mode_e;
-
 typedef enum bit [4:0] {
   RDMA_QUEUE_ROLE_CQ_RING = 5'd0,
   RDMA_QUEUE_ROLE_SRQ_RING = 5'd1,
@@ -34,51 +31,6 @@ typedef enum bit [4:0] {
 
 typedef enum bit { RDMA_QUEUE_FLUSH_PRE_DELETE, RDMA_QUEUE_FLUSH_POST_DELETE }
   rdma_queue_flush_phase_e;
-
-typedef enum bit { RDMA_QUEUE_RECOVER_CREATE_ROLLBACK,
-                   RDMA_QUEUE_RECOVER_NORMAL_DESTROY }
-  rdma_queue_recovery_intent_e;
-
-typedef enum bit [1:0] { RDMA_QUEUE_AMBIG_NONE,
-                         RDMA_QUEUE_AMBIG_CREATE,
-                         RDMA_QUEUE_AMBIG_DELETE,
-                         RDMA_QUEUE_AMBIG_OCC_FLUSH }
-  rdma_queue_ambiguous_operation_e;
-
-// 中文设计：SRQ destroy 同时受硬件 OCC flush、SRQC delete、context release
-// 和 backing detach 的顺序约束；其中 SRQ_SGB 只在 max_sge>2 时存在。把这组
-// 不携带对象引用的值规则放在 model 层，policy 与 executor 只消费同一份 detached
-// recipe，避免在跨资源 QP→SRQ dependency guard 旁边复制角色顺序或误提交半份清理。
-// 功能：生成 SRQ 销毁所需的 flush 顺序与本地 backing 释放顺序。
-// 输入/输出及副作用：include_optional_sgb 为输入；输出 flush_roles/flush_phases/local_roles 及两个顺序标志。
-// 失败/边界：无失败返回；为 0 时仅省略 SRQ_SGB，其余顺序不变；该 recipe 不代表 backing 所有权或硬件完成。
-function automatic void rdma_srq_destroy_value_policy(
-  input bit include_optional_sgb,
-  output rdma_queue_backing_role_e flush_roles[$],
-  output rdma_queue_flush_phase_e flush_phases[$],
-  output bit delete_before_flush,
-  output rdma_queue_backing_role_e local_roles[$],
-  output bit release_context_first
-);
-  flush_roles.delete();
-  flush_phases.delete();
-  local_roles.delete();
-
-  delete_before_flush = 1'b0;
-  release_context_first = 1'b1;
-
-  flush_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
-  flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
-  flush_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
-  flush_phases.push_back(RDMA_QUEUE_FLUSH_PRE_DELETE);
-
-  local_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_PD);
-  local_roles.push_back(RDMA_QUEUE_ROLE_SRQ_PD);
-  if (include_optional_sgb)
-    local_roles.push_back(RDMA_QUEUE_ROLE_SRQ_SGB);
-  local_roles.push_back(RDMA_QUEUE_ROLE_SRFQ_RING);
-  local_roles.push_back(RDMA_QUEUE_ROLE_SRQ_RING);
-endfunction
 
 // 功能：把嵌套 validator 返回的 status 归一化，null 转为 INVALID_STATE。
 // 输入/输出及副作用：status/label 为输入；非空 status 原样返回，否则返回带 label 的 INVALID_STATE。
@@ -202,17 +154,6 @@ function automatic rdma_status rdma_queue_queue_range_status(
   return rdma_status::success();
 endfunction
 
-// 功能：把 4KiB 对齐的 iova 写入 base。
-// 输入/输出及副作用：iova 为输入；base 为输入输出，仅成功时更新 base.value。
-// 失败/边界：iova 未 4KiB 对齐返回 INVALID_ARGUMENT，base 保持不变。
-function automatic rdma_status rdma_queue_base_from_iova(
-    rdma_iova_t iova, inout rdma_backing_addr_t base);
-  if (!rdma_queue_aligned(iova.value, 4096))
-    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "queue IOVA is not 4 KiB aligned");
-  base.value = iova.value;
-  return rdma_status::success();
-endfunction
-
 class rdma_queue_completion_authority extends uvm_object;
   `rdma_object_utils(rdma_queue_completion_authority)
   bit complete;
@@ -278,139 +219,6 @@ class rdma_queue_slot_token_contract extends uvm_object;
     return rdma_queue_nested_status(
       completion_authority.validate(), "slot token completion authority"
     );
-  endfunction
-endclass
-
-class rdma_queue_opaque_slot_token extends rdma_queue_slot_token_contract;
-  `rdma_object_utils(rdma_queue_opaque_slot_token)
-
-  // 功能：构造对象，字段置默认值。
-  // 输入/输出及副作用：name 传给 UVM 父类。
-  // 失败/边界：无。
-  function new(string name = "rdma_queue_opaque_slot_token");
-    super.new(name);
-  endfunction
-endclass
-
-class rdma_queue_backing_slice extends uvm_object;
-  `rdma_object_utils(rdma_queue_backing_slice)
-  rdma_queue_backing_role_e role;
-  rdma_dma_mapping mapping;
-  longint unsigned mapping_offset, length, logical_queue_offset;
-
-  // 功能：构造对象，字段置默认值。
-  // 输入/输出及副作用：name 传给 UVM 父类。
-  // 失败/边界：无。
-  function new(string name = "rdma_queue_backing_slice");
-    super.new(name);
-    role = RDMA_QUEUE_ROLE_CQ_RING;
-    mapping = null;
-    mapping_offset = 0;
-    length = 0;
-    logical_queue_offset = 0;
-  endfunction
-
-  // 功能：把 rhs 的值字段复制为隔离快照，嵌套对象 clone。
-  // 输入/输出及副作用：rhs 为源对象；覆盖本对象字段，不修改 rhs。
-  // 失败/边界：类型不匹配或 clone/cast 失败时触发 UVM fatal（slice copy mismatch）。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_queue_backing_slice r;
-    rdma_dma_mapping m;
-
-    super.do_copy(rhs);
-    if (!$cast(r, rhs))
-      `uvm_fatal("RDMA_COPY_TYPE", "slice copy mismatch");
-    role = r.role;
-    mapping_offset = r.mapping_offset;
-    length = r.length;
-    logical_queue_offset = r.logical_queue_offset;
-    if (r.mapping == null) begin
-      mapping = null;
-    end else begin
-      m = rdma_deep_copy#(rdma_dma_mapping)::of(
-        r.mapping, "slice mapping clone failure");
-      mapping = m;
-    end
-  endfunction
-
-  // 功能：校验 rdma_queue_backing_slice 字段 的合法性。
-  // 输入/输出及副作用：无显式输入；返回 status，不修改对象。
-  // 失败/边界：失败返回 INVALID_ARGUMENT，如：slice role is not payload；logical offset is unaligned。
-  virtual function rdma_status validate();
-    if (!rdma_queue_role_is_payload(role) && !rdma_qp_role_is_payload(role))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "slice role is not payload");
-    if (!rdma_queue_aligned(logical_queue_offset, rdma_queue_role_alignment(role)))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "logical offset is unaligned");
-    if (!rdma_queue_add_ok(logical_queue_offset, length))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "logical range overflows");
-    return rdma_queue_queue_range_status(mapping, mapping_offset, length,
-      rdma_queue_role_alignment(role));
-  endfunction
-endclass
-
-class rdma_queue_backing_spec extends uvm_object;
-  `rdma_object_utils(rdma_queue_backing_spec)
-  rdma_queue_backing_mode_e mode;
-  rdma_queue_backing_slice slices[$];
-
-  // 功能：构造对象，字段置默认值。
-  // 输入/输出及副作用：name 传给 UVM 父类。
-  // 失败/边界：无。
-  function new(string name = "rdma_queue_backing_spec");
-    super.new(name);
-    mode = RDMA_QUEUE_BACKING_OWNED;
-  endfunction
-
-  // 功能：把 rhs 的值字段复制为隔离快照，嵌套对象 clone。
-  // 输入/输出及副作用：rhs 为源对象；覆盖本对象字段，不修改 rhs。
-  // 失败/边界：类型不匹配或 clone/cast 失败时触发 UVM fatal（spec copy mismatch）。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_queue_backing_spec r;
-    uvm_object c;
-    rdma_queue_backing_slice s;
-
-    super.do_copy(rhs);
-    if (!$cast(r, rhs))
-      `uvm_fatal("RDMA_COPY_TYPE", "spec copy mismatch");
-    mode = r.mode;
-    slices.delete();
-    foreach (r.slices[i]) begin
-      c = r.slices[i].clone();
-      if (c == null || !$cast(s, c) || s == r.slices[i])
-        `uvm_fatal("RDMA_COPY_TYPE", "slice clone failure");
-      slices.push_back(s);
-    end
-  endfunction
-
-  // 功能：校验 rdma_queue_backing_spec 字段 的合法性。
-  // 输入/输出及副作用：无显式输入；返回 status，不修改对象。
-  // 失败/边界：失败返回 INVALID_ARGUMENT，如：backing mode invalid；owned spec contains slices。
-  virtual function rdma_status validate();
-    rdma_status s;
-
-    if (!(mode inside {RDMA_QUEUE_BACKING_OWNED,
-                       RDMA_QUEUE_BACKING_BORROWED}))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "backing mode invalid");
-    if (mode == RDMA_QUEUE_BACKING_OWNED) begin
-      if (slices.size() != 0)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "owned spec contains slices");
-      return rdma_status::success();
-    end
-    if (slices.size() == 0)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "borrowed spec has no slices");
-    foreach (slices[i]) begin
-      if (slices[i] == null || !rdma_queue_role_is_payload(slices[i].role))
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "invalid borrowed payload role");
-      s = rdma_queue_nested_status(
-        slices[i].validate(), "backing spec slice"
-      );
-      if (!s.ok())
-        return s;
-    end
-    return rdma_status::success();
   endfunction
 endclass
 
@@ -1203,37 +1011,11 @@ class rdma_qp_ring_layout extends uvm_object;
   endfunction
 endclass
 
-// 功能：计算 SQ/RQ SGB 的 logical/storage 字节数（每项 512B，storage 按 4KiB 向上取整）。
-// 输入/输出及副作用：depth 为输入；logical_bytes/storage_bytes 为输出（失败时也已写入）。
-// 失败/边界：depth 为 0 或非 2 的幂返回 INVALID_ARGUMENT。
-function automatic rdma_status rdma_qp_sgb_geometry(
-  int unsigned depth, output longint unsigned logical_bytes,
-  output longint unsigned storage_bytes);
-  // logical bytes 描述有效 slot 总量，storage bytes 额外包含 4KiB 对齐填充。
-  logical_bytes = longint'(depth) * 512;
-  storage_bytes = ((logical_bytes + 4095) / 4096) * 4096;
-  if (!rdma_qp_power_of_two(depth) || depth == 0)
-    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SGB depth invalid");
-  return rdma_status::success();
-endfunction
-
 // 功能：SQ/RQ SGB 的 storage 字节数（每个 RQE 一个 512B slot，按 4KiB 向上取整）。
 // 输入/输出及副作用：纯函数。
 // 失败/边界：无（depth 合法性由 QP plan/request 校验）。
 function automatic longint unsigned rdma_qp_sgb_storage_bytes(int unsigned depth);
   return ((longint'(depth) * 512 + 4095) / 4096) * 4096;
-endfunction
-
-// 功能：判断 QP 是否需要 SQ SGB：UD 总是需要，RC 在任一方向 SGE>2 时需要。
-// 输入/输出及副作用：transport/max_send_sge/max_recv_sge 为输入；返回 bit，无副作用。
-// 失败/边界：其他 transport 返回 0。
-function automatic bit rdma_qp_needs_sq_sgb(
-  rdma_transport_e transport, int unsigned max_send_sge,
-  int unsigned max_recv_sge);
-  // UD 总是需要 SGB；RC 在任一方向超过 2 个 SGE 时也必须启用 SGB。
-  return transport == RDMA_TRANSPORT_UD ||
-         (transport == RDMA_TRANSPORT_RC &&
-          (max_send_sge > 2 || max_recv_sge > 2));
 endfunction
 
 class rdma_qp_backing_ref extends uvm_object;
@@ -1603,109 +1385,6 @@ class rdma_qp_backing_plan extends uvm_object;
          (urc_refs.size() != 3 || !seen_urc[0] || !seen_urc[1] || !seen_urc[2])) ||
         (transport != RDMA_TRANSPORT_URC && urc_refs.size() != 0))
       return rdma_status::make(RDMA_SC_INVALID_STATE, "QP URC backing roles invalid");
-    return rdma_status::success();
-  endfunction
-endclass
-
-class rdma_queue_preflight extends uvm_object;
-  `rdma_object_utils(rdma_queue_preflight)
-  rdma_resource_kind_e resource_kind;
-  int unsigned depth;
-  int unsigned cqe_size_bytes;
-  int unsigned max_sge;
-  int unsigned limit_threshold;
-  int unsigned local_vector;
-  int unsigned hardware_vector;
-  int unsigned msix_table_index;
-  rdma_queue_backing_spec backing_spec;
-  rdma_queue_ring_layout required_rings[$];
-
-  // 功能：构造对象，字段置默认值。
-  // 输入/输出及副作用：name 传给 UVM 父类。
-  // 失败/边界：无。
-  function new(string name = "rdma_queue_preflight");
-    super.new(name);
-    resource_kind = RDMA_RESOURCE_CQ;
-    depth = 0;
-    cqe_size_bytes = 0;
-    max_sge = 0;
-    limit_threshold = 0;
-    local_vector = 0;
-    hardware_vector = 0;
-    msix_table_index = 0;
-    backing_spec = null;
-  endfunction
-
-  // 功能：把 rhs 的值字段复制为隔离快照，嵌套对象 clone。
-  // 输入/输出及副作用：rhs 为源对象；覆盖本对象字段，不修改 rhs。
-  // 失败/边界：类型不匹配或 clone/cast 失败时触发 UVM fatal（preflight copy mismatch）。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_queue_preflight r;
-    rdma_queue_backing_spec b;
-    rdma_queue_ring_layout l;
-
-    super.do_copy(rhs);
-    if (!$cast(r, rhs))
-      `uvm_fatal("RDMA_COPY_TYPE", "preflight copy mismatch");
-    resource_kind = r.resource_kind;
-    depth = r.depth;
-    cqe_size_bytes = r.cqe_size_bytes;
-    max_sge = r.max_sge;
-    limit_threshold = r.limit_threshold;
-    local_vector = r.local_vector;
-    hardware_vector = r.hardware_vector;
-    msix_table_index = r.msix_table_index;
-    required_rings.delete();
-    foreach (r.required_rings[i]) begin
-      l = rdma_deep_copy#(rdma_queue_ring_layout)::of(
-        r.required_rings[i], "required ring clone failure");
-      required_rings.push_back(l);
-    end
-    if (r.backing_spec == null) begin
-      backing_spec = null;
-    end else begin
-      b = rdma_deep_copy#(rdma_queue_backing_spec)::of(
-        r.backing_spec, "spec clone failure");
-      backing_spec = b;
-    end
-  endfunction
-
-  // 功能：校验 rdma_queue_preflight 字段 的合法性。
-  // 输入/输出及副作用：无显式输入；返回 status，不修改对象。
-  // 失败/边界：失败返回 INVALID_ARGUMENT，如：preflight kind invalid；preflight fields missing。
-  virtual function rdma_status validate();
-    rdma_status s;
-
-    if (!(resource_kind inside {RDMA_RESOURCE_CQ, RDMA_RESOURCE_SRQ,
-                                RDMA_RESOURCE_CEQ, RDMA_RESOURCE_AEQ}))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "preflight kind invalid");
-    if (depth == 0 || backing_spec == null)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                               "preflight fields missing");
-    s = rdma_queue_nested_status(
-      backing_spec.validate(), "preflight backing spec"
-    );
-    if (!s.ok())
-      return s;
-    foreach (required_rings[i]) begin
-      if (required_rings[i] == null)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "null required ring");
-      if (required_rings[i].pages.size() == 0)
-        s = rdma_queue_nested_status(
-          required_rings[i].validate_metadata(), "preflight ring metadata"
-        );
-      else
-        s = rdma_queue_nested_status(
-          required_rings[i].validate(), "preflight ring"
-        );
-      if (!s.ok())
-        return s;
-    end
-    if (resource_kind == RDMA_RESOURCE_CQ &&
-        !(cqe_size_bytes inside {32, 64, 128}))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "CQE size invalid");
     return rdma_status::success();
   endfunction
 endclass

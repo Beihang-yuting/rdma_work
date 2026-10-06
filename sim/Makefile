@@ -1,5 +1,5 @@
 # 目录：sim/Makefile，仿真构建层入口。
-# 职责：定义 core、integration、host_mem 与可选 net_packet 的编译、预检和 UVM 运行流程。
+# 职责：定义 core、host_mem、pcie_work、net_packet 与 e2e 的编译、预检和 UVM 运行流程。
 # 依赖与所有权：依赖 VCS、仓库 filelist 及外部只读源码树；本文件仅管理 build 输出目录，不拥有外部依赖生命周期。
 
 BUILD ?= build/core
@@ -29,7 +29,7 @@ define RUN_CORE_LOGICAL_TEST
 		"../scripts/check_uvm_summary.sh"
 endef
 
-.PHONY: core cmq_gate sv_style host_mem_preflight host_mem rdma_defs integration net_packet net_packet_preflight pcie_work pcie_work_preflight dpu_common_preflight e2e regression
+.PHONY: core cmq_gate sv_style host_mem_preflight host_mem rdma_defs net_packet net_packet_preflight pcie_work pcie_work_preflight e2e regression
 
 # 变更 SV 的注释/单语句门禁与 Git 空白检查共用明确的基线提交，避免隐式读取工作树历史。
 sv_style:
@@ -48,7 +48,7 @@ regression:
 		      "$$suite" == axis_vip || "$$test" == *axis* ]]; then \
 			echo "invalid regression manifest row" >&2; exit 2; \
 		fi; \
-		if [[ ! "$$suite" =~ ^(core|integration|host_mem|pcie_work|net_packet|e2e|rdma_defs)$$ || \
+		if [[ ! "$$suite" =~ ^(core|host_mem|pcie_work|net_packet|e2e|rdma_defs)$$ || \
 		      ! "$$test" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]]; then \
 			echo "invalid suite/test in regression manifest: $$suite $$test" >&2; exit 2; \
 		fi; \
@@ -203,23 +203,6 @@ host_mem: host_mem_preflight
 		../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log; \
 	fi
 
-integration: dpu_common_preflight
-	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for integration" >&2; exit 2; fi
-	set -euo pipefail; \
-	mkdir -p build/integration; \
-	$(VCS) $(VCS_FLAGS) +define+RDMA_DPU_INTEGRATION +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv -f filelists/integration.f -top tb_top -o build/integration/simv; \
-	if [[ "$(TEST)" == regression ]]; then \
-		mapfile -t suite_tests < <(sed -n '/^readonly INTEGRATION_TESTS=(/,/^)/p' ../scripts/run_queue_lifecycle_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
-		if (( $${#suite_tests[@]} == 0 )); then echo "integration regression manifest is empty" >&2; exit 2; fi; \
-		for test_name in "$${suite_tests[@]}"; do \
-			build/integration/simv +UVM_TESTNAME=$$test_name | tee build/integration/$$test_name.log; \
-			../scripts/check_uvm_summary.sh build/integration/$$test_name.log; \
-		done; \
-	else \
-		build/integration/simv +UVM_TESTNAME=$(TEST) | tee build/integration/$(TEST).log; \
-		../scripts/check_uvm_summary.sh build/integration/$(TEST).log; \
-	fi
-
 net_packet_preflight:
 	@if [[ -z "$(NET_PACKET_ROOT)" ]]; then echo "NET_PACKET_ROOT is required for net_packet" >&2; exit 2; fi
 	@preflight_failed=0; \
@@ -274,25 +257,17 @@ pcie_work: pcie_work_preflight
 	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
 	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
 
-# dpu_common 只以外部只读 package 参与 e2e；预检不复制源码，也不把该依赖
-# 引入 core filelist，保证 core 层仍可独立编译。
-dpu_common_preflight:
-	@if [[ -z "$(DPU_COMMON_ROOT)" ]]; then echo "DPU_COMMON_ROOT is required for dpu_common integration" >&2; exit 2; fi
-	@if [[ ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then echo "Required dpu_common dependency is not readable: $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" >&2; exit 2; fi
-	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency dpu_common --root "$(DPU_COMMON_ROOT)"
-
-e2e: host_mem_preflight net_packet_preflight dpu_common_preflight
+e2e: host_mem_preflight net_packet_preflight
 	set -euo pipefail; \
 	mkdir -p $(E2E_BUILD); \
 	: "VCS 不会替换 filelist 中的 Make 变量，先生成只读依赖路径展开后的临时 filelist"; \
 	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
 	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
-	    -e 's|@DPU_COMMON_ROOT@|$(DPU_COMMON_ROOT)|g' \
 	    filelists/e2e.f > $(E2E_BUILD)/e2e.expanded.f; \
-	$(VCS) $(VCS_FLAGS) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET +define+RDMA_DPU_INTEGRATION \
+	$(VCS) $(VCS_FLAGS) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET \
 		$(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
 		-f $(E2E_BUILD)/e2e.expanded.f -top tb_top -o $(E2E_BUILD)/simv; \
 	test_name=$(TEST); \
-	if [[ "$$test_name" == regression ]]; then test_name=rdma_end_to_end_dual_env_test; fi; \
+	if [[ "$$test_name" == regression ]]; then test_name=rdma_tb_e2e_test; fi; \
 	$(E2E_BUILD)/simv +UVM_TESTNAME=$$test_name | tee $(E2E_BUILD)/$$test_name.log; \
 	../scripts/check_uvm_summary.sh $(E2E_BUILD)/$$test_name.log

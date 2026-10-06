@@ -114,9 +114,6 @@ class rdma_dev_cmq extends uvm_object;
     return 1'b1;
   endfunction
 
-  // 功能：某类 context 的数量。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
   // 功能：故障注入：下一条 opcode 命令不执行并以 ecode 完成（一次性）。
   // 输入/输出及副作用：设置注入状态。
   // 失败/边界：复位清除。
@@ -136,6 +133,9 @@ class rdma_dev_cmq extends uvm_object;
     return objects[kind].first(id);
   endfunction
 
+  // 功能：某类 context 的数量。
+  // 输入/输出及副作用：纯查询。
+  // 失败/边界：无。
   function int unsigned count(rdma_dev_kind_e kind);
     if (!objects.exists(kind))
       return 0;

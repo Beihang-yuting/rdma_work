@@ -1,23 +1,27 @@
 # RDMA UVM driver
 
-本仓库实现面向 XTR RDMA 0.1.34 驱动的 UVM 语义模型、codec、控制面和数据面
-队列引擎。生产 core 只依赖本仓库的抽象 adapter；Host/PF/VF/BDF/BAR、global
-Function ID 和 topology 由 `dpu_common` 冻结快照提供，外部 host-mem、PCIe、AXIS
-VIP 和 `net_packet` 的对象由各自环境拥有。
+本仓库按 XTR RDMA 0.1.34 内核驱动的形状建模主机侧驱动（`src/drv`）与设备侧（`src/dev`），二者只经
+真实硬件边界交互：CMQ 环、MMIO doorbell（BAR+0x2000 窗口）与按 IOVA 的 DMA。UVM 验证环境
+（`src/tb`）在其上运行 seq → 驱动 → 设备 → 报文 → 内存的端到端数据检查。外部 host-mem、PCIe 与
+`net_packet` 的对象由各自环境拥有，经 `src/adapter(s)` 接入。
 
 ## 目录与边界
 
-- `src/model`：Function、queue、QP/CQ、UMEM/PBL/MW 和事务证据的值模型。
-- `src/codec`：QPC、SQE/RQE/CQE、doorbell、context body 和 CMQ 编解码。
-- `src/core`：SQ/RQ/CQ/EQ、CMQ、资源管理和生命周期执行器；不包含外部 VIP 实现。
-- `src/adapter`：Host-memory、PCIe、Function table、ABI v5 和网络抽象接口。
-- `src/adapters/net_packet`：可选的 `net_packet` 报文生成/解析适配器。
-- `tests/unit`：不依赖外部仓库的模型和 codec 回归。
-- `tests/integration`：`dpu_common`、真实 host-mem 或 `net_packet` 依赖的回归。
+- `src/types`、`src/model`：状态码、句柄、DMA mapping、报文与 context 等值模型。
+- `src/codec`：QPC、SQE/RQE/CQE/CEQE/AEQE、doorbell、context body 与 CMQ 编解码；`rdma_defs.svh`
+  为驱动头文件字段坐标（冻结清单 `hw/rdma/frozen_abi_manifest.txt`）。
+- `src/drv`：驱动模型（probe/remove、CMQ、HMC、EQ、PD/MR/CQ/SRQ/QP verbs、post_send/post_recv/
+  poll_cq、URC、CQ resize、flush/cq_clean）。
+- `src/dev`：设备模型（CMQ 消费者与 context 存储、HMC 地址翻译、NIC 数据面、CQE/CEQE/AEQE、FLR）。
+- `src/core`：CMQ 参考引擎（cmq.c 环/pending/watchdog）、transport 与 doorbell 调度器，供 CMQ golden
+  门禁使用。
+- `src/tb`：verb agent、wire、记分板、env 与流量序列。
+- `src/adapter`、`src/adapters/*`：Host-memory、PCIe、网络抽象接口与 host_mem/net_packet/pcie_work 绑定。
+- `tests/unit`：不依赖外部仓库的回归（core suite）；`tests/integration`：真实 host-mem、
+  `net_packet` 或 pcie_work 依赖的回归。
 - `hw/rdma`：从驱动归档提取的只读来源清单和 golden vectors；不复制外部源码。
-- `docs/history/batch-reports`：历次结构重构 batch 报告归档（只读历史记录）。
-- `docs/rdma-arch-slim-report.md`：feature/rdma-arch-slim 精简重构的总报告。
-- `docs/rdma-uvm-flow-design.md`：seq → 报文 → 内存的 UVM 验证流程（`src/tb`：verb agent、NIC 行为模型、wire、记分板）。
+- `docs/rdma-driver-shaped-arch.md`：驱动形状架构与迁移计划；`docs/rdma-uvm-flow-design.md`：UVM 流程；
+  `docs/rdma-arch-slim-report.md`：feature/rdma-arch-slim 总报告；`docs/history`：只读历史记录。
 
 ## 固定依赖
 
@@ -27,7 +31,6 @@ CMQ/codec 基线来自 `/home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.ta
 
 | 依赖 | 环境变量 | 固定版本 |
 | --- | --- | --- |
-| dpu_common | `DPU_COMMON_ROOT` | 由仿真环境提供的 snapshot 实现 |
 | host_mem | `HOST_MEM_ROOT` | `3b9e000d5df4d10efbb3029f43605e0362e0caca` |
 | net_packet | `NET_PACKET_ROOT` | `6766c4f042484814548481065328ffbcffab590f` |
 
@@ -45,18 +48,18 @@ git diff --check
 
 ## VCS53 回归入口
 
-所有 VCS 命令必须通过 `scripts/run_vcs53.sh` 在 `ubuntu@10.11.10.53` 的登录 bash
-中执行。核心和集成分层如下：
+所有 VCS 命令必须通过 `scripts/run_vcs53.sh` 在 `ubuntu@10.11.10.53` 的登录 bash 中执行：
 
 ```bash
 scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test
 scripts/run_vcs53.sh core regression
-DPU_COMMON_ROOT=/path/to/dpu_common \
-  scripts/run_vcs53.sh integration regression
+scripts/run_vcs53.sh cmq_gate regression
 HOST_MEM_ROOT=/path/to/host_mem \
   scripts/run_vcs53.sh host_mem regression
 NET_PACKET_ROOT=/path/to/net_packet \
   scripts/run_vcs53.sh net_packet regression
+HOST_MEM_ROOT=... NET_PACKET_ROOT=... \
+  scripts/run_vcs53.sh e2e rdma_tb_e2e_test
 ```
 
 也可以运行固定清单脚本：
@@ -66,28 +69,12 @@ scripts/run_queue_lifecycle_regression53.sh
 scripts/run_host_mem_regression53.sh
 ```
 
-每次 suite 都会生成本地临时 build/log，并调用
-`scripts/check_uvm_summary.sh`；可接受的最终摘要必须是
-`warning=0 error=0 fatal=0`。当前仓库没有独立的 AXIS VIP adapter/filelist，
-因此 `AXIS_VIP_ROOT` 仅作为后续外部集成预留，不会被 core 编译或伪造为已通过。
+每次 suite 都会生成本地临时 build/log，并调用 `scripts/check_uvm_summary.sh`；可接受的最终摘要必须是
+`warning=0 error=0 fatal=0`。
 
-更完整的命令、依赖 preflight、测试范围和已验证证据见
-[`docs/rdma-0.1.34-gap-closure-verification.md`](docs/rdma-0.1.34-gap-closure-verification.md)。
+## CMQ 门禁
 
-## CMQ contract foundation
-
-CMQ 的线上执行入口是 `execute_observed()`；它返回本次调用独占的 ticket、
-completion、`observation_status`、`attempt_effect` 和累计 `submission_effect`，
-不读取或写入共享的 `last_*` 证据。engine 内部 journal 保存 detached command、
-identity、batch digest 与 reset/fence 证明，恢复入口必须重新验证 owner、mapping
-capability、generation 和 reset epoch。`PRE_SUBMIT_REJECTED`、`HOST_VISIBLE`、
-`MMIO_VISIBLE`、`UNOBSERVED` 四态 effect 以及 timeout quarantine/fence 语义见
-[`docs/rdma-cmq-contract-foundation-verification.md`](docs/rdma-cmq-contract-foundation-verification.md)。
-
-CMQ wire gate 以真实的
-`dpu_kernel_rdma-version_0.1.34.tar(1).gz` 归档、source manifest 和 C oracle
-为唯一 ABI 来源；固定清单、执行命令和日志摘要记录在上述验证文档中。
-`rdma_cmq_port` 只暴露 `execute_observed()`/`reconcile()`；控制面、queue 与 QP
-lifecycle executor 统一经 `rdma_cmq_dispatch()` 调用，并以
-`rdma_cmq_result_no_submit_proven()` 判定“确定未提交”。legacy `execute()` 与
-`last_execute_no_submit_proven` 兼容 seam 已移除。
+CMQ wire gate 以真实的 `dpu_kernel_rdma-version_0.1.34.tar(1).gz` 归档、source manifest 和 C oracle
+为唯一 ABI 来源：70 个 opcode 的请求逐字节对比驱动 golden（`rdma_cmq_request_golden_test`），字段
+变异契约（`rdma_cmq_driver_field_mutation_test`），驱动模型与设备模型的 CMQ 往返（`rdma_drv_cmq_test`、
+`rdma_dev_cmq_test`、`rdma_drv_verbs_test`）。清单见 `sim/cmq_gate.list`。

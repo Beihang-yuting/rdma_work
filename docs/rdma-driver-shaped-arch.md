@@ -58,6 +58,19 @@ L5 tb           verb agent / wire / scoreboard（不变，driver 换成 L2）；
 
 A–D 只新增代码，旧回归保持全绿；E 一次性删除，验收为迁移后的套件全绿。
 
+### 完成状态（2026-10-06）
+
+- A/B：`src/dev` CMQ 消费者 + context 存储 + HMC 翻译；`src/drv` probe/remove、CMQ、HMC、EQ、PD/MR/CQ/
+  SRQ/QP verbs。
+- C：`src/dev` NIC（RC/UD/URC 收发、READ/ATOMIC、NAK、CQE/CEQE/AEQE、flush）与 `src/drv` 数据路径
+  （post_send/post_recv/post_srq_recv/poll_cq/CEQ/AEQ、CQ resize、cq_clean、cleanup_ceqes、URC frag CQ）；
+  tb 改为驱动 + 设备，`rdma_tb_flow_test`/`rdma_tb_e2e_test` 数据比对不变。
+- D：`rdma_multifunc_test`（5 个 Function 的隔离、故障矩阵与 VF/PF/设备三级复位）、
+  `rdma_tb_host_mem_test`、`rdma_tb_e2e_high_traffic_test`、CMQ 失败注入下的驱动回退。
+- E：删除 queue-data engine、生命周期执行器与策略、资源管理/投影、runtime、control plane、CMQ port
+  栈、integration 层（reset coordinator、function context、device env）、SR-IOV enumerator 与对应
+  测试/门禁；`src/core` 只保留 CMQ 参考引擎、transport 与 doorbell 调度器。
+
 ## 4. 保留
 
 CMQ 引擎与驱动 golden 门禁、全部 codec 与其 golden/字段门禁、host_mem/net_packet/pcie_work 适配器、

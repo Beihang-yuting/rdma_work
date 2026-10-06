@@ -1,5 +1,5 @@
 // 目录：测试层 tests/unit/rdma_cmq_engine_models_test.sv。
-// 职责：验证共享提交证据顺序、CMQ ambiguity policy、recovery owner、execution result 默认值，
+// 职责：验证共享提交证据顺序、recovery owner、execution result 默认值，
 // 以及 CMQ model 的 validation 与 detached clone。
 // 依赖：依赖 rdma_model_pkg 导出的真实 helper/model 和 UVM test/object/report 基础设施。
 // 所有权与生命周期：测试持有局部 fixture 引用；对象随 SystemVerilog 引用生命周期存在，
@@ -819,98 +819,6 @@ class rdma_cmq_engine_models_test extends uvm_test;
       `uvm_error("EFFECT_X", "four-state unknown evidence was accepted")
   endfunction
 
-  // 功能：比较 CMQ ambiguity policy 的实际分类与期望值，统一报告 label 和输入场景。
-  // 输入/输出及副作用：label 标识测试矩阵条目，actual/expected 为只读 bit；函数只在
-  //   不一致时发布 UVM error，不修改 status、ticket 或 completion，也不拥有其生命周期。
-  // 失败/边界：actual 与 expected 不同表示公共 policy 或 caller profile 破坏既有证据
-  //   语义；label 为空不会改变断言结果，只影响诊断文本。
-  function automatic void expect_ambiguity_policy(
-    string label,
-    bit actual,
-    bit expected
-  );
-    if (actual !== expected)
-      `uvm_error("CMQ_AMBIGUITY_POLICY",
-                 $sformatf("%s expected=%0d actual=%0d",
-                           label, expected, actual))
-  endfunction
-
-  // 功能：覆盖 queue/QP 两种 ambiguity profile 在 null status、timeout、完整 completion、
-  //   无证据成功、no-submit 失败和缺 status completion 壳下的差异矩阵。
-  // 输入/输出及副作用：函数构造局部 status/completion fixture，调用真实纯值 policy，
-  //   通过 UVM error 输出不符合历史契约的组合；不触碰 CMQ adapter 或 runtime 状态。
-  // 失败/边界：任何 profile 把 timeout/reset 或缺少适用 no-submit 证明误判为确定结果，
-  //   或把显式允许的成功/no-submit 仍判为 ambiguous，均导致测试失败。
-  function automatic void check_cmq_ambiguity_policy();
-    rdma_status success_status;
-    rdma_status failure_status;
-    rdma_status timeout_status;
-    rdma_cmq_completion completion_shell;
-    rdma_cmq_completion completed;
-
-    success_status = rdma_status::success("policy success");
-    failure_status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                       "policy failure");
-    timeout_status = rdma_status::make(RDMA_SC_TIMEOUT,
-                                       "policy timeout");
-    completion_shell = rdma_cmq_completion::type_id::create(
-      "ambiguity_completion_shell"
-    );
-    completed = rdma_cmq_completion::type_id::create(
-      "ambiguity_completed"
-    );
-    completed.status = success_status;
-
-    expect_ambiguity_policy(
-      "NULL_STATUS_QUEUE", rdma_cmq_ambiguity_policy::is_ambiguous(
-        null, null, null, 1'b1, 1'b0, 1'b0, 1'b0), 1'b1
-    );
-    expect_ambiguity_policy(
-      "TIMEOUT_QP", rdma_cmq_ambiguity_policy::is_ambiguous(
-        timeout_status, null, null, 1'b1, 1'b1, 1'b0, 1'b1), 1'b1
-    );
-    expect_ambiguity_policy(
-      "COMPLETE_BOTH", rdma_cmq_ambiguity_policy::is_ambiguous(
-        success_status, null, completed, 1'b0, 1'b0, 1'b0, 1'b0), 1'b0
-    );
-    expect_ambiguity_policy(
-      "NULL_SUCCESS_QUEUE", rdma_cmq_ambiguity_policy::is_ambiguous(
-        success_status, null, null, 1'b1, 1'b0, 1'b0, 1'b0), 1'b1
-    );
-    expect_ambiguity_policy(
-      "NULL_SUCCESS_QP", rdma_cmq_ambiguity_policy::is_ambiguous(
-        success_status, null, null, 1'b1, 1'b1, 1'b0, 1'b1), 1'b0
-    );
-    expect_ambiguity_policy(
-      "NO_SUBMIT_FAILURE_QUEUE", rdma_cmq_ambiguity_policy::is_ambiguous(
-        failure_status, null, null, 1'b1, 1'b0, 1'b0, 1'b0), 1'b0
-    );
-    expect_ambiguity_policy(
-      "NO_SUBMIT_FAILURE_QP", rdma_cmq_ambiguity_policy::is_ambiguous(
-        failure_status, null, null, 1'b1, 1'b1, 1'b0, 1'b1), 1'b0
-    );
-    expect_ambiguity_policy(
-      "SHELL_FAILURE_QUEUE", rdma_cmq_ambiguity_policy::is_ambiguous(
-        failure_status, null, completion_shell, 1'b1, 1'b0, 1'b1, 1'b0), 1'b0
-    );
-    expect_ambiguity_policy(
-      "SHELL_FAILURE_QP", rdma_cmq_ambiguity_policy::is_ambiguous(
-        failure_status, null, completion_shell, 1'b1, 1'b1, 1'b1, 1'b1), 1'b0
-    );
-    expect_ambiguity_policy(
-      "SHELL_FAILURE_QP_STRICT", rdma_cmq_ambiguity_policy::is_ambiguous(
-        failure_status, null, completion_shell, 1'b1, 1'b1, 1'b0, 1'b1), 1'b1
-    );
-    expect_ambiguity_policy(
-      "MISSING_TICKET_COMPLETE_QUEUE", rdma_cmq_ambiguity_policy::is_ambiguous(
-        success_status, null, completed, 1'b0, 1'b0, 1'b0, 1'b0), 1'b0
-    );
-    expect_ambiguity_policy(
-      "MISSING_TICKET_COMPLETE_QP", rdma_cmq_ambiguity_policy::is_ambiguous(
-        success_status, null, completed, 1'b0, 1'b1, 1'b0, 1'b1), 1'b1
-    );
-  endfunction
-
   // 功能：运行各 model 检查，并验证 CMQ 值对象的 validation 与 detached clone。
   // 输入/输出及副作用：phase 由 UVM 提供；task 持有 objection，调用断言并在结束时释放。
   // 失败/边界：任一 ordering、validation 或 clone 契约失败均产生 UVM error；task 仍释放
@@ -950,7 +858,6 @@ class rdma_cmq_engine_models_test extends uvm_test;
     // 先校验独立的共享只读值契约；binding accessor 允许瞬态 status/identity，
     // ordering 检查不依赖后续 CMQ object fixture。
     check_submission_effect_ordering();
-    check_cmq_ambiguity_policy();
     check_recovery_owner_contract();
     check_execution_value_defaults();
 

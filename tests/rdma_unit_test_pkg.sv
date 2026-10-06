@@ -26,14 +26,6 @@ package rdma_unit_test_pkg;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
   import rdma_tb_pkg::*;
-  // Disambiguate the shared recovery enum from the legacy core compatibility type.
-  import rdma_model_pkg::rdma_queue_recovery_action_e;
-`ifdef RDMA_DPU_INTEGRATION
-  import rdma_dpu_env_pkg::*;
-  // 测试夹具需要直接构造 dpu_common snapshot，以验证 integration 边界的
-  // 查询语义；生产代码仍只依赖 rdma_dpu_env_pkg 的适配接口。
-  import dpu_resource_pkg::*;
-`endif
 `ifdef RDMA_HOST_MEM_TEST
   import rdma_host_mem_external_pkg::*;
   import host_mem_pkg::*;
@@ -51,36 +43,22 @@ package rdma_unit_test_pkg;
   `include "uvm_macros.svh"
 
   `include "rdma_mock_adapters.sv"
-  `include "mocks/rdma_mock_control_plane.sv"
   `include "mocks/rdma_mock_context_backing.sv"
   `include "support/rdma_golden_reader.sv"
   `include "support/rdma_cmq_contract_reader.sv"
   `include "support/rdma_cmq_device_responder.sv"
   `include "support/rdma_drv_dev_bar.sv"
   `include "unit/rdma_smoke_test.sv"
-  `include "unit/rdma_responder_registry_test.sv"
-  `include "unit/rdma_env_composition_test.sv"
   `include "unit/rdma_types_test.sv"
   `include "unit/rdma_model_test.sv"
   `include "unit/rdma_cmq_engine_models_test.sv"
-  `include "unit/rdma_control_plane_models_test.sv"
   `include "unit/rdma_context_model_test.sv"
-  `include "unit/rdma_request_model_test.sv"
-  `include "unit/rdma_sq_models_test.sv"
-  `include "unit/rdma_queue_model_test.sv"
   `include "unit/rdma_adapter_contract_test.sv"
-  `include "unit/rdma_resource_manager_test.sv"
-  `include "unit/rdma_queue_lifecycle_models_test.sv"
-  `include "unit/rdma_queue_lifecycle_test.sv"
-  `include "unit/rdma_qp_lifecycle_test.sv"
-  `include "unit/rdma_qp_recovery_test.sv"
-  `include "unit/rdma_queue_recovery_test.sv"
   `include "unit/rdma_context_backing_contract_test.sv"
   `include "unit/rdma_doorbell_scheduler_test.sv"
   `include "unit/rdma_doorbell_barrier_test.sv"
   `include "unit/rdma_doorbell_scheduler_authority_test.sv"
   `include "unit/rdma_cmq_engine_test.sv"
-  `include "unit/rdma_cmq_port_test.sv"
   `include "unit/rdma_cmq_request_golden_test.sv"
   `include "unit/rdma_dev_cmq_test.sv"
   `include "unit/rdma_drv_cmq_test.sv"
@@ -88,48 +66,18 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_drv_verbs_test.sv"
   `include "unit/rdma_drv_data_test.sv"
   `include "unit/rdma_multifunc_test.sv"
-  `include "unit/rdma_control_plane_test.sv"
-  `include "unit/rdma_control_plane_cmq_engine_test.sv"
   `include "unit/rdma_codec_registry_test.sv"
   `include "unit/rdma_defs_test.sv"
   `include "unit/rdma_qword_codec_test.sv"
   `include "unit/rdma_queue_page_codec_test.sv"
-  `include "unit/rdma_sriov_enumerator_authority_test.sv"
   `include "unit/rdma_queue_codec_test.sv"
   `include "unit/rdma_cqe_size_codec_test.sv"
   `include "unit/rdma_sq_codec_test.sv"
   `include "unit/rdma_ud_urc_sqe_codec_test.sv"
   `include "unit/rdma_wqe_extended_opcode_test.sv"
   `include "unit/rdma_sqe_authority_test.sv"
-  `include "unit/rdma_queue_runtime_test.sv"
-  `include "unit/rdma_unclaimed_recovery_handoff_test.sv"
-  `include "unit/rdma_runtime_commit_gate_test.sv"
-  `include "unit/rdma_runtime_recovery_retirement_test.sv"
-  `include "unit/rdma_queue_runtime_projector_test.sv"
-  `include "unit/rdma_hw_image_copy_contract_test.sv"
-  `include "unit/rdma_queue_backing_access_test.sv"
-  `include "unit/rdma_queue_data_engine_post_test.sv"
   `include "unit/rdma_tb_flow_test.sv"
-  `include "unit/rdma_queue_detached_snapshot_test.sv"
-  `include "unit/rdma_queue_consumer_steps_test.sv"
-  `include "unit/rdma_queue_data_engine_device_publish_test.sv"
-  `include "unit/rdma_device_publish_exit_test.sv"
-  `include "unit/rdma_device_publish_prepare_test.sv"
-  `include "unit/rdma_queue_event_route_consume_test.sv"
-  `include "unit/rdma_aeqe_f5_e2e_test.sv"
   `include "unit/rdma_aeqe_route_test.sv"
-  // resource local lookup test reuses the manager-test fixture declared above.
-  `include "unit/rdma_queue_data_engine_final_fix_test.sv"
-  `include "unit/rdma_cq_engine_resize_test.sv"
-  `include "unit/rdma_cq_resize_exit_test.sv"
-  `include "unit/rdma_queue_data_engine_poll_test.sv"
-  `include "unit/rdma_host_producer_exit_test.sv"
-  `include "unit/rdma_queue_data_engine_recovery_test.sv"
-  `include "unit/rdma_sq_engine_test.sv"
-  `include "unit/rdma_rq_engine_test.sv"
-  `include "unit/rdma_cq_engine_test.sv"
-  `include "unit/rdma_cq_shadow_flush_test.sv"
-  `include "unit/rdma_eq_engine_test.sv"
   `include "unit/rdma_doorbell_codec_test.sv"
   `include "unit/rdma_qpc_codec_test.sv"
   `include "unit/rdma_context_body_codec_test.sv"
@@ -141,25 +89,12 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_context_cmq_regression_test.sv"
   `include "unit/rdma_harness_expected_failure_probe.sv"
   `include "unit/rdma_function_identity_test.sv"
-  `include "unit/rdma_queue_txn_journal_test.sv"
   `include "unit/rdma_umem_pbl_mw_test.sv"
-  `include "unit/rdma_coverage_test.sv"
 `ifdef RDMA_NET_PACKET
   `include "integration/rdma_net_packet_adapter_test.sv"
 `endif
 `ifdef RDMA_PCIE_WORK_TEST
   `include "integration/rdma_pcie_work_adapter_test.sv"
-  `include "integration/rdma_sriov_enumeration_test.sv"
-`endif
-`ifdef RDMA_DPU_INTEGRATION
-  `include "integration/rdma_dpu_integration_test.sv"
-  `include "unit/rdma_host_mem_router_test.sv"
-  `include "unit/rdma_pcie_router_test.sv"
-  `include "unit/rdma_reset_coordinator_test.sv"
-  `include "integration/rdma_function_context_test.sv"
-  `include "integration/rdma_device_env_test.sv"
-  `include "integration/rdma_reset_cascade_test.sv"
-  `include "integration/rdma_multivf_recovery_test.sv"
 `endif
 endpackage
 
@@ -177,19 +112,17 @@ endpackage
   import rdma_host_mem_adapter_pkg::*;
   `include "uvm_macros.svh"
   `include "integration/rdma_host_mem_adapter_test.sv"
-  `include "integration/rdma_queue_data_engine_host_mem_test.sv"
   `include "integration/rdma_host_mem_umem_test.sv"
   import rdma_tb_pkg::*;
+  // tb 主机内存/端到端测试继承 rdma_unit_test_pkg 中的 rdma_tb_flow_test 与驱动 BAR 支撑类。
+  import rdma_unit_test_pkg::*;
   `include "integration/rdma_tb_host_mem_test.sv"
 `ifdef RDMA_NET_PACKET
-  // 双 env 端到端测试必须在命名 host_mem manager 和 net_packet 适配器
-  // 都完成编译后再展开，避免把外部依赖复制进本仓库或形成循环 typedef。
+  // 端到端测试必须在命名 host_mem manager 和 net_packet 适配器都完成编译后再展开，
+  // 避免把外部依赖复制进本仓库或形成循环 typedef。
   import rdma_net_packet_adapter_pkg::*;
   import rdma_net_packet_bridge_pkg::*;
   import rdma_tb_pkg::*;
-  `include "integration/rdma_end_to_end_dual_env_test.sv"
-  `include "integration/rdma_end_to_end_transport_test.sv"
-  `include "integration/rdma_end_to_end_high_traffic_test.sv"
   `include "integration/rdma_tb_e2e_test.sv"
   `include "integration/rdma_tb_e2e_high_traffic_test.sv"
 `endif

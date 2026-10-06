@@ -17,12 +17,6 @@ typedef enum bit {
   RDMA_OWNERSHIP_CONTROL_PLANE
 } rdma_resource_ownership_e;
 
-typedef enum bit [1:0] {
-  RDMA_HW_PRESENCE_UNKNOWN,
-  RDMA_HW_PRESENCE_PRESENT,
-  RDMA_HW_PRESENCE_ABSENT
-} rdma_hw_presence_e;
-
 class rdma_backing_ref extends uvm_object;
   `rdma_object_utils(rdma_backing_ref)
 

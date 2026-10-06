@@ -9,12 +9,10 @@
 +incdir+../src/adapter
 +incdir+../src/dev
 +incdir+../src/drv
-+incdir+../src/integration
 +incdir+../src/adapters/host_mem
 +incdir+../src/adapters/net_packet
 +incdir+@HOST_MEM_ROOT@/src
 +incdir+@NET_PACKET_ROOT@/src
-+incdir+@DPU_COMMON_ROOT@/src
 +incdir+@NET_PACKET_ROOT@/src/core
 +incdir+@NET_PACKET_ROOT@/src/common
 +incdir+@NET_PACKET_ROOT@/src/protocols
@@ -29,7 +27,5 @@
 ../src/adapters/host_mem/rdma_host_mem_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_net_packet_bridge.sv
-@DPU_COMMON_ROOT@/src/dpu_resource_pkg.sv
-../src/integration/rdma_dpu_env_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
 ../tests/tb_top.sv
