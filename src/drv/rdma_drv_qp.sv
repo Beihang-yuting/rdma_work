@@ -109,6 +109,8 @@ class rdma_drv_qp extends uvm_object;
   localparam int unsigned MIN_URC_WR = 8;
   localparam int unsigned SERVICE_URC = 6;
   localparam int unsigned SGB_BYTES = 512;
+  // rf->urc_rnr_code 默认值（qp.h:139，debugfs 可调未建模）。
+  localparam int unsigned URC_RNR_CODE = 8;
   localparam int unsigned SHADOW_OFFSET = 504;
   localparam int unsigned SERVICE_RC = 0;
   localparam int unsigned SERVICE_UD = 3;
@@ -515,8 +517,8 @@ class rdma_drv_qp extends uvm_object;
   endfunction
 
   // 功能：fill_urc_qpc_info 中与 RC 不同的部分（qp.c:1226）：服务类型 6，RSQ/RDSQ/DSQ 地址与大小，
-  //   RBSN/RPSN 初值 0x1000、DBSN/DPSN 初值 0，RDSQ/DSQ 预取数 8，SQ CE/RQ SE 门限，FC/ECN 同 RC；
-  //   不写 ORQ/EIRQ/UAQ_IRQ 地址。
+  //   RBSN/RPSN 初值 0x1000、DBSN/DPSN 初值 0，RDSQ/DSQ 预取数 8，LOCAL_RNR_CODE = urc_rnr_code，
+  //   SQ CE/RQ SE 门限，FC/ECN 同 RC；不写 ORQ/EIRQ/UAQ_IRQ 地址。
   // 输入/输出及副作用：修改 qpc 镜像。
   // 失败/边界：无。
   protected function void fill_urc_qpc();
@@ -537,6 +539,7 @@ class rdma_drv_qp extends uvm_object;
     `RDMA_DRV_SET(qpc, RDMA_QPC_URC_TPE_RPSN_MAX, 24'h1000)
     `RDMA_DRV_SET(qpc, RDMA_QPC_URC_NXT_RDSQ_FETCH_NUM, 8)
     `RDMA_DRV_SET(qpc, RDMA_QPC_URC_NXT_DSQ_FETCH_NUM, 8)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_LOCAL_RNR_CODE, URC_RNR_CODE)
     if (rq_depth >= 8) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RQ_SE_TH, $clog2(rq_depth >> 3))
     end
@@ -673,7 +676,8 @@ class rdma_drv_qp extends uvm_object;
     if (a.mask & rdma_drv_qp_attr::M_TIMEOUT) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_RTO_CODE, a.timeout)
     end
-    if (a.mask & rdma_drv_qp_attr::M_MIN_RNR) begin
+    // URC 忽略 MIN_RNR，保持 create 时的 urc_rnr_code（qp.c:2513）。
+    if ((a.mask & rdma_drv_qp_attr::M_MIN_RNR) && !urc) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_LOCAL_RNR_CODE, a.min_rnr)
     end
     if (a.mask & rdma_drv_qp_attr::M_ACCESS) begin

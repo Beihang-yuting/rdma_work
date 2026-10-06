@@ -174,7 +174,10 @@ class rdma_tb_flow_test extends uvm_test;
       attr.state = RDMA_DRV_QPS_RTR;
       if (qp.qp_type == RDMA_DRV_QPT_RC) begin
         attr.mask |= rdma_drv_qp_attr::M_DEST_QPN | rdma_drv_qp_attr::M_RQ_PSN |
-                     rdma_drv_qp_attr::M_PATH_MTU | rdma_drv_qp_attr::M_AV;
+                     rdma_drv_qp_attr::M_PATH_MTU | rdma_drv_qp_attr::M_AV |
+                     rdma_drv_qp_attr::M_MIN_RNR;
+        // RNR 定时器编码 1 = 10us。
+        attr.min_rnr = 1;
         attr.dest_qpn = y.qps[x.qps[i].peer_qp_index].qp.qpn;
         attr.rq_psn = 0;
         attr.path_mtu = x.mtu;

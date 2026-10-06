@@ -164,9 +164,9 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 | v28 | 86ee72e | 全部通过：Python、style、驱动门禁、CMQ 12、core 42、net_packet、PCIe、host_mem 3、e2e_tb、e2e 高流量（告警 2 来自外部 net_packet） |
 | v29 | f2c46d9 | 全部通过（core 43，新增 `rdma_drv_reliability_test`）：PSN 重传、RNR 重试、URC 异常完成、UD Q_Key/GRH、SRQ SGB |
 
-假设与未建模：URC 每个完成都发 CEQE（驱动源码未说明硬件是否依赖 arm）；URC 异常只经 CEQE 上报
-（AEQE 路径未建模）；重传为整条 WQE 从首 PSN 重发（无选择性重传）；RNR 等待固定 rnr_delay（未按
-RNR 定时器编码）；驱动 abnormal 位置按环大小回绕（驱动源码 idx+1 不取模，按正确行为建模）。
+假设与未建模：URC 每个完成都发 CEQE（驱动源码未说明硬件是否依赖 arm）；URC 异常经 CEQE
+或 AEQE（设备开关二选一，硬件选择未知）；响应超时固定，未按 RTO_CODE 换算；驱动 abnormal 位置
+按环大小回绕（驱动源码 idx+1 不取模，按正确行为建模）。
 
 ## 未做与遗留
 

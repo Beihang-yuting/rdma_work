@@ -10,12 +10,15 @@
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
 // 生命周期：run_phase 内建立并运行到结束。
 
-// 两节点链路：按目的 MAC 把报文交给对应节点的 NIC；可按目的 MAC 丢弃指定数量的报文。
+// 两节点链路：按目的 MAC 把报文交给对应节点的 NIC；可按目的 MAC 先放行 drop_after 个、再丢弃
+// drops 个报文；sent_to 按目的 MAC 计数（含丢弃的）。
 class rdma_drv_data_link extends rdma_dev_port;
   `uvm_object_utils(rdma_drv_data_link)
 
   rdma_dev nodes[bit [47:0]];
   int unsigned drops[bit [47:0]];
+  int unsigned drop_after[bit [47:0]];
+  int unsigned sent_to[bit [47:0]];
   int unsigned packets;
   int unsigned dropped;
 
@@ -28,12 +31,16 @@ class rdma_drv_data_link extends rdma_dev_port;
     dropped = 0;
   endfunction
 
-  // 功能：投递报文到目的 NIC；drops[dmac] 非 0 时丢弃并计数。
+  // 功能：投递报文到目的 NIC；drops[dmac] 非 0 时（先放行 drop_after[dmac] 个）丢弃并计数。
   // 输入/输出及副作用：调用目的 NIC receive。
   // 失败/边界：未知 MAC 报告 UVM_ERROR。
   virtual task send(rdma_packet pkt, bit [47:0] dmac);
     packets++;
-    if (drops.exists(dmac) && drops[dmac] != 0) begin
+    sent_to[dmac]++;
+    if (drops.exists(dmac) && drops[dmac] != 0 && drop_after.exists(dmac) &&
+        drop_after[dmac] != 0)
+      drop_after[dmac]--;
+    else if (drops.exists(dmac) && drops[dmac] != 0) begin
       drops[dmac]--;
       dropped++;
       return;
@@ -204,8 +211,10 @@ class rdma_drv_data_test extends uvm_test;
     attr = rdma_drv_qp_attr::type_id::create("rtr");
     attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_DEST_QPN |
                 rdma_drv_qp_attr::M_RQ_PSN | rdma_drv_qp_attr::M_PATH_MTU |
-                rdma_drv_qp_attr::M_AV;
+                rdma_drv_qp_attr::M_AV | rdma_drv_qp_attr::M_MIN_RNR;
     attr.state = RDMA_DRV_QPS_RTR;
+    // RNR 定时器编码 1 = 10us（编码 0 为 655ms）。
+    attr.min_rnr = 1;
     attr.dest_qpn = dest_qpn;
     attr.rq_psn = 0;
     attr.path_mtu = 1024;

@@ -119,9 +119,10 @@ class rdma_dev_nic extends uvm_object;
   rdma_dev_port port;
   // ACK/响应超时（重传定时器）与 RNR NAK 后的重试间隔；模型取固定值，不按 IB 定时器编码换算。
   time response_timeout;
-  time rnr_delay;
   // 观测：因 Q_Key 不符被丢弃的 UD 报文数。
   int unsigned qkey_drops;
+  // URC 异常上报通道：0 为 frag CQ 的 ABNML CEQE，1 为 AEQE（驱动两条路径都处理；硬件选择未知）。
+  bit urc_abnormal_via_aeq;
   protected rdma_dev_qp_rt qps[int unsigned];
   protected longint unsigned cq_pi[int unsigned];
   protected int unsigned cq_armed[int unsigned];
@@ -143,8 +144,8 @@ class rdma_dev_nic extends uvm_object;
     host_mem = null;
     port = null;
     response_timeout = 100us;
-    rnr_delay = 1us;
     qkey_drops = 0;
+    urc_abnormal_via_aeq = 1'b0;
     sq_kicks = new();
     rx_mb = new();
   endfunction
@@ -604,10 +605,11 @@ class rdma_dev_nic extends uvm_object;
     write_eqe(RDMA_DEV_CEQ, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE), ceqe);
   endfunction
 
-  // 功能：URC 异常完成（event.c urc_eq_update_abnml_info）：向 SQ（rq=0）或 RQ（rq=1）的 frag CQ 写
-  //   ABNML CEQE（类型 1/2、ECODE、远端 syndrome、异常 WQE 位置 = 当前已完成数 {wrap, idx}），
+  // 功能：URC 异常完成（event.c urc_eq_update_abnml_info）：urc_abnormal_via_aeq 时写 URC AEQE，否则
+  //   向 SQ（rq=0）或 RQ（rq=1）的 frag CQ 写 ABNML CEQE（类型 1/2、ECODE、远端 syndrome、
+  //   异常 WQE 位置 = 当前已完成数 {wrap, idx}），
   //   HW_CPL 不推进；QP 进入错误，不再处理 SQ。
-  // 输入/输出及副作用：DMA 写 CEQ；置 urc_error。
+  // 输入/输出及副作用：DMA 写 CEQ 或 AEQ；置 urc_error。
   // 失败/边界：CQ 不存在报告协议错误。
   protected function void urc_abnormal(int unsigned qpn, bit rq, bit [7:0] ecode,
                                        bit [7:0] remote);
@@ -623,6 +625,10 @@ class rdma_dev_nic extends uvm_object;
     size = 1 << (rq ? `RDMA_QPC(qpn, RDMA_QPC_RQ_SIZE) : `RDMA_QPC(qpn, RDMA_QPC_SQ_SIZE));
     pos = rq ? rt.urc_rq_cpl : rt.urc_sq_cpl;
     rt.urc_error = 1'b1;
+    if (urc_abnormal_via_aeq) begin
+      urc_abnormal_aeqe(qpn, rq, ecode, remote, pos, size);
+      return;
+    end
     if (!ctx.lookup(RDMA_DEV_CQ, cqn, cqc)) begin
       protocol_error($sformatf("URC QP %0d abnormal completion to absent CQ %0d", qpn, cqn));
       return;
@@ -637,6 +643,31 @@ class rdma_dev_nic extends uvm_object;
     `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX, pos % size)
     `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP, (pos / size) & 1)
     write_eqe(RDMA_DEV_CEQ, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE), ceqe);
+  endfunction
+
+  // 功能：URC 异常经 AEQ 上报（event.c get_aeqe_info / qp 类错误分支）：AEQE 带 URC_FLAG、异常类型、
+  //   ECODE、QPN、远端 syndrome 与异常 WQE 位置 {wrap, idx}。
+  // 输入/输出及副作用：DMA 写 AEQ。
+  // 失败/边界：无 AEQ 报告协议错误。
+  protected function void urc_abnormal_aeqe(int unsigned qpn, bit rq, bit [7:0] ecode,
+                                            bit [7:0] remote, longint unsigned pos,
+                                            int unsigned size);
+    rdma_bytes_t aeqe;
+    int unsigned aeqn;
+
+    aeqe = rdma_be::zeros(RDMA_AEQE_BYTES);
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_URC_FLAG, 1)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_URC_ABNML_CQE_TYPE, rq ? 2 : 1)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_ECODE, ecode)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_QPN, qpn)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_URC_REMOTE_ECODE, remote)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_WQE_INDEX, pos % size)
+    `RDMA_BE_SET(aeqe, RDMA_AEQE_WQE_WRAP, (pos / size) & 1)
+    if (!ctx.first_id(RDMA_DEV_AEQ, aeqn)) begin
+      protocol_error("URC abnormal event without an AEQ");
+      return;
+    end
+    write_eqe(RDMA_DEV_AEQ, aeqn, aeqe);
   endfunction
 
   // 功能：QP flush：向 SQ CQ 写一个 SQ flush CQE（0x08），非 SRQ 时向 RQ CQ 写一个 RQ flush CQE（0x8F）；
@@ -817,38 +848,50 @@ class rdma_dev_nic extends uvm_object;
                 `RDMA_BE_GET(wqe, RDMA_SQ_WQE_WRAP), ecode, byte_len, '0, 0, synd);
   endtask
 
-  // 功能：RC/URC 请求的重传循环：每次尝试从该 WQE 的首 PSN 重发并等响应。ACK/READ 响应/ATOMIC ACK
-  //   完成；超时或 PSN 序列 NAK 消耗 PSN_RETRY_TH 次重试（耗尽为 0x16/0x18）；RNR NAK 等 rnr_delay
-  //   后重试，消耗 RNR_RETRY_TH（7 为无限，耗尽为 0xB7）；其余 NAK 为致命错误（0xB9，synd 为远端
-  //   syndrome）。
-  // 输入/输出及副作用：发包、写本地内存；推进 send_psn；ecode/synd 输出。
+  // 功能：RC/URC 请求的重传循环。PSN 序列 NAK 从 NAK 指出的 PSN 起重发（READ 从第一个缺失的响应
+  //   PSN 起重新请求剩余部分）；超时时 SEND/WRITE 从首 PSN 重发、READ 从第一个缺失的响应起；两者消耗
+  //   PSN_RETRY_TH（耗尽为 0x16/0x18）。RNR NAK 按其 syndrome 低 5 位的 RNR 定时器编码等待后从首 PSN
+  //   重发，消耗 RNR_RETRY_TH（7 为无限，耗尽为 0xB7）。其余 NAK 为致命错误（0xB9，synd 为远端
+  //   syndrome）。ACK/READ 响应/ATOMIC ACK 完成。
+  // 输入/输出及副作用：发包、写本地内存；send_psn 结束于首 PSN + 分段数；ecode/synd 输出。
   // 失败/边界：本地写失败以 SQ_KEY_ERR 结束。
   protected task run_request(int unsigned qpn, rdma_dev_qp_rt rt, rdma_bytes_t wqe, bit [3:0] op,
                              bit [63:0] sges[$], rdma_bytes_t data, int unsigned pd,
                              int unsigned payload, bit [23:0] dst_qpn, bit [47:0] dmac,
                              output bit [7:0] ecode, output bit [7:0] synd);
     bit [23:0] start;
+    bit [23:0] nak_psn;
     int unsigned retries;
     int unsigned rnrs;
     int unsigned outcome;
+    int unsigned segs;
+    int unsigned from;
+    int unsigned resume;
     rdma_packet junk;
 
     start = rt.send_psn;
     retries = `RDMA_QPC(qpn, RDMA_QPC_PSN_RETRY_TH);
     rnrs = `RDMA_QPC(qpn, RDMA_QPC_RNR_RETRY_TH);
+    segs = (payload + mtu(qpn) - 1) / mtu(qpn);
+    if (segs == 0)
+      segs = 1;
+    from = 0;
     synd = '0;
     forever begin
-      rt.send_psn = start;
+      rt.send_psn = start + from;
       while (rt.responses.try_get(junk))
         ;
       ecode = RDMA_CMQ_SUCCESS_ECODE;
+      resume = 0;
       if (op inside {RDMA_SQ_OPCODE_ATOMIC_CMP_AND_SWP, RDMA_SQ_OPCODE_ATOMIC_FETCH_AND_ADD})
         do_atomic(qpn, rt, wqe, pd, dmac, outcome, synd, ecode);
       else if (op == RDMA_SQ_OPCODE_READ)
-        do_read(qpn, rt, wqe, sges, pd, payload, dmac, outcome, synd, ecode);
+        do_read(qpn, rt, wqe, sges, pd, payload, dmac, start, from, outcome, synd, ecode, resume);
       else begin
-        send_message(qpn, rt, net_opcode(op), data, wqe, dst_qpn, dmac, 1'b0);
-        wait_ack(rt, start, outcome, synd);
+        send_message(qpn, rt, net_opcode(op), data, wqe, dst_qpn, dmac, 1'b0, from);
+        wait_ack(rt, start, outcome, synd, nak_psn);
+        if (outcome == RSP_SEQ)
+          resume = 24'(nak_psn - start);
       end
       case (outcome)
         RSP_OK: return;
@@ -864,7 +907,8 @@ class rdma_dev_nic extends uvm_object;
           end
           if (rnrs != 7)
             rnrs--;
-          #(rnr_delay);
+          #(rnr_time(5'(synd)));
+          from = 0;
         end
         default: begin
           if (retries == 0) begin
@@ -874,10 +918,30 @@ class rdma_dev_nic extends uvm_object;
             return;
           end
           retries--;
+          from = resume < segs ? resume : 0;
         end
       endcase
     end
   endtask
+
+  // 功能：IB RNR 定时器编码 → 等待时间（0 为 655.36ms，1..31 为 0.01ms..491.52ms）。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：无。
+  protected function time rnr_time(bit [4:0] code);
+    int unsigned table_us[32] = '{655360, 10, 20, 30, 40, 60, 80, 120, 160, 240, 320, 480, 640,
+                                   960, 1280, 1920, 2560, 3840, 5120, 7680, 10240, 15360, 20480,
+                                   30720, 40960, 61440, 81920, 122880, 163840, 245760, 327680,
+                                   491520};
+
+    return table_us[code] * 1us;
+  endfunction
+
+  // 功能：本端 RNR NAK 的 syndrome：001 + QPC LOCAL_RNR_CODE（最小 RNR 定时器编码）。
+  // 输入/输出及副作用：纯查询。
+  // 失败/边界：无。
+  protected function bit [7:0] rnr_syndrome(int unsigned qpn);
+    return RDMA_AETH_RNR_NAK | 8'(`RDMA_QPC(qpn, RDMA_QPC_LOCAL_RNR_CODE));
+  endfunction
 
   // 功能：SQ WQE opcode → 网络 opcode。
   // 输入/输出及副作用：纯函数。
@@ -934,12 +998,13 @@ class rdma_dev_nic extends uvm_object;
     port.send(pkt, dmac);
   endtask
 
-  // 功能：按 PMTU 分段发送一条消息（WRITE 带 RETH，立即数带 ImmDt，UD 带 DETH Q_Key）。
+  // 功能：按 PMTU 分段发送一条消息（WRITE 带 RETH，立即数带 ImmDt，UD 带 DETH Q_Key），从第 from
+  //   个分段起（重传时从中间分段继续，PSN 取 send_psn）。
   // 输入/输出及副作用：推进 send_psn，经端口发包。
   // 失败/边界：空负载发一个零长度单包。
   protected task send_message(int unsigned qpn, rdma_dev_qp_rt rt, rdma_network_opcode_e op,
                               rdma_bytes_t payload, rdma_bytes_t wqe, bit [23:0] dst_qpn,
-                              bit [47:0] dmac, bit ud);
+                              bit [47:0] dmac, bit ud, int unsigned from = 0);
     int unsigned count;
     int unsigned start;
     int unsigned take;
@@ -948,7 +1013,7 @@ class rdma_dev_nic extends uvm_object;
     count = (payload.size() + mtu(qpn) - 1) / mtu(qpn);
     if (count == 0)
       count = 1;
-    for (int unsigned k = 0; k < count; k++) begin
+    for (int unsigned k = from; k < count; k++) begin
       pkt = new_packet(qpn, op, k, count, rt.send_psn, dst_qpn, ud);
       rt.send_psn++;
       start = k * mtu(qpn);
@@ -1013,15 +1078,17 @@ class rdma_dev_nic extends uvm_object;
     return RSP_FATAL;
   endfunction
 
-  // 功能：RC SEND/WRITE 等 ACK：覆盖最后一个 PSN（send_psn-1）的 ACK 完成；NAK 按类型返回。
-  // 输入/输出及副作用：消费响应；outcome/synd 输出。
+  // 功能：RC SEND/WRITE 等 ACK：覆盖最后一个 PSN（send_psn-1）的 ACK 完成；NAK 按类型返回，
+  //   nak_psn 为 NAK 携带的 PSN（序列 NAK 时即响应方期望的 PSN）。
+  // 输入/输出及副作用：消费响应；outcome/synd/nak_psn 输出。
   // 失败/边界：超时为 RSP_TIMEOUT。
   protected task wait_ack(rdma_dev_qp_rt rt, bit [23:0] first, output int unsigned outcome,
-                          output bit [7:0] synd);
+                          output bit [7:0] synd, output bit [23:0] nak_psn);
     rdma_packet pkt;
     bit got;
 
     synd = '0;
+    nak_psn = first;
     forever begin
       next_response(rt, first, pkt, got);
       if (!got) begin
@@ -1030,6 +1097,7 @@ class rdma_dev_nic extends uvm_object;
       end
       if (pkt.aeth_syndrome != RDMA_AETH_ACK) begin
         synd = pkt.aeth_syndrome;
+        nak_psn = pkt.psn;
         outcome = nak_outcome(pkt.aeth_syndrome);
         return;
       end
@@ -1040,15 +1108,17 @@ class rdma_dev_nic extends uvm_object;
     end
   endtask
 
-  // 功能：RDMA READ 一次尝试：发请求（RC 一个；URC 按 PMTU 分包，各对应一个 READ_DATA_ONLY），
-  //   收响应并散写到本地 SGE。
-  // 输入/输出及副作用：推进 send_psn，写主机内存；outcome/synd/ecode 输出。
+  // 功能：RDMA READ 一次尝试，从第 from 个响应分段起：发请求（RC 一个，覆盖 from 之后的剩余部分，
+  //   PSN = start + from；URC 按 PMTU 每段一个 READ_DATA_ONLY 请求），按序收响应并散写到本地 SGE。
+  //   resume 输出第一个未收到的分段（供重传）。
+  // 输入/输出及副作用：send_psn 置为 start + 分段数，写主机内存；outcome/synd/ecode/resume 输出。
   // 失败/边界：超时/NAK 按类型返回；响应 PSN 跳号为 RSP_SEQ；长度不符为致命；本地写失败为
   //   RSP_LOCAL（SQ_KEY_ERR）。
   protected task do_read(int unsigned qpn, rdma_dev_qp_rt rt, rdma_bytes_t wqe,
                          bit [63:0] sges[$], int unsigned pd, int unsigned total,
-                         bit [47:0] dmac, output int unsigned outcome, output bit [7:0] synd,
-                         inout bit [7:0] ecode);
+                         bit [47:0] dmac, bit [23:0] start, int unsigned from,
+                         output int unsigned outcome, output bit [7:0] synd,
+                         inout bit [7:0] ecode, output int unsigned resume);
     rdma_packet pkt;
     int unsigned offset;
     int unsigned count;
@@ -1062,26 +1132,25 @@ class rdma_dev_nic extends uvm_object;
     if (count == 0)
       count = 1;
     urc = is_urc(qpn);
-    first = rt.send_psn;
+    first = start;
     synd = '0;
-    for (int unsigned k = 0; k < (urc ? count : 1); k++) begin
+    resume = from;
+    for (int unsigned k = from; k < (urc ? count : from + 1); k++) begin
       pkt = new_packet(qpn, RDMA_NET_RDMA_READ_REQUEST, k, urc ? count : 1, first + k,
                        `RDMA_QPC(qpn, RDMA_QPC_DST_QPN), 1'b0);
-      pkt.reth_va = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_REMOTE_VA) + (urc ? k * mtu(qpn) : 0);
+      pkt.reth_va = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_REMOTE_VA) + k * mtu(qpn);
       pkt.reth_rkey = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_REMOTE_KEY);
-      pkt.reth_len = total;
-      if (urc) begin
-        pkt.reth_len = total - k * mtu(qpn);
-        if (pkt.reth_len > mtu(qpn))
-          pkt.reth_len = mtu(qpn);
-      end
+      pkt.reth_len = total - k * mtu(qpn);
+      if (urc && pkt.reth_len > mtu(qpn))
+        pkt.reth_len = mtu(qpn);
       emit(pkt, dmac);
     end
     rt.send_psn = first + count;
-    offset = 0;
-    received = 0;
+    offset = from * mtu(qpn);
+    received = from;
     forever begin
       next_response(rt, first, pkt, got);
+      resume = received;
       if (!got) begin
         outcome = RSP_TIMEOUT;
         return;
@@ -1106,7 +1175,7 @@ class rdma_dev_nic extends uvm_object;
       end
       offset += part.size();
       received++;
-      if (urc ? received == count : pkt.segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY})
+      if (received == count)
         break;
     end
     outcome = RSP_OK;
@@ -1625,7 +1694,7 @@ class rdma_dev_nic extends uvm_object;
             // RNR：本消息不接收，期望 PSN 回到首包，余下报文丢弃，等请求方重传。
             rt.expected_psn = pkt.psn;
             rt.rnr_drop = 1'b1;
-            send_ack(qpn, rt, pkt.psn, RDMA_AETH_RNR_NAK);
+            send_ack(qpn, rt, pkt.psn, rnr_syndrome(qpn));
             return;
           end
           // 带副作用的调用不放进 && 表达式（VCS 不保证短路）。
@@ -1684,7 +1753,7 @@ class rdma_dev_nic extends uvm_object;
               write_cqe(qpn, 1'b1, index, wrap, RDMA_CMQ_SUCCESS_ECODE, rt.wr_len, pkt.imm, 0);
             else begin
               // RNR：数据可重写，整条消息待重传。
-              syndrome = RDMA_AETH_RNR_NAK;
+              syndrome = rnr_syndrome(qpn);
               rt.expected_psn = rt.msg_first_psn;
             end
           end

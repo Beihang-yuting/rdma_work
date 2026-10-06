@@ -752,7 +752,14 @@ class rdma_drv_wr extends uvm_object;
         info[0][1] = 1'b1;
     end
     else if (abnml != 0)
-      urc_abnml_info(frag, ceqe, abnml == 2, ecode, info);
+      urc_abnml_info(frag, abnml == 2, ecode,
+                     rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE_WORD_BYTE_OFFSET,
+                                    RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE_LSB, 8),
+                     rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WORD_BYTE_OFFSET,
+                                    RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_LSB,
+                                    RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WIDTH),
+                     rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP_WORD_BYTE_OFFSET,
+                                    RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP_LSB, 1), info);
     else begin
       info[0][7:6] = info[0][7:6] + 1;
       for (int i = 12; i < 16; i++)
@@ -761,10 +768,12 @@ class rdma_drv_wr extends uvm_object;
     return frag.write_urc_info(dev, info);
   endfunction
 
-  // 功能：urc_eq_update_abnml_info_process：见 urc_ceqe。
+  // 功能：urc_eq_update_abnml_info_process（CEQE 与 AEQE 共用）：见 urc_ceqe；idx/wrap 为异常 WQE
+  //   位置，remote 为远端 syndrome。
   // 输入/输出及副作用：修改 info。
   // 失败/边界：该方向已记异常时不变。
-  static function void urc_abnml_info(rdma_drv_cq frag, rdma_bytes_t ceqe, bit rq, bit [7:0] ecode,
+  static function void urc_abnml_info(rdma_drv_cq frag, bit rq, bit [7:0] ecode,
+                                      bit [7:0] remote, bit [14:0] idx, bit wrap,
                                       inout rdma_bytes_t info);
     bit [15:0] pos;
     int unsigned size;
@@ -773,17 +782,13 @@ class rdma_drv_wr extends uvm_object;
     if (info[0][rq ? 3 : 2])
       return;
     info[rq ? 2 : 1] = ecode;
-    info[0][5:4] = rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE_WORD_BYTE_OFFSET,
-                                  RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE_LSB, 2);
+    info[0][5:4] = remote[1:0];
     info[0][rq ? 3 : 2] = 1'b1;
     if (info[0][rq ? 1 : 0])
       return;
     size = rq ? frag.recv_size : frag.send_size;
-    pos[14:0] = rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WORD_BYTE_OFFSET,
-                               RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_LSB,
-                               RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WIDTH) + 1;
-    pos[15] = rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP_WORD_BYTE_OFFSET,
-                             RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP_LSB, 1);
+    pos[14:0] = idx + 1;
+    pos[15] = wrap;
     if (pos[14:0] == size) begin
       pos[14:0] = 0;
       pos[15] = !pos[15];
@@ -1052,8 +1057,51 @@ class rdma_drv_wr extends uvm_object;
     end
   endtask
 
+  // 功能：URC 异常 AEQE：QP 存在且异常类型非 0 时更新对应 frag 的 URC 信息区，未处于 ERR 的 QP
+  //   转 ERR。
+  // 输入/输出及副作用：写 frag 信息区，可能执行 QP modify。
+  // 失败/边界：未知 QP 忽略；读写或 modify 失败返回错误。
+  static task urc_aeqe(rdma_drv_dev dev, rdma_bytes_t aeqe, output rdma_status status);
+    rdma_drv_qp qp;
+    rdma_drv_cq frag;
+    rdma_drv_qp_attr attr;
+    rdma_bytes_t info;
+    bit [1:0] kind;
+    int unsigned qpn;
+
+    status = rdma_status::success();
+    qpn = rdma_be::field(aeqe, RDMA_AEQE_QPN_WORD_BYTE_OFFSET, RDMA_AEQE_QPN_LSB,
+                         RDMA_AEQE_QPN_WIDTH);
+    kind = rdma_be::field(aeqe, RDMA_AEQE_URC_ABNML_CQE_TYPE_WORD_BYTE_OFFSET,
+                          RDMA_AEQE_URC_ABNML_CQE_TYPE_LSB, RDMA_AEQE_URC_ABNML_CQE_TYPE_WIDTH);
+    if (!dev.qp_table.exists(qpn) || kind == 0)
+      return;
+    qp = dev.qp_table[qpn];
+    frag = kind == 2 ? qp.recv_cq : qp.send_cq;
+    status = frag.read_urc_info(dev, info);
+    if (!status.ok())
+      return;
+    urc_abnml_info(frag, kind == 2,
+                   rdma_be::field(aeqe, RDMA_AEQE_ECODE_WORD_BYTE_OFFSET, RDMA_AEQE_ECODE_LSB,
+                                  RDMA_AEQE_ECODE_WIDTH),
+                   rdma_be::field(aeqe, RDMA_AEQE_URC_REMOTE_ECODE_WORD_BYTE_OFFSET,
+                                  RDMA_AEQE_URC_REMOTE_ECODE_LSB, 8),
+                   rdma_be::field(aeqe, RDMA_AEQE_WQE_INDEX_WORD_BYTE_OFFSET,
+                                  RDMA_AEQE_WQE_INDEX_LSB, 15),
+                   rdma_be::field(aeqe, RDMA_AEQE_WQE_WRAP_WORD_BYTE_OFFSET,
+                                  RDMA_AEQE_WQE_WRAP_LSB, 1), info);
+    status = frag.write_urc_info(dev, info);
+    if (!status.ok() || qp.cur_state == RDMA_DRV_QPS_ERR)
+      return;
+    attr = rdma_drv_qp_attr::type_id::create("urc_abnml_err");
+    attr.mask = rdma_drv_qp_attr::M_STATE;
+    attr.state = RDMA_DRV_QPS_ERR;
+    qp.modify(dev, attr, status);
+  endtask
+
   // 功能：xtrdma_process_aeq：取有效 AEQE，记录 {ECODE, QPN}（SRFQ 事件记录 SRFQN），推进 CI 并敲
-  //   AEQ doorbell。
+  //   AEQ doorbell。URC_FLAG 的 QP 错误（xtrdma_qp_event_process）先按异常类型把异常信息记入 QP 的
+  //   SQ/RQ frag，再把 QP 转 ERR（硬件随后 flush）。
   // 输入/输出及副作用：events 追加 {ecode[7:0], qpn 或 srqn[23:0]}；更新 EQ 状态与 doorbell。
   // 失败/边界：读写失败返回错误。
   static task process_aeq(rdma_drv_dev dev, inout bit [31:0] events[$],
@@ -1077,6 +1125,12 @@ class rdma_drv_wr extends uvm_object;
                                              RDMA_AEQE_SRFQN_LSB, RDMA_AEQE_SRFQN_WIDTH))});
       else
         events.push_back({word0[31:24], 6'b0, word0[17:0]});
+      if (rdma_be::field(aeqe, RDMA_AEQE_URC_FLAG_WORD_BYTE_OFFSET, RDMA_AEQE_URC_FLAG_LSB,
+                         1)) begin
+        urc_aeqe(dev, aeqe, status);
+        if (!status.ok())
+          return;
+      end
       eq.tail++;
       if (eq.tail % eq.entries == 0)
         eq.polarity = !eq.polarity;

@@ -1,9 +1,10 @@
 // 目录：单元测试层 tests/unit/rdma_drv_reliability_test.sv。
 // 层：单元测试。
-// 职责：两节点（复用 rdma_drv_data_test 的节点、链路与辅助）的可靠传输与异常路径：请求丢包后 PSN
-//   序列 NAK 重传、ACK/READ 响应/ATOMIC ACK 丢失后的重复请求处理（不重复执行）、RNR NAK 重试与
-//   耗尽（0xB7）、URC 的 SQ/RQ 异常完成（ABNML CEQE → REM_ACCESS/REM_INV_REQ + FLUSH、RQ 0x9C）、
-//   UD 的 Q_Key 校验与 40B GRH、SRQ 3 SGE 走 SGB。
+// 职责：两节点（复用 rdma_drv_data_test 的节点、链路与辅助）的可靠传输与异常路径：中间包丢失后从
+//   PSN 序列 NAK 指出的 PSN 起重传、ACK/ATOMIC ACK 丢失后的重复请求处理（不重复执行）、READ 末段
+//   响应丢失后只重新请求缺失部分、RNR NAK 按定时器编码等待的重试与耗尽（0xB7）、URC 的 SQ/RQ 异常
+//   完成（ABNML CEQE 或 AEQE → REM_ACCESS/REM_INV_REQ + FLUSH、RQ 0x9C）、UD 的 Q_Key 校验与 40B
+//   GRH、SRQ 3 SGE 走 SGB。
 // 依赖：rdma_drv_data_test。
 // 所有权：同 rdma_drv_data_test。
 // 生命周期：run_phase 内建立并运行到结束。
@@ -35,6 +36,7 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     check_srq_sgb();
     check_urc_sq_abnormal();
     check_urc_rq_abnormal();
+    check_urc_aeqe();
   endtask
 
   // 功能：断言 B 在 20us 内没有新的完成。
@@ -51,29 +53,34 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
       `uvm_error(label, $sformatf("%0d unexpected completions on B", wcs.size()))
   endtask
 
-  // 功能：3 包 SEND 的首包被丢：B 对后续包回 PSN 序列 NAK，A 从首 PSN 重发，两端各一个成功完成，
-  //   数据一致，B 无多余完成。
+  // 功能：3 包 SEND 的第 2 包被丢：B 对第 3 包回 PSN 序列 NAK（期望 PSN = 第 2 包），A 只重发第 2、
+  //   3 包（发往 B 共 5 包），两端各一个成功完成，数据一致，B 无多余完成。
   // 输入/输出及副作用：丢 1 包。
   // 失败/边界：不符报告 UVM_ERROR。
   task check_request_drop();
     rdma_bytes_t data;
     rdma_drv_wc wc;
     longint unsigned rwr;
+    int unsigned to_b;
 
     data = fill(a, 0, 2500, 8'h17);
     post_recv(b, '{4096}, '{4096}, rwr);
+    to_b = link.sent_to[b.mac];
+    link.drop_after[b.mac] = 1;
     link.drops[b.mac] = 1;
     send_and_wait("request drop", send_wr(a, RDMA_DRV_WR_SEND, '{0}, '{2500}));
     expect_recv("request drop rq", rwr, wc);
     expect_mem("request drop data", b, 4096, data);
-    if (link.dropped != 1 || wc.byte_len != 2500)
-      `uvm_error("request drop", $sformatf("dropped %0d, byte_len %0d", link.dropped,
-                                           wc.byte_len))
+    if (link.dropped != 1 || wc.byte_len != 2500 || link.sent_to[b.mac] - to_b != 5)
+      `uvm_error("request drop", $sformatf("dropped %0d, byte_len %0d, packets to B %0d",
+                                           link.dropped, wc.byte_len,
+                                           link.sent_to[b.mac] - to_b))
     expect_b_idle("request drop");
   endtask
 
   // 功能：B→A 的响应被丢，A 超时重发，B 按重复请求处理：SEND 只消费一个 RQE（第二个 RQE 留给
-  //   下一条 SEND），READ 重放响应，FAA 回缓存的原值且目标只加一次。
+  //   下一条 SEND）；2 段 READ 的第 2 段响应被丢，A 只对第 2 段重新请求（发往 B 共 2 个请求，回 A
+  //   共 3 个响应）；FAA 回缓存的原值且目标只加一次。
   // 输入/输出及副作用：每项丢 1 包。
   // 失败/边界：不符报告 UVM_ERROR。
   task check_ack_drop();
@@ -83,6 +90,8 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     rdma_drv_send_wr wr;
     rdma_drv_wc wc;
     longint unsigned rwr[2];
+    int unsigned to_a;
+    int unsigned to_b;
 
     data = fill(a, 'h100, 64, 8'h27);
     post_recv(b, '{'h1000}, '{'h100}, rwr[0]);
@@ -97,12 +106,19 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     expect_recv("after ACK drop rq", rwr[1], wc);
     expect_mem("after ACK drop data", b, 'h1100, data);
     data = fill(b, 'h2000, 2000, 8'h47);
+    to_a = link.sent_to[a.mac];
+    to_b = link.sent_to[b.mac];
+    link.drop_after[a.mac] = 1;
     link.drops[a.mac] = 1;
     wr = send_wr(a, RDMA_DRV_WR_READ, '{'h2800}, '{2000});
     wr.remote_va = b.data_buf.iova + 'h2000;
     wr.rkey = b.mr.key();
     send_and_wait("READ response drop", wr);
     expect_mem("READ response drop data", a, 'h2800, data);
+    if (link.sent_to[a.mac] - to_a != 3 || link.sent_to[b.mac] - to_b != 2)
+      `uvm_error("READ response drop", $sformatf("responses to A %0d, requests to B %0d",
+                                                 link.sent_to[a.mac] - to_a,
+                                                 link.sent_to[b.mac] - to_b))
     init = rdma_be::zeros(8);
     init[0] = 8'h40;
     expect_ok("seed FAA", b.drv.hw.write(b.data_buf, 'h3800, init));
@@ -121,7 +137,8 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
   endtask
 
   // 功能：B 无 RQE 时 SEND 得到 RNR NAK，2us 后 B 投 RECV，A 的 RNR 重试成功；另一对 QP 上 B 始终
-  //   不投 RECV，RNR 重试（RNR_RETRY_TH=6）耗尽得到 vendor 0xB7。
+  //   不投 RECV，RNR 重试（RNR_RETRY_TH=6）耗尽得到 vendor 0xB7，耗时为 6 次 RNR 定时器（编码 1 =
+  //   10us，由 B 的 QPC LOCAL_RNR_CODE 经 NAK 带给 A）。
   // 输入/输出及副作用：创建一对 QP。
   // 失败/边界：不符报告 UVM_ERROR。
   task check_rnr();
@@ -132,6 +149,8 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     rdma_drv_qp qb;
     rdma_drv_send_wr wr;
     longint unsigned rwr;
+    time started;
+    time elapsed;
     rdma_status status;
 
     data = fill(a, 'h300, 48, 8'h57);
@@ -146,9 +165,13 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     expect_mem("RNR retry data", b, 'h1200, data);
     make_pair(null, qa, qb);
     wr = send_wr(a, RDMA_DRV_WR_SEND, '{'h300}, '{48});
+    started = $time;
     rdma_drv_wr::post_send(a.drv, qa, wr, status);
     expect_ok("post RNR exhausted", status);
     wait_wcs(a, 1, wcs);
+    elapsed = $time - started;
+    if (elapsed < 60us || elapsed >= 65us)
+      `uvm_error("RNR exhausted", $sformatf("took %0t, expected 6 x 10us", elapsed))
     expect_wc("RNR exhausted", wcs[0], wr.wr_id, 1'b0, RDMA_DRV_WC_GENERAL_ERR);
     if (wcs[0].vendor_err != RDMA_ECODE_EC_RPE_RSP_NAK_RNR_ERR_OVERTIME)
       `uvm_error("RNR exhausted", $sformatf("vendor %02h", wcs[0].vendor_err))
@@ -361,5 +384,44 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     wait_urc(a, ua, 1, wcs);
     expect_wc("URC requester of RQ abnormal", wcs[0], wr.wr_id, 1'b0,
               RDMA_DRV_WC_REM_INV_REQ_ERR);
+  endtask
+
+  // 功能：URC 异常经 AEQ：A 设备改走 AEQE 上报；错 rkey 的 WRITE 后跟一个 SEND。驱动处理 AEQ 时记入
+  //   SQ frag 的异常信息并把 QP 转 ERR，A 得到 REM_ACCESS_ERR 与 FLUSH_ERR，AEQ 记录 {0xB9, QPN}。
+  // 输入/输出及副作用：创建一对 URC QP 与 CQ；临时切换 A 设备的上报通道。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task check_urc_aeqe();
+    rdma_drv_cq ua;
+    rdma_drv_cq ub;
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
+    rdma_drv_send_wr wrs[2];
+    rdma_drv_wc wcs[$];
+    bit [31:0] events[$];
+    rdma_status status;
+
+    make_urc_pair(ua, ub, qa, qb);
+    a.dev.nic.urc_abnormal_via_aeq = 1'b1;
+    wrs[0] = send_wr(a, RDMA_DRV_WR_WRITE, '{'h600}, '{32});
+    wrs[0].remote_va = b.data_buf.iova + 'h3700;
+    wrs[0].rkey = b.mr.key() ^ 32'h1;
+    wrs[1] = send_wr(a, RDMA_DRV_WR_SEND, '{'h600}, '{32});
+    foreach (wrs[k]) begin
+      rdma_drv_wr::post_send(a.drv, qa, wrs[k], status);
+      expect_ok("post URC AEQE", status);
+    end
+    for (int t = 0; t < 200 && events.size() == 0; t++) begin
+      #100ns;
+      rdma_drv_wr::process_aeq(a.drv, events, status);
+      expect_ok("process AEQ", status);
+    end
+    a.dev.nic.urc_abnormal_via_aeq = 1'b0;
+    if (events.size() != 1 || events[0] != {RDMA_ECODE_EC_RPE_NAK_FATAL_ERR, 24'(qa.qpn)} ||
+        qa.cur_state != RDMA_DRV_QPS_ERR)
+      `uvm_error("URC AEQE", $sformatf("AEQ events %p, QP state %s", events,
+                                       qa.cur_state.name()))
+    wait_urc(a, ua, 2, wcs);
+    expect_wc("URC AEQE abnormal", wcs[0], wrs[0].wr_id, 1'b0, RDMA_DRV_WC_REM_ACCESS_ERR);
+    expect_wc("URC AEQE flush", wcs[1], wrs[1].wr_id, 1'b0, RDMA_DRV_WC_FLUSH_ERR);
   endtask
 endclass
