@@ -129,10 +129,47 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 去除注释与空白后的代码 token 与改写前完全一致。注释改写由脚本逐文件校验：去除注释与空白后的代码 token
 与改写前完全一致。
 
+## 第二阶段：驱动形状重构（2026-10-06，S0–S6 / 阶段 A–E）
+
+目标：主机与设备只经真实硬件边界交互（CMQ 环、MMIO doorbell、按 IOVA 的 DMA），数据端到端检查
+走这一边界。计划与完成状态见 `docs/rdma-driver-shaped-arch.md`，UVM 流程见 `docs/rdma-uvm-flow-design.md`。
+
+| 阶段 | 内容 |
+| --- | --- |
+| A/B | `src/dev` CMQ 消费者、context 存储、HMC 翻译；`src/drv` probe/remove、CMQ、HMC、EQ、PD/MR/CQ/SRQ/QP |
+| C | 设备 NIC（RC/UD/URC、READ/ATOMIC、NAK、CQE/CEQE/AEQE、flush）与驱动数据路径（post/poll、CEQ/AEQ、SRQ、CQ resize、cq_clean、cleanup_ceqes、URC frag CQ）；tb 改为驱动 + 设备 |
+| D | `rdma_multifunc_test`（5 Function 隔离、故障矩阵、VF/PF/设备复位）、真实 host_mem 与高流量 e2e、CMQ 失败注入回退 |
+| E | 删除旧 core（只留 CMQ 参考引擎/transport/doorbell 调度器）、integration 层、CMQ port 栈、SR-IOV、死模型代码与对应测试 |
+
+规模（全部 `.sv/.svh`）：
+
+| | 基线 1ea354f | 第一阶段末 510fd27 | 第二阶段 86ee72e |
+| --- | ---: | ---: | ---: |
+| src | 114,092 | 93,573 | 41,442 |
+| tests | 164,612 | 126,870 | 39,846 |
+
+数据端到端：`rdma_tb_flow_test`（loopback）、`rdma_tb_host_mem_test`（真实 host_mem）、
+`rdma_tb_e2e_test`（再加 net_packet RoCEv2 帧，含 URC 的 XTR 0b110 opcode）各 33 项检查零错误；
+`rdma_tb_e2e_high_traffic_test` 4114 项。每个新功能都做了变异检查（注入对应缺陷被测试捕获）。
+
+| 轮次 | 提交 | 结果 |
+| --- | --- | --- |
+| v18–v21 | 2c49a3e…94e0c5d | A/B 各步全部通过 |
+| v22 | 7fa9f7a | 全部通过（core 93） |
+| v23 | 5dbfc48 | 全部通过（驱动数据路径 + 设备 NIC） |
+| v24 | 19cc6d0 | 全部通过（tb 迁移） |
+| v25 | 1f54939 | 全部通过（SRQ、resize、flush、AEQ） |
+| v26 | 5b27ae7 | 全部通过（URC） |
+| v27 | c61437c | 仅 style 失败（09f534e 插入函数挤掉相邻注释），其余全部通过；E 提交中修复 |
+| v28 | 86ee72e | 全部通过：Python、style、驱动门禁、CMQ 12、core 42、net_packet、PCIe、host_mem 3、e2e_tb、e2e 高流量（告警 2 来自外部 net_packet） |
+
+假设与未建模：URC 每个完成都发 CEQE（驱动源码未说明硬件是否依赖 arm）；URC 异常完成（NAK/ABNML
+CEQE/AEQE）、UD GRH/Q_Key 校验、PSN 重传/RNR 重试、SRQ 的 SGB（>2 SGE）未建模。
+
 ## 未做与遗留
 
 - CEQ/AEQ 的 request/resource/context model 与 lifecycle policy 仍为平行实现；字段名不同，
   用钩子合并反而增加行数，需先统一模型基类才值得做。
 - 驱动对 7 个无填充函数 opcode 提交全零 WQE，模型发信封头（有意偏离，见 CMQ 对齐文档）。
 - 驱动 KEY_QUERY/CQC_QUERY 越界读 CQE 之后字节，模型只解码 64B CQE 内的内容。
-- 包级 DAG（Phase E）未开始。
+- 第一阶段的包级 DAG 计划已被第二阶段的驱动形状重构取代。
