@@ -35,29 +35,6 @@ class rdma_dpu_test_topology extends uvm_object;
       `uvm_fatal("DPU_TEST", $sformatf("%s: dpu_common topology failed: %s", name,
                                        status.convert2string()))
   endfunction
-
-  // 功能：取上述拓扑第 pick 个 Function 的 rdma_function_binding（state 为 DISCOVERED）。
-  // 输入/输出及副作用：返回新 binding；f 输出该 Function 投影。
-  // 失败/边界：pick 越界或投影失败报告 UVM_FATAL。
-  static function rdma_function_binding binding(string name, output rdma_dpu_function f,
-                                                input int unsigned vf_count = 0,
-                                                input int unsigned pick = 0,
-                                                input int segment = -1);
-    dpu_device_snapshot snapshot;
-    rdma_dpu_function funcs[$];
-    rdma_function_binding b;
-    rdma_status status;
-
-    resolve(name, vf_count, segment, snapshot, funcs);
-    if (pick >= funcs.size())
-      `uvm_fatal("DPU_TEST", $sformatf("%s: no Function %0d", name, pick))
-    f = funcs[pick];
-    status = f.binding(b);
-    if (!status.ok())
-      `uvm_fatal("DPU_TEST", $sformatf("%s: binding projection failed: %s", name,
-                                       status.convert2string()))
-    return b;
-  endfunction
 endclass
 
 class rdma_dpu_test_bar extends rdma_dpu_bar;

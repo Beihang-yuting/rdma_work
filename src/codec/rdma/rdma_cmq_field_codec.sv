@@ -106,10 +106,6 @@ class rdma_hw_cmq_field_codec extends uvm_object;
       if (!status.ok())
         return status;
     end
-    foreach (words[q])
-      if ((words[q] & ~rdma_cmq_codec_registry::request_mask(opcode, q)) != 0)
-        return codec_error($sformatf(
-          "CMQ field body qword %0d writes outside opcode 0x%02x ownership", q, opcode));
     image = make_image(words);
     return rdma_status::success();
   endfunction

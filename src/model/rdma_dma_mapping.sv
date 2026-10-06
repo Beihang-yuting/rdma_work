@@ -5,10 +5,6 @@
 
 // // 阅读提示：先看公开类型与接口，再看实现；失败路径须保持状态与资源所有权可追踪。
 
-// // 前置声明：UMEM/PBL/MW 在 context_models.sv 定义；mapping 仅保存非拥有引用，不隐式转移 page pin 或窗口释放责任。
-typedef class rdma_umem;
-typedef class rdma_pbl;
-typedef class rdma_mw_binding;
 
 class rdma_dma_mapping extends uvm_object;
   `rdma_object_utils(rdma_dma_mapping)
@@ -31,12 +27,7 @@ class rdma_dma_mapping extends uvm_object;
   rdma_dma_permission_t permissions;
   rdma_mapping_state_e state;
   rdma_handle owner_h;
-  // // 用户 buffer 关联对象均为非拥有引用，生命周期由 host-mem/MW 管理。
-  rdma_umem umem_ref;
-  rdma_pbl pbl_ref;
-  rdma_mw_binding mw_ref;
-  bit umem_backed;
-  int unsigned umem_page_count;
+
 
   // 功能：构造 DMA mapping，所有句柄置 null、有效位清零。
   // 输入/输出及副作用：name 传给 super.new。
@@ -60,11 +51,6 @@ class rdma_dma_mapping extends uvm_object;
     permissions = '0;
     state = RDMA_MAPPING_INVALID;
     owner_h = null;
-    umem_ref = null;
-    pbl_ref = null;
-    mw_ref = null;
-    umem_backed = 1'b0;
-    umem_page_count = 0;
   endfunction
 
   // // owned mapping 是 release capability：具体分配 adapter 须提供 opaque authority 快照并证明等价性，
@@ -135,11 +121,6 @@ class rdma_dma_mapping extends uvm_object;
     direction = rhs_mapping.direction;
     permissions = rhs_mapping.permissions;
     state = rhs_mapping.state;
-    umem_ref = rhs_mapping.umem_ref;
-    pbl_ref = rhs_mapping.pbl_ref;
-    mw_ref = rhs_mapping.mw_ref;
-    umem_backed = rhs_mapping.umem_backed;
-    umem_page_count = rhs_mapping.umem_page_count;
     owner_h = rdma_deep_copy#(rdma_handle)::of(
       rhs_mapping.owner_h, "rdma_handle clone type mismatch");
   endfunction

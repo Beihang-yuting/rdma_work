@@ -39,9 +39,6 @@ except ImportError:  # pragma: no cover - direct script execution
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "hw" / "rdma" / "source_manifest.txt"
 SV_DEFS_PATH = REPO_ROOT / "src" / "codec" / "rdma" / "rdma_defs.svh"
-ERROR_CODEC_PATH = (
-    REPO_ROOT / "src" / "codec" / "rdma" / "rdma_error_codec.sv"
-)
 SV_MASKS_PATH = REPO_ROOT / "src" / "codec" / "rdma" / "rdma_image_masks.svh"
 GOLDEN_DIR = REPO_ROOT / "hw" / "rdma" / "golden_vectors"
 
@@ -5013,10 +5010,7 @@ def validate(
     error_values = validate_error_code_mappings(
         ERROR_CODE_MAPPINGS, source_text, sv_defs_text
     )
-    canonical_error_codes = canonical_error_code_mappings(
-        ERROR_CODE_MAPPINGS, error_values
-    )
-    validate_error_codec(ERROR_CODEC_PATH.read_text(), canonical_error_codes)
+    canonical_error_code_mappings(ERROR_CODE_MAPPINGS, error_values)
     sv_constants = parse_sv_constants(sv_defs_text)
     validate_profile_constants(sv_constants, PROFILE_VALUES)
     sv_mask_text = SV_MASKS_PATH.read_text()

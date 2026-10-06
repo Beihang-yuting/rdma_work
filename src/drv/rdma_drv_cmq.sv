@@ -76,34 +76,77 @@ class rdma_drv_cmq extends uvm_object;
     return sqe;
   endfunction
 
-  // 功能：执行表驱动 opcode：字段表（由驱动填充函数生成）编码 body 后提交；SD_UPDATE 在
-  //   sd_num>2 时按 xtrdma_sc_update_sd 对整条 SQE 与扩展 SD 表签名。
-  // 输入/输出及副作用：同 exec_signed。
-  // 失败/边界：字段编码失败返回其 status；其余同 exec_signed。
-  task exec_fields(bit [7:0] opcode, rdma_hw_cmq_field_body body, output rdma_bytes_t cqe,
-                   output rdma_status status);
+  // 功能：表驱动 opcode 的 SQE：字段表（由驱动填充函数生成）编码 body，写 opcode，再按 seal 填信封；
+  //   只有 SD_UPDATE 在 sd_num>2 时（字段表置 sd_sign_en）按 xtrdma_sc_update_sd 对含信封的整条 SQE 与
+  //   扩展 SD 表签名（其余表驱动 opcode 在 qword 8 的同一位置是业务字段）。
+  // 输入/输出及副作用：sqe 输出完整 64B SQE。
+  // 失败/边界：字段编码失败返回其 status。
+  static function rdma_status compose_fields(bit [7:0] opcode, rdma_hw_cmq_field_body body,
+                                             int unsigned idx, bit polarity,
+                                             output rdma_bytes_t sqe);
     rdma_hw_cmq_field_codec codec;
     rdma_hw_image image;
-    rdma_bytes_t sqe;
     rdma_bytes_t extra;
+    rdma_status status;
     bit sign;
 
-    cqe = new[0];
+    sqe = new[0];
     codec = rdma_hw_cmq_field_codec::type_id::create("drv_field_codec");
     status = codec.encode(opcode, body, image);
     if (!status.ok())
-      return;
+      return status;
     sqe = new[RDMA_CMQE_BYTES];
     foreach (sqe[i])
       sqe[i] = image.bytes[i];
     rdma_be::set_field(sqe, RDMA_CMQ_OPCODE_WORD_BYTE_OFFSET, RDMA_CMQ_OPCODE_LSB,
                        RDMA_CMQ_OPCODE_WIDTH, opcode);
-    sign = rdma_be::field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB,
-                          RDMA_CMQ_SIGN_EN_WIDTH);
     extra = new[0];
-    if (body.blobs.exists("sd_extra_data"))
-      extra = body.blobs["sd_extra_data"];
-    exec_signed(sqe, sign, extra, cqe, status);
+    sign = 1'b0;
+    if (opcode == RDMA_OP_SD_UPDATE) begin
+      sign = rdma_be::field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB,
+                            RDMA_CMQ_SIGN_EN_WIDTH);
+      if (body.blobs.exists("sd_extra_data"))
+        extra = body.blobs["sd_extra_data"];
+    end
+    seal(sqe, idx, polarity, sign, extra);
+    return rdma_status::success();
+  endfunction
+
+  // 功能：填信封（VALID=polarity，WRAP=!polarity，INDEX=idx）；sign 时置 SIGN_EN 并按
+  //   ~(SQE 全部字节异或 ^ extra 字节异或) 写签名（QPC 命令的 extra 为 512B QPC，SD_UPDATE 为扩展表）。
+  // 输入/输出及副作用：修改 sqe。
+  // 失败/边界：无。
+  static function void seal(inout rdma_bytes_t sqe, input int unsigned idx, input bit polarity,
+                            input bit sign, input rdma_bytes_t extra);
+    bit [63:0] word0;
+
+    word0 = rdma_be::qword(sqe, 0);
+    word0[RDMA_CMQ_VALID_LSB] = polarity;
+    word0[RDMA_CMQ_WRAP_LSB] = !polarity;
+    word0[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH] = idx;
+    rdma_be::put_qword(sqe, 0, word0);
+    if (!sign)
+      return;
+    rdma_be::set_field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB,
+                       RDMA_CMQ_SIGN_EN_WIDTH, 1);
+    rdma_be::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
+                       RDMA_CMQ_SIGNATURE_WIDTH, 0);
+    rdma_be::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
+                       RDMA_CMQ_SIGNATURE_WIDTH,
+                       ~(rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(extra)));
+  endfunction
+
+  // 功能：执行表驱动 opcode（见 compose_fields），信封取当前生产者位置。
+  // 输入/输出及副作用：同 submit。
+  // 失败/边界：字段编码失败返回其 status；其余同 submit。
+  task exec_fields(bit [7:0] opcode, rdma_hw_cmq_field_body body, output rdma_bytes_t cqe,
+                   output rdma_status status);
+    rdma_bytes_t sqe;
+
+    cqe = new[0];
+    status = compose_fields(opcode, body, pi % DEPTH, !((pi / DEPTH) & 1), sqe);
+    if (status.ok())
+      submit(sqe, cqe, status);
   endtask
 
   // 功能：执行一条命令（不带签名）。
@@ -115,17 +158,21 @@ class rdma_drv_cmq extends uvm_object;
     exec_signed(sqe, 1'b0, none, cqe, status);
   endtask
 
-  // 功能：执行一条命令：填信封（VALID=polarity，WRAP=!polarity，INDEX），sign 时置 SIGN_EN 并按
-  //   ~(SQE 全部字节异或 ^ extra 字节异或) 写签名（QPC 命令的 extra 为 512B QPC，SD_UPDATE 为扩展表）；
-  //   写 SQE、敲 doorbell、轮询 CQE。
+  // 功能：执行一条命令：按当前生产者位置 seal（见 seal）后提交。
+  // 输入/输出及副作用：同 submit。
+  // 失败/边界：同 submit。
+  task exec_signed(rdma_bytes_t sqe, bit sign, rdma_bytes_t extra, output rdma_bytes_t cqe,
+                   output rdma_status status);
+    seal(sqe, pi % DEPTH, !((pi / DEPTH) & 1), sign, extra);
+    submit(sqe, cqe, status);
+  endtask
+
+  // 功能：提交已 seal 的 SQE：写到生产者槽、PI 加一并敲 doorbell，轮询 CQE。
   // 输入/输出及副作用：写 CMQ 环与 doorbell；cqe 输出完成字节；last_ecode 记录 ecode。
   // 失败/边界：未创建返回 INVALID_STATE；超时返回 TIMEOUT；CQE 回显不符返回 CODEC_ERROR；
   //   ecode 非 0 返回 UNKNOWN_HW_ERROR。
-  task exec_signed(rdma_bytes_t sqe, bit sign, rdma_bytes_t extra, output rdma_bytes_t cqe,
-                   output rdma_status status);
-    bit [63:0] word0;
+  task submit(rdma_bytes_t sqe, output rdma_bytes_t cqe, output rdma_status status);
     bit [63:0] db;
-    bit polarity;
     int unsigned idx;
 
     cqe = new[0];
@@ -134,21 +181,6 @@ class rdma_drv_cmq extends uvm_object;
       return;
     end
     idx = pi % DEPTH;
-    polarity = !((pi / DEPTH) & 1);
-    word0 = rdma_be::qword(sqe, 0);
-    word0[RDMA_CMQ_VALID_LSB] = polarity;
-    word0[RDMA_CMQ_WRAP_LSB] = !polarity;
-    word0[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH] = idx;
-    rdma_be::put_qword(sqe, 0, word0);
-    if (sign) begin
-      rdma_be::set_field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB,
-                         RDMA_CMQ_SIGN_EN_WIDTH, 1);
-      rdma_be::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
-                         RDMA_CMQ_SIGNATURE_WIDTH, 0);
-      rdma_be::set_field(sqe, RDMA_CMQ_SIGNATURE_WORD_BYTE_OFFSET, RDMA_CMQ_SIGNATURE_LSB,
-                         RDMA_CMQ_SIGNATURE_WIDTH,
-                         ~(rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(extra)));
-    end
     status = hw.write(mem_buf, idx * RDMA_CMQE_BYTES, sqe);
     if (!status.ok())
       return;
@@ -159,7 +191,7 @@ class rdma_drv_cmq extends uvm_object;
     hw.notify(RDMA_DB_CMQ_OFFSET, db, status);
     if (!status.ok())
       return;
-    poll_cqe(word0, cqe, status);
+    poll_cqe(rdma_be::qword(sqe, 0), cqe, status);
   endtask
 
   // 功能：xtrdma_sc_cmq_next_cqe_valid + xtrdma_get_cqe_common_info：等待第 ci 个 CQE 的 owner

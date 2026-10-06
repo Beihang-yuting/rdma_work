@@ -15,8 +15,5 @@ package rdma_adapter_pkg;
 
   `include "rdma_adapter_status_policy.sv"
   `include "rdma_host_mem_api.sv"
-  `include "rdma_context_backing_api.sv"
-  `include "rdma_pcie_api.sv"
-  `include "rdma_function_table_api.sv"
   `include "rdma_net_api.sv"
 endpackage

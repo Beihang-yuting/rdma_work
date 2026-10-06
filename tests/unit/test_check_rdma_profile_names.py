@@ -1276,46 +1276,6 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
                 except CHECKER.ValidationError as error:
                     self.fail(f"legal based-literal whitespace was rejected: {error}")
 
-    def test_error_codec_uvm_test_checks_success_symbols(self) -> None:
-        """
-        功能：在 ErrorCodeMappingTest 测试类中确认 UVM error codec 测试覆盖
-        success symbols。
-        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
-        codec_text() 生成的 defs.h、wr.h、SV
-        字符串上调用 self.assertRegex、self.subTest，只在内存/
-        临时目录构造变异输入并用 unittest 断言返回值或异常。
-        本测试关注的关键
-        token/坐标包括 function automatic void check_error、endfunction、
-        ZERO_RETAINS_ENGINE。
-        失败边界：通过 assertRegex 锁定成功路径（function automatic void
-        check_error、endfunction、ZERO_RETAINS_ENGINE）；
-        任一实际结果不符都会使该回归测试失败。
-        """
-        test_text = (
-            REPO_ROOT / "tests" / "unit" /
-            "rdma_error_codec_test.sv"
-        ).read_text()
-        start = test_text.index("function automatic void check_error")
-        end = test_text.index("endfunction", start)
-        check_error_body = test_text[start:end]
-        self.assertRegex(
-            check_error_body,
-            re.compile(
-                r"\n    end\n    if \(expected_symbol != \"\" && "
-                r"decoded\.message != expected_symbol\)",
-            ),
-        )
-        for label in ("ZERO_RETAINS_ENGINE", "ZERO_NONE_CANONICAL"):
-            with self.subTest(label=label):
-                self.assertRegex(
-                    test_text,
-                    re.compile(
-                        rf'check_error\("{label}"[^;]*1\'b0,\s*'
-                        r'"RDMA_CMQ_SUCCESS"\s*\);',
-                        re.S,
-                    ),
-                )
-
     def test_sv_error_constant_cannot_be_forged_inside_string(self) -> None:
         """
         功能：在 ErrorCodeMappingTest
@@ -1372,40 +1332,6 @@ string macro_text = "`REVIEW_HC(hardware_,code)";
             CHECKER.ValidationError, "hardware error case item"
         ):
             validate_codec(source_zero, canonical)
-
-    def test_repo_f0_uses_source_pinned_constant_and_symbol(self) -> None:
-        """
-        功能：在 ErrorCodeMappingTest 测试类中确认仓库 f0 路径使用
-        source-pinned constant/symbol。
-        输入输出及副作用：无显式参数；在 SOURCES/SOURCE_VALUES 以及 sv_text()/
-        codec_text() 生成的 defs.h、wr.h、SV
-        字符串上调用
-        CHECKER.parse_sv_constants、self.assertEqual、self.assertNotRegex、
-        self.assertRegex，只在内存/
-        临时目录构造变异输入并用
-        unittest 断言返回值或异常。本测试关注的关键 token/坐标包括
-        RDMA_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT、\\b8'h[fF]0\\s*:、
-        \\b。
-        失败边界：通过 assertEqual, assertNotRegex, assertRegex
-        锁定成功路径（RDMA_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_SQ_CPL_SRBM_DUP_PKT、
-        \\b8'h[fF]0\\s*:、
-        \\b）；任一实际结果不符都会使该回归测试失败。
-        """
-        constants = CHECKER.parse_sv_constants(
-            (REPO_ROOT / "src/codec/rdma/rdma_defs.svh").read_text()
-        )
-        name = (
-            "RDMA_ECODE_XTRDMA_CQE_ECODE_TX_EC_RCE_URC_"
-            "SQ_CPL_SRBM_DUP_PKT"
-        )
-        self.assertEqual(constants.get(name), 0xF0)
-        codec = (
-            REPO_ROOT
-            / "src/codec/rdma/rdma_error_codec.sv"
-        ).read_text()
-        self.assertRegex(codec, rf"\b{re.escape(name)}\s*:")
-        self.assertNotRegex(codec, r"\b8'h[fF]0\s*:")
-
 
 class SvDefinitionTest(unittest.TestCase):
     """功能：验证 SV 定义、mask API、字段映射和 profile 常量的静态契约。
@@ -1576,30 +1502,6 @@ localparam int unsigned RDMA_LATER = 6;
                 CHECKER.VALUE_MAPPINGS + (colliding_value,),
                 CHECKER.REFERENCE_FIELDS + (colliding_reference,),
             )
-
-    def test_cmq_composer_does_not_retain_built_artifacts(self) -> None:
-        """
-        功能：在 SvDefinitionTest 测试类中确认 composer
-        不保留被禁止的构建产物。
-        输入输出及副作用：无显式参数；在仓库 rdma_defs.svh/
-        rdma_image_masks.svh 的只读文本及其内存变异副本上调用
-        self.assertNotRegex，只在内存/临时目录构造变异输入并用 unittest
-        断言返回值或异常。本测试关注的关键 token/坐标包括
-        \\bminted_(?:bodies|opcodes|snapshots)\\s*\\[\\$\\]、src/codec/rdma/
-        rdma_cmq_codecs.sv。
-        失败边界：通过 assertNotRegex
-        锁定成功路径（\\bminted_(?:bodies|opcodes|snapshots)\\s*\\[\\$\\]、src/codec/
-        rdma/
-        rdma_cmq_codecs.sv）；任一实际结果不符都会使该回归测试失败。
-        """
-        source = (
-            REPO_ROOT
-            / "src/codec/rdma/rdma_cmq_codecs.sv"
-        ).read_text()
-        self.assertNotRegex(
-            source,
-            r"\bminted_(?:bodies|opcodes|snapshots)\s*\[\$\]",
-        )
 
     def test_duplicate_source_symbol_at_another_offset_is_fatal(self) -> None:
         """

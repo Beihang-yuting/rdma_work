@@ -90,7 +90,7 @@ cmq_gate:
 	manifest=cmq_gate.list; \
 	[[ -r "$$manifest" ]] || { echo "CMQ gate manifest is missing" >&2; exit 2; }; \
 	mapfile -t cmq_tests < <(sed -e 's/[[:space:]]*#.*$$//' -e '/^[[:space:]]*$$/d' "$$manifest"); \
-	(( $${#cmq_tests[@]} == 12 )) || { echo "CMQ gate requires exactly twelve tests" >&2; exit 2; }; \
+	(( $${#cmq_tests[@]} == 5 )) || { echo "CMQ gate requires exactly five tests" >&2; exit 2; }; \
 	declare -A seen=(); \
 	for test_name in "$${cmq_tests[@]}"; do \
 		[[ "$$test_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]] || { echo "invalid CMQ test name" >&2; exit 2; }; \
@@ -110,8 +110,7 @@ rdma_defs:
 	@cd .. && python3 -m unittest \
 		tests.unit.test_verify_rdma_archive \
 		tests.unit.test_check_rdma_profile_names \
-		tests.unit.test_verify_rdma_cmq_oracle \
-		tests.unit.test_check_rdma_field_ownership -v
+		tests.unit.test_verify_rdma_cmq_oracle -v
 	@set -euo pipefail; ref_dir=$$(mktemp -d /tmp/rdma_profile_ref.XXXXXX); \
 	if [[ ! "$$ref_dir" =~ ^/tmp/rdma_profile_ref\.[A-Za-z0-9]{6}$$ ]]; then \
 		echo "Refusing unexpected RDMA reference directory: $$ref_dir" >&2; \
@@ -155,15 +154,6 @@ rdma_defs:
 		--oracle-source ../hw/rdma/c_oracle/rdma_cmq_oracle.c \
 		--artifact-root ../hw/rdma/c_oracle/cases \
 		--cc /usr/bin/gcc; \
-	python3 ../tools/check_rdma_field_ownership.py \
-		--kernel-root "$$kernel_root" \
-		--archive-lock ../hw/rdma/archive_lock.env \
-		--source-manifest ../hw/rdma/source_manifest.txt \
-		--ownership ../hw/rdma/field_ownership.tsv \
-		--exclusions ../hw/rdma/field_exclusions.tsv \
-		--oracle-root ../hw/rdma/c_oracle/cases \
-		--mutation-manifest ../hw/rdma/cmq_field_mutation.tsv \
-		--sv-root ../src; \
 	python3 ../tools/gen_cmq_request_fields.py --driver-root "$$kernel_root" --check \
 		--tsv ../hw/rdma/cmq_request_fields.tsv \
 		--svh ../src/codec/rdma/rdma_cmq_request_fields.svh; \

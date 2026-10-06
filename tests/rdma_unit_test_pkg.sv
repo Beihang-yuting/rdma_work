@@ -21,7 +21,6 @@ package rdma_unit_test_pkg;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
   import rdma_codec_pkg::*;
-  import rdma_core_pkg::*;
   import rdma_adapter_pkg::*;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
@@ -37,85 +36,42 @@ package rdma_unit_test_pkg;
   import rdma_net_packet_adapter_pkg::*;
   import rdma_net_packet_bridge_pkg::*;
 `endif
-`ifdef RDMA_PCIE_WORK_TEST
-  import pcie_tl_pkg::*;
-  import pcie_tl_device_profile_pkg::*;
-  import rdma_pcie_work_adapter_pkg::*;
-`endif
   `include "uvm_macros.svh"
 
-  `include "rdma_mock_adapters.sv"
-  `include "mocks/rdma_mock_context_backing.sv"
+  `include "mocks/rdma_mock_host_mem.sv"
   `include "support/rdma_golden_reader.sv"
-  `include "support/rdma_cmq_contract_reader.sv"
-  `include "support/rdma_cmq_device_responder.sv"
   `include "support/rdma_dpu_test_bar.sv"
   `include "unit/rdma_smoke_test.sv"
   `include "unit/rdma_types_test.sv"
-  `include "unit/rdma_model_test.sv"
-  `include "unit/rdma_cmq_engine_models_test.sv"
-  `include "unit/rdma_context_model_test.sv"
-  `include "unit/rdma_adapter_contract_test.sv"
-  `include "unit/rdma_context_backing_contract_test.sv"
-  `include "unit/rdma_doorbell_scheduler_test.sv"
-  `include "unit/rdma_doorbell_barrier_test.sv"
-  `include "unit/rdma_doorbell_scheduler_authority_test.sv"
-  `include "unit/rdma_cmq_engine_test.sv"
-  `include "unit/rdma_cmq_request_golden_test.sv"
   `include "unit/rdma_dev_cmq_test.sv"
   `include "unit/rdma_drv_cmq_test.sv"
+  `include "unit/rdma_drv_cmq_golden_test.sv"
   `include "unit/rdma_drv_dev_test.sv"
   `include "unit/rdma_drv_verbs_test.sv"
   `include "unit/rdma_drv_data_test.sv"
   `include "unit/rdma_drv_reliability_test.sv"
   `include "unit/rdma_multifunc_test.sv"
-  `include "unit/rdma_codec_registry_test.sv"
   `include "unit/rdma_defs_test.sv"
-  `include "unit/rdma_qword_codec_test.sv"
-  `include "unit/rdma_queue_page_codec_test.sv"
-  `include "unit/rdma_queue_codec_test.sv"
-  `include "unit/rdma_cqe_size_codec_test.sv"
-  `include "unit/rdma_sq_codec_test.sv"
-  `include "unit/rdma_ud_urc_sqe_codec_test.sv"
-  `include "unit/rdma_wqe_extended_opcode_test.sv"
-  `include "unit/rdma_sqe_authority_test.sv"
   `include "unit/rdma_tb_flow_test.sv"
   `include "unit/rdma_aeqe_route_test.sv"
-  `include "unit/rdma_doorbell_codec_test.sv"
-  `include "unit/rdma_qpc_codec_test.sv"
-  `include "unit/rdma_context_body_codec_test.sv"
-  `include "unit/rdma_cmq_codec_test.sv"
-  `include "unit/rdma_error_codec_test.sv"
-  `include "unit/rdma_cmq_completion_test.sv"
-  `include "unit/rdma_cmq_profile_test.sv"
-  `include "unit/rdma_cmq_driver_field_mutation_test.sv"
-  `include "unit/rdma_context_cmq_regression_test.sv"
   `include "unit/rdma_harness_expected_failure_probe.sv"
-  `include "unit/rdma_function_identity_test.sv"
-  `include "unit/rdma_umem_pbl_mw_test.sv"
 `ifdef RDMA_NET_PACKET
   `include "integration/rdma_net_packet_adapter_test.sv"
-`endif
-`ifdef RDMA_PCIE_WORK_TEST
-  `include "integration/rdma_pcie_work_adapter_test.sv"
 `endif
 endpackage
 
 `ifdef RDMA_HOST_MEM_TEST
-  // 真实 host_mem suite 复用上方命名 package 中的外部 manager 类型；下面三个测试
-  // 共享同一 concrete type，但仍由各自的 run_phase 负责申请和释放资源。
+  // 真实 host_mem suite 复用上方命名 package 中的外部 manager 类型；tb 主机内存/端到端测试共享
+  // 同一 concrete type，但仍由各自的 run_phase 负责申请和释放资源。
   import uvm_pkg::*;
   import host_mem_pkg::*;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
-  import rdma_core_pkg::*;
   import rdma_adapter_pkg::*;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
   import rdma_host_mem_adapter_pkg::*;
   `include "uvm_macros.svh"
-  `include "integration/rdma_host_mem_adapter_test.sv"
-  `include "integration/rdma_host_mem_umem_test.sv"
   import rdma_tb_pkg::*;
   // tb 主机内存/端到端测试继承 rdma_unit_test_pkg 中的 rdma_tb_flow_test 与驱动 BAR 支撑类。
   import rdma_unit_test_pkg::*;

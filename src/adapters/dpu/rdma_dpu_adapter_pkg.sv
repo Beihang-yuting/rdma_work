@@ -3,8 +3,7 @@
 // 职责：把 dpu_common 的逻辑设备配置接入 RDMA 驱动/设备模型：按 Host/PF/VF 声明生成
 //   dpu_device_cfg（BAR 请求取 dut_caps.bar_profiles），经 dpu_device_resolver 解析并冻结快照；
 //   把快照中每个 Function 投影为 host_id、global Function ID（驱动 QPC/PD 的 VF_ID）、BDF、BAR，
-//   以及 net_packet 用的 rdma_function_identity 与老模型层使用的 rdma_function_binding；驱动的
-//   MMIO 写按 BAR0 基址 + 偏移形成绝对地址，
+//   以及 net_packet 用的 rdma_function_identity；驱动的 MMIO 写按 BAR0 基址 + 偏移形成绝对地址，
 //   由快照 resolve_bar_address 解码到所属 Function 的设备。
 // 依赖：dpu_common（dpu_resource_pkg）、rdma_types/model、rdma_dev、rdma_drv。
 // 所有权：快照与 cfg 由调用方持有；Function 投影为值快照；路由器只借用设备引用。
@@ -15,7 +14,6 @@ package rdma_dpu_adapter_pkg;
   import dpu_resource_pkg::*;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
-  import rdma_codec_pkg::*;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
 
@@ -30,7 +28,7 @@ package rdma_dpu_adapter_pkg;
     dpu_bar_pair_lease_t mailbox;
     dpu_bar_pair_lease_t msix;
     dpu_pcie_function_id_t parent_pcie_id;
-    // 快照的 DUT 能力（binding 的队列能力上界）。
+    // 快照的 DUT 能力。
     dpu_dut_caps caps;
 
     // 功能：构造空投影。
@@ -73,60 +71,6 @@ package rdma_dpu_adapter_pkg;
       rkey.bdf = to_bdf(pcie_id);
       id = rdma_function_identity::type_id::create($sformatf("dpu_identity_%0d", global_id));
       return id.configure(rkey, global_id, uid(), 1, 0);
-    endfunction
-
-    // 功能：生成 rdma_function_binding：identity（见 identity()）、host_id、pfvf_id/rdma_vf_id =
-    //   global ID、三个 BAR 放在各自 even BAR 号、notify 窗口 = BAR0 + RDMA_NOTIFY_WINDOW_OFFSET
-    //   （驱动 doorbell）、queue DMA requester = BDF、DMA domain = PCIe segment（无 PASID）、队列
-    //   能力（dpu_common 无 RDMA 专用能力：CQ/SRQ 深度上界取 max_vio_net_qpairs_per_device，CEQ/AEQ
-    //   取 global_msix_vector_count，SGE 取驱动 RDMA_MAX_WQ_SGE，ring/SGB 字节取 BAR0 大小）。
-    //   state 保持 DISCOVERED，由使用者推进。
-    // 输入/输出及副作用：b 输出新对象。
-    // 失败/边界：identity 或 binding 校验失败返回其 status。
-    function rdma_status binding(output rdma_function_binding b);
-      rdma_function_identity id;
-      rdma_status status;
-
-      b = rdma_function_binding::type_id::create($sformatf("dpu_binding_%0d", global_id));
-      status = identity(id);
-      if (status.ok())
-        status = b.configure_identity(id);
-      if (!status.ok())
-        return status;
-      b.host_id = key.host_id;
-      b.pfvf_id = global_id;
-      b.rdma_vf_id = global_id;
-      set_bar(b, bar0);
-      set_bar(b, mailbox);
-      set_bar(b, msix);
-      b.notify_bar_id = bar0.even_bar_id;
-      b.notify_base.value = bar0.base + RDMA_NOTIFY_WINDOW_OFFSET;
-      b.notify_size = RDMA_NOTIFY_WINDOW_SIZE;
-      b.queue_dma.requester_bdf = to_bdf(pcie_id);
-      b.queue_dma.pasid_valid = 1'b0;
-      b.queue_dma.pasid = '0;
-      b.queue_dma.dma_domain_valid = 1'b1;
-      b.queue_dma.dma_domain_id = pcie_id.domain.segment_id;
-      b.queue_caps.min_cq_depth = 1;
-      b.queue_caps.max_cq_depth = caps.max_vio_net_qpairs_per_device;
-      b.queue_caps.min_srq_depth = 1;
-      b.queue_caps.max_srq_depth = caps.max_vio_net_qpairs_per_device;
-      b.queue_caps.max_ceq_depth = caps.global_msix_vector_count;
-      b.queue_caps.max_aeq_depth = caps.global_msix_vector_count;
-      b.queue_caps.max_wq_sge = RDMA_MAX_WQ_SGE;
-      b.queue_caps.max_queue_ring_bytes = bar0.size;
-      b.queue_caps.max_sgb_bytes = bar0.size;
-      return b.validate();
-    endfunction
-
-    // 功能：把一个 BAR 租约写入 binding 的 pcie.bar[even_bar_id]。
-    // 输入/输出及副作用：修改 b.pcie。
-    // 失败/边界：无。
-    static function void set_bar(rdma_function_binding b, dpu_bar_pair_lease_t lease);
-      b.pcie.bar[lease.even_bar_id].bar_id = lease.even_bar_id;
-      b.pcie.bar[lease.even_bar_id].base.value = lease.base;
-      b.pcie.bar[lease.even_bar_id].size = lease.size;
-      b.pcie.bar[lease.even_bar_id].enabled = 1'b1;
     endfunction
 
     // 功能：dpu_common PCIe ID → RDMA BDF。

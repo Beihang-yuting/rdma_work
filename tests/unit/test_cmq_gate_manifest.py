@@ -36,7 +36,7 @@ class CmqGateManifestTest(unittest.TestCase):
     def test_gate_list_is_unique_and_registered(self):
         rows = gate_tests()
         self.assertEqual(len(rows), len(set(rows)))
-        self.assertIn("rdma_cmq_engine_test", rows)
+        self.assertIn("rdma_drv_cmq_golden_test", rows)
         missing = sorted(set(rows) - registered_tests())
         self.assertEqual(missing, [])
 

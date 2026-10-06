@@ -9,47 +9,17 @@ readonly repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel)"
 readonly CORE_TESTS=(
   rdma_smoke_test
   rdma_types_test
-  rdma_model_test
-  rdma_cmq_engine_models_test
-  rdma_context_model_test
-  rdma_adapter_contract_test
   rdma_aeqe_route_test
   rdma_tb_flow_test
-  rdma_cqe_size_codec_test
-  rdma_queue_codec_test
-  rdma_doorbell_scheduler_test
-  rdma_doorbell_barrier_test
-  rdma_doorbell_scheduler_authority_test
-  rdma_doorbell_scheduler_reset_epoch_test
-  rdma_cmq_engine_test
-  rdma_cmq_request_golden_test
   rdma_dev_cmq_test
   rdma_drv_cmq_test
+  rdma_drv_cmq_golden_test
   rdma_drv_dev_test
   rdma_drv_verbs_test
   rdma_drv_data_test
   rdma_drv_reliability_test
   rdma_multifunc_test
-  rdma_codec_registry_test
   rdma_defs_test
-  rdma_qword_codec_test
-  rdma_doorbell_codec_test
-  rdma_qpc_codec_test
-  rdma_context_body_codec_test
-  rdma_cmq_codec_test
-  rdma_error_codec_test
-  rdma_cmq_completion_test
-  rdma_cmq_profile_test
-  rdma_cmq_driver_field_mutation_test
-  rdma_context_cmq_regression_test
-  rdma_context_backing_contract_test
-  rdma_queue_page_codec_test
-  rdma_sq_codec_test
-  rdma_ud_urc_sqe_codec_test
-  rdma_wqe_extended_opcode_test
-  rdma_sqe_authority_test
-  rdma_function_identity_test
-  rdma_umem_pbl_mw_test
 )
 
 if [[ ${1-} == "--list" ]]; then

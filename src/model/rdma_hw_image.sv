@@ -78,3 +78,24 @@ class rdma_hw_image extends uvm_object;
     field_summary = rhs_image.field_summary;
   endfunction
 endclass
+
+// 硬件格式模型基类（CMQ 字段 body 等派生）。
+virtual class rdma_hw_model extends uvm_object;
+
+  // 功能：构造 hw model 基类对象。
+  // 输入/输出及副作用：name 为对象名。
+  // 失败/边界：无。
+  function new(string name = "rdma_hw_model");
+    super.new(name);
+  endfunction
+
+  // 功能：校验 context 模型字段与状态一致性（由各派生类实现）。
+  // 输入/输出及副作用：只读；返回 rdma_status。
+  // 失败/边界：不一致时返回 INVALID_ARGUMENT/INVALID_STATE，不修改模型。
+  pure virtual function rdma_status validate();
+
+  // 功能：返回 context 模型的稳定文本描述（由各派生类实现）。
+  // 输入/输出及副作用：只读；返回 string。
+  // 失败/边界：无。
+  pure virtual function string describe();
+endclass
