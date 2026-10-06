@@ -167,6 +167,7 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 | v31 | 9011339 | 全部通过：响应超时按 QPC RTO_CODE 换算 |
 | v32 | 131140d | 全部通过：dpu_common 接入（Function 身份与 BAR 由快照生成，BAR0 绝对地址解码），所有 suite 依赖 DPU_COMMON_ROOT |
 | v33 | 89a7fd3 | 全部通过：驱动层单元测试改用 dpu_common（rdma_dpu_test_bar 取代 rdma_drv_dev_bar） |
+| v34 | 914e68e | 全部通过：老模型层基线 binding（cmq_engine/golden、doorbell 系列、adapter_contract）由 dpu_common 快照投影 |
 
 假设与未建模：URC 每个完成都发 CEQE（驱动源码未说明硬件是否依赖 arm）；URC 异常经 CEQE
 或 AEQE（设备开关二选一，硬件选择未知）；RTO_CODE → 超时时长按驱动 xtrdma_rto_code_map 的逆推定
