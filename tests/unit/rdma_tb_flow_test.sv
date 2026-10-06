@@ -1,7 +1,7 @@
 // 目录：单元测试层 unit/rdma_tb_flow_test.sv。
 // 层：单元测试。
 // 职责：两节点 seq → 驱动模型 → 设备模型 → 报文 → 内存全流程：每节点一个设备模型（rdma_dev）与
-//   经 BAR/CMQ probe 的驱动模型（PD、CQ、RC/UD QP、覆盖 64KiB 数据缓冲的 MR），rdma_tb_env
+//   经 BAR/CMQ probe 的驱动模型（PD、CQ、RC/UD/URC QP、覆盖 64KiB 数据缓冲的 MR），rdma_tb_env
 //   （verb agent + wire + 记分板）运行 rdma_tb_traffic_vseq，记分板判定完成与内存逐字节一致。
 //   主机与设备之间只经 CMQ、MMIO doorbell 与 DMA 交互。
 // 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem、rdma_tb_pkg。
@@ -102,9 +102,14 @@ class rdma_tb_flow_test extends uvm_test;
     expect_ok("alloc PD", rdma_drv_pd::alloc(cfg.drv, pd));
     rdma_drv_cq::create_cq(cfg.drv, 256, 0, cfg.cq, status);
     expect_ok("create CQ", status);
-    // qp_index 0/1 = RC/UD，与对端同索引 QP 互连。
-    add_qp(cfg, pd, RDMA_DRV_QPT_RC, n);
-    add_qp(cfg, pd, RDMA_DRV_QPT_UD, n);
+    // qp_index 0/1/2 = RC/UD/URC，与对端同索引 QP 互连；URC 用专属 CQ（rc_to_urc 下创建 RC QP）。
+    add_qp(cfg, pd, RDMA_DRV_QPT_RC, n, cfg.cq);
+    add_qp(cfg, pd, RDMA_DRV_QPT_UD, n, cfg.cq);
+    rdma_drv_cq::create_cq(cfg.drv, 256, 0, cfg.urc_cq, status);
+    expect_ok("create URC CQ", status);
+    cfg.drv.cfg.rc_to_urc = 1'b1;
+    add_qp(cfg, pd, RDMA_DRV_QPT_RC, n, cfg.urc_cq);
+    cfg.drv.cfg.rc_to_urc = 1'b0;
     expect_ok("alloc data buffer", hw.alloc_dma(DATA_MR_BYTES, 4096, cfg.data_buf));
     for (int unsigned i = 0; i < DATA_MR_BYTES / 4096; i++)
       pages.push_back(cfg.data_buf.iova + i * 4096);
@@ -113,11 +118,11 @@ class rdma_tb_flow_test extends uvm_test;
     expect_ok("reg data MR", status);
   endtask
 
-  // 功能：创建一个 QP 并登记为与对端节点同索引 QP 互连。
+  // 功能：创建一个 QP（收发都用 cq）并登记为与对端节点同索引 QP 互连。
   // 输入/输出及副作用：追加 cfg.qps。
   // 失败/边界：失败报 UVM_FATAL。
   task automatic add_qp(rdma_tb_node_cfg cfg, rdma_drv_pd pd, rdma_drv_qp_type_e qp_type,
-                        int unsigned n);
+                        int unsigned n, rdma_drv_cq cq);
     rdma_drv_qp_init_attr attr;
     rdma_tb_qp_link link;
     rdma_status status;
@@ -125,8 +130,8 @@ class rdma_tb_flow_test extends uvm_test;
     attr = rdma_drv_qp_init_attr::type_id::create("tb_qp_attr");
     attr.qp_type = qp_type;
     attr.pd = pd;
-    attr.send_cq = cfg.cq;
-    attr.recv_cq = cfg.cq;
+    attr.send_cq = cq;
+    attr.recv_cq = cq;
     attr.max_send_sge = 4;
     attr.max_recv_sge = 4;
     attr.max_send_wr = qp_depth;

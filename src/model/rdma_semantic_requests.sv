@@ -1501,6 +1501,26 @@ class rdma_packet extends uvm_object;
            segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY};
   endfunction
 
+  // 功能：按 opcode/segment 计算扩展头总长度（与 pack_headers 一致）。
+  // 输入/输出及副作用：只读 opcode/segment。
+  // 失败/边界：无。
+  function int unsigned header_length();
+    int unsigned n;
+
+    n = 0;
+    if (has_reth())
+      n += 16;
+    if (has_aeth())
+      n += 4;
+    if (has_atomic_eth())
+      n += 28;
+    if (opcode == RDMA_NET_ATOMIC_ACK)
+      n += 8;
+    if (has_immdt())
+      n += 4;
+    return n;
+  endfunction
+
   // 功能：按 IBTA 顺序把结构化扩展头序列化为 header_bytes（大端）。
   // 输入/输出及副作用：覆盖 header_bytes。
   // 失败/边界：无；不携带的头不输出。

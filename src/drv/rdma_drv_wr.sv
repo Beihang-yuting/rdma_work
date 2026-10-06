@@ -278,6 +278,10 @@ class rdma_drv_wr extends uvm_object;
       fill_rc(wqe, wr, sge_num, payload);
     else
       fill_ud(wqe, qp, wr, sge_num, payload);
+    // wr.c:239 URC 的 READ 走 SGB 时在 0x28 带总包数 sum(ceil(len/PMTU))。
+    if (qp.urc && wr.opcode == RDMA_DRV_WR_READ && use_sgb) begin
+      `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_URC_TOTAL_PKT_NUM, urc_read_packets(qp, wr))
+    end
     if (idx == 0)
       qp.sq_polarity = !qp.sq_polarity;
     ce = 0;
@@ -309,6 +313,21 @@ class rdma_drv_wr extends uvm_object;
     qp.sq_ring_head[idx] = qp.sq_head;
     notify_sq_db(dev, qp, hdr, status);
   endtask
+
+  // 功能：URC READ 的总包数：各非零 SGE 的 ceil(len / PMTU) 之和，PMTU = 1 << (QPC PMTU + 8)。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：无。
+  static function int unsigned urc_read_packets(rdma_drv_qp qp, rdma_drv_send_wr wr);
+    int unsigned pmtu;
+    int unsigned n;
+
+    pmtu = 1 << (rdma_be::field(qp.qpc, RDMA_QPC_PMTU_WORD_BYTE_OFFSET, RDMA_QPC_PMTU_LSB,
+                                RDMA_QPC_PMTU_WIDTH) + 8);
+    n = 0;
+    foreach (wr.sges[i])
+      n += (wr.sges[i].length + pmtu - 1) / pmtu;
+    return n;
+  endfunction
 
   // 功能：xtrdma_set_rc_wqe：按 opcode 写 RC 字段（长度/立即数、SGE 数、远端 VA/KEY、原子操作数）。
   // 输入/输出及副作用：修改 wqe。
@@ -579,6 +598,10 @@ class rdma_drv_wr extends uvm_object;
     bit move_ci;
 
     status = rdma_status::success();
+    if (cq.urc_flag) begin
+      urc_poll_cq(dev, cq, max_wc, wcs, status);
+      return;
+    end
     n = 0;
     moved = 1'b0;
     while (n < max_wc) begin
@@ -665,6 +688,229 @@ class rdma_drv_wr extends uvm_object;
       status = cq.update_shadow_ci(dev);
   endtask
 
+  // 功能：URC frag 的 CEQE（event.c:450-522）：ECODE 为 0x08/0x8F 时按 SQ/RQ_CEQE_VLD 置 flush 标志
+  //   （byte0 bit0/1）；否则 ce_urc_process：URC_ARM_SN 加一并把 CEQE 字节 12..15（HW_CPL SQ/RQ
+  //   下标与 wrap）复制到信息区 +12。异常（ABNML）CEQE 未建模。
+  // 输入/输出及副作用：写 frag 的 URC 信息区。
+  // 失败/边界：读写失败返回错误。
+  static function rdma_status urc_ceqe(rdma_drv_dev dev, rdma_drv_cq frag, rdma_bytes_t ceqe);
+    rdma_bytes_t info;
+    rdma_status status;
+    bit [7:0] ecode;
+
+    status = frag.read_urc_info(dev, info);
+    if (!status.ok())
+      return status;
+    ecode = rdma_be::field(ceqe, RDMA_CEQE_ECODE_WORD_BYTE_OFFSET, RDMA_CEQE_ECODE_LSB,
+                           RDMA_CEQE_ECODE_WIDTH);
+    if (ecode inside {RDMA_ECODE_EC_TPE_QP_FLUSH, RDMA_ECODE_EC_RPE_RX_FLUSH}) begin
+      if (rdma_be::field(ceqe, RDMA_CEQE_URC_SQ_CQE_VALID_WORD_BYTE_OFFSET,
+                         RDMA_CEQE_URC_SQ_CQE_VALID_LSB, 1))
+        info[0][0] = 1'b1;
+      if (rdma_be::field(ceqe, RDMA_CEQE_URC_RQ_CQE_VALID_WORD_BYTE_OFFSET,
+                         RDMA_CEQE_URC_RQ_CQE_VALID_LSB, 1))
+        info[0][1] = 1'b1;
+    end
+    else begin
+      info[0][7:6] = info[0][7:6] + 1;
+      for (int i = 12; i < 16; i++)
+        info[i] = ceqe[i];
+    end
+    return frag.write_urc_info(dev, info);
+  endfunction
+
+  // 功能：xtrdma_urc_poll_cq：从 urc_cur_polled 起轮流轮询原始 CQ 的各 frag，直到取够或转一圈。
+  // 输入/输出及副作用：wcs 追加完成；推进各 frag/QP 软件状态。
+  // 失败/边界：frag 轮询错误即返回。
+  static task urc_poll_cq(rdma_drv_dev dev, rdma_drv_cq cq, int unsigned max_wc,
+                          inout rdma_drv_wc wcs[$], output rdma_status status);
+    int unsigned n_before;
+    int unsigned k;
+
+    status = rdma_status::success();
+    n_before = wcs.size();
+    for (int unsigned step = 0; step < cq.frags.size() && wcs.size() - n_before < max_wc; step++) begin
+      k = (cq.urc_cur_polled + step) % cq.frags.size();
+      urc_poll_frag(dev, cq.frags[k], max_wc - (wcs.size() - n_before), wcs, status);
+      if (!status.ok())
+        return;
+    end
+    if (cq.frags.size() != 0)
+      cq.urc_cur_polled = (cq.urc_cur_polled + 1) % cq.frags.size();
+  endtask
+
+  // 功能：_xtrdma_urc_poll_cq（一个 frag）：先 SQ 后 RQ。SQ 完成全部由 SQ WQE 合成：HW_CPL 之前的
+  //   WQE 按 CE 生成成功完成（未 signaled 的只推进），flush 后其余 WQE 生成 FLUSH 完成；RQ 完成读
+  //   frag 中 start + RQ 下标处的 CQE（polarity = recv_vld，环回绕翻转），flush 后其余 RQE 生成
+  //   FLUSH。最后把软件完成位置写入信息区 +4（SW_CPL）。
+  // 输入/输出及副作用：wcs 追加；推进 QP 与 frag 环。
+  // 失败/边界：HW 完成数超过环大小返回 INVALID_STATE。
+  static task urc_poll_frag(rdma_drv_dev dev, rdma_drv_cq frag, int unsigned max_wc,
+                            inout rdma_drv_wc wcs[$], output rdma_status status);
+    rdma_bytes_t info;
+    bit [31:0] hw_cpl;
+    bit [31:0] sw_cpl;
+    int unsigned got;
+
+    status = frag.read_urc_info(dev, info);
+    if (!status.ok())
+      return;
+    hw_cpl = {info[12], info[13], info[14], info[15]};
+    got = 0;
+    if (frag.send_flag && dev.qp_table.exists(frag.send_qpn))
+      urc_poll_sq(dev, frag, dev.qp_table[frag.send_qpn], hw_cpl[31:16], info[0][0], max_wc,
+                  wcs, got, status);
+    if (status.ok() && frag.recv_flag && dev.qp_table.exists(frag.recv_qpn))
+      urc_poll_rq(dev, frag, dev.qp_table[frag.recv_qpn], hw_cpl[15:0], info[0][1], max_wc,
+                  wcs, got, status);
+    if (!status.ok())
+      return;
+    sw_cpl = '0;
+    sw_cpl[31] = (frag.send_tail / (frag.send_size == 0 ? 1 : frag.send_size)) & 1;
+    sw_cpl[30:16] = frag.send_size == 0 ? 0 : frag.send_tail % frag.send_size;
+    sw_cpl[15] = (frag.recv_tail / (frag.recv_size == 0 ? 1 : frag.recv_size)) & 1;
+    sw_cpl[14:0] = frag.recv_size == 0 ? 0 : frag.recv_tail % frag.recv_size;
+    for (int i = 0; i < 4; i++)
+      info[4 + i] = sw_cpl[31 - 8 * i -: 8];
+    status = frag.write_urc_info(dev, info);
+  endtask
+
+  // 功能：环上已由硬件完成的个数：hw 为 {wrap, idx[14:0]}，ring_tail 为软件完成计数。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：同圈且 hw < 软件位置时返回 size+1（调用方视为错误）。
+  static function int unsigned urc_ready(bit [15:0] hw, longint unsigned ring_tail,
+                                         int unsigned size);
+    int unsigned ci;
+    bit ci_wrap;
+
+    ci = ring_tail % size;
+    ci_wrap = (ring_tail / size) & 1;
+    if (hw[15] == ci_wrap) begin
+      if (hw[14:0] < ci)
+        return size + 1;
+      return hw[14:0] - ci;
+    end
+    return size - ci + hw[14:0];
+  endfunction
+
+  // 功能：xtrdma_urc_poll_send_cqe：见 urc_poll_frag。
+  // 输入/输出及副作用：wcs 追加，got 计数；推进 qp.sq_tail 与 frag.send_tail。
+  // 失败/边界：完成数越界返回 INVALID_STATE。
+  static task urc_poll_sq(rdma_drv_dev dev, rdma_drv_cq frag, rdma_drv_qp qp, bit [15:0] hw,
+                          bit flush, int unsigned max_wc, inout rdma_drv_wc wcs[$],
+                          inout int unsigned got, output rdma_status status);
+    rdma_bytes_t wqe;
+    rdma_drv_wc wc;
+    int unsigned cnt;
+    int unsigned total;
+    int unsigned idx;
+
+    status = rdma_status::success();
+    cnt = urc_ready(hw, frag.send_tail, frag.send_size);
+    if (cnt > frag.send_size) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE, "URC SQ completion index is invalid");
+      return;
+    end
+    total = flush ? qp.sq_head - qp.sq_tail : cnt;
+    for (int unsigned k = 0; k < total && got < max_wc; k++) begin
+      idx = qp.sq_tail % qp.sq_depth;
+      if (k < cnt) begin
+        status = qp.sq_kbuf.read(dev.hw, idx * RDMA_WQE_BYTES, RDMA_WQE_BYTES, wqe);
+        if (!status.ok())
+          return;
+        frag.send_tail++;
+        qp.sq_tail++;
+        if (!qp.sig_all &&
+            rdma_be::field(wqe, RDMA_SQ_WQE_CE_WORD_BYTE_OFFSET, RDMA_SQ_WQE_CE_LSB,
+                           RDMA_SQ_WQE_CE_WIDTH) == 0)
+          continue;
+        wc = urc_wc(qp, qp.sq_wr_id[idx], 1'b0, RDMA_DRV_WC_SUCCESS, 8'h00);
+        wc.byte_len = rdma_be::field(wqe, RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN_WORD_BYTE_OFFSET,
+                                     RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN_LSB,
+                                     RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN_WIDTH);
+      end
+      else begin
+        qp.sq_tail++;
+        wc = urc_wc(qp, qp.sq_wr_id[idx], 1'b0, RDMA_DRV_WC_FLUSH_ERR,
+                    RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR);
+      end
+      wcs.push_back(wc);
+      got++;
+    end
+  endtask
+
+  // 功能：xtrdma_urc_poll_recv_cqe：见 urc_poll_frag。
+  // 输入/输出及副作用：wcs 追加，got 计数；推进 qp.rq_tail、frag.recv_tail 与 recv_vld。
+  // 失败/边界：完成数越界返回 INVALID_STATE；CQE polarity 未到时停止。
+  static task urc_poll_rq(rdma_drv_dev dev, rdma_drv_cq frag, rdma_drv_qp qp, bit [15:0] hw,
+                          bit flush, int unsigned max_wc, inout rdma_drv_wc wcs[$],
+                          inout int unsigned got, output rdma_status status);
+    rdma_bytes_t cqe;
+    rdma_drv_wc wc;
+    bit [7:0] ecode;
+    int unsigned cnt;
+    int unsigned total;
+    int unsigned idx;
+
+    status = rdma_status::success();
+    cnt = urc_ready(hw, frag.recv_tail, frag.recv_size);
+    if (cnt > frag.recv_size) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE, "URC RQ completion index is invalid");
+      return;
+    end
+    total = flush ? qp.rq_head - qp.rq_tail : cnt;
+    for (int unsigned k = 0; k < total && got < max_wc; k++) begin
+      idx = qp.rq_tail % qp.rq_depth;
+      if (k < cnt) begin
+        status = frag.mem_kbuf.read(dev.hw, (frag.start_idx + idx % frag.recv_size) *
+                                    rdma_drv_cq::CQE_BYTES, rdma_drv_cq::CQE_BYTES, cqe);
+        if (!status.ok())
+          return;
+        if (cqe[0][7] != frag.recv_vld)
+          break;
+        ecode = rdma_be::field(cqe, RDMA_CQE_ECODE_WORD_BYTE_OFFSET, RDMA_CQE_ECODE_LSB,
+                               RDMA_CQE_ECODE_WIDTH);
+        wc = urc_wc(qp, qp.rq_wr_id[rdma_be::field(cqe, RDMA_CQE_WQE_INDEX_WORD_BYTE_OFFSET,
+                                                   RDMA_CQE_WQE_INDEX_LSB,
+                                                   RDMA_CQE_WQE_INDEX_WIDTH) % qp.rq_depth],
+                    1'b1, ecode == 8'h00 ? RDMA_DRV_WC_SUCCESS : RDMA_DRV_WC_GENERAL_ERR, ecode);
+        wc.byte_len = rdma_be::field(cqe, RDMA_CQE_PAYLOAD_LEN_WORD_BYTE_OFFSET,
+                                     RDMA_CQE_PAYLOAD_LEN_LSB, RDMA_CQE_PAYLOAD_LEN_WIDTH);
+        wc.imm = rdma_be::field(cqe, RDMA_CQE_IMMDT_DATA_WORD_BYTE_OFFSET,
+                                RDMA_CQE_IMMDT_DATA_LSB, RDMA_CQE_IMMDT_DATA_WIDTH);
+        wc.pkt_opcode = rdma_be::field(cqe, RDMA_CQE_PKT_OPCODE_WORD_BYTE_OFFSET,
+                                       RDMA_CQE_PKT_OPCODE_LSB, RDMA_CQE_PKT_OPCODE_WIDTH);
+        frag.recv_tail++;
+        if (frag.recv_tail % frag.recv_size == 0)
+          frag.recv_vld = !frag.recv_vld;
+      end
+      else begin
+        wc = urc_wc(qp, qp.rq_wr_id[idx], 1'b1, RDMA_DRV_WC_FLUSH_ERR,
+                    RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR);
+      end
+      qp.rq_tail++;
+      wcs.push_back(wc);
+      got++;
+    end
+  endtask
+
+  // 功能：新建一个 URC 完成。
+  // 输入/输出及副作用：返回新对象。
+  // 失败/边界：无。
+  static function rdma_drv_wc urc_wc(rdma_drv_qp qp, longint unsigned wr_id, bit is_recv,
+                                     rdma_drv_wc_status_e st, bit [7:0] ecode);
+    rdma_drv_wc wc;
+
+    wc = rdma_drv_wc::type_id::create("urc_wc");
+    wc.wr_id = wr_id;
+    wc.is_recv = is_recv;
+    wc.status = st;
+    wc.vendor_err = ecode;
+    wc.qpn = qp.qpn;
+    wc.src_qp = qp.qpn;
+    return wc;
+  endfunction
+
   // 功能：xtrdma_process_ceq：取有效 CEQE（bit63 与当前圈 polarity 一致），记录 CQN 并递增该 CQ 的
   //   arm_sn（ce_handler），推进 CI（回绕翻转），每条敲 CEQ doorbell（CI_WRAP|CI|CEQN）。
   // 输入/输出及副作用：cqns 追加完成通知的 CQN；更新 EQ/CQ 软件状态与 doorbell。
@@ -682,9 +928,19 @@ class rdma_drv_wr extends uvm_object;
         return;
       cqn = rdma_be::field(ceqe, RDMA_CEQE_CQN_WORD_BYTE_OFFSET, RDMA_CEQE_CQN_LSB,
                            RDMA_CEQE_CQN_WIDTH);
-      cqns.push_back(cqn);
-      if (dev.cq_table.exists(cqn))
-        dev.cq_table[cqn].arm_sn++;
+      if (dev.cq_table.exists(cqn) && dev.cq_table[cqn].original != null) begin
+        // URC frag：flush CEQE 置 flush 标志，否则把 HW 完成下标复制进 URC 信息区；
+        //   完成通知交给原始 CQ（event.c:465-522）。
+        status = urc_ceqe(dev, dev.cq_table[cqn], ceqe);
+        if (!status.ok())
+          return;
+        cqns.push_back(dev.cq_table[cqn].original.cqn);
+      end
+      else begin
+        cqns.push_back(cqn);
+        if (dev.cq_table.exists(cqn))
+          dev.cq_table[cqn].arm_sn++;
+      end
       eq.tail++;
       if (eq.tail % eq.entries == 0)
         eq.polarity = !eq.polarity;

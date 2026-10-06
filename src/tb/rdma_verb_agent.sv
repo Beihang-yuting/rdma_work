@@ -180,18 +180,26 @@ class rdma_verb_monitor extends uvm_monitor;
     cqe_ap = new("cqe_ap", this);
   endfunction
 
-  // 功能：持续经驱动 poll_cq 轮询节点 CQ，把每个完成转换为 rdma_verb_completion 广播。
-  // 输入/输出及副作用：消费 CQE（推进驱动的 SQ/RQ 尾与 CQ shadow CI）；永久循环。
-  // 失败/边界：无完成时等待 poll_interval；轮询失败报 UVM_ERROR。
+  // 功能：持续处理节点 CEQ（模拟中断处理，URC 完成经 CEQE 上报）并经驱动 poll_cq 轮询节点 CQ 与
+  //   URC CQ，把每个完成转换为 rdma_verb_completion 广播。
+  // 输入/输出及副作用：消费 CEQE/CQE（推进驱动的 EQ/SQ/RQ/CQ 软件状态）；永久循环。
+  // 失败/边界：无完成时等待 poll_interval；处理失败报 UVM_ERROR。
   task run_phase(uvm_phase phase);
     rdma_drv_wc wcs[$];
-    rdma_verb_completion done;
+    int unsigned cqns[$];
     rdma_status status;
 
     wait (cfg != null);
     forever begin
       wcs.delete();
+      cqns.delete();
+      rdma_drv_wr::process_ceq(cfg.drv, cfg.drv.ceqs[0], cqns, status);
+      if (!status.ok())
+        `uvm_error("RDMA_MON", $sformatf("node %0d CEQ failed: %s", cfg.node_id,
+                   status.convert2string()))
       rdma_drv_wr::poll_cq(cfg.drv, cfg.cq, 1, wcs, status);
+      if (status.ok() && wcs.size() == 0 && cfg.urc_cq != null)
+        rdma_drv_wr::poll_cq(cfg.drv, cfg.urc_cq, 1, wcs, status);
       if (!status.ok())
         `uvm_error("RDMA_MON", $sformatf("node %0d CQ poll failed: %s", cfg.node_id,
                    status.convert2string()))
@@ -199,19 +207,28 @@ class rdma_verb_monitor extends uvm_monitor;
         #(cfg.poll_interval);
         continue;
       end
-      done = rdma_verb_completion::type_id::create("completion");
-      done.node_id = cfg.node_id;
-      done.wr_id = wcs[0].wr_id;
-      done.rq = wcs[0].is_recv;
-      done.ok = wcs[0].status == RDMA_DRV_WC_SUCCESS;
-      done.ecode = wcs[0].vendor_err;
-      done.byte_len = wcs[0].byte_len;
-      done.imm = wcs[0].imm;
-      seen[done.wr_id] = done;
-      ->seen_event;
-      cqe_ap.write(done);
+      publish(wcs[0]);
     end
   endtask
+
+  // 功能：把一个驱动完成转换为 rdma_verb_completion，记录并广播。
+  // 输入/输出及副作用：更新 seen，触发 seen_event，写 analysis 端口。
+  // 失败/边界：无。
+  protected function void publish(rdma_drv_wc wc);
+    rdma_verb_completion done;
+
+    done = rdma_verb_completion::type_id::create("completion");
+    done.node_id = cfg.node_id;
+    done.wr_id = wc.wr_id;
+    done.rq = wc.is_recv;
+    done.ok = wc.status == RDMA_DRV_WC_SUCCESS;
+    done.ecode = wc.vendor_err;
+    done.byte_len = wc.byte_len;
+    done.imm = wc.imm;
+    seen[done.wr_id] = done;
+    ->seen_event;
+    cqe_ap.write(done);
+  endfunction
 
   // 功能：等待指定 wr_id 的完成出现。
   // 输入/输出及副作用：阻塞至多 timeout。

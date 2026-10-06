@@ -200,6 +200,8 @@ class rdma_drv_cq extends uvm_object;
 
   localparam int unsigned CQE_BYTES = 32;
   localparam int unsigned MIN_CQE = 512;
+  // URC 信息区在 CQC 槽中的偏移（与普通 CQ shadow 同址，cq.h:33）。
+  localparam int unsigned URC_INFO_OFFSET = 48;
 
   int unsigned cqn;
   int unsigned size;
@@ -213,6 +215,25 @@ class rdma_drv_cq extends uvm_object;
   bit ci_wrap;
   int unsigned arm_sn;
   int unsigned last_arm_st;
+  // URC（cq.h urc_cq_info）。原始 CQ：frag 列表、按 CQE 槽的 frag 占用图与轮询游标；
+  //   urc_flag 置位后 poll 只遍历 frag。frag CQ：共享原始缓冲，自 start_idx 起占槽；
+  //   send/recv 环（大小 = SQ/RQ 深度）记录软件已完成位置，recv_vld 为 RQ CQE 有效 polarity。
+  bit urc_flag;
+  rdma_drv_cq frags[$];
+  bit frag_bm[];
+  int unsigned urc_cur_polled;
+  rdma_drv_cq original;
+  int unsigned start_idx;
+  int unsigned slots;
+  bit send_flag;
+  bit recv_flag;
+  int unsigned send_qpn;
+  int unsigned recv_qpn;
+  int unsigned send_size;
+  int unsigned recv_size;
+  longint unsigned send_tail;
+  longint unsigned recv_tail;
+  bit recv_vld;
 
   // 功能：构造 CQ。
   // 输入/输出及副作用：name 为 UVM 对象名。
@@ -225,6 +246,43 @@ class rdma_drv_cq extends uvm_object;
     ci_wrap = 1'b0;
     arm_sn = 0;
     last_arm_st = RDMA_CQC_ARM_ST_NO_EVENT;
+    urc_flag = 1'b0;
+    urc_cur_polled = 0;
+    original = null;
+    start_idx = 0;
+    send_flag = 1'b0;
+    recv_flag = 1'b0;
+    send_tail = 0;
+    recv_tail = 0;
+    recv_vld = 1'b1;
+  endfunction
+
+  // 功能：init_cq 的 CQC_CREATE SQE（56B CQC 在 SQE 字节 8 起）：尺寸、状态、当前/下一 PBA、CI 门限、
+  //   OM、LAST_ARM_SN、CEQN、shadow 地址；frag CQ 另带 URC_CQ_START_IDX（覆盖 CQ_PI）。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：无。
+  static function rdma_bytes_t cqc_sqe(int unsigned cqn, int unsigned size, bit [63:0] pba,
+                                       int unsigned om, int unsigned ceqn, bit [63:0] ctx_iova,
+                                       int unsigned start);
+    rdma_bytes_t sqe;
+
+    sqe = rdma_drv_cmq::new_sqe(RDMA_OP_CQC_CREATE);
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQN, cqn)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQ_SIZE, $clog2(size))
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQ_ST, RDMA_CQC_ST_VALID)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CUR_PBA_VLD, 1)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CUR_CQ_PD_PBA, pba)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_NXT_CQ_PD_PBA_H, pba >> 44)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_NXT_CQ_PD_PBA_L, pba)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_LOAD_CQ_CI_DONE, 1)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_LOAD_CQ_CI_TH, 2)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQ_OM, om)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_NXT_PBA_VLD, 1)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_URC_CQ_START_IDX, start)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_LAST_ARM_SN, 1)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CEQN, ceqn)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_SHADOW_PA, ctx_iova >> 6)
+    return sqe;
   endfunction
 
   // 功能：xtrdma_ib_create_cq（内核）：cqe_num=roundup_pow2(max(cqe,512)*2)，32B CQE，偏好大页缓冲，
@@ -258,21 +316,9 @@ class rdma_drv_cq extends uvm_object;
     end
     void'(dev.hmc[rdma_drv_dev::HMC_CQC].locate(cq.cqn, cq.ctx_page, cq.ctx_offset));
     pba = cq.mem_kbuf.base_iova() >> 12;
-    sqe = rdma_drv_cmq::new_sqe(RDMA_OP_CQC_CREATE);
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQN, cq.cqn)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQ_SIZE, $clog2(cq.size))
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQ_ST, RDMA_CQC_ST_VALID)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CUR_PBA_VLD, 1)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CUR_CQ_PD_PBA, pba)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_NXT_CQ_PD_PBA_H, pba >> 44)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_NXT_CQ_PD_PBA_L, pba)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_LOAD_CQ_CI_DONE, 1)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_LOAD_CQ_CI_TH, 2)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQ_OM, cq.mem_kbuf.alloc_type)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_NXT_PBA_VLD, 1)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_LAST_ARM_SN, 1)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CEQN, cq.ceqn)
-    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_SHADOW_PA, (cq.ctx_page.iova + cq.ctx_offset) >> 6)
+    sqe = cqc_sqe(cq.cqn, cq.size, pba, cq.mem_kbuf.alloc_type, cq.ceqn,
+                  cq.ctx_page.iova + cq.ctx_offset, 0);
+    cq.frag_bm = new[cq.size];
     status = dev.hw.write(cq.ctx_page, cq.ctx_offset, rdma_be::slice(sqe, 8, RDMA_CQC_BYTES));
     if (status.ok())
       dev.cmq.exec(sqe, cqe_bytes, status);
@@ -308,6 +354,138 @@ class rdma_drv_cq extends uvm_object;
     dev.cq_ids.free(cqn);
     dev.cq_table.delete(cqn);
   endtask
+
+  // 功能：xtrdma_urc_create_cq_kernel + urc_alloc_frag：在原始 CQ 的槽位图中找 queue_size 个连续空槽，
+  //   新建 frag CQ（新 CQN，共享原始缓冲，尺寸 roundup_pow2(queue_size)，CQC 带 URC_CQ_START_IDX），
+  //   CQC_CREATE 后挂入原始 CQ 的 frag 列表并置原始 CQ urc_flag。
+  // 输入/输出及副作用：占用槽位与 CQN，下发命令；frag 输出。
+  // 失败/边界：无连续空槽返回 RESOURCE_EXHAUSTED；命令失败回退槽位与 CQN。
+  task create_frag(rdma_drv_dev dev, int unsigned queue_size, output rdma_drv_cq frag,
+                   output rdma_status status);
+    rdma_bytes_t sqe;
+    rdma_bytes_t cqe_bytes;
+    int unsigned start;
+    bit found;
+
+    frag = null;
+    found = 1'b0;
+    for (int unsigned s0 = 0; s0 + queue_size <= size && !found; s0++) begin
+      found = 1'b1;
+      for (int unsigned k = 0; k < queue_size && found; k++)
+        found = !frag_bm[s0 + k];
+      start = s0;
+    end
+    if (!found) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "no free CQ area for a URC frag");
+      return;
+    end
+    frag = rdma_drv_cq::type_id::create("urc_frag_cq");
+    if (!dev.cq_ids.alloc_next(frag.cqn)) begin
+      status = rdma_status::make(RDMA_SC_RESOURCE_EXHAUSTED, "CQ numbers are exhausted");
+      frag = null;
+      return;
+    end
+    frag.original = this;
+    frag.size = 1 << $clog2(queue_size);
+    frag.ceqn = ceqn;
+    frag.mem_kbuf = mem_kbuf;
+    frag.start_idx = start;
+    frag.slots = queue_size;
+    void'(dev.hmc[rdma_drv_dev::HMC_CQC].locate(frag.cqn, frag.ctx_page, frag.ctx_offset));
+    sqe = cqc_sqe(frag.cqn, frag.size, mem_kbuf.base_iova() >> 12, mem_kbuf.alloc_type, ceqn,
+                  frag.ctx_page.iova + frag.ctx_offset, start);
+    status = dev.hw.write(frag.ctx_page, frag.ctx_offset,
+                          rdma_be::slice(sqe, 8, RDMA_CQC_BYTES));
+    if (status.ok())
+      dev.cmq.exec(sqe, cqe_bytes, status);
+    if (!status.ok()) begin
+      dev.cq_ids.free(frag.cqn);
+      frag = null;
+      return;
+    end
+    for (int unsigned k = 0; k < queue_size; k++)
+      frag_bm[start + k] = 1'b1;
+    frags.push_back(frag);
+    urc_flag = 1'b1;
+    dev.cq_table[frag.cqn] = frag;
+  endtask
+
+  // 功能：xtrdma_urc_destroy_cq + urc_free_frag：CQC_DELETE、cleanup_ceqes、释放 CQN 与槽位并移出
+  //   列表；原始 CQ 不再有 frag 时清 urc_flag 并重置其 CQE polarity（CI 之前为当前 polarity，其后取反）。
+  // 输入/输出及副作用：下发命令，改写原始 CQ 缓冲。
+  // 失败/边界：status 为 CQC_DELETE 结果，资源总是释放。
+  task destroy_frag(rdma_drv_dev dev, output rdma_status status);
+    rdma_bytes_t sqe;
+    rdma_bytes_t ctx;
+    rdma_bytes_t cqe_bytes;
+    rdma_bytes_t init;
+    rdma_status ignored;
+    int unsigned ci;
+
+    sqe = rdma_drv_cmq::new_sqe(RDMA_OP_CQC_DELETE);
+    status = dev.hw.read(ctx_page, ctx_offset, RDMA_CQC_BYTES - 8, ctx);
+    foreach (ctx[i])
+      sqe[8 + i] = ctx[i];
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQN, cqn)
+    if (status.ok())
+      dev.cmq.exec(sqe, cqe_bytes, status);
+    foreach (dev.ceqs[i])
+      if (dev.ceqs[i].eqn == ceqn)
+        dev.ceqs[i].cleanup(dev.hw, cqn, ignored);
+    dev.cq_ids.free(cqn);
+    dev.cq_table.delete(cqn);
+    for (int unsigned k = 0; k < slots; k++)
+      original.frag_bm[start_idx + k] = 1'b0;
+    foreach (original.frags[i])
+      if (original.frags[i] == this) begin
+        original.frags.delete(i);
+        break;
+      end
+    original.urc_cur_polled = 0;
+    if (original.frags.size() != 0)
+      return;
+    original.urc_flag = 1'b0;
+    ci = original.tail % original.size;
+    init = rdma_be::zeros(CQE_BYTES);
+    for (int unsigned i = 0; i < original.size; i++) begin
+      init[0][7] = (i <= ci) ? original.polarity : !original.polarity;
+      ignored = original.mem_kbuf.write(dev.hw, i * CQE_BYTES, init);
+    end
+  endtask
+
+  // 功能：xtrdma_qp_set/clear_cqc_urc_flag 的一条 CQC_MODIFY：NXT_CQ_ST=VALID、URC_FLAG、SQ/RQ 尺寸
+  //   （log2）与 flush 时上报 SQ/RQ CEQE 的有效位。
+  // 输入/输出及副作用：下发命令。
+  // 失败/边界：命令失败返回错误。
+  task modify_urc(rdma_drv_dev dev, bit urc, bit sq_ceqe, bit rq_ceqe, int unsigned sq_log,
+                  int unsigned rq_log, output rdma_status status);
+    rdma_bytes_t sqe;
+    rdma_bytes_t cqe_bytes;
+
+    sqe = rdma_drv_cmq::new_sqe(RDMA_OP_CQC_MODIFY);
+    `RDMA_DRV_SET(sqe, RDMA_CQC_BODY_CQN, cqn)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_MODIFY_NXT_CQ_ST, RDMA_CQC_ST_VALID)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_MODIFY_URC_FLAG, urc)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_MODIFY_URC_SQ_CEQE_VLD, sq_ceqe)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_MODIFY_URC_RQ_CEQE_VLD, rq_ceqe)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_MODIFY_URC_SQ_SIZE, sq_log)
+    `RDMA_DRV_SET(sqe, RDMA_CQC_MODIFY_URC_RQ_SIZE, rq_log)
+    dev.cmq.exec(sqe, cqe_bytes, status);
+  endtask
+
+  // 功能：读 frag CQ 的 URC 信息区（CQC 槽 +48 起 16B，cq.h:33-105）。
+  // 输入/输出及副作用：读 HMC；info 输出。
+  // 失败/边界：读失败返回错误。
+  function rdma_status read_urc_info(rdma_drv_dev dev, output rdma_bytes_t info);
+    return dev.hw.read(ctx_page, ctx_offset + URC_INFO_OFFSET, 16, info);
+  endfunction
+
+  // 功能：写 frag CQ 的 URC 信息区。
+  // 输入/输出及副作用：写 HMC。
+  // 失败/边界：写失败返回错误。
+  function rdma_status write_urc_info(rdma_drv_dev dev, rdma_bytes_t info);
+    return dev.hw.write(ctx_page, ctx_offset + URC_INFO_OFFSET, info);
+  endfunction
 
   // 功能：move_cq_ring_tail：tail 加一，回绕时翻转 polarity 与 ci_wrap。
   // 输入/输出及副作用：修改软件 CI 状态。

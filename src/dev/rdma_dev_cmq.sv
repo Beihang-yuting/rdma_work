@@ -411,6 +411,8 @@ class rdma_dev_cmq extends uvm_object;
       if ((rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(obj.bytes)) != 8'hff)
         return rdma_status::make(RDMA_SC_CODEC_ERROR, "QPC command signature mismatch");
       objects[RDMA_DEV_QP][qpn] = obj;
+      if (opcode == RDMA_OP_QPC_CREATE && nic != null)
+        nic.forget(RDMA_DEV_QP, qpn);
       return rdma_status::success();
     end
     if (!lookup(RDMA_DEV_QP, qpn, obj))
@@ -504,6 +506,8 @@ class rdma_dev_cmq extends uvm_object;
       obj = rdma_dev_object::type_id::create($sformatf("cqc_%0d", cqn));
       obj.bytes = rdma_be::slice(sqe, CQC_QUERY_OFFSET, RDMA_CMQE_BYTES - CQC_QUERY_OFFSET);
       objects[RDMA_DEV_CQ][cqn] = obj;
+      if (nic != null)
+        nic.forget(RDMA_DEV_CQ, cqn);
       return;
     end
     if (!lookup(RDMA_DEV_CQ, cqn, obj)) begin
@@ -592,6 +596,8 @@ class rdma_dev_cmq extends uvm_object;
       obj = rdma_dev_object::type_id::create($sformatf("srfqc_%0d", srfqn));
       obj.bytes = rdma_be::slice(sqe, EQ_CTX_OFFSET, EQ_CTX_BYTES);
       objects[RDMA_DEV_SRQ][srfqn] = obj;
+      if (nic != null)
+        nic.forget(RDMA_DEV_SRQ, srfqn);
       return rdma_status::success();
     end
     if (!lookup(RDMA_DEV_SRQ, srfqn, obj))

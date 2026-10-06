@@ -33,6 +33,9 @@ class rdma_dev_qp_rt extends uvm_object;
   int unsigned sq_doorbells;
   // 已投递 TX 但尚未 drain 完的 SQ doorbell 数（flush 据此决定立即执行或排队）。
   int unsigned kicks_pending;
+  // URC：已完成的 SQ/RQ WQE 数（经 CEQE 的 HW_CPL 下标上报）。
+  longint unsigned urc_sq_cpl;
+  longint unsigned urc_rq_cpl;
   bit [23:0] send_psn;
   bit [23:0] expected_psn;
   bit [23:0] msn;
@@ -60,6 +63,8 @@ class rdma_dev_qp_rt extends uvm_object;
     rq_ci = 0;
     sq_doorbells = 0;
     kicks_pending = 0;
+    urc_sq_cpl = 0;
+    urc_rq_cpl = 0;
     send_psn = '0;
     expected_psn = '0;
     msn = '0;
@@ -79,6 +84,7 @@ class rdma_dev_nic extends uvm_object;
   localparam int unsigned HMC_PBL = 3;
   // TX 队列中标记 QP flush（与 SQ doorbell 共用队列以保持顺序）。
   localparam int unsigned FLUSH_TAG = 32'h8000_0000;
+  localparam int unsigned URC_SERVICE_TYPE = 6;
   // 设备保存的 CQC 从 SQE 字节 8 起、EQC 从 SQE 字节 16 起。
   localparam int unsigned CQC_BASE = 8;
   localparam int unsigned EQC_BASE = 16;
@@ -127,6 +133,24 @@ class rdma_dev_nic extends uvm_object;
     srq_ci.delete();
     srq_limit.delete();
     errors.delete();
+  endfunction
+
+  // 功能：新建 context 时丢弃该对象残留的设备运行状态（编号复用）。
+  // 输入/输出及副作用：删除对应运行状态。
+  // 失败/边界：无。
+  function void forget(rdma_dev_kind_e kind, int unsigned id);
+    case (kind)
+      RDMA_DEV_QP: qps.delete(id);
+      RDMA_DEV_CQ: begin
+        cq_pi.delete(id);
+        cq_armed.delete(id);
+      end
+      RDMA_DEV_SRQ: begin
+        srq_ci.delete(id);
+        srq_limit.delete(id);
+      end
+      default: ;
+    endcase
   endfunction
 
   // 功能：SQ doorbell：值为 SQE 头，按其中 QPN 唤醒 TX。
@@ -460,6 +484,99 @@ class rdma_dev_nic extends uvm_object;
   endfunction
 
   // ---------------------------------------------------------------- TX
+  // 功能：QP 是否为 URC（QPC 服务类型 6）。
+  // 输入/输出及副作用：纯查询。
+  // 失败/边界：QP 不存在返回 0。
+  protected function bit is_urc(int unsigned qpn);
+    return `RDMA_QPC(qpn, RDMA_QPC_SERVICE_TYPE) == URC_SERVICE_TYPE;
+  endfunction
+
+  // 功能：URC 完成（假设：每完成一个 WQE 即上报，不依赖 arm）：RQ 完成在 RQ frag 的
+  //   URC_CQ_START_IDX + (n % RQ 深度) 槽写 32B CQE（polarity 按 RQ 圈数，首圈 1）；SQ 完成只计数；
+  //   随后向该 frag 的 CEQ 写 URC CEQE，携带本 QP 的 HW_CPL SQ/RQ 下标。
+  // 输入/输出及副作用：DMA 写 CQ/CEQ，推进 URC 完成计数。
+  // 失败/边界：frag CQ 不存在或写失败报告协议错误。
+  protected function void urc_complete(int unsigned qpn, bit rq, int unsigned wqe_index,
+                                       bit [7:0] ecode, int unsigned byte_len, bit [31:0] imm);
+    rdma_dev_qp_rt rt;
+    rdma_dev_object cqc;
+    rdma_bytes_t cqe;
+    bit [63:0] slot;
+    int unsigned cqn;
+    int unsigned rq_size;
+    longint unsigned n;
+    rdma_status status;
+
+    rt = qp_rt(qpn);
+    if (!rq) begin
+      rt.urc_sq_cpl++;
+      urc_ceqe(qpn, `RDMA_QPC(qpn, RDMA_QPC_SQ_CQN), 8'h00, 1'b0, 1'b0);
+      return;
+    end
+    cqn = `RDMA_QPC(qpn, RDMA_QPC_RQ_CQN);
+    if (!ctx.lookup(RDMA_DEV_CQ, cqn, cqc)) begin
+      protocol_error($sformatf("URC QP %0d completes to absent CQ %0d", qpn, cqn));
+      return;
+    end
+    rq_size = 1 << `RDMA_QPC(qpn, RDMA_QPC_RQ_SIZE);
+    n = rt.urc_rq_cpl;
+    status = ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
+                             `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
+                             (`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_URC_CQ_START_IDX, CQC_BASE) +
+                              n % rq_size) * CQE_BYTES, slot);
+    cqe = rdma_be::zeros(CQE_BYTES);
+    `RDMA_BE_SET(cqe, RDMA_CQE_POLARITY, !((n / rq_size) & 1))
+    `RDMA_BE_SET(cqe, RDMA_CQE_RQ_CQE, 1)
+    `RDMA_BE_SET(cqe, RDMA_CQE_WQE_INDEX, wqe_index)
+    `RDMA_BE_SET(cqe, RDMA_CQE_PKT_OPCODE, 8'h01)
+    `RDMA_BE_SET(cqe, RDMA_CQE_ECODE, ecode)
+    `RDMA_BE_SET(cqe, RDMA_CQE_QPN, qpn)
+    `RDMA_BE_SET(cqe, RDMA_CQE_IMMDT_DATA, imm)
+    `RDMA_BE_SET(cqe, RDMA_CQE_PAYLOAD_LEN, byte_len)
+    if (!status.ok() || !dma_write(slot, cqe)) begin
+      protocol_error($sformatf("URC QP %0d RQ CQE write failed", qpn));
+      return;
+    end
+    rt.urc_rq_cpl = n + 1;
+    urc_ceqe(qpn, cqn, 8'h00, 1'b0, 1'b0);
+  endfunction
+
+  // 功能：向 frag CQ 的 CEQ 写 URC CEQE：URC_FLAG、QPN、CQN、ECODE、flush 时的 SQ/RQ 有效位，
+  //   qword1 的 HW_CPL SQ（cqn 为 QP 的 SQ CQ 时）与 RQ（cqn 为 RQ CQ 时）{wrap, 下标}。
+  // 输入/输出及副作用：DMA 写 CEQ。
+  // 失败/边界：CQ 不存在报告协议错误。
+  protected function void urc_ceqe(int unsigned qpn, int unsigned cqn, bit [7:0] ecode,
+                                   bit sq_vld, bit rq_vld);
+    rdma_dev_object cqc;
+    rdma_dev_qp_rt rt;
+    rdma_bytes_t ceqe;
+    int unsigned size;
+
+    if (!ctx.lookup(RDMA_DEV_CQ, cqn, cqc)) begin
+      protocol_error($sformatf("URC QP %0d notifies absent CQ %0d", qpn, cqn));
+      return;
+    end
+    rt = qp_rt(qpn);
+    ceqe = rdma_be::zeros(RDMA_CEQE_BYTES);
+    `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_FLAG, 1)
+    `RDMA_BE_SET(ceqe, RDMA_CEQE_QPN, qpn)
+    `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_SQ_CQE_VALID, sq_vld)
+    `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_RQ_CQE_VALID, rq_vld)
+    `RDMA_BE_SET(ceqe, RDMA_CEQE_CQN, cqn)
+    `RDMA_BE_SET(ceqe, RDMA_CEQE_ECODE, ecode)
+    if (`RDMA_QPC(qpn, RDMA_QPC_SQ_CQN) == cqn) begin
+      size = 1 << `RDMA_QPC(qpn, RDMA_QPC_SQ_SIZE);
+      `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX, rt.urc_sq_cpl % size)
+      `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_HW_CPL_SQ_WQE_IDX_WRAP, (rt.urc_sq_cpl / size) & 1)
+    end
+    if (`RDMA_QPC(qpn, RDMA_QPC_RQ_CQN) == cqn) begin
+      size = 1 << `RDMA_QPC(qpn, RDMA_QPC_RQ_SIZE);
+      `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX, rt.urc_rq_cpl % size)
+      `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP, (rt.urc_rq_cpl / size) & 1)
+    end
+    write_eqe(RDMA_DEV_CEQ, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE), ceqe);
+  endfunction
+
   // 功能：QP flush：向 SQ CQ 写一个 SQ flush CQE（0x08），非 SRQ 时向 RQ CQ 写一个 RQ flush CQE（0x8F）；
   //   驱动以每个 flush CQE 为对应环中全部未完成 WQE 生成 FLUSH 完成。
   // 输入/输出及副作用：写 CQE。
@@ -469,6 +586,12 @@ class rdma_dev_nic extends uvm_object;
 
     if (!ctx.lookup(RDMA_DEV_QP, qpn, obj)) begin
       protocol_error($sformatf("flush doorbell for absent QP %0d", qpn));
+      return;
+    end
+    if (is_urc(qpn)) begin
+      // URC：flush 经 CEQE 上报（CQC_MODIFY 的 SQ/RQ_CEQE_VLD），驱动据此合成 FLUSH 完成。
+      urc_ceqe(qpn, `RDMA_QPC(qpn, RDMA_QPC_SQ_CQN), RDMA_ECODE_EC_TPE_QP_FLUSH, 1'b1, 1'b0);
+      urc_ceqe(qpn, `RDMA_QPC(qpn, RDMA_QPC_RQ_CQN), RDMA_ECODE_EC_RPE_RX_FLUSH, 1'b0, 1'b1);
       return;
     end
     write_cqe(qpn, 1'b0, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR, 0, '0, 0);
@@ -622,7 +745,14 @@ class rdma_dev_nic extends uvm_object;
           wait_ack(qpn, rt, ecode);
       end
     end
-    if (`RDMA_BE_GET(wqe, RDMA_SQ_WQE_CE) != 0 || ecode != RDMA_CMQ_SUCCESS_ECODE)
+    if (is_urc(qpn)) begin
+      // URC 每个 WQE 都推进 HW_CPL（未 signaled 的由驱动跳过）；异常完成未建模。
+      if (ecode != RDMA_CMQ_SUCCESS_ECODE)
+        protocol_error($sformatf("URC QP %0d abnormal completion %02h is not modeled", qpn,
+                                 ecode));
+      urc_complete(qpn, 1'b0, `RDMA_BE_GET(wqe, RDMA_SQ_WQE_INDEX), ecode, byte_len, '0);
+    end
+    else if (`RDMA_BE_GET(wqe, RDMA_SQ_WQE_CE) != 0 || ecode != RDMA_CMQ_SUCCESS_ECODE)
       write_cqe(qpn, 1'b0, `RDMA_BE_GET(wqe, RDMA_SQ_WQE_INDEX),
                 `RDMA_BE_GET(wqe, RDMA_SQ_WQE_WRAP), ecode, byte_len, '0, 0);
   endtask
@@ -658,6 +788,8 @@ class rdma_dev_nic extends uvm_object;
     pkt.transport = RDMA_TRANSPORT_RC;
     if (ud)
       pkt.transport = RDMA_TRANSPORT_UD;
+    else if (is_urc(qpn))
+      pkt.transport = RDMA_TRANSPORT_URC;
     pkt.opcode = op;
     pkt.segment = RDMA_SEG_MIDDLE;
     if (count == 1)
@@ -755,21 +887,34 @@ class rdma_dev_nic extends uvm_object;
     rdma_packet pkt;
     int unsigned offset;
     int unsigned count;
+    int unsigned received;
     bit got;
+    bit urc;
     rdma_bytes_t part;
 
-    pkt = new_packet(qpn, RDMA_NET_RDMA_READ_REQUEST, 0, 1, rt.send_psn,
-                     `RDMA_QPC(qpn, RDMA_QPC_DST_QPN), 1'b0);
-    pkt.reth_va = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_REMOTE_VA);
-    pkt.reth_rkey = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_REMOTE_KEY);
-    pkt.reth_len = total;
     count = (total + mtu(qpn) - 1) / mtu(qpn);
     if (count == 0)
       count = 1;
+    urc = is_urc(qpn);
+    // RC：一个 READ 请求，响应按 PMTU 分 FIRST/MIDDLE/LAST；URC：请求按 PMTU 分包（各带自身
+    //   RETH 区间），每个请求包对应一个 READ_DATA_ONLY 响应（defs.h xtrdma_urc_pkt_opcode_type）。
+    for (int unsigned k = 0; k < (urc ? count : 1); k++) begin
+      pkt = new_packet(qpn, RDMA_NET_RDMA_READ_REQUEST, k, urc ? count : 1, rt.send_psn + k,
+                       `RDMA_QPC(qpn, RDMA_QPC_DST_QPN), 1'b0);
+      pkt.reth_va = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_REMOTE_VA) + (urc ? k * mtu(qpn) : 0);
+      pkt.reth_rkey = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_REMOTE_KEY);
+      pkt.reth_len = total;
+      if (urc) begin
+        pkt.reth_len = total - k * mtu(qpn);
+        if (pkt.reth_len > mtu(qpn))
+          pkt.reth_len = mtu(qpn);
+      end
+      emit(pkt, dmac);
+    end
     rt.send_psn += count;
-    emit(pkt, dmac);
     ecode = RDMA_CMQ_SUCCESS_ECODE;
     offset = 0;
+    received = 0;
     forever begin
       get_response(rt, pkt, got);
       if (!got || pkt.opcode != RDMA_NET_RDMA_READ_RESP) begin
@@ -785,7 +930,8 @@ class rdma_dev_nic extends uvm_object;
           !scatter(sges, pd, RDMA_RIGHT_LOCAL_WRITE, offset, part))
         ecode = RDMA_ECODE_EC_TPE_SQ_KEY_ERR;
       offset += part.size();
-      if (pkt.segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY})
+      received++;
+      if (urc ? received == count : pkt.segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY})
         break;
     end
     if (ecode == RDMA_CMQ_SUCCESS_ECODE && offset != total)
@@ -851,6 +997,10 @@ class rdma_dev_nic extends uvm_object;
     longint unsigned pi;
     rdma_status status;
 
+    if (is_urc(qpn)) begin
+      urc_complete(qpn, rq, wqe_index, ecode, byte_len, imm);
+      return;
+    end
     if (rq)
       cqn = `RDMA_QPC(qpn, RDMA_QPC_RQ_CQN);
     else

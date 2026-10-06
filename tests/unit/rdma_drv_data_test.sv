@@ -3,7 +3,8 @@
 // 职责：两节点数据端到端（驱动模型 + 设备模型，仅经 CMQ/doorbell/DMA 交互）：RC 的 SEND（多 MTU、
 //   3 SGE 走 SGB、inline）、WRITE、WRITE_IMM、READ、FAA、CAS、rkey 错误 NAK，CQ arm 产生 CEQE，
 //   SEND 进 SRQ（post_srq_recv、SRFQ 环、CQE 的 SRFQ 回查与槽位释放），CQ resize 时未消费 CQE 迁移，
-//   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE，CQ destroy 的 cleanup_ceqes；
+//   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE，CQ destroy 的 cleanup_ceqes，
+//   URC（rc_to_urc：frag CQ、CEQE 上报 HW 完成下标、SQ 完成合成、RQ CQE 在 frag 槽、flush、销毁）；
 //   每项逐字节比对目的内存并检查完成的 wr_id/方向/状态。
 // 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
@@ -103,6 +104,7 @@ class rdma_drv_data_test extends uvm_test;
     check_flush();
     check_srq_limit();
     check_ceq_cleanup();
+    check_urc();
     if (a.dev.nic.errors.size() != 0 || b.dev.nic.errors.size() != 0)
       `uvm_error("DATA", $sformatf("device protocol errors: a=%p b=%p",
                                    a.dev.nic.errors, b.dev.nic.errors))
@@ -606,18 +608,18 @@ class rdma_drv_data_test extends uvm_test;
       `uvm_error("FLUSH", $sformatf("%0d completions after destroy", wcs.size()))
   endtask
 
-  // 功能：新建一对已连接的 RC QP：qb 在 B（可绑定 srq），qa 在 A（a_cq 为空时用节点默认 CQ）。
+  // 功能：新建一对已连接的 RC QP：qb 在 B（可绑定 srq），qa 在 A（a_cq/b_cq 为空时用节点默认 CQ）。
   // 输入/输出及副作用：qa/qb 输出。
   // 失败/边界：失败报告 UVM_FATAL。
   task make_pair(rdma_drv_srq srq, output rdma_drv_qp qa, output rdma_drv_qp qb,
-                 input rdma_drv_cq a_cq = null);
+                 input rdma_drv_cq a_cq = null, input rdma_drv_cq b_cq = null);
     rdma_drv_qp_init_attr attr;
     rdma_status status;
 
     attr = rdma_drv_qp_init_attr::type_id::create("pair_attr");
     attr.pd = b.pd;
-    attr.send_cq = b.cq;
-    attr.recv_cq = b.cq;
+    attr.send_cq = b_cq == null ? b.cq : b_cq;
+    attr.recv_cq = attr.send_cq;
     attr.srq = srq;
     rdma_drv_qp::create_qp(b.drv, attr, qb, status);
     expect_ok("create pair QP on B", status);
@@ -719,5 +721,136 @@ class rdma_drv_data_test extends uvm_test;
     if (cqns.size() != 1 || cqns[0] != a.cq.cqn)
       `uvm_error("CEQ_CLEANUP", $sformatf("CEQ delivered %p (c2 %0d, A CQ %0d)", cqns, c2.cqn,
                                           a.cq.cqn))
+  endtask
+
+  // 功能：处理节点 CEQ 并轮询 cq，直到得到 n 个完成或超时（URC 完成经 CEQE 上报）。
+  // 输入/输出及副作用：wcs 输出。
+  // 失败/边界：超时报告 UVM_FATAL。
+  task wait_urc(rdma_drv_data_node node, rdma_drv_cq cq, int unsigned n,
+                output rdma_drv_wc wcs[$]);
+    int unsigned cqns[$];
+    rdma_status status;
+
+    wcs.delete();
+    for (int t = 0; t < 2000 && wcs.size() < n; t++) begin
+      rdma_drv_wr::process_ceq(node.drv, node.drv.ceqs[0], cqns, status);
+      expect_ok("process CEQ", status);
+      rdma_drv_wr::poll_cq(node.drv, cq, n - wcs.size(), wcs, status);
+      expect_ok("poll URC", status);
+      if (wcs.size() < n)
+        #100ns;
+    end
+    if (wcs.size() != n)
+      `uvm_fatal("URC", $sformatf("%s: %0d of %0d completions", node.get_name(), wcs.size(), n))
+  endtask
+
+  // 功能：rc_to_urc 下建一对 URC QP（各用专属 CQ）：A 发 2500B SEND、未 signaled WRITE、WRITE_IMM、
+  //   READ；A 只得到 3 个 signaled 完成（按序），B 得到 2 个接收完成（含立即数），内存逐字节一致；
+  //   B 再投 2 个 RECV 后转 ERR 得到 2 个 FLUSH；销毁后原始 CQ 退出 URC 模式。
+  // 输入/输出及副作用：创建并销毁 2 个 CQ 与一对 QP。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task check_urc();
+    rdma_drv_cq ua;
+    rdma_drv_cq ub;
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
+    rdma_drv_qp_attr mod;
+    rdma_drv_recv_wr rwr;
+    rdma_drv_send_wr wrs[4];
+    rdma_drv_wc wcs[$];
+    rdma_dev_object obj;
+    rdma_bytes_t d_send;
+    rdma_bytes_t d_write;
+    rdma_bytes_t d_imm;
+    rdma_bytes_t d_read;
+    longint unsigned rids[2];
+    rdma_status status;
+
+    rdma_drv_cq::create_cq(a.drv, 64, 0, ua, status);
+    expect_ok("create URC CQ on A", status);
+    rdma_drv_cq::create_cq(b.drv, 64, 0, ub, status);
+    expect_ok("create URC CQ on B", status);
+    a.drv.cfg.rc_to_urc = 1'b1;
+    b.drv.cfg.rc_to_urc = 1'b1;
+    make_pair(null, qa, qb, ua, ub);
+    a.drv.cfg.rc_to_urc = 1'b0;
+    b.drv.cfg.rc_to_urc = 1'b0;
+    if (!qa.urc || !qb.urc || qa.send_cq.original != ua || !ua.urc_flag)
+      `uvm_error("URC", "rc_to_urc did not create URC QPs on frag CQs")
+    // lookup 的输出参数与同一表达式中的读取顺序不保证，分两句写。
+    if (!b.dev.cmq.lookup(RDMA_DEV_QP, qb.qpn, obj))
+      `uvm_fatal("URC", "device has no URC QPC")
+    if (rdma_be::field(obj.bytes, RDMA_QPC_SERVICE_TYPE_WORD_BYTE_OFFSET,
+                       RDMA_QPC_SERVICE_TYPE_LSB, RDMA_QPC_SERVICE_TYPE_WIDTH) != 6)
+      `uvm_error("URC", "device QPC service type is not URC")
+    foreach (rids[k]) begin
+      rwr = rdma_drv_recv_wr::type_id::create("urc_recv");
+      rwr.wr_id = next_wr_id++;
+      rwr.sges.push_back(rdma_drv_sge::make(b.data_buf.iova + 'h400 + k * 'h1000, 'h1000,
+                                            b.mr.key()));
+      rdma_drv_wr::post_recv(b.drv, qb, rwr, status);
+      expect_ok("post URC recv", status);
+      rids[k] = rwr.wr_id;
+    end
+    d_send = fill(a, 'h0, 2500, 8'h13);
+    d_write = fill(a, 'h1000, 300, 8'h23);
+    d_imm = fill(a, 'h1200, 64, 8'h33);
+    d_read = fill(b, 'h2c00, 1500, 8'h43);
+    wrs[0] = send_wr(a, RDMA_DRV_WR_SEND, '{'h0}, '{2500});
+    wrs[1] = send_wr(a, RDMA_DRV_WR_WRITE, '{'h1000}, '{300});
+    wrs[1].signaled = 1'b0;
+    wrs[1].remote_va = b.data_buf.iova + 'h2000;
+    wrs[1].rkey = b.mr.key();
+    wrs[2] = send_wr(a, RDMA_DRV_WR_WRITE_IMM, '{'h1200}, '{64});
+    wrs[2].remote_va = b.data_buf.iova + 'h2400;
+    wrs[2].rkey = b.mr.key();
+    wrs[2].imm = 32'h0bad_cafe;
+    wrs[3] = send_wr(a, RDMA_DRV_WR_READ, '{'h1800}, '{1500});
+    wrs[3].remote_va = b.data_buf.iova + 'h2c00;
+    wrs[3].rkey = b.mr.key();
+    foreach (wrs[k]) begin
+      rdma_drv_wr::post_send(a.drv, qa, wrs[k], status);
+      expect_ok("post URC send", status);
+    end
+    wait_urc(a, ua, 3, wcs);
+    expect_wc("URC SEND", wcs[0], wrs[0].wr_id, 1'b0);
+    expect_wc("URC WRITE_IMM", wcs[1], wrs[2].wr_id, 1'b0);
+    expect_wc("URC READ", wcs[2], wrs[3].wr_id, 1'b0);
+    wait_urc(b, ub, 2, wcs);
+    expect_wc("URC recv SEND", wcs[0], rids[0], 1'b1);
+    expect_wc("URC recv WRITE_IMM", wcs[1], rids[1], 1'b1);
+    if (wcs[0].byte_len != 2500 || wcs[1].imm != 32'h0bad_cafe)
+      `uvm_error("URC", $sformatf("receive byte_len %0d / imm %08h", wcs[0].byte_len,
+                                  wcs[1].imm))
+    expect_mem("URC SEND data", b, 'h400, d_send);
+    expect_mem("URC WRITE data", b, 'h2000, d_write);
+    expect_mem("URC WRITE_IMM data", b, 'h2400, d_imm);
+    expect_mem("URC READ data", a, 'h1800, d_read);
+    foreach (rids[k]) begin
+      rwr = rdma_drv_recv_wr::type_id::create("urc_flush_recv");
+      rwr.wr_id = next_wr_id++;
+      rwr.sges.push_back(rdma_drv_sge::make(b.data_buf.iova + 'h400, 'h10, b.mr.key()));
+      rdma_drv_wr::post_recv(b.drv, qb, rwr, status);
+      expect_ok("post URC recv before flush", status);
+      rids[k] = rwr.wr_id;
+    end
+    mod = rdma_drv_qp_attr::type_id::create("urc_err");
+    mod.mask = rdma_drv_qp_attr::M_STATE;
+    mod.state = RDMA_DRV_QPS_ERR;
+    qb.modify(b.drv, mod, status);
+    expect_ok("URC to ERR", status);
+    wait_urc(b, ub, 2, wcs);
+    foreach (rids[k])
+      expect_wc("URC flush", wcs[k], rids[k], 1'b1, RDMA_DRV_WC_FLUSH_ERR);
+    qa.destroy(a.drv, status);
+    expect_ok("destroy URC QP A", status);
+    qb.destroy(b.drv, status);
+    expect_ok("destroy URC QP B", status);
+    if (ua.urc_flag || ub.urc_flag || ua.frags.size() != 0)
+      `uvm_error("URC", "original CQs still in URC mode after destroy")
+    ua.destroy(a.drv, status);
+    expect_ok("destroy URC CQ A", status);
+    ub.destroy(b.drv, status);
+    expect_ok("destroy URC CQ B", status);
   endtask
 endclass

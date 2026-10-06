@@ -24,6 +24,8 @@ class rdma_drv_config extends uvm_object;
   int unsigned first_ceqn;
   int unsigned ceq_cnt;
   int unsigned eq_entries;
+  // debugfs rc_to_urc（rdma_main.h:192）：置位后内核新建的 RC QP 实为 URC。
+  bit rc_to_urc;
 
   // 功能：以小规模仿真默认值构造配置。
   // 输入/输出及副作用：name 为 UVM 对象名。
@@ -43,6 +45,7 @@ class rdma_drv_config extends uvm_object;
     first_ceqn = 0;
     ceq_cnt = 1;
     eq_entries = 256;
+    rc_to_urc = 1'b0;
   endfunction
 endclass
 

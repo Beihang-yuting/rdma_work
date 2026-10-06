@@ -97,8 +97,8 @@ class rdma_net_packet_adapter_test extends uvm_test;
   //   才发现外部 profile 不支持。
   // 输入/输出及副作用：无显式参数；只读取 capability 函数结果，不创建
   //   packet 或访问 sink/host-memory。
-  // 失败/边界：UD SEND_WITH_INV、URC READ/LOCAL_INVALIDATE 以及 CUSTOM
-  //   均必须返回 0；RC SEND/WRITE/READ/ATOMIC 和 UD/URC 支持项必须返回 1。
+  // 失败/边界：UD SEND_WITH_INV、URC LOCAL_INVALIDATE 以及 CUSTOM
+  //   均必须返回 0；RC/URC SEND/WRITE/READ/ATOMIC 和 UD SEND 必须返回 1。
   task automatic test_transport_capability_matrix();
     if (!rdma_net_packet_work_opcode_supported_for_transport(
           RDMA_TRANSPORT_RC, RDMA_WR_RDMA_READ) ||
@@ -107,12 +107,12 @@ class rdma_net_packet_adapter_test extends uvm_test;
         !rdma_net_packet_work_opcode_supported_for_transport(
           RDMA_TRANSPORT_UD, RDMA_WR_SEND) ||
         !rdma_net_packet_work_opcode_supported_for_transport(
-          RDMA_TRANSPORT_URC, RDMA_WR_RDMA_WRITE))
+          RDMA_TRANSPORT_URC, RDMA_WR_RDMA_WRITE) ||
+        !rdma_net_packet_work_opcode_supported_for_transport(
+          RDMA_TRANSPORT_URC, RDMA_WR_RDMA_READ))
       `uvm_error("CAP_MATRIX_POSITIVE", "supported wire opcode was rejected")
     if (rdma_net_packet_work_opcode_supported_for_transport(
           RDMA_TRANSPORT_UD, RDMA_WR_SEND_WITH_INV) ||
-        rdma_net_packet_work_opcode_supported_for_transport(
-          RDMA_TRANSPORT_URC, RDMA_WR_RDMA_READ) ||
         rdma_net_packet_work_opcode_supported_for_transport(
           RDMA_TRANSPORT_URC, RDMA_WR_LOCAL_INVALIDATE) ||
         rdma_net_packet_work_opcode_supported_for_transport(
@@ -171,25 +171,57 @@ class rdma_net_packet_adapter_test extends uvm_test;
       `uvm_error("RC_WRITE_RETH", "RC WRITE RETH projection mismatch")
   endtask
 
-  // 功能：验证 URC/UC wire profile 不接受 RDMA READ request，避免把非法
-  //   语义映射成 RC READ opcode 后发送到网络。
-  // 输入/输出及副作用：adapter（输入）；frame_bytes、status（局部输出）；
-  //   只执行纯编码，不触碰 sink、队列游标或 host-memory。
-  // 失败/边界：encode_packet 必须返回 RDMA_SC_UNSUPPORTED_OPCODE，并保持
-  //   输出 frame 为空；任何成功编码或残留半包都属于协议边界错误。
-  task automatic test_urc_read_rejected(
+  // 功能：验证 URC 使用 XTR URC opcode（defs.h xtrdma_urc_pkt_opcode_type，0b110 前缀）：SEND ONLY
+  //   为 0xC4、READ 请求 FIRST 为 0xCD、ACK 为 0xD1，解码回 URC 语义；READ 响应只能单包
+  //   （READ_DATA_ONLY），FIRST 分段被拒。
+  // 输入/输出及副作用：adapter（输入）；只编码/解码本地 packet 快照。
+  // 失败/边界：opcode、transport、segment 不符或非法组合被接受时报告错误。
+  task automatic test_urc_opcodes(
     rdma_net_packet_adapter adapter
   );
     rdma_packet source;
+    rdma_packet decoded;
+    packet wire_packet;
+    rocev2_bth roce;
     byte unsigned frame_bytes[$];
+    rdma_network_opcode_e ops[3];
+    rdma_packet_segment_e segs[3];
+    bit [7:0] wire_ops[3];
     rdma_status status;
 
-    source = make_rdma_packet("urc_read", RDMA_TRANSPORT_URC,
-                              RDMA_NET_RDMA_READ_REQUEST);
+    ops = '{RDMA_NET_SEND, RDMA_NET_RDMA_READ_REQUEST, RDMA_NET_ACK};
+    segs = '{RDMA_SEG_ONLY, RDMA_SEG_FIRST, RDMA_SEG_ONLY};
+    wire_ops = '{8'hc4, 8'hcd, 8'hd1};
+    foreach (ops[k]) begin
+      source = make_rdma_packet("urc_op", RDMA_TRANSPORT_URC, ops[k]);
+      source.segment = segs[k];
+      if (ops[k] != RDMA_NET_SEND)
+        source.payload.delete();
+      source.pack_headers();
+      frame_bytes.delete();
+      status = adapter.encode_packet(source, frame_bytes);
+      expect_status("URC_OP_ENCODE", status, RDMA_SC_OK);
+      wire_packet = new();
+      wire_packet.unpack(frame_bytes);
+      roce = wire_packet.get_rocev2();
+      if (roce == null || roce.opcode != wire_ops[k])
+        `uvm_error("URC_OP", $sformatf("%s/%s encoded as %02h, expected %02h", ops[k].name(),
+                                       segs[k].name(), roce == null ? 8'h0 : roce.opcode,
+                                       wire_ops[k]))
+      status = adapter.decode_packet(frame_bytes, decoded);
+      expect_status("URC_OP_DECODE", status, RDMA_SC_OK);
+      if (decoded == null || decoded.transport != RDMA_TRANSPORT_URC ||
+          decoded.opcode != ops[k] || decoded.segment != segs[k])
+        `uvm_error("URC_OP_DECODE", $sformatf("%s/%s did not round-trip", ops[k].name(),
+                                              segs[k].name()))
+    end
+    source = make_rdma_packet("urc_read_resp", RDMA_TRANSPORT_URC, RDMA_NET_RDMA_READ_RESP);
+    source.segment = RDMA_SEG_FIRST;
+    frame_bytes.delete();
     status = adapter.encode_packet(source, frame_bytes);
-    expect_status("URC_READ_ENCODE", status, RDMA_SC_UNSUPPORTED_OPCODE);
+    expect_status("URC_READ_RESP_ENCODE", status, RDMA_SC_UNSUPPORTED_OPCODE);
     if (frame_bytes.size() != 0)
-      `uvm_error("URC_READ_FRAME", "unsupported URC READ left encoded bytes")
+      `uvm_error("URC_READ_RESP_FRAME", "unsupported URC READ response left encoded bytes")
   endtask
 
   // 功能：验证 RC compare-and-swap 使用 RoCEv2 AtomicETH 和对应 opcode，
@@ -400,7 +432,7 @@ class rdma_net_packet_adapter_test extends uvm_test;
     test_rc_write_reth(adapter);
     test_rc_atomic_round_trip(adapter);
     test_rc_atomic_fetch_add_round_trip(adapter);
-    test_urc_read_rejected(adapter);
+    test_urc_opcodes(adapter);
     test_ud_send_deth(adapter);
     test_iwarp_round_trip(adapter);
     test_sink_and_fault_policy(adapter, sink);

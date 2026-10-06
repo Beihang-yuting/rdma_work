@@ -34,6 +34,8 @@ class rdma_tb_node_cfg extends uvm_object;
   rdma_dev dev;
   rdma_drv_dev drv;
   rdma_drv_cq cq;
+  // URC QP 专用 CQ（URC 的 frag CQ 取自它，置 urc_flag 后只能轮询 frag）；无 URC QP 时为 null。
+  rdma_drv_cq urc_cq;
   rdma_tb_qp_link qps[$];
   // 数据 MR：verb 的本地/远端 buffer 都位于 data_buf 内，MR 覆盖整个 data_buf（VA = IOVA）。
   rdma_drv_mr data_mr;
@@ -55,6 +57,7 @@ class rdma_tb_node_cfg extends uvm_object;
     dev = null;
     drv = null;
     cq = null;
+    urc_cq = null;
     data_mr = null;
     data_buf = null;
     mtu = 1024;

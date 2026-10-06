@@ -105,6 +105,9 @@ class rdma_drv_qp extends uvm_object;
 
   localparam int unsigned MIN_WR = 256;
   localparam int unsigned MAX_WR = 32768;
+  // xtrdma_hw.h XTRDMA_MIN_URC_QP_ENTRIES；qp.h XTRDMA_SERVICE_TYPE_URC。
+  localparam int unsigned MIN_URC_WR = 8;
+  localparam int unsigned SERVICE_URC = 6;
   localparam int unsigned SGB_BYTES = 512;
   localparam int unsigned SHADOW_OFFSET = 504;
   localparam int unsigned SERVICE_RC = 0;
@@ -119,6 +122,11 @@ class rdma_drv_qp extends uvm_object;
   rdma_drv_cq recv_cq;
   rdma_drv_srq srq;
   bit sig_all;
+  // URC（cfg.rc_to_urc 下由 RC 转来；ibqp 类型仍为 RC）：send_cq/recv_cq 换成 frag CQ，
+  //   orig_* 为用户给的原始 CQ。
+  bit urc;
+  rdma_drv_cq orig_send_cq;
+  rdma_drv_cq orig_recv_cq;
   int unsigned max_send_sge;
   int unsigned max_recv_sge;
   int unsigned max_inline;
@@ -186,9 +194,10 @@ class rdma_drv_qp extends uvm_object;
     return $clog2(mtu) - 8;
   endfunction
 
-  // 功能：xtrdma_ib_create_qp（内核 RC/UD）：参数检查与深度取整，alloc_qpn，SQ/RQ（偏好大页）与
-  //   SGB 页，RC 的 ORQ/EIRQ/EIRQ_EXTRA 与 UAQ 页，HMC QPC 槽（shadow 在 +504），填 QPC 镜像，
-  //   签名 QPC_CREATE。失败按 goto 链逆序释放。
+  // 功能：xtrdma_ib_create_qp（内核 RC/UD；cfg.rc_to_urc 时 RC 转 URC）：参数检查与深度取整，
+  //   alloc_qpn，URC 先换 frag CQ，SQ/RQ（偏好大页）与 SGB 页，RC 的 ORQ/EIRQ/EIRQ_EXTRA（URC 为
+  //   RSQ/RDSQ/DSQ）与 UAQ 页，HMC QPC 槽（shadow 在 +504），填 QPC 镜像，URC 先 CQC_MODIFY 置 URC
+  //   标志，签名 QPC_CREATE，URC 记录 frag 信息。失败按 goto 链逆序释放。
   // 输入/输出及副作用：分配资源并下发命令；qp 输出。
   // 失败/边界：参数越界返回 INVALID_ARGUMENT；资源用尽或命令失败返回其错误。
   static task create_qp(rdma_drv_dev dev, rdma_drv_qp_init_attr attr, output rdma_drv_qp qp,
@@ -201,6 +210,11 @@ class rdma_drv_qp extends uvm_object;
       return;
     end
     qp.qp_type = attr.qp_type;
+    qp.urc = dev.cfg.rc_to_urc && attr.qp_type == RDMA_DRV_QPT_RC;
+    if (qp.urc && attr.srq != null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "URC QP does not support SRQ");
+      return;
+    end
     qp.pd = attr.pd;
     qp.send_cq = attr.send_cq;
     qp.recv_cq = attr.recv_cq;
@@ -209,8 +223,8 @@ class rdma_drv_qp extends uvm_object;
     qp.max_send_sge = attr.max_send_sge;
     qp.max_recv_sge = attr.max_recv_sge;
     qp.max_inline = attr.max_inline;
-    qp.sq_depth = round_depth(attr.max_send_wr);
-    qp.rq_depth = round_depth(attr.max_recv_wr);
+    qp.sq_depth = round_depth(attr.max_send_wr, qp.urc);
+    qp.rq_depth = round_depth(attr.max_recv_wr, qp.urc);
     qp.sgb_shift = 0;
     if (attr.qp_type == RDMA_DRV_QPT_UD || attr.max_send_sge > 2 || attr.max_recv_sge > 2)
       qp.sgb_shift = 9;
@@ -221,20 +235,31 @@ class rdma_drv_qp extends uvm_object;
     if (!dev.qp_sn.exists(qp.qpn))
       dev.qp_sn[qp.qpn] = 0;
     qp.qp_sn = dev.qp_sn[qp.qpn]++;
-    status = qp.alloc_buffers(dev);
+    status = rdma_status::success();
+    if (qp.urc)
+      qp.make_frags(dev, status);
+    if (status.ok())
+      status = qp.alloc_buffers(dev);
     if (status.ok()) begin
       void'(dev.hmc[rdma_drv_dev::HMC_QPC].locate(qp.qpn, qp.ctx_page, qp.ctx_offset));
       status = dev.hw.write(qp.ctx_page, qp.ctx_offset, rdma_be::zeros(RDMA_QPC_BYTES));
     end
     if (status.ok()) begin
       qp.fill_qpc(dev);
-      qp.hw_qpc_cmd(dev, RDMA_OP_QPC_CREATE, 1'b1, status);
+      if (qp.urc)
+        qp.set_cqc_urc(dev, 1'b1, status);
+      if (status.ok())
+        qp.hw_qpc_cmd(dev, RDMA_OP_QPC_CREATE, 1'b1, status);
     end
     if (!status.ok()) begin
       qp.free_buffers(dev);
+      if (qp.urc)
+        qp.drop_frags(dev);
       dev.qp_ids.free(qp.qpn);
       return;
     end
+    if (qp.urc)
+      qp.set_urc_info();
     qp.sq_wr_id = new[qp.sq_depth];
     qp.sq_ring_head = new[qp.sq_depth];
     qp.rq_wr_id = new[qp.rq_depth];
@@ -242,13 +267,99 @@ class rdma_drv_qp extends uvm_object;
     dev.qp_table[qp.qpn] = qp;
   endtask
 
-  // 功能：xtrdma_set_qp_param：clamp(wr, 256, 32768) 后取 2 的幂。
+  // 功能：xtrdma_set_qp_param：clamp(wr, 256（URC 为 8）, 32768) 后取 2 的幂。
   // 输入/输出及副作用：纯函数。
   // 失败/边界：无。
-  static function int unsigned round_depth(int unsigned wr);
-    if (wr < MIN_WR)
+  static function int unsigned round_depth(int unsigned wr, bit urc = 1'b0);
+    if (!urc && wr < MIN_WR)
       wr = MIN_WR;
+    if (urc && wr < MIN_URC_WR)
+      wr = MIN_URC_WR;
     return 1 << $clog2(wr);
+  endfunction
+
+  // 功能：xtrdma_qp_urc_shared_cq_process：同一 CQ 时取一个 sq+rq 槽的 frag，否则发送 CQ 取 sq 槽、
+  //   接收 CQ 取 rq 槽各一个 frag；QP 的 send_cq/recv_cq 换成 frag。
+  // 输入/输出及副作用：创建 frag CQ。
+  // 失败/边界：失败回退已建 frag 并恢复原始 CQ。
+  protected task make_frags(rdma_drv_dev dev, output rdma_status status);
+    rdma_drv_cq frag;
+    rdma_status ignored;
+
+    orig_send_cq = send_cq;
+    orig_recv_cq = recv_cq;
+    if (send_cq == recv_cq) begin
+      orig_send_cq.create_frag(dev, sq_depth + rq_depth, frag, status);
+      if (!status.ok())
+        return;
+      send_cq = frag;
+      recv_cq = frag;
+      return;
+    end
+    orig_send_cq.create_frag(dev, sq_depth, frag, status);
+    if (!status.ok())
+      return;
+    send_cq = frag;
+    orig_recv_cq.create_frag(dev, rq_depth, frag, status);
+    if (!status.ok()) begin
+      send_cq.destroy_frag(dev, ignored);
+      send_cq = orig_send_cq;
+      return;
+    end
+    recv_cq = frag;
+  endtask
+
+  // 功能：销毁 frag CQ 并恢复原始 CQ（创建失败与 destroy 共用）。
+  // 输入/输出及副作用：下发 CQC_DELETE。
+  // 失败/边界：命令错误忽略。
+  protected task drop_frags(rdma_drv_dev dev);
+    rdma_status ignored;
+
+    if (send_cq != null && send_cq.original != null)
+      send_cq.destroy_frag(dev, ignored);
+    if (recv_cq != null && recv_cq != send_cq && recv_cq.original != null)
+      recv_cq.destroy_frag(dev, ignored);
+    send_cq = orig_send_cq;
+    recv_cq = orig_recv_cq;
+  endtask
+
+  // 功能：xtrdma_qp_set_cqc_urc_flag / clear_cqc_urc_flag：同一 frag 一条 CQC_MODIFY（SQ/RQ CEQE 均
+  //   有效，带 SQ/RQ 尺寸）；不同 frag 时发送侧 {SQ CEQE, sq 尺寸}、接收侧 {RQ CEQE, rq 尺寸}，
+  //   接收侧失败回退发送侧。清除时全部为 0。
+  // 输入/输出及副作用：下发命令。
+  // 失败/边界：命令失败返回错误。
+  protected task set_cqc_urc(rdma_drv_dev dev, bit set, output rdma_status status);
+    rdma_status ignored;
+    int unsigned sq_log;
+    int unsigned rq_log;
+
+    sq_log = set ? $clog2(sq_depth) : 0;
+    rq_log = set ? $clog2(rq_depth) : 0;
+    if (send_cq == recv_cq) begin
+      send_cq.modify_urc(dev, set, set, set, sq_log, rq_log, status);
+      return;
+    end
+    send_cq.modify_urc(dev, set, set, 1'b0, sq_log, 0, status);
+    if (!status.ok())
+      return;
+    recv_cq.modify_urc(dev, set, 1'b0, set, 0, rq_log, status);
+    if (!status.ok() && set)
+      send_cq.modify_urc(dev, 1'b0, 1'b0, 1'b0, 0, 0, ignored);
+  endtask
+
+  // 功能：xtrdma_qp_set_urc_info：frag 记录本 QP 的 QPN 与方向，send/recv 环大小取 SQ/RQ 深度。
+  // 输入/输出及副作用：修改 frag CQ 软件状态。
+  // 失败/边界：无。
+  protected function void set_urc_info();
+    send_cq.send_flag = 1'b1;
+    send_cq.send_qpn = qpn;
+    send_cq.send_size = sq_depth;
+    send_cq.send_tail = 0;
+    recv_cq.recv_flag = 1'b1;
+    recv_cq.recv_qpn = qpn;
+    recv_cq.recv_size = rq_depth;
+    recv_cq.recv_tail = 0;
+    recv_cq.recv_vld = 1'b1;
   endfunction
 
   // 功能：xtrdma_create_qp_kernel + set_qpc_basic_param 的缓冲：SQ/RQ = depth*64B（偏好大页），
@@ -277,11 +388,17 @@ class rdma_drv_qp extends uvm_object;
       if (status.ok())
         rq_sgb.push_back(page);
     end
+    // RC：UAQ、ORQ、EIRQ、EIRQ_EXTRA；URC：UAQ、RSQ、RDSQ（各 4KiB）与 DSQ（8KiB）；UD：UAQ。
     side = 1;
     if (qp_type == RDMA_DRV_QPT_RC)
-      side = 4;
+      side = urc ? 3 : 4;
     for (int unsigned i = 0; status.ok() && i < side; i++) begin
       status = dev.hw.alloc_dma(RDMA_HMC_PAGE_BYTES, RDMA_HMC_PAGE_BYTES, page);
+      if (status.ok())
+        side_bufs.push_back(page);
+    end
+    if (status.ok() && urc) begin
+      status = dev.hw.alloc_dma(2 * RDMA_HMC_PAGE_BYTES, RDMA_HMC_PAGE_BYTES, page);
       if (status.ok())
         side_bufs.push_back(page);
     end
@@ -337,7 +454,10 @@ class rdma_drv_qp extends uvm_object;
     `RDMA_DRV_SET(qpc, RDMA_QPC_ICOS, 3)
     `RDMA_DRV_SET(qpc, RDMA_QPC_QPN, qpn)
     `RDMA_DRV_SET(qpc, RDMA_QPC_PKEY, 16'hffff)
-    if (qp_type == RDMA_DRV_QPT_RC) begin
+    if (urc) begin
+      fill_urc_qpc();
+    end
+    else if (qp_type == RDMA_DRV_QPT_RC) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_SERVICE_TYPE, SERVICE_RC)
       orq = side_bufs[1].iova >> 12;
       `RDMA_DRV_SET(qpc, RDMA_QPC_RC_ORQ_PBA_H, orq >> 48)
@@ -366,8 +486,10 @@ class rdma_drv_qp extends uvm_object;
       `RDMA_DRV_SET(qpc, RDMA_QPC_RC_SRFQ, 1)
       `RDMA_DRV_SET(qpc, RDMA_QPC_RC_SRFQN, srq.srqn)
     end
-    `RDMA_DRV_SET(qpc, RDMA_QPC_RC_IRQ_SIZE, 7)
-    `RDMA_DRV_SET(qpc, RDMA_QPC_UAQ_IRQ_PBA, side_bufs[0].iova >> 12)
+    if (!urc) begin
+      `RDMA_DRV_SET(qpc, RDMA_QPC_RC_IRQ_SIZE, 7)
+      `RDMA_DRV_SET(qpc, RDMA_QPC_UAQ_IRQ_PBA, side_bufs[0].iova >> 12)
+    end
     `RDMA_DRV_SET(qpc, RDMA_QPC_UAQ_SIZE, 7)
     `RDMA_DRV_SET(qpc, RDMA_QPC_PSN_RETRY_TH, 6)
     `RDMA_DRV_SET(qpc, RDMA_QPC_ACK_REQ_TH, 3)
@@ -392,6 +514,42 @@ class rdma_drv_qp extends uvm_object;
     `RDMA_DRV_SET(qpc, RDMA_QPC_LOAD_RQ_PI_TH, 8'h05)
   endfunction
 
+  // 功能：fill_urc_qpc_info 中与 RC 不同的部分（qp.c:1226）：服务类型 6，RSQ/RDSQ/DSQ 地址与大小，
+  //   RBSN/RPSN 初值 0x1000、DBSN/DPSN 初值 0，RDSQ/DSQ 预取数 8，SQ CE/RQ SE 门限，FC/ECN 同 RC；
+  //   不写 ORQ/EIRQ/UAQ_IRQ 地址。
+  // 输入/输出及副作用：修改 qpc 镜像。
+  // 失败/边界：无。
+  protected function void fill_urc_qpc();
+    bit [63:0] rsq;
+    bit [63:0] dsq;
+
+    `RDMA_DRV_SET(qpc, RDMA_QPC_SERVICE_TYPE, SERVICE_URC)
+    rsq = side_bufs[1].iova >> 12;
+    dsq = side_bufs[3].iova >> 12;
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RSQ_PBA_H, rsq >> 48)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RSQ_PBA_L, rsq)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RSQ_SIZE, 6)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RDSQ_PBA, side_bufs[2].iova >> 12)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RDSQ_SIZE, 6)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_TX_RBSN, 24'h1000)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RX_RBSN, 24'h1000)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_CUR_TX_RPSN, 24'h1000)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_TPE_RPSN_MAX, 24'h1000)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_NXT_RDSQ_FETCH_NUM, 8)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_NXT_DSQ_FETCH_NUM, 8)
+    if (rq_depth >= 8) begin
+      `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RQ_SE_TH, $clog2(rq_depth >> 3))
+    end
+    if (!sig_all && sq_depth >= 8) begin
+      `RDMA_DRV_SET(qpc, RDMA_QPC_URC_SQ_CE_TH, $clog2(sq_depth >> 3))
+    end
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_CUR_DSQ_PBA_H, dsq >> 12)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_CUR_DSQ_PBA_L, dsq)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_URC_NXT_DSQ_PBA, (side_bufs[3].iova + RDMA_HMC_PAGE_BYTES) >> 12)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_FC_EN, 1)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_ECN, 2)
+  endfunction
+
   // 功能：QPC_CREATE / QPC_MODIFY / QPC_DELETE：SQE 带 QPN 与 CQN；full 时 QPC 镜像写入 4KiB cmdq
   //   缓冲，SQE 带缓冲地址（>>9）与 QPC 签名；仅状态修改与删除不带缓冲与签名。
   // 输入/输出及副作用：分配并释放 cmdq 缓冲，下发命令。
@@ -413,6 +571,8 @@ class rdma_drv_qp extends uvm_object;
                                    RDMA_QPC_QP_ST_WIDTH))
       if (full) begin
         `RDMA_DRV_SET(sqe, RDMA_CMQ_MODIFY_MODE, RDMA_QPC_MODIFY_FULL)
+        // qp.c:2625 URC 的全量修改带 WBE 模板 1（XTRDMA_WBE_URC）。
+        `RDMA_DRV_SET(sqe, RDMA_CMQ_WBE_TPL_NUM, urc)
       end
     end
     if (!full) begin
@@ -580,11 +740,20 @@ class rdma_drv_qp extends uvm_object;
     hw_qpc_cmd(dev, RDMA_OP_QPC_DELETE, 1'b0, status);
     if (!status.ok())
       return;
-    recv_cq.clean(dev, qpn, srq, status);
-    if (status.ok() && send_cq != recv_cq)
-      send_cq.clean(dev, qpn, null, status);
-    if (!status.ok())
-      return;
+    if (urc) begin
+      // clear_cqc_urc_flag；URC 的 cq_clean 把环直接跳到头（cq.c:1732）；随后销毁 frag。
+      set_cqc_urc(dev, 1'b0, ignored);
+      sq_tail = sq_head;
+      rq_tail = rq_head;
+      drop_frags(dev);
+    end
+    else begin
+      recv_cq.clean(dev, qpn, srq, status);
+      if (status.ok() && send_cq != recv_cq)
+        send_cq.clean(dev, qpn, null, status);
+      if (!status.ok())
+        return;
+    end
     free_buffers(dev);
     dev.qp_ids.free(qpn);
     dev.qp_table.delete(qpn);

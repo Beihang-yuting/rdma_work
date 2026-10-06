@@ -41,9 +41,10 @@ test
 - core：`rdma_drv_data_test`（两节点、逐项操作与 CQ arm 事件）、`rdma_tb_flow_test`（mock host_mem，
   loopback wire，完整流量序列）。
 - e2e：`rdma_tb_e2e_test`：真实 host_mem + net_packet RoCEv2 帧编解码 wire，同一组 sequence。
-- 传输矩阵：RC/UD（qp_index 0/1）。状态：两项均通过（28 项检查零错误）。
+- 传输矩阵：RC/UD/URC（qp_index 0/1/2；URC 在 rc_to_urc 下创建，用专属 CQ 的 frag，完成经 CEQE
+  的 HW_CPL 上报，monitor 每轮先处理 CEQ）。状态：两项均通过（33 项检查零错误）。
+- 高流量：`rdma_tb_e2e_high_traffic_test`（4096 个 SEND，整窗填满 256 深 SQ/RQ，4114 项检查）。
 
 ## 4. 后续
 
-URC（驱动与设备）、SRQ 接收、CQ resize、AEQE 错误上报、flush、UD GRH/Q_Key 校验、
-PSN 乱序重传、RNR 重试、接入 DUT。
+URC 异常完成（NAK/ABNML CEQE/AEQE）、UD GRH/Q_Key 校验、PSN 乱序重传、RNR 重试、接入 DUT。

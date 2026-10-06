@@ -16,7 +16,7 @@ package rdma_net_packet_adapter_pkg;
 
   // 功能：判断 transport/opcode 是否在本适配器的 RoCEv2 wire 能力内，供上层提交前预检。
   // 输入/输出及副作用：transport、opcode 输入；返回 bit，无副作用。
-  // 失败/边界：UD 仅 SEND/SEND_WITH_IMM；URC 仅 SEND/WRITE 及 WITH_IMM；RC 另含 READ/ATOMIC；
+  // 失败/边界：UD 仅 SEND/SEND_WITH_IMM；RC 与 URC 含 SEND/WRITE 及 WITH_IMM、READ、ATOMIC；
   //   其余（控制 WQE、SEND_WITH_INV 等）返回 0，调用方须在 encode 前 fail-closed。
   function automatic bit rdma_net_packet_work_opcode_supported_for_transport(
     rdma_transport_e transport,
@@ -33,7 +33,10 @@ package rdma_net_packet_adapter_pkg;
         return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM};
       RDMA_TRANSPORT_URC:
         return opcode inside {RDMA_WR_SEND, RDMA_WR_SEND_WITH_IMM,
-                              RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM};
+                              RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
+                              RDMA_WR_RDMA_READ,
+                              RDMA_WR_ATOMIC_CMP_SWAP,
+                              RDMA_WR_ATOMIC_FETCH_ADD};
       default:
         return 1'b0;
     endcase
@@ -293,6 +296,18 @@ package rdma_net_packet_adapter_pkg;
       return 1'b1;
     endfunction
 
+    // 功能：URC READ 请求分段的低 5 位（defs.h：ONLY 0x0c，FIRST/MIDDLE/LAST 0x0d-0x0f）。
+    // 输入/输出及副作用：纯函数。
+    // 失败/边界：无。
+    static function bit [4:0] urc_read_request_low(rdma_packet_segment_e segment);
+      case (segment)
+        RDMA_SEG_FIRST:  return 5'h0d;
+        RDMA_SEG_MIDDLE: return 5'h0e;
+        RDMA_SEG_LAST:   return 5'h0f;
+        default:         return 5'h0c;
+      endcase
+    endfunction
+
     // 功能：把 RDMA 网络 opcode/segment 映射为 RoCEv2 BTH opcode，并确认 transport 支持该组合。
     // 输入/输出及副作用：value（输入）、opcode（输出）；只做映射，不修改 packet。
     // 失败/边界：UC 只支持 SEND/WRITE，UD 只支持单包 SEND；其它组合返回 UNSUPPORTED_OPCODE。
@@ -306,16 +321,20 @@ package rdma_net_packet_adapter_pkg;
       if (value == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RDMA packet is null");
-      if (!roce_low_opcode(value.opcode, value.segment, low))
+      if (value.transport == RDMA_TRANSPORT_URC && value.opcode == RDMA_NET_RDMA_READ_REQUEST)
+        low = urc_read_request_low(value.segment);
+      else if (!roce_low_opcode(value.opcode, value.segment, low))
         return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                  "unsupported network opcode/segment");
       case (value.transport)
         RDMA_TRANSPORT_RC: opcode = {3'b000, low};
         RDMA_TRANSPORT_URC: begin
-          if (low > 5'h0b)
+          // defs.h xtrdma_urc_pkt_opcode_type（0b110 前缀）：READ 请求可分 FIRST/MIDDLE/LAST
+          //   （0x0d-0x0f），每个请求包对应一个 READ_DATA_ONLY（0x10）响应；其余低 5 位同 IBTA。
+          if (value.opcode == RDMA_NET_RDMA_READ_RESP && value.segment != RDMA_SEG_ONLY)
             return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                     "unsupported URC network opcode");
-          opcode = {3'b001, low};
+                                     "URC READ data is one packet per request");
+          opcode = {3'b110, low};
         end
         RDMA_TRANSPORT_UD: begin
           if (!(low inside {5'h04, 5'h05}))
@@ -472,9 +491,15 @@ package rdma_net_packet_adapter_pkg;
       foreach (net_value.layer_stack[i])
         header_bytes += net_value.layer_stack[i].get_header_length();
       target_length = header_bytes + value.payload.size();
-      net_value.pkt_len = target_length;
       net_value.payload_mode = PAYLOAD_PATTERN;
       net_value.payload_pattern.delete();
+      // net_packet 不识别 XTR URC opcode 的扩展头：URC 把扩展头字节放在 payload 之前原样携带。
+      if (value.transport == RDMA_TRANSPORT_URC) begin
+        target_length += value.header_bytes.size();
+        foreach (value.header_bytes[i])
+          net_value.payload_pattern.push_back(value.header_bytes[i]);
+      end
+      net_value.pkt_len = target_length;
       foreach (value.payload[i])
         net_value.payload_pattern.push_back(value.payload[i]);
       net_value.do_pack();
@@ -581,7 +606,7 @@ package rdma_net_packet_adapter_pkg;
       full = roce.opcode;
       case (full[7:5])
         3'b000: value.transport = RDMA_TRANSPORT_RC;
-        3'b001: value.transport = RDMA_TRANSPORT_URC;
+        3'b110: value.transport = RDMA_TRANSPORT_URC;
         3'b011: value.transport = RDMA_TRANSPORT_UD;
         default:
           return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
@@ -600,15 +625,18 @@ package rdma_net_packet_adapter_pkg;
           value.segment = seg_of(full[4:0] - 5'h06);
         end
         5'h0c: value.opcode = RDMA_NET_RDMA_READ_REQUEST;
-        5'h0d, 5'h0e, 5'h0f, 5'h10: begin
+        5'h0d, 5'h0e, 5'h0f: begin
+          // RC：READ 响应 FIRST/MIDDLE/LAST；URC：READ 请求 FIRST/MIDDLE/LAST。
           value.opcode = RDMA_NET_RDMA_READ_RESP;
-          case (full[4:0])
-            5'h0d: value.segment = RDMA_SEG_FIRST;
-            5'h0e: value.segment = RDMA_SEG_MIDDLE;
-            5'h0f: value.segment = RDMA_SEG_LAST;
-            default: value.segment = RDMA_SEG_ONLY;
-          endcase
+          if (value.transport == RDMA_TRANSPORT_URC)
+            value.opcode = RDMA_NET_RDMA_READ_REQUEST;
+          value.segment = RDMA_SEG_LAST;
+          if (full[4:0] == 5'h0d)
+            value.segment = RDMA_SEG_FIRST;
+          else if (full[4:0] == 5'h0e)
+            value.segment = RDMA_SEG_MIDDLE;
         end
+        5'h10: value.opcode = RDMA_NET_RDMA_READ_RESP;
         5'h11: value.opcode = RDMA_NET_ACK;
         5'h12: value.opcode = RDMA_NET_ATOMIC_ACK;
         5'h13: value.opcode = RDMA_NET_ATOMIC_CMP_SWAP;
@@ -617,11 +645,24 @@ package rdma_net_packet_adapter_pkg;
           return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                    "RoCEv2 opcode projection is unsupported");
       endcase
-      if ((value.transport == RDMA_TRANSPORT_URC && full[4:0] > 5'h0b) ||
-          (value.transport == RDMA_TRANSPORT_UD &&
-           !(full[4:0] inside {5'h04, 5'h05})))
+      if (value.transport == RDMA_TRANSPORT_UD && !(full[4:0] inside {5'h04, 5'h05}))
         return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                  "RoCEv2 opcode is invalid for its transport");
+      return rdma_status::success();
+    endfunction
+
+    // 功能：URC 解码：按语义 opcode/segment 的扩展头长度把 payload 前缀切回 header_bytes。
+    // 输入/输出及副作用：修改 value.header_bytes/payload。
+    // 失败/边界：payload 短于扩展头返回 CODEC_ERROR。
+    static function rdma_status split_urc_headers(rdma_packet value);
+      int unsigned n;
+
+      n = value.header_length();
+      if (value.payload.size() < n)
+        return rdma_status::make(RDMA_SC_CODEC_ERROR, "URC extension headers are truncated");
+      value.header_bytes.delete();
+      for (int unsigned i = 0; i < n; i++)
+        value.header_bytes.push_back(value.payload.pop_front());
       return rdma_status::success();
     endfunction
 
@@ -719,6 +760,8 @@ package rdma_net_packet_adapter_pkg;
         for (index = payload_offset; index < payload_end; index++)
           value.payload.push_back(frame_bytes[index]);
         status = validate_net_packet(net_value, roce, value.payload);
+        if (status != null && status.ok() && value.transport == RDMA_TRANSPORT_URC)
+          status = split_urc_headers(value);
         return status;
       end
 
