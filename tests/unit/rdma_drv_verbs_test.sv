@@ -2,7 +2,7 @@
 // 职责：驱动 verbs 控制路径对设备模型的端到端效果：PD/MR（三种 PBL 模式与注销）、CQ（create 的 CQC
 //   与 HMC 一致、arm 的 shadow 与 doorbell、destroy）、SRQ（create/limit/destroy）、RC QP 状态机
 //   （RESET→INIT 无命令、INIT→RTR/RTR→RTS 全量签名、转 ERR 仅状态 + flush doorbell、destroy）与 UD QP，
-//   最后 remove 归还全部 DMA 内存。
+//   CMQ 命令失败注入下 QP create/modify/destroy 的回退，最后 remove 归还全部 DMA 内存。
 // 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
 // 所有权与生命周期：测试拥有 mock 内存、设备与驱动对象。
 class rdma_drv_verbs_test extends uvm_test;
@@ -53,6 +53,7 @@ class rdma_drv_verbs_test extends uvm_test;
     check_srq();
     check_rc_qp();
     check_ud_qp();
+    check_qp_failures();
     cq.destroy(drv, status);
     expect_ok("destroy CQ", status);
     pd.dealloc(drv);
@@ -282,5 +283,53 @@ class rdma_drv_verbs_test extends uvm_test;
       `uvm_error("QP", "UD QP context or SGB is wrong")
     qp.destroy(drv, status);
     expect_ok("destroy UD QP", status);
+  endtask
+
+  // 功能：设备 CMQ 注入失败：QPC_CREATE 失败时 create_qp 返回错误且 DMA 分配、QPN 与设备 QP 数
+  //   全部回退；INIT→RTR 的 QPC_MODIFY 失败时返回错误且 cur_state 仍为 INIT；QPC_DELETE 失败时
+  //   destroy 返回错误且不释放（与驱动一致），再次 destroy 成功后 DMA 归还。
+  // 输入/输出及副作用：创建并销毁 QP。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task check_qp_failures();
+    rdma_drv_qp qp;
+    rdma_drv_qp_attr attr;
+    int unsigned live;
+    int unsigned qpns;
+    int unsigned dev_qps;
+    rdma_status status;
+
+    live = mem.live_allocations();
+    qpns = drv.qp_ids.count();
+    dev_qps = dev.cmq.count(RDMA_DEV_QP);
+    dev.cmq.inject_failure(RDMA_OP_QPC_CREATE, 8'h40);
+    rdma_drv_qp::create_qp(drv, qp_attr(RDMA_DRV_QPT_RC), qp, status);
+    if (status.ok() || status.code != RDMA_SC_UNKNOWN_HW_ERROR)
+      `uvm_error("QP_FAIL", $sformatf("failed QPC_CREATE returned %s", status.convert2string()))
+    if (mem.live_allocations() != live || drv.qp_ids.count() != qpns ||
+        dev.cmq.count(RDMA_DEV_QP) != dev_qps)
+      `uvm_error("QP_FAIL", "failed create_qp leaked DMA, a QPN or a device QP")
+    rdma_drv_qp::create_qp(drv, qp_attr(RDMA_DRV_QPT_RC), qp, status);
+    expect_ok("create QP after injected failure", status);
+    attr = rdma_drv_qp_attr::type_id::create("fail_init");
+    attr.mask = rdma_drv_qp_attr::M_STATE;
+    attr.state = RDMA_DRV_QPS_INIT;
+    qp.modify(drv, attr, status);
+    expect_ok("RESET->INIT", status);
+    dev.cmq.inject_failure(RDMA_OP_QPC_MODIFY, 8'h41);
+    attr = rdma_drv_qp_attr::type_id::create("fail_rtr");
+    attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_DEST_QPN;
+    attr.state = RDMA_DRV_QPS_RTR;
+    attr.dest_qpn = 24'h33;
+    qp.modify(drv, attr, status);
+    if (status.ok() || qp.cur_state != RDMA_DRV_QPS_INIT)
+      `uvm_error("QP_FAIL", "failed QPC_MODIFY changed the QP state")
+    dev.cmq.inject_failure(RDMA_OP_QPC_DELETE, 8'h42);
+    qp.destroy(drv, status);
+    if (status.ok() || dev.cmq.count(RDMA_DEV_QP) != dev_qps + 1)
+      `uvm_error("QP_FAIL", "failed QPC_DELETE did not keep the QP")
+    qp.destroy(drv, status);
+    expect_ok("destroy after injected failure", status);
+    if (mem.live_allocations() != live || drv.qp_ids.count() != qpns)
+      `uvm_error("QP_FAIL", "QP resources were not returned after destroy")
   endtask
 endclass

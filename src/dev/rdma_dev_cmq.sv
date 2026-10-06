@@ -51,6 +51,10 @@ class rdma_dev_cmq extends uvm_object;
   rdma_dev_nic nic;
   // 故障注入：置位后接受 CMQ doorbell 但不消费 SQE（命令永不完成，驱动超时）；复位清除。
   bit stall;
+  // 故障注入：下一条 opcode 为 fail_opcode 的命令不执行（无状态效果），以 fail_ecode 完成。
+  protected bit fail_armed;
+  protected bit [7:0] fail_opcode;
+  protected bit [7:0] fail_ecode;
   protected rdma_host_mem_api host_mem;
   protected bit [63:0] sq_pa;
   protected bit enabled;
@@ -87,6 +91,7 @@ class rdma_dev_cmq extends uvm_object;
   function void reset();
     enabled = 1'b0;
     stall = 1'b0;
+    fail_armed = 1'b0;
     sq_pa = '0;
     sq_seq = 0;
     cq_seq = 0;
@@ -112,6 +117,15 @@ class rdma_dev_cmq extends uvm_object;
   // 功能：某类 context 的数量。
   // 输入/输出及副作用：纯查询。
   // 失败/边界：无。
+  // 功能：故障注入：下一条 opcode 命令不执行并以 ecode 完成（一次性）。
+  // 输入/输出及副作用：设置注入状态。
+  // 失败/边界：复位清除。
+  function void inject_failure(bit [7:0] opcode, bit [7:0] ecode);
+    fail_armed = 1'b1;
+    fail_opcode = opcode;
+    fail_ecode = ecode;
+  endfunction
+
   // 功能：取某类中任一（编号最小）已创建 context 的编号。
   // 输入/输出及副作用：id 输出。
   // 失败/边界：该类为空返回 0。
@@ -200,9 +214,15 @@ class rdma_dev_cmq extends uvm_object;
     cqe = new[RDMA_CMQE_BYTES];
     foreach (cqe[i])
       cqe[i] = 0;
-    status = execute(sqe, cqe, ecode);
-    if (!status.ok())
-      return status;
+    if (fail_armed && word0[RDMA_CMQ_OPCODE_LSB +: 8] == fail_opcode) begin
+      fail_armed = 1'b0;
+      ecode = fail_ecode;
+    end
+    else begin
+      status = execute(sqe, cqe, ecode);
+      if (!status.ok())
+        return status;
+    end
     sq_seq++;
     executed_opcodes.push_back(word0[RDMA_CMQ_OPCODE_LSB +: 8]);
     executed_ecodes.push_back(ecode);

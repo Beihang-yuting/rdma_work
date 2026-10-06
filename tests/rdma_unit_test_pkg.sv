@@ -179,6 +179,8 @@ endpackage
   `include "integration/rdma_host_mem_adapter_test.sv"
   `include "integration/rdma_queue_data_engine_host_mem_test.sv"
   `include "integration/rdma_host_mem_umem_test.sv"
+  import rdma_tb_pkg::*;
+  `include "integration/rdma_tb_host_mem_test.sv"
 `ifdef RDMA_NET_PACKET
   // 双 env 端到端测试必须在命名 host_mem manager 和 net_packet 适配器
   // 都完成编译后再展开，避免把外部依赖复制进本仓库或形成循环 typedef。

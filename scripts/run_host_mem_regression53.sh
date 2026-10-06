@@ -11,6 +11,7 @@ readonly host_mem_tests=(
   rdma_host_mem_adapter_test
   rdma_queue_data_engine_host_mem_test
   rdma_host_mem_umem_test
+  rdma_tb_host_mem_test
 )
 
 if [[ $# -ne 0 ]]; then

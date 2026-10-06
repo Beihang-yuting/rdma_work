@@ -1,10 +1,9 @@
 // 目录：集成测试层 integration/rdma_tb_e2e_test.sv。
 // 层：集成测试。
-// 职责：rdma_tb_flow_test 的端到端版本：每节点真实 host_mem（manager + adapter + proxy）供驱动与
-//   设备 DMA，wire 替换为经 net_packet RoCEv2 帧编码/解码（含 checksum/ICRC）的实现，复用同一
-//   流量序列与记分板。
-// 依赖：rdma_tb_flow_test、rdma_real_host_mem_proxy、net_packet adapter/bridge。
-// 所有权：host_mem/adapter/proxy 由测试创建；wire 持有各节点 net adapter。
+// 职责：rdma_tb_host_mem_test 的端到端版本：真实 host_mem 之上把 wire 替换为经 net_packet RoCEv2 帧
+//   编码/解码（含 checksum/ICRC）的实现，复用同一流量序列与记分板。
+// 依赖：rdma_tb_host_mem_test、net_packet adapter/bridge。
+// 所有权：host_mem 由父类创建；wire 持有各节点 net adapter。
 // 生命周期：仿真期间常驻。
 
 // 经 net_packet 帧编解码的 wire：源节点 adapter 编码发送，目的节点 adapter 从其 sink 解码接收。
@@ -58,7 +57,7 @@ class rdma_tb_net_wire extends rdma_wire;
   endtask
 endclass
 
-class rdma_tb_e2e_test extends rdma_tb_flow_test;
+class rdma_tb_e2e_test extends rdma_tb_host_mem_test;
   `uvm_component_utils(rdma_tb_e2e_test)
 
   // 功能：构造。
@@ -76,26 +75,6 @@ class rdma_tb_e2e_test extends rdma_tb_flow_test;
     super.build_phase(phase);
   endfunction
 
-  // 功能：为节点建立独立的真实 host_mem（不重叠的物理区间与 IOVA 域）。
-  // 输入/输出及副作用：返回 proxy。
-  // 失败/边界：无。
-  virtual function rdma_host_mem_api make_host_mem(int unsigned n);
-    rdma_host_mem_external_pkg::host_mem_manager host_mem;
-    rdma_host_mem_adapter adapter;
-    rdma_real_host_mem_proxy proxy;
-
-    host_mem = rdma_host_mem_external_pkg::host_mem_manager::type_id::create(
-      $sformatf("tb_host_mem%0d", n));
-    host_mem.init_region(64'h0000_000a_0000_0000 + n * 64'h1_0000_0000,
-                         64'h0000_000a_00ff_ffff + n * 64'h1_0000_0000,
-                         MODE_BUDDY, 16, 8'ha0 + n);
-    adapter = rdma_host_mem_adapter::type_id::create($sformatf("tb_host_adapter%0d", n));
-    adapter.mem = host_mem;
-    adapter.iova_base = 64'h0000_0030_0000_0000 + n * 64'h10_0000_0000;
-    proxy = rdma_real_host_mem_proxy::type_id::create($sformatf("tb_mem_proxy%0d", n));
-    proxy.delegate = adapter;
-    return proxy;
-  endfunction
 
   // 功能：为每个节点登记 net_packet adapter（Function identity：PF，BDF 总线号 = 节点号 + 2）。
   // 输入/输出及副作用：配置 env.fabric。
