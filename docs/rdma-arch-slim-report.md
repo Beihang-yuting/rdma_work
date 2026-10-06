@@ -3,6 +3,27 @@
 日期：2026-10-05。基线：`1ea354f`（`feature/rdma-structural-batch226` 末端，Batch247）。
 本分支不修改其它分支；所有仿真经 `scripts/run_vcs53.sh` 在 `ubuntu@10.11.10.53` 执行。
 
+## 最终总结（2026-10-06，HEAD 1f91a7c，最后一轮全量 v34 全部通过）
+
+1. **第一阶段：精简**（v1–v17）。合并重复代码；CMQ 引擎按驱动流程重写（13,763→849 行），70 个驱动 opcode
+   的请求/响应与 golden 逐字节对齐；删除按源码文本冻结结构的 Python 门禁；注释改写为三段式。
+2. **第二阶段：驱动形状重构**（v18–v28）。新建 `src/drv`（驱动模型）与 `src/dev`（设备模型），两者只经
+   CMQ 环、MMIO doorbell 与按 IOVA 的 DMA 交互；tb 改为 seq → 驱动 → 设备 → 报文 → 内存；删除旧 core、
+   integration 层、CMQ port 栈、SR-IOV 与死代码。
+3. **第三阶段：协议补全与 dpu_common 接入**（v29–v34）。补齐可靠传输（PSN 续传、重复请求、RNR、RTO）、
+   URC 异常完成（CEQE/AEQE）、UD Q_Key/GRH、SRQ SGB；Function 身份与 BAR 统一由 dpu_common 快照生成，
+   doorbell 写 BAR0 绝对地址并经快照解码。
+
+| | 基线 1ea354f | 最终 HEAD | 变化 |
+| --- | ---: | ---: | ---: |
+| src（.sv/.svh 行） | 114,092 | 42,434 | −62.8% |
+| tests（.sv/.svh 行） | 164,612 | 40,447 | −75.4% |
+| 分支提交数 | — | 59 | |
+
+最终回归（v34）：Python 238 项、style、驱动契约门禁、CMQ gate 12、core 43、net_packet、PCIe、host_mem 3、
+e2e（`rdma_tb_e2e_test` 与 4096 SEND 高流量）全部通过；唯一的 2 条告警来自外部 net_packet 仓库。
+新功能均做过变异检查（注入对应缺陷后测试失败）。
+
 ## 目标与取舍
 
 此前的结构重构以单批小改动推进，每批附报告和按源码文本冻结结构的 Python 门禁，
@@ -143,10 +164,10 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 
 规模（全部 `.sv/.svh`）：
 
-| | 基线 1ea354f | 第一阶段末 510fd27 | 第二阶段 86ee72e |
-| --- | ---: | ---: | ---: |
-| src | 114,092 | 93,573 | 41,442 |
-| tests | 164,612 | 126,870 | 39,846 |
+| | 基线 1ea354f | 第一阶段末 510fd27 | 第二阶段 86ee72e | 第三阶段 HEAD |
+| --- | ---: | ---: | ---: | ---: |
+| src | 114,092 | 93,573 | 41,442 | 42,434 |
+| tests | 164,612 | 126,870 | 39,846 | 40,447 |
 
 数据端到端：`rdma_tb_flow_test`（loopback）、`rdma_tb_host_mem_test`（真实 host_mem）、
 `rdma_tb_e2e_test`（再加 net_packet RoCEv2 帧，含 URC 的 XTR 0b110 opcode）各 33 项检查零错误；
@@ -169,10 +190,27 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 | v33 | 89a7fd3 | 全部通过：驱动层单元测试改用 dpu_common（rdma_dpu_test_bar 取代 rdma_drv_dev_bar） |
 | v34 | 914e68e | 全部通过：老模型层基线 binding（cmq_engine/golden、doorbell 系列、adapter_contract）由 dpu_common 快照投影 |
 
-假设与未建模：URC 每个完成都发 CEQE（驱动源码未说明硬件是否依赖 arm）；URC 异常经 CEQE
-或 AEQE（设备开关二选一，硬件选择未知）；RTO_CODE → 超时时长按驱动 xtrdma_rto_code_map 的逆推定
-（硬件编码表未公开）；驱动 abnormal 位置
-按环大小回绕（驱动源码 idx+1 不取模，按正确行为建模）。
+## 第三阶段：协议补全与 dpu_common 接入（2026-10-06，v29–v34）
+
+| 提交 | 内容 |
+| --- | --- |
+| f2c46d9 | 请求方重试循环（超时/PSN 序列 NAK → 0x16/0x18，RNR → 0xB7，其余 NAK → 0xB9 + 远端 syndrome）；响应方重复请求（重发 ACK、重放 READ、回缓存的 ATOMIC 原值）；URC 异常 CEQE 与驱动异常轮询；UD Q_Key 校验与 40B GRH；SRQ SGB；驱动 REM_ACCESS/REM_OP；新 `rdma_drv_reliability_test` |
+| a43107a | 从 NAK 指出的 PSN 续传、READ 只重请求缺失段；RNR NAK 携带 QPC LOCAL_RNR_CODE，按 IB 定时器表等待；URC 异常可经 AEQE 上报，驱动处理后 QP 转 ERR |
+| 9011339 | 响应超时由 QPC RTO_CODE 换算；驱动按 `xtrdma_get_rto_code` 映射 IB timeout，URC 固定 urc_rto_code |
+| 131140d | `src/adapters/dpu/rdma_dpu_adapter_pkg.sv`：dpu_common 声明 Host/PF/VF → resolver 冻结快照 → Function 投影（host_id、global Function ID = QPC/PD VF_ID、BDF、BAR0/MAILBOX/MSI-X、net_packet identity）；BAR0 绝对地址经 `resolve_bar_address` 路由到设备，MAILBOX/MSI-X/越界地址拒绝；multifunc（2 Host、5 Function）与 tb/e2e 接入 |
+| 89a7fd3 | 驱动层单元测试（cmq/dev/verbs/data/reliability）经 `rdma_dpu_test_bar` 走 dpu_common，删除直连的 `rdma_drv_dev_bar` |
+| 914e68e | `rdma_dpu_function::binding()`；cmq_engine/golden、doorbell 系列、adapter_contract 的基线 binding 由快照投影 |
+
+假设（驱动源码未给出，模型按推定实现，可替换）：
+- URC 每个完成都发 CEQE（硬件是否依赖 arm 未知）；URC 异常经 CEQE 还是 AEQE 上报未知，设备开关二选一。
+- RTO_CODE → 超时时长：硬件编码表未公开，取驱动 `xtrdma_rto_code_map` 的逆（编码 0 = 8.192us，31 = 不超时）；
+  RC 未设 timeout 时编码 0，超时很短。RC 默认 RNR 编码 0 = 655ms，测试在 RTR 设 min_rnr=1。
+- 驱动 URC 异常位置按环大小回绕（驱动源码 idx+1 不取模，按正确行为建模）。
+- doorbell 所在 BAR 取 DEVICE_MEMORY（BAR0，对应驱动 `pf->hw_addr`）；MAILBOX/MSI-X 只分配，寄存器与中断
+  未建模（EQ 轮询）。
+- dpu_common 无 RDMA 专用队列能力，binding 的 CQ/SRQ/EQ 深度上界取其 VIO qpair 与 MSI-X 数。
+
+构建：所有编译 `tests/rdma_unit_test_pkg.sv` 的 suite 都需要 `DPU_COMMON_ROOT`（`dpu_common_preflight`）。
 
 ## 未做与遗留
 
@@ -181,3 +219,9 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 - 驱动对 7 个无填充函数 opcode 提交全零 WQE，模型发信封头（有意偏离，见 CMQ 对齐文档）。
 - 驱动 KEY_QUERY/CQC_QUERY 越界读 CQE 之后字节，模型只解码 64B CQE 内的内容。
 - 第一阶段的包级 DAG 计划已被第二阶段的驱动形状重构取代。
+- 尚无 RTL DUT：`src/dev` 设备模型充当设备，接入 DUT 后应退为预测器。
+- binding 值对象的复制/校验/溢出边界测试（model、function_identity、context_backing_contract、
+  host_mem_adapter）保留刻意的字面量，未改为 dpu_common 生成。
+- core 内的 data/reliability/multifunc 用直连链路，只有 e2e 经 net_packet 帧编解码；设备报文不带 IP
+  地址，GRH 与 IP 头地址为 0。
+- MAILBOX/MSI-X 寄存器、中断、SEND/WRITE 超时后的部分重传（响应方只对末包 ACK）未建模。
