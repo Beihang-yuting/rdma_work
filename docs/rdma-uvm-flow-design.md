@@ -21,19 +21,26 @@ test
 主机与设备之间只有真实硬件边界：CMQ 环（命令与 context 经 DMA 读取）、MMIO doorbell
 （BAR+0x2000 窗口）和按 IOVA 的 DMA。设备不调用任何主机对象。
 
-Function 身份与 BAR 由 dpu_common 管理（`src/adapters/dpu/rdma_dpu_adapter_pkg.sv`）：测试用
-`rdma_dpu_topology` 声明 Host/PF/VF（BAR 请求取 `dut_caps.bar_profiles`），`dpu_device_resolver`
-解析并冻结快照；每个 Function 的 host_id、global Function ID（驱动 QPC/PD 的 VF_ID）、BDF、
-BAR0/MAILBOX/MSI-X 取自快照。驱动的 doorbell 写为 BAR0（驱动 `pf->hw_addr`）基址 + 偏移的绝对
-地址，`rdma_dpu_bar_router` 用 `snapshot.resolve_bar_address` 解码到所属 Function 的设备；MAILBOX/
-MSI-X 与 BAR 外地址拒绝（这两个 BAR 只分配，寄存器与中断未建模）。e2e 的 net_packet Function
-identity 也由快照生成。multifunc（2 Host、5 Function）与 tb 节点（每节点一台 DPU、Host0 PF0）
-走这条路径；驱动层单元测试（cmq/dev/verbs/data/reliability）经 `tests/support/rdma_dpu_test_bar.sv`
-同样由 dpu_common 解析 Function 与 BAR（drv_dev 测试取 Host0 VF3，global ID 3）。老模型层把 binding 当正常
-Function 用的测试（cmq_engine/golden、doorbell_scheduler 及其 barrier/authority/reset_epoch、
-adapter_contract）的 binding 由 `rdma_dpu_function::binding()` 从快照投影（notify 窗口 = BAR0 + 0x2000，
-DMA domain = segment）；只保留测试自身的句柄 UID/generation、PASID 与运行期就绪位。binding 值对象的
-复制/校验/溢出边界测试（model、function_identity、context_backing_contract、host_mem_adapter）保留字面量。
+Function 身份与 BAR 由 dpu_common 管理（`src/adapters/dpu/rdma_dpu_adapter_pkg.sv`）：
+`rdma_dpu_system` 用 `rdma_dpu_topology` 声明 Host/PF/VF（BAR 随机放置），`dpu_device_resolver` 解析并
+冻结快照；每个 Function 的 host_id、global Function ID（驱动 QPC/PD 的 VF_ID）、BDF、BAR0/MAILBOX/MSI-X
+取自快照。`build` 为每个 Function 建主机内存（`rdma_dpu_mem_factory`）、设备、驱动 BAR 与驱动；`probe`
+以快照身份初始化驱动；`find`/`pf_scope`/`host_scope`/`device_scope` 按快照求复位范围，`flr`/`recover`
+对范围内 Function 复位并重新 probe。驱动 doorbell 写 BAR0（驱动 `pf->hw_addr`）基址 + 偏移的绝对地址，
+`rdma_dpu_bar_router` 用 `snapshot.resolve_bar_address` 解码到所属设备；MAILBOX/MSI-X 与 BAR 外地址拒绝
+（这两个 BAR 只分配，寄存器与中断未建模）。e2e 的 net_packet Function identity 也由快照生成。
+全部单元测试（`tests/support/rdma_dpu_test_system.sv`）、tb 与 multifunc 都经 `rdma_dpu_system`。
+
+设备对主机内存的访问全部经 `rdma_dev_dma`（task）。默认后门直接读写 host_mem；pcie_work suite
+（`src/adapters/pcie_work/rdma_pcie_work_pkg.sv`）以 factory 覆盖为 PCIe 路径：
+
+```
+dpu_common 快照 ── pcie_topology（每 Host：RC<h> ── EP<h>）── pcie_dpu_cfg_adapter ── pcie_tl_env（TLM）
+驱动 BAR 写  → RC<h> MemWr（BAR0 + 偏移）→ EP<h> → 队列 → 快照解码 → rdma_dev.write_register
+设备 DMA     → EP<h> MemRd/MemWr（requester = Function BDF，≤512/256B，不跨 4KB）→ RC<h> → Host<h> host_mem
+```
+
+RC 的统一内存是绑定到该 Root 的 Host host_mem manager；没有 IOMMU，驱动分配用恒等 IOVA adapter。
 
 ## 2. 关键约定
 
@@ -73,6 +80,10 @@ DMA domain = segment）；只保留测试自身的句柄 UID/generation、PASID 
   READ 只重请求缺失段、RNR 按定时器编码重试与耗尽、UD Q_Key/GRH、SRQ SGB、URC SQ/RQ 异常完成经 CEQE
   与 AEQE）；`rdma_multifunc_test` 的丢包项改为
   “丢一包重传成功 + 持续丢包重试耗尽 0x16”。
+- QP 生命周期：`rdma_drv_qp_lifecycle_test`（RTS→SQD 等 AEQE、doorbell 状态不符、RESET/INIT 接收丢包、
+  销毁重建与编号复用）；multifunc 按快照范围做 Function/PF/Host 复位。
+- PCIe：`rdma_pcie_rdma_test`（pcie_work suite）：Host0 PF0/VF1 与 Host1 PF0 经 PCIe 完成 probe 与
+  SEND/WRITE，检查 MMIO TLP 解码数、DMA TLP 发出/送达数、各 Function 的 requester BDF、MAILBOX 拒绝。
 
 ## 4. 后续
 

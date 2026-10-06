@@ -3,7 +3,7 @@
 日期：2026-10-05。基线：`1ea354f`（`feature/rdma-structural-batch226` 末端，Batch247）。
 本分支不修改其它分支；所有仿真经 `scripts/run_vcs53.sh` 在 `ubuntu@10.11.10.53` 执行。
 
-## 最终总结（2026-10-06，HEAD 1f91a7c，最后一轮全量 v34 全部通过）
+## 最终总结（2026-10-06，HEAD 0f1fd94，最后一轮全量 v39）
 
 1. **第一阶段：精简**（v1–v17）。合并重复代码；CMQ 引擎按驱动流程重写（13,763→849 行），70 个驱动 opcode
    的请求/响应与 golden 逐字节对齐；删除按源码文本冻结结构的 Python 门禁；注释改写为三段式。
@@ -13,15 +13,21 @@
 3. **第三阶段：协议补全与 dpu_common 接入**（v29–v34）。补齐可靠传输（PSN 续传、重复请求、RNR、RTO）、
    URC 异常完成（CEQE/AEQE）、UD Q_Key/GRH、SRQ SGB；Function 身份与 BAR 统一由 dpu_common 快照生成，
    doorbell 写 BAR0 绝对地址并经快照解码。
+4. **第四阶段：去旧层、dpu 系统层与 pcie_work**（v35–v39）。删除老 core/model/codec 层与其测试，CMQ golden
+   改由新驱动模型生成；`rdma_dpu_system` 由 dpu_common 快照统一建立并控制全部 Function（probe、按 Function/
+   PF/Host/设备范围 FLR 与恢复）；QP 状态门控与 SQD；MMIO 与设备 DMA 都经 pcie_work 传输：dpu_common 生成
+   PF/VF 与随机 BAR，pcie_work 承载 TLP（RC→EP MemWr 送 doorbell，EP→RC MemRd/MemWr 访问 Host 内存），
+   RDMA 模型产生数据。
 
 | | 基线 1ea354f | 最终 HEAD | 变化 |
 | --- | ---: | ---: | ---: |
-| src（.sv/.svh 行） | 114,092 | 42,434 | −62.8% |
-| tests（.sv/.svh 行） | 164,612 | 40,447 | −75.4% |
-| 分支提交数 | — | 59 | |
+| src（.sv/.svh 行） | 114,092 | 15,261 | −86.6% |
+| tests（.sv/.svh 行） | 164,612 | 6,399 | −96.1% |
+| 分支提交数 | — | 66 | |
 
-最终回归（v34）：Python 238 项、style、驱动契约门禁、CMQ gate 12、core 43、net_packet、PCIe、host_mem 3、
-e2e（`rdma_tb_e2e_test` 与 4096 SEND 高流量）全部通过；唯一的 2 条告警来自外部 net_packet 仓库。
+第三阶段结束时（v34）src 42,434 行、tests 40,447 行；第四阶段删除老 core/model/codec 层后降至上表。
+最终回归（v39，全部通过）：Python、style、驱动契约门禁、CMQ gate 5、core 14、host_mem、net_packet、pcie_work、
+e2e（`rdma_tb_e2e_test` 与 4096 SEND 高流量）；唯一的 2 条告警来自外部 net_packet 仓库。
 新功能均做过变异检查（注入对应缺陷后测试失败）。
 
 ## 目标与取舍
@@ -189,6 +195,11 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 | v32 | 131140d | 全部通过：dpu_common 接入（Function 身份与 BAR 由快照生成，BAR0 绝对地址解码），所有 suite 依赖 DPU_COMMON_ROOT |
 | v33 | 89a7fd3 | 全部通过：驱动层单元测试改用 dpu_common（rdma_dpu_test_bar 取代 rdma_drv_dev_bar） |
 | v34 | 914e68e | 全部通过：老模型层基线 binding（cmq_engine/golden、doorbell 系列、adapter_contract）由 dpu_common 快照投影 |
+| v35 | b5f1883 | 全部通过（core 14、CMQ 5）：删除老层后的首轮；QP 状态门控、SQD、`rdma_drv_qp_lifecycle_test` |
+| v36 | c90ab2a | 全部通过：`rdma_dpu_system` 全局 Function 控制 |
+| v37 | abcf720 | 全部通过：MMIO 经 pcie_work（pcie_work suite 重新纳入全量） |
+| v38 | 26d800d | 全部通过：设备 DMA 端口 `rdma_dev_dma`（task 化，默认后门，行为不变） |
+| v39 | 0f1fd94 | 全部通过：设备 DMA 经 pcie_work EP→RC（MemRd 73、MemWr 55 全部送达，requester = Function BDF）；告警 2 来自外部 net_packet |
 
 ## 第三阶段：协议补全与 dpu_common 接入（2026-10-06，v29–v34）
 
@@ -212,6 +223,23 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 
 构建：所有编译 `tests/rdma_unit_test_pkg.sv` 的 suite 都需要 `DPU_COMMON_ROOT`（`dpu_common_preflight`）。
 
+## 第四阶段：去旧层、dpu 系统层与 pcie_work（2026-10-06，v35–v39）
+
+| 提交 | 内容 |
+| --- | --- |
+| 77f3a03 | 删除 `src/core`、老 model/codec 层、字段归属门禁与 30 个老层测试；CMQ golden（51 条）改由 `rdma_drv_cmq::compose_fields` 生成并比对 `cmq_requests.hex`；测试 mock 改为 `rdma_mock_host_mem` |
+| b5f1883 | 按驱动源码补 QP 状态：modify 到 RESET 不支持（驱动映射为 ERR，复用即销毁重建）；RTS→SQD 发 doorbell 后等 AEQE 0x2E，状态不符 0x2C/0x2F；SQD/ERR 下不取新 SQE，RESET/INIT/ERR 接收端丢包；新 `rdma_drv_qp_lifecycle_test`（SQD、doorbell 状态不符、复位后丢包、销毁重建与编号复用） |
+| c90ab2a | `rdma_dpu_system`：由 dpu_common 快照为每个 Function 建内存、设备、BAR、驱动；`probe`（host_id、VF_ID = global Function ID）；按快照求 Function/PF（含其 VF）/Host/设备范围，`flr` 与 `recover`；全部单元测试、tb 与 multifunc 改用它 |
+| abcf720 | `rdma_pcie_work_pkg`：快照 → pcie_topology（每 Host 一条 RC↔EP 链）→ `pcie_dpu_cfg_adapter` 投影 → `pcie_tl_env`；驱动 BAR 写成为 RC 上的 MemWr（BAR0 随机基址 + 偏移），EP 经快照解码送设备，MAILBOX BAR 拒绝 |
+| 26d800d | 设备对主机内存的全部访问经 `rdma_dev_dma` 的 task；DMA 链与寄存器写改为 task；CQ/EQ PI 与 URC 计数在 DMA 前占位 |
+| 0f1fd94 | `rdma_pcie_dma`：设备 DMA 在所属 Host 的 EP 上发 MemRd/MemWr（requester ID = Function BDF，按 MRRS 512/MPS 256 切分不跨 4KB），RC 以绑定到该 Root 的 Host host_mem 应答；EP 收到的 MemWr 排队由工作进程分派（RC→EP 进程还要送回 DMA 的 CplD）；测试每 Host 一个真实 host_mem，检查 DMA TLP 发出/送达数、各 Function BDF、经 PCIe 写入的数据 |
+
+分工：dpu_common 生成 Host/PF/VF 与随机 BAR 并冻结快照；pcie_work 按快照建拓扑、承载 TLP；RDMA 驱动与
+设备模型产生 MMIO 与 DMA 数据。全局 Function 控制（probe、FLR、恢复范围）由 `rdma_dpu_system` 按快照完成。
+
+假设：PCIe 路径无 IOMMU，设备 DMA 地址即 Host 内存地址（host_mem adapter 用恒等 IOVA）；不同 Host 的
+Function 可有相同 BDF（各自 PCIe 域）。
+
 ## 未做与遗留
 
 - CEQ/AEQ 的 request/resource/context model 与 lifecycle policy 仍为平行实现；字段名不同，
@@ -220,8 +248,8 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 - 驱动 KEY_QUERY/CQC_QUERY 越界读 CQE 之后字节，模型只解码 64B CQE 内的内容。
 - 第一阶段的包级 DAG 计划已被第二阶段的驱动形状重构取代。
 - 尚无 RTL DUT：`src/dev` 设备模型充当设备，接入 DUT 后应退为预测器。
-- binding 值对象的复制/校验/溢出边界测试（model、function_identity、context_backing_contract、
-  host_mem_adapter）保留刻意的字面量，未改为 dpu_common 生成。
+- 只有 pcie_work suite 的 DMA 走 PCIe；core/host_mem/e2e 仍用后门 DMA 端口（零仿真时间）。
+- PCIe 路径未开 FC/记分板/覆盖率；Completion 超时、UR/CA 只报为 DMA 失败，未建模设备侧错误上报。
 - core 内的 data/reliability/multifunc 用直连链路，只有 e2e 经 net_packet 帧编解码；设备报文不带 IP
   地址，GRH 与 IP 头地址为 0。
 - MAILBOX/MSI-X 寄存器、中断、SEND/WRITE 超时后的部分重传（响应方只对末包 ACK）未建模。
