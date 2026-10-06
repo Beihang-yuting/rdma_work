@@ -3,7 +3,7 @@
 //   与 HMC 一致、arm 的 shadow 与 doorbell、destroy）、SRQ（create/limit/destroy）、RC QP 状态机
 //   （RESET→INIT 无命令、INIT→RTR/RTR→RTS 全量签名、转 ERR 仅状态 + flush doorbell、destroy）与 UD QP，
 //   CMQ 命令失败注入下 QP create/modify/destroy 的回退，最后 remove 归还全部 DMA 内存。
-// 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_test_bar（dpu_common）、rdma_mock_host_mem。
 // 所有权与生命周期：测试拥有 mock 内存、设备与驱动对象。
 class rdma_drv_verbs_test extends uvm_test;
   `uvm_component_utils(rdma_drv_verbs_test)
@@ -25,7 +25,7 @@ class rdma_drv_verbs_test extends uvm_test;
   // 输入/输出及副作用：持有 objection 直到结束。
   // 失败/边界：以 UVM_ERROR/FATAL 报告。
   task run_phase(uvm_phase phase);
-    rdma_drv_dev_bar bar;
+    rdma_dpu_test_bar bar;
     rdma_drv_hw hw;
     rdma_drv_config cfg;
     rdma_function_handle fn;
@@ -35,15 +35,16 @@ class rdma_drv_verbs_test extends uvm_test;
     mem = rdma_mock_host_mem::type_id::create("verbs_mem");
     dev = rdma_dev::type_id::create("verbs_dev");
     dev.configure(mem);
-    bar = rdma_drv_dev_bar::type_id::create("verbs_bar");
-    bar.dev = dev;
+    bar = rdma_dpu_test_bar::make("verbs_bar", dev);
     fn = rdma_function_handle::type_id::create("verbs_fn");
     fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = 64'h0e0f;
+    fn.function_uid = bar.func.uid();
     fn.generation = 1;
     hw = rdma_drv_hw::type_id::create("verbs_hw");
     expect_ok("bind", hw.bind_hw(bar, mem, fn));
     cfg = rdma_drv_config::type_id::create("verbs_cfg");
+    cfg.host_id = bar.func.key.host_id;
+    cfg.vf_id = bar.func.global_id;
     drv = rdma_drv_dev::type_id::create("verbs_drv");
     drv.probe(cfg, hw, status);
     expect_ok("probe", status);

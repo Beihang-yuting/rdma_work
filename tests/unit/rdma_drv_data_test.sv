@@ -6,7 +6,7 @@
 //   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE，CQ destroy 的 cleanup_ceqes，
 //   URC（rc_to_urc：frag CQ、CEQE 上报 HW 完成下标、SQ 完成合成、RQ CQE 在 frag 槽、flush、销毁）；
 //   每项逐字节比对目的内存并检查完成的 wr_id/方向/状态。
-// 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_test_bar（dpu_common）、rdma_mock_host_mem。
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
 // 生命周期：run_phase 内建立并运行到结束。
 
@@ -148,7 +148,7 @@ class rdma_drv_data_test extends uvm_test;
   // 输入/输出及副作用：node 输出；注册到链路。
   // 失败/边界：任一步失败报告 UVM_FATAL。
   task build_node(string name, bit [47:0] mac, output rdma_drv_data_node node);
-    rdma_drv_dev_bar bar;
+    rdma_dpu_test_bar bar;
     rdma_drv_hw hw;
     rdma_drv_config cfg;
     rdma_function_handle fn;
@@ -163,15 +163,16 @@ class rdma_drv_data_test extends uvm_test;
     node.dev.configure(node.mem);
     node.dev.nic.port = link;
     link.nodes[mac] = node.dev;
-    bar = rdma_drv_dev_bar::type_id::create({name, "_bar"});
-    bar.dev = node.dev;
+    bar = rdma_dpu_test_bar::make({name, "_bar"}, node.dev);
     fn = rdma_function_handle::type_id::create({name, "_fn"});
     fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = mac;
+    fn.function_uid = bar.func.uid();
     fn.generation = 1;
     hw = rdma_drv_hw::type_id::create({name, "_hw"});
     expect_ok("bind", hw.bind_hw(bar, node.mem, fn));
     cfg = rdma_drv_config::type_id::create({name, "_cfg"});
+    cfg.host_id = bar.func.key.host_id;
+    cfg.vf_id = bar.func.global_id;
     node.drv = rdma_drv_dev::type_id::create({name, "_drv"});
     node.drv.probe(cfg, hw, status);
     expect_ok("probe", status);

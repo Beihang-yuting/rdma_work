@@ -49,7 +49,7 @@ package rdma_unit_test_pkg;
   `include "support/rdma_golden_reader.sv"
   `include "support/rdma_cmq_contract_reader.sv"
   `include "support/rdma_cmq_device_responder.sv"
-  `include "support/rdma_drv_dev_bar.sv"
+  `include "support/rdma_dpu_test_bar.sv"
   `include "unit/rdma_smoke_test.sv"
   `include "unit/rdma_types_test.sv"
   `include "unit/rdma_model_test.sv"

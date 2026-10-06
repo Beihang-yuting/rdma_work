@@ -28,7 +28,8 @@ BAR0/MAILBOX/MSI-X 取自快照。驱动的 doorbell 写为 BAR0（驱动 `pf->h
 地址，`rdma_dpu_bar_router` 用 `snapshot.resolve_bar_address` 解码到所属 Function 的设备；MAILBOX/
 MSI-X 与 BAR 外地址拒绝（这两个 BAR 只分配，寄存器与中断未建模）。e2e 的 net_packet Function
 identity 也由快照生成。multifunc（2 Host、5 Function）与 tb 节点（每节点一台 DPU、Host0 PF0）
-走这条路径；data/reliability 等单元测试仍用直连设备的 `rdma_drv_dev_bar`。
+走这条路径；驱动层单元测试（cmq/dev/verbs/data/reliability）经 `tests/support/rdma_dpu_test_bar.sv`
+同样由 dpu_common 解析 Function 与 BAR（drv_dev 测试取 Host0 VF3，global ID 3）。
 
 ## 2. 关键约定
 
