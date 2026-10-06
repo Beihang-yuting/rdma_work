@@ -21,6 +21,8 @@ typedef enum int {
   RDMA_DRV_WC_SUCCESS,
   RDMA_DRV_WC_FLUSH_ERR,
   RDMA_DRV_WC_REM_INV_REQ_ERR,
+  RDMA_DRV_WC_REM_ACCESS_ERR,
+  RDMA_DRV_WC_REM_OP_ERR,
   RDMA_DRV_WC_GENERAL_ERR
 } rdma_drv_wc_status_e;
 
@@ -506,10 +508,11 @@ class rdma_drv_wr extends uvm_object;
 
   // 功能：xtrdma_post_srq_recv（单个 WR）：get_srq_wqe 从 next_slot 起轮转取空闲槽（bitmap），SGE
   //   写入 WQE 字节 32 起，+8 TPL，SRFQ 首槽翻转 polarity，头 QPN=SRQN|QP_SN|RQ_WQE|IDX=槽|WRAP|VALID，
-  //   写入 SRQ 缓冲槽并复制到 SRFQ 环 PI 槽；PI++，shadow（context+28）写 be16(wrap<<15|PI)，
+  //   写入 SRQ 缓冲槽并复制到 SRFQ 环 PI 槽（SGE>2 时 SGE 写入该槽的 SGB，SGB_PA、SIGN_EN 并签名）；
+  //   PI++，shadow（context+28）写 be16(wrap<<15|PI)，
   //   敲 SRFQ doorbell（LIMIT_INVLD|WRAP|PI|SRFQN）。
   // 输入/输出及副作用：写 SRQ/SRFQ/shadow/doorbell；推进 pi。
-  // 失败/边界：SGE>2（SRQ SGB）未建模返回 INVALID_ARGUMENT；SRFQ 或槽位满返回 QUEUE_FULL。
+  // 失败/边界：SGE 超过一个 SGB 返回 INVALID_ARGUMENT；SRFQ 或槽位满返回 QUEUE_FULL。
   static task post_srq_recv(rdma_drv_dev dev, rdma_drv_srq srq, rdma_drv_recv_wr wr,
                             output rdma_status status);
     rdma_bytes_t wqe;
@@ -522,12 +525,15 @@ class rdma_drv_wr extends uvm_object;
     longint unsigned payload;
     bit [15:0] pi;
     bit found;
+    bit use_sgb;
+    bit [63:0] sgb_pa;
 
     data = sge_descriptors(wr.sges);
-    if (data.size() / SGE_BYTES > S_SGE_MAX) begin
-      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SRQ SGB is not modeled");
+    if (data.size() > rdma_drv_srq::SGB_BYTES) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "SRQ SGE count exceeds the SGB");
       return;
     end
+    use_sgb = data.size() / SGE_BYTES > S_SGE_MAX;
     found = 1'b0;
     for (int unsigned k = 0; k < srq.depth && !found; k++) begin
       idx = (srq.next_slot + k) % srq.depth;
@@ -539,8 +545,17 @@ class rdma_drv_wr extends uvm_object;
     end
     srq.next_slot = (idx + 1) % srq.depth;
     wqe = rdma_be::zeros(RDMA_RQE_BYTES);
-    foreach (data[i])
-      wqe[PAYLOAD_OFFSET + i] = data[i];
+    if (use_sgb) begin
+      sgb_pa = srq.sgb[idx / 8].iova + (idx % 8) * rdma_drv_srq::SGB_BYTES;
+      `RDMA_DRV_SET(wqe, RDMA_RQE_SGB_PA, sgb_pa >> 9)
+      status = dev.hw.write(srq.sgb[idx / 8], (idx % 8) * rdma_drv_srq::SGB_BYTES, data);
+      if (!status.ok())
+        return;
+    end
+    else begin
+      foreach (data[i])
+        wqe[PAYLOAD_OFFSET + i] = data[i];
+    end
     payload = 0;
     foreach (wr.sges[i])
       payload += wr.sges[i].length;
@@ -555,8 +570,12 @@ class rdma_drv_wr extends uvm_object;
     hdr[RDMA_RQE_OPCODE_LSB +: RDMA_RQE_OPCODE_WIDTH] = RQE_OPCODE;
     hdr[RDMA_RQE_INDEX_LSB +: RDMA_RQE_INDEX_WIDTH] = idx;
     hdr[RDMA_RQE_WRAP_LSB] = (srq.pi / srq.depth) & 1;
+    hdr[RDMA_RQE_SIGN_EN_LSB] = use_sgb;
     hdr[RDMA_RQE_VALID_LSB] = srq.polarity;
-    rdma_be::put_qword(wqe, 0, hdr);
+    if (use_sgb)
+      sign(wqe, hdr, data, 1'b1);
+    else
+      rdma_be::put_qword(wqe, 0, hdr);
     status = srq.srq_kbuf.write(dev.hw, idx * RDMA_RQE_BYTES, wqe);
     if (status.ok())
       status = srq.srfq_kbuf.write(dev.hw, slot * RDMA_RQE_BYTES, wqe);
@@ -670,13 +689,9 @@ class rdma_drv_wr extends uvm_object;
         qp.sq_tail = qp.sq_ring_head[idx % qp.sq_depth];
       end
       wc.vendor_err = ecode;
-      wc.status = RDMA_DRV_WC_GENERAL_ERR;
-      if (ecode inside {8'h00, 8'h01, 8'h78, 8'h80, 8'h81})
-        wc.status = RDMA_DRV_WC_SUCCESS;
-      else if (ecode inside {8'h08, 8'h8f})
-        wc.status = RDMA_DRV_WC_FLUSH_ERR;
-      else if (ecode == 8'hb9)
-        wc.status = RDMA_DRV_WC_REM_INV_REQ_ERR;
+      wc.status = wc_status(ecode, rdma_be::field(cqe, RDMA_CQE_RC_REMOTE_SYNDROME_WORD_BYTE_OFFSET,
+                                                  RDMA_CQE_RC_REMOTE_SYNDROME_LSB,
+                                                  RDMA_CQE_RC_REMOTE_SYNDROME_WIDTH));
       wcs.push_back(wc);
       n++;
       if (move_ci) begin
@@ -688,21 +703,46 @@ class rdma_drv_wr extends uvm_object;
       status = cq.update_shadow_ci(dev);
   endtask
 
+  // 功能：xtrdma_set_ib_wc_status：成功类 ecode 为 SUCCESS，0x08/0x8F 为 FLUSH，0xB9（NAK 致命）按
+  //   远端 syndrome 0x61/0x62/0x63 映射为 REM_INV_REQ/REM_ACCESS/REM_OP，其余为 GENERAL_ERR。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：0xB9 下未知 syndrome 为 GENERAL_ERR。
+  static function rdma_drv_wc_status_e wc_status(bit [7:0] ecode, bit [7:0] synd);
+    if (ecode inside {8'h00, 8'h01, 8'h78, 8'h80, 8'h81})
+      return RDMA_DRV_WC_SUCCESS;
+    if (ecode inside {8'h08, 8'h8f})
+      return RDMA_DRV_WC_FLUSH_ERR;
+    if (ecode == 8'hb9) begin
+      case (synd)
+        8'h61: return RDMA_DRV_WC_REM_INV_REQ_ERR;
+        8'h62: return RDMA_DRV_WC_REM_ACCESS_ERR;
+        8'h63: return RDMA_DRV_WC_REM_OP_ERR;
+        default: return RDMA_DRV_WC_GENERAL_ERR;
+      endcase
+    end
+    return RDMA_DRV_WC_GENERAL_ERR;
+  endfunction
+
   // 功能：URC frag 的 CEQE（event.c:450-522）：ECODE 为 0x08/0x8F 时按 SQ/RQ_CEQE_VLD 置 flush 标志
   //   （byte0 bit0/1）；否则 ce_urc_process：URC_ARM_SN 加一并把 CEQE 字节 12..15（HW_CPL SQ/RQ
-  //   下标与 wrap）复制到信息区 +12。异常（ABNML）CEQE 未建模。
+  //   下标与 wrap）复制到信息区 +12。ABNML CEQE（类型 1 SQ / 2 RQ，urc_eq_update_abnml_info）：
+  //   该方向未记异常时记 ecode（+1/+2）、FATAL_SYNDROME（远端 syndrome 低 2 位），未 flush 时把
+  //   be16 异常位置 {wrap, idx+1}（按环大小回绕）写到 +8/+10，并置 SQ/RQ_ABNML。
   // 输入/输出及副作用：写 frag 的 URC 信息区。
   // 失败/边界：读写失败返回错误。
   static function rdma_status urc_ceqe(rdma_drv_dev dev, rdma_drv_cq frag, rdma_bytes_t ceqe);
     rdma_bytes_t info;
     rdma_status status;
     bit [7:0] ecode;
+    bit [1:0] abnml;
 
     status = frag.read_urc_info(dev, info);
     if (!status.ok())
       return status;
     ecode = rdma_be::field(ceqe, RDMA_CEQE_ECODE_WORD_BYTE_OFFSET, RDMA_CEQE_ECODE_LSB,
                            RDMA_CEQE_ECODE_WIDTH);
+    abnml = rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_TYPE_WORD_BYTE_OFFSET,
+                           RDMA_CEQE_URC_ABNML_CQE_TYPE_LSB, RDMA_CEQE_URC_ABNML_CQE_TYPE_WIDTH);
     if (ecode inside {RDMA_ECODE_EC_TPE_QP_FLUSH, RDMA_ECODE_EC_RPE_RX_FLUSH}) begin
       if (rdma_be::field(ceqe, RDMA_CEQE_URC_SQ_CQE_VALID_WORD_BYTE_OFFSET,
                          RDMA_CEQE_URC_SQ_CQE_VALID_LSB, 1))
@@ -711,12 +751,46 @@ class rdma_drv_wr extends uvm_object;
                          RDMA_CEQE_URC_RQ_CQE_VALID_LSB, 1))
         info[0][1] = 1'b1;
     end
+    else if (abnml != 0)
+      urc_abnml_info(frag, ceqe, abnml == 2, ecode, info);
     else begin
       info[0][7:6] = info[0][7:6] + 1;
       for (int i = 12; i < 16; i++)
         info[i] = ceqe[i];
     end
     return frag.write_urc_info(dev, info);
+  endfunction
+
+  // 功能：urc_eq_update_abnml_info_process：见 urc_ceqe。
+  // 输入/输出及副作用：修改 info。
+  // 失败/边界：该方向已记异常时不变。
+  static function void urc_abnml_info(rdma_drv_cq frag, rdma_bytes_t ceqe, bit rq, bit [7:0] ecode,
+                                      inout rdma_bytes_t info);
+    bit [15:0] pos;
+    int unsigned size;
+    int unsigned at;
+
+    if (info[0][rq ? 3 : 2])
+      return;
+    info[rq ? 2 : 1] = ecode;
+    info[0][5:4] = rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE_WORD_BYTE_OFFSET,
+                                  RDMA_CEQE_URC_ABNML_CQE_REMOTE_ECODE_LSB, 2);
+    info[0][rq ? 3 : 2] = 1'b1;
+    if (info[0][rq ? 1 : 0])
+      return;
+    size = rq ? frag.recv_size : frag.send_size;
+    pos[14:0] = rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WORD_BYTE_OFFSET,
+                               RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_LSB,
+                               RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WIDTH) + 1;
+    pos[15] = rdma_be::field(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP_WORD_BYTE_OFFSET,
+                             RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP_LSB, 1);
+    if (pos[14:0] == size) begin
+      pos[14:0] = 0;
+      pos[15] = !pos[15];
+    end
+    at = rq ? 10 : 8;
+    info[at] = pos[15:8];
+    info[at + 1] = pos[7:0];
   endfunction
 
   // 功能：xtrdma_urc_poll_cq：从 urc_cur_polled 起轮流轮询原始 CQ 的各 frag，直到取够或转一圈。
@@ -729,7 +803,8 @@ class rdma_drv_wr extends uvm_object;
 
     status = rdma_status::success();
     n_before = wcs.size();
-    for (int unsigned step = 0; step < cq.frags.size() && wcs.size() - n_before < max_wc; step++) begin
+    for (int unsigned step = 0; step < cq.frags.size() && wcs.size() - n_before < max_wc;
+         step++) begin
       k = (cq.urc_cur_polled + step) % cq.frags.size();
       urc_poll_frag(dev, cq.frags[k], max_wc - (wcs.size() - n_before), wcs, status);
       if (!status.ok())
@@ -741,8 +816,9 @@ class rdma_drv_wr extends uvm_object;
 
   // 功能：_xtrdma_urc_poll_cq（一个 frag）：先 SQ 后 RQ。SQ 完成全部由 SQ WQE 合成：HW_CPL 之前的
   //   WQE 按 CE 生成成功完成（未 signaled 的只推进），flush 后其余 WQE 生成 FLUSH 完成；RQ 完成读
-  //   frag 中 start + RQ 下标处的 CQE（polarity = recv_vld，环回绕翻转），flush 后其余 RQE 生成
-  //   FLUSH。最后把软件完成位置写入信息区 +4（SW_CPL）。
+  //   frag 中 start + RQ 下标处的 CQE（polarity = recv_vld，环回绕翻转）。flush 或异常后其余 WQE
+  //   中位于异常位置之前的生成异常完成（信息区 ecode，远端 syndrome = FATAL_SYNDROME + 0x60），
+  //   之后的生成 FLUSH。最后把软件完成位置写入信息区 +4（SW_CPL）。
   // 输入/输出及副作用：wcs 追加；推进 QP 与 frag 环。
   // 失败/边界：HW 完成数超过环大小返回 INVALID_STATE。
   static task urc_poll_frag(rdma_drv_dev dev, rdma_drv_cq frag, int unsigned max_wc,
@@ -758,11 +834,11 @@ class rdma_drv_wr extends uvm_object;
     hw_cpl = {info[12], info[13], info[14], info[15]};
     got = 0;
     if (frag.send_flag && dev.qp_table.exists(frag.send_qpn))
-      urc_poll_sq(dev, frag, dev.qp_table[frag.send_qpn], hw_cpl[31:16], info[0][0], max_wc,
-                  wcs, got, status);
+      urc_poll_sq(dev, frag, dev.qp_table[frag.send_qpn], hw_cpl[31:16], info, max_wc, wcs, got,
+                  status);
     if (status.ok() && frag.recv_flag && dev.qp_table.exists(frag.recv_qpn))
-      urc_poll_rq(dev, frag, dev.qp_table[frag.recv_qpn], hw_cpl[15:0], info[0][1], max_wc,
-                  wcs, got, status);
+      urc_poll_rq(dev, frag, dev.qp_table[frag.recv_qpn], hw_cpl[15:0], info, max_wc, wcs, got,
+                  status);
     if (!status.ok())
       return;
     sw_cpl = '0;
@@ -797,24 +873,31 @@ class rdma_drv_wr extends uvm_object;
   // 输入/输出及副作用：wcs 追加，got 计数；推进 qp.sq_tail 与 frag.send_tail。
   // 失败/边界：完成数越界返回 INVALID_STATE。
   static task urc_poll_sq(rdma_drv_dev dev, rdma_drv_cq frag, rdma_drv_qp qp, bit [15:0] hw,
-                          bit flush, int unsigned max_wc, inout rdma_drv_wc wcs[$],
+                          rdma_bytes_t info, int unsigned max_wc, inout rdma_drv_wc wcs[$],
                           inout int unsigned got, output rdma_status status);
     rdma_bytes_t wqe;
     rdma_drv_wc wc;
     int unsigned cnt;
+    int unsigned abnml_cnt;
     int unsigned total;
     int unsigned idx;
+    longint unsigned cpl_end;
+    longint unsigned abnml_end;
 
     status = rdma_status::success();
     cnt = urc_ready(hw, frag.send_tail, frag.send_size);
-    if (cnt > frag.send_size) begin
+    abnml_cnt = info[0][2] ? urc_ready({info[8], info[9]}, frag.send_tail, frag.send_size) : 0;
+    if (cnt > frag.send_size || abnml_cnt > frag.send_size) begin
       status = rdma_status::make(RDMA_SC_INVALID_STATE, "URC SQ completion index is invalid");
       return;
     end
-    total = flush ? qp.sq_head - qp.sq_tail : cnt;
+    // 软件完成位置之后的 WQE 按 qp.sq_tail 编号：异常/flush 完成只推进 sq_tail。
+    cpl_end = qp.sq_tail + cnt;
+    abnml_end = qp.sq_tail + abnml_cnt;
+    total = (info[0][0] || info[0][2]) ? qp.sq_head - qp.sq_tail : cnt;
     for (int unsigned k = 0; k < total && got < max_wc; k++) begin
       idx = qp.sq_tail % qp.sq_depth;
-      if (k < cnt) begin
+      if (qp.sq_tail < cpl_end) begin
         status = qp.sq_kbuf.read(dev.hw, idx * RDMA_WQE_BYTES, RDMA_WQE_BYTES, wqe);
         if (!status.ok())
           return;
@@ -830,9 +913,8 @@ class rdma_drv_wr extends uvm_object;
                                      RDMA_SQ_WQE_RC_TOTAL_PAYLOAD_LEN_WIDTH);
       end
       else begin
+        wc = urc_error_wc(qp, qp.sq_wr_id[idx], 1'b0, info, qp.sq_tail < abnml_end);
         qp.sq_tail++;
-        wc = urc_wc(qp, qp.sq_wr_id[idx], 1'b0, RDMA_DRV_WC_FLUSH_ERR,
-                    RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR);
       end
       wcs.push_back(wc);
       got++;
@@ -843,25 +925,31 @@ class rdma_drv_wr extends uvm_object;
   // 输入/输出及副作用：wcs 追加，got 计数；推进 qp.rq_tail、frag.recv_tail 与 recv_vld。
   // 失败/边界：完成数越界返回 INVALID_STATE；CQE polarity 未到时停止。
   static task urc_poll_rq(rdma_drv_dev dev, rdma_drv_cq frag, rdma_drv_qp qp, bit [15:0] hw,
-                          bit flush, int unsigned max_wc, inout rdma_drv_wc wcs[$],
+                          rdma_bytes_t info, int unsigned max_wc, inout rdma_drv_wc wcs[$],
                           inout int unsigned got, output rdma_status status);
     rdma_bytes_t cqe;
     rdma_drv_wc wc;
     bit [7:0] ecode;
     int unsigned cnt;
+    int unsigned abnml_cnt;
     int unsigned total;
     int unsigned idx;
+    longint unsigned cpl_end;
+    longint unsigned abnml_end;
 
     status = rdma_status::success();
     cnt = urc_ready(hw, frag.recv_tail, frag.recv_size);
-    if (cnt > frag.recv_size) begin
+    abnml_cnt = info[0][3] ? urc_ready({info[10], info[11]}, frag.recv_tail, frag.recv_size) : 0;
+    if (cnt > frag.recv_size || abnml_cnt > frag.recv_size) begin
       status = rdma_status::make(RDMA_SC_INVALID_STATE, "URC RQ completion index is invalid");
       return;
     end
-    total = flush ? qp.rq_head - qp.rq_tail : cnt;
+    cpl_end = qp.rq_tail + cnt;
+    abnml_end = qp.rq_tail + abnml_cnt;
+    total = (info[0][1] || info[0][3]) ? qp.rq_head - qp.rq_tail : cnt;
     for (int unsigned k = 0; k < total && got < max_wc; k++) begin
       idx = qp.rq_tail % qp.rq_depth;
-      if (k < cnt) begin
+      if (qp.rq_tail < cpl_end) begin
         status = frag.mem_kbuf.read(dev.hw, (frag.start_idx + idx % frag.recv_size) *
                                     rdma_drv_cq::CQE_BYTES, rdma_drv_cq::CQE_BYTES, cqe);
         if (!status.ok())
@@ -873,7 +961,7 @@ class rdma_drv_wr extends uvm_object;
         wc = urc_wc(qp, qp.rq_wr_id[rdma_be::field(cqe, RDMA_CQE_WQE_INDEX_WORD_BYTE_OFFSET,
                                                    RDMA_CQE_WQE_INDEX_LSB,
                                                    RDMA_CQE_WQE_INDEX_WIDTH) % qp.rq_depth],
-                    1'b1, ecode == 8'h00 ? RDMA_DRV_WC_SUCCESS : RDMA_DRV_WC_GENERAL_ERR, ecode);
+                    1'b1, wc_status(ecode, 8'h00), ecode);
         wc.byte_len = rdma_be::field(cqe, RDMA_CQE_PAYLOAD_LEN_WORD_BYTE_OFFSET,
                                      RDMA_CQE_PAYLOAD_LEN_LSB, RDMA_CQE_PAYLOAD_LEN_WIDTH);
         wc.imm = rdma_be::field(cqe, RDMA_CQE_IMMDT_DATA_WORD_BYTE_OFFSET,
@@ -884,15 +972,29 @@ class rdma_drv_wr extends uvm_object;
         if (frag.recv_tail % frag.recv_size == 0)
           frag.recv_vld = !frag.recv_vld;
       end
-      else begin
-        wc = urc_wc(qp, qp.rq_wr_id[idx], 1'b1, RDMA_DRV_WC_FLUSH_ERR,
-                    RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR);
-      end
+      else
+        wc = urc_error_wc(qp, qp.rq_wr_id[idx], 1'b1, info, qp.rq_tail < abnml_end);
       qp.rq_tail++;
       wcs.push_back(wc);
       got++;
     end
   endtask
+
+  // 功能：硬件完成位置之后的 URC 完成：abnml 时为该方向的异常 ecode（远端 syndrome =
+  //   FATAL_SYNDROME + 0x60），否则为 SQ/RQ FLUSH。
+  // 输入/输出及副作用：返回新对象。
+  // 失败/边界：无。
+  static function rdma_drv_wc urc_error_wc(rdma_drv_qp qp, longint unsigned wr_id, bit is_recv,
+                                           rdma_bytes_t info, bit abnml);
+    bit [7:0] ecode;
+
+    if (!abnml)
+      return urc_wc(qp, wr_id, is_recv, RDMA_DRV_WC_FLUSH_ERR,
+                    is_recv ? RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR :
+                              RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR);
+    ecode = info[is_recv ? 2 : 1];
+    return urc_wc(qp, wr_id, is_recv, wc_status(ecode, 8'h60 + info[0][5:4]), ecode);
+  endfunction
 
   // 功能：新建一个 URC 完成。
   // 输入/输出及副作用：返回新对象。

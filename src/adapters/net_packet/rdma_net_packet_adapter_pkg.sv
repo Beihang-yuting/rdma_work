@@ -373,7 +373,7 @@ package rdma_net_packet_adapter_pkg;
       roce.dest_qp = value.destination_qpn;
       roce.psn = value.psn;
       roce.pkey = 16'hffff;
-      roce.deth_q_key = 32'h8001_0000;
+      roce.deth_q_key = value.deth_qkey;
       roce.deth_src_qp = value.source_qpn;
       roce.icrc_enable = 1'b1;
       extension_offset = 0;
@@ -602,6 +602,7 @@ package rdma_net_packet_adapter_pkg;
                                  "RoCEv2 header is null");
       value.destination_qpn = roce.dest_qp;
       value.source_qpn = roce.has_deth() ? roce.deth_src_qp : 0;
+      value.deth_qkey = roce.has_deth() ? roce.deth_q_key : 0;
       value.psn = roce.psn;
       full = roce.opcode;
       case (full[7:5])

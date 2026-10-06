@@ -11,6 +11,8 @@
 class rdma_tb_scoreboard extends uvm_scoreboard;
   `uvm_component_utils(rdma_tb_scoreboard)
 
+  localparam int unsigned GRH_BYTES = 40;
+
   rdma_tb_node_cfg nodes[int unsigned];
   uvm_analysis_imp_posted #(rdma_verb_item, rdma_tb_scoreboard) posted_export;
   uvm_analysis_imp_cqe #(rdma_verb_completion, rdma_tb_scoreboard) cqe_export;
@@ -214,6 +216,7 @@ class rdma_tb_scoreboard extends uvm_scoreboard;
     rdma_verb_item recv;
     rdma_verb_item src;
     int unsigned k;
+    int unsigned grh;
     bit found;
 
     found = 1'b0;
@@ -232,16 +235,36 @@ class rdma_tb_scoreboard extends uvm_scoreboard;
     recv = rq_posted[k].pop_front();
     src = inbound[k].pop_front();
     checked++;
+    grh = nodes[recv.node_id].qps[recv.qp_index].qp.qp_type == RDMA_DRV_QPT_UD ? GRH_BYTES : 0;
     if (!done.ok)
       fail({"RQ completion failed: ", done.convert2string()});
-    if (done.byte_len != src.length)
-      fail($sformatf("RQ byte_len %0d != %0d for %s", done.byte_len, src.length,
+    if (done.byte_len != src.length + grh)
+      fail($sformatf("RQ byte_len %0d != %0d for %s", done.byte_len, src.length + grh,
                      src.convert2string()));
     if (src.op inside {RDMA_VERB_SEND_IMM, RDMA_VERB_WRITE_IMM} && done.imm != src.imm)
       fail($sformatf("RQ imm %08h != %08h", done.imm, src.imm));
+    if (grh != 0)
+      predict_grh(recv.node_id, recv.local_offset, src.length);
     if (src.op != RDMA_VERB_WRITE_IMM)
       foreach (src.data[b])
-        shadow[recv.node_id][recv.local_offset + b] = src.data[b];
+        shadow[recv.node_id][recv.local_offset + grh + b] = src.data[b];
+  endfunction
+
+  // 功能：UD 接收缓冲开头 40B GRH 的预测（RoCEv2 IPv4：20B 0，IPv4 头版本/IHL 0x45、总长
+  //   = IP+UDP+BTH+DETH+载荷+ICRC、TTL 64、协议 UDP，其余为 0）。
+  // 输入/输出及副作用：写影子。
+  // 失败/边界：无。
+  protected function void predict_grh(int unsigned n, int unsigned offset, int unsigned len);
+    int unsigned total;
+
+    total = 20 + 8 + 12 + 8 + len + 4;
+    for (int unsigned b = 0; b < GRH_BYTES; b++)
+      shadow[n][offset + b] = 8'h00;
+    shadow[n][offset + 20] = 8'h45;
+    shadow[n][offset + 22] = total[15:8];
+    shadow[n][offset + 23] = total[7:0];
+    shadow[n][offset + 28] = 8'd64;
+    shadow[n][offset + 29] = 8'd17;
   endfunction
 
   // 功能：比对一个节点的影子与真实数据 MR 内容。

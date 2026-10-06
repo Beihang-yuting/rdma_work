@@ -1,7 +1,7 @@
 // 目录：单元测试层 tests/unit/rdma_drv_data_test.sv。
 // 层：单元测试。
 // 职责：两节点数据端到端（驱动模型 + 设备模型，仅经 CMQ/doorbell/DMA 交互）：RC 的 SEND（多 MTU、
-//   3 SGE 走 SGB、inline）、WRITE、WRITE_IMM、READ、FAA、CAS、rkey 错误 NAK，CQ arm 产生 CEQE，
+//   3 SGE 走 SGB、inline）、WRITE、WRITE_IMM、READ、FAA、CAS、rkey 错误 NAK（REM_ACCESS），CQ arm 产生 CEQE，
 //   SEND 进 SRQ（post_srq_recv、SRFQ 环、CQE 的 SRFQ 回查与槽位释放），CQ resize 时未消费 CQE 迁移，
 //   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE，CQ destroy 的 cleanup_ceqes，
 //   URC（rc_to_urc：frag CQ、CEQE 上报 HW 完成下标、SQ 完成合成、RQ CQE 在 frag 槽、flush、销毁）；
@@ -10,12 +10,14 @@
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
 // 生命周期：run_phase 内建立并运行到结束。
 
-// 两节点链路：按目的 MAC 把报文交给对应节点的 NIC。
+// 两节点链路：按目的 MAC 把报文交给对应节点的 NIC；可按目的 MAC 丢弃指定数量的报文。
 class rdma_drv_data_link extends rdma_dev_port;
   `uvm_object_utils(rdma_drv_data_link)
 
   rdma_dev nodes[bit [47:0]];
+  int unsigned drops[bit [47:0]];
   int unsigned packets;
+  int unsigned dropped;
 
   // 功能：构造链路。
   // 输入/输出及副作用：name 为 UVM 对象名。
@@ -23,13 +25,19 @@ class rdma_drv_data_link extends rdma_dev_port;
   function new(string name = "rdma_drv_data_link");
     super.new(name);
     packets = 0;
+    dropped = 0;
   endfunction
 
-  // 功能：投递报文到目的 NIC。
+  // 功能：投递报文到目的 NIC；drops[dmac] 非 0 时丢弃并计数。
   // 输入/输出及副作用：调用目的 NIC receive。
   // 失败/边界：未知 MAC 报告 UVM_ERROR。
   virtual task send(rdma_packet pkt, bit [47:0] dmac);
     packets++;
+    if (drops.exists(dmac) && drops[dmac] != 0) begin
+      drops[dmac]--;
+      dropped++;
+      return;
+    end
     if (!nodes.exists(dmac)) begin
       `uvm_error("DATA_LINK", $sformatf("no node with MAC %012h", dmac))
       return;
@@ -92,6 +100,19 @@ class rdma_drv_data_test extends uvm_test;
     join_none
     connect_qp(a.drv, a.qp, b.qp.qpn, b.mac);
     connect_qp(b.drv, b.qp, a.qp.qpn, a.mac);
+    run_cases();
+    if (a.dev.nic.errors.size() != 0 || b.dev.nic.errors.size() != 0)
+      `uvm_error("DATA", $sformatf("device protocol errors: a=%p b=%p",
+                                   a.dev.nic.errors, b.dev.nic.errors))
+    if (link.packets == 0)
+      `uvm_error("DATA", "no packet crossed the link")
+    phase.drop_objection(this);
+  endtask
+
+  // 功能：本测试的用例序列（子类可替换）。
+  // 输入/输出及副作用：见各用例。
+  // 失败/边界：以 UVM_ERROR/FATAL 报告。
+  virtual task run_cases();
     check_send();
     check_sgb_and_inline();
     check_write();
@@ -105,12 +126,6 @@ class rdma_drv_data_test extends uvm_test;
     check_srq_limit();
     check_ceq_cleanup();
     check_urc();
-    if (a.dev.nic.errors.size() != 0 || b.dev.nic.errors.size() != 0)
-      `uvm_error("DATA", $sformatf("device protocol errors: a=%p b=%p",
-                                   a.dev.nic.errors, b.dev.nic.errors))
-    if (link.packets == 0)
-      `uvm_error("DATA", "no packet crossed the link")
-    phase.drop_objection(this);
   endtask
 
   // 功能：断言 status 成功。
@@ -457,7 +472,7 @@ class rdma_drv_data_test extends uvm_test;
     wr = send_wr(a, RDMA_DRV_WR_WRITE, '{'h3c00}, '{64});
     wr.remote_va = b.data_buf.iova + 'h3c00;
     wr.rkey = b.mr.key() ^ 32'h1;
-    send_and_wait("bad rkey", wr, RDMA_DRV_WC_GENERAL_ERR);
+    send_and_wait("bad rkey", wr, RDMA_DRV_WC_REM_ACCESS_ERR);
     expect_mem("bad rkey target", b, 'h3c00, snapshot);
   endtask
 

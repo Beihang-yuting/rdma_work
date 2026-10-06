@@ -32,7 +32,15 @@ test
   或 ATOMIC ACK 后写 SQ CQE；drain 后回写 `hw_drop_db_cnt`。
 - **设备 RX**：SEND 取 RQE（shadow PI）散写，WRITE 按 RETH/rkey 写入（WRITE_IMM 消费 RQE），
   READ 读出回包，ATOMIC 读改写；RC 响应的目的 QPN 取自本端 QPC（BTH 不带源 QPN）。
-  访问错误回 NAK，请求方 CQE 带错误 ecode。
+  访问错误回 NAK（0x61/0x62/0x63），请求方 CQE 为 0xB9 + RC_REMOTE_SYNDROME，驱动映射为
+  REM_INV_REQ/REM_ACCESS/REM_OP。UD 先校验 DETH Q_Key（不符静默丢弃），接收缓冲前 40B 为 GRH
+  （RoCEv2 IPv4），byte_len 含 40。SRQ 的 SGE>2 走 SGB（签名）。
+- **可靠传输**：请求方每个 WQE 从首 PSN 起尝试；超时或 PSN 序列 NAK 消耗 PSN_RETRY_TH（耗尽 0x16/
+  0x18），RNR NAK 等 rnr_delay 后消耗 RNR_RETRY_TH（7 无限，耗尽 0xB7），其余 NAK 致命（0xB9）。
+  响应方：PSN 早于期望为重复请求（重发 ACK、重放 READ、回缓存的 ATOMIC 原值，不再执行），晚于期望
+  回一次 PSN 序列 NAK；无 RQE 回 RNR NAK 且不推进期望 PSN。
+- **URC 异常**：请求方致命错误或接收侧长度错误时设备写 ABNML CEQE（类型 SQ/RQ、ecode、远端 syndrome、
+  异常 WQE 位置）并停止该 SQ；驱动记入 URC 信息区，轮询时异常位置前的 WQE 报异常完成，其后 FLUSH。
 - **完成**：设备按 CQC 写 32B CQE（polarity），CQ armed 时写 CEQE；驱动 `poll_cq` 按 WQE_INDEX
   回查 wr_id 并更新 shadow CI。
 
@@ -44,7 +52,11 @@ test
 - 传输矩阵：RC/UD/URC（qp_index 0/1/2；URC 在 rc_to_urc 下创建，用专属 CQ 的 frag，完成经 CEQE
   的 HW_CPL 上报，monitor 每轮先处理 CEQ）。状态：两项均通过（33 项检查零错误）。
 - 高流量：`rdma_tb_e2e_high_traffic_test`（4096 个 SEND，整窗填满 256 深 SQ/RQ，4114 项检查）。
+- 可靠性：`rdma_drv_reliability_test`（请求丢包重传、ACK/READ 响应/ATOMIC ACK 丢失的重复处理、RNR
+  重试与耗尽、UD Q_Key/GRH、SRQ SGB、URC SQ/RQ 异常完成）；`rdma_multifunc_test` 的丢包项改为
+  “丢一包重传成功 + 持续丢包重试耗尽 0x16”。
 
 ## 4. 后续
 
-URC 异常完成（NAK/ABNML CEQE/AEQE）、UD GRH/Q_Key 校验、PSN 乱序重传、RNR 重试、接入 DUT。
+接入 DUT。未建模：URC 异常经 AEQE 上报的路径（当前只走 CEQE）、乱序到达后的选择性重传（当前整条
+WQE 从首 PSN 重发）、RNR 定时器编码（当前固定 rnr_delay）。

@@ -70,6 +70,9 @@ localparam bit [7:0] RDMA_AETH_NAK_REMOTE_ACCESS = 8'h62;
 // RNR NAK（timer 字段取 0）。
 localparam bit [7:0] RDMA_AETH_RNR_NAK = 8'h20;
 localparam bit [7:0] RDMA_AETH_NAK_INVALID_REQUEST = 8'h61;
+localparam bit [7:0] RDMA_AETH_NAK_REMOTE_OPERATIONAL = 8'h63;
+// PSN 序列错误 NAK（NAK code 0）：响应方期望的 PSN 放在 BTH.PSN。
+localparam bit [7:0] RDMA_AETH_NAK_PSN_SEQ = 8'h60;
 
 typedef enum bit [5:0] {
   RDMA_CMQ_CREATE_PD  = 6'd0,
@@ -493,6 +496,8 @@ class rdma_packet extends uvm_object;
   bit [63:0] atomic_swap_add;
   bit [63:0] atomic_compare;
   bit [63:0] atomic_orig;
+  // UD 的 DETH Q_Key（源 QPN 即 source_qpn）。
+  bit [31:0] deth_qkey;
   string metadata[$];
   byte unsigned payload[$];
 
@@ -518,6 +523,7 @@ class rdma_packet extends uvm_object;
     atomic_swap_add = '0;
     atomic_compare = '0;
     atomic_orig = '0;
+    deth_qkey = '0;
   endfunction
 
   // 功能：判断报文是否携带 RETH（WRITE 首/单包与 READ 请求）。
@@ -700,6 +706,7 @@ class rdma_packet extends uvm_object;
     atomic_swap_add = rhs_packet.atomic_swap_add;
     atomic_compare = rhs_packet.atomic_compare;
     atomic_orig = rhs_packet.atomic_orig;
+    deth_qkey = rhs_packet.deth_qkey;
     metadata = rhs_packet.metadata;
     payload = rhs_packet.payload;
   endfunction

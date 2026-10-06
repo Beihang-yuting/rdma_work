@@ -2,7 +2,8 @@
 // 层：单元测试。
 // 职责：多 Function 隔离与复位（驱动形状）：5 个 Function（PF0、VF0_1、VF0_2、PF1、VF1_1），每个
 //   Function 一个设备模型 + 独立主机内存域（IOVA 数值相同）+ 独立驱动 probe，RC QP 连成环。验证：
-//   非法 IOVA→本地访问错完成、CMQ 卡死→驱动命令超时、错 rkey→NAK 错完成、丢包→ACK 超时错完成，
+//   非法 IOVA→本地访问错完成、CMQ 卡死→驱动命令超时、错 rkey→REM_ACCESS 完成、丢一包→重传成功、
+//   持续丢包→重试耗尽（0x16）错完成，
 //   每项故障只影响目标 Function；VF FLR、PF FLR（含其 VF）、整设备复位只清空范围内 Function 的
 //   context，范围外流量不受影响，范围内驱动 remove/probe 后流量恢复。
 // 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
@@ -458,7 +459,7 @@ class rdma_multifunc_test extends uvm_test;
     recover('{2});
   endtask
 
-  // 功能：错 rkey：PF0 向 VF0_1 WRITE 用错 rkey，PF0 得到错误完成，VF0_1 内存不变，全环流量正常。
+  // 功能：错 rkey：PF0 向 VF0_1 WRITE 用错 rkey，PF0 得到 REM_ACCESS 完成，VF0_1 内存不变，全环流量正常。
   // 输入/输出及副作用：一次被拒的 WRITE。
   // 失败/边界：不符报告 UVM_ERROR。
   task fault_bad_rkey();
@@ -477,33 +478,48 @@ class rdma_multifunc_test extends uvm_test;
     wr = make_wr(a, RDMA_DRV_WR_WRITE, 'h800, 64);
     wr.remote_va = b.data_buf.iova + 'h3800;
     wr.rkey = b.mr.key() ^ 32'h1;
-    send_one("bad rkey", a, wr, RDMA_DRV_WC_GENERAL_ERR, wc);
+    send_one("bad rkey", a, wr, RDMA_DRV_WC_REM_ACCESS_ERR, wc);
     expect_mem("bad rkey target", b, 'h3800, snapshot);
     check_traffic("after bad rkey", none);
   endtask
 
-  // 功能：丢包：PF1 发往 VF1_1 的 SEND 被网络丢弃，PF1 等 ACK 超时得到错误完成（设备记录 ACK
-  //   timeout）；该链路两端 QP 重建后全环流量正常。
+  // 功能：丢包：PF1 发往 VF1_1 的 WRITE 丢一包，超时后重传成功且数据到达；再持续丢包，PSN 重试
+  //   （PSN_RETRY_TH=6）耗尽后得到 vendor 0x16 的错误完成；该链路两端 QP 重建后全环流量正常。
+  //   本项把 PF1 的响应超时缩短到 5us。
   // 输入/输出及副作用：重建链路 3。
   // 失败/边界：不符报告 UVM_ERROR。
   task fault_packet_drop();
     rdma_mf_func a;
+    rdma_mf_func b;
+    rdma_drv_send_wr wr;
     rdma_drv_wc wc;
-    rdma_bytes_t scratch;
+    rdma_bytes_t data;
     int unsigned none[$];
+    time saved;
 
     a = funcs[3];
+    b = funcs[4];
+    saved = a.dev.nic.response_timeout;
+    a.dev.nic.response_timeout = 5us;
     net.drops[a.mac] = 1;
-    scratch = fill(a, 'h0, 64, 8'h21);
-    // 预期的 ACK 超时由设备以 RDMA_DEV_NIC 报告；本窗口内降为 INFO，随后按 errors 列表断言。
-    uvm_top.set_report_severity_id_override(UVM_ERROR, "RDMA_DEV_NIC", UVM_INFO);
-    send_one("packet drop", a, make_wr(a, RDMA_DRV_WR_SEND, 'h0, 64), RDMA_DRV_WC_GENERAL_ERR,
-             wc);
-    uvm_top.set_report_severity_id_override(UVM_ERROR, "RDMA_DEV_NIC", UVM_ERROR);
-    if (net.dropped != 1 || a.dev.nic.errors.size() != 1)
+    data = fill(a, 'h0, 64, 8'h21);
+    wr = make_wr(a, RDMA_DRV_WR_WRITE, 'h0, 64);
+    wr.remote_va = b.data_buf.iova + 'h3400;
+    wr.rkey = b.mr.key();
+    send_one("packet drop", a, wr, RDMA_DRV_WC_SUCCESS, wc);
+    expect_mem("packet drop retransmitted data", b, 'h3400, data);
+    if (net.dropped != 1 || a.dev.nic.errors.size() != 0)
       `uvm_error("packet drop", $sformatf("dropped %0d, device errors %p", net.dropped,
                                           a.dev.nic.errors))
-    a.dev.nic.errors.delete();
+    net.drops[a.mac] = 7;
+    wr = make_wr(a, RDMA_DRV_WR_WRITE, 'h0, 64);
+    wr.remote_va = b.data_buf.iova + 'h3400;
+    wr.rkey = b.mr.key();
+    send_one("retry exhausted", a, wr, RDMA_DRV_WC_GENERAL_ERR, wc);
+    if (wc.vendor_err != RDMA_ECODE_EC_TPE_SQ_RTO_OVERTIME || net.dropped != 8)
+      `uvm_error("retry exhausted", $sformatf("vendor %02h, dropped %0d", wc.vendor_err,
+                                              net.dropped))
+    a.dev.nic.response_timeout = saved;
     link_qps(3);
     check_traffic("after packet drop", none);
   endtask

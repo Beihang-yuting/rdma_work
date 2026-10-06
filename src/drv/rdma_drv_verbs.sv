@@ -686,6 +686,7 @@ class rdma_drv_srq extends uvm_object;
   localparam int unsigned MIN_LIMIT = 16;
   localparam int unsigned CTX_BYTES = 32;
   localparam int unsigned SHADOW_OFFSET = 28;
+  localparam int unsigned SGB_BYTES = 512;
 
   int unsigned srqn;
   int unsigned srq_sn;
@@ -696,6 +697,8 @@ class rdma_drv_srq extends uvm_object;
   rdma_drv_kbuf srfq_kbuf;
   rdma_drv_dma ctx_page;
   int unsigned ctx_offset;
+  // SGE>2 的 SRQ WQE 用的 SGB：每页 8 个 512B，按槽位图下标。
+  rdma_drv_dma sgb[$];
   // post_srq_recv 状态：WQE 槽位图、SRFQ 生产者/消费者计数与 polarity、wr_id。
   bit slot_used[];
   int unsigned next_slot;
@@ -720,13 +723,14 @@ class rdma_drv_srq extends uvm_object;
   endfunction
 
   // 功能：xtrdma_ib_create_srq（内核）：wqe_cnt=roundup_pow2(max_wr)，limit=max(limit,16)，
-  //   SRQ 与 SRFQ 缓冲各 cnt*64B，context 页 + (srqn%128)*32（shadow 在 +28），SRFQC_CREATE。
+  //   SRQ 与 SRFQ 缓冲各 cnt*64B，SGB 页（每槽 512B），context 页 + (srqn%128)*32（shadow 在 +28），SRFQC_CREATE。
   // 输入/输出及副作用：分配 SRQN/缓冲/命令；srq 输出。
   // 失败/边界：失败回退并返回错误。
   static task create_srq(rdma_drv_dev dev, rdma_drv_pd pd, int unsigned max_wr,
                      int unsigned limit_arg, output rdma_drv_srq srq, output rdma_status status);
     rdma_bytes_t sqe;
     rdma_bytes_t cqe;
+    rdma_drv_dma page;
 
     srq = rdma_drv_srq::type_id::create("srq");
     srq.depth = 1 << $clog2(max_wr);
@@ -745,6 +749,11 @@ class rdma_drv_srq extends uvm_object;
     status = srq.srq_kbuf.alloc(dev.hw, srq.depth * RDMA_WQE_BYTES, 1'b1, dev.cfg.vf_id);
     if (status.ok())
       status = srq.srfq_kbuf.alloc(dev.hw, srq.depth * RDMA_WQE_BYTES, 1'b1, dev.cfg.vf_id);
+    for (int unsigned i = 0; status.ok() && i < (srq.depth + 7) / 8; i++) begin
+      status = dev.hw.alloc_dma(RDMA_HMC_PAGE_BYTES, RDMA_HMC_PAGE_BYTES, page);
+      if (status.ok())
+        srq.sgb.push_back(page);
+    end
     if (status.ok())
       status = dev.hw.alloc_dma(RDMA_HMC_PAGE_BYTES, RDMA_HMC_PAGE_BYTES, srq.ctx_page);
     srq.ctx_offset = (srq.srqn % 128) * CTX_BYTES;
@@ -819,6 +828,9 @@ class rdma_drv_srq extends uvm_object;
       void'(srq_kbuf.free(dev.hw));
     if (srfq_kbuf != null)
       void'(srfq_kbuf.free(dev.hw));
+    foreach (sgb[i])
+      void'(dev.hw.free_dma(sgb[i]));
+    sgb.delete();
     void'(dev.hw.free_dma(ctx_page));
     dev.srq_ids.free(srqn);
   endfunction
