@@ -250,7 +250,7 @@ pcie_work: dpu_common_preflight pcie_work_preflight
 	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_PCIE_WORK_TEST \
 		-f build/pcie_work/pcie_work.expanded.f -top tb_top -o build/pcie_work/simv; \
 	test_name=$(TEST); \
-	if [[ "$$test_name" == regression ]]; then test_name=rdma_pcie_work_adapter_test; fi; \
+	if [[ "$$test_name" == regression ]]; then test_name=rdma_pcie_rdma_test; fi; \
 	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
 	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
 

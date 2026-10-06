@@ -104,7 +104,7 @@ package rdma_dpu_adapter_pkg;
     endfunction
 
     // 功能：声明一个 Host 及其 PCIe domain（segment 为负时取 host_id，BDF 0x0010..0x00ff，MMIO 窗口
-    //   [4GiB*(host+1), +4GiB) 允许 DEVICE_MEMORY/MAILBOX/MSI-X）。
+    //   [4GiB*(host+1), +4GiB) 允许 DEVICE_MEMORY/MAILBOX/MSI-X，BAR 随机放置）。
     // 输入/输出及副作用：追加 cfg.hosts；该 Host 的 Function 用同一 segment。
     // 失败/边界：无（合法性由 resolver 校验）。
     static function void add_host(dpu_device_cfg cfg, int unsigned host_id,
@@ -129,6 +129,8 @@ package rdma_dpu_adapter_pkg;
       window.allowed_roles.push_back(DPU_BAR_MAILBOX);
       window.allowed_roles.push_back(DPU_BAR_MSIX);
       domain.mmio_windows.push_back(window);
+      // BAR 基址由 dpu_common resolver 在窗口内随机放置（满足对齐/同域不重叠），随快照冻结。
+      domain.bar_placement_policy = DPU_BAR_PLACEMENT_RANDOM;
       host.pcie_domains.push_back(domain);
       cfg.hosts.push_back(host);
     endfunction

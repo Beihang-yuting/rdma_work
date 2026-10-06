@@ -36,6 +36,10 @@ package rdma_unit_test_pkg;
   import rdma_net_packet_adapter_pkg::*;
   import rdma_net_packet_bridge_pkg::*;
 `endif
+`ifdef RDMA_PCIE_WORK_TEST
+  import pcie_tl_pkg::*;
+  import rdma_pcie_work_pkg::*;
+`endif
   `include "uvm_macros.svh"
 
   `include "mocks/rdma_mock_host_mem.sv"
@@ -58,6 +62,9 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_harness_expected_failure_probe.sv"
 `ifdef RDMA_NET_PACKET
   `include "integration/rdma_net_packet_adapter_test.sv"
+`endif
+`ifdef RDMA_PCIE_WORK_TEST
+  `include "integration/rdma_pcie_rdma_test.sv"
 `endif
 endpackage
 

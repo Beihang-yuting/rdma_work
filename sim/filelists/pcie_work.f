@@ -19,6 +19,8 @@
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/topology/pcie_topology_pkg.sv
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/pcie_tl_pkg.sv
++incdir+@PCIE_WORK_ROOT@/pcie_dpu_integration/src
+@PCIE_WORK_ROOT@/pcie_dpu_integration/src/pcie_dpu_integration_pkg.sv
 
 +incdir+../tests
 +incdir+../src/types
@@ -37,6 +39,7 @@
 ../src/dev/rdma_dev_pkg.sv
 ../src/drv/rdma_drv_pkg.sv
 ../src/adapters/dpu/rdma_dpu_adapter_pkg.sv
+../src/adapters/pcie_work/rdma_pcie_work_pkg.sv
 ../src/tb/rdma_tb_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
 ../tests/tb_top.sv
