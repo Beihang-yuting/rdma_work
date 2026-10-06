@@ -17,6 +17,9 @@ VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_acces
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
+# dpu_common（Host/PF/VF、BDF、BAR 的逻辑设备配置）：所有编译 tests/rdma_unit_test_pkg 的 suite 都需要；
+# 由 rdma_dpu_adapter_pkg 投影给驱动/设备模型。
+DPU_COMMON_SRC = +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv
 
 # 功能：把一个 core UVM test 转交给统一 runner 执行并检查 summary。
 # 输入输出及副作用：参数 1 是 UVM test，参数 2 是含 simv 的 build 目录；写独立 log。
@@ -29,7 +32,11 @@ define RUN_CORE_LOGICAL_TEST
 		"../scripts/check_uvm_summary.sh"
 endef
 
-.PHONY: core cmq_gate sv_style host_mem_preflight host_mem rdma_defs net_packet net_packet_preflight pcie_work pcie_work_preflight e2e regression
+.PHONY: dpu_common_preflight core cmq_gate sv_style host_mem_preflight host_mem rdma_defs net_packet net_packet_preflight pcie_work pcie_work_preflight e2e regression
+
+dpu_common_preflight:
+	@if [[ -z "$(DPU_COMMON_ROOT)" || ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then \
+		echo "DPU_COMMON_ROOT must point at a dpu_common checkout" >&2; exit 2; fi
 
 # 变更 SV 的注释/单语句门禁与 Git 空白检查共用明确的基线提交，避免隐式读取工作树历史。
 sv_style:
@@ -64,10 +71,10 @@ regression:
 	echo "REGRESSION SUMMARY total=$$total pass=$$pass fail=$$fail"; \
 	(( fail == 0 ))
 
-core:
+core: dpu_common_preflight
 	set -euo pipefail; \
 	mkdir -p $(BUILD); \
-	$(VCS) $(VCS_FLAGS) -f filelists/core.f -top tb_top -o $(BUILD)/simv; \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) -f filelists/core.f -top tb_top -o $(BUILD)/simv; \
 	if [[ "$(TEST)" == regression ]]; then \
 		mapfile -t suite_tests < <(sed -n '/^readonly CORE_TESTS=(/,/^)/p' ../scripts/run_queue_lifecycle_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
 		if (( $${#suite_tests[@]} == 0 )); then echo "core regression manifest is empty" >&2; exit 2; fi; \
@@ -184,10 +191,10 @@ host_mem_preflight:
 	done
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
 
-host_mem: host_mem_preflight
+host_mem: dpu_common_preflight host_mem_preflight
 	set -euo pipefail; \
 	mkdir -p $(HOST_MEM_BUILD); \
-	$(VCS) $(VCS_FLAGS) +define+RDMA_HOST_MEM_TEST \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_HOST_MEM_TEST \
 		+incdir+$(HOST_MEM_ROOT)/src \
 		$(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
 		-f filelists/host_mem.f -top tb_top -o $(HOST_MEM_BUILD)/simv; \
@@ -216,12 +223,12 @@ net_packet_preflight:
 	if [[ "$$preflight_failed" != 0 ]]; then exit 2; fi
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency net_packet --root "$(NET_PACKET_ROOT)"
 
-net_packet: net_packet_preflight
+net_packet: dpu_common_preflight net_packet_preflight
 	set -euo pipefail; \
 	mkdir -p build/net_packet; \
 	: "VCS 不会替换 filelist 中的 GNU make 变量，先生成只读依赖路径展开后的临时 filelist"; \
 	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/net_packet.f > build/net_packet/net_packet.expanded.f; \
-	$(VCS) $(VCS_FLAGS) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/net_packet/net_packet.expanded.f -top tb_top -o build/net_packet/simv; \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/net_packet/net_packet.expanded.f -top tb_top -o build/net_packet/simv; \
 	test_name=$(TEST); \
 	if [[ "$$test_name" == regression ]]; then test_name=rdma_net_packet_adapter_test; fi; \
 	build/net_packet/simv +UVM_TESTNAME=$$test_name | tee build/net_packet/$$test_name.log; \
@@ -243,28 +250,28 @@ pcie_work_preflight:
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency pcie_work --root "$(PCIE_WORK_ROOT)"
 
-pcie_work: pcie_work_preflight
+pcie_work: dpu_common_preflight pcie_work_preflight
 	set -euo pipefail; \
 	mkdir -p build/pcie_work; \
 	: "VCS 不会替换 filelist 中的 GNU make 变量，先生成只读依赖路径展开后的临时 filelist"; \
 	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
 	    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' \
 	    filelists/pcie_work.f > build/pcie_work/pcie_work.expanded.f; \
-	$(VCS) $(VCS_FLAGS) +define+RDMA_PCIE_WORK_TEST \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_PCIE_WORK_TEST \
 		-f build/pcie_work/pcie_work.expanded.f -top tb_top -o build/pcie_work/simv; \
 	test_name=$(TEST); \
 	if [[ "$$test_name" == regression ]]; then test_name=rdma_pcie_work_adapter_test; fi; \
 	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
 	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
 
-e2e: host_mem_preflight net_packet_preflight
+e2e: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \
 	mkdir -p $(E2E_BUILD); \
 	: "VCS 不会替换 filelist 中的 Make 变量，先生成只读依赖路径展开后的临时 filelist"; \
 	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
 	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
 	    filelists/e2e.f > $(E2E_BUILD)/e2e.expanded.f; \
-	$(VCS) $(VCS_FLAGS) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET \
 		$(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
 		-f $(E2E_BUILD)/e2e.expanded.f -top tb_top -o $(E2E_BUILD)/simv; \
 	test_name=$(TEST); \

@@ -21,6 +21,15 @@ test
 主机与设备之间只有真实硬件边界：CMQ 环（命令与 context 经 DMA 读取）、MMIO doorbell
 （BAR+0x2000 窗口）和按 IOVA 的 DMA。设备不调用任何主机对象。
 
+Function 身份与 BAR 由 dpu_common 管理（`src/adapters/dpu/rdma_dpu_adapter_pkg.sv`）：测试用
+`rdma_dpu_topology` 声明 Host/PF/VF（BAR 请求取 `dut_caps.bar_profiles`），`dpu_device_resolver`
+解析并冻结快照；每个 Function 的 host_id、global Function ID（驱动 QPC/PD 的 VF_ID）、BDF、
+BAR0/MAILBOX/MSI-X 取自快照。驱动的 doorbell 写为 BAR0（驱动 `pf->hw_addr`）基址 + 偏移的绝对
+地址，`rdma_dpu_bar_router` 用 `snapshot.resolve_bar_address` 解码到所属 Function 的设备；MAILBOX/
+MSI-X 与 BAR 外地址拒绝（这两个 BAR 只分配，寄存器与中断未建模）。e2e 的 net_packet Function
+identity 也由快照生成。multifunc（2 Host、5 Function）与 tb 节点（每节点一台 DPU、Host0 PF0）
+走这条路径；data/reliability 等单元测试仍用直连设备的 `rdma_drv_dev_bar`。
+
 ## 2. 关键约定
 
 - **节点配置** `rdma_tb_node_cfg`：MAC、`rdma_dev`、`rdma_drv_dev`、CQ、QP 连接表（本地 QP →

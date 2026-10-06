@@ -3,8 +3,10 @@
 // 职责：两节点 seq → 驱动模型 → 设备模型 → 报文 → 内存全流程：每节点一个设备模型（rdma_dev）与
 //   经 BAR/CMQ probe 的驱动模型（PD、CQ、RC/UD/URC QP、覆盖 64KiB 数据缓冲的 MR），rdma_tb_env
 //   （verb agent + wire + 记分板）运行 rdma_tb_traffic_vseq，记分板判定完成与内存逐字节一致。
-//   主机与设备之间只经 CMQ、MMIO doorbell 与 DMA 交互。
-// 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem、rdma_tb_pkg。
+//   主机与设备之间只经 CMQ、MMIO doorbell 与 DMA 交互。每个节点是一台独立 DPU：Function（Host0
+//   PF0）的 host_id、global Function ID、BDF 与 BAR 由 dpu_common 解析，doorbell 写 BAR0 绝对地址经
+//   快照解码到设备。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_adapter_pkg（dpu_common）、rdma_mock_host_mem、rdma_tb_pkg。
 // 所有权：测试拥有各节点内存、设备与驱动对象；env 组件只借用。
 // 生命周期：节点在仿真期间常驻（不做 remove）。
 
@@ -15,6 +17,8 @@ class rdma_tb_flow_test extends uvm_test;
 
   rdma_tb_env env;
   rdma_host_mem_api mems[2];
+  // 各节点 dpu_common 快照中的 PF（e2e 的 net_packet identity 也取自它）。
+  rdma_dpu_function dpu_funcs[2];
   // QP 的 SQ/RQ 深度（子类可调小以覆盖环满与回绕）。
   int unsigned qp_depth;
 
@@ -69,11 +73,35 @@ class rdma_tb_flow_test extends uvm_test;
     vseq.start(null);
   endtask
 
+  // 功能：节点 n 的 dpu_common 拓扑（Host0 上一个 PF）解析后，建立经快照 BAR 解码的驱动 BAR。
+  // 输入/输出及副作用：写 dpu_funcs[n]；返回连到 dev 的 BAR。
+  // 失败/边界：解析失败报 UVM_FATAL。
+  function rdma_dpu_bar make_dpu_bar(int unsigned n, rdma_dev dev);
+    dpu_device_cfg dpu_cfg;
+    dpu_device_snapshot snapshot;
+    rdma_dpu_function funcs[$];
+    rdma_dpu_bar_router router;
+    rdma_dpu_bar bar;
+
+    dpu_cfg = dpu_device_cfg::type_id::create($sformatf("tb_dpu_cfg%0d", n));
+    rdma_dpu_topology::add_host(dpu_cfg, 0);
+    rdma_dpu_topology::add_function(dpu_cfg, 0, 0, DPU_FUNCTION_PF, 0);
+    expect_ok("dpu_common resolve", rdma_dpu_topology::resolve(dpu_cfg, snapshot, funcs));
+    dpu_funcs[n] = funcs[0];
+    router = rdma_dpu_bar_router::type_id::create($sformatf("tb_router%0d", n));
+    router.snapshot = snapshot;
+    router.attach(funcs[0], dev);
+    bar = rdma_dpu_bar::type_id::create($sformatf("tb_bar%0d", n));
+    bar.router = router;
+    bar.func = funcs[0];
+    return bar;
+  endfunction
+
   // 功能：建立一个节点：主机内存、设备、BAR、probe、PD、CQ、RC/UD QP、数据缓冲与覆盖它的 MR。
   // 输入/输出及副作用：返回节点配置；分配主机内存。
   // 失败/边界：任一步失败报 UVM_FATAL。
   task automatic make_node(int unsigned n, output rdma_tb_node_cfg cfg);
-    rdma_drv_dev_bar bar;
+    rdma_dpu_bar bar;
     rdma_drv_hw hw;
     rdma_drv_config dcfg;
     rdma_function_handle fn;
@@ -87,15 +115,16 @@ class rdma_tb_flow_test extends uvm_test;
     mems[n] = make_host_mem(n);
     cfg.dev = rdma_dev::type_id::create($sformatf("tb_dev%0d", n));
     cfg.dev.configure(mems[n]);
-    bar = rdma_drv_dev_bar::type_id::create($sformatf("tb_bar%0d", n));
-    bar.dev = cfg.dev;
+    bar = make_dpu_bar(n, cfg.dev);
     fn = rdma_function_handle::type_id::create($sformatf("tb_fn%0d", n));
     fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = n + 1;
+    fn.function_uid = dpu_funcs[n].uid();
     fn.generation = 1;
     hw = rdma_drv_hw::type_id::create($sformatf("tb_hw%0d", n));
     expect_ok("bind", hw.bind_hw(bar, mems[n], fn));
     dcfg = rdma_drv_config::type_id::create($sformatf("tb_drv_cfg%0d", n));
+    dcfg.host_id = dpu_funcs[n].key.host_id;
+    dcfg.vf_id = dpu_funcs[n].global_id;
     cfg.drv = rdma_drv_dev::type_id::create($sformatf("tb_drv%0d", n));
     cfg.drv.probe(dcfg, hw, status);
     expect_ok("probe", status);

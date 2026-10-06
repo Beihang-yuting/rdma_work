@@ -26,6 +26,8 @@ package rdma_unit_test_pkg;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
   import rdma_tb_pkg::*;
+  import dpu_resource_pkg::*;
+  import rdma_dpu_adapter_pkg::*;
 `ifdef RDMA_HOST_MEM_TEST
   import rdma_host_mem_external_pkg::*;
   import host_mem_pkg::*;

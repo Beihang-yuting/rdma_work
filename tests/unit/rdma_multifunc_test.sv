@@ -1,12 +1,15 @@
 // 目录：单元测试层 tests/unit/rdma_multifunc_test.sv。
 // 层：单元测试。
-// 职责：多 Function 隔离与复位（驱动形状）：5 个 Function（PF0、VF0_1、VF0_2、PF1、VF1_1），每个
+// 职责：多 Function 隔离与复位（驱动形状）：拓扑由 dpu_common 声明并解析（Host0：PF0、VF0_1、
+//   VF0_2；Host1：PF1、VF1_1），每个 Function 的 host_id、global Function ID（驱动 VF_ID）、BDF 与
+//   BAR 取自冻结快照；驱动 doorbell 写 BAR0 绝对地址，经快照解码路由到所属 Function 的设备。每个
 //   Function 一个设备模型 + 独立主机内存域（IOVA 数值相同）+ 独立驱动 probe，RC QP 连成环。验证：
+//   快照投影进 QPC（HOST_ID/VF_ID）、BAR 解码（MAILBOX/跨 Host 地址被拒），
 //   非法 IOVA→本地访问错完成、CMQ 卡死→驱动命令超时、错 rkey→REM_ACCESS 完成、丢一包→重传成功、
 //   持续丢包→重试耗尽（0x16）错完成，
 //   每项故障只影响目标 Function；VF FLR、PF FLR（含其 VF）、整设备复位只清空范围内 Function 的
 //   context，范围外流量不受影响，范围内驱动 remove/probe 后流量恢复。
-// 依赖：rdma_drv_*、rdma_dev、rdma_drv_dev_bar、rdma_mock_host_mem。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_adapter_pkg（dpu_common）、rdma_mock_host_mem。
 // 所有权：测试拥有全部 Function 的内存、设备、驱动与链路。
 // 生命周期：run_phase 内建立并运行到结束。
 
@@ -62,12 +65,11 @@ endclass
 class rdma_mf_func extends uvm_object;
   `uvm_object_utils(rdma_mf_func)
 
-  int unsigned pf;
-  int unsigned vf_id;
+  rdma_dpu_function dpu;
   bit [47:0] mac;
   rdma_mock_host_mem mem;
   rdma_dev dev;
-  rdma_drv_dev_bar bar;
+  rdma_dpu_bar bar;
   rdma_drv_hw hw;
   rdma_drv_dev drv;
   rdma_drv_pd pd;
@@ -92,6 +94,8 @@ class rdma_multifunc_test extends uvm_test;
 
   rdma_mf_func funcs[$];
   rdma_mf_net net;
+  dpu_device_snapshot snapshot;
+  rdma_dpu_bar_router router;
   longint unsigned next_wr_id;
 
   // 功能：构造测试组件。
@@ -110,17 +114,14 @@ class rdma_multifunc_test extends uvm_test;
 
     phase.raise_objection(this);
     net = rdma_mf_net::type_id::create("net");
-    add_func("pf0", 0, 0);
-    add_func("vf0_1", 0, 1);
-    add_func("vf0_2", 0, 2);
-    add_func("pf1", 1, 0);
-    add_func("vf1_1", 1, 1);
+    build_topology();
     foreach (funcs[i])
       if (funcs[i].data_buf.iova != funcs[0].data_buf.iova)
         `uvm_error("MF", "Function DMA domains do not reuse the same IOVA numbers")
     foreach (funcs[i])
       link_qps(i);
     check_traffic("baseline", none);
+    check_dpu_projection();
     fault_iova();
     fault_cmq_stall();
     fault_bad_rkey();
@@ -144,18 +145,50 @@ class rdma_multifunc_test extends uvm_test;
                  status == null ? "null" : status.convert2string()))
   endfunction
 
-  // 功能：建立一个 Function：独立 mock 内存域、设备、BAR、端口并启动 NIC，随后 probe。
-  // 输入/输出及副作用：追加 funcs，注册到网络。
+  // 功能：用 dpu_common 声明并解析拓扑（Host0：PF0 + VF1/VF2；Host1：PF1 + VF1），按快照顺序
+  //   建立 Function（顺序须为 pf0、vf0_1、vf0_2、pf1、vf1_1，故障与复位用例按此下标）。
+  // 输入/输出及副作用：设置 snapshot/router，追加 funcs。
+  // 失败/边界：解析失败或顺序不符报告 UVM_FATAL。
+  task build_topology();
+    dpu_device_cfg cfg;
+    rdma_dpu_function dfuncs[$];
+    string expected[$];
+
+    cfg = dpu_device_cfg::type_id::create("mf_dpu_cfg");
+    rdma_dpu_topology::add_host(cfg, 0);
+    rdma_dpu_topology::add_host(cfg, 1);
+    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_PF, 0);
+    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_VF, 1);
+    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_VF, 2);
+    rdma_dpu_topology::add_function(cfg, 1, 1, DPU_FUNCTION_PF, 0);
+    rdma_dpu_topology::add_function(cfg, 1, 1, DPU_FUNCTION_VF, 1);
+    expect_ok("dpu_common resolve", rdma_dpu_topology::resolve(cfg, snapshot, dfuncs));
+    router = rdma_dpu_bar_router::type_id::create("mf_router");
+    router.snapshot = snapshot;
+    expected = '{"pf0", "vf0_1", "vf0_2", "pf1", "vf1_1"};
+    if (dfuncs.size() != expected.size())
+      `uvm_fatal("MF", $sformatf("snapshot has %0d Functions", dfuncs.size()))
+    foreach (dfuncs[i]) begin
+      if (dfuncs[i].key.host_id != (i < 3 ? 0 : 1) ||
+          (dfuncs[i].key.kind == DPU_FUNCTION_VF) != (i inside {1, 2, 4}))
+        `uvm_fatal("MF", $sformatf("snapshot Function %0d is %s", i,
+                                   dpu_function_key_name(dfuncs[i].key)))
+      add_func(expected[i], dfuncs[i]);
+    end
+  endtask
+
+  // 功能：建立一个 Function：独立 mock 内存域、设备、经 dpu 路由器的 BAR、端口并启动 NIC，随后
+  //   probe。MAC 为 02:00:00:00:<host>:<global ID>，host_mem 绑定用快照的 Function UID。
+  // 输入/输出及副作用：追加 funcs，注册到网络与路由器。
   // 失败/边界：失败报告 UVM_FATAL。
-  task add_func(string name, int unsigned pf, int unsigned vf_id);
+  task add_func(string name, rdma_dpu_function d);
     rdma_mf_func f;
     rdma_mf_port port;
     rdma_function_handle fn;
 
     f = rdma_mf_func::type_id::create(name);
-    f.pf = pf;
-    f.vf_id = vf_id;
-    f.mac = 48'h02_00_00_00_00_00 | (pf << 8) | vf_id;
+    f.dpu = d;
+    f.mac = {32'h0200_0000, 8'(d.key.host_id), 8'(d.global_id)};
     f.mem = rdma_mock_host_mem::type_id::create({name, "_mem"});
     f.dev = rdma_dev::type_id::create({name, "_dev"});
     f.dev.configure(f.mem);
@@ -164,11 +197,13 @@ class rdma_multifunc_test extends uvm_test;
     port.src = f.mac;
     f.dev.nic.port = port;
     net.devs[f.mac] = f.dev;
-    f.bar = rdma_drv_dev_bar::type_id::create({name, "_bar"});
-    f.bar.dev = f.dev;
+    router.attach(d, f.dev);
+    f.bar = rdma_dpu_bar::type_id::create({name, "_bar"});
+    f.bar.router = router;
+    f.bar.func = d;
     fn = rdma_function_handle::type_id::create({name, "_fn"});
     fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = {pf[7:0], vf_id[7:0]} + 1;
+    fn.function_uid = d.uid();
     fn.generation = 1;
     f.hw = rdma_drv_hw::type_id::create({name, "_hw"});
     expect_ok("bind", f.hw.bind_hw(f.bar, f.mem, fn));
@@ -179,7 +214,50 @@ class rdma_multifunc_test extends uvm_test;
     funcs.push_back(f);
   endtask
 
-  // 功能：驱动 probe（vf_id 按 Function）后建 PD、CQ、16KiB 数据缓冲与覆盖它的 MR。
+  // 功能：快照投影检查：global Function ID 互不相同；每个 Function 的设备 QPC 带快照的 HOST_ID 与
+  //   global ID（VF_ID）；每个设备都收到过经路由器的 doorbell；MAILBOX BAR 与另一 Host 的 BAR0
+  //   地址在本 Host domain 内的写被路由器拒绝（不到达任何设备）。
+  // 输入/输出及副作用：读设备 context；向路由器发起被拒的写。
+  // 失败/边界：不符报告 UVM_ERROR。
+  function void check_dpu_projection();
+    rdma_dev_object obj;
+    bit seen[int unsigned];
+    rdma_status status;
+    dpu_pcie_domain_key_t domain;
+    int unsigned routed;
+
+    foreach (funcs[i]) begin
+      if (seen.exists(funcs[i].dpu.global_id))
+        `uvm_error("MF", $sformatf("duplicate global Function ID %0d", funcs[i].dpu.global_id))
+      seen[funcs[i].dpu.global_id] = 1'b1;
+      if (!funcs[i].dev.cmq.lookup(RDMA_DEV_QP, funcs[i].qp_out.qpn, obj)) begin
+        `uvm_error("MF", $sformatf("%s has no QPC", funcs[i].get_name()))
+        continue;
+      end
+      if (rdma_be::field(obj.bytes, RDMA_QPC_HOST_ID_WORD_BYTE_OFFSET, RDMA_QPC_HOST_ID_LSB,
+                         RDMA_QPC_HOST_ID_WIDTH) != funcs[i].dpu.key.host_id ||
+          rdma_be::field(obj.bytes, RDMA_QPC_VF_ID_WORD_BYTE_OFFSET, RDMA_QPC_VF_ID_LSB,
+                         RDMA_QPC_VF_ID_WIDTH) != funcs[i].dpu.global_id)
+        `uvm_error("MF", $sformatf("%s QPC HOST_ID/VF_ID do not match the dpu_common snapshot",
+                                   funcs[i].get_name()))
+      if (funcs[i].dev.doorbell_offsets.size() == 0)
+        `uvm_error("MF", $sformatf("%s received no routed doorbell", funcs[i].get_name()))
+      routed = router.routed;
+      status = router.write(funcs[i].dpu.pcie_id.domain,
+                            funcs[i].dpu.mailbox.base + RDMA_NOTIFY_WINDOW_OFFSET, '0);
+      if (status.ok() || router.routed != routed)
+        `uvm_error("MF", $sformatf("%s MAILBOX BAR write was routed to the RDMA device",
+                                   funcs[i].get_name()))
+    end
+    domain = funcs[0].dpu.pcie_id.domain;
+    routed = router.routed;
+    status = router.write(domain, funcs[3].dpu.bar0.base + RDMA_NOTIFY_WINDOW_OFFSET, '0);
+    if (status.ok() || router.routed != routed)
+      `uvm_error("MF", "Host1 BAR0 address was routed from the Host0 domain")
+  endfunction
+
+  // 功能：驱动 probe（host_id 与 vf_id = global Function ID 取自 dpu_common 快照）后建 PD、CQ、
+  //   16KiB 数据缓冲与覆盖它的 MR。
   // 输入/输出及副作用：替换 f 的驱动与资源。
   // 失败/边界：失败报告 UVM_FATAL。
   task probe(rdma_mf_func f);
@@ -188,7 +266,8 @@ class rdma_multifunc_test extends uvm_test;
     rdma_status status;
 
     cfg = rdma_drv_config::type_id::create("mf_cfg");
-    cfg.vf_id = f.vf_id;
+    cfg.host_id = f.dpu.key.host_id;
+    cfg.vf_id = f.dpu.global_id;
     f.drv = rdma_drv_dev::type_id::create({f.get_name(), "_drv"});
     f.drv.probe(cfg, f.hw, status);
     expect_ok({f.get_name(), " probe"}, status);

@@ -14,6 +14,7 @@
 ../src/adapter/rdma_adapter_pkg.sv
 ../src/dev/rdma_dev_pkg.sv
 ../src/drv/rdma_drv_pkg.sv
+../src/adapters/dpu/rdma_dpu_adapter_pkg.sv
 ../src/core/rdma_core_pkg.sv
 ../src/tb/rdma_tb_pkg.sv
 ../tests/rdma_unit_test_pkg.sv

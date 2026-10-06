@@ -76,7 +76,7 @@ class rdma_tb_e2e_test extends rdma_tb_host_mem_test;
   endfunction
 
 
-  // 功能：为每个节点登记 net_packet adapter（Function identity：PF，BDF 总线号 = 节点号 + 2）。
+  // 功能：为每个节点登记 net_packet adapter，Function identity 取自该节点 dpu_common 快照的 PF。
   // 输入/输出及副作用：配置 env.fabric。
   // 失败/边界：wire 类型不符或配置失败报 UVM_FATAL。
   virtual function void attach_fabric();
@@ -86,12 +86,7 @@ class rdma_tb_e2e_test extends rdma_tb_host_mem_test;
     if (!$cast(net, env.fabric))
       `uvm_fatal("TB_E2E", "env fabric is not the net_packet wire")
     foreach (mems[n]) begin
-      identity = rdma_function_identity::type_id::create($sformatf("tb_identity%0d", n));
-      identity.key = '{root_id:16'h1, host_topology_key:32'h100, function_kind:RDMA_FUNCTION_PF,
-                       parent_pf_bdf:'0, vf_index:'0, bdf:'0};
-      identity.key.bdf = '{segment:16'h0, bus:8'(n + 2), device:5'h0, function_num:3'h0};
-      identity.function_uid = n + 1;
-      identity.generation = 1;
+      expect_ok("dpu identity", dpu_funcs[n].identity(identity));
       expect_ok("net wire add_node", net.add_node(n, identity));
     end
   endfunction
