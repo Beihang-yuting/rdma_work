@@ -38,6 +38,8 @@ class rdma_dev_qp_rt extends uvm_object;
   longint unsigned urc_rq_cpl;
   // URC 异常完成后 QP 停止处理 SQ（剩余 WQE 由驱动按异常/flush 合成完成）。
   bit urc_error;
+  // 当前请求的响应超时（由 QPC RTO_CODE 换算，0 为不超时）。
+  time rto;
   bit [23:0] send_psn;
   bit [23:0] expected_psn;
   bit [23:0] msn;
@@ -79,6 +81,7 @@ class rdma_dev_qp_rt extends uvm_object;
     rx_active = 1'b0;
     rx_failed = 1'b0;
     urc_error = 1'b0;
+    rto = 0;
     msg_first_psn = '0;
     seq_nak_sent = 1'b0;
     rnr_drop = 1'b0;
@@ -117,8 +120,6 @@ class rdma_dev_nic extends uvm_object;
   rdma_dev_cmq ctx;
   rdma_host_mem_api host_mem;
   rdma_dev_port port;
-  // ACK/响应超时（重传定时器）与 RNR NAK 后的重试间隔；模型取固定值，不按 IB 定时器编码换算。
-  time response_timeout;
   // 观测：因 Q_Key 不符被丢弃的 UD 报文数。
   int unsigned qkey_drops;
   // URC 异常上报通道：0 为 frag CQ 的 ABNML CEQE，1 为 AEQE（驱动两条路径都处理；硬件选择未知）。
@@ -143,7 +144,6 @@ class rdma_dev_nic extends uvm_object;
     ctx = null;
     host_mem = null;
     port = null;
-    response_timeout = 100us;
     qkey_drops = 0;
     urc_abnormal_via_aeq = 1'b0;
     sq_kicks = new();
@@ -852,7 +852,7 @@ class rdma_dev_nic extends uvm_object;
   //   PSN 起重新请求剩余部分）；超时时 SEND/WRITE 从首 PSN 重发、READ 从第一个缺失的响应起；两者消耗
   //   PSN_RETRY_TH（耗尽为 0x16/0x18）。RNR NAK 按其 syndrome 低 5 位的 RNR 定时器编码等待后从首 PSN
   //   重发，消耗 RNR_RETRY_TH（7 为无限，耗尽为 0xB7）。其余 NAK 为致命错误（0xB9，synd 为远端
-  //   syndrome）。ACK/READ 响应/ATOMIC ACK 完成。
+  //   syndrome）。ACK/READ 响应/ATOMIC ACK 完成。响应超时由 QPC RTO_CODE 换算（rto_time）。
   // 输入/输出及副作用：发包、写本地内存；send_psn 结束于首 PSN + 分段数；ecode/synd 输出。
   // 失败/边界：本地写失败以 SQ_KEY_ERR 结束。
   protected task run_request(int unsigned qpn, rdma_dev_qp_rt rt, rdma_bytes_t wqe, bit [3:0] op,
@@ -870,6 +870,7 @@ class rdma_dev_nic extends uvm_object;
     rdma_packet junk;
 
     start = rt.send_psn;
+    rt.rto = rto_time(`RDMA_QPC(qpn, RDMA_QPC_RTO_CODE));
     retries = `RDMA_QPC(qpn, RDMA_QPC_PSN_RETRY_TH);
     rnrs = `RDMA_QPC(qpn, RDMA_QPC_RNR_RETRY_TH);
     segs = (payload + mtu(qpn) - 1) / mtu(qpn);
@@ -923,6 +924,31 @@ class rdma_dev_nic extends uvm_object;
       endcase
     end
   endtask
+
+  // 功能：QPC RTO_CODE（硬件时间编码）→ 响应超时。假设：硬件编码表未公开，取驱动
+  //   xtrdma_rto_code_map（IB timeout t → 编码）的逆：编码 c 的时长为映射到它的 IB 超时
+  //   4.096us * 2^t，即 0:8.192us 1:16.384us 3:32.768us 7:65.536us 11:131.072us 15:262.144us，
+  //   17..30 为 4.096us * 2^(c-10)；未被映射的编码取不大于它的最近映射编码的时长；31（IB t=0）为
+  //   不超时，返回 0。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：无。
+  protected function time rto_time(bit [4:0] code);
+    if (code == 31)
+      return 0;
+    if (code >= 17)
+      return 4096ns * (64'd1 << (code - 10));
+    if (code >= 15)
+      return 262144ns;
+    if (code >= 11)
+      return 131072ns;
+    if (code >= 7)
+      return 65536ns;
+    if (code >= 3)
+      return 32768ns;
+    if (code >= 1)
+      return 16384ns;
+    return 8192ns;
+  endfunction
 
   // 功能：IB RNR 定时器编码 → 等待时间（0 为 655.36ms，1..31 为 0.01ms..491.52ms）。
   // 输入/输出及副作用：纯函数。
@@ -1043,7 +1069,7 @@ class rdma_dev_nic extends uvm_object;
   endfunction
 
   // 功能：等待一个属于本次请求（PSN 不早于 first）的响应，丢弃更早的过期响应。
-  // 输入/输出及副作用：消费响应；pkt 输出；至多等待 response_timeout。
+  // 输入/输出及副作用：消费响应；pkt 输出；至多等待 rt.rto（0 为一直等）。
   // 失败/边界：超时 got=0。
   protected task next_response(rdma_dev_qp_rt rt, bit [23:0] first, output rdma_packet pkt,
                                output bit got);
@@ -1057,7 +1083,11 @@ class rdma_dev_nic extends uvm_object;
               rt.responses.get(pkt);
               got = 1'b1;
             end
-            #(response_timeout);
+            begin
+              if (rt.rto == 0)
+                wait (1'b0);
+              #(rt.rto);
+            end
           join_any
           disable fork;
         end

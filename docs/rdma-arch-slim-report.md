@@ -166,7 +166,8 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 | v30 | a43107a | 全部通过（core 43）：按 NAK PSN 续传、READ 只重请求缺失段、RNR 定时器编码、URC 异常经 AEQE |
 
 假设与未建模：URC 每个完成都发 CEQE（驱动源码未说明硬件是否依赖 arm）；URC 异常经 CEQE
-或 AEQE（设备开关二选一，硬件选择未知）；响应超时固定，未按 RTO_CODE 换算；驱动 abnormal 位置
+或 AEQE（设备开关二选一，硬件选择未知）；RTO_CODE → 超时时长按驱动 xtrdma_rto_code_map 的逆推定
+（硬件编码表未公开）；驱动 abnormal 位置
 按环大小回绕（驱动源码 idx+1 不取模，按正确行为建模）。
 
 ## 未做与遗留

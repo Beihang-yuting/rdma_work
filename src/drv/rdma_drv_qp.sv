@@ -111,6 +111,8 @@ class rdma_drv_qp extends uvm_object;
   localparam int unsigned SGB_BYTES = 512;
   // rf->urc_rnr_code 默认值（qp.h:139，debugfs 可调未建模）。
   localparam int unsigned URC_RNR_CODE = 8;
+  // rf->urc_rto_code 默认值（qp.h:136）。
+  localparam int unsigned URC_RTO_CODE = 'h12;
   localparam int unsigned SHADOW_OFFSET = 504;
   localparam int unsigned SERVICE_RC = 0;
   localparam int unsigned SERVICE_UD = 3;
@@ -516,9 +518,24 @@ class rdma_drv_qp extends uvm_object;
     `RDMA_DRV_SET(qpc, RDMA_QPC_LOAD_RQ_PI_TH, 8'h05)
   endfunction
 
+  // 功能：xtrdma_get_rto_code：IB timeout（4.096us * 2^t，0 为无限）→ 硬件 RTO 时间编码
+  //   （xtrdma_rto_code_map：0→31，1→0，2→1，3→3，4→7，5→11，6→15，7..20→t+10，≥21→31）。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：无。
+  static function bit [4:0] rto_code(int unsigned timeout);
+    bit [4:0] low[7];
+
+    low = '{31, 0, 1, 3, 7, 11, 15};
+    if (timeout < 7)
+      return low[timeout];
+    if (timeout <= 20)
+      return timeout + 10;
+    return 31;
+  endfunction
+
   // 功能：fill_urc_qpc_info 中与 RC 不同的部分（qp.c:1226）：服务类型 6，RSQ/RDSQ/DSQ 地址与大小，
-  //   RBSN/RPSN 初值 0x1000、DBSN/DPSN 初值 0，RDSQ/DSQ 预取数 8，LOCAL_RNR_CODE = urc_rnr_code，
-  //   SQ CE/RQ SE 门限，FC/ECN 同 RC；不写 ORQ/EIRQ/UAQ_IRQ 地址。
+  //   RBSN/RPSN 初值 0x1000、DBSN/DPSN 初值 0，RDSQ/DSQ 预取数 8，LOCAL_RNR_CODE/RTO_CODE 为
+  //   urc_rnr_code/urc_rto_code，SQ CE/RQ SE 门限，FC/ECN 同 RC；不写 ORQ/EIRQ/UAQ_IRQ 地址。
   // 输入/输出及副作用：修改 qpc 镜像。
   // 失败/边界：无。
   protected function void fill_urc_qpc();
@@ -540,6 +557,7 @@ class rdma_drv_qp extends uvm_object;
     `RDMA_DRV_SET(qpc, RDMA_QPC_URC_NXT_RDSQ_FETCH_NUM, 8)
     `RDMA_DRV_SET(qpc, RDMA_QPC_URC_NXT_DSQ_FETCH_NUM, 8)
     `RDMA_DRV_SET(qpc, RDMA_QPC_LOCAL_RNR_CODE, URC_RNR_CODE)
+    `RDMA_DRV_SET(qpc, RDMA_QPC_RTO_CODE, URC_RTO_CODE)
     if (rq_depth >= 8) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_URC_RQ_SE_TH, $clog2(rq_depth >> 3))
     end
@@ -673,8 +691,9 @@ class rdma_drv_qp extends uvm_object;
     if (a.mask & rdma_drv_qp_attr::M_RETRY_CNT) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_PSN_RETRY_TH, a.retry_cnt)
     end
-    if (a.mask & rdma_drv_qp_attr::M_TIMEOUT) begin
-      `RDMA_DRV_SET(qpc, RDMA_QPC_RTO_CODE, a.timeout)
+    // URC 忽略 timeout，保持 urc_rto_code（qp.c:2506）。
+    if ((a.mask & rdma_drv_qp_attr::M_TIMEOUT) && !urc) begin
+      `RDMA_DRV_SET(qpc, RDMA_QPC_RTO_CODE, rto_code(a.timeout))
     end
     // URC 忽略 MIN_RNR，保持 create 时的 urc_rnr_code（qp.c:2513）。
     if ((a.mask & rdma_drv_qp_attr::M_MIN_RNR) && !urc) begin

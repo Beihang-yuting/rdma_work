@@ -186,9 +186,12 @@ class rdma_tb_flow_test extends uvm_test;
       qp.modify(x.drv, attr, status);
       expect_ok("RTR", status);
       attr = rdma_drv_qp_attr::type_id::create("tb_rts");
-      attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_SQ_PSN;
+      attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_SQ_PSN |
+                  rdma_drv_qp_attr::M_TIMEOUT;
       attr.state = RDMA_DRV_QPS_RTS;
       attr.sq_psn = 0;
+      // IB timeout 14（约 67ms）。
+      attr.timeout = 14;
       qp.modify(x.drv, attr, status);
       expect_ok("RTS", status);
     end

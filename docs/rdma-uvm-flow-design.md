@@ -62,6 +62,7 @@ test
 
 ## 4. 后续
 
-接入 DUT。假设：硬件何时用 AEQE、何时用 CEQE 上报 URC 异常未知（设备开关二选一）；响应超时固定
-（未按 QPC RTO_CODE 换算）；SEND/WRITE 超时从首 PSN 重发（响应方只对末包 ACK，请求方无从得知
+接入 DUT。假设：硬件何时用 AEQE、何时用 CEQE 上报 URC 异常未知（设备开关二选一）；响应超时由
+QPC RTO_CODE 换算，硬件编码表未公开，取驱动 xtrdma_rto_code_map（IB timeout → 编码）的逆（31 为
+不超时，URC 固定 urc_rto_code=0x12）；SEND/WRITE 超时从首 PSN 重发（响应方只对末包 ACK，请求方无从得知
 已收到的部分）。

@@ -222,9 +222,12 @@ class rdma_drv_data_test extends uvm_test;
     qp.modify(drv, attr, status);
     expect_ok("RTR", status);
     attr = rdma_drv_qp_attr::type_id::create("rts");
-    attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_SQ_PSN;
+    attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_SQ_PSN |
+                rdma_drv_qp_attr::M_TIMEOUT;
     attr.state = RDMA_DRV_QPS_RTS;
     attr.sq_psn = 0;
+    // IB timeout 3 → 硬件 RTO 编码 3（32.768us）。
+    attr.timeout = 3;
     qp.modify(drv, attr, status);
     expect_ok("RTS", status);
   endtask

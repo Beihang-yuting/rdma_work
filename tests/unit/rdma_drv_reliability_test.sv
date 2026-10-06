@@ -23,12 +23,10 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     ud_qkeys = '{32'h2222_0003, 32'h2222_0002};
   endfunction
 
-  // 功能：缩短两端响应超时到 5us 后依次执行各用例。
+  // 功能：依次执行各用例（RC QP 的 RTO 编码 3 = 32.768us，见 connect_qp）。
   // 输入/输出及副作用：见各用例。
   // 失败/边界：以 UVM_ERROR/FATAL 报告。
   virtual task run_cases();
-    a.dev.nic.response_timeout = 5us;
-    b.dev.nic.response_timeout = 5us;
     check_request_drop();
     check_ack_drop();
     check_rnr();
@@ -78,7 +76,7 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     expect_b_idle("request drop");
   endtask
 
-  // 功能：B→A 的响应被丢，A 超时重发，B 按重复请求处理：SEND 只消费一个 RQE（第二个 RQE 留给
+  // 功能：B→A 的响应被丢，A 等满 RTO（32.768us）后重发，B 按重复请求处理：SEND 只消费一个 RQE（第二个 RQE 留给
   //   下一条 SEND）；2 段 READ 的第 2 段响应被丢，A 只对第 2 段重新请求（发往 B 共 2 个请求，回 A
   //   共 3 个响应）；FAA 回缓存的原值且目标只加一次。
   // 输入/输出及副作用：每项丢 1 包。
@@ -92,12 +90,17 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     longint unsigned rwr[2];
     int unsigned to_a;
     int unsigned to_b;
+    time started;
 
     data = fill(a, 'h100, 64, 8'h27);
     post_recv(b, '{'h1000}, '{'h100}, rwr[0]);
     post_recv(b, '{'h1100}, '{'h100}, rwr[1]);
     link.drops[a.mac] = 1;
+    started = $time;
     send_and_wait("ACK drop", send_wr(a, RDMA_DRV_WR_SEND, '{'h100}, '{64}));
+    if ($time - started < 32768ns || $time - started >= 34us)
+      `uvm_error("ACK drop", $sformatf("completed after %0t, expected one 32.768us RTO",
+                                       $time - started))
     expect_recv("ACK drop rq", rwr[0], wc);
     expect_mem("ACK drop data", b, 'h1000, data);
     expect_b_idle("ACK drop");

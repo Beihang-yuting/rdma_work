@@ -484,8 +484,8 @@ class rdma_multifunc_test extends uvm_test;
   endtask
 
   // 功能：丢包：PF1 发往 VF1_1 的 WRITE 丢一包，超时后重传成功且数据到达；再持续丢包，PSN 重试
-  //   （PSN_RETRY_TH=6）耗尽后得到 vendor 0x16 的错误完成；该链路两端 QP 重建后全环流量正常。
-  //   本项把 PF1 的响应超时缩短到 5us。
+  //   （PSN_RETRY_TH=6）耗尽后得到 vendor 0x16 的错误完成（QP 未设 timeout，RTO 编码 0 = 8.192us）；
+  //   该链路两端 QP 重建后全环流量正常。
   // 输入/输出及副作用：重建链路 3。
   // 失败/边界：不符报告 UVM_ERROR。
   task fault_packet_drop();
@@ -495,12 +495,9 @@ class rdma_multifunc_test extends uvm_test;
     rdma_drv_wc wc;
     rdma_bytes_t data;
     int unsigned none[$];
-    time saved;
 
     a = funcs[3];
     b = funcs[4];
-    saved = a.dev.nic.response_timeout;
-    a.dev.nic.response_timeout = 5us;
     net.drops[a.mac] = 1;
     data = fill(a, 'h0, 64, 8'h21);
     wr = make_wr(a, RDMA_DRV_WR_WRITE, 'h0, 64);
@@ -519,7 +516,6 @@ class rdma_multifunc_test extends uvm_test;
     if (wc.vendor_err != RDMA_ECODE_EC_TPE_SQ_RTO_OVERTIME || net.dropped != 8)
       `uvm_error("retry exhausted", $sformatf("vendor %02h, dropped %0d", wc.vendor_err,
                                               net.dropped))
-    a.dev.nic.response_timeout = saved;
     link_qps(3);
     check_traffic("after packet drop", none);
   endtask
