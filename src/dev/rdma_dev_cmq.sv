@@ -2,8 +2,8 @@
 // 职责：NIC 的 CMQ 消费者与 context 存储。驱动经 CMQC_HIGH 写 SQ 基址、CMQC_LOW 使能
 //   （cmq.c xtrdma_sc_cmq_create），每次 CMQ doorbell 给出新 PI/polarity；设备按序 DMA 读取 SQE，
 //   按 opcode 更新 context 表，再把完成写入紧随 SQ 的 CQ 环（cmq.c 的 sq_buf/cq_buf 布局）。
-// 依赖：rdma_host_mem_api.dma_read/dma_write、rdma_defs.svh 的 CMQ/MRT/doorbell 字段常量。
-// 所有权与生命周期：context 表归本对象；host_mem 只借用。reset 清空全部设备状态。
+// 依赖：rdma_dev_dma（设备 DMA 端口）、rdma_defs.svh 的 CMQ/MRT/doorbell 字段常量。
+// 所有权与生命周期：context 表与 DMA 端口归本对象（NIC 共用该端口）；reset 清空全部设备状态。
 // 设计说明：设备保存驱动下发的 context 原始字节（QPC 为 512B 缓冲区，其余为 SQE 中的 context 区），
 //   查询类命令按驱动 *_cqe_info 读取的偏移原样回填；数据面（NIC）按需解码这些字节。
 
@@ -55,7 +55,8 @@ class rdma_dev_cmq extends uvm_object;
   protected bit fail_armed;
   protected bit [7:0] fail_opcode;
   protected bit [7:0] fail_ecode;
-  protected rdma_host_mem_api host_mem;
+  // 设备 DMA 端口（CMQ 与 NIC 共用）。
+  rdma_dev_dma dma;
   protected bit [63:0] sq_pa;
   protected bit enabled;
   protected longint unsigned sq_seq;
@@ -73,15 +74,19 @@ class rdma_dev_cmq extends uvm_object;
   // 失败/边界：无。
   function new(string name = "rdma_dev_cmq");
     super.new(name);
-    host_mem = null;
+    dma = null;
     reset();
   endfunction
 
-  // 功能：绑定设备 DMA 使用的主机内存并清空状态。
-  // 输入/输出及副作用：保存非拥有引用。
+  // 功能：创建设备 DMA 端口（factory，可被覆盖）并绑定主机内存，清空状态。
+  // 输入/输出及副作用：新建 dma；host_mem 为非拥有引用。
   // 失败/边界：host_mem 为 null 时之后的 doorbell 返回 INVALID_STATE。
   function void configure(rdma_host_mem_api host_mem_arg);
-    host_mem = host_mem_arg;
+    dma = null;
+    if (host_mem_arg != null) begin
+      dma = rdma_dev_dma::type_id::create({get_name(), "_dma"});
+      dma.host_mem = host_mem_arg;
+    end
     reset();
   endfunction
 
@@ -145,72 +150,80 @@ class rdma_dev_cmq extends uvm_object;
   // 功能：处理 notify 窗口内的 CMQ 寄存器写：CMQC_HIGH（SQ 基址）、CMQC_LOW（使能）、CMQ doorbell。
   // 输入/输出及副作用：offset 为 notify 窗口内偏移，value 为 8B 寄存器值；doorbell 触发 SQE 处理。
   // 失败/边界：非 CMQ 寄存器、未使能时的 doorbell、乱序 PI 或非法 SQE 返回错误。
-  function rdma_status write_register(bit [63:0] offset, bit [63:0] value);
+  task write_register(bit [63:0] offset, bit [63:0] value, output rdma_status status);
+    status = rdma_status::success();
     if (offset == RDMA_DB_CMQC_HIGH_OFFSET) begin
       sq_pa = value;
-      return rdma_status::success();
+      return;
     end
     if (offset == RDMA_DB_CMQC_LOW_OFFSET) begin
       // cmq.c：PI/CI 初值 0，bit31 置 1 表示 CMQC 有效。
       enabled = value[31];
       sq_seq = 0;
       cq_seq = 0;
-      return rdma_status::success();
+      return;
     end
-    if (offset == RDMA_DB_CMQ_OFFSET)
-      return doorbell(value);
-    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "not a CMQ register");
-  endfunction
+    if (offset == RDMA_DB_CMQ_OFFSET) begin
+      doorbell(value, status);
+      return;
+    end
+    status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "not a CMQ register");
+  endtask
 
   // 功能：CMQ doorbell：处理 [sq_seq, 目标序号) 的全部 SQE；目标序号由 PI 与 polarity 唯一确定。
   // 输入/输出及副作用：读 SQ、写 CQ、更新 context 表。
   // 失败/边界：未配置/未使能、目标不在下一圈内、任一 SQE 非法时返回错误并停在该 SQE。
-  protected function rdma_status doorbell(bit [63:0] value);
+  protected task doorbell(bit [63:0] value, output rdma_status status);
     longint unsigned target;
     bit [4:0] pi;
     bit polarity;
-    rdma_status status;
 
-    if (host_mem == null || !enabled)
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "CMQ is not enabled");
+    status = rdma_status::success();
+    if (dma == null || !enabled) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE, "CMQ is not enabled");
+      return;
+    end
     if (stall)
-      return rdma_status::success();
+      return;
     pi = value[RDMA_CMQ_DB_PI_LSB +: RDMA_CMQ_DB_PI_WIDTH];
     polarity = value[RDMA_CMQ_DB_POLARITY_LSB];
     target = 0;
     for (longint unsigned s = sq_seq + 1; s <= sq_seq + DEPTH; s++)
       if (s % DEPTH == pi && ((s / DEPTH) & 1) == polarity)
         target = s;
-    if (target == 0)
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "CMQ doorbell PI is not ahead of the device");
-    while (sq_seq < target) begin
-      status = consume_one();
-      if (!status.ok())
-        return status;
+    if (target == 0) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "CMQ doorbell PI is not ahead of the device");
+      return;
     end
-    return rdma_status::success();
-  endfunction
+    while (sq_seq < target) begin
+      consume_one(status);
+      if (!status.ok())
+        return;
+    end
+  endtask
 
   // 功能：读取并执行一个 SQE，写出对应 CQE。
   // 输入/输出及副作用：推进 sq_seq/cq_seq。
   // 失败/边界：DMA 失败、valid/wrap/index 与设备游标不符或执行发现协议错误时返回错误。
-  protected function rdma_status consume_one();
+  protected task consume_one(output rdma_status status);
     byte unsigned sqe[];
     byte unsigned cqe[];
     bit [63:0] word0;
     bit lap;
     bit [7:0] ecode;
-    rdma_status status;
 
-    status = read_bytes(sq_pa + (sq_seq % DEPTH) * RDMA_CMQE_BYTES, RDMA_CMQE_BYTES, sqe);
+    read_bytes(sq_pa + (sq_seq % DEPTH) * RDMA_CMQE_BYTES, RDMA_CMQE_BYTES, sqe, status);
     if (!status.ok())
-      return status;
+      return;
     word0 = rdma_be::qword(sqe, 0);
     lap = (sq_seq / DEPTH) & 1;
     // cmq.c：VALID=polarity，WRAP=!polarity；polarity 每圈翻转，首圈为 1。
     if (word0[RDMA_CMQ_WRAP_LSB] != lap || word0[RDMA_CMQ_VALID_LSB] == lap ||
-        word0[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH] != sq_seq % DEPTH)
-      return rdma_status::make(RDMA_SC_CODEC_ERROR, "CMQ SQE envelope does not match the ring");
+        word0[RDMA_CMQ_WQE_INDEX_LSB +: RDMA_CMQ_WQE_INDEX_WIDTH] != sq_seq % DEPTH) begin
+      status = rdma_status::make(RDMA_SC_CODEC_ERROR, "CMQ SQE envelope does not match the ring");
+      return;
+    end
     cqe = new[RDMA_CMQE_BYTES];
     foreach (cqe[i])
       cqe[i] = 0;
@@ -219,23 +232,22 @@ class rdma_dev_cmq extends uvm_object;
       ecode = fail_ecode;
     end
     else begin
-      status = execute(sqe, cqe, ecode);
+      execute(sqe, cqe, ecode, status);
       if (!status.ok())
-        return status;
+        return;
     end
     sq_seq++;
     executed_opcodes.push_back(word0[RDMA_CMQ_OPCODE_LSB +: 8]);
     executed_ecodes.push_back(ecode);
-    return write_cqe(word0, ecode, cqe);
-  endfunction
+    write_cqe(word0, ecode, cqe, status);
+  endtask
 
   // 功能：写出 CQE：owner 按 CQ 圈数取值，wrap/index/opcode 回显 SQE，ecode 为执行结果。
   // 输入/输出及副作用：写 CQ 环，推进 cq_seq。
   // 失败/边界：DMA 失败返回其 status。
-  protected function rdma_status write_cqe(bit [63:0] sqe_word0, bit [7:0] ecode,
-                                           byte unsigned cqe[]);
+  protected task write_cqe(bit [63:0] sqe_word0, bit [7:0] ecode, byte unsigned cqe[],
+                           output rdma_status status);
     bit [63:0] head;
-    rdma_status status;
 
     head = rdma_be::qword(cqe, 0);
     head[RDMA_CMQ_VALID_LSB] = !((cq_seq / DEPTH) & 1);
@@ -245,28 +257,28 @@ class rdma_dev_cmq extends uvm_object;
     head[RDMA_CMQ_OPCODE_LSB +: 8] = sqe_word0[RDMA_CMQ_OPCODE_LSB +: 8];
     head[RDMA_CMQ_CMD_ECODE_LSB +: 8] = ecode;
     rdma_be::put_qword(cqe, 0, head);
-    status = write_bytes(sq_pa + CQ_OFFSET + (cq_seq % DEPTH) * RDMA_CMQE_BYTES, cqe);
+    write_bytes(sq_pa + CQ_OFFSET + (cq_seq % DEPTH) * RDMA_CMQE_BYTES, cqe, status);
     if (status.ok())
       cq_seq++;
-    return status;
-  endfunction
+  endtask
 
   // 功能：按 opcode 执行一条命令：更新 context 表，查询类在 cqe 中回填结果。
   // 输入/输出及副作用：cqe 为 64B 完成缓冲（qword0 由调用方补全），ecode 输出。
   // 失败/边界：协议错误（签名不符、操作不存在的 QP/SRQ/MR）返回错误 status。
-  protected function rdma_status execute(byte unsigned sqe[], inout byte unsigned cqe[],
-                                         output bit [7:0] ecode);
+  protected task execute(byte unsigned sqe[], inout byte unsigned cqe[], output bit [7:0] ecode,
+                         output rdma_status status);
     bit [7:0] opcode;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
+    status = rdma_status::success();
     opcode = rdma_be::qword(sqe, 0) >> RDMA_CMQ_OPCODE_LSB;
     case (opcode)
       RDMA_OP_QPC_CREATE, RDMA_OP_QPC_MODIFY, RDMA_OP_QPC_QUERY, RDMA_OP_QPC_DELETE,
       RDMA_OP_QPC_FORCE_DELETE: begin
-        return execute_qp(opcode, sqe, ecode);
+        execute_qp(opcode, sqe, ecode, status);
       end
       RDMA_OP_KEY_ALLOC, RDMA_OP_MR_REGISTER, RDMA_OP_MR_DEREGISTER, RDMA_OP_KEY_QUERY: begin
-        return execute_mr(opcode, sqe, cqe, ecode);
+        status = execute_mr(opcode, sqe, cqe, ecode);
       end
       RDMA_OP_CQC_CREATE, RDMA_OP_CQC_MODIFY, RDMA_OP_CQC_RESIZE, RDMA_OP_CQC_DELETE,
       RDMA_OP_CQC_FORCE_DELETE, RDMA_OP_CQC_QUERY: begin
@@ -280,10 +292,10 @@ class rdma_dev_cmq extends uvm_object;
       end
       RDMA_OP_SRFQC_CREATE, RDMA_OP_SRFQC_MODIFY, RDMA_OP_SRFQC_DELETE,
       RDMA_OP_SRFQC_QUERY: begin
-        return execute_srq(opcode, sqe, cqe, ecode);
+        status = execute_srq(opcode, sqe, cqe, ecode);
       end
       RDMA_OP_SD_UPDATE: begin
-        return update_sds(sqe);
+        update_sds(sqe, status);
       end
       RDMA_OP_IFA_UPDATE: begin
         ifa_data[(rdma_be::qword(sqe, 0) >> 60) & 2'b11] = rdma_be::qword(sqe, 8);
@@ -292,30 +304,28 @@ class rdma_dev_cmq extends uvm_object;
         // OCC/TQ flush、IFA/GID/MAC 等表项：设备侧无可观测状态，按成功完成。
       end
     endcase
-    return rdma_status::success();
-  endfunction
+  endtask
 
   // 功能：SD_UPDATE：校验签名后记录每个 SD 表项（前 2 项在 SQE 字节 32 起，其余在 sd_buf_addr）；
   //   VF_VALID=0 的表项表示清除。
   // 输入/输出及副作用：更新 sd_pa；DMA 读扩展表。
   // 失败/边界：签名不符或 DMA 失败返回错误。
-  protected function rdma_status update_sds(byte unsigned sqe[]);
+  protected task update_sds(byte unsigned sqe[], output rdma_status status);
     int unsigned n;
     byte unsigned entries[];
     byte unsigned extra[];
     int unsigned idx;
-    rdma_status status;
 
-    status = check_sd_signature(sqe);
+    check_sd_signature(sqe, status);
     if (!status.ok())
-      return status;
+      return;
     n = rdma_be::qword(sqe, 0) & 8'hff;
     entries = rdma_be::slice(sqe, 32, RDMA_SD_CARRIED_IN_SQE * RDMA_SD_ENTRY_BYTES);
     if (n > RDMA_SD_CARRIED_IN_SQE) begin
-      status = read_bytes(rdma_be::qword(sqe, 24),
-                          (n - RDMA_SD_CARRIED_IN_SQE) * RDMA_SD_ENTRY_BYTES, extra);
+      read_bytes(rdma_be::qword(sqe, 24), (n - RDMA_SD_CARRIED_IN_SQE) * RDMA_SD_ENTRY_BYTES,
+                 extra, status);
       if (!status.ok())
-        return status;
+        return;
       entries = {entries, extra};
     end
     for (int unsigned i = 0; i < n; i++) begin
@@ -329,105 +339,108 @@ class rdma_dev_cmq extends uvm_object;
       else
         sd_pa.delete(idx);
     end
-    return rdma_status::success();
-  endfunction
+  endtask
 
   // 功能：HMC 对象地址：obj_type 类对象区内 offset 处 → FVM 地址（FVM_SOA<<9 + offset）→ SD →
   //   PD 表项 → 页 + 页内偏移（4K INDIRECT）。
   // 输入/输出及副作用：iova 输出；DMA 读 PD 表项。
   // 失败/边界：对象类未配置、SD 未建立或 PD 表项无效返回 DMA_TRANSLATION。
-  function rdma_status hmc_addr(int unsigned obj_type, longint unsigned offset,
-                                output bit [63:0] iova);
+  task hmc_addr(int unsigned obj_type, longint unsigned offset, output bit [63:0] iova,
+                output rdma_status status);
     bit [63:0] fvm;
     bit [63:0] entry;
     int unsigned sd;
     byte unsigned bytes[];
-    rdma_status status;
 
     iova = '0;
-    if (!ifa_data[obj_type][RDMA_IFA_DATA_VALID_LSB])
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC object class is not configured");
+    if (!ifa_data[obj_type][RDMA_IFA_DATA_VALID_LSB]) begin
+      status = rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC object class is not configured");
+      return;
+    end
     fvm = (ifa_data[obj_type][RDMA_IFA_DATA_FVM_SOA_LSB +: RDMA_IFA_DATA_FVM_SOA_WIDTH]
            << RDMA_HMC_FVM_SOA_SHIFT) + offset;
     sd = fvm / (RDMA_HMC_PAGE_BYTES * RDMA_HMC_PD_PER_SD);
-    if (!sd_pa.exists(sd))
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC SD is not mapped");
-    status = read_bytes(sd_pa[sd] + ((fvm / RDMA_HMC_PAGE_BYTES) % RDMA_HMC_PD_PER_SD) * 8, 8,
-                        bytes);
+    if (!sd_pa.exists(sd)) begin
+      status = rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC SD is not mapped");
+      return;
+    end
+    read_bytes(sd_pa[sd] + ((fvm / RDMA_HMC_PAGE_BYTES) % RDMA_HMC_PD_PER_SD) * 8, 8, bytes,
+               status);
     if (!status.ok())
-      return status;
+      return;
     entry = rdma_be::qword(bytes, 0);
-    if (!entry[RDMA_PD_ENTRY_VLD_LSB])
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC PD entry is not valid");
+    if (!entry[RDMA_PD_ENTRY_VLD_LSB]) begin
+      status = rdma_status::make(RDMA_SC_DMA_TRANSLATION, "HMC PD entry is not valid");
+      return;
+    end
     iova = ((entry >> RDMA_PD_ENTRY_PBA_LSB) << RDMA_PD_ENTRY_PBA_LSB) +
            fvm % RDMA_HMC_PAGE_BYTES;
-    return rdma_status::success();
-  endfunction
+  endtask
 
   // 功能：队列缓冲地址：HUGE/DIRECT 为 (pba<<12)+offset；INDIRECT 先读 PD 表 (pba<<12) 的第
   //   offset/4K 项，再加页内偏移。
   // 输入/输出及副作用：iova 输出；可能 DMA 读 PD 表。
   // 失败/边界：PD 表项无效或 L3 模式返回 DMA_TRANSLATION。
-  function rdma_status buffer_addr(int unsigned om, bit [63:0] pba, longint unsigned offset,
-                                   output bit [63:0] iova);
+  task buffer_addr(int unsigned om, bit [63:0] pba, longint unsigned offset,
+                   output bit [63:0] iova, output rdma_status status);
     byte unsigned bytes[];
     bit [63:0] entry;
-    rdma_status status;
 
     iova = (pba << 12) + offset;
+    status = rdma_status::success();
     if (om != RDMA_ALLOC_TYPE_INDIRECT) begin
       if (om == RDMA_ALLOC_TYPE_L3_INDIRECT)
-        return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "L3 indirect buffers are not modeled");
-      return rdma_status::success();
+        status = rdma_status::make(RDMA_SC_DMA_TRANSLATION, "L3 indirect buffers are not modeled");
+      return;
     end
-    status = read_bytes((pba << 12) + (offset / RDMA_HMC_PAGE_BYTES) * 8, 8, bytes);
+    read_bytes((pba << 12) + (offset / RDMA_HMC_PAGE_BYTES) * 8, 8, bytes, status);
     if (!status.ok())
-      return status;
+      return;
     entry = rdma_be::qword(bytes, 0);
-    if (!entry[RDMA_PD_ENTRY_VLD_LSB])
-      return rdma_status::make(RDMA_SC_DMA_TRANSLATION, "buffer PD entry is not valid");
+    if (!entry[RDMA_PD_ENTRY_VLD_LSB]) begin
+      status = rdma_status::make(RDMA_SC_DMA_TRANSLATION, "buffer PD entry is not valid");
+      return;
+    end
     iova = ((entry >> RDMA_PD_ENTRY_PBA_LSB) << RDMA_PD_ENTRY_PBA_LSB) +
            offset % RDMA_HMC_PAGE_BYTES;
-    return rdma_status::success();
-  endfunction
+  endtask
 
   // 功能：SD_UPDATE：sd_num>2 时（SIGN_EN），签名覆盖整条 SQE 与 sd_buf_addr 处的扩展 SD 表
   //   （cmq.c xtrdma_sc_update_sd），含签名的全体异或恒为 0xff。
   // 输入/输出及副作用：DMA 读扩展表。
   // 失败/边界：签名不符或 DMA 失败返回错误。
-  protected function rdma_status check_sd_signature(byte unsigned sqe[]);
+  protected task check_sd_signature(byte unsigned sqe[], output rdma_status status);
     int unsigned n;
     byte unsigned extra[];
-    rdma_status status;
 
+    status = rdma_status::success();
     if (!rdma_be::field(sqe, RDMA_CMQ_SIGN_EN_WORD_BYTE_OFFSET, RDMA_CMQ_SIGN_EN_LSB,
                         RDMA_CMQ_SIGN_EN_WIDTH))
-      return rdma_status::success();
+      return;
     n = rdma_be::qword(sqe, 0) & 8'hff;
-    status = read_bytes(rdma_be::qword(sqe, 24), (n - RDMA_SD_CARRIED_IN_SQE) * RDMA_SD_ENTRY_BYTES,
-                        extra);
+    read_bytes(rdma_be::qword(sqe, 24), (n - RDMA_SD_CARRIED_IN_SQE) * RDMA_SD_ENTRY_BYTES, extra,
+               status);
     if (!status.ok())
-      return status;
+      return;
     if ((rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(extra)) != 8'hff)
-      return rdma_status::make(RDMA_SC_CODEC_ERROR, "SD_UPDATE signature mismatch");
-    return rdma_status::success();
-  endfunction
+      status = rdma_status::make(RDMA_SC_CODEC_ERROR, "SD_UPDATE signature mismatch");
+  endtask
 
   // 功能：QP 命令。CREATE/全量 MODIFY 从 QPC 缓冲区 DMA 读取 512B 并校验签名；仅状态 MODIFY
   //   改写 QPC 状态字段；部分 MODIFY 按 4 个 (起始 qword, 字节使能, 数据) 模板写入；
   //   QUERY 把 QPC DMA 写回缓冲区；DELETE 删除。
   // 输入/输出及副作用：更新 QP 表或主机内存。
   // 失败/边界：签名不符、DMA 失败或操作不存在的 QP 返回错误。
-  protected function rdma_status execute_qp(bit [7:0] opcode, byte unsigned sqe[],
-                                            output bit [7:0] ecode);
+  protected task execute_qp(bit [7:0] opcode, byte unsigned sqe[], output bit [7:0] ecode,
+                            output rdma_status status);
     int unsigned qpn;
     bit [63:0] buffer;
     bit [1:0] mode;
     rdma_dev_object obj;
     byte unsigned qpc[];
-    rdma_status status;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
+    status = rdma_status::success();
     qpn = rdma_be::field(sqe, RDMA_CMQ_QPN_WORD_BYTE_OFFSET, RDMA_CMQ_QPN_LSB, RDMA_CMQ_QPN_WIDTH);
     buffer = rdma_be::field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB,
@@ -436,27 +449,35 @@ class rdma_dev_cmq extends uvm_object;
                  RDMA_CMQ_MODIFY_MODE_WIDTH);
     if (opcode == RDMA_OP_QPC_CREATE ||
         (opcode == RDMA_OP_QPC_MODIFY && mode == RDMA_QPC_MODIFY_FULL)) begin
-      if (opcode == RDMA_OP_QPC_MODIFY && !lookup(RDMA_DEV_QP, qpn, obj))
-        return rdma_status::make(RDMA_SC_INVALID_STATE, "QPC_MODIFY on an absent QP");
+      if (opcode == RDMA_OP_QPC_MODIFY && !lookup(RDMA_DEV_QP, qpn, obj)) begin
+        status = rdma_status::make(RDMA_SC_INVALID_STATE, "QPC_MODIFY on an absent QP");
+        return;
+      end
       obj = rdma_dev_object::type_id::create($sformatf("qpc_%0d", qpn));
-      status = read_bytes(buffer, RDMA_QPC_BYTES, obj.bytes);
+      read_bytes(buffer, RDMA_QPC_BYTES, obj.bytes, status);
       if (!status.ok())
-        return status;
+        return;
       // cmq.c：签名 = ~(SQE 其余字节异或 ^ QPC 字节异或)，故含签名的全体异或恒为 0xff。
-      if ((rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(obj.bytes)) != 8'hff)
-        return rdma_status::make(RDMA_SC_CODEC_ERROR, "QPC command signature mismatch");
+      if ((rdma_be::xor_bytes(sqe) ^ rdma_be::xor_bytes(obj.bytes)) != 8'hff) begin
+        status = rdma_status::make(RDMA_SC_CODEC_ERROR, "QPC command signature mismatch");
+        return;
+      end
       objects[RDMA_DEV_QP][qpn] = obj;
       if (opcode == RDMA_OP_QPC_CREATE && nic != null)
         nic.forget(RDMA_DEV_QP, qpn);
-      return rdma_status::success();
+      return;
     end
-    if (!lookup(RDMA_DEV_QP, qpn, obj))
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "QP command on an absent QP");
-    if (opcode == RDMA_OP_QPC_QUERY)
-      return write_bytes(buffer, obj.bytes);
+    if (!lookup(RDMA_DEV_QP, qpn, obj)) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE, "QP command on an absent QP");
+      return;
+    end
+    if (opcode == RDMA_OP_QPC_QUERY) begin
+      write_bytes(buffer, obj.bytes, status);
+      return;
+    end
     if (opcode != RDMA_OP_QPC_MODIFY) begin
       objects[RDMA_DEV_QP].delete(qpn);
-      return rdma_status::success();
+      return;
     end
     qpc = obj.bytes;
     if (mode == RDMA_QPC_MODIFY_STATE_ONLY)
@@ -468,8 +489,7 @@ class rdma_dev_cmq extends uvm_object;
     else
       apply_partial(qpc, sqe);
     obj.bytes = qpc;
-    return rdma_status::success();
-  endfunction
+  endtask
 
   // 功能：部分修改：模板 t 的 start_qword/wbe 在 SQE qword2（每模板 16 位），数据在 qword4+t；
   //   wbe 第 7-b 位对应该 qword 的第 b 个字节（大端序，b=0 为最高字节）。
@@ -529,8 +549,8 @@ class rdma_dev_cmq extends uvm_object;
   //   QUERY 在 CQE 字节 8 起回填 CQC。删除/查询不存在的 CQ 返回 CQC_INVLD。
   // 输入/输出及副作用：更新 CQ 表或 cqe。
   // 失败/边界：无协议错误路径。
-  protected function void execute_cq(bit [7:0] opcode, byte unsigned sqe[],
-                                     inout byte unsigned cqe[], output bit [7:0] ecode);
+  protected task execute_cq(bit [7:0] opcode, byte unsigned sqe[], inout byte unsigned cqe[],
+                            output bit [7:0] ecode);
     int unsigned cqn;
     rdma_dev_object obj;
 
@@ -561,13 +581,13 @@ class rdma_dev_cmq extends uvm_object;
       end
       default: objects[RDMA_DEV_CQ].delete(cqn);
     endcase
-  endfunction
+  endtask
 
   // 功能：CQC_RESIZE：NIC 先在旧 CQ 写 RESIZE CQE 并把生产者位置接到新 CQ，再把 CQC 的
   //   CUR_CQ_PD_PBA/CQ_SIZE/CQ_OM 改为命令中的新值。
   // 输入/输出及副作用：修改 obj.bytes；经 NIC DMA 写旧 CQ。
   // 失败/边界：未接 NIC（纯控制面测试）时只更新 CQC。
-  protected function void resize_cq(int unsigned cqn, rdma_dev_object obj, byte unsigned sqe[]);
+  protected task resize_cq(int unsigned cqn, rdma_dev_object obj, byte unsigned sqe[]);
     if (nic != null)
       nic.resize_cq(cqn, sqe);
     rdma_be::set_field(obj.bytes,
@@ -580,7 +600,7 @@ class rdma_dev_cmq extends uvm_object;
     rdma_be::set_field(obj.bytes, RDMA_CQC_BODY_CQ_OM_WORD_BYTE_OFFSET - CQC_QUERY_OFFSET,
                        RDMA_CQC_BODY_CQ_OM_LSB, RDMA_CQC_BODY_CQ_OM_WIDTH,
                        `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_CQ_OM));
-  endfunction
+  endtask
 
   // 功能：CEQ/AEQ 命令：context 在 SQE/CQE 字节 16..47，EQN 在 qword0 低 12 位。
   // 输入/输出及副作用：更新 EQ 表或 cqe。
@@ -648,33 +668,18 @@ class rdma_dev_cmq extends uvm_object;
   endfunction
 
   // ---------------------------------------------------------------- DMA
-  // 功能：DMA 读 size 字节到 out。
+  // 功能：经 DMA 端口读 size 字节到 out。
   // 输入/输出及副作用：读主机内存。
   // 失败/边界：DMA 失败返回其 status，out 为空。
-  protected function rdma_status read_bytes(bit [63:0] iova, int unsigned size,
-                                            output byte unsigned out[]);
-    byte data[];
-    rdma_status status;
+  protected task read_bytes(bit [63:0] iova, int unsigned size, output byte unsigned out[],
+                            output rdma_status status);
+    dma.read(iova, size, out, status);
+  endtask
 
-    out = new[0];
-    status = host_mem.dma_read(iova, size, data);
-    if (!status.ok())
-      return status;
-    out = new[data.size()];
-    foreach (data[i])
-      out[i] = data[i];
-    return status;
-  endfunction
-
-  // 功能：DMA 写 bytes。
+  // 功能：经 DMA 端口写 bytes。
   // 输入/输出及副作用：写主机内存。
   // 失败/边界：DMA 失败返回其 status。
-  protected function rdma_status write_bytes(bit [63:0] iova, byte unsigned bytes[]);
-    byte data[];
-
-    data = new[bytes.size()];
-    foreach (data[i])
-      data[i] = bytes[i];
-    return host_mem.dma_write(iova, data);
-  endfunction
+  protected task write_bytes(bit [63:0] iova, byte unsigned bytes[], output rdma_status status);
+    dma.write(iova, bytes, status);
+  endtask
 endclass

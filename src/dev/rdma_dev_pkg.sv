@@ -14,6 +14,7 @@ package rdma_dev_pkg;
 
   typedef class rdma_dev_nic;
 
+  `include "rdma_dev_dma.sv"
   `include "rdma_dev_cmq.sv"
   `include "rdma_dev_nic.sv"
   `include "rdma_dev.sv"

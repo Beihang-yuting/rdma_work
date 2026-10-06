@@ -208,7 +208,7 @@ class rdma_multifunc_test extends uvm_test;
   //   地址在本 Host domain 内的写被路由器拒绝（不到达任何设备）。
   // 输入/输出及副作用：读设备 context；向路由器发起被拒的写。
   // 失败/边界：不符报告 UVM_ERROR。
-  function void check_dpu_projection();
+  task check_dpu_projection();
     rdma_dev_object obj;
     bit seen[int unsigned];
     rdma_status status;
@@ -232,18 +232,18 @@ class rdma_multifunc_test extends uvm_test;
       if (funcs[i].dev.doorbell_offsets.size() == 0)
         `uvm_error("MF", $sformatf("%s received no routed doorbell", funcs[i].get_name()))
       routed = sys.router.routed;
-      status = sys.router.write(funcs[i].dpu.pcie_id.domain,
-                            funcs[i].dpu.mailbox.base + RDMA_NOTIFY_WINDOW_OFFSET, '0);
+      sys.router.write(funcs[i].dpu.pcie_id.domain,
+                       funcs[i].dpu.mailbox.base + RDMA_NOTIFY_WINDOW_OFFSET, '0, status);
       if (status.ok() || sys.router.routed != routed)
         `uvm_error("MF", $sformatf("%s MAILBOX BAR write was routed to the RDMA device",
                                    funcs[i].get_name()))
     end
     domain = funcs[0].dpu.pcie_id.domain;
     routed = sys.router.routed;
-    status = sys.router.write(domain, funcs[3].dpu.bar0.base + RDMA_NOTIFY_WINDOW_OFFSET, '0);
+    sys.router.write(domain, funcs[3].dpu.bar0.base + RDMA_NOTIFY_WINDOW_OFFSET, '0, status);
     if (status.ok() || sys.router.routed != routed)
       `uvm_error("MF", "Host1 BAR0 address was routed from the Host0 domain")
-  endfunction
+  endtask
 
   // 功能：驱动 probe（host_id 与 vf_id = global Function ID 取自 dpu_common 快照）后建 PD、CQ、
   //   16KiB 数据缓冲与覆盖它的 MR。

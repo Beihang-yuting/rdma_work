@@ -6,7 +6,7 @@
 //       HW_DROP_DB_CNT。RX：按目的 QPN 取 QPC，从 shadow 的 RQ PI 判断可用 RQE，散写数据，
 //       WRITE/READ/ATOMIC 按 rkey 校验 MRT。完成：按 CQC 的 CQ 基址/大小写 32B CQE，CQ 已 arm 时
 //       按 CEQN 的 EQC 写 CEQE。
-// 依赖：rdma_dev_cmq（context 与地址翻译）、rdma_host_mem_api（DMA）、rdma_packet、rdma_defs.svh。
+// 依赖：rdma_dev_cmq（context、地址翻译与 DMA 端口）、rdma_packet、rdma_defs.svh。
 // 所有权与生命周期：拥有每 QP/CQ/EQ 的设备运行状态；context 归 rdma_dev_cmq；reset 清空。
 
 // 网络端口：设备按目的 MAC 发包（测试平台的 wire 实现路由）。
@@ -124,7 +124,6 @@ class rdma_dev_nic extends uvm_object;
   localparam int unsigned GRH_BYTES = 40;
 
   rdma_dev_cmq ctx;
-  rdma_host_mem_api host_mem;
   rdma_dev_port port;
   // 观测：因 Q_Key 不符被丢弃的 UD 报文数。
   int unsigned qkey_drops;
@@ -146,11 +145,10 @@ class rdma_dev_nic extends uvm_object;
 
   // 功能：构造未连接的 NIC。
   // 输入/输出及副作用：创建 mailbox。
-  // 失败/边界：run 前须设置 ctx/host_mem/port。
+  // 失败/边界：run 前须设置 ctx/port。
   function new(string name = "rdma_dev_nic");
     super.new(name);
     ctx = null;
-    host_mem = null;
     port = null;
     qkey_drops = 0;
     state_drops = 0;
@@ -213,7 +211,7 @@ class rdma_dev_nic extends uvm_object;
   //   命令，如 QPC_DELETE），否则排入 TX 队列在之前的 SQ doorbell 处理完后执行。
   // 输入/输出及副作用：写 CQE 或投递 TX 任务。
   // 失败/边界：无。
-  function void qp_flush(bit [63:0] value);
+  task qp_flush(bit [63:0] value);
     int unsigned qpn;
 
     qpn = value[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH];
@@ -221,7 +219,7 @@ class rdma_dev_nic extends uvm_object;
       flush_qp(qpn);
     else
       void'(sq_kicks.try_put(FLUSH_TAG | qpn));
-  endfunction
+  endtask
 
   // 功能：SRFQ doorbell：LIMIT_INVLD=0 时（modify_srq）按 LIMIT（4 个 WQE 为单位）武装 SRQ limit 事件；
   //   post_srq_recv 的 doorbell（LIMIT_INVLD=1）只更新 PI，设备从 shadow 读取，此处无动作。
@@ -312,43 +310,33 @@ class rdma_dev_nic extends uvm_object;
   endfunction
 
   // ---------------------------------------------------------------- DMA 与 MR
-  // 功能：按 IOVA 读字节。
-  // 输入/输出及副作用：bytes 输出。
-  // 失败/边界：DMA 失败返回 0。
-  protected function bit dma_read(bit [63:0] iova, int unsigned size, output rdma_bytes_t bytes);
-    byte raw[];
+  // 功能：经设备 DMA 端口（ctx.dma）按 IOVA 读字节。
+  // 输入/输出及副作用：bytes/ok 输出。
+  // 失败/边界：DMA 失败 ok=0。
+  protected task dma_read(bit [63:0] iova, int unsigned size, output rdma_bytes_t bytes,
+                          output bit ok);
     rdma_status status;
 
-    bytes = new[0];
-    status = host_mem.dma_read(iova, size, raw);
-    if (!status.ok())
-      return 1'b0;
-    bytes = new[raw.size()];
-    foreach (raw[i])
-      bytes[i] = raw[i];
-    return 1'b1;
-  endfunction
+    ctx.dma.read(iova, size, bytes, status);
+    ok = status.ok();
+  endtask
 
-  // 功能：按 IOVA 写字节。
-  // 输入/输出及副作用：写主机内存。
-  // 失败/边界：DMA 失败返回 0。
-  protected function bit dma_write(bit [63:0] iova, byte unsigned bytes[]);
-    byte raw[];
+  // 功能：经设备 DMA 端口按 IOVA 写字节。
+  // 输入/输出及副作用：写主机内存；ok 输出。
+  // 失败/边界：DMA 失败 ok=0。
+  protected task dma_write(bit [63:0] iova, byte unsigned bytes[], output bit ok);
     rdma_status status;
 
-    raw = new[bytes.size()];
-    foreach (raw[i])
-      raw[i] = bytes[i];
-    status = host_mem.dma_write(iova, raw);
-    return status.ok();
-  endfunction
+    ctx.dma.write(iova, bytes, status);
+    ok = status.ok();
+  endtask
 
   // 功能：MR 地址翻译：key 的 STAG_IDX 找 MRT，校验 STAG_KEY、状态 VALID、PD、权限位与 [va, va+len)
   //   在 MR 范围内；按 PBL 模式求每个 4KiB 页的 DMA 地址，输出按页切分的 {iova, len} 段。
   // 输入/输出及副作用：segs 输出 iova/len 交替；MODE_2 读 PBLE。
-  // 失败/边界：任一校验失败返回 0。
-  protected function bit translate(bit [31:0] key, int unsigned pd, bit [4:0] need,
-                                   bit [63:0] va, int unsigned len, output bit [63:0] segs[$]);
+  // 失败/边界：任一校验失败 ok=0。
+  protected task translate(bit [31:0] key, int unsigned pd, bit [4:0] need, bit [63:0] va,
+                           int unsigned len, output bit [63:0] segs[$], output bit ok);
     rdma_dev_object mrt;
     bit [63:0] start;
     longint unsigned mr_len;
@@ -359,17 +347,18 @@ class rdma_dev_nic extends uvm_object;
     int unsigned mode;
 
     segs.delete();
+    ok = 1'b0;
     if (!ctx.lookup(RDMA_DEV_MR, key >> 8, mrt))
-      return 1'b0;
+      return;
     if (`RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_STAG_KEY) != key[7:0] ||
         `RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_ST) != RDMA_MR_ST_VALID ||
         `RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_PD_IDX) != pd ||
         (`RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_RIGHT) & need) != need)
-      return 1'b0;
+      return;
     start = `RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_START_VA);
     mr_len = `RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_LEN);
     if (va < start || va + len > start + mr_len)
-      return 1'b0;
+      return;
     mode = `RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_PBL_MODE);
     off = va - (start & ~64'hfff);
     while (len != 0) begin
@@ -384,61 +373,69 @@ class rdma_dev_nic extends uvm_object;
         page = `RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_PAYLOAD_PBA0) << 12;
       else if (mode == RDMA_PBL_MODE_1)
         page = `RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_PAYLOAD_PBA1) << 12;
-      else if (!read_pble(`RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_FIRST_PBL_IDX) +
-                          off / RDMA_HMC_PAGE_BYTES, page))
-        return 1'b0;
+      else begin
+        read_pble(`RDMA_BE_GET(mrt.bytes, RDMA_MRT_BODY_FIRST_PBL_IDX) +
+                  off / RDMA_HMC_PAGE_BYTES, page, ok);
+        if (!ok)
+          return;
+      end
       segs.push_back(page + page_off);
       segs.push_back(take);
       off += take;
       len -= take;
     end
-    return 1'b1;
-  endfunction
+    ok = 1'b1;
+  endtask
 
   // 功能：读第 idx 个 PBLE（HMC PBL 对象区），返回页地址（去掉 VLD 位）。
-  // 输入/输出及副作用：page 输出；DMA 读。
-  // 失败/边界：翻译失败或 VLD=0 返回 0。
-  protected function bit read_pble(longint unsigned idx, output bit [63:0] page);
+  // 输入/输出及副作用：page/ok 输出；DMA 读。
+  // 失败/边界：翻译失败或 VLD=0 时 ok=0。
+  protected task read_pble(longint unsigned idx, output bit [63:0] page, output bit ok);
     bit [63:0] iova;
     rdma_bytes_t entry;
     rdma_status status;
 
     page = '0;
-    status = ctx.hmc_addr(HMC_PBL, idx * 8, iova);
-    if (!status.ok() || !dma_read(iova, 8, entry))
-      return 1'b0;
+    ok = 1'b0;
+    ctx.hmc_addr(HMC_PBL, idx * 8, iova, status);
+    if (!status.ok())
+      return;
+    dma_read(iova, 8, entry, ok);
+    if (!ok)
+      return;
     page = rdma_be::qword(entry, 0);
-    if (!page[0])
-      return 1'b0;
+    ok = page[0];
     page[0] = 1'b0;
-    return 1'b1;
-  endfunction
+  endtask
 
   // 功能：按 SGE 列表（{key, va, len} 三元组）读出数据。
-  // 输入/输出及副作用：data 输出。
-  // 失败/边界：翻译或 DMA 失败返回 0。
-  protected function bit gather(bit [63:0] sges[$], int unsigned pd, output rdma_bytes_t data);
+  // 输入/输出及副作用：data/ok 输出。
+  // 失败/边界：翻译或 DMA 失败 ok=0。
+  protected task gather(bit [63:0] sges[$], int unsigned pd, output rdma_bytes_t data,
+                        output bit ok);
     bit [63:0] segs[$];
     rdma_bytes_t part;
 
     data = new[0];
+    ok = 1'b1;
     for (int i = 0; i < sges.size(); i += 3) begin
-      if (!translate(sges[i], pd, 5'h0, sges[i + 1], sges[i + 2], segs))
-        return 1'b0;
+      translate(sges[i], pd, 5'h0, sges[i + 1], sges[i + 2], segs, ok);
+      if (!ok)
+        return;
       for (int k = 0; k < segs.size(); k += 2) begin
-        if (!dma_read(segs[k], segs[k + 1], part))
-          return 1'b0;
+        dma_read(segs[k], segs[k + 1], part, ok);
+        if (!ok)
+          return;
         data = {data, part};
       end
     end
-    return 1'b1;
-  endfunction
+  endtask
 
   // 功能：把 data 从消息偏移 offset 起按 need 权限散写到 SGE 列表。
-  // 输入/输出及副作用：写主机内存。
-  // 失败/边界：超出容量或翻译/DMA 失败返回 0。
-  protected function bit scatter(bit [63:0] sges[$], int unsigned pd, bit [4:0] need,
-                                 int unsigned offset, byte unsigned data[]);
+  // 输入/输出及副作用：写主机内存；ok 输出。
+  // 失败/边界：超出容量或翻译/DMA 失败 ok=0。
+  protected task scatter(bit [63:0] sges[$], int unsigned pd, bit [4:0] need, int unsigned offset,
+                         byte unsigned data[], output bit ok);
     int unsigned pos;
     longint unsigned base;
     int unsigned start;
@@ -454,20 +451,22 @@ class rdma_dev_nic extends uvm_object;
         take = sges[i + 2] - start;
         if (take > data.size() - pos)
           take = data.size() - pos;
-        if (!translate(sges[i], pd, need, sges[i + 1] + start, take, segs))
-          return 1'b0;
+        translate(sges[i], pd, need, sges[i + 1] + start, take, segs, ok);
+        if (!ok)
+          return;
         done = 0;
         for (int k = 0; k < segs.size(); k += 2) begin
-          if (!dma_write(segs[k], rdma_be::slice(data, pos + done, segs[k + 1])))
-            return 1'b0;
+          dma_write(segs[k], rdma_be::slice(data, pos + done, segs[k + 1]), ok);
+          if (!ok)
+            return;
           done += segs[k + 1];
         end
         pos += take;
       end
       base += sges[i + 2];
     end
-    return pos == data.size();
-  endfunction
+    ok = pos == data.size();
+  endtask
 
   // 功能：解析 n 个 16B SGE 描述符为 {key, va, len} 三元组。
   // 输入/输出及副作用：纯函数。
@@ -504,7 +503,7 @@ class rdma_dev_nic extends uvm_object;
   //   否则写 EC_RTS2SQD_DB_QP_ST_UNMATCH。
   // 输入/输出及副作用：写 AEQE。
   // 失败/边界：QP 不存在报告协议错误。
-  protected function void finish_rts2sqd(int unsigned qpn);
+  protected task finish_rts2sqd(int unsigned qpn);
     rdma_dev_object obj;
 
     if (!ctx.lookup(RDMA_DEV_QP, qpn, obj)) begin
@@ -515,13 +514,13 @@ class rdma_dev_nic extends uvm_object;
       write_aeqe(qpn, RDMA_ECODE_EC_RTS2SQD_DONE, 1'b0, 0);
     else
       write_aeqe(qpn, RDMA_ECODE_EC_RTS2SQD_DB_QP_ST_UNMATCH, 1'b0, 0);
-  endfunction
+  endtask
 
   // 功能：SQD2RTS doorbell：QPC 状态须已是 RTS（驱动先发 QPC_MODIFY），否则 AEQE
   //   EC_SQD2RTS_DB_QP_ST_UNMATCH；状态正确时恢复取 SQE（重新 drain SQ）。
   // 输入/输出及副作用：写 AEQE 或投递 TX 任务。
   // 失败/边界：QP 不存在报告协议错误。
-  function void sqd2rts(bit [63:0] value);
+  task sqd2rts(bit [63:0] value);
     int unsigned qpn;
     rdma_dev_object obj;
 
@@ -536,14 +535,14 @@ class rdma_dev_nic extends uvm_object;
     end
     qp_rt(qpn).kicks_pending++;
     void'(sq_kicks.try_put(qpn));
-  endfunction
+  endtask
 
 
   // 功能：QP 的 SQ/RQ 槽地址（QPC 的 PBA/OM，深度 2^SIZE）。
-  // 输入/输出及副作用：iova/depth 输出。
-  // 失败/边界：翻译失败返回 0。
-  protected function bit wq_slot(int unsigned qpn, bit rq, longint unsigned index,
-                                 output bit [63:0] iova, output int unsigned depth);
+  // 输入/输出及副作用：iova/depth/ok 输出。
+  // 失败/边界：翻译失败 ok=0。
+  protected task wq_slot(int unsigned qpn, bit rq, longint unsigned index, output bit [63:0] iova,
+                         output int unsigned depth, output bit ok);
     bit [63:0] pba;
     int unsigned om;
     rdma_status status;
@@ -558,9 +557,9 @@ class rdma_dev_nic extends uvm_object;
       om = `RDMA_QPC(qpn, RDMA_QPC_SQ_OM);
       depth = 1 << `RDMA_QPC(qpn, RDMA_QPC_SQ_SIZE);
     end
-    status = ctx.buffer_addr(om, pba, (index % depth) * RDMA_WQE_BYTES, iova);
-    return status.ok();
-  endfunction
+    ctx.buffer_addr(om, pba, (index % depth) * RDMA_WQE_BYTES, iova, status);
+    ok = status.ok();
+  endtask
 
   // 功能：QP shadow 地址（QPC SHADOW_PBA<<9 + 504）。
   // 输入/输出及副作用：纯查询。
@@ -580,10 +579,10 @@ class rdma_dev_nic extends uvm_object;
   // 功能：URC 完成（假设：每完成一个 WQE 即上报，不依赖 arm）：RQ 完成在 RQ frag 的
   //   URC_CQ_START_IDX + (n % RQ 深度) 槽写 32B CQE（polarity 按 RQ 圈数，首圈 1）；SQ 完成只计数；
   //   随后向该 frag 的 CEQ 写 URC CEQE，携带本 QP 的 HW_CPL SQ/RQ 下标。
-  // 输入/输出及副作用：DMA 写 CQ/CEQ，推进 URC 完成计数。
+  // 输入/输出及副作用：DMA 写 CQ/CEQ，推进 URC 完成计数（DMA 前占位，DMA 可能消耗时间）。
   // 失败/边界：frag CQ 不存在或写失败报告协议错误。
-  protected function void urc_complete(int unsigned qpn, bit rq, int unsigned wqe_index,
-                                       bit [7:0] ecode, int unsigned byte_len, bit [31:0] imm);
+  protected task urc_complete(int unsigned qpn, bit rq, int unsigned wqe_index, bit [7:0] ecode,
+                              int unsigned byte_len, bit [31:0] imm);
     rdma_dev_qp_rt rt;
     rdma_dev_object cqc;
     rdma_bytes_t cqe;
@@ -592,6 +591,7 @@ class rdma_dev_nic extends uvm_object;
     int unsigned rq_size;
     longint unsigned n;
     rdma_status status;
+    bit ok;
 
     rt = qp_rt(qpn);
     if (!rq) begin
@@ -606,10 +606,11 @@ class rdma_dev_nic extends uvm_object;
     end
     rq_size = 1 << `RDMA_QPC(qpn, RDMA_QPC_RQ_SIZE);
     n = rt.urc_rq_cpl;
-    status = ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
-                             `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
-                             (`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_URC_CQ_START_IDX, CQC_BASE) +
-                              n % rq_size) * CQE_BYTES, slot);
+    rt.urc_rq_cpl = n + 1;
+    ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
+                    `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
+                    (`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_URC_CQ_START_IDX, CQC_BASE) +
+                     n % rq_size) * CQE_BYTES, slot, status);
     cqe = rdma_be::zeros(CQE_BYTES);
     `RDMA_BE_SET(cqe, RDMA_CQE_POLARITY, !((n / rq_size) & 1))
     `RDMA_BE_SET(cqe, RDMA_CQE_RQ_CQE, 1)
@@ -619,20 +620,22 @@ class rdma_dev_nic extends uvm_object;
     `RDMA_BE_SET(cqe, RDMA_CQE_QPN, qpn)
     `RDMA_BE_SET(cqe, RDMA_CQE_IMMDT_DATA, imm)
     `RDMA_BE_SET(cqe, RDMA_CQE_PAYLOAD_LEN, byte_len)
-    if (!status.ok() || !dma_write(slot, cqe)) begin
+    ok = 1'b0;
+    if (status.ok())
+      dma_write(slot, cqe, ok);
+    if (!ok) begin
       protocol_error($sformatf("URC QP %0d RQ CQE write failed", qpn));
       return;
     end
-    rt.urc_rq_cpl = n + 1;
     urc_ceqe(qpn, cqn, 8'h00, 1'b0, 1'b0);
-  endfunction
+  endtask
 
   // 功能：向 frag CQ 的 CEQ 写 URC CEQE：URC_FLAG、QPN、CQN、ECODE、flush 时的 SQ/RQ 有效位，
   //   qword1 的 HW_CPL SQ（cqn 为 QP 的 SQ CQ 时）与 RQ（cqn 为 RQ CQ 时）{wrap, 下标}。
   // 输入/输出及副作用：DMA 写 CEQ。
   // 失败/边界：CQ 不存在报告协议错误。
-  protected function void urc_ceqe(int unsigned qpn, int unsigned cqn, bit [7:0] ecode,
-                                   bit sq_vld, bit rq_vld);
+  protected task urc_ceqe(int unsigned qpn, int unsigned cqn, bit [7:0] ecode, bit sq_vld,
+                          bit rq_vld);
     rdma_dev_object cqc;
     rdma_dev_qp_rt rt;
     rdma_bytes_t ceqe;
@@ -661,7 +664,7 @@ class rdma_dev_nic extends uvm_object;
       `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_HW_CPL_RQ_WQE_IDX_WRAP, (rt.urc_rq_cpl / size) & 1)
     end
     write_eqe(RDMA_DEV_CEQ, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE), ceqe);
-  endfunction
+  endtask
 
   // 功能：URC 异常完成（event.c urc_eq_update_abnml_info）：urc_abnormal_via_aeq 时写 URC AEQE，否则
   //   向 SQ（rq=0）或 RQ（rq=1）的 frag CQ 写 ABNML CEQE（类型 1/2、ECODE、远端 syndrome、
@@ -669,8 +672,7 @@ class rdma_dev_nic extends uvm_object;
   //   HW_CPL 不推进；QP 进入错误，不再处理 SQ。
   // 输入/输出及副作用：DMA 写 CEQ 或 AEQ；置 urc_error。
   // 失败/边界：CQ 不存在报告协议错误。
-  protected function void urc_abnormal(int unsigned qpn, bit rq, bit [7:0] ecode,
-                                       bit [7:0] remote);
+  protected task urc_abnormal(int unsigned qpn, bit rq, bit [7:0] ecode, bit [7:0] remote);
     rdma_dev_object cqc;
     rdma_dev_qp_rt rt;
     rdma_bytes_t ceqe;
@@ -701,15 +703,14 @@ class rdma_dev_nic extends uvm_object;
     `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX, pos % size)
     `RDMA_BE_SET(ceqe, RDMA_CEQE_URC_ABNML_CQE_WQE_IDX_WRAP, (pos / size) & 1)
     write_eqe(RDMA_DEV_CEQ, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE), ceqe);
-  endfunction
+  endtask
 
   // 功能：URC 异常经 AEQ 上报（event.c get_aeqe_info / qp 类错误分支）：AEQE 带 URC_FLAG、异常类型、
   //   ECODE、QPN、远端 syndrome 与异常 WQE 位置 {wrap, idx}。
   // 输入/输出及副作用：DMA 写 AEQ。
   // 失败/边界：无 AEQ 报告协议错误。
-  protected function void urc_abnormal_aeqe(int unsigned qpn, bit rq, bit [7:0] ecode,
-                                            bit [7:0] remote, longint unsigned pos,
-                                            int unsigned size);
+  protected task urc_abnormal_aeqe(int unsigned qpn, bit rq, bit [7:0] ecode, bit [7:0] remote,
+                                   longint unsigned pos, int unsigned size);
     rdma_bytes_t aeqe;
     int unsigned aeqn;
 
@@ -726,13 +727,13 @@ class rdma_dev_nic extends uvm_object;
       return;
     end
     write_eqe(RDMA_DEV_AEQ, aeqn, aeqe);
-  endfunction
+  endtask
 
   // 功能：QP flush：向 SQ CQ 写一个 SQ flush CQE（0x08），非 SRQ 时向 RQ CQ 写一个 RQ flush CQE（0x8F）；
   //   驱动以每个 flush CQE 为对应环中全部未完成 WQE 生成 FLUSH 完成。
   // 输入/输出及副作用：写 CQE。
   // 失败/边界：QP 不存在时报告协议错误。
-  protected function void flush_qp(int unsigned qpn);
+  protected task flush_qp(int unsigned qpn);
     rdma_dev_object obj;
 
     if (!ctx.lookup(RDMA_DEV_QP, qpn, obj)) begin
@@ -748,7 +749,7 @@ class rdma_dev_nic extends uvm_object;
     write_cqe(qpn, 1'b0, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR, 0, '0, 0);
     if (!`RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ))
       write_cqe(qpn, 1'b1, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR, 0, '0, 0);
-  endfunction
+  endtask
 
   // 功能：drain SQ：从设备游标起处理所有 polarity 有效的 SQE；完毕后把 HW_DROP_DB_CNT 写为已见
   //   doorbell 数（驱动据此判断可再次敲 doorbell）。
@@ -769,10 +770,9 @@ class rdma_dev_nic extends uvm_object;
     end
     rt = qp_rt(qpn);
     forever begin
-      // wq_slot 的输出与同一表达式中的读取顺序不保证，分两句写。
-      ok = wq_slot(qpn, 1'b0, rt.sq_ci, slot, depth);
+      wq_slot(qpn, 1'b0, rt.sq_ci, slot, depth, ok);
       if (ok)
-        ok = dma_read(slot, RDMA_WQE_BYTES, wqe);
+        dma_read(slot, RDMA_WQE_BYTES, wqe, ok);
       if (!ok) begin
         protocol_error($sformatf("QP %0d SQ slot %0d is not readable", qpn, rt.sq_ci));
         break;
@@ -787,16 +787,16 @@ class rdma_dev_nic extends uvm_object;
     end
     cnt = rdma_be::zeros(1);
     cnt[0] = rt.sq_doorbells & 7'h7f;
-    void'(dma_write(qp_shadow(qpn) + 1, cnt));
+    dma_write(qp_shadow(qpn) + 1, cnt, ok);
   endtask
 
   // 功能：取 SQE 的数据区：inline（WQE 内或 SGB）或 SGE 描述符（WQE 内或 SGB），并校验签名
   //   （头、WQE 其余字节与使用中的 SGB 部分异或，含签名应为 0xff）。
-  // 输入/输出及副作用：sges/inline_data/payload 输出；读 SGB。
-  // 失败/边界：签名不符或 SGB 读失败返回 0。
-  protected function bit sqe_data(int unsigned qpn, rdma_bytes_t wqe, bit ud,
-                                  output bit [63:0] sges[$], output rdma_bytes_t inline_data,
-                                  output int unsigned payload);
+  // 输入/输出及副作用：sges/inline_data/payload/ok 输出；读 SGB。
+  // 失败/边界：签名不符或 SGB 读失败 ok=0。
+  protected task sqe_data(int unsigned qpn, rdma_bytes_t wqe, bit ud, output bit [63:0] sges[$],
+                          output rdma_bytes_t inline_data, output int unsigned payload,
+                          output bit ok);
     bit inl;
     bit use_sgb;
     int unsigned sge_num;
@@ -822,24 +822,26 @@ class rdma_dev_nic extends uvm_object;
         use_sgb = sge_num > 2;
     end
     area = rdma_be::slice(wqe, PAYLOAD_OFFSET, 32);
-    // dma_read 的输出参数放在短路表达式里会被 VCS 无条件清空，单独成句。
+    ok = 1'b0;
     if (use_sgb) begin
-      if (!dma_read(`RDMA_BE_GET(wqe, RDMA_SQ_WQE_SGB_PA) << 9, sge_num * SGE_BYTES, area))
-        return 1'b0;
+      dma_read(`RDMA_BE_GET(wqe, RDMA_SQ_WQE_SGB_PA) << 9, sge_num * SGE_BYTES, area, ok);
+      if (!ok)
+        return;
     end
     sum = rdma_be::xor_bytes(wqe);
     if (use_sgb)
       sum ^= rdma_be::xor_bytes(area);
     if (sum != 8'hff) begin
       protocol_error($sformatf("QP %0d SQE signature mismatch", qpn));
-      return 1'b0;
+      ok = 1'b0;
+      return;
     end
     if (inl)
       inline_data = rdma_be::slice(area, 0, payload);
     else
       parse_sges(area, sge_num, sges);
-    return 1'b1;
-  endfunction
+    ok = 1'b1;
+  endtask
 
   // 功能：执行一个 SQE：本地准备（签名、SGE/inline 取数）后 UD 直接发包；RC/URC 经 run_request
   //   带重传/RNR 重试执行；结果按 RC 写 SQ CQE（CE 或出错时）或按 URC 推进 HW_CPL/上报异常。
@@ -857,6 +859,7 @@ class rdma_dev_nic extends uvm_object;
     bit [23:0] dst_qpn;
     bit [47:0] dmac;
     int unsigned byte_len;
+    bit ok;
 
     ud = `RDMA_QPC(qpn, RDMA_QPC_SERVICE_TYPE) == 3;
     pd = `RDMA_QPC(qpn, RDMA_QPC_PD_IDX);
@@ -878,17 +881,20 @@ class rdma_dev_nic extends uvm_object;
         ecode = RDMA_ECODE_EC_TPE_SQ_WQE_SIGN_ERR;
       end
     end
-    else if (!sqe_data(qpn, wqe, ud, sges, data, payload))
-      ecode = RDMA_ECODE_EC_TPE_SQ_WQE_SIGN_ERR;
-    else if (op == RDMA_SQ_OPCODE_READ)
-      byte_len = payload;
     else begin
-      // gather 的输出参数不能放进短路表达式（VCS 会无条件清空 inline 数据），单独成句。
-      if (data.size() == 0 && sges.size() != 0) begin
-        if (!gather(sges, pd, data))
-          ecode = RDMA_ECODE_EC_TPE_SQ_KEY_ERR;
+      sqe_data(qpn, wqe, ud, sges, data, payload, ok);
+      if (!ok)
+        ecode = RDMA_ECODE_EC_TPE_SQ_WQE_SIGN_ERR;
+      else if (op == RDMA_SQ_OPCODE_READ)
+        byte_len = payload;
+      else begin
+        if (data.size() == 0 && sges.size() != 0) begin
+          gather(sges, pd, data, ok);
+          if (!ok)
+            ecode = RDMA_ECODE_EC_TPE_SQ_KEY_ERR;
+        end
+        byte_len = data.size();
       end
-      byte_len = data.size();
     end
     if (ecode == RDMA_CMQ_SUCCESS_ECODE) begin
       if (ud)
@@ -1215,6 +1221,7 @@ class rdma_dev_nic extends uvm_object;
     bit [23:0] first;
     bit got;
     bit urc;
+    bit ok;
     rdma_bytes_t part;
 
     count = (total + mtu(qpn) - 1) / mtu(qpn);
@@ -1257,7 +1264,8 @@ class rdma_dev_nic extends uvm_object;
       part = new[pkt.payload.size()];
       foreach (part[b])
         part[b] = pkt.payload[b];
-      if (!scatter(sges, pd, RDMA_RIGHT_LOCAL_WRITE, offset, part)) begin
+      scatter(sges, pd, RDMA_RIGHT_LOCAL_WRITE, offset, part, ok);
+      if (!ok) begin
         ecode = RDMA_ECODE_EC_TPE_SQ_KEY_ERR;
         outcome = RSP_LOCAL;
         return;
@@ -1286,6 +1294,7 @@ class rdma_dev_nic extends uvm_object;
     bit [23:0] first;
     rdma_bytes_t orig;
     bit [63:0] lsge[$];
+    bit ok;
 
     cas = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_OPCODE) == RDMA_SQ_OPCODE_ATOMIC_CMP_AND_SWP;
     first = rt.send_psn;
@@ -1323,7 +1332,8 @@ class rdma_dev_nic extends uvm_object;
     lsge.push_back(`RDMA_BE_GET(wqe, RDMA_SQ_WQE_ATOMIC_L_VA));
     lsge.push_back(8);
     outcome = RSP_OK;
-    if (!scatter(lsge, pd, RDMA_RIGHT_LOCAL_WRITE, 0, orig)) begin
+    scatter(lsge, pd, RDMA_RIGHT_LOCAL_WRITE, 0, orig, ok);
+    if (!ok) begin
       ecode = RDMA_ECODE_EC_TPE_SQ_KEY_ERR;
       outcome = RSP_LOCAL;
     end
@@ -1331,9 +1341,9 @@ class rdma_dev_nic extends uvm_object;
 
   // ---------------------------------------------------------------- 完成
   // 功能：按 CQC 写一个 32B CQE（polarity 首圈为 1），CQ 已 arm 时按 CEQN 写 CEQE 并解除 arm。
-  // 输入/输出及副作用：DMA 写 CQ/CEQ。
+  // 输入/输出及副作用：DMA 写 CQ/CEQ；PI 在 DMA 前占位（DMA 可能消耗时间，TX/RX/flush 并发写同一 CQ）。
   // 失败/边界：CQ 不存在或写失败报告协议错误。
-  protected function void write_cqe(int unsigned qpn, bit rq, int unsigned wqe_index, bit wqe_wrap,
+  protected task write_cqe(int unsigned qpn, bit rq, int unsigned wqe_index, bit wqe_wrap,
                            bit [7:0] ecode, int unsigned byte_len, bit [31:0] imm,
                            int unsigned src_qpn, bit [7:0] rem_synd = '0);
     int unsigned cqn;
@@ -1343,6 +1353,7 @@ class rdma_dev_nic extends uvm_object;
     rdma_bytes_t cqe;
     longint unsigned pi;
     rdma_status status;
+    bit ok;
 
     if (is_urc(qpn)) begin
       urc_complete(qpn, rq, wqe_index, ecode, byte_len, imm);
@@ -1360,9 +1371,10 @@ class rdma_dev_nic extends uvm_object;
     if (!cq_pi.exists(cqn))
       cq_pi[cqn] = 0;
     pi = cq_pi[cqn];
-    status = ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
-                             `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
-                             (pi % size) * CQE_BYTES, slot);
+    cq_pi[cqn] = pi + 1;
+    ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
+                    `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
+                    (pi % size) * CQE_BYTES, slot, status);
     if (!status.ok()) begin
       protocol_error($sformatf("CQ %0d buffer is not translatable", cqn));
       return;
@@ -1387,23 +1399,23 @@ class rdma_dev_nic extends uvm_object;
       `RDMA_BE_SET(cqe, RDMA_CQE_SRFQ, 1)
       `RDMA_BE_SET(cqe, RDMA_CQE_SRFQN, `RDMA_QPC(qpn, RDMA_QPC_RC_SRFQN))
     end
-    if (!dma_write(slot, cqe)) begin
+    dma_write(slot, cqe, ok);
+    if (!ok) begin
       protocol_error($sformatf("CQ %0d CQE write failed", cqn));
       return;
     end
-    cq_pi[cqn] = pi + 1;
     if (cq_armed.exists(cqn) && cq_armed[cqn] != RDMA_CQC_ARM_ST_NO_EVENT) begin
       cq_armed.delete(cqn);
       write_ceqe(cqn, `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CEQN, CQC_BASE));
     end
-  endfunction
+  endtask
 
   // 功能：CQC_RESIZE 的数据面部分（命令完成前执行）：在旧 CQ 的当前 PI 槽写 RESIZE CQE（不推进 PI），
   //   未被驱动消费的 CQE 数 pending = PI - (OLD_CI_WRAP*old + OLD_CI)（模 2*old）；驱动把它们复制到
   //   新 CQ 的 OLD_CI+1 起，故新生产者位置 = OLD_CI_WRAP*new + OLD_CI + 1 + pending。
   // 输入/输出及副作用：DMA 写旧 CQ；更新 cq_pi。
   // 失败/边界：CQ 不存在或旧缓冲不可翻译时报告协议错误。
-  function void resize_cq(int unsigned cqn, byte unsigned sqe[]);
+  task resize_cq(int unsigned cqn, byte unsigned sqe[]);
     rdma_dev_object cqc;
     int unsigned old_size;
     int unsigned new_size;
@@ -1413,6 +1425,7 @@ class rdma_dev_nic extends uvm_object;
     bit [63:0] slot;
     rdma_bytes_t cqe;
     rdma_status status;
+    bit ok;
 
     if (!ctx.lookup(RDMA_DEV_CQ, cqn, cqc)) begin
       protocol_error($sformatf("resize of absent CQ %0d", cqn));
@@ -1423,13 +1436,16 @@ class rdma_dev_nic extends uvm_object;
     if (!cq_pi.exists(cqn))
       cq_pi[cqn] = 0;
     pi = cq_pi[cqn];
-    status = ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
-                             `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
-                             (pi % old_size) * CQE_BYTES, slot);
+    ctx.buffer_addr(`RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CQ_OM, CQC_BASE),
+                    `RDMA_BE_GET_AT(cqc.bytes, RDMA_CQC_BODY_CUR_CQ_PD_PBA, CQC_BASE),
+                    (pi % old_size) * CQE_BYTES, slot, status);
     cqe = rdma_be::zeros(CQE_BYTES);
     `RDMA_BE_SET(cqe, RDMA_CQE_POLARITY, !((pi / old_size) & 1))
     `RDMA_BE_SET(cqe, RDMA_CQE_RESIZE_CQE, 1)
-    if (!status.ok() || !dma_write(slot, cqe)) begin
+    ok = 1'b0;
+    if (status.ok())
+      dma_write(slot, cqe, ok);
+    if (!ok) begin
       protocol_error($sformatf("CQ %0d resize CQE write failed", cqn));
       return;
     end
@@ -1438,25 +1454,24 @@ class rdma_dev_nic extends uvm_object;
     pending = (pi + 2 * old_size - consumed) % (2 * old_size);
     cq_pi[cqn] = `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI_WRAP) * new_size +
                  `RDMA_BE_GET(sqe, RDMA_CQC_RESIZE_OLD_CQ_CI) + 1 + pending;
-  endfunction
+  endtask
 
   // 功能：向 CEQ 写一个 16B CEQE（CQN）。
   // 输入/输出及副作用：DMA 写 CEQ。
   // 失败/边界：见 write_eqe。
-  protected function void write_ceqe(int unsigned cqn, int unsigned ceqn);
+  protected task write_ceqe(int unsigned cqn, int unsigned ceqn);
     rdma_bytes_t ceqe;
 
     ceqe = rdma_be::zeros(RDMA_CEQE_BYTES);
     `RDMA_BE_SET(ceqe, RDMA_CEQE_CQN, cqn)
     write_eqe(RDMA_DEV_CEQ, ceqn, ceqe);
-  endfunction
+  endtask
 
   // 功能：向 AEQ 写一个 16B AEQE（ECODE、QPN；SRQ 事件带 SRFQ_EN/SRFQN）。本设备实例即一个
   //   Function，AEQN 取该 Function 唯一的 AEQ（驱动以 vf_id 建立）。
   // 输入/输出及副作用：DMA 写 AEQ。
   // 失败/边界：见 write_eqe。
-  protected function void write_aeqe(int unsigned qpn, bit [7:0] ecode, bit srfq,
-                                     int unsigned srfqn);
+  protected task write_aeqe(int unsigned qpn, bit [7:0] ecode, bit srfq, int unsigned srfqn);
     rdma_bytes_t aeqe;
     int unsigned aeqn;
 
@@ -1470,18 +1485,19 @@ class rdma_dev_nic extends uvm_object;
       return;
     end
     write_eqe(RDMA_DEV_AEQ, aeqn, aeqe);
-  endfunction
+  endtask
 
   // 功能：按 EQC 向 CEQ/AEQ 的当前 PI 槽写一个 16B 事件（bit63 polarity 首圈为 1），PI 加一。
-  // 输入/输出及副作用：DMA 写 EQ。
+  // 输入/输出及副作用：DMA 写 EQ；PI 在 DMA 前占位。
   // 失败/边界：EQ 不存在、不可翻译或写失败报告协议错误。
-  protected function void write_eqe(rdma_dev_kind_e kind, int unsigned eqn, rdma_bytes_t entry);
+  protected task write_eqe(rdma_dev_kind_e kind, int unsigned eqn, rdma_bytes_t entry);
     rdma_dev_object eqc;
     int unsigned entries;
     int unsigned key;
     bit [63:0] slot;
     longint unsigned pi;
     rdma_status status;
+    bit ok;
 
     if (!ctx.lookup(kind, eqn, eqc)) begin
       protocol_error($sformatf("event for absent %s %0d", kind.name(), eqn));
@@ -1493,18 +1509,19 @@ class rdma_dev_nic extends uvm_object;
     if (!eq_pi.exists(key))
       eq_pi[key] = 0;
     pi = eq_pi[key];
-    status = ctx.buffer_addr(`RDMA_BE_GET_AT(eqc.bytes, RDMA_EQC_BODY_EQ_OM, EQC_BASE),
-                             `RDMA_BE_GET_AT(eqc.bytes, RDMA_EQC_BODY_CUR_EQ_PBA, EQC_BASE),
-                             (pi % entries) * RDMA_CEQE_BYTES, slot);
+    ctx.buffer_addr(`RDMA_BE_GET_AT(eqc.bytes, RDMA_EQC_BODY_EQ_OM, EQC_BASE),
+                    `RDMA_BE_GET_AT(eqc.bytes, RDMA_EQC_BODY_CUR_EQ_PBA, EQC_BASE),
+                    (pi % entries) * RDMA_CEQE_BYTES, slot, status);
     if (!status.ok()) begin
       protocol_error($sformatf("%s %0d buffer is not translatable", kind.name(), eqn));
       return;
     end
-    entry[0][7] = !((pi / entries) & 1);
-    if (!dma_write(slot, entry))
-      protocol_error($sformatf("%s %0d write failed", kind.name(), eqn));
     eq_pi[key] = pi + 1;
-  endfunction
+    entry[0][7] = !((pi / entries) & 1);
+    dma_write(slot, entry, ok);
+    if (!ok)
+      protocol_error($sformatf("%s %0d write failed", kind.name(), eqn));
+  endtask
 
   // ---------------------------------------------------------------- RX
   // 功能：处理一个收到的报文：响应类交给请求方 QP，请求类按 opcode 处理。
@@ -1530,10 +1547,10 @@ class rdma_dev_nic extends uvm_object;
 
   // 功能：取下一个 RQE：shadow（QPC+510）的 be16 PI|wrap<<15 与设备 CI 比较判断可用，校验 polarity
   //   与签名，解析 SGE（WQE 内或 RQ SGB）。
-  // 输入/输出及副作用：推进 rq_ci；index/wrap 输出 RQE 头中的 INDEX/WRAP。
-  // 失败/边界：无可用 RQE 或校验失败返回 0。
-  protected function bit fetch_rqe(int unsigned qpn, rdma_dev_qp_rt rt, output int unsigned index,
-                                   output bit wrap, output bit [63:0] sges[$]);
+  // 输入/输出及副作用：推进 rq_ci；index/wrap 输出 RQE 头中的 INDEX/WRAP；ok 输出。
+  // 失败/边界：无可用 RQE 或校验失败 ok=0。
+  protected task fetch_rqe(int unsigned qpn, rdma_dev_qp_rt rt, output int unsigned index,
+                           output bit wrap, output bit [63:0] sges[$], output bit ok);
     bit [63:0] slot;
     int unsigned depth;
     rdma_bytes_t shadow;
@@ -1543,40 +1560,51 @@ class rdma_dev_nic extends uvm_object;
     index = 0;
     wrap = 1'b0;
     sges.delete();
-    if (`RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ))
-      return fetch_srqe(qpn, `RDMA_QPC(qpn, RDMA_QPC_RC_SRFQN), index, wrap, sges);
-    if (!dma_read(qp_shadow(qpn) + 6, 2, shadow) || !wq_slot(qpn, 1'b1, rt.rq_ci, slot, depth))
-      return 1'b0;
+    if (`RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ)) begin
+      fetch_srqe(qpn, `RDMA_QPC(qpn, RDMA_QPC_RC_SRFQN), index, wrap, sges, ok);
+      return;
+    end
+    dma_read(qp_shadow(qpn) + 6, 2, shadow, ok);
+    if (ok)
+      wq_slot(qpn, 1'b1, rt.rq_ci, slot, depth, ok);
+    if (!ok)
+      return;
     pi = {shadow[0], shadow[1]};
+    ok = 1'b0;
     if (pi[14:0] == rt.rq_ci % depth && pi[15] == ((rt.rq_ci / depth) & 1))
-      return 1'b0;
-    if (!dma_read(slot, RDMA_RQE_BYTES, rqe))
-      return 1'b0;
+      return;
+    dma_read(slot, RDMA_RQE_BYTES, rqe, ok);
+    if (!ok)
+      return;
     if (rdma_be::field(rqe, 0, RDMA_RQE_VALID_LSB, 1) != !((rt.rq_ci / depth) & 1)) begin
       protocol_error($sformatf("QP %0d RQE polarity does not match the posted PI", qpn));
-      return 1'b0;
+      ok = 1'b0;
+      return;
     end
     rt.rq_ci++;
     index = `RDMA_BE_GET(rqe, RDMA_RQE_INDEX);
     wrap = `RDMA_BE_GET(rqe, RDMA_RQE_WRAP);
-    return rqe_sges(rqe, $sformatf("QP %0d", qpn), sges);
-  endfunction
+    rqe_sges(rqe, $sformatf("QP %0d", qpn), sges, ok);
+  endtask
 
   // 功能：解析 RQE 的 SGE：SGE≤2 在 WQE 字节 32 起，否则从 SGB_PA<<9 读 SGB；SIGN_EN 时校验签名
   //   （WQE 与 SGB 有效部分异或为 0xFF）。
-  // 输入/输出及副作用：DMA 读 SGB；sges 输出 {key, va, len} 三元组。
-  // 失败/边界：读失败返回 0；签名不符报告协议错误并返回 0。
-  protected function bit rqe_sges(rdma_bytes_t rqe, string owner, output bit [63:0] sges[$]);
+  // 输入/输出及副作用：DMA 读 SGB；sges 输出 {key, va, len} 三元组；ok 输出。
+  // 失败/边界：读失败 ok=0；签名不符报告协议错误且 ok=0。
+  protected task rqe_sges(rdma_bytes_t rqe, string owner, output bit [63:0] sges[$],
+                          output bit ok);
     rdma_bytes_t area;
     int unsigned sge_num;
     bit [7:0] sum;
 
     sges.delete();
+    ok = 1'b0;
     sge_num = `RDMA_BE_GET(rqe, RDMA_RQE_SGE_NUM);
     area = rdma_be::slice(rqe, PAYLOAD_OFFSET, 32);
     if (sge_num > 2) begin
-      if (!dma_read(`RDMA_BE_GET(rqe, RDMA_RQE_SGB_PA) << 9, sge_num * SGE_BYTES, area))
-        return 1'b0;
+      dma_read(`RDMA_BE_GET(rqe, RDMA_RQE_SGB_PA) << 9, sge_num * SGE_BYTES, area, ok);
+      if (!ok)
+        return;
     end
     if (`RDMA_BE_GET(rqe, RDMA_RQE_SIGN_EN)) begin
       sum = rdma_be::xor_bytes(rqe);
@@ -1584,20 +1612,21 @@ class rdma_dev_nic extends uvm_object;
         sum ^= rdma_be::xor_bytes(area);
       if (sum != 8'hff) begin
         protocol_error($sformatf("%s RQE signature mismatch", owner));
-        return 1'b0;
+        ok = 1'b0;
+        return;
       end
     end
     parse_sges(area, sge_num, sges);
-    return 1'b1;
-  endfunction
+    ok = 1'b1;
+  endtask
 
   // 功能：从 SRQ 的 SRFQ 环取下一个 RQE：SRQ shadow 的 be16 PI|wrap<<15 与设备 SRQ CI 比较判断
   //   可用，校验 polarity，解析 SGE（含 SGB 与签名）。
-  // 输入/输出及副作用：推进该 SRQ 的 CI；index/wrap 输出 RQE 头中的 INDEX（驱动 bitmap 槽）/WRAP。
-  // 失败/边界：无可用 RQE 或校验失败返回 0。
-  protected function bit fetch_srqe(int unsigned qpn, int unsigned srqn,
-                                    output int unsigned index, output bit wrap,
-                                    output bit [63:0] sges[$]);
+  // 输入/输出及副作用：推进该 SRQ 的 CI；index/wrap 输出 RQE 头中的 INDEX（驱动 bitmap 槽）/WRAP；
+  //   ok 输出。
+  // 失败/边界：无可用 RQE 或校验失败 ok=0。
+  protected task fetch_srqe(int unsigned qpn, int unsigned srqn, output int unsigned index,
+                            output bit wrap, output bit [63:0] sges[$], output bit ok);
     rdma_dev_object srqc;
     rdma_bytes_t shadow;
     rdma_bytes_t rqe;
@@ -1611,9 +1640,10 @@ class rdma_dev_nic extends uvm_object;
     index = 0;
     wrap = 1'b0;
     sges.delete();
+    ok = 1'b0;
     if (!ctx.lookup(RDMA_DEV_SRQ, srqn, srqc)) begin
       protocol_error($sformatf("QP %0d uses absent SRQ %0d", qpn, srqn));
-      return 1'b0;
+      return;
     end
     if (!srq_ci.exists(srqn))
       srq_ci[srqn] = 0;
@@ -1621,19 +1651,25 @@ class rdma_dev_nic extends uvm_object;
     depth = 1 << `RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_SIZE, SRQC_BASE);
     shadow_pa = (`RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SHADOW_PA, SRQC_BASE) << 12) +
                 (srqn % 128) * SRQ_CTX_BYTES + SRQ_SHADOW_OFFSET;
-    if (!dma_read(shadow_pa, 2, shadow))
-      return 1'b0;
+    dma_read(shadow_pa, 2, shadow, ok);
+    if (!ok)
+      return;
     pi = {shadow[0], shadow[1]};
+    ok = 1'b0;
     if (pi[14:0] == ci % depth && pi[15] == ((ci / depth) & 1))
-      return 1'b0;
-    status = ctx.buffer_addr(`RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_OM, SRQC_BASE),
-                             `RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_PBA, SRQC_BASE),
-                             (ci % depth) * RDMA_RQE_BYTES, slot);
-    if (!status.ok() || !dma_read(slot, RDMA_RQE_BYTES, rqe))
-      return 1'b0;
+      return;
+    ctx.buffer_addr(`RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_OM, SRQC_BASE),
+                    `RDMA_BE_GET_AT(srqc.bytes, RDMA_SRQC_BODY_SRFQ_PBA, SRQC_BASE),
+                    (ci % depth) * RDMA_RQE_BYTES, slot, status);
+    if (!status.ok())
+      return;
+    dma_read(slot, RDMA_RQE_BYTES, rqe, ok);
+    if (!ok)
+      return;
     if (rdma_be::field(rqe, 0, RDMA_RQE_VALID_LSB, 1) != !((ci / depth) & 1)) begin
       protocol_error($sformatf("SRQ %0d RQE polarity does not match the posted PI", srqn));
-      return 1'b0;
+      ok = 1'b0;
+      return;
     end
     srq_ci[srqn] = ci + 1;
     if (srq_limit.exists(srqn) &&
@@ -1644,8 +1680,8 @@ class rdma_dev_nic extends uvm_object;
     end
     index = `RDMA_BE_GET(rqe, RDMA_RQE_INDEX);
     wrap = `RDMA_BE_GET(rqe, RDMA_RQE_WRAP);
-    return rqe_sges(rqe, $sformatf("SRQ %0d", srqn), sges);
-  endfunction
+    rqe_sges(rqe, $sformatf("SRQ %0d", srqn), sges, ok);
+  endtask
 
   // 功能：发送 ACK/NAK。dup 为重复请求的重发 ACK（不推进 MSN）。
   // 输入/输出及副作用：新 ACK 推进 msn，经端口发包。
@@ -1710,9 +1746,10 @@ class rdma_dev_nic extends uvm_object;
 
   // 功能：在 RQE 缓冲开头写 40B GRH（RoCEv2 IPv4：前 20 字节为 0，后 20 字节为 IPv4 头：版本/IHL、
   //   总长、TTL 64、协议 UDP；模型报文不携带 IP 地址，地址字段为 0）。
-  // 输入/输出及副作用：写主机内存。
-  // 失败/边界：写失败返回 0。
-  protected function bit write_grh(bit [63:0] sges[$], int unsigned pd, int unsigned payload);
+  // 输入/输出及副作用：写主机内存；ok 输出。
+  // 失败/边界：写失败 ok=0。
+  protected task write_grh(bit [63:0] sges[$], int unsigned pd, int unsigned payload,
+                           output bit ok);
     rdma_bytes_t grh;
     int unsigned total;
 
@@ -1723,8 +1760,8 @@ class rdma_dev_nic extends uvm_object;
     grh[23] = total[7:0];
     grh[28] = 8'd64;
     grh[29] = 8'd17;
-    return scatter(sges, pd, RDMA_RIGHT_LOCAL_WRITE, 0, grh);
-  endfunction
+    scatter(sges, pd, RDMA_RIGHT_LOCAL_WRITE, 0, grh, ok);
+  endtask
 
   // 功能：响应方处理请求：RC/URC 先做 PSN 检查；SEND 消费 RQE 散写（UD 先校验 Q_Key，缓冲前 40B
   //   为 GRH），WRITE 按 rkey 写入（带立即数时消费 RQE），READ/ATOMIC 读出或读改写后回包；RC 按
@@ -1746,6 +1783,7 @@ class rdma_dev_nic extends uvm_object;
     bit [31:0] imm;
     int unsigned src_qp;
     int unsigned base;
+    bit ok;
 
     rt = qp_rt(qpn);
     // 接收端只在 RTR/RTS/SQD 接受请求（RESET/INIT/ERR 丢弃，不回 ACK）。
@@ -1779,7 +1817,8 @@ class rdma_dev_nic extends uvm_object;
       RDMA_NET_SEND, RDMA_NET_SEND_WITH_IMM: begin
         if (pkt.segment inside {RDMA_SEG_FIRST, RDMA_SEG_ONLY}) begin
           rt.rx_offset = 0;
-          rt.rx_active = fetch_rqe(qpn, rt, index, wrap, rsges);
+          fetch_rqe(qpn, rt, index, wrap, rsges, ok);
+          rt.rx_active = ok;
           rt.rx_index = index;
           rt.rx_wrap = wrap;
           rt.rx_sges = rsges;
@@ -1791,14 +1830,15 @@ class rdma_dev_nic extends uvm_object;
             send_ack(qpn, rt, pkt.psn, rnr_syndrome(qpn));
             return;
           end
-          // 带副作用的调用不放进 && 表达式（VCS 不保证短路）。
           if (rt.rx_active && ud) begin
-            if (!write_grh(rt.rx_sges, pd, pkt.payload.size()))
+            write_grh(rt.rx_sges, pd, pkt.payload.size(), ok);
+            if (!ok)
               rt.rx_failed = 1'b1;
           end
         end
         if (!rt.rx_failed) begin
-          if (!scatter(rt.rx_sges, pd, RDMA_RIGHT_LOCAL_WRITE, base + rt.rx_offset, data))
+          scatter(rt.rx_sges, pd, RDMA_RIGHT_LOCAL_WRITE, base + rt.rx_offset, data, ok);
+          if (!ok)
             rt.rx_failed = 1'b1;
         end
         rt.rx_offset += data.size();
@@ -1824,8 +1864,9 @@ class rdma_dev_nic extends uvm_object;
           rt.wr_rkey = pkt.reth_rkey;
           rt.wr_len = pkt.reth_len;
           rt.wr_offset = 0;
-          rt.wr_failed = !translate(pkt.reth_rkey, pd, RDMA_RIGHT_REMOTE_WRITE, pkt.reth_va,
-                                    pkt.reth_len, segs);
+          translate(pkt.reth_rkey, pd, RDMA_RIGHT_REMOTE_WRITE, pkt.reth_va, pkt.reth_len, segs,
+                    ok);
+          rt.wr_failed = !ok;
           if (rt.wr_failed)
             send_ack(qpn, rt, pkt.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
         end
@@ -1834,7 +1875,8 @@ class rdma_dev_nic extends uvm_object;
           rsges.push_back(rt.wr_rkey);
           rsges.push_back(rt.wr_va);
           rsges.push_back(rt.wr_len);
-          if (!scatter(rsges, pd, RDMA_RIGHT_REMOTE_WRITE, rt.wr_offset, data)) begin
+          scatter(rsges, pd, RDMA_RIGHT_REMOTE_WRITE, rt.wr_offset, data, ok);
+          if (!ok) begin
             rt.wr_failed = 1'b1;
             send_ack(qpn, rt, pkt.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
           end
@@ -1843,7 +1885,8 @@ class rdma_dev_nic extends uvm_object;
         if (last && !rt.wr_failed) begin
           syndrome = RDMA_AETH_ACK;
           if (pkt.opcode == RDMA_NET_WRITE_WITH_IMM) begin
-            if (fetch_rqe(qpn, rt, index, wrap, rsges))
+            fetch_rqe(qpn, rt, index, wrap, rsges, ok);
+            if (ok)
               write_cqe(qpn, 1'b1, index, wrap, RDMA_CMQ_SUCCESS_ECODE, rt.wr_len, pkt.imm, 0);
             else begin
               // RNR：数据可重写，整条消息待重传。
@@ -1879,6 +1922,7 @@ class rdma_dev_nic extends uvm_object;
     int unsigned count;
     int unsigned start;
     int unsigned take;
+    bit ok;
 
     count = (req.reth_len + mtu(qpn) - 1) / mtu(qpn);
     if (count == 0)
@@ -1886,13 +1930,14 @@ class rdma_dev_nic extends uvm_object;
     if (!dup)
       rt.expected_psn = req.psn + count;
     data = new[0];
-    if (!translate(req.reth_rkey, pd, RDMA_RIGHT_REMOTE_READ, req.reth_va, req.reth_len,
-                   segs)) begin
+    translate(req.reth_rkey, pd, RDMA_RIGHT_REMOTE_READ, req.reth_va, req.reth_len, segs, ok);
+    if (!ok) begin
       send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
       return;
     end
     for (int k = 0; k < segs.size(); k += 2) begin
-      if (!dma_read(segs[k], segs[k + 1], part)) begin
+      dma_read(segs[k], segs[k + 1], part, ok);
+      if (!ok) begin
         send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
         return;
       end
@@ -1924,10 +1969,14 @@ class rdma_dev_nic extends uvm_object;
     rdma_bytes_t raw;
     bit [63:0] orig;
     bit [63:0] value;
+    bit ok;
 
-    if (req.atomic_va[2:0] != 3'b000 ||
-        !translate(req.atomic_rkey, pd, RDMA_RIGHT_REMOTE_ATOMIC, req.atomic_va, 8, segs) ||
-        !dma_read(segs[0], 8, raw)) begin
+    ok = req.atomic_va[2:0] == 3'b000;
+    if (ok)
+      translate(req.atomic_rkey, pd, RDMA_RIGHT_REMOTE_ATOMIC, req.atomic_va, 8, segs, ok);
+    if (ok)
+      dma_read(segs[0], 8, raw, ok);
+    if (!ok) begin
       send_ack(qpn, rt, req.psn, RDMA_AETH_NAK_REMOTE_ACCESS);
       return;
     end
@@ -1940,7 +1989,7 @@ class rdma_dev_nic extends uvm_object;
       value = orig + req.atomic_swap_add;
     foreach (raw[k])
       raw[k] = value >> (8 * k);
-    void'(dma_write(segs[0], raw));
+    dma_write(segs[0], raw, ok);
     rt.msn++;
     rt.atomic_cache[req.psn] = orig;
     atomic_ack(qpn, rt, req.psn, orig);

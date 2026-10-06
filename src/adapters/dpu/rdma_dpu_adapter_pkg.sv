@@ -274,26 +274,34 @@ package rdma_dpu_adapter_pkg;
     // 输入/输出及副作用：调用 rdma_dev.write_register，routed 计数。
     // 失败/边界：地址不在任何 BAR、落在非 DEVICE_MEMORY BAR、或 Function 无设备时返回
     //   INVALID_ARGUMENT/INVALID_STATE。
-    function rdma_status write(dpu_pcie_domain_key_t domain, bit [63:0] address,
-                               bit [63:0] value);
+    task write(dpu_pcie_domain_key_t domain, bit [63:0] address, bit [63:0] value,
+               output rdma_status status);
       dpu_bar_address_match_t match;
       string name;
       string why;
 
-      if (snapshot == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE, "BAR router has no snapshot");
-      if (!snapshot.resolve_bar_address(domain, address, match, why))
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, why);
-      if (match.role != DPU_BAR_DEVICE_MEMORY)
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 $sformatf("MMIO %016h is in a %s BAR", address,
-                                           match.role.name()));
+      if (snapshot == null) begin
+        status = rdma_status::make(RDMA_SC_INVALID_STATE, "BAR router has no snapshot");
+        return;
+      end
+      if (!snapshot.resolve_bar_address(domain, address, match, why)) begin
+        status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, why);
+        return;
+      end
+      if (match.role != DPU_BAR_DEVICE_MEMORY) begin
+        status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   $sformatf("MMIO %016h is in a %s BAR", address,
+                                             match.role.name()));
+        return;
+      end
       name = dpu_function_key_name(match.function_key);
-      if (!devs.exists(name))
-        return rdma_status::make(RDMA_SC_INVALID_STATE, {"no device for ", name});
+      if (!devs.exists(name)) begin
+        status = rdma_status::make(RDMA_SC_INVALID_STATE, {"no device for ", name});
+        return;
+      end
       routed++;
-      return devs[name].write_register(match.offset, value);
-    endfunction
+      devs[name].write_register(match.offset, value, status);
+    endtask
   endclass
 
   // 一个 Function 的驱动 BAR：偏移加 BAR0 基址成为该 Host domain 内的绝对地址，经路由器解码；记录
@@ -325,7 +333,7 @@ package rdma_dpu_adapter_pkg;
         status = rdma_status::make(RDMA_SC_INVALID_STATE, "dpu BAR is not connected");
         return;
       end
-      status = router.write(func.pcie_id.domain, func.bar0.base + offset, value);
+      router.write(func.pcie_id.domain, func.bar0.base + offset, value, status);
     endtask
   endclass
 

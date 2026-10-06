@@ -63,13 +63,14 @@ class rdma_drv_dev_test extends uvm_test;
   //   PD 表地址；QP0 的 QPC 状态为 ERR 且带 VF_ID。
   // 输入/输出及副作用：只读设备与主机内存。
   // 失败/边界：不符报告 UVM_ERROR。
-  function void check_probe();
+  task check_probe();
     bit [7:0] expected[$];
     rdma_dev_object eqc;
     rdma_drv_dma page;
     int unsigned offset;
     rdma_bytes_t qpc;
     bit [63:0] iova;
+    rdma_status status;
 
     expected = '{RDMA_OP_IFA_UPDATE, RDMA_OP_IFA_UPDATE, RDMA_OP_IFA_UPDATE, RDMA_OP_IFA_UPDATE,
                  RDMA_OP_SD_UPDATE, RDMA_OP_CEQC_CREATE, RDMA_OP_CEQC_CREATE,
@@ -88,14 +89,17 @@ class rdma_drv_dev_test extends uvm_test;
                        RDMA_EQC_BODY_CUR_EQ_PBA_LSB, RDMA_EQC_BODY_CUR_EQ_PBA_WIDTH) !=
         drv.ceqs[1].mem_kbuf.base_iova() >> 12)
       `uvm_error("PROBE", "CEQ 5 context does not carry its PD table address")
-    expect_ok("HMC QPC 5", dev.cmq.hmc_addr(0, 5 * RDMA_QPC_BYTES, iova));
+    dev.cmq.hmc_addr(0, 5 * RDMA_QPC_BYTES, iova, status);
+    expect_ok("HMC QPC 5", status);
     if (iova != drv.hmc[0].pages[0].iova + 5 * RDMA_QPC_BYTES)
       `uvm_error("PROBE", "device HMC translation of QPC 5 does not match the driver page")
-    expect_ok("HMC PBL 600", dev.cmq.hmc_addr(3, 600 * 8, iova));
+    dev.cmq.hmc_addr(3, 600 * 8, iova, status);
+    expect_ok("HMC PBL 600", status);
     if (iova != drv.hmc[3].pages[1].iova + (600 - 512) * 8)
       `uvm_error("PROBE", "device HMC translation of PBLE 600 does not match the driver page")
-    expect_ok("CEQ buffer", dev.cmq.buffer_addr(RDMA_ALLOC_TYPE_INDIRECT,
-                                                drv.ceqs[0].mem_kbuf.base_iova() >> 12, 48, iova));
+    dev.cmq.buffer_addr(RDMA_ALLOC_TYPE_INDIRECT, drv.ceqs[0].mem_kbuf.base_iova() >> 12, 48, iova,
+                        status);
+    expect_ok("CEQ buffer", status);
     if (iova != drv.ceqs[0].mem_kbuf.pages[0].iova + 48)
       `uvm_error("PROBE", "device INDIRECT translation of the CEQ buffer is wrong")
     void'(drv.hmc[0].locate(0, page, offset));
@@ -105,7 +109,7 @@ class rdma_drv_dev_test extends uvm_test;
         rdma_be::field(qpc, RDMA_QPC_VF_ID_WORD_BYTE_OFFSET, RDMA_QPC_VF_ID_LSB,
                        RDMA_QPC_VF_ID_WIDTH) != 3)
       `uvm_error("PROBE", "QP0 context was not set to ERR with the VF id")
-  endfunction
+  endtask
 
   // 功能：remove 追加 TQ_FLUSH、OCC_FLUSH、AEQC_DELETE、CEQC_DELETE×2、SD_UPDATE（清除），
   //   设备 EQ 全部删除，驱动分配的 DMA 内存全部归还。

@@ -23,12 +23,11 @@ class rdma_dev extends uvm_object;
     cmq.nic = nic;
   endfunction
 
-  // 功能：绑定设备 DMA 使用的主机内存并复位。
+  // 功能：绑定设备 DMA 使用的主机内存（CMQ 建立 DMA 端口，NIC 共用）并复位。
   // 输入/输出及副作用：保存非拥有引用。
   // 失败/边界：无。
   function void configure(rdma_host_mem_api host_mem);
     cmq.configure(host_mem);
-    nic.host_mem = host_mem;
     nic.reset();
   endfunction
 
@@ -43,16 +42,23 @@ class rdma_dev extends uvm_object;
 
   // 功能：BAR 寄存器写：notify 窗口内按偏移分派。
   // 输入/输出及副作用：转交对应单元。
+  //   寄存器写在调用方进程内同步完成（CMQ 命令、立即 flush 等的 DMA 可能消耗仿真时间）。
   // 失败/边界：窗口外或尚未建模的寄存器返回 INVALID_ARGUMENT/UNSUPPORTED_OPCODE。
-  function rdma_status write_register(bit [63:0] bar_offset, bit [63:0] value);
+  task write_register(bit [63:0] bar_offset, bit [63:0] value, output rdma_status status);
     bit [63:0] offset;
 
+    status = rdma_status::success();
     if (bar_offset < RDMA_NOTIFY_WINDOW_OFFSET ||
-        bar_offset >= RDMA_NOTIFY_WINDOW_OFFSET + RDMA_NOTIFY_WINDOW_SIZE)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "BAR write is outside the notify window");
+        bar_offset >= RDMA_NOTIFY_WINDOW_OFFSET + RDMA_NOTIFY_WINDOW_SIZE) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "BAR write is outside the notify window");
+      return;
+    end
     offset = bar_offset - RDMA_NOTIFY_WINDOW_OFFSET;
-    if (offset inside {RDMA_DB_CMQC_HIGH_OFFSET, RDMA_DB_CMQC_LOW_OFFSET, RDMA_DB_CMQ_OFFSET})
-      return cmq.write_register(offset, value);
+    if (offset inside {RDMA_DB_CMQC_HIGH_OFFSET, RDMA_DB_CMQC_LOW_OFFSET, RDMA_DB_CMQ_OFFSET}) begin
+      cmq.write_register(offset, value, status);
+      return;
+    end
     if (offset inside {RDMA_DB_SQ_OFFSET, RDMA_DB_RQ_OFFSET, RDMA_DB_CQ_OFFSET, RDMA_DB_CEQ_OFFSET,
                        RDMA_DB_AEQ_OFFSET, RDMA_DB_SRFQ_OFFSET, RDMA_DB_RTS2SQD_OFFSET,
                        RDMA_DB_SQD2RTS_OFFSET, RDMA_DB_QP_FLUSH_OFFSET,
@@ -71,9 +77,9 @@ class rdma_dev extends uvm_object;
         nic.rts2sqd(value);
       if (offset == RDMA_DB_SQD2RTS_OFFSET)
         nic.sqd2rts(value);
-      return rdma_status::success();
+      return;
     end
-    return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                             $sformatf("notify register %0h is not modeled", offset));
-  endfunction
+    status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                               $sformatf("notify register %0h is not modeled", offset));
+  endtask
 endclass

@@ -47,14 +47,14 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：分配 CMQ 环（4KiB）与 QPC 缓冲区（512B 对齐），配置并使能设备 CMQ。
   // 输入/输出及副作用：创建 mem/dev/ring/qpc_buf。
   // 失败/边界：任一步失败报告 UVM_FATAL。
-  function void setup();
+  task setup();
     mem = rdma_mock_host_mem::type_id::create("dev_cmq_mem");
     dev = rdma_dev_cmq::type_id::create("dev_cmq");
     ring = alloc(4096, 4096);
     qpc_buf = alloc(512, 512);
     dev.configure(mem);
     enable();
-  endfunction
+  endtask
 
   // 功能：从 mock 内存分配一段 DMA 映射。
   // 输入/输出及副作用：返回新映射。
@@ -77,17 +77,20 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：按驱动 xtrdma_sc_cmq_create 写 CMQC_HIGH/LOW，并清零环与本地序号。
   // 输入/输出及副作用：写 ring 与设备寄存器，posted 归零。
   // 失败/边界：寄存器写失败报告 UVM_FATAL。
-  function void enable();
+  task enable();
     byte zero[];
+    rdma_status status;
 
     zero = new[4096];
     foreach (zero[i])
       zero[i] = 0;
     expect_ok("clear ring", mem.write(ring, 0, zero));
     posted = 0;
-    expect_ok("CMQC_HIGH", dev.write_register(RDMA_DB_CMQC_HIGH_OFFSET, ring.iova.value));
-    expect_ok("CMQC_LOW", dev.write_register(RDMA_DB_CMQC_LOW_OFFSET, 64'h8000_0000));
-  endfunction
+    dev.write_register(RDMA_DB_CMQC_HIGH_OFFSET, ring.iova.value, status);
+    expect_ok("CMQC_HIGH", status);
+    dev.write_register(RDMA_DB_CMQC_LOW_OFFSET, 64'h8000_0000, status);
+    expect_ok("CMQC_LOW", status);
+  endtask
 
   // 功能：断言 status 成功。
   // 输入/输出及副作用：what 用于报告。
@@ -151,16 +154,16 @@ class rdma_dev_cmq_test extends uvm_test;
   endfunction
 
   // 功能：按驱动 xtrdma_sc_cmq_post_sq 敲 doorbell，PI/polarity 取自已提交序号。
-  // 输入/输出及副作用：返回设备处理结果。
-  // 失败/边界：设备拒绝时返回其错误。
-  function rdma_status ring_doorbell();
+  // 输入/输出及副作用：status 输出设备处理结果。
+  // 失败/边界：设备拒绝时输出其错误。
+  task ring_doorbell(output rdma_status status);
     bit [63:0] value;
 
     value = '0;
     value[RDMA_CMQ_DB_PI_LSB +: RDMA_CMQ_DB_PI_WIDTH] = posted % DEPTH;
     value[RDMA_CMQ_DB_POLARITY_LSB] = (posted / DEPTH) & 1;
-    return dev.write_register(RDMA_DB_CMQ_OFFSET, value);
-  endfunction
+    dev.write_register(RDMA_DB_CMQ_OFFSET, value, status);
+  endtask
 
   // 功能：读第 seq 个 CQE 并检查 owner/wrap/index/opcode/ecode。
   // 输入/输出及副作用：返回 CQE 字节。
@@ -186,17 +189,19 @@ class rdma_dev_cmq_test extends uvm_test;
   endfunction
 
   // 功能：提交单条命令、敲 doorbell 并检查其 CQE。
-  // 输入/输出及副作用：返回 CQE 字节。
+  // 输入/输出及副作用：cqe 输出 CQE 字节。
   // 失败/边界：doorbell 失败报告 UVM_FATAL，CQE 不符报告 UVM_ERROR。
-  function rdma_bytes_t exec(string label, rdma_bytes_t sqe,
-                                bit [7:0] ecode = RDMA_CMQ_SUCCESS_ECODE);
+  task exec(string label, rdma_bytes_t sqe, output rdma_bytes_t cqe,
+            input bit [7:0] ecode = RDMA_CMQ_SUCCESS_ECODE);
     bit [7:0] opcode;
+    rdma_status status;
 
     opcode = rdma_be::qword(sqe, 0) >> RDMA_CMQ_OPCODE_LSB;
     post(sqe);
-    expect_ok({label, " doorbell"}, ring_doorbell());
-    return check_cqe(label, posted - 1, opcode, ecode);
-  endfunction
+    ring_doorbell(status);
+    expect_ok({label, " doorbell"}, status);
+    cqe = check_cqe(label, posted - 1, opcode, ecode);
+  endtask
 
   // 功能：比较两段字节。
   // 输入/输出及副作用：只读。
@@ -214,22 +219,25 @@ class rdma_dev_cmq_test extends uvm_test;
   // 功能：批量 doorbell 与跨圈回绕：40 条 TQ_FLUSH，CQE owner 随圈翻转。
   // 输入/输出及副作用：推进设备与 ring。
   // 失败/边界：任一 CQE 或执行计数不符报告 UVM_ERROR。
-  function void check_envelope_and_wrap();
+  task check_envelope_and_wrap();
+    rdma_status status;
     for (int i = 0; i < 3; i++)
       post(make_sqe(RDMA_OP_TQ_FLUSH));
-    expect_ok("batch doorbell", ring_doorbell());
+    ring_doorbell(status);
+    expect_ok("batch doorbell", status);
     for (int i = 0; i < 3; i++)
       scratch = (check_cqe("BATCH", i, RDMA_OP_TQ_FLUSH, RDMA_CMQ_SUCCESS_ECODE));
     for (int i = 0; i < 37; i++)
-      scratch = (exec("WRAP", make_sqe(RDMA_OP_TQ_FLUSH)));
+      exec("WRAP", make_sqe(RDMA_OP_TQ_FLUSH), scratch);
     if (dev.executed_opcodes.size() != 40)
       `uvm_error("WRAP", $sformatf("executed %0d commands", dev.executed_opcodes.size()))
-  endfunction
+  endtask
 
   // 功能：QP：CREATE 取缓冲区 QPC 并校验签名；仅状态/部分 MODIFY；QUERY 写回缓冲区；DELETE。
   // 输入/输出及副作用：修改 qpc_buf 与设备 QP 表。
   // 失败/边界：字节或状态不符报告 UVM_ERROR。
-  function void check_qp();
+  task check_qp();
+    rdma_status status;
     rdma_bytes_t qpc;
     rdma_bytes_t sqe;
     rdma_dev_object obj;
@@ -248,7 +256,8 @@ class rdma_dev_cmq_test extends uvm_test;
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
                             qpc_buf.iova.value >> 9);
     post_signed(sqe, 1'b1, qpc);
-    expect_ok("QPC_CREATE doorbell", ring_doorbell());
+    ring_doorbell(status);
+    expect_ok("QPC_CREATE doorbell", status);
     scratch = (check_cqe("QPC_CREATE", posted - 1, RDMA_OP_QPC_CREATE, RDMA_CMQ_SUCCESS_ECODE));
     if (!dev.lookup(RDMA_DEV_QP, 5, obj))
       `uvm_fatal("QPC_CREATE", "QP 5 was not stored")
@@ -257,7 +266,7 @@ class rdma_dev_cmq_test extends uvm_test;
     sqe = make_sqe(RDMA_OP_QPC_MODIFY, 5);
     rdma_be::set_field(sqe, RDMA_CMQ_NEXT_QP_STATE_WORD_BYTE_OFFSET,
                             RDMA_CMQ_NEXT_QP_STATE_LSB, RDMA_CMQ_NEXT_QP_STATE_WIDTH, 3);
-    scratch = (exec("QPC_MODIFY_ST", sqe));
+    exec("QPC_MODIFY_ST", sqe, scratch);
     if (rdma_be::field(obj.bytes, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
                             RDMA_QPC_QP_ST_WIDTH) != 3)
       `uvm_error("QPC_MODIFY_ST", "QPC state field was not updated")
@@ -269,7 +278,7 @@ class rdma_dev_cmq_test extends uvm_test;
     layout[RDMA_CMQ_MODIFY_WBE0_LSB +: 8] = 8'b1000_0011;
     rdma_be::put_qword(sqe, RDMA_CMQ_MODIFY_MODE_WORD_BYTE_OFFSET, layout);
     rdma_be::put_qword(sqe, RDMA_CMQ_MODIFY_DATA0_WORD_BYTE_OFFSET, 64'h1122_3344_5566_7788);
-    scratch = (exec("QPC_MODIFY_PARTIAL", sqe));
+    exec("QPC_MODIFY_PARTIAL", sqe, scratch);
     if (obj.bytes[16] != 8'h11 || obj.bytes[22] != 8'h77 || obj.bytes[23] != 8'h88 ||
         obj.bytes[17] != qpc[17])
       `uvm_error("QPC_MODIFY_PARTIAL", "partial template was not applied by byte enable")
@@ -281,7 +290,7 @@ class rdma_dev_cmq_test extends uvm_test;
     rdma_be::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
                             qpc_buf.iova.value >> 9);
-    scratch = (exec("QPC_QUERY", sqe));
+    exec("QPC_QUERY", sqe, scratch);
     expect_ok("read QPC buffer", mem.read(qpc_buf, 0, 512, data));
     foreach (data[i])
       if (byte'(obj.bytes[i]) != data[i]) begin
@@ -289,86 +298,90 @@ class rdma_dev_cmq_test extends uvm_test;
         break;
       end
 
-    scratch = (exec("QPC_DELETE", make_sqe(RDMA_OP_QPC_DELETE, 5)));
+    exec("QPC_DELETE", make_sqe(RDMA_OP_QPC_DELETE, 5), scratch);
     if (dev.count(RDMA_DEV_QP) != 0)
       `uvm_error("QPC_DELETE", "QP 5 is still stored")
-  endfunction
+  endtask
 
   // 功能：MR：REGISTER 保存 MRT，KEY_QUERY 回填 CQE 字节 16..63，DEREGISTER(INVALID) 删除。
   // 输入/输出及副作用：修改设备 MR 表。
   // 失败/边界：回填或删除不符报告 UVM_ERROR。
-  function void check_mr();
+  task check_mr();
     rdma_bytes_t sqe;
     rdma_bytes_t cqe;
 
     sqe = make_sqe(RDMA_OP_MR_REGISTER, 24'h42);
     for (int i = 8; i < 64; i++)
       sqe[i] = 8'h40 + i;
-    scratch = (exec("MR_REGISTER", sqe));
-    cqe = exec("KEY_QUERY", make_sqe(RDMA_OP_KEY_QUERY, 24'h42));
+    exec("MR_REGISTER", sqe, scratch);
+    exec("KEY_QUERY", make_sqe(RDMA_OP_KEY_QUERY, 24'h42), cqe);
     expect_bytes("KEY_QUERY", cqe, 16, sqe, 16, 48);
-    scratch = (exec("MR_DEREGISTER", make_sqe(RDMA_OP_MR_DEREGISTER, 24'h42)));
+    exec("MR_DEREGISTER", make_sqe(RDMA_OP_MR_DEREGISTER, 24'h42), scratch);
     if (dev.count(RDMA_DEV_MR) != 0)
       `uvm_error("MR_DEREGISTER", "MR 0x42 is still stored")
-  endfunction
+  endtask
 
   // 功能：CQ/CEQ/AEQ/SRFQ：CREATE 保存 context，QUERY 按驱动偏移回填，DELETE 后查询得到 INVLD。
   // 输入/输出及副作用：修改设备 CQ/EQ/SRQ 表。
   // 失败/边界：回填、ecode 或删除不符报告 UVM_ERROR。
-  function void check_cq_eq_srq();
+  task check_cq_eq_srq();
     rdma_bytes_t sqe;
     rdma_bytes_t cqe;
 
     sqe = make_sqe(RDMA_OP_CQC_CREATE, 7);
     for (int i = 8; i < 64; i++)
       sqe[i] = 8'h80 + i;
-    scratch = (exec("CQC_CREATE", sqe));
-    cqe = exec("CQC_QUERY", make_sqe(RDMA_OP_CQC_QUERY, 7));
+    exec("CQC_CREATE", sqe, scratch);
+    exec("CQC_QUERY", make_sqe(RDMA_OP_CQC_QUERY, 7), cqe);
     expect_bytes("CQC_QUERY", cqe, 8, sqe, 8, 56);
-    scratch = (exec("CQC_RESIZE", make_sqe(RDMA_OP_CQC_RESIZE, 7)));
-    scratch = (exec("CQC_DELETE", make_sqe(RDMA_OP_CQC_DELETE, 7)));
-    scratch = (exec("CQC_QUERY_GONE", make_sqe(RDMA_OP_CQC_QUERY, 7), RDMA_ECODE_EC_RCE_CQC_INVLD));
+    exec("CQC_RESIZE", make_sqe(RDMA_OP_CQC_RESIZE, 7), scratch);
+    exec("CQC_DELETE", make_sqe(RDMA_OP_CQC_DELETE, 7), scratch);
+    exec("CQC_QUERY_GONE", make_sqe(RDMA_OP_CQC_QUERY, 7), scratch,
+         RDMA_ECODE_EC_RCE_CQC_INVLD);
 
     sqe = make_sqe(RDMA_OP_CEQC_CREATE, 3);
     for (int i = 16; i < 48; i++)
       sqe[i] = 8'hc0 + i;
-    scratch = (exec("CEQC_CREATE", sqe));
-    cqe = exec("CEQC_QUERY", make_sqe(RDMA_OP_CEQC_QUERY, 3));
+    exec("CEQC_CREATE", sqe, scratch);
+    exec("CEQC_QUERY", make_sqe(RDMA_OP_CEQC_QUERY, 3), cqe);
     expect_bytes("CEQC_QUERY", cqe, 16, sqe, 16, 32);
     if (rdma_be::field(cqe, 0, 0, 12) != 3)
       `uvm_error("CEQC_QUERY", "CQE does not carry the EQN")
-    scratch = (exec("CEQC_DELETE", make_sqe(RDMA_OP_CEQC_DELETE, 3)));
-    scratch = (exec("AEQC_DELETE_GONE", make_sqe(RDMA_OP_AEQC_DELETE, 1),
-              RDMA_ECODE_EC_RCE_AEQC_INVLD));
+    exec("CEQC_DELETE", make_sqe(RDMA_OP_CEQC_DELETE, 3), scratch);
+    exec("AEQC_DELETE_GONE", make_sqe(RDMA_OP_AEQC_DELETE, 1), scratch,
+         RDMA_ECODE_EC_RCE_AEQC_INVLD);
 
     sqe = make_sqe(RDMA_OP_SRFQC_CREATE, 9);
     for (int i = 16; i < 48; i++)
       sqe[i] = 8'h20 + i;
-    scratch = (exec("SRFQC_CREATE", sqe));
-    cqe = exec("SRFQC_QUERY", make_sqe(RDMA_OP_SRFQC_QUERY, 9));
+    exec("SRFQC_CREATE", sqe, scratch);
+    exec("SRFQC_QUERY", make_sqe(RDMA_OP_SRFQC_QUERY, 9), cqe);
     expect_bytes("SRFQC_QUERY", cqe, 16, sqe, 16, 32);
-    scratch = (exec("SRFQC_DELETE", make_sqe(RDMA_OP_SRFQC_DELETE, 9)));
+    exec("SRFQC_DELETE", make_sqe(RDMA_OP_SRFQC_DELETE, 9), scratch);
     if (dev.count(RDMA_DEV_SRQ) != 0)
       `uvm_error("SRFQC_DELETE", "SRFQ 9 is still stored")
-  endfunction
+  endtask
 
   // 功能：协议错误：未使能 doorbell、envelope 与环不符、QPC 签名不符、查询不存在的 MR。
   // 输入/输出及副作用：每例前复位并重新使能设备。
   // 失败/边界：设备接受非法命令时报告 UVM_ERROR。
-  function void check_errors();
+  task check_errors();
+    rdma_status status;
     rdma_bytes_t sqe;
     rdma_bytes_t qpc;
 
     dev.reset();
     post(make_sqe(RDMA_OP_TQ_FLUSH));
-    if (ring_doorbell().ok())
+    ring_doorbell(status);
+    if (status.ok())
       `uvm_error("DISABLED", "doorbell before CMQC enable was accepted")
 
     enable();
     posted = 1;
     post(make_sqe(RDMA_OP_TQ_FLUSH));
     posted = 1;
-    if (ring_doorbell().ok())
+    ring_doorbell(status);
+    if (status.ok())
       `uvm_error("ENVELOPE", "SQE in the wrong ring slot was accepted")
 
     // QPC 缓冲区此时保存 QUERY 写回的非零内容，按全零 QPC 计算的签名必然不符。
@@ -381,12 +394,14 @@ class rdma_dev_cmq_test extends uvm_test;
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
                             qpc_buf.iova.value >> 9);
     post_signed(sqe, 1'b1, qpc);
-    if (ring_doorbell().ok())
+    ring_doorbell(status);
+    if (status.ok())
       `uvm_error("SIGNATURE", "QPC_CREATE with a stale signature was accepted")
 
     enable();
     post(make_sqe(RDMA_OP_KEY_QUERY, 24'h99));
-    if (ring_doorbell().ok())
+    ring_doorbell(status);
+    if (status.ok())
       `uvm_error("ABSENT_MR", "KEY_QUERY on an absent MR was accepted")
-  endfunction
+  endtask
 endclass

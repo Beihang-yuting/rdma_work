@@ -194,7 +194,7 @@ package rdma_pcie_work_pkg;
     //   内即交给其设备（decoded_writes 加一），否则拒绝（rejected_writes 加一）。
     // 输入/输出及副作用：可能写设备寄存器。
     // 失败/边界：长度不足 8 字节按拒绝计。
-    function void deliver_mmio(pcie_tl_mem_tlp req);
+    task deliver_mmio(pcie_tl_mem_tlp req);
       bit [63:0] value;
       dpu_pcie_domain_key_t domains[$];
       bit seen[string];
@@ -214,13 +214,13 @@ package rdma_pcie_work_pkg;
         domains.push_back(dpu.nodes[i].func.pcie_id.domain);
       end
       foreach (domains[d]) begin
-        status = dpu.router.write(domains[d], req.addr, value);
+        dpu.router.write(domains[d], req.addr, value, status);
         if (status.ok()) begin
           decoded_writes++;
           return;
         end
       end
       rejected_writes++;
-    endfunction
+    endtask
   endclass
 endpackage
