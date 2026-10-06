@@ -32,6 +32,15 @@ class rdma_dev extends uvm_object;
     nic.reset();
   endfunction
 
+  // 功能：Function 级复位（FLR）：关闭 CMQ、清空全部 context 与数据面运行状态；主机内存绑定保留。
+  //   之后驱动须重新 probe。
+  // 输入/输出及副作用：修改设备状态。
+  // 失败/边界：无。
+  function void flr();
+    cmq.reset();
+    nic.reset();
+  endfunction
+
   // 功能：BAR 寄存器写：notify 窗口内按偏移分派。
   // 输入/输出及副作用：转交对应单元。
   // 失败/边界：窗口外或尚未建模的寄存器返回 INVALID_ARGUMENT/UNSUPPORTED_OPCODE。

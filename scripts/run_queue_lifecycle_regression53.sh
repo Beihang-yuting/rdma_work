@@ -75,6 +75,7 @@ readonly CORE_TESTS=(
   rdma_drv_dev_test
   rdma_drv_verbs_test
   rdma_drv_data_test
+  rdma_multifunc_test
   rdma_control_plane_test
   rdma_control_plane_cmq_engine_test
   rdma_codec_registry_test

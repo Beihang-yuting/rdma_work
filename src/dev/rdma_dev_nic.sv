@@ -1101,20 +1101,25 @@ class rdma_dev_nic extends uvm_object;
     write_eqe(RDMA_DEV_CEQ, ceqn, ceqe);
   endfunction
 
-  // 功能：向 AEQ 写一个 16B AEQE（ECODE、QPN；SRQ 事件带 SRFQ_EN/SRFQN）。AEQN 为本 Function 的
-  //   vf_id，单 Function 设备固定为 0。
+  // 功能：向 AEQ 写一个 16B AEQE（ECODE、QPN；SRQ 事件带 SRFQ_EN/SRFQN）。本设备实例即一个
+  //   Function，AEQN 取该 Function 唯一的 AEQ（驱动以 vf_id 建立）。
   // 输入/输出及副作用：DMA 写 AEQ。
   // 失败/边界：见 write_eqe。
   protected function void write_aeqe(int unsigned qpn, bit [7:0] ecode, bit srfq,
                                      int unsigned srfqn);
     rdma_bytes_t aeqe;
+    int unsigned aeqn;
 
     aeqe = rdma_be::zeros(RDMA_AEQE_BYTES);
     `RDMA_BE_SET(aeqe, RDMA_AEQE_ECODE, ecode)
     `RDMA_BE_SET(aeqe, RDMA_AEQE_QPN, qpn)
     `RDMA_BE_SET(aeqe, RDMA_AEQE_SRFQ_EN, srfq)
     `RDMA_BE_SET(aeqe, RDMA_AEQE_SRFQN, srfqn)
-    write_eqe(RDMA_DEV_AEQ, 0, aeqe);
+    if (!ctx.first_id(RDMA_DEV_AEQ, aeqn)) begin
+      protocol_error("asynchronous event without an AEQ");
+      return;
+    end
+    write_eqe(RDMA_DEV_AEQ, aeqn, aeqe);
   endfunction
 
   // 功能：按 EQC 向 CEQ/AEQ 的当前 PI 槽写一个 16B 事件（bit63 polarity 首圈为 1），PI 加一。

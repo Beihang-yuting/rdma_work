@@ -49,6 +49,8 @@ class rdma_dev_cmq extends uvm_object;
 
   // 数据面：CQC_RESIZE 需在命令完成前由 NIC 在旧 CQ 写 RESIZE CQE 并切换生产者位置。
   rdma_dev_nic nic;
+  // 故障注入：置位后接受 CMQ doorbell 但不消费 SQE（命令永不完成，驱动超时）；复位清除。
+  bit stall;
   protected rdma_host_mem_api host_mem;
   protected bit [63:0] sq_pa;
   protected bit enabled;
@@ -84,6 +86,7 @@ class rdma_dev_cmq extends uvm_object;
   // 失败/边界：无。
   function void reset();
     enabled = 1'b0;
+    stall = 1'b0;
     sq_pa = '0;
     sq_seq = 0;
     cq_seq = 0;
@@ -109,6 +112,16 @@ class rdma_dev_cmq extends uvm_object;
   // 功能：某类 context 的数量。
   // 输入/输出及副作用：纯查询。
   // 失败/边界：无。
+  // 功能：取某类中任一（编号最小）已创建 context 的编号。
+  // 输入/输出及副作用：id 输出。
+  // 失败/边界：该类为空返回 0。
+  function bit first_id(rdma_dev_kind_e kind, output int unsigned id);
+    id = 0;
+    if (!objects.exists(kind) || objects[kind].size() == 0)
+      return 1'b0;
+    return objects[kind].first(id);
+  endfunction
+
   function int unsigned count(rdma_dev_kind_e kind);
     if (!objects.exists(kind))
       return 0;
@@ -146,6 +159,8 @@ class rdma_dev_cmq extends uvm_object;
 
     if (host_mem == null || !enabled)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "CMQ is not enabled");
+    if (stall)
+      return rdma_status::success();
     pi = value[RDMA_CMQ_DB_PI_LSB +: RDMA_CMQ_DB_PI_WIDTH];
     polarity = value[RDMA_CMQ_DB_POLARITY_LSB];
     target = 0;

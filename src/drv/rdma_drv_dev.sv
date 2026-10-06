@@ -230,10 +230,11 @@ class rdma_drv_dev extends uvm_object;
     probed = 1'b1;
   endtask
 
-  // 功能：xtrdma_remove：vf_disable_flush_hw（TQ_FLUSH、OCC VF flush）后逆序拆除。
+  // 功能：xtrdma_remove：vf_disable_flush_hw（TQ_FLUSH、OCC VF flush）后逆序拆除。after_reset 时
+  //   （设备已 FLR/复位）不再下发任何硬件命令，只释放主机侧资源。
   // 输入/输出及副作用：向设备下发清理命令并释放全部资源。
   // 失败/边界：flush 失败只记录到 status，继续拆除（驱动 remove 不可失败）。
-  task remove(output rdma_status status);
+  task remove(output rdma_status status, input bit after_reset = 1'b0);
     rdma_bytes_t cqe;
     rdma_bytes_t sqe;
     rdma_status one;
@@ -241,6 +242,11 @@ class rdma_drv_dev extends uvm_object;
     status = rdma_status::success();
     if (!probed)
       return;
+    if (after_reset) begin
+      teardown(1'b0);
+      probed = 1'b0;
+      return;
+    end
     cmq.exec(rdma_drv_cmq::new_sqe(RDMA_OP_TQ_FLUSH), cqe, one);
     keep_first(status, one);
     sqe = rdma_drv_cmq::new_sqe(RDMA_OP_OCC_FLUSH);
