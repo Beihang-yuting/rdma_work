@@ -247,7 +247,8 @@ pcie_work: dpu_common_preflight pcie_work_preflight
 	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
 	    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' \
 	    filelists/pcie_work.f > build/pcie_work/pcie_work.expanded.f; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_PCIE_WORK_TEST \
+	: "RDMA_HOST_MEM_TEST：host_mem_manager 包进 rdma_host_mem_external_pkg，供各 Host 的统一内存"; \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_PCIE_WORK_TEST +define+RDMA_HOST_MEM_TEST \
 		-f build/pcie_work/pcie_work.expanded.f -top tb_top -o build/pcie_work/simv; \
 	test_name=$(TEST); \
 	if [[ "$$test_name" == regression ]]; then test_name=rdma_pcie_rdma_test; fi; \

@@ -1,19 +1,64 @@
 // 目录：集成测试层 integration/rdma_pcie_rdma_test.sv。
 // 层：集成测试。
-// 职责：dpu_common → pcie_work → RDMA 的 MMIO 路径：dpu_common 声明 Host0（PF0、VF1）与 Host1（PF0），
-//   BAR 随机放置；rdma_pcie_system 把快照投影为 PCIe 拓扑（每 Host 一条 RC↔EP 链）。各 Function 的
-//   驱动 probe、建资源、QP 互连与数据传输中的全部 BAR 写都以 MemWr TLP 经 pcie_work 送达 EP，再经快照
-//   解码到设备；检查 TLP 数与解码数相等、Host0↔Host1 的 SEND/WRITE 数据一致、MAILBOX BAR 的 MemWr 被
-//   拒绝。DMA 仍走主机内存模型（后续改走 pcie_work）。
-// 依赖：rdma_pcie_work_pkg、rdma_dpu_adapter_pkg（dpu_common）、rdma_mf_net/rdma_mf_port、mock 内存。
-// 所有权：测试拥有 dpu 系统与 PCIe 系统。
+// 职责：dpu_common → pcie_work → RDMA：dpu_common 声明 Host0（PF0、VF1）与 Host1（PF0），BAR 随机
+//   放置；rdma_pcie_system 把快照投影为 PCIe 拓扑（每 Host 一条 RC↔EP 链），每个 Host 一个真实
+//   host_mem 绑定到其 Root。各 Function 的驱动 probe、建资源、QP 互连与数据传输中：全部 BAR 写以
+//   MemWr TLP 经 RC→EP 送达并经快照解码到设备；设备全部 DMA（CMQ、WQE/SGE、数据、CQE/EQE）以
+//   requester ID 为 Function BDF 的 MemRd/MemWr 经 EP→RC 访问 Host 内存。检查 MMIO TLP 数与解码数
+//   相等、DMA TLP 发出数与 RC 收到数相等且每个 Function 的 BDF 都出现、Host0↔Host1 的 SEND/WRITE
+//   数据一致（驱动经 host_mem 读回设备经 PCIe 写入的数据）、MAILBOX BAR 的 MemWr 被拒绝。
+// 依赖：rdma_pcie_work_pkg、rdma_dpu_adapter_pkg（dpu_common）、rdma_host_mem_adapter、外部
+//   host_mem_manager、rdma_mf_net/rdma_mf_port。
+// 所有权：测试拥有 dpu 系统、PCIe 系统与各 Host 的 host_mem。
 // 生命周期：build_phase 建拓扑与 PCIe 环境，run_phase 运行。
+// 每个 Host 一个 host_mem manager（区间按 Host 错开，host_id 为 Host 号），每个 Function 一个恒等
+// IOVA 的 adapter：PCIe 上没有 IOMMU，设备发出的 IOVA 即 Host 内存地址。
+class rdma_pcie_host_mem_factory extends rdma_dpu_mem_factory;
+  `uvm_object_utils(rdma_pcie_host_mem_factory)
+
+  localparam bit [63:0] REGION_BASE = 64'h0000_0040_0000_0000;
+  localparam bit [63:0] REGION_STRIDE = 64'h0000_0001_0000_0000;
+  localparam bit [63:0] REGION_BYTES = 64'h0000_0000_0100_0000;
+
+  host_mem_api managers[int unsigned];
+
+  // 功能：构造。
+  // 输入/输出及副作用：name 为 UVM 名。
+  // 失败/边界：无。
+  function new(string name = "rdma_pcie_host_mem_factory");
+    super.new(name);
+  endfunction
+
+  // 功能：Function f 的主机内存：其 Host 的 manager（首次使用时建立）之上的恒等 IOVA adapter。
+  // 输入/输出及副作用：可能新建 manager；返回新 adapter。
+  // 失败/边界：无。
+  virtual function rdma_host_mem_api make(rdma_dpu_function f);
+    rdma_host_mem_external_pkg::host_mem_manager manager;
+    rdma_host_mem_adapter adapter;
+    int unsigned h;
+
+    h = f.key.host_id;
+    if (!managers.exists(h)) begin
+      manager = rdma_host_mem_external_pkg::host_mem_manager::type_id::create(
+        $sformatf("pcie_host_mem%0d", h));
+      manager.init_region(REGION_BASE + h * REGION_STRIDE,
+                          REGION_BASE + h * REGION_STRIDE + REGION_BYTES - 1, MODE_BUDDY, 16);
+      manager.set_host_id(h);
+      managers[h] = manager;
+    end
+    adapter = rdma_host_mem_adapter::type_id::create($sformatf("pcie_mem_%0d", f.global_id));
+    adapter.mem = managers[h];
+    return adapter;
+  endfunction
+endclass
+
 class rdma_pcie_rdma_test extends uvm_test;
   `uvm_component_utils(rdma_pcie_rdma_test)
 
   localparam int unsigned BUF_BYTES = 16384;
 
   rdma_dpu_system sys;
+  rdma_pcie_host_mem_factory mems;
   rdma_pcie_system pcie;
   rdma_mf_net net;
   bit [47:0] macs[$];
@@ -40,14 +85,16 @@ class rdma_pcie_rdma_test extends uvm_test;
                  status == null ? "null" : status.convert2string()))
   endfunction
 
-  // 功能：注册 PCIe 覆盖，声明并 build dpu 拓扑（mock 内存，每 Function 独立域），建 PCIe 系统。
+  // 功能：注册 PCIe 覆盖，声明并 build dpu 拓扑（每 Host 一个 host_mem），建 PCIe 系统并交给它
+  //   各 Host 的内存。
   // 输入/输出及副作用：创建 sys 与 pcie 组件。
   // 失败/边界：失败报告 UVM_FATAL。
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
     rdma_pcie_system::install_overrides();
     sys = rdma_dpu_system::type_id::create("pcie_dpu");
-    sys.mem_factory = rdma_mock_mem_factory::type_id::create("pcie_mem_factory");
+    mems = rdma_pcie_host_mem_factory::type_id::create("pcie_mem_factory");
+    sys.mem_factory = mems;
     sys.add_host(0);
     sys.add_host(1);
     sys.add_function(0, 0, DPU_FUNCTION_PF, 0);
@@ -56,10 +103,11 @@ class rdma_pcie_rdma_test extends uvm_test;
     expect_ok("dpu system build", sys.build());
     pcie = rdma_pcie_system::type_id::create("pcie", this);
     pcie.dpu = sys;
+    pcie.host_mems = mems.managers;
   endfunction
 
   // 功能：接网络、启动 NIC，经 PCIe probe 全部 Function 并建资源；Host0 PF0/VF1 各与 Host1 PF0 建
-  //   一对 RC QP 并传数据；最后检查 MMIO 计数与 MAILBOX 拒绝。
+  //   一对 RC QP 并传数据；最后检查 DMA 与 MMIO 计数、MAILBOX 拒绝。
   // 输入/输出及副作用：持有 objection。
   // 失败/边界：以 UVM_ERROR/FATAL 报告。
   task run_phase(uvm_phase phase);
@@ -75,6 +123,7 @@ class rdma_pcie_rdma_test extends uvm_test;
     end
     transfer(0, 2);
     transfer(1, 2);
+    check_dma();
     check_mmio();
     phase.drop_objection(this);
   endtask
@@ -251,6 +300,37 @@ class rdma_pcie_rdma_test extends uvm_test;
         `uvm_error("PCIE_RDMA", $sformatf("WRITE %0d->%0d byte %0d differs", a, b, k))
         break;
       end
+  endtask
+
+  // 功能：设备 DMA 全部经 PCIe：EP 发出的 MemRd/MemWr 都到达 RC（数量相等且均非零），每个 Function
+  //   的 BDF 都以 requester ID 出现，RC 收到的请求都来自这些 BDF。
+  // 输入/输出及副作用：只读计数。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task check_dma();
+    int unsigned seen;
+    bit counted[bit [15:0]];
+
+    #1us;
+    `uvm_info("PCIE_RDMA", $sformatf("DMA TLPs: MemRd %0d/%0d, MemWr %0d/%0d (EP sent/RC served)",
+                                     pcie.dma_read_tlps, pcie.host_reads, pcie.dma_write_tlps,
+                                     pcie.host_writes), UVM_LOW)
+    if (pcie.dma_read_tlps == 0 || pcie.dma_write_tlps == 0 ||
+        pcie.host_reads != pcie.dma_read_tlps || pcie.host_writes != pcie.dma_write_tlps)
+      `uvm_error("PCIE_RDMA", "device DMA TLPs sent by the EPs and served by the RCs differ")
+    seen = 0;
+    foreach (sys.nodes[i]) begin
+      if (!pcie.host_requesters.exists(sys.nodes[i].func.pcie_id.bdf))
+        `uvm_error("PCIE_RDMA", $sformatf("%s BDF %04h issued no DMA",
+                                          dpu_function_key_name(sys.nodes[i].func.key),
+                                          sys.nodes[i].func.pcie_id.bdf))
+      else if (!counted.exists(sys.nodes[i].func.pcie_id.bdf)) begin
+        // 不同 Host 的 Function 可有相同 BDF（各自的 PCIe 域），只计一次。
+        counted[sys.nodes[i].func.pcie_id.bdf] = 1'b1;
+        seen += pcie.host_requesters[sys.nodes[i].func.pcie_id.bdf];
+      end
+    end
+    if (seen != pcie.host_reads + pcie.host_writes)
+      `uvm_error("PCIE_RDMA", "RC served DMA requests from an unknown requester ID")
   endtask
 
   // 功能：每次驱动 BAR 写都是一个 MemWr TLP 且在 EP 被解码到设备（发送数 = 各 BAR 记录数之和 =
