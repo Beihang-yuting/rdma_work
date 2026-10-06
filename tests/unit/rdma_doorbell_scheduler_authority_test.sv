@@ -116,8 +116,7 @@ class rdma_doorbell_scheduler_authority_test extends rdma_doorbell_scheduler_tes
     expect_status("AUTHORITY_CONFIGURE",
                   scheduler.configure(mem_api, pcie_api), RDMA_SC_OK);
 
-    binding = make_binding("authority_binding", 64'h1234, 7, 3,
-                           64'h0000_0000_7000_0000);
+    binding = make_binding("authority_binding", 64'h1234, 7, 3);
     desc = make_desc("authority_desc", binding);
     factory = uvm_factory::get();
 
@@ -181,8 +180,7 @@ class rdma_doorbell_scheduler_authority_test extends rdma_doorbell_scheduler_tes
     // 场景三：binding validator 返回 null；authority 入口同样必须保持非空状态。
     // 直接构造 hostile subtype，避免让 binding factory override 改写 fixture
     //   的 constructor-owned identity/BAR 拓扑；source_binding 只提供合法值图。
-    source_binding = make_binding("authority_null_binding_source", 64'h5678,
-                                  8, 4, 64'h0000_0000_7100_0000);
+    source_binding = make_binding("authority_null_binding_source", 64'h5678, 8, 4);
     null_binding = new("authority_null_binding");
     null_binding.copy(source_binding);
     binding = null_binding;
@@ -258,6 +256,7 @@ class rdma_doorbell_scheduler_reset_epoch_test
     rdma_doorbell_blocking_pcie blocking_pcie;
     rdma_doorbell_scheduler scheduler;
     rdma_function_binding binding;
+    rdma_function_identity route;
     rdma_doorbell_desc first_desc;
     rdma_doorbell_desc second_desc;
     rdma_doorbell_result first_result;
@@ -290,12 +289,13 @@ class rdma_doorbell_scheduler_reset_epoch_test
     expect_status("RESET_EPOCH_CONFIGURE",
                   scheduler.configure(mem_api, pcie_api), RDMA_SC_OK);
 
-    binding = make_binding("reset_epoch_binding", 64'h9a9a, 11, 5,
-                           64'h0000_0000_7200_0000);
-    // make_binding 为 legacy fixture（epoch=0）；这里显式建立非零 epoch，
+    binding = make_binding("reset_epoch_binding", 64'h9a9a, 11, 5);
+    // make_binding 的 identity epoch 为 0；这里沿同一 dpu_common route 显式建立非零 epoch，
     //   使 scheduler 能区分“未知旧 fixture”与真实 reset 代际漂移。
+    route = binding.function_identity_snapshot();
     status = binding.configure_identity_from_legacy_mirrors(
-      16'h0, 32'h1, RDMA_FUNCTION_PF, 16'h0, 64'd1
+      route.key.root_id, route.key.host_topology_key, route.key.function_kind,
+      route.key.vf_index, 64'd1
     );
     if (status == null || !status.ok()) begin
       `uvm_error("RESET_EPOCH_SETUP",
@@ -343,7 +343,8 @@ class rdma_doorbell_scheduler_reset_epoch_test
         wait (blocking_pcie.barrier_entered);
         #1ns;
         status = binding.configure_identity_from_legacy_mirrors(
-          16'h0, 32'h1, RDMA_FUNCTION_PF, 16'h0, 64'd2
+          route.key.root_id, route.key.host_topology_key, route.key.function_kind,
+          route.key.vf_index, 64'd2
         );
         epoch_update_ok = (status != null && status.ok());
         #1ns;

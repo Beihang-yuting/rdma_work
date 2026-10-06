@@ -1,10 +1,65 @@
 // 目录：测试支撑层 tests/support/rdma_dpu_test_bar.sv。
 // 层：测试支撑。
-// 职责：单设备单元测试的 dpu_common 连线：声明 Host0 上 PF0 及 vf_count 个 VF，解析冻结快照，取第
-//   pick 个 Function，驱动的 BAR 写经快照 BAR0 解码送到给定设备；并记录 BAR 内偏移与值供断言。
+// 职责：单元测试的 dpu_common 夹具：rdma_dpu_test_topology 声明 Host0（可指定 segment）上 PF0 及
+//   vf_count 个 VF 并解析冻结快照；rdma_dpu_test_bar 取第 pick 个 Function，驱动的 BAR 写经快照 BAR0
+//   解码送到给定设备，并记录 BAR 内偏移与值供断言。
 // 依赖：rdma_dpu_adapter_pkg（dpu_common）、rdma_dev。
 // 所有权：快照与路由器由本对象持有；设备只借用。
 // 生命周期：随测试存在。
+class rdma_dpu_test_topology extends uvm_object;
+  `uvm_object_utils(rdma_dpu_test_topology)
+
+  // 功能：构造。
+  // 输入/输出及副作用：name 为 UVM 名。
+  // 失败/边界：无。
+  function new(string name = "rdma_dpu_test_topology");
+    super.new(name);
+  endfunction
+
+  // 功能：解析 Host0（segment 为负时取 0）上 PF0 + VF1..VF<vf_count> 的拓扑。
+  // 输入/输出及副作用：snapshot/funcs 输出（快照顺序：PF0、VF1…）。
+  // 失败/边界：解析失败报告 UVM_FATAL。
+  static function void resolve(string name, int unsigned vf_count, int segment,
+                               output dpu_device_snapshot snapshot,
+                               output rdma_dpu_function funcs[$]);
+    dpu_device_cfg cfg;
+    rdma_status status;
+
+    cfg = dpu_device_cfg::type_id::create({name, "_dpu_cfg"});
+    rdma_dpu_topology::add_host(cfg, 0, segment);
+    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_PF, 0);
+    for (int unsigned v = 1; v <= vf_count; v++)
+      rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_VF, v);
+    status = rdma_dpu_topology::resolve(cfg, snapshot, funcs);
+    if (!status.ok() || funcs.size() != vf_count + 1)
+      `uvm_fatal("DPU_TEST", $sformatf("%s: dpu_common topology failed: %s", name,
+                                       status.convert2string()))
+  endfunction
+
+  // 功能：取上述拓扑第 pick 个 Function 的 rdma_function_binding（state 为 DISCOVERED）。
+  // 输入/输出及副作用：返回新 binding；f 输出该 Function 投影。
+  // 失败/边界：pick 越界或投影失败报告 UVM_FATAL。
+  static function rdma_function_binding binding(string name, output rdma_dpu_function f,
+                                                input int unsigned vf_count = 0,
+                                                input int unsigned pick = 0,
+                                                input int segment = -1);
+    dpu_device_snapshot snapshot;
+    rdma_dpu_function funcs[$];
+    rdma_function_binding b;
+    rdma_status status;
+
+    resolve(name, vf_count, segment, snapshot, funcs);
+    if (pick >= funcs.size())
+      `uvm_fatal("DPU_TEST", $sformatf("%s: no Function %0d", name, pick))
+    f = funcs[pick];
+    status = f.binding(b);
+    if (!status.ok())
+      `uvm_fatal("DPU_TEST", $sformatf("%s: binding projection failed: %s", name,
+                                       status.convert2string()))
+    return b;
+  endfunction
+endclass
+
 class rdma_dpu_test_bar extends rdma_dpu_bar;
   `uvm_object_utils(rdma_dpu_test_bar)
 
@@ -26,21 +81,13 @@ class rdma_dpu_test_bar extends rdma_dpu_bar;
   // 失败/边界：解析失败或 pick 越界报告 UVM_FATAL。
   static function rdma_dpu_test_bar make(string name, rdma_dev dev, int unsigned vf_count = 0,
                                          int unsigned pick = 0);
-    dpu_device_cfg cfg;
     rdma_dpu_function funcs[$];
     rdma_dpu_test_bar bar;
-    rdma_status status;
 
-    cfg = dpu_device_cfg::type_id::create({name, "_dpu_cfg"});
-    rdma_dpu_topology::add_host(cfg, 0);
-    rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_PF, 0);
-    for (int unsigned v = 1; v <= vf_count; v++)
-      rdma_dpu_topology::add_function(cfg, 0, 0, DPU_FUNCTION_VF, v);
     bar = rdma_dpu_test_bar::type_id::create(name);
-    status = rdma_dpu_topology::resolve(cfg, bar.snapshot, funcs);
-    if (!status.ok() || pick >= funcs.size())
-      `uvm_fatal("DPU_TEST_BAR", $sformatf("%s: dpu_common topology failed: %s", name,
-                                           status.convert2string()))
+    rdma_dpu_test_topology::resolve(name, vf_count, -1, bar.snapshot, funcs);
+    if (pick >= funcs.size())
+      `uvm_fatal("DPU_TEST_BAR", $sformatf("%s: no Function %0d", name, pick))
     bar.router = rdma_dpu_bar_router::type_id::create({name, "_router"});
     bar.router.snapshot = bar.snapshot;
     bar.router.attach(funcs[pick], dev);

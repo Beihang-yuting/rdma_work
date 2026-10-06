@@ -29,7 +29,11 @@ BAR0/MAILBOX/MSI-X 取自快照。驱动的 doorbell 写为 BAR0（驱动 `pf->h
 MSI-X 与 BAR 外地址拒绝（这两个 BAR 只分配，寄存器与中断未建模）。e2e 的 net_packet Function
 identity 也由快照生成。multifunc（2 Host、5 Function）与 tb 节点（每节点一台 DPU、Host0 PF0）
 走这条路径；驱动层单元测试（cmq/dev/verbs/data/reliability）经 `tests/support/rdma_dpu_test_bar.sv`
-同样由 dpu_common 解析 Function 与 BAR（drv_dev 测试取 Host0 VF3，global ID 3）。
+同样由 dpu_common 解析 Function 与 BAR（drv_dev 测试取 Host0 VF3，global ID 3）。老模型层把 binding 当正常
+Function 用的测试（cmq_engine/golden、doorbell_scheduler 及其 barrier/authority/reset_epoch、
+adapter_contract）的 binding 由 `rdma_dpu_function::binding()` 从快照投影（notify 窗口 = BAR0 + 0x2000，
+DMA domain = segment）；只保留测试自身的句柄 UID/generation、PASID 与运行期就绪位。binding 值对象的
+复制/校验/溢出边界测试（model、function_identity、context_backing_contract、host_mem_adapter）保留字面量。
 
 ## 2. 关键约定
 

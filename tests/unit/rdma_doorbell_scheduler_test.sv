@@ -511,52 +511,33 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     end
   endfunction
 
-  // 功能：构造 active PF binding fixture，填充稳定 Function identity、BAR0 notify 窗口、
-  //   queue DMA authority、中断向量和必需 capability。
-  // 输入/输出及副作用：name/function_uid/function_id/generation/bar_base 被复制；
-  //   返回新 binding，其 BDF bus 取 function_id 低 8 位，不修改任何输入对象。
-  // 失败/边界：factory 必须返回非空 binding；legacy identity 配置失败会报
-  //   UVM_ERROR，本辅助函数不替 DUT 执行输入合法性检查。
+  // 功能：构造 active binding fixture：Function 取 dpu_common 拓扑（Host0：PF0 + VF1..VF11）中
+  //   global ID = function_id 的那个，BDF、BAR0、notify 窗口（BAR0 + 0x2000）、DMA domain 与能力
+  //   取自快照投影；测试句柄所用的 function_uid/generation 按参数覆盖（沿快照 route 重建 identity），
+  //   并补上运行期就绪位与中断向量。
+  // 输入/输出及副作用：返回新 binding，不修改任何输入对象。
+  // 失败/边界：function_id 超出 0..11 或快照 global ID 不符报告 UVM_FATAL；identity 重建失败报
+  //   UVM_ERROR。
   function automatic rdma_function_binding make_binding(
     string name,
     longint unsigned function_uid,
     int unsigned function_id,
-    int unsigned generation,
-    longint unsigned bar_base
+    int unsigned generation
   );
     rdma_function_binding binding;
+    rdma_dpu_function dpu;
     rdma_interrupt_vector_binding vector;
-    binding = rdma_function_binding::type_id::create(name);
+
+    binding = rdma_dpu_test_topology::binding(name, dpu, 11, function_id);
+    if (dpu.global_id != function_id)
+      `uvm_fatal("BINDING", $sformatf("dpu_common global ID %0d, expected %0d", dpu.global_id,
+                                      function_id))
     binding.function_uid = function_uid;
-    binding.global_function_id = function_id;
     binding.generation = generation;
-    binding.pcie.bdf = '{segment:16'h0, bus:function_id[7:0],
-                         device:5'h1, function_num:3'h0};
-    if (!binding.configure_identity_from_legacy_mirrors(
-          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
-      `uvm_error("BINDING", "legacy binding identity configuration failed")
-    binding.pcie.bar[0].base.value = bar_base;
-    binding.pcie.bar[0].size = 64'h4000;
-    binding.pcie.bar[0].enabled = 1'b1;
-    binding.notify_bar_id = 3'd0;
-    binding.notify_base.value = bar_base + 64'h2000;
-    binding.notify_size = 64'h2000;
+    if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+      `uvm_error("BINDING", "binding identity resynchronization failed")
     binding.state = RDMA_BIND_ACTIVE;
     binding.owner_h = binding.make_handle();
-    binding.queue_dma.requester_bdf = binding.pcie.bdf;
-    binding.queue_dma.pasid_valid = 1'b0;
-    binding.queue_dma.pasid = '0;
-    binding.queue_dma.dma_domain_valid = 1'b1;
-    binding.queue_dma.dma_domain_id = 32'h1122_3344;
-    binding.queue_caps.min_cq_depth = 16;
-    binding.queue_caps.max_cq_depth = 32768;
-    binding.queue_caps.min_srq_depth = 16;
-    binding.queue_caps.max_srq_depth = 32768;
-    binding.queue_caps.max_ceq_depth = 4096;
-    binding.queue_caps.max_aeq_depth = 4096;
-    binding.queue_caps.max_wq_sge = 8;
-    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
-    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
     vector = '{default:'0};
     vector.function_local_vector = 3;
     vector.hardware_eq_vector = 17;
@@ -1782,6 +1763,9 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     rdma_function_binding snapshot_binding;
     rdma_function_binding rebound_binding_old;
     rdma_function_binding rebound_binding_new;
+    longint unsigned saved_notify;
+    longint unsigned saved_bar_base;
+    longint unsigned saved_bar_size;
     rdma_function_handle function_a;
     rdma_function_handle function_b;
     rdma_dma_request_context request_context;
@@ -1852,10 +1836,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
     expect_status("CONFIGURE", scheduler.configure(mem_api, pcie_api),
                   RDMA_SC_OK);
 
-    binding_a = make_binding("binding_a", 64'haaaa, 1, 9,
-                             64'h0000_0000_8000_0000);
-    binding_b = make_binding("binding_b", 64'hbbbb, 2, 4,
-                             64'h0000_0000_9000_0000);
+    binding_a = make_binding("binding_a", 64'haaaa, 1, 9);
+    binding_b = make_binding("binding_b", 64'hbbbb, 2, 4);
     function_a = binding_a.make_handle();
     function_b = binding_b.make_handle();
     request_context = rdma_dma_request_context::type_id::create(
@@ -1952,14 +1934,17 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                     RDMA_SC_INVALID_ARGUMENT, mem, pcie, trace);
 
     desc = make_desc("address_overflow", binding_a);
+    saved_notify = binding_a.notify_base.value;
+    saved_bar_base = binding_a.pcie.bar[0].base.value;
+    saved_bar_size = binding_a.pcie.bar[0].size;
     binding_a.notify_base.value = 64'hffff_ffff_ffff_e000;
     binding_a.pcie.bar[0].base.value = 64'hffff_ffff_ffff_e000;
     binding_a.pcie.bar[0].size = 64'h2000;
     expect_rejected("ADDRESS_OVERFLOW", scheduler, binding_a, desc,
                     RDMA_SC_INVALID_ARGUMENT, mem, pcie, trace);
-    binding_a.notify_base.value = 64'h0000_0000_8000_2000;
-    binding_a.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
-    binding_a.pcie.bar[0].size = 64'h4000;
+    binding_a.notify_base.value = saved_notify;
+    binding_a.pcie.bar[0].base.value = saved_bar_base;
+    binding_a.pcie.bar[0].size = saved_bar_size;
 
     desc = make_desc("width_mismatch", binding_a);
     desc.width = 4;
@@ -2119,8 +2104,7 @@ class rdma_doorbell_scheduler_test extends uvm_test;
                   concurrent_scheduler.configure(mem_api, blocking_pcie_api),
                   RDMA_SC_OK);
 
-    snapshot_binding = make_binding("snapshot_binding", 64'haaaa, 1, 9,
-                                    64'h0000_0000_8000_0000);
+    snapshot_binding = make_binding("snapshot_binding", 64'haaaa, 1, 9);
     snapshot_desc = make_desc("snapshot_desc", snapshot_binding);
     add_two_dependencies(snapshot_desc, mapping,
                          snapshot_desc.function_h);
@@ -2319,10 +2303,8 @@ class rdma_doorbell_scheduler_test extends uvm_test;
 
     // 锁 identity 故意排除 generation：同一 immutable Function 的旧/新 incarnation
     //   即使使用两个 binding 对象，也必须串行。
-    rebound_binding_old = make_binding("rebound_old", 64'hcccc, 3, 1,
-                                       64'h0000_0000_a000_0000);
-    rebound_binding_new = make_binding("rebound_new", 64'hcccc, 3, 2,
-                                       64'h0000_0000_a000_0000);
+    rebound_binding_old = make_binding("rebound_old", 64'hcccc, 3, 1);
+    rebound_binding_new = make_binding("rebound_new", 64'hcccc, 3, 2);
     first_desc = make_desc("old_incarnation", rebound_binding_old);
     second_desc = make_desc("new_incarnation", rebound_binding_new);
     first_desc.timeout = 100ns;

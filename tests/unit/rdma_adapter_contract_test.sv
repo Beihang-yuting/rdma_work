@@ -41,23 +41,28 @@ endclass
 class rdma_adapter_contract_test extends uvm_test;
   `uvm_component_utils(rdma_adapter_contract_test)
 
+  // 测试 Function 的 dpu_common 投影（见 fixture_dpu）。
+  rdma_dpu_function dpu;
+
   // 功能：构造 rdma_adapter_contract_test，调用 super.new 建立 UVM 层级对象；外部依赖字段保持未绑定，后续由 configure/build/activate 明确注入。
   // 输入/输出及副作用：name、parent（输入）；new 只写入构造体列出的默认字段并返回 void，外部依赖与资源所有权仍由上层管理。
   // 失败/边界：rdma_adapter_contract_test 构造只建立本地初始状态，不接管外部 Host-memory、PCIe 或 manager；未完成后续 configure/build/activate 时，业务入口必须返回 INVALID_STATE。
   function new(string name = "rdma_adapter_contract_test",
                uvm_component parent = null);
     super.new(name, parent);
+    dpu = null;
   endfunction
 
-  // 功能：make_function_handle 创建独立的 rdma_function_handle；根据 name 设置字段 function_h、function_h.function_uid、function_h.object_id、function_h.generation，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）；make_function_handle 读取 name 并使用字段 function_h、function_h.function_uid、function_h.object_id、function_h.generation；函数返回 rdma_function_handle，不取得调用方资源所有权。
-  // 失败/边界：make_function_handle 的结果直接由 return function_h 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：make_function_handle 创建测试 Function 的句柄：UID 与 object_id（global Function ID）取自
+  //   dpu_common 投影，generation 17。
+  // 输入/输出及副作用：name（输入）；返回新句柄，不取得调用方资源所有权。
+  // 失败/边界：同 fixture_dpu。
   function automatic rdma_function_handle make_function_handle(string name);
     rdma_function_handle function_h;
 
     function_h = rdma_function_handle::type_id::create(name);
-    function_h.function_uid = 64'h1234_5678_9abc_def0;
-    function_h.object_id = 32'h1020_3040;
+    function_h.function_uid = fixture_dpu().uid();
+    function_h.object_id = fixture_dpu().global_id;
     function_h.generation = 32'd17;
     return function_h;
   endfunction
@@ -85,42 +90,41 @@ class rdma_adapter_contract_test extends uvm_test;
     return result;
   endfunction
 
-  // 功能：make_binding 创建独立的 rdma_function_binding；根据 name 设置字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled、binding.notify_bar_id、notify_base.value，返回对象仅由调用方持有，不转移外部资源所有权。
-  // 输入/输出及副作用：name（输入）；make_binding 读取 name 并使用字段 binding、binding.function_uid、binding.global_function_id、binding.generation、pcie.bdf、base.value、size、enabled；函数返回 rdma_function_binding，不取得调用方资源所有权。
-  // 失败/边界：make_binding 的结果直接由 return binding 计算；输入不满足表达式条件时沿函数体的保守分支返回，不修改已发布账本。
+  // 功能：测试 Function 的 dpu_common 投影（Host0：PF0 + VF1，取 VF1；segment 0x1122），首次调用时
+  //   解析并缓存。
+  // 输入/输出及副作用：可能写 dpu。
+  // 失败/边界：解析失败报告 UVM_FATAL。
+  function rdma_dpu_function fixture_dpu();
+    rdma_function_binding unused;
+
+    if (dpu == null)
+      unused = rdma_dpu_test_topology::binding("adapter_contract", dpu, 1, 1, 'h1122);
+    return dpu;
+  endfunction
+
+  // 功能：测试 Function 的 DMA domain（= dpu_common PCIe segment）。
+  // 输入/输出及副作用：纯查询。
+  // 失败/边界：同 fixture_dpu。
+  function int unsigned dma_domain();
+    return fixture_dpu().pcie_id.domain.segment_id;
+  endfunction
+
+  // 功能：make_binding 创建独立的 rdma_function_binding：identity、BDF、BAR、notify 窗口、DMA domain
+  //   与能力取自测试 Function 的 dpu_common 投影；generation 17 与 PASID（dpu_common 不管理）、中断
+  //   向量由测试补上。
+  // 输入/输出及副作用：name（输入）；返回新 binding，不取得调用方资源所有权。
+  // 失败/边界：投影失败报告 UVM_FATAL；identity 重建失败报告 UVM_ERROR。
   function automatic rdma_function_binding make_binding(string name);
     rdma_function_binding binding;
+    rdma_dpu_function f;
     rdma_interrupt_vector_binding vector;
 
-    binding = rdma_function_binding::type_id::create(name);
-    binding.function_uid = 64'h1234_5678_9abc_def0;
-    binding.global_function_id = 32'h1020_3040;
+    binding = rdma_dpu_test_topology::binding(name, f, 1, 1, 'h1122);
     binding.generation = 32'd17;
-    binding.pcie.bdf = '{segment:16'h1, bus:8'h22, device:5'h3,
-                         function_num:3'h4};
-    if (!binding.configure_identity_from_legacy_mirrors(
-          16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
-      `uvm_error("BINDING", "legacy binding identity configuration failed")
-    binding.pcie.bar[0].base.value = 64'h8000_0000;
-    binding.pcie.bar[0].size = 64'h4000;
-    binding.pcie.bar[0].enabled = 1'b1;
-    binding.notify_bar_id = 0;
-    binding.notify_base.value = 64'h8000_2000;
-    binding.notify_size = 64'h2000;
-    binding.queue_dma.requester_bdf = binding.pcie.bdf;
+    if (!binding.synchronize_identity_from_legacy_mirrors().ok())
+      `uvm_error("BINDING", "binding identity resynchronization failed")
     binding.queue_dma.pasid_valid = 1'b1;
     binding.queue_dma.pasid = 20'h34567;
-    binding.queue_dma.dma_domain_valid = 1'b1;
-    binding.queue_dma.dma_domain_id = 32'h1122_3344;
-    binding.queue_caps.min_cq_depth = 16;
-    binding.queue_caps.max_cq_depth = 32768;
-    binding.queue_caps.min_srq_depth = 16;
-    binding.queue_caps.max_srq_depth = 32768;
-    binding.queue_caps.max_ceq_depth = 4096;
-    binding.queue_caps.max_aeq_depth = 4096;
-    binding.queue_caps.max_wq_sge = 8;
-    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
-    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
     vector = '{default:'0};
     vector.function_local_vector = 3;
     vector.hardware_eq_vector = 17;
@@ -259,7 +263,7 @@ class rdma_adapter_contract_test extends uvm_test;
                  "non-null backend status was not preserved")
 
     function_h = make_function_handle("function_h");
-    bdf = '{segment:16'h1, bus:8'h22, device:5'h3, function_num:3'h4};
+    bdf = rdma_dpu_function::to_bdf(fixture_dpu().pcie_id);
     owner_h = rdma_handle::type_id::create("dma_owner");
     owner_h.kind = RDMA_RESOURCE_CMQ;
     owner_h.function_uid = function_h.function_uid;
@@ -269,7 +273,7 @@ class rdma_adapter_contract_test extends uvm_test;
       "request_context", function_h, bdf, 1'b1, 20'h34567, owner_h
     );
     request_context.dma_domain_valid = 1'b1;
-    request_context.dma_domain_id = 32'h1122_3344;
+    request_context.dma_domain_id = dma_domain();
     cfg_offset.value = 12'habc;
     bar_address.value = 64'h9000_0040;
 
@@ -369,7 +373,7 @@ class rdma_adapter_contract_test extends uvm_test;
         mapping.function_h.generation != function_h.generation ||
         mapping.requester_bdf != bdf || !mapping.pasid_valid ||
         mapping.pasid != 20'h34567 || !mapping.dma_domain_valid ||
-        mapping.dma_domain_id != 32'h1122_3344 ||
+        mapping.dma_domain_id != dma_domain() ||
         mapping.owner_h == null ||
         mapping.owner_h == request_context.owner_h ||
         !mapping.owner_h.same_instance(request_context.owner_h))
@@ -386,7 +390,7 @@ class rdma_adapter_contract_test extends uvm_test;
         !mem.calls[0].request_context.pasid_valid ||
         mem.calls[0].request_context.pasid != 20'h34567 ||
         !mem.calls[0].request_context.dma_domain_valid ||
-        mem.calls[0].request_context.dma_domain_id != 32'h1122_3344 ||
+        mem.calls[0].request_context.dma_domain_id != dma_domain() ||
         mem.calls[0].request_context.owner_h == null ||
         mem.calls[0].request_context.owner_h.object_id != 32'h4455_6677 ||
         mem.calls[0].size != 4096 || mem.calls[0].alignment != 4096)
@@ -402,7 +406,7 @@ class rdma_adapter_contract_test extends uvm_test;
       mapping.iova, 4096, RDMA_DMA_DEVICE_READ, read_permission), RDMA_SC_OK);
     expect_status("DOMAIN_MISMATCH", mapping.check_access(
       binding.make_handle(), binding.queue_dma.requester_bdf,
-      1'b1, 20'h34567, 1'b1, 32'h1122_3345,
+      1'b1, 20'h34567, 1'b1, dma_domain() + 1,
       mapping.iova, 4096, RDMA_DMA_DEVICE_READ, read_permission),
       RDMA_SC_DMA_TRANSLATION);
     request_context.function_h.generation = 32'd99;
@@ -415,7 +419,7 @@ class rdma_adapter_contract_test extends uvm_test;
     if (mapping.function_h.generation != 17 ||
         mapping.requester_bdf != bdf || !mapping.pasid_valid ||
         mapping.pasid != 20'h34567 || !mapping.dma_domain_valid ||
-        mapping.dma_domain_id != 32'h1122_3344 ||
+        mapping.dma_domain_id != dma_domain() ||
         mapping.owner_h == null ||
         mapping.owner_h.object_id != 32'h4455_6677 ||
         mem.calls[0].request_context.function_h.generation != 17 ||
@@ -423,7 +427,7 @@ class rdma_adapter_contract_test extends uvm_test;
         !mem.calls[0].request_context.pasid_valid ||
         mem.calls[0].request_context.pasid != 20'h34567 ||
         !mem.calls[0].request_context.dma_domain_valid ||
-        mem.calls[0].request_context.dma_domain_id != 32'h1122_3344 ||
+        mem.calls[0].request_context.dma_domain_id != dma_domain() ||
         mem.calls[0].request_context.owner_h.object_id != 32'h4455_6677 ||
         mem.regions.size() != 1 || mem.regions[0].mapping == null ||
         mem.regions[0].mapping.function_h.generation != 17 ||
@@ -431,7 +435,7 @@ class rdma_adapter_contract_test extends uvm_test;
         !mem.regions[0].mapping.pasid_valid ||
         mem.regions[0].mapping.pasid != 20'h34567 ||
         !mem.regions[0].mapping.dma_domain_valid ||
-        mem.regions[0].mapping.dma_domain_id != 32'h1122_3344 ||
+        mem.regions[0].mapping.dma_domain_id != dma_domain() ||
         mem.regions[0].mapping.owner_h == null ||
         mem.regions[0].mapping.owner_h.object_id != 32'h4455_6677)
       `uvm_error("HOST_CONTEXT_SNAPSHOT",

@@ -20,9 +20,6 @@ endclass
 class rdma_cmq_engine_test extends uvm_test;
   `uvm_component_utils(rdma_cmq_engine_test)
 
-  localparam longint unsigned TEST_FUNCTION_UID = 64'h1020_3040_5060_7080;
-  localparam int unsigned TEST_FUNCTION_ID = 32'h1020_3040;
-  localparam int unsigned TEST_GENERATION = 32'd9;
   localparam int unsigned TEST_CMQ_ID = 32'h5566_7788;
   localparam int unsigned CMQ_DEPTH = 32;
 
@@ -49,43 +46,22 @@ class rdma_cmq_engine_test extends uvm_test;
                                   status.code.name(), status.convert2string()))
   endfunction
 
-  // 功能：构造测试用 Function binding（固定 uid/BDF/BAR/notify 窗口与队列能力）。
+  // 功能：构造测试用 Function binding：identity、BDF、BAR0、notify 窗口、DMA domain 与能力取自
+  //   dpu_common 快照（Host0 PF0，segment 0x1122）；PASID（dpu_common 不管理）、state、owner、
+  //   运行期就绪位与中断向量由测试补上。
   // 输入/输出及副作用：返回新 binding，调用方独占。
-  // 失败/边界：identity 配置失败时报告 UVM_ERROR。
+  // 失败/边界：拓扑解析或投影失败报告 UVM_FATAL。
   function automatic rdma_function_binding make_binding(string name,
                                                         rdma_binding_state_e binding_state);
     rdma_function_binding binding;
+    rdma_dpu_function dpu;
     rdma_interrupt_vector_binding vector;
 
-    binding = rdma_function_binding::type_id::create(name);
-    binding.function_uid = TEST_FUNCTION_UID;
-    binding.global_function_id = TEST_FUNCTION_ID;
-    binding.generation = TEST_GENERATION;
-    binding.pcie.bdf = '{segment:16'h0001, bus:8'h42, device:5'h03, function_num:3'h1};
-    if (!binding.configure_identity_from_legacy_mirrors(16'h0, 32'h1, RDMA_FUNCTION_PF).ok())
-      `uvm_error("BINDING", "legacy binding identity configuration failed")
-    binding.pcie.bar[0].base.value = 64'h0000_0000_8000_0000;
-    binding.pcie.bar[0].size = 64'h0001_0000;
-    binding.pcie.bar[0].enabled = 1'b1;
-    binding.notify_bar_id = 0;
-    binding.notify_base.value = 64'h0000_0000_8000_2000;
-    binding.notify_size = 64'h2000;
+    binding = rdma_dpu_test_topology::binding(name, dpu, 0, 0, 'h1122);
     binding.state = binding_state;
     binding.owner_h = binding.make_handle();
-    binding.queue_dma.requester_bdf = binding.pcie.bdf;
     binding.queue_dma.pasid_valid = 1'b1;
     binding.queue_dma.pasid = 20'h34567;
-    binding.queue_dma.dma_domain_valid = 1'b1;
-    binding.queue_dma.dma_domain_id = 32'h1122_3344;
-    binding.queue_caps.min_cq_depth = 16;
-    binding.queue_caps.max_cq_depth = 32768;
-    binding.queue_caps.min_srq_depth = 16;
-    binding.queue_caps.max_srq_depth = 32768;
-    binding.queue_caps.max_ceq_depth = 4096;
-    binding.queue_caps.max_aeq_depth = 4096;
-    binding.queue_caps.max_wq_sge = 8;
-    binding.queue_caps.max_queue_ring_bytes = 32'h0020_0000;
-    binding.queue_caps.max_sgb_bytes = 32'h0040_0000;
     vector = '{default:'0};
     vector.function_local_vector = 3;
     vector.hardware_eq_vector = 17;

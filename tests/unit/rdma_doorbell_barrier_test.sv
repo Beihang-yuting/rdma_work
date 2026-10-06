@@ -289,8 +289,8 @@ class rdma_doorbell_barrier_test extends rdma_doorbell_scheduler_test;
     int unsigned cases;
 
     phase.raise_objection(this);
-    a = make_binding("barrier_a", 64'h23501, 1, 1, 64'h40000000);
-    b = make_binding("barrier_b", 64'h23502, 2, 1, 64'h50000000);
+    a = make_binding("barrier_a", 64'h23501, 1, 1);
+    b = make_binding("barrier_b", 64'h23502, 2, 1);
     mem = new("barrier_unused_memory");
     cases = 0;
     fork
