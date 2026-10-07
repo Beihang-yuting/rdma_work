@@ -32,7 +32,7 @@ define RUN_CORE_LOGICAL_TEST
 		"../scripts/check_uvm_summary.sh"
 endef
 
-.PHONY: dpu_common_preflight core cmq_gate sv_style host_mem_preflight host_mem rdma_defs net_packet net_packet_preflight pcie_work pcie_work_preflight e2e regression
+.PHONY: dpu_common_preflight core cmq_gate sv_style host_mem_preflight host_mem rdma_defs net_packet net_packet_preflight pcie_work pcie_work_preflight rxe e2e regression
 
 dpu_common_preflight:
 	@if [[ -z "$(DPU_COMMON_ROOT)" || ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then \
@@ -254,6 +254,22 @@ pcie_work: dpu_common_preflight pcie_work_preflight
 	if [[ "$$test_name" == regression ]]; then test_name=rdma_pcie_rdma_test; fi; \
 	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
 	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
+
+# Soft-RoCE 互打：需先在本机运行 tools/rxe/rxe_tap_setup.sh up（TAP 网卡 + rxe 设备，需 sudo）。
+RXE_TAP ?= rtap0
+
+rxe: dpu_common_preflight net_packet_preflight
+	set -euo pipefail; \
+	mkdir -p build/rxe; \
+	if [[ ! -e /sys/class/net/$(RXE_TAP) ]]; then \
+		echo "TAP $(RXE_TAP) is missing: run tools/rxe/rxe_tap_setup.sh up" >&2; exit 2; fi; \
+	gcc -O2 -Wall -o build/rxe/rxe_peer ../tools/rxe/rxe_peer.c -libverbs; \
+	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/rxe.f > build/rxe/rxe.expanded.f; \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_NET_PACKET +define+RDMA_RXE_TEST +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/rxe/rxe.expanded.f ../src/adapters/rxe/rdma_rxe_dpi.c -top tb_top -o build/rxe/simv; \
+	test_name=$(TEST); \
+	if [[ "$$test_name" == regression ]]; then test_name=rdma_rxe_test; fi; \
+	build/rxe/simv +UVM_TESTNAME=$$test_name +RXE_TAP=$(RXE_TAP) +RXE_PEER=$$(pwd)/build/rxe/rxe_peer | tee build/rxe/$$test_name.log; \
+	../scripts/check_uvm_summary.sh build/rxe/$$test_name.log
 
 e2e: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \

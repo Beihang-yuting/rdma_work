@@ -79,6 +79,12 @@ package rdma_net_packet_adapter_pkg;
     int unsigned corrupted_count;
     longint unsigned delayed_cycles;
     packet last_sent_packet;
+    // RoCEv2 帧的以太网/IPv4 地址（本端为源）；缺省为两节点 loopback 的固定值，与真实对端
+    //   （如 Soft-RoCE）互通时按链路配置。
+    bit [47:0] src_mac;
+    bit [47:0] dst_mac;
+    bit [31:0] src_ip;
+    bit [31:0] dst_ip;
 
     // 功能：构造 net_packet adapter，保存 sink 的非拥有引用并清零统计量。
     // 输入/输出及副作用：name、sink（输入）；初始化本地字段，不创建或释放外部网络环境。
@@ -97,6 +103,10 @@ package rdma_net_packet_adapter_pkg;
       corrupted_count = 0;
       delayed_cycles = 0;
       last_sent_packet = null;
+      src_mac = 48'h0002_0000_0001;
+      dst_mac = 48'h0002_0000_0002;
+      src_ip = 32'h0a00_0001;
+      dst_ip = 32'h0a00_0002;
     endfunction
 
     // 功能：绑定一个 detached Function identity，作为所有网络事务的 authority。
@@ -372,6 +382,7 @@ package rdma_net_packet_adapter_pkg;
       roce.opcode = rocev2_opcode_e'(opcode);
       roce.dest_qp = value.destination_qpn;
       roce.psn = value.psn;
+      roce.ack_req = value.ack_req;
       roce.pkey = 16'hffff;
       roce.deth_q_key = value.deth_qkey;
       roce.deth_src_qp = value.source_qpn;
@@ -394,7 +405,7 @@ package rdma_net_packet_adapter_pkg;
         extension_offset += 4;
       end
       // AtomicETH 顺序：VA(8B)、r_key(4B)、swap/add(8B)、compare(8B)；FetchAdd 的 compare
-      // 置零，仍消费完整 28B 以保持后续 ICRC/payload 偏移正确。
+      // 置零，仍消费完整 28B 以保持后续扩展头偏移正确。
       if (roce.has_atomic_eth()) begin
         roce.atomic_va = read_be64(value.header_bytes, extension_offset);
         roce.atomic_r_key = read_be32(value.header_bytes, extension_offset + 8);
@@ -440,20 +451,17 @@ package rdma_net_packet_adapter_pkg;
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "RDMA packet is null");
       net_value = new();
-      eth = eth_header::create(48'h0002_0000_0002,
-                               48'h0002_0000_0001,
-                               ETHERTYPE_IPV4);
+      eth = eth_header::create(dst_mac, src_mac, ETHERTYPE_IPV4);
       if (!net_value.add_layer(eth))
         return rdma_status::make(RDMA_SC_CODEC_ERROR,
                                  "failed to add Ethernet layer");
 
       case (value.transport)
         RDMA_TRANSPORT_CUSTOM: begin
-          ip4 = ipv4_header::create(32'h0a00_0001, 32'h0a00_0002,
-                                    IP_PROTO_TCP, 64);
+          ip4 = ipv4_header::create(src_ip, dst_ip, IP_PROTO_TCP, 64);
           tcp = tcp_header::create(16'd5044, 16'd5044, 9'h010);
           iwarp = iwarp_header::create();
-          iwarp.queue_number = value.destination_qpn[15:0];
+          iwarp.queue_number = 16'(value.destination_qpn);
           iwarp.sink_stag = value.destination_qpn;
           case (value.opcode)
             RDMA_NET_SEND:              iwarp.rdmap_opcode = 4'd0;
@@ -474,8 +482,7 @@ package rdma_net_packet_adapter_pkg;
           status = populate_roce_header(value, roce);
           if (status == null || !status.ok())
             return status;
-          ip4 = ipv4_header::create(32'h0a00_0001, 32'h0a00_0002,
-                                    IP_PROTO_UDP, 64);
+          ip4 = ipv4_header::create(src_ip, dst_ip, IP_PROTO_UDP, 64);
           udp = udp_header::create(16'd4791, 16'd4791);
           if (!net_value.add_layer(ip4) || !net_value.add_layer(udp) ||
               !net_value.add_layer(roce))
@@ -490,7 +497,8 @@ package rdma_net_packet_adapter_pkg;
       header_bytes = 0;
       foreach (net_value.layer_stack[i])
         header_bytes += net_value.layer_stack[i].get_header_length();
-      target_length = header_bytes + value.payload.size();
+      // RoCEv2 的 ICRC 是负载之后的尾部；pad 由 net_packet 按 PadCnt 补齐。
+      target_length = header_bytes + net_value.get_all_trailers_length() + value.payload.size();
       net_value.payload_mode = PAYLOAD_PATTERN;
       net_value.payload_pattern.delete();
       // net_packet 不识别 XTR URC opcode 的扩展头：URC 把扩展头字节放在 payload 之前原样携带。
@@ -604,6 +612,7 @@ package rdma_net_packet_adapter_pkg;
       value.source_qpn = roce.has_deth() ? roce.deth_src_qp : 0;
       value.deth_qkey = roce.has_deth() ? roce.deth_q_key : 0;
       value.psn = roce.psn;
+      value.ack_req = roce.ack_req;
       full = roce.opcode;
       case (full[7:5])
         3'b000: value.transport = RDMA_TRANSPORT_RC;
@@ -667,7 +676,7 @@ package rdma_net_packet_adapter_pkg;
       return rdma_status::success();
     endfunction
 
-    // 功能：校验 net_packet 各层 verify 结果以及 RoCEv2 ICRC placeholder 的一致性。
+    // 功能：校验 net_packet 各层 verify 结果以及 RoCEv2 ICRC（IBTA Annex A17，net_packet 按 rxe 算法）。
     // 输入/输出及副作用：net_value、payload（输入）；verify 可能读取层字段但不改变 packet 语义。
     // 失败/边界：任何硬错误或 ICRC 不一致返回 CODEC_ERROR；warning 不阻塞接收。
     static function rdma_status validate_net_packet(
@@ -677,7 +686,6 @@ package rdma_net_packet_adapter_pkg;
     );
       string errors[$];
       string warnings[$];
-      bit [31:0] saved_icrc;
 
       if (net_value == null)
         return rdma_status::make(RDMA_SC_CODEC_ERROR,
@@ -687,16 +695,8 @@ package rdma_net_packet_adapter_pkg;
       end
       if (errors.size() != 0)
         return rdma_status::make(RDMA_SC_CODEC_ERROR, errors[0]);
-      if (roce != null && roce.icrc_enable) begin
-        saved_icrc = roce.icrc;
-        roce.calc_fields(payload, PROTO_RAW_PAYLOAD);
-        if (roce.icrc != saved_icrc) begin
-          roce.icrc = saved_icrc;
-          return rdma_status::make(RDMA_SC_CODEC_ERROR,
-                                   "RoCEv2 ICRC mismatch");
-        end
-        roce.icrc = saved_icrc;
-      end
+      if (roce != null && !net_value.verify_rocev2_icrc())
+        return rdma_status::make(RDMA_SC_CODEC_ERROR, "RoCEv2 ICRC mismatch");
       return rdma_status::success();
     endfunction
 
@@ -736,8 +736,11 @@ package rdma_net_packet_adapter_pkg;
         locate_transport_bounds(net_value, PROTO_ROCEV2,
                                 rdma_offset, frame_end);
         payload_offset = rdma_offset + roce.get_header_length();
-        // locate_transport_bounds 已用 UDP length/IP total_length 去掉以太网补齐字节。
-        payload_end = frame_end;
+        // locate_transport_bounds 已用 UDP length/IP total_length 去掉以太网补齐字节；
+        // 负载之后依次是 PadCnt 个 pad 字节与 ICRC 尾部。
+        payload_end = frame_end - roce.get_trailer_length();
+        if (payload_end >= payload_offset + roce.pad_count)
+          payload_end -= roce.pad_count;
         if (payload_end < payload_offset || payload_end > frame_bytes.size())
           return rdma_status::make(RDMA_SC_CODEC_ERROR,
                                    "RoCEv2 payload bounds are invalid");
@@ -752,10 +755,8 @@ package rdma_net_packet_adapter_pkg;
         // header_bytes 与 encode_packet 输入契约一致：只存 BTH 之后的扩展字段，
         // 不含 BTH、DETH（encode 由 source_qpn 等字段生成）和尾部 ICRC，使 decode→encode 可直接复用。
         value.header_bytes.delete();
-        frame_end = payload_offset;
-        if (roce.icrc_enable && frame_end >= 4)
-          frame_end -= 4;
-        for (index = rdma_offset + 12 + (roce.has_deth() ? 8 : 0); index < frame_end; index++)
+        for (index = rdma_offset + 12 + (roce.has_deth() ? 8 : 0); index < payload_offset;
+             index++)
           value.header_bytes.push_back(frame_bytes[index]);
         value.payload.delete();
         for (index = payload_offset; index < payload_end; index++)

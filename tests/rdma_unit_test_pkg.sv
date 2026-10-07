@@ -40,6 +40,9 @@ package rdma_unit_test_pkg;
   import pcie_tl_pkg::*;
   import rdma_pcie_work_pkg::*;
 `endif
+`ifdef RDMA_RXE_TEST
+  import rdma_rxe_pkg::*;
+`endif
   `include "uvm_macros.svh"
 
   `include "mocks/rdma_mock_host_mem.sv"
@@ -65,6 +68,9 @@ package rdma_unit_test_pkg;
 `endif
 `ifdef RDMA_PCIE_WORK_TEST
   `include "integration/rdma_pcie_rdma_test.sv"
+`endif
+`ifdef RDMA_RXE_TEST
+  `include "integration/rdma_rxe_test.sv"
 `endif
 endpackage
 

@@ -60,8 +60,10 @@ typedef enum bit [1:0] {
   RDMA_SEG_LAST   = 2'd3
 } rdma_packet_segment_e;
 
-// AETH syndrome：0x00 为 ACK；0x60|code 为 NAK，code 3 表示 remote access error。
-localparam bit [7:0] RDMA_AETH_ACK = 8'h00;
+// AETH syndrome：bit[7:5] 为类型（000 ACK、001 RNR NAK、011 NAK），ACK 的 bit[4:0] 为信用值；
+//   设备不做端到端信用，ACK 填 0x1F（信用无效，IBTA 9.7.5.1.2，与 Linux rxe 一致）；
+//   NAK 为 0x60|code，code 3 表示 remote access error。
+localparam bit [7:0] RDMA_AETH_ACK = 8'h1f;
 localparam bit [7:0] RDMA_AETH_NAK_REMOTE_ACCESS = 8'h62;
 // RNR NAK（timer 字段取 0）。
 localparam bit [7:0] RDMA_AETH_RNR_NAK = 8'h20;
@@ -93,6 +95,8 @@ class rdma_packet extends uvm_object;
   bit [23:0] destination_qpn;
   bit [23:0] source_qpn;
   bit [23:0] psn;
+  // BTH AckReq：请求方要求响应方对本包回 ACK（RC SEND/WRITE 的末包置位；IBTA 9.7.2）。
+  bit ack_req;
   // header_bytes 是 BTH 之后扩展头的线上字节（IBTA 顺序：RETH、AETH、AtomicETH、
   //   AtomicAckETH、ImmDt），由 pack_headers()/unpack_headers() 与下列结构化字段互转。
   byte unsigned header_bytes[$];
@@ -123,6 +127,7 @@ class rdma_packet extends uvm_object;
     destination_qpn = '0;
     source_qpn = '0;
     psn = '0;
+    ack_req = 1'b0;
     reth_va = '0;
     reth_rkey = '0;
     reth_len = '0;
@@ -305,6 +310,7 @@ class rdma_packet extends uvm_object;
     destination_qpn = rhs_packet.destination_qpn;
     source_qpn = rhs_packet.source_qpn;
     psn = rhs_packet.psn;
+    ack_req = rhs_packet.ack_req;
     header_bytes = rhs_packet.header_bytes;
     reth_va = rhs_packet.reth_va;
     reth_rkey = rhs_packet.reth_rkey;

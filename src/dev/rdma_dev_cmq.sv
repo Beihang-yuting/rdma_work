@@ -438,10 +438,12 @@ class rdma_dev_cmq extends uvm_object;
     bit [1:0] mode;
     rdma_dev_object obj;
     byte unsigned qpc[];
+    int unsigned old_state;
 
     ecode = RDMA_CMQ_SUCCESS_ECODE;
     status = rdma_status::success();
     qpn = rdma_be::field(sqe, RDMA_CMQ_QPN_WORD_BYTE_OFFSET, RDMA_CMQ_QPN_LSB, RDMA_CMQ_QPN_WIDTH);
+    old_state = qp_state(qpn);
     buffer = rdma_be::field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB,
                             RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH) << RDMA_CMQ_QPC_BUFFER_ADDR_LSB;
@@ -465,6 +467,8 @@ class rdma_dev_cmq extends uvm_object;
       objects[RDMA_DEV_QP][qpn] = obj;
       if (opcode == RDMA_OP_QPC_CREATE && nic != null)
         nic.forget(RDMA_DEV_QP, qpn);
+      if (nic != null)
+        nic.qpc_written(qpn, old_state);
       return;
     end
     if (!lookup(RDMA_DEV_QP, qpn, obj)) begin
@@ -489,7 +493,21 @@ class rdma_dev_cmq extends uvm_object;
     else
       apply_partial(qpc, sqe);
     obj.bytes = qpc;
+    if (nic != null)
+      nic.qpc_written(qpn, old_state);
   endtask
+
+  // 功能：QP 当前状态（QPC QP_ST）。
+  // 输入/输出及副作用：纯查询。
+  // 失败/边界：QP 不存在返回 0（RESET）。
+  protected function int unsigned qp_state(int unsigned qpn);
+    rdma_dev_object obj;
+
+    if (!lookup(RDMA_DEV_QP, qpn, obj))
+      return 0;
+    return rdma_be::field(obj.bytes, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
+                          RDMA_QPC_QP_ST_WIDTH);
+  endfunction
 
   // 功能：部分修改：模板 t 的 start_qword/wbe 在 SQE qword2（每模板 16 位），数据在 qword4+t；
   //   wbe 第 7-b 位对应该 qword 的第 b 个字节（大端序，b=0 为最高字节）。

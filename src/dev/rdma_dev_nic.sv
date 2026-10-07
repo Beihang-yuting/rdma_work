@@ -499,6 +499,24 @@ class rdma_dev_nic extends uvm_object;
 
   `define RDMA_QPC(QPN, STEM) qpc_field(QPN, STEM``_WORD_BYTE_OFFSET, STEM``_LSB, STEM``_WIDTH)
 
+  // 功能：QPC 写入后（CREATE/MODIFY）同步设备运行状态中的起始 PSN：QP 新进入 RTR 时期望请求 PSN
+  //   取 QPC EPSN_REQ，由 RTR 进入 RTS 时发送 PSN 取 QPC RC_TPE_CUR_SQ_PSN（驱动 modify 的
+  //   rq_psn/sq_psn）。
+  // 输入/输出及副作用：修改该 QP 的运行状态。
+  // 失败/边界：QP 不存在时无动作。
+  function void qpc_written(int unsigned qpn, int unsigned old_state);
+    rdma_dev_object obj;
+    int unsigned state;
+
+    if (!ctx.lookup(RDMA_DEV_QP, qpn, obj))
+      return;
+    state = `RDMA_QPC(qpn, RDMA_QPC_QP_ST);
+    if (state == QP_ST_RTR && old_state != QP_ST_RTR)
+      qp_rt(qpn).expected_psn = `RDMA_QPC(qpn, RDMA_QPC_EPSN_REQ);
+    if (state == QP_ST_RTS && old_state == QP_ST_RTR)
+      qp_rt(qpn).send_psn = `RDMA_QPC(qpn, RDMA_QPC_RC_TPE_CUR_SQ_PSN);
+  endfunction
+
   // 功能：完成 RTS2SQD（在途 WQE 已在此前的 drain 中完成）：QPC 已是 SQD 则写 AEQE EC_RTS2SQD_DONE，
   //   否则写 EC_RTS2SQD_DB_QP_ST_UNMATCH。
   // 输入/输出及副作用：写 AEQE。
@@ -1119,6 +1137,8 @@ class rdma_dev_nic extends uvm_object;
       pkt.imm = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_RC_IMMEDIATE);
       if (ud)
         pkt.deth_qkey = `RDMA_BE_GET(wqe, RDMA_SQ_WQE_UD_DST_Q_KEY);
+      // RC/URC 的末包要求 ACK（IBTA 9.7.2；IBTA 响应方如 rxe 只对 AckReq=1 的包回 ACK）。
+      pkt.ack_req = !ud && k == count - 1;
       emit(pkt, dmac);
     end
   endtask
@@ -1162,6 +1182,13 @@ class rdma_dev_nic extends uvm_object;
     end
   endtask
 
+  // 功能：AETH 是否为 ACK（类型位 bit[7:5] = 000，bit[4:0] 为信用值，忽略）。
+  // 输入/输出及副作用：纯函数。
+  // 失败/边界：无。
+  protected function bit is_ack(bit [7:0] syndrome);
+    return syndrome[7:5] == 3'b000;
+  endfunction
+
   // 功能：把一个 NAK syndrome 分类：RNR（001xxxxx）、PSN 序列错误（0x60）、其余致命。
   // 输入/输出及副作用：纯函数。
   // 失败/边界：无。
@@ -1190,7 +1217,7 @@ class rdma_dev_nic extends uvm_object;
         outcome = RSP_TIMEOUT;
         return;
       end
-      if (pkt.aeth_syndrome != RDMA_AETH_ACK) begin
+      if (!is_ack(pkt.aeth_syndrome)) begin
         synd = pkt.aeth_syndrome;
         nak_psn = pkt.psn;
         outcome = nak_outcome(pkt.aeth_syndrome);
@@ -1320,7 +1347,7 @@ class rdma_dev_nic extends uvm_object;
       outcome = RSP_TIMEOUT;
       return;
     end
-    if (pkt.opcode != RDMA_NET_ATOMIC_ACK || pkt.aeth_syndrome != RDMA_AETH_ACK) begin
+    if (pkt.opcode != RDMA_NET_ATOMIC_ACK || !is_ack(pkt.aeth_syndrome)) begin
       synd = pkt.aeth_syndrome;
       outcome = nak_outcome(pkt.aeth_syndrome);
       return;
