@@ -266,10 +266,12 @@ rxe: dpu_common_preflight net_packet_preflight
 	gcc -O2 -Wall -o build/rxe/rxe_peer ../tools/rxe/rxe_peer.c -libverbs; \
 	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/rxe.f > build/rxe/rxe.expanded.f; \
 	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_NET_PACKET +define+RDMA_RXE_TEST +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/rxe/rxe.expanded.f ../src/adapters/rxe/rdma_rxe_dpi.c -top tb_top -o build/rxe/simv; \
-	test_name=$(TEST); \
-	if [[ "$$test_name" == regression ]]; then test_name=rdma_rxe_test; fi; \
-	build/rxe/simv +UVM_TESTNAME=$$test_name +RXE_TAP=$(RXE_TAP) +RXE_PEER=$$(pwd)/build/rxe/rxe_peer | tee build/rxe/$$test_name.log; \
-	../scripts/check_uvm_summary.sh build/rxe/$$test_name.log
+	tests=$(TEST); \
+	if [[ "$$tests" == regression ]]; then tests="rdma_rxe_test rdma_rxe_fault_test"; fi; \
+	for test_name in $$tests; do \
+		build/rxe/simv +UVM_TESTNAME=$$test_name +RXE_TAP=$(RXE_TAP) +RXE_PEER=$$(pwd)/build/rxe/rxe_peer | tee build/rxe/$$test_name.log; \
+		../scripts/check_uvm_summary.sh build/rxe/$$test_name.log; \
+	done
 
 e2e: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \

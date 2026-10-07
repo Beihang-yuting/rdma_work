@@ -110,11 +110,16 @@ package rdma_rxe_pkg;
     // 链路空闲时每次推进的仿真时间与等待的真实时间（微秒）。
     time poll_step;
     int unsigned wait_us;
-    // 观测：发出/收到的报文（rx 为解码成功的）、解码失败（非 RoCEv2 或 ICRC 错）的帧数。
+    // 观测：发出/收到的报文（rx 为解码成功的）、解码失败（非 RoCEv2 或 ICRC 错）的帧数、
+    //   注入丢弃的报文。
     rdma_packet tx_log[$];
     rdma_packet rx_log[$];
     int unsigned rx_dropped;
+    rdma_packet tx_lost[$];
+    rdma_packet rx_lost[$];
     protected int fd;
+    protected int unsigned tx_drop_countdown;
+    protected int unsigned rx_drop_countdown;
 
     // 功能：构造未打开的链路。
     // 输入/输出及副作用：name 为 UVM 名。
@@ -125,6 +130,22 @@ package rdma_rxe_pkg;
       poll_step = 100ns;
       wait_us = 200;
       rx_dropped = 0;
+      tx_drop_countdown = 0;
+      rx_drop_countdown = 0;
+    endfunction
+
+    // 功能：故障注入：丢弃此后设备发出的第 k 个报文（k 从 1 起，不写入 TAP，记入 tx_lost）。
+    // 输入/输出及副作用：设置一次性计数。
+    // 失败/边界：k 为 0 时取消。
+    function void drop_tx(int unsigned k);
+      tx_drop_countdown = k;
+    endfunction
+
+    // 功能：故障注入：丢弃此后从 rxe 收到的第 k 个 RoCEv2 报文（不交给 NIC，记入 rx_lost）。
+    // 输入/输出及副作用：设置一次性计数。
+    // 失败/边界：k 为 0 时取消。
+    function void drop_rx(int unsigned k);
+      rx_drop_countdown = k;
     endfunction
 
     // 功能：打开 TAP 网卡。
@@ -151,6 +172,12 @@ package rdma_rxe_pkg;
       byte unsigned data[];
       rdma_status status;
 
+      if (tx_drop_countdown != 0 && --tx_drop_countdown == 0) begin
+        tx_lost.push_back(pkt);
+        `uvm_info("RXE_LINK", $sformatf("tx %s psn %06h dropped (injected)", pkt.opcode.name(),
+                                        pkt.psn), UVM_MEDIUM)
+        return;
+      end
       status = adapter.encode_packet(pkt, frame);
       if (status == null || !status.ok()) begin
         `uvm_error("RXE_LINK", "RoCEv2 encode failed")
@@ -194,6 +221,12 @@ package rdma_rxe_pkg;
           `uvm_info("RXE_LINK", $sformatf("rx %0dB frame dropped: %s", n,
                                           status == null ? "null" : status.convert2string()),
                     UVM_MEDIUM)
+          continue;
+        end
+        if (rx_drop_countdown != 0 && --rx_drop_countdown == 0) begin
+          rx_lost.push_back(pkt);
+          `uvm_info("RXE_LINK", $sformatf("rx %s psn %06h dropped (injected)", pkt.opcode.name(),
+                                          pkt.psn), UVM_MEDIUM)
           continue;
         end
         rx_log.push_back(pkt);

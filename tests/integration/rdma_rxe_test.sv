@@ -3,7 +3,8 @@
 // 职责：仿真 RDMA（驱动模型 + 设备模型）与 Linux Soft-RoCE（rdma_rxe）经 TAP 互打，验证业务流程与
 //   RoCEv2 线上协议：设备发出的帧经 net_packet 编码（ICRC、pad、AckReq），rxe 接受并执行；rxe 的帧
 //   经解码交给设备。双向覆盖 SEND（单包/多包/立即数）、WRITE（含立即数）、READ、FETCH_ADD、CMP_SWAP，
-//   检查两端完成状态、立即数与内存数据，以及链路上没有被丢弃的帧。
+//   检查两端完成状态、立即数与内存数据，以及链路上没有被丢弃的帧。子类 rdma_rxe_fault_test 复用
+//   本类的链路、对端与 QP 对建立（make_pair）覆盖 UD、SRQ、RNR、丢包与错误场景。
 // 前置：tools/rxe/rxe_tap_setup.sh up（TAP + rxe 设备）；+RXE_PEER=<rxe_peer 路径>。
 //   可选：+RXE_TAP（rtap0）、+RXE_DEV（rxe_rtap0）、+RXE_GID（1）、+RXE_IP（10.79.0.2）、
 //   +RXE_SIM_IP（10.79.0.1）、+RXE_SIM_MAC（02:00:00:00:79:01，须与 setup 的静态邻居一致）。
@@ -150,7 +151,7 @@ class rdma_rxe_test extends uvm_test;
     drv = sys.nodes[0].drv;
     setup_resources();
     setup_peer();
-    connect_qps();
+    make_pair("base");
     run_cases();
     `uvm_info("RXE", $sformatf("frames: sim->rxe %0d, rxe->sim %0d, dropped %0d",
                                link.tx_log.size(), link.rx_log.size(), link.rx_dropped), UVM_LOW)
@@ -161,10 +162,10 @@ class rdma_rxe_test extends uvm_test;
     phase.drop_objection(this);
   endtask
 
-  // 功能：双向用例（+RXE_CASES=N 只跑前 N 个，调试用）。
+  // 功能：双向用例（+RXE_CASES=N 只跑前 N 个，调试用）；子类覆盖为其场景。
   // 输入/输出及副作用：见各用例。
   // 失败/边界：以 UVM_ERROR 报告。
-  task run_cases();
+  virtual task run_cases();
     int unsigned limit;
 
     if (!$value$plusargs("RXE_CASES=%d", limit))
@@ -219,7 +220,7 @@ class rdma_rxe_test extends uvm_test;
     join_none
   endtask
 
-  // 功能：PD、CQ、64KiB 数据缓冲与覆盖它的 MR（本地写、远端读写、原子）。
+  // 功能：PD、64KiB 数据缓冲与覆盖它的 MR（本地写、远端读写、原子）。
   // 输入/输出及副作用：创建驱动资源。
   // 失败/边界：失败报告 UVM_FATAL。
   task setup_resources();
@@ -227,8 +228,6 @@ class rdma_rxe_test extends uvm_test;
     rdma_status status;
 
     expect_ok("alloc PD", rdma_drv_pd::alloc(drv, pd));
-    rdma_drv_cq::create_cq(drv, 256, 0, cq, status);
-    expect_ok("create CQ", status);
     expect_ok("alloc buffer", sys.nodes[0].hw.alloc_dma(BUF_BYTES, 4096, data_buf));
     for (int p = 0; p < BUF_BYTES / 4096; p++)
       pages.push_back(data_buf.iova + p * 4096);
@@ -250,32 +249,37 @@ class rdma_rxe_test extends uvm_test;
     reply = peer.cmd($sformatf("mr %0d", BUF_BYTES));
     peer_addr = rdma_rxe_peer::field(reply, "addr");
     peer_rkey = rdma_rxe_peer::field(reply, "rkey");
-    reply = peer.cmd("qp rc");
-    peer_qpn = rdma_rxe_peer::field(reply, "qpn");
   endtask
 
-  // 功能：仿真 RC QP 与 rxe QP 互连：仿真侧 PMTU 1024、不超时（IB timeout 0），rxe 侧 timeout 14、
-  //   重试 7；PSN：仿真发 0x200 起，rxe 发 0x100 起。
-  // 输入/输出及副作用：QP modify。
+  // 功能：新建一对 RC QP 并互连，成为当前 QP 对（qp/cq/peer_qpn）：仿真侧新 CQ（可绑 SRQ）、PMTU 1024、
+  //   min_rnr 1，timeout/retry/rnr_retry 取参数（timeout 0 为不超时）；rxe 侧新 QP，timeout 14、重试 7、
+  //   RNR 重试取 rxe_rnr。PSN：仿真发 0x200 起，rxe 发 0x100 起。先清空 rxe CQ 中的残留完成。
+  // 输入/输出及副作用：创建 CQ/QP，修改当前 QP 对。
   // 失败/边界：失败报告 UVM_FATAL。
-  task connect_qps();
+  task make_pair(string tag, int unsigned timeout = 0, int unsigned retry = 7,
+                 int unsigned rnr_retry = 7, rdma_drv_srq srq = null, int unsigned rxe_rnr = 7);
     rdma_drv_qp_init_attr init;
     rdma_drv_qp_attr attr;
     rdma_status status;
 
-    init = rdma_drv_qp_init_attr::type_id::create("rxe_qp_attr");
+    peer_drain();
+    rdma_drv_cq::create_cq(drv, 256, 0, cq, status);
+    expect_ok({tag, " CQ"}, status);
+    init = rdma_drv_qp_init_attr::type_id::create({tag, "_qp_attr"});
     init.pd = pd;
     init.send_cq = cq;
     init.recv_cq = cq;
+    init.srq = srq;
     rdma_drv_qp::create_qp(drv, init, qp, status);
-    expect_ok("create QP", status);
-    attr = rdma_drv_qp_attr::type_id::create("rxe_init");
+    expect_ok({tag, " QP"}, status);
+    attr = rdma_drv_qp_attr::type_id::create({tag, "_init"});
     attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_ACCESS;
     attr.state = RDMA_DRV_QPS_INIT;
     attr.access = RDMA_RIGHT_REMOTE_READ | RDMA_RIGHT_REMOTE_WRITE | RDMA_RIGHT_REMOTE_ATOMIC;
     qp.modify(drv, attr, status);
-    expect_ok("INIT", status);
-    attr = rdma_drv_qp_attr::type_id::create("rxe_rtr");
+    expect_ok({tag, " INIT"}, status);
+    peer_qpn = rdma_rxe_peer::field(peer.cmd("qp rc"), "qpn");
+    attr = rdma_drv_qp_attr::type_id::create({tag, "_rtr"});
     attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_DEST_QPN |
                 rdma_drv_qp_attr::M_RQ_PSN | rdma_drv_qp_attr::M_PATH_MTU |
                 rdma_drv_qp_attr::M_AV | rdma_drv_qp_attr::M_MIN_RNR;
@@ -286,23 +290,35 @@ class rdma_rxe_test extends uvm_test;
     attr.dmac = rxe_mac;
     attr.min_rnr = 1;
     qp.modify(drv, attr, status);
-    expect_ok("RTR", status);
-    attr = rdma_drv_qp_attr::type_id::create("rxe_rts");
+    expect_ok({tag, " RTR"}, status);
+    attr = rdma_drv_qp_attr::type_id::create({tag, "_rts"});
     attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_SQ_PSN |
-                rdma_drv_qp_attr::M_TIMEOUT;
+                rdma_drv_qp_attr::M_TIMEOUT | rdma_drv_qp_attr::M_RETRY_CNT |
+                rdma_drv_qp_attr::M_RNR_RETRY;
     attr.state = RDMA_DRV_QPS_RTS;
     attr.sq_psn = 24'h200;
-    attr.timeout = 0;
+    attr.timeout = timeout;
+    attr.retry_cnt = retry;
+    attr.rnr_retry = rnr_retry;
     qp.modify(drv, attr, status);
-    expect_ok("RTS", status);
-    void'(peer.cmd($sformatf("rc_connect %0d %0d 0x200 0x100 %s 1024 14 7 7", peer_qpn, qp.qpn,
-                             arg("RXE_SIM_IP", "10.79.0.1"))));
+    expect_ok({tag, " RTS"}, status);
+    void'(peer.cmd($sformatf("rc_connect %0d %0d 0x200 0x100 %s 1024 14 7 %0d", peer_qpn, qp.qpn,
+                             arg("RXE_SIM_IP", "10.79.0.1"), rxe_rnr)));
   endtask
 
-  // 功能：等仿真 CQ 的一个完成（每次 1us 仿真时间，期间链路等待 rxe）。
+  // 功能：取走 rxe CQ 中的全部完成（上一组用例的 flush 等残留）。
+  // 输入/输出及副作用：与对端交互。
+  // 失败/边界：无。
+  function void peer_drain();
+    for (int i = 0; i < 1000 && peer.cmd("poll 0") != "OK none"; i++)
+      ;
+  endfunction
+
+  // 功能：等当前 CQ 的一个完成（每次 1us 仿真时间，期间链路等待 rxe），期望状态为 want。
   // 输入/输出及副作用：wc 输出。
   // 失败/边界：超时报告 UVM_ERROR 并输出 null；wr_id 或状态不符报告 UVM_ERROR。
-  task wait_sim(string label, longint unsigned wr_id, output rdma_drv_wc wc);
+  task wait_sim(string label, longint unsigned wr_id, output rdma_drv_wc wc,
+                input rdma_drv_wc_status_e want = RDMA_DRV_WC_SUCCESS);
     rdma_drv_wc wcs[$];
     rdma_status status;
 
@@ -318,15 +334,17 @@ class rdma_rxe_test extends uvm_test;
       return;
     end
     wc = wcs[0];
-    if (wc.wr_id != wr_id || wc.status != RDMA_DRV_WC_SUCCESS)
-      `uvm_error(label, $sformatf("sim completion wr_id %0d status %s (vendor %02h), expected %0d",
-                                  wc.wr_id, wc.status.name(), wc.vendor_err, wr_id))
+    if (wc.wr_id != wr_id || wc.status != want)
+      `uvm_error(label, $sformatf("sim completion wr_id %0d %s (vendor %02h), expected %0d %s",
+                                  wc.wr_id, wc.status.name(), wc.vendor_err, wr_id, want.name()))
   endtask
 
-  // 功能：等 rxe 的一个完成（非阻塞轮询 + 1us 仿真时间推进，让仿真继续应答）。
+  // 功能：等 rxe 的一个完成（非阻塞轮询 + 1us 仿真时间推进，让仿真继续应答），期望 ibv_wc_status 为
+  //   want（0 成功，9 REM_INV_REQ，10 REM_ACCESS，13 RNR_RETRY_EXC）。
   // 输入/输出及副作用：reply 输出应答行。
-  // 失败/边界：超时或状态非 0、wr_id 不符报告 UVM_ERROR。
-  task wait_peer(string label, longint unsigned wr_id, output string reply);
+  // 失败/边界：超时或状态、wr_id 不符报告 UVM_ERROR。
+  task wait_peer(string label, longint unsigned wr_id, output string reply,
+                 input int unsigned want = 0);
     reply = "OK none";
     for (int t = 0; t < POLL_LIMIT && reply == "OK none"; t++) begin
       reply = peer.cmd("poll 0");
@@ -336,7 +354,7 @@ class rdma_rxe_test extends uvm_test;
     if (reply == "OK none")
       `uvm_error(label, "no completion on the rxe side")
     else if (rdma_rxe_peer::field(reply, "wr_id") != wr_id ||
-             rdma_rxe_peer::field(reply, "status") != 0)
+             rdma_rxe_peer::field(reply, "status") != want)
       `uvm_error(label, {"rxe completion ", reply})
   endtask
 

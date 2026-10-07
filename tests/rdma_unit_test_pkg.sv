@@ -71,6 +71,7 @@ package rdma_unit_test_pkg;
 `endif
 `ifdef RDMA_RXE_TEST
   `include "integration/rdma_rxe_test.sv"
+  `include "integration/rdma_rxe_fault_test.sv"
 `endif
 endpackage
 
