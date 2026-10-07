@@ -1,7 +1,7 @@
 // 目录：设备层 src/dev/rdma_dev.sv。
 // 职责：NIC 设备顶层：按 BAR 偏移把寄存器写分派给 CMQ 与各 doorbell 处理单元
 //   （xtrdma_hw.h 的 XTRDMA_PF_NTFE_* 位于 BAR+0x2000 起的 notify 窗口）。
-// 依赖：rdma_dev_cmq、rdma_host_mem_api、rdma_defs.svh。
+// 依赖：rdma_dev_cmq、rdma_host_mem、rdma_defs.svh。
 // 所有权与生命周期：拥有 CMQ 消费者/context 存储与数据面 NIC；host_mem 只借用；configure 复位。
 class rdma_dev extends uvm_object;
   `rdma_object_utils(rdma_dev)
@@ -26,7 +26,7 @@ class rdma_dev extends uvm_object;
   // 功能：绑定设备 DMA 使用的主机内存（CMQ 建立 DMA 端口，NIC 共用）并复位。
   // 输入/输出及副作用：保存非拥有引用。
   // 失败/边界：无。
-  function void configure(rdma_host_mem_api host_mem);
+  function void configure(rdma_host_mem host_mem);
     cmq.configure(host_mem);
     nic.reset();
   endfunction

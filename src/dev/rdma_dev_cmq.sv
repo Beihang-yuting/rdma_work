@@ -81,7 +81,7 @@ class rdma_dev_cmq extends uvm_object;
   // 功能：创建设备 DMA 端口（factory，可被覆盖）并绑定主机内存，清空状态。
   // 输入/输出及副作用：新建 dma；host_mem 为非拥有引用。
   // 失败/边界：host_mem 为 null 时之后的 doorbell 返回 INVALID_STATE。
-  function void configure(rdma_host_mem_api host_mem_arg);
+  function void configure(rdma_host_mem host_mem_arg);
     dma = null;
     if (host_mem_arg != null) begin
       dma = rdma_dev_dma::type_id::create({get_name(), "_dma"});

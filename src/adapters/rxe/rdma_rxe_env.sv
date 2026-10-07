@@ -9,7 +9,7 @@
 //   - rdma_rxe_plugin：安装上述覆盖、启动对端进程、登记远端 Function。
 //   对端进程限制：一个 PD/CQ/MR/SRQ（多次分配缓冲返回同一个）、单 SGE、无 URC；远端只支持建资源与
 //   连接（不支持销毁/FLR）。
-// 依赖：rdma_env_pkg、rdma_rxe_pkg（TAP 链路、对端进程）、net_packet 适配器。
+// 依赖：rdma_env_pkg、rdma_rxe_pkg（TAP 链路、对端进程）、rdma_netpkt_codec。
 // 所有权：插件持有对端进程；链路持有 TAP。
 // 生命周期：env build 时安装，run_phase 启动，report 时关闭。
 package rdma_rxe_env_pkg;
@@ -20,7 +20,7 @@ package rdma_rxe_env_pkg;
   import rdma_codec_pkg::*;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
-  import rdma_net_packet_adapter_pkg::*;
+  import rdma_netpkt_pkg::*;
   import rdma_env_pkg::*;
   import rdma_rxe_pkg::*;
 
@@ -191,31 +191,27 @@ package rdma_rxe_env_pkg;
       rxe_mac = rdma_rxe_util::mac_of(text);
       tap = rdma_rxe_env_tap::type_id::create("tap");
       tap.link = this;
-      tap.adapter = rdma_net_packet_adapter::type_id::create("rxe_adapter");
+      tap.codec = rdma_netpkt_codec::type_id::create("rxe_codec");
       tap.wait_us = rdma_rxe_util::arg("RXE_WAIT_US", "20").atoi();
       if (!tap.open(name))
         `uvm_fatal("RXE", {"cannot open TAP ", name})
     endfunction
 
-    // 功能：接入 Function：远端只登记 MAC；仿真 Function 配置 TAP 适配器的身份与帧地址并接收 TAP 报文。
+    // 功能：接入 Function：远端只登记 MAC；仿真 Function 配置 TAP 帧地址并接收 TAP 报文。
     // 输入/输出及副作用：见基类。
-    // 失败/边界：适配器配置失败 UVM_FATAL。
+    // 失败/边界：无。
     virtual function rdma_dev_port attach(rdma_res_func f);
-      rdma_function_identity id;
-
       if (f.remote) begin
         funcs[f.index] = f;
         func_of_mac[f.mac] = f.index;
         tap.src = f.index;
         return null;
       end
-      if (!f.node.func.identity(id).ok() || !tap.adapter.configure_function(id).ok())
-        `uvm_fatal("RXE", "TAP adapter configuration failed")
-      tap.adapter.src_mac = rdma_rxe_util::mac_of(rdma_rxe_util::arg("RXE_SIM_MAC",
+      tap.codec.src_mac = rdma_rxe_util::mac_of(rdma_rxe_util::arg("RXE_SIM_MAC",
                                                                      "02:00:00:00:79:01"));
-      tap.adapter.dst_mac = rxe_mac;
-      tap.adapter.src_ip = rdma_rxe_util::ip_of(rdma_rxe_util::arg("RXE_SIM_IP", "10.79.0.1"));
-      tap.adapter.dst_ip = rdma_rxe_util::ip_of(rdma_rxe_util::arg("RXE_IP", "10.79.0.2"));
+      tap.codec.dst_mac = rxe_mac;
+      tap.codec.src_ip = rdma_rxe_util::ip_of(rdma_rxe_util::arg("RXE_SIM_IP", "10.79.0.1"));
+      tap.codec.dst_ip = rdma_rxe_util::ip_of(rdma_rxe_util::arg("RXE_IP", "10.79.0.2"));
       tap.nic = f.node.dev.nic;
       tap.dst = f.index;
       return super.attach(f);

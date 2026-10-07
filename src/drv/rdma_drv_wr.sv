@@ -185,7 +185,7 @@ class rdma_drv_wr extends uvm_object;
     foreach (sges[i]) begin
       if (sges[i].length == 0)
         continue;
-      status = dev.hw.host_mem.dma_read(sges[i].addr, sges[i].length, raw);
+      status = dev.hw.host_mem.read(sges[i].addr, sges[i].length, raw);
       if (!status.ok())
         return status;
       foreach (raw[k])

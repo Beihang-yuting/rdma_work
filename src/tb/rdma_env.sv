@@ -86,7 +86,6 @@ class rdma_env extends uvm_env;
     rdma_status status;
 
     sys = rdma_dpu_system::type_id::create("dpu");
-    sys.mem_factory = cfg.mem_factory;
     foreach (cfg.funcs[i])
       if (!hosts.exists(cfg.funcs[i].host)) begin
         hosts[cfg.funcs[i].host] = 1'b1;

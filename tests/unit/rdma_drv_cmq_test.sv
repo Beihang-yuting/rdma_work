@@ -1,13 +1,13 @@
 // 目录：单元测试层 tests/unit/rdma_drv_cmq_test.sv。
 // 职责：驱动 CMQ（rdma_drv_cmq）与设备 CMQ（rdma_dev_cmq）经 BAR/DMA 端到端对接：CMQC 寄存器编程、
 //   跨圈回绕、context 命令往返、ecode 透传，以及驱动签名被设备按 cmq.c 规则接受。
-// 依赖：rdma_drv_hw/rdma_drv_cmq、rdma_dev、rdma_dpu_system（dpu_common）、rdma_mock_host_mem。
-// 所有权与生命周期：测试拥有 mock 内存、设备与驱动对象。
+// 依赖：rdma_drv_hw/rdma_drv_cmq、rdma_dev、rdma_dpu_system（dpu_common）、rdma_host_mem（外部 host_mem）。
+// 所有权与生命周期：测试拥有主机内存、设备与驱动对象。
 class rdma_drv_cmq_test extends uvm_test;
   `uvm_component_utils(rdma_drv_cmq_test)
 
   rdma_dpu_system sys;
-  rdma_mock_host_mem mem;
+  rdma_host_mem mem;
   rdma_dev dev;
   rdma_dpu_bar bar;
   rdma_drv_hw hw;
@@ -28,8 +28,7 @@ class rdma_drv_cmq_test extends uvm_test;
 
     phase.raise_objection(this);
     sys = rdma_dpu_test_system::single_host("drv_cmq");
-    if (!$cast(mem, sys.nodes[0].mem))
-      `uvm_fatal("DRV_CMQ", "dpu node memory is not the mock")
+    mem = sys.nodes[0].mem;
     dev = sys.nodes[0].dev;
     bar = sys.nodes[0].bar;
     hw = sys.nodes[0].hw;

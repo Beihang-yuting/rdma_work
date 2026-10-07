@@ -6,7 +6,7 @@
 //   延迟（造成乱序）或损坏（接收端校验应丢弃）。
 //   子类覆盖 carry()/corrupt()：rdma_link_netpkt 让报文经过 net_packet 的 RoCEv2 帧编码与解析。
 //   env 按 cfg.link_type 经 factory 创建（rxe 链路在 rxe 包内，tb 不依赖它）。
-// 依赖：rdma_res_func（Function 的设备与 MAC）、rdma_dev_port、net_packet 适配器。
+// 依赖：rdma_res_func（Function 的设备与 MAC）、rdma_dev_port、rdma_netpkt_codec。
 // 所有权：链路只借用设备；交付的是独立副本。
 // 生命周期：env build 创建，attach() 后对该 Function 生效。
 
@@ -226,13 +226,11 @@ class rdma_link extends uvm_component;
   endtask
 endclass
 
-// 报文经 net_packet 编码为 RoCEv2 帧、再由目的端适配器解析（每个 Function 一个适配器，身份取自
-//   dpu_common）。
+// 报文经 net_packet 编码为 RoCEv2 帧、再解析回报文后交付（帧地址取 codec 缺省值）。
 class rdma_link_netpkt extends rdma_link;
   `uvm_component_utils(rdma_link_netpkt)
 
-  protected rdma_net_packet_adapter nets[int unsigned];
-  protected rdma_net_packet_queue_sink sinks[int unsigned];
+  protected rdma_netpkt_codec codec;
   protected byte unsigned carried[$];
 
   // 功能：构造。
@@ -240,39 +238,18 @@ class rdma_link_netpkt extends rdma_link;
   // 失败/边界：无。
   function new(string name = "rdma_link_netpkt", uvm_component parent = null);
     super.new(name, parent);
+    codec = rdma_netpkt_codec::type_id::create("codec");
   endfunction
 
-  // 功能：接入 Function 并为它建立 net_packet 适配器与接收队列。
-  // 输入/输出及副作用：见基类。
-  // 失败/边界：身份解析或适配器配置失败报 UVM_FATAL。
-  virtual function rdma_dev_port attach(rdma_res_func f);
-    rdma_function_identity identity;
-    rdma_status status;
-
-    sinks[f.index] = rdma_net_packet_queue_sink::type_id::create($sformatf("sink%0d", f.index));
-    nets[f.index] = rdma_net_packet_adapter::type_id::create($sformatf("net%0d", f.index));
-    status = nets[f.index].configure_sink(sinks[f.index]);
-    if (status.ok())
-      status = f.node.func.identity(identity);
-    if (status.ok())
-      status = nets[f.index].configure_function(identity);
-    if (!status.ok())
-      `uvm_fatal("RDMA_LINK", {"net_packet attach failed: ", status.convert2string()})
-    return super.attach(f);
-  endfunction
-
-  // 功能：源适配器编码发帧 → 目的接收队列 → 目的适配器解析。
-  // 输入/输出及副作用：见基类。
+  // 功能：编码为帧 → 解析回报文。
+  // 输入/输出及副作用：见基类；记下帧供观测。
   // 失败/边界：编码/解析失败经 status 返回。
   virtual task carry(int unsigned src, int unsigned dst, rdma_packet pkt,
                      output rdma_packet delivered, output rdma_status status);
     delivered = null;
-    nets[src].send_packet(pkt, status);
-    if (!status.ok())
-      return;
-    carried = nets[src].last_sent_packet.raw_data;
-    sinks[dst].enqueue(nets[src].last_sent_packet);
-    nets[dst].receive_packet(delivered, status);
+    status = codec.encode(pkt, carried);
+    if (status.ok())
+      status = codec.decode(carried, delivered);
   endtask
 
   // 功能：rx 观测附带刚传输的帧（供帧级协议检查）。
@@ -286,19 +263,19 @@ class rdma_link_netpkt extends rdma_link;
     return o;
   endfunction
 
-  // 功能：编码后翻转帧中载荷/ICRC 区的一个字节，目的适配器解析须失败（ICRC 校验），报文丢弃。
+  // 功能：编码后翻转帧中载荷/ICRC 区的一个字节，解析须失败（ICRC 校验），报文丢弃。
   // 输入/输出及副作用：无交付。
   // 失败/边界：损坏帧被接受时报 UVM_ERROR。
   virtual task corrupt(int unsigned src, int unsigned dst, rdma_packet pkt);
     byte unsigned frame[$];
     rdma_packet decoded;
 
-    if (!nets[src].encode_packet(pkt, frame).ok()) begin
+    if (!codec.encode(pkt, frame).ok()) begin
       `uvm_error("RDMA_LINK", "encode failed")
       return;
     end
     frame[frame.size() - 6] ^= 8'h01;
-    if (nets[dst].decode_packet(frame, decoded).ok())
+    if (codec.decode(frame, decoded).ok())
       `uvm_error("RDMA_LINK", "corrupted frame passed the receiver's checks")
   endtask
 endclass

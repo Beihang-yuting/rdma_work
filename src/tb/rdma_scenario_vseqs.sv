@@ -88,7 +88,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
 
   // 功能：f0 用自己的 MR 作远端 WRITE（rkey 不属于对端）→ REM_ACCESS，随后同 QP 的 WRITE 按预测
   //   flush（远端响应方出错后 QP 进入 ERR、不再应答，故远端时不发）；被测设备作响应方时 f1 随后投递的
-  //   RECV 因 QP 已 ERR 而 FLUSH（rxe 5.15 出错后不 flush RQ，远端时不发）；f1 用自己的 MR 作远端 READ（被测设备作响应方，新 QP 对）→ REM_ACCESS。
+  //   RECV 因 QP 已 ERR 而 FLUSH（rxe 5.15 出错后不 flush RQ，远端时不发）；f1 用自己的 MR 作远端
+  //   READ（被测设备作响应方，新 QP 对）→ REM_ACCESS。
   // 输入/输出及副作用：QP 进入错误态。
   // 失败/边界：无。
   task bad_rkey();

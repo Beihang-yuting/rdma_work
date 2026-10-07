@@ -5,9 +5,9 @@
 //   范围；下层把 dpu_common 的逻辑设备配置接入 RDMA 驱动/设备模型：按 Host/PF/VF 声明生成
 //   dpu_device_cfg（BAR 请求取 dut_caps.bar_profiles），经 dpu_device_resolver 解析并冻结快照；
 //   把快照中每个 Function 投影为 host_id、global Function ID（驱动 QPC/PD 的 VF_ID）、BDF、BAR，
-//   以及 net_packet 用的 rdma_function_identity；驱动的 MMIO 写按 BAR0 基址 + 偏移形成绝对地址，
+//   驱动的 MMIO 写按 BAR0 基址 + 偏移形成绝对地址，
 //   由快照 resolve_bar_address 解码到所属 Function 的设备。
-// 依赖：dpu_common（dpu_resource_pkg）、rdma_types/model/adapter（host_mem API）、rdma_dev、rdma_drv。
+// 依赖：dpu_common（dpu_resource_pkg）、rdma_types/model、rdma_host_mem_pkg、rdma_dev、rdma_drv。
 // 所有权：快照与 cfg 由调用方持有；Function 投影为值快照；路由器只借用设备引用。
 // 生命周期：测试建立拓扑时创建，仿真期间常驻。
 package rdma_dpu_adapter_pkg;
@@ -16,7 +16,7 @@ package rdma_dpu_adapter_pkg;
   import dpu_resource_pkg::*;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
-  import rdma_adapter_pkg::*;
+  import rdma_host_mem_pkg::*;
   import rdma_dev_pkg::*;
   import rdma_drv_pkg::*;
 
@@ -41,52 +41,6 @@ package rdma_dpu_adapter_pkg;
       super.new(name);
       global_id = 0;
       caps = null;
-    endfunction
-
-    // 功能：Function 唯一标识：{Host, segment, BDF}（与 net_packet/host_mem 的 function_uid 共用）。
-    // 输入/输出及副作用：纯查询。
-    // 失败/边界：全零路由时退回 global_id + 1。
-    function longint unsigned uid();
-      longint unsigned value;
-
-      value = (longint'(pcie_id.domain.host_id) << 32) |
-              (longint'(pcie_id.domain.segment_id) << 16) | longint'(pcie_id.bdf);
-      if (value == 0)
-        value = longint'(global_id) + 1;
-      return value;
-    endfunction
-
-    // 功能：生成 RDMA Function identity（Host 拓扑键、segment、PF/VF、BDF、父 PF BDF、global ID）。
-    // 输入/输出及副作用：id 输出新对象。
-    // 失败/边界：identity 校验失败返回其 status。
-    function rdma_status identity(output rdma_function_identity id);
-      rdma_function_key_t rkey;
-
-      rkey.root_id = pcie_id.domain.segment_id;
-      rkey.host_topology_key = pcie_id.domain.host_id;
-      rkey.function_kind = RDMA_FUNCTION_PF;
-      rkey.parent_pf_bdf = '0;
-      if (key.kind == DPU_FUNCTION_VF) begin
-        rkey.function_kind = RDMA_FUNCTION_VF;
-        rkey.parent_pf_bdf = to_bdf(parent_pcie_id);
-      end
-      rkey.vf_index = key.vf_id;
-      rkey.bdf = to_bdf(pcie_id);
-      id = rdma_function_identity::type_id::create($sformatf("dpu_identity_%0d", global_id));
-      return id.configure(rkey, global_id, uid(), 1, 0);
-    endfunction
-
-    // 功能：dpu_common PCIe ID → RDMA BDF。
-    // 输入/输出及副作用：纯函数。
-    // 失败/边界：无。
-    static function rdma_bdf_t to_bdf(dpu_pcie_function_id_t id);
-      rdma_bdf_t bdf;
-
-      bdf.segment = id.domain.segment_id;
-      bdf.bus = id.bdf[15:8];
-      bdf.device = id.bdf[7:3];
-      bdf.function_num = id.bdf[2:0];
-      return bdf;
     endfunction
   endclass
 
@@ -342,55 +296,17 @@ package rdma_dpu_adapter_pkg;
     `uvm_object_utils(rdma_dpu_node)
 
     rdma_dpu_function func;
-    rdma_host_mem_api mem;
+    rdma_host_mem mem;
     rdma_dev dev;
     rdma_dpu_bar bar;
     rdma_drv_hw hw;
     rdma_drv_dev drv;
-    rdma_function_handle fn;
 
     // 功能：构造空节点。
     // 输入/输出及副作用：name 为 UVM 名。
     // 失败/边界：无。
     function new(string name = "rdma_dpu_node");
       super.new(name);
-    endfunction
-  endclass
-
-  // Function 主机内存域的提供方（mock、真实 host_mem 或之后的 pcie_work 统一内存）。
-  virtual class rdma_dpu_mem_factory extends uvm_object;
-    // 功能：构造。
-    // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
-    function new(string name = "rdma_dpu_mem_factory");
-      super.new(name);
-    endfunction
-
-    // 功能：为 Function f 提供主机内存。
-    // 输入/输出及副作用：返回内存对象。
-    // 失败/边界：由实现决定。
-    pure virtual function rdma_host_mem_api make(rdma_dpu_function f);
-  endclass
-
-  // 所有 Function 共用同一主机内存（同一 Host 地址域，如 tb 节点或 PCIe 统一内存）。
-  class rdma_dpu_fixed_mem_factory extends rdma_dpu_mem_factory;
-    `uvm_object_utils(rdma_dpu_fixed_mem_factory)
-
-    rdma_host_mem_api mem;
-
-    // 功能：构造。
-    // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
-    function new(string name = "rdma_dpu_fixed_mem_factory");
-      super.new(name);
-      mem = null;
-    endfunction
-
-    // 功能：返回共用内存。
-    // 输入/输出及副作用：无。
-    // 失败/边界：未设置时返回 null（build 的 bind_hw 会拒绝）。
-    virtual function rdma_host_mem_api make(rdma_dpu_function f);
-      return mem;
     endfunction
   endclass
 
@@ -401,7 +317,8 @@ package rdma_dpu_adapter_pkg;
     dpu_device_cfg cfg;
     dpu_device_snapshot snapshot;
     rdma_dpu_bar_router router;
-    rdma_dpu_mem_factory mem_factory;
+    // 各 Host 的 host_mem（Function 在其 Host 的 manager 上分配）。
+    rdma_host_mems mems;
     rdma_dpu_node nodes[$];
 
     // 功能：构造空拓扑。
@@ -412,7 +329,7 @@ package rdma_dpu_adapter_pkg;
       cfg = dpu_device_cfg::type_id::create({name, "_cfg"});
       snapshot = null;
       router = null;
-      mem_factory = null;
+      mems = rdma_host_mems::type_id::create({name, "_mems"});
     endfunction
 
     // 功能：声明 Host（见 rdma_dpu_topology::add_host）。
@@ -430,18 +347,16 @@ package rdma_dpu_adapter_pkg;
       rdma_dpu_topology::add_function(cfg, host_id, pf_id, kind, vf_id);
     endfunction
 
-    // 功能：解析冻结快照，按快照顺序为每个 Function 建立节点：主机内存（mem_factory）、设备、BAR
-    //   （经路由器）、驱动硬件绑定（Function UID 取自快照）。不启动 NIC、不 probe。
+    // 功能：解析冻结快照，按快照顺序为每个 Function 建立节点：主机内存（所属 Host 的 host_mem）、
+    //   设备、BAR（经路由器）、驱动硬件绑定。不启动 NIC、不 probe。
     // 输入/输出及副作用：设置 snapshot/router/nodes。
-    // 失败/边界：未设 mem_factory 返回 INVALID_STATE；解析或绑定失败返回其 status。
+    // 失败/边界：解析或绑定失败返回其 status。
     function rdma_status build();
       rdma_dpu_function funcs[$];
       rdma_dpu_node n;
       rdma_status status;
       string name;
 
-      if (mem_factory == null)
-        return rdma_status::make(RDMA_SC_INVALID_STATE, "dpu system has no memory factory");
       status = rdma_dpu_topology::resolve(cfg, snapshot, funcs);
       if (!status.ok())
         return status;
@@ -452,19 +367,15 @@ package rdma_dpu_adapter_pkg;
         name = $sformatf("%s_f%0d", get_name(), funcs[i].global_id);
         n = rdma_dpu_node::type_id::create(name);
         n.func = funcs[i];
-        n.mem = mem_factory.make(funcs[i]);
+        n.mem = mems.make(funcs[i].key.host_id, {name, "_mem"});
         n.dev = rdma_dev::type_id::create({name, "_dev"});
         n.dev.configure(n.mem);
         router.attach(funcs[i], n.dev);
         n.bar = rdma_dpu_bar::type_id::create({name, "_bar"});
         n.bar.router = router;
         n.bar.func = funcs[i];
-        n.fn = rdma_function_handle::type_id::create({name, "_fn"});
-        n.fn.kind = RDMA_RESOURCE_FUNCTION;
-        n.fn.function_uid = funcs[i].uid();
-        n.fn.generation = 1;
         n.hw = rdma_drv_hw::type_id::create({name, "_hw"});
-        status = n.hw.bind_hw(n.bar, n.mem, n.fn);
+        status = n.hw.bind_hw(n.bar, n.mem);
         if (!status.ok())
           return status;
         n.drv = null;

@@ -1,8 +1,7 @@
 // 目录/层次：协议与资源模型层 model/rdma_semantic_requests.sv。
-// 职责：定义语义层的 QP 状态/WR/网络/CMQ opcode 枚举、AETH syndrome，以及语义报文 rdma_packet
-//   与网络适配器的响应策略/故障注入值对象。
-// 依赖：rdma_status、rdma_handle；不访问硬件或外部资源。
-// 所有权与生命周期：请求对象拥有自身字段与深拷贝的嵌套快照；句柄只表示资源身份，不接管资源。
+// 职责：定义语义层的 QP 状态/WR/网络/CMQ opcode 枚举、AETH syndrome，以及语义报文 rdma_packet。
+// 依赖：rdma_status；不访问硬件或外部资源。
+// 所有权与生命周期：报文对象拥有自身字段。
 
 typedef enum bit [3:0] {
   RDMA_QPS_RESET = 4'd0,
@@ -326,87 +325,5 @@ class rdma_packet extends uvm_object;
     deth_qkey = rhs_packet.deth_qkey;
     metadata = rhs_packet.metadata;
     payload = rhs_packet.payload;
-  endfunction
-endclass
-
-class rdma_net_response_policy extends uvm_object;
-  `rdma_object_utils(rdma_net_response_policy)
-
-  rdma_responder_mode_e responder_mode;
-  int unsigned drop_every_n;
-  int unsigned corrupt_every_n;
-  longint unsigned delay_cycles;
-  bit [31:0] deterministic_seed;
-
-  // 功能：构造网络响应策略，默认 DUT 响应、无注入。
-  // 输入/输出及副作用：name 为 UVM 实例名；仅初始化本地字段为默认值。
-  // 失败/边界：无。
-  function new(string name = "rdma_net_response_policy");
-    super.new(name);
-    responder_mode = RDMA_RESPONDER_DUT;
-    drop_every_n = '0;
-    corrupt_every_n = '0;
-    delay_cycles = '0;
-    deterministic_seed = '0;
-  endfunction
-
-  // 功能：复制网络响应策略的值字段。
-  // 输入/输出及副作用：rhs 为源对象；覆盖本对象字段，源不变。
-  // 失败/边界：类型不符触发 UVM fatal（network policy copy type mismatch）。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_net_response_policy rhs_policy;
-
-    super.do_copy(rhs);
-    if (!$cast(rhs_policy, rhs))
-      `uvm_fatal("RDMA_COPY_TYPE", "network policy copy type mismatch")
-    responder_mode = rhs_policy.responder_mode;
-    drop_every_n = rhs_policy.drop_every_n;
-    corrupt_every_n = rhs_policy.corrupt_every_n;
-    delay_cycles = rhs_policy.delay_cycles;
-    deterministic_seed = rhs_policy.deterministic_seed;
-  endfunction
-endclass
-
-class rdma_net_fault extends uvm_object;
-  `rdma_object_utils(rdma_net_fault)
-
-  rdma_fault_kind_e kind;
-  bit drop_packet;
-  bit corrupt_byte;
-  int unsigned corrupt_byte_index;
-  byte unsigned corrupt_xor_mask;
-  longint unsigned delay_cycles;
-  bit [31:0] deterministic_seed;
-
-  // 功能：构造网络故障描述，默认 PACKET_DROP 类别、各注入位清零。
-  // 输入/输出及副作用：name 为 UVM 实例名；仅初始化本地字段为默认值。
-  // 失败/边界：无。
-  function new(string name = "rdma_net_fault");
-    super.new(name);
-    kind = RDMA_FAULT_PACKET_DROP;
-    drop_packet = 1'b0;
-    corrupt_byte = 1'b0;
-    corrupt_byte_index = '0;
-    corrupt_xor_mask = '0;
-    delay_cycles = '0;
-    deterministic_seed = '0;
-  endfunction
-
-  // 功能：复制网络故障描述的值字段。
-  // 输入/输出及副作用：rhs 为源对象；覆盖本对象字段，源不变。
-  // 失败/边界：类型不符触发 UVM fatal（network fault copy type mismatch）。
-  virtual function void do_copy(uvm_object rhs);
-    rdma_net_fault rhs_fault;
-
-    super.do_copy(rhs);
-    if (!$cast(rhs_fault, rhs))
-      `uvm_fatal("RDMA_COPY_TYPE", "network fault copy type mismatch")
-    kind = rhs_fault.kind;
-    drop_packet = rhs_fault.drop_packet;
-    corrupt_byte = rhs_fault.corrupt_byte;
-    corrupt_byte_index = rhs_fault.corrupt_byte_index;
-    corrupt_xor_mask = rhs_fault.corrupt_xor_mask;
-    delay_cycles = rhs_fault.delay_cycles;
-    deterministic_seed = rhs_fault.deterministic_seed;
   endfunction
 endclass

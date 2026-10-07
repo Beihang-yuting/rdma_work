@@ -2,18 +2,18 @@
 // 职责：验证设备侧 CMQ 消费者 rdma_dev_cmq：CMQC 配置、doorbell 批处理与回绕、CQE envelope/owner，
 //   以及 QP/MR/CQ/EQ/SRQ context 的创建、修改、查询、删除效果和协议错误拒绝。
 //   SQE 按驱动 cmq.c 的字段布局直接构造（驱动编码本身由 CMQ golden 门禁保证）。
-// 依赖：rdma_dev_cmq、rdma_mock_host_mem。
-// 所有权与生命周期：测试拥有 mock 内存、映射与设备实例，随测试结束释放。
+// 依赖：rdma_dev_cmq、rdma_host_mem（外部 host_mem）。
+// 所有权与生命周期：测试拥有主机内存、缓冲与设备实例，随测试结束释放。
 class rdma_dev_cmq_test extends uvm_test;
   `uvm_component_utils(rdma_dev_cmq_test)
 
   localparam int unsigned DEPTH = 32;
   localparam int unsigned CQ_OFFSET = DEPTH * 64;
 
-  rdma_mock_host_mem mem;
+  rdma_host_mem mem;
   rdma_dev_cmq dev;
-  rdma_dma_mapping ring;
-  rdma_dma_mapping qpc_buf;
+  bit [63:0] ring;
+  bit [63:0] qpc_buf;
   longint unsigned posted;
   // 丢弃型调用的 CQE 接收变量（VCS 对 void'() 丢弃动态数组返回值会崩溃）。
   rdma_bytes_t scratch;
@@ -48,7 +48,10 @@ class rdma_dev_cmq_test extends uvm_test;
   // 输入/输出及副作用：创建 mem/dev/ring/qpc_buf。
   // 失败/边界：任一步失败报告 UVM_FATAL。
   task setup();
-    mem = rdma_mock_host_mem::type_id::create("dev_cmq_mem");
+    rdma_host_mems mems;
+
+    mems = rdma_host_mems::type_id::create("dev_cmq_mems");
+    mem = mems.make(0, "dev_cmq_mem");
     dev = rdma_dev_cmq::type_id::create("dev_cmq");
     ring = alloc(4096, 4096);
     qpc_buf = alloc(512, 512);
@@ -56,22 +59,14 @@ class rdma_dev_cmq_test extends uvm_test;
     enable();
   endtask
 
-  // 功能：从 mock 内存分配一段 DMA 映射。
-  // 输入/输出及副作用：返回新映射。
+  // 功能：从主机内存分配一段 DMA 缓冲。
+  // 输入/输出及副作用：返回 IOVA。
   // 失败/边界：分配失败报告 UVM_FATAL。
-  function rdma_dma_mapping alloc(int unsigned size, int unsigned align);
-    rdma_dma_request_context ctx;
-    rdma_function_handle fn;
-    rdma_dma_mapping mapping;
+  function bit [63:0] alloc(int unsigned size, int unsigned align);
+    bit [63:0] iova;
 
-    fn = rdma_function_handle::type_id::create("dev_cmq_fn");
-    fn.kind = RDMA_RESOURCE_FUNCTION;
-    fn.function_uid = 64'h0d0e_0f10;
-    fn.generation = 1;
-    ctx = rdma_dma_request_context::type_id::create("dev_cmq_ctx");
-    ctx.function_h = fn;
-    expect_ok("allocate", mem.allocate(ctx, size, align, RDMA_DMA_BIDIRECTIONAL, mapping));
-    return mapping;
+    expect_ok("allocate", mem.alloc(size, align, iova));
+    return iova;
   endfunction
 
   // 功能：按驱动 xtrdma_sc_cmq_create 写 CMQC_HIGH/LOW，并清零环与本地序号。
@@ -84,9 +79,9 @@ class rdma_dev_cmq_test extends uvm_test;
     zero = new[4096];
     foreach (zero[i])
       zero[i] = 0;
-    expect_ok("clear ring", mem.write(ring, 0, zero));
+    expect_ok("clear ring", mem.write(ring, zero));
     posted = 0;
-    dev.write_register(RDMA_DB_CMQC_HIGH_OFFSET, ring.iova.value, status);
+    dev.write_register(RDMA_DB_CMQC_HIGH_OFFSET, ring, status);
     expect_ok("CMQC_HIGH", status);
     dev.write_register(RDMA_DB_CMQC_LOW_OFFSET, 64'h8000_0000, status);
     expect_ok("CMQC_LOW", status);
@@ -149,7 +144,7 @@ class rdma_dev_cmq_test extends uvm_test;
     data = new[64];
     foreach (data[i])
       data[i] = sqe[i];
-    expect_ok("write SQE", mem.write(ring, (posted % DEPTH) * 64, data));
+    expect_ok("write SQE", mem.write(ring + (posted % DEPTH) * 64, data));
     posted++;
   endfunction
 
@@ -174,7 +169,7 @@ class rdma_dev_cmq_test extends uvm_test;
     rdma_bytes_t cqe;
     bit [63:0] head;
 
-    expect_ok("read CQE", mem.read(ring, CQ_OFFSET + (seq % DEPTH) * 64, 64, data));
+    expect_ok("read CQE", mem.read(ring + CQ_OFFSET + (seq % DEPTH) * 64, 64, data));
     cqe = new[64];
     foreach (cqe[i])
       cqe[i] = data[i];
@@ -250,11 +245,11 @@ class rdma_dev_cmq_test extends uvm_test;
       qpc[i] = i * 7 + 3;
       data[i] = qpc[i];
     end
-    expect_ok("write QPC", mem.write(qpc_buf, 0, data));
+    expect_ok("write QPC", mem.write(qpc_buf, data));
     sqe = make_sqe(RDMA_OP_QPC_CREATE, 5);
     rdma_be::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
-                            qpc_buf.iova.value >> 9);
+                            qpc_buf >> 9);
     post_signed(sqe, 1'b1, qpc);
     ring_doorbell(status);
     expect_ok("QPC_CREATE doorbell", status);
@@ -285,13 +280,13 @@ class rdma_dev_cmq_test extends uvm_test;
 
     foreach (data[i])
       data[i] = 0;
-    expect_ok("clear QPC buffer", mem.write(qpc_buf, 0, data));
+    expect_ok("clear QPC buffer", mem.write(qpc_buf, data));
     sqe = make_sqe(RDMA_OP_QPC_QUERY, 5);
     rdma_be::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
-                            qpc_buf.iova.value >> 9);
+                            qpc_buf >> 9);
     exec("QPC_QUERY", sqe, scratch);
-    expect_ok("read QPC buffer", mem.read(qpc_buf, 0, 512, data));
+    expect_ok("read QPC buffer", mem.read(qpc_buf, 512, data));
     foreach (data[i])
       if (byte'(obj.bytes[i]) != data[i]) begin
         `uvm_error("QPC_QUERY", $sformatf("buffer byte %0d differs from the device QPC", i))
@@ -392,7 +387,7 @@ class rdma_dev_cmq_test extends uvm_test;
     sqe = make_sqe(RDMA_OP_QPC_CREATE, 6);
     rdma_be::set_field(sqe, RDMA_CMQ_QPC_BUFFER_ADDR_WORD_BYTE_OFFSET,
                             RDMA_CMQ_QPC_BUFFER_ADDR_LSB, RDMA_CMQ_QPC_BUFFER_ADDR_WIDTH,
-                            qpc_buf.iova.value >> 9);
+                            qpc_buf >> 9);
     post_signed(sqe, 1'b1, qpc);
     ring_doorbell(status);
     if (status.ok())

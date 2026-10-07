@@ -3,13 +3,14 @@
 // 职责：多 Function 隔离与复位（驱动形状）：拓扑由 dpu_common 声明并解析（Host0：PF0、VF0_1、
 //   VF0_2；Host1：PF1、VF1_1），每个 Function 的 host_id、global Function ID（驱动 VF_ID）、BDF 与
 //   BAR 取自冻结快照；驱动 doorbell 写 BAR0 绝对地址，经快照解码路由到所属 Function 的设备。每个
-//   Function 一个设备模型 + 独立主机内存域（IOVA 数值相同）+ 独立驱动 probe，RC QP 连成环。验证：
+//   Function 一个设备模型 + 所属 Host 的 host_mem 上按 Function 记账的内存（DMA 只能访问本 Function
+//   的分配）+ 独立驱动 probe，RC QP 连成环。验证：
 //   快照投影进 QPC（HOST_ID/VF_ID）、BAR 解码（MAILBOX/跨 Host 地址被拒），
 //   非法 IOVA→本地访问错完成、CMQ 卡死→驱动命令超时、错 rkey→REM_ACCESS 完成、丢一包→重传成功、
 //   持续丢包→重试耗尽（0x16）错完成，
 //   每项故障只影响目标 Function；VF FLR、PF FLR（含其 VF）、整设备复位只清空范围内 Function 的
 //   context，范围外流量不受影响，范围内驱动 remove/probe 后流量恢复。
-// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_adapter_pkg（dpu_common）、rdma_mock_host_mem。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_adapter_pkg（dpu_common）、rdma_host_mem（外部 host_mem）。
 // 所有权：测试拥有全部 Function 的内存、设备、驱动与链路。
 // 生命周期：run_phase 内建立并运行到结束。
 
@@ -69,7 +70,7 @@ class rdma_mf_func extends uvm_object;
   int unsigned idx;
   rdma_dpu_function dpu;
   bit [47:0] mac;
-  rdma_mock_host_mem mem;
+  rdma_host_mem mem;
   rdma_dev dev;
   rdma_dpu_bar bar;
   rdma_drv_hw hw;
@@ -118,9 +119,6 @@ class rdma_multifunc_test extends uvm_test;
     net = rdma_mf_net::type_id::create("net");
     build_topology();
     foreach (funcs[i])
-      if (funcs[i].data_buf.iova != funcs[0].data_buf.iova)
-        `uvm_error("MF", "Function DMA domains do not reuse the same IOVA numbers")
-    foreach (funcs[i])
       link_qps(i);
     check_traffic("baseline", none);
     check_dpu_projection();
@@ -153,7 +151,6 @@ class rdma_multifunc_test extends uvm_test;
     string expected[$];
 
     sys = rdma_dpu_system::type_id::create("mf_dpu");
-    sys.mem_factory = rdma_mock_mem_factory::type_id::create("mf_mem_factory");
     sys.add_host(0);
     sys.add_host(1);
     sys.add_function(0, 0, DPU_FUNCTION_PF, 0);
@@ -186,8 +183,7 @@ class rdma_multifunc_test extends uvm_test;
     f.idx = i;
     f.dpu = sys.nodes[i].func;
     f.mac = {32'h0200_0000, 8'(f.dpu.key.host_id), 8'(f.dpu.global_id)};
-    if (!$cast(f.mem, sys.nodes[i].mem))
-      `uvm_fatal("MF", "dpu node memory is not the mock")
+    f.mem = sys.nodes[i].mem;
     f.dev = sys.nodes[i].dev;
     f.bar = sys.nodes[i].bar;
     f.hw = sys.nodes[i].hw;

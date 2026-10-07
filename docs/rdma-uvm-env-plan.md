@@ -65,7 +65,7 @@ rdma_res_db ── funcs[uid] : rdma_res_func（每个 Function 一个；rxe 远
 - **rdma_link**：基类提供 `port(func)`、`tx_ap/rx_ap`、`drop/corrupt/delay(dir, nth)`；loopback 与 netpkt 在
   tb 包内，rxe 在 rxe 包内（工厂按名字创建，tb 不依赖 rxe 包）。
 - **rdma_env_plugin**：钩子 `pre_build(env)`、`build(env)`、`start(env)`、`report(env)`。
-  - `rdma_pcie_plugin`（tests/rdma_env_test_pkg，需 host_mem 工厂）：安装 BAR/DMA 覆盖、按快照建 PCIe 系统、
+  - `rdma_pcie_plugin`（tests/rdma_env_test_pkg，RC 应答用各 Host 的 host_mem manager）：安装 BAR/DMA 覆盖、按快照建 PCIe 系统、
     结束时检查 MMIO/DMA TLP 计数、每个 BDF 都发过 DMA、MAILBOX 写被拒绝。
   - `rdma_rxe_plugin`（src/adapters/rxe/rdma_rxe_env.sv）：远端 Function（`cfg.remote_funcs`，下标在 dpu
     Function 之后）由 rxe_peer 进程承载；覆盖 ctrl/verb driver 与 monitor，远端资源/投递/完成经对端命令，
@@ -114,12 +114,15 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 
 | suite | 内容 | 依赖 |
 | --- | --- | --- |
-| core / cmq_gate / rdma_defs | 模型单元测试（不含 env） | dpu_common |
-| env | env 全部场景（loopback/netpkt × mock/真实 host_mem）＋ net_packet adapter 测试 | dpu_common、host_mem、net_packet |
+| core / cmq_gate / rdma_defs | 模型与驱动单元测试、net_packet 帧编解码测试 | dpu_common、host_mem、net_packet |
+| env | env 全部场景（loopback/netpkt 链路） | dpu_common、host_mem、net_packet |
 | pcie_work | rdma_env_pcie_test（PF/VF ↔ 另一 Host 的 basic_traffic）+ PCIe 插件 | 上述 + pcie_work |
-| rxe | rdma_env_rxe_test（basic_traffic ↔ Soft-RoCE）+ 原 rxe 互打测试（需 TAP，手动） | net_packet、DPI、rdma_rxe |
+| rxe | rdma_env_rxe_test（basic_traffic ↔ Soft-RoCE）+ 原 rxe 互打测试（需 TAP，手动） | 上述 + DPI、rdma_rxe |
 
-原 host_mem、net_packet、e2e 三个 suite 并入 env。
+原 host_mem、net_packet、e2e 三个 suite 并入 env。外部组件直接引用（不锁版本、不做抽象层）：所有 suite
+编译同一份 RDMA 源码（`sim/filelists/rdma.f` + `tests.f`），主机内存恒为外部 host_mem（每个 Host 一个
+manager，每个 Function 按记账隔离 DMA），帧编解码为 `rdma_netpkt_codec`；pcie_work、rxe 只追加各自的
+filelist。对接代码集中在 `src/adapters/<组件>`。
 
 env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并全部测试的 covergroup 并打印
 `RDMA_COV merged=`（回归汇总的 merged 字段）。单个测试的 `RDMA_COV total=` 只反映该场景，专项测试

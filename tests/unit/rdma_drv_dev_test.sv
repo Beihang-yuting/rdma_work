@@ -2,12 +2,12 @@
 // 职责：驱动 probe/remove（rdma_drv_dev）对设备模型的完整命令序列：CMQ 建立、4 类 HMC 对象
 //   IFA_UPDATE、带签名的 SD_UPDATE（设备校验扩展 SD 表签名）、CEQ/AEQ 创建与 EQC 内容、QP0 置 ERR，
 //   以及 remove 的 flush/删除/清 SD 顺序和 DMA 内存全部归还。
-// 依赖：rdma_drv_dev、rdma_dev、rdma_dpu_system（dpu_common）、rdma_mock_host_mem。
-// 所有权与生命周期：测试拥有 mock 内存、设备与驱动对象。
+// 依赖：rdma_drv_dev、rdma_dev、rdma_dpu_system（dpu_common）、rdma_host_mem（外部 host_mem）。
+// 所有权与生命周期：测试拥有主机内存、设备与驱动对象。
 class rdma_drv_dev_test extends uvm_test;
   `uvm_component_utils(rdma_drv_dev_test)
 
-  rdma_mock_host_mem mem;
+  rdma_host_mem mem;
   rdma_dev dev;
   rdma_drv_dev drv;
 
@@ -34,8 +34,7 @@ class rdma_drv_dev_test extends uvm_test;
     if (func.key.kind != DPU_FUNCTION_VF || func.global_id != 3)
       `uvm_fatal("DRV_DEV", $sformatf("dpu_common Function %s has global ID %0d",
                                       dpu_function_key_name(func.key), func.global_id))
-    if (!$cast(mem, sys.nodes[3].mem))
-      `uvm_fatal("DRV_DEV", "dpu node memory is not the mock")
+    mem = sys.nodes[3].mem;
     dev = sys.nodes[3].dev;
     cfg = rdma_drv_config::type_id::create("drv_dev_cfg");
     cfg.ceq_cnt = 2;

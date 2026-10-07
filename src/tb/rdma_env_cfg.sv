@@ -1,9 +1,9 @@
 // 目录：验证组件层 tb/rdma_env_cfg.sv。
 // 层：验证组件。
-// 职责：env 配置：拓扑（dpu_common 的 Host/PF/VF）、主机内存工厂、链路类型、插件、QP 默认属性、时间参数与
+// 职责：env 配置：拓扑（dpu_common 的 Host/PF/VF）、链路类型、插件、QP 默认属性、时间参数与
 //   检查开关。测试经 uvm_config_db 把它交给 env（键 "cfg"）。
-// 依赖：rdma_dpu_adapter_pkg（Function 声明与内存工厂）。
-// 所有权：配置对象只持有工厂/插件引用。
+// 依赖：rdma_dpu_adapter_pkg（Function 声明）。
+// 所有权：配置对象只持有插件引用。
 // 生命周期：测试 build_phase 创建，env build_phase 读取。
 
 typedef class rdma_env;
@@ -57,7 +57,6 @@ class rdma_env_cfg extends uvm_object;
   rdma_env_func_t funcs[$];
   // 插件提供的远端 Function 数（如 rxe），下标排在 dpu Function 之后。
   int unsigned remote_funcs;
-  rdma_dpu_mem_factory mem_factory;
   string link_type;
   rdma_env_plugin plugins[$];
   // QP 默认属性（IB timeout 0 为不超时）。
@@ -78,10 +77,9 @@ class rdma_env_cfg extends uvm_object;
 
   // 功能：构造默认配置：链路 rdma_link（loopback），PMTU 1024，timeout 14，重试 7，min_rnr 1，深度 256。
   // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：拓扑与内存工厂须由测试填写。
+  // 失败/边界：拓扑须由测试填写。
   function new(string name = "rdma_env_cfg");
     super.new(name);
-    mem_factory = null;
     link_type = "rdma_link";
     mtu = 1024;
     timeout = 14;

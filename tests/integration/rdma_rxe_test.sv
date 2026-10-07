@@ -9,7 +9,7 @@
 //   可选：+RXE_TAP（rtap0）、+RXE_DEV（rxe_rtap0）、+RXE_GID（1）、+RXE_IP（10.79.0.2）、
 //   +RXE_SIM_IP（10.79.0.1）、+RXE_SIM_MAC（02:00:00:00:79:01，须与 setup 的静态邻居一致）、
 //   +RXE_WAIT_US（链路空闲时每 100ns 仿真时间等待 rxe 的真实时间上限，默认 20）。
-// 依赖：rdma_rxe_pkg、rdma_net_packet_adapter_pkg、rdma_dpu_test_system。
+// 依赖：rdma_rxe_pkg、rdma_netpkt_pkg、rdma_dpu_test_system。
 // 所有权：测试拥有 dpu 系统、链路与对端进程。
 // 生命周期：build_phase 建 dpu 系统，run_phase 建链路/对端并运行，结束时关闭。
 class rdma_rxe_test extends uvm_test;
@@ -190,7 +190,6 @@ class rdma_rxe_test extends uvm_test;
   // 输入/输出及副作用：创建 link，fork 进程。
   // 失败/边界：TAP 不可用报告 UVM_FATAL。
   task setup_link();
-    rdma_function_identity id;
     string tap;
     string mac_text;
     int fd;
@@ -203,13 +202,11 @@ class rdma_rxe_test extends uvm_test;
     $fclose(fd);
     rxe_mac = mac_of(mac_text);
     link = rdma_rxe_link::type_id::create("rxe_link");
-    link.adapter = rdma_net_packet_adapter::type_id::create("rxe_adapter");
-    expect_ok("identity", sys.nodes[0].func.identity(id));
-    expect_ok("adapter function", link.adapter.configure_function(id));
-    link.adapter.src_mac = mac_of(arg("RXE_SIM_MAC", "02:00:00:00:79:01"));
-    link.adapter.dst_mac = rxe_mac;
-    link.adapter.src_ip = ip_of(arg("RXE_SIM_IP", "10.79.0.1"));
-    link.adapter.dst_ip = ip_of(arg("RXE_IP", "10.79.0.2"));
+    link.codec = rdma_netpkt_codec::type_id::create("rxe_codec");
+    link.codec.src_mac = mac_of(arg("RXE_SIM_MAC", "02:00:00:00:79:01"));
+    link.codec.dst_mac = rxe_mac;
+    link.codec.src_ip = ip_of(arg("RXE_SIM_IP", "10.79.0.1"));
+    link.codec.dst_ip = ip_of(arg("RXE_IP", "10.79.0.2"));
     if (!link.open(tap))
       `uvm_fatal("RXE", {"cannot open TAP ", tap})
     link.wait_us = arg("RXE_WAIT_US", "20").atoi();

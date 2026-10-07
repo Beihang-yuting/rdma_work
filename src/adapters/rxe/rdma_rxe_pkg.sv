@@ -1,12 +1,12 @@
 // 目录：外部适配器实现层 adapters/rxe/rdma_rxe_pkg.sv。
 // 层：外部适配器。
 // 职责：仿真设备与 Linux Soft-RoCE（rdma_rxe）经 TAP 网卡互打：
-//   - rdma_rxe_link 作为设备 NIC 的网络端口：发出的 rdma_packet 经 net_packet adapter 编码为 RoCEv2
+//   - rdma_rxe_link 作为设备 NIC 的网络端口：发出的 rdma_packet 经 rdma_netpkt_codec 编码为 RoCEv2
 //     以太网帧（ICRC、pad、AckReq）写入 TAP；接收进程从 TAP 读帧、解码后交给 NIC。
 //   - rdma_rxe_peer 驱动 rxe 侧的 verbs 对端进程（tools/rxe/rxe_peer）。
 //   仿真时间与真实时间：链路空闲时每推进 poll_step 仿真时间等待至多 wait_us 真实时间，使 rxe 有时间
 //   应答；设备 QP 的响应超时应设为不超时（IB timeout 0），避免在仿真时间内误判超时。
-// 依赖：rdma_rxe_dpi.c（DPI-C）、rdma_net_packet_adapter_pkg、rdma_dev_pkg。
+// 依赖：rdma_rxe_dpi.c（DPI-C）、rdma_netpkt_pkg、rdma_dev_pkg。
 // 所有权：link 持有 TAP 文件描述符；peer 持有子进程句柄。
 // 生命周期：由测试创建；测试结束时调用 link.close/peer.stop。
 package rdma_rxe_pkg;
@@ -15,7 +15,7 @@ package rdma_rxe_pkg;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
   import rdma_dev_pkg::*;
-  import rdma_net_packet_adapter_pkg::*;
+  import rdma_netpkt_pkg::*;
 
   import "DPI-C" function int rdma_rxe_tap_open(string name);
   import "DPI-C" function void rdma_rxe_tap_close(int fd);
@@ -105,7 +105,7 @@ package rdma_rxe_pkg;
 
     localparam int unsigned FRAME_MAX = 16384;
 
-    rdma_net_packet_adapter adapter;
+    rdma_netpkt_codec codec;
     rdma_dev_nic nic;
     // 链路空闲时每次推进的仿真时间与等待的真实时间（微秒）。
     time poll_step;
@@ -164,7 +164,7 @@ package rdma_rxe_pkg;
       fd = -1;
     endfunction
 
-    // 功能：设备发包：编码为 RoCEv2 帧写入 TAP（地址取 adapter 配置）。
+    // 功能：设备发包：编码为 RoCEv2 帧写入 TAP（地址取 codec 配置）。
     // 输入/输出及副作用：写 TAP，记入 tx_log。
     // 失败/边界：编码或写失败报告 UVM_ERROR。
     virtual task send(rdma_packet pkt, bit [47:0] dmac);
@@ -178,7 +178,7 @@ package rdma_rxe_pkg;
                                         pkt.psn), UVM_MEDIUM)
         return;
       end
-      status = adapter.encode_packet(pkt, frame);
+      status = codec.encode(pkt, frame);
       if (status == null || !status.ok()) begin
         `uvm_error("RXE_LINK", "RoCEv2 encode failed")
         return;
@@ -222,7 +222,7 @@ package rdma_rxe_pkg;
         frame.delete();
         for (int i = 0; i < n; i++)
           frame.push_back(data[i]);
-        status = adapter.decode_packet(frame, pkt);
+        status = codec.decode(frame, pkt);
         if (status == null || !status.ok() || pkt == null) begin
           rx_dropped++;
           `uvm_info("RXE_LINK", $sformatf("rx %0dB frame dropped: %s", n,

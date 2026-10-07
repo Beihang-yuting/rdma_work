@@ -6,7 +6,7 @@
 //   QP 转 ERR 的 flush 完成与 destroy 的 cq_clean，SRQ limit 的 AEQE，CQ destroy 的 cleanup_ceqes，
 //   URC（rc_to_urc：frag CQ、CEQE 上报 HW 完成下标、SQ 完成合成、RQ CQE 在 frag 槽、flush、销毁）；
 //   每项逐字节比对目的内存并检查完成的 wr_id/方向/状态。
-// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_system（dpu_common）、rdma_mock_host_mem。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_system（dpu_common）、rdma_host_mem（外部 host_mem）。
 // 所有权：测试拥有两个节点的内存、设备、驱动与链路。
 // 生命周期：run_phase 内建立并运行到结束。
 
@@ -60,7 +60,7 @@ class rdma_drv_data_node extends uvm_object;
   bit [47:0] mac;
   // 节点即一台 DPU：dpu_common 解析的 Host0 PF0。
   rdma_dpu_system sys;
-  rdma_mock_host_mem mem;
+  rdma_host_mem mem;
   rdma_dev dev;
   rdma_drv_dev drv;
   rdma_drv_pd pd;
@@ -146,7 +146,7 @@ class rdma_drv_data_test extends uvm_test;
                  status == null ? "null" : status.convert2string()))
   endfunction
 
-  // 功能：建一个节点：mock 内存、设备、BAR、probe、PD、CQ、RC QP、16KiB 数据缓冲与覆盖它的 MR。
+  // 功能：建一个节点：主机内存、设备、BAR、probe、PD、CQ、RC QP、16KiB 数据缓冲与覆盖它的 MR。
   // 输入/输出及副作用：node 输出；注册到链路。
   // 失败/边界：任一步失败报告 UVM_FATAL。
   task build_node(string name, bit [47:0] mac, output rdma_drv_data_node node);
@@ -158,8 +158,7 @@ class rdma_drv_data_test extends uvm_test;
     node = rdma_drv_data_node::type_id::create(name);
     node.mac = mac;
     node.sys = rdma_dpu_test_system::single_host(name);
-    if (!$cast(node.mem, node.sys.nodes[0].mem))
-      `uvm_fatal("DATA", "dpu node memory is not the mock")
+    node.mem = node.sys.nodes[0].mem;
     node.dev = node.sys.nodes[0].dev;
     node.dev.nic.port = link;
     link.nodes[mac] = node.dev;

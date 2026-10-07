@@ -22,7 +22,7 @@
 | --- | --- | --- |
 | CMQ | `rdma_cmq_engine`（已完成）在主机内存环写 SQE、敲 CMQ doorbell、轮询 CQE | 读 CMQ SQE、解码、更新 context 存储、写 CQE |
 | MMIO doorbell | `rdma_pcie_api.mmio_write` | doorbell 解码 → SQ/RQ/SRQ PI、CQ arm、EQ CI |
-| DMA | `rdma_host_mem_api` 读写 WQE/CQE/EQE/数据/shadow | 同一 host_mem，按 context 中的地址访问 |
+| DMA | `rdma_host_mem`（外部 host_mem 的 Function 视图）读写 WQE/CQE/EQE/数据/shadow | 同一 host_mem，按 context 中的地址访问 |
 
 层次（一个模块对应驱动一个源文件）：
 
@@ -39,7 +39,7 @@ L2 drv          主机侧驱动模型（新）：
 L3 dev          设备侧 NIC 模型（由现 src/tb/rdma_nic_model 演化）：
                   CMQ 消费者 + context 存储（QPC/CQC/MRT/SRFQC/CEQC/AEQC，按 Function 隔离）
                   doorbell 接收；SQ 处理/RX/ACK；按 CQC 写 CQE、按 EQC 写 CEQE/AEQE
-L4 adapter      现 src/adapter 抽象接口 + src/adapters 外部 VIP 绑定（不变）
+L4 adapters     src/adapters/<组件>：直接使用外部 host_mem、net_packet、dpu_common、pcie_work、rxe
 L5 tb           verb agent / wire / scoreboard（不变，driver 换成 L2）；多 Function env
 ```
 

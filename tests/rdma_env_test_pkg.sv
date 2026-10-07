@@ -1,10 +1,10 @@
 // 目录：测试层 rdma_env_test_pkg.sv。
 // 层：测试。
 // 职责：env 测试：基类按配置（两 Function：Host0 PF0、Host1 PF0）建立 rdma_env 并运行一个虚拟序列；
-//   子类只选链路、内存与序列。+RDMA_LINK=<链路类名>、+RDMA_MEM=mock|host_mem、+RDMA_VSEQ=<序列类名>
+//   子类只选链路与序列（主机内存恒为外部 host_mem）。+RDMA_LINK=<链路类名>、+RDMA_VSEQ=<序列类名>
 //   可覆盖默认值。
 //   pcie_work suite 另有 PCIe 插件与 rdma_env_pcie_test；rxe suite 另有 rdma_env_rxe_test。
-// 依赖：rdma_env_pkg、rdma_unit_test_pkg（mock 与真实 host_mem 内存工厂）、pcie_work（可选）。
+// 依赖：rdma_env_pkg、rdma_unit_test_pkg、pcie_work（可选）。
 // 所有权：测试拥有配置与 env。
 // 生命周期：build 建 env，run_phase 运行序列。
 package rdma_env_test_pkg;
@@ -30,40 +30,28 @@ package rdma_env_test_pkg;
     rdma_env_cfg cfg;
     rdma_env env;
     string link_type;
-    string mem_kind;
     string vseq_type;
 
-    // 功能：构造默认选择：loopback 链路、mock 内存、basic_traffic。
+    // 功能：构造默认选择：loopback 链路、basic_traffic。
     // 输入/输出及副作用：name/parent 为 UVM 层级。
     // 失败/边界：无。
     function new(string name = "rdma_env_base_test", uvm_component parent = null);
       super.new(name, parent);
       link_type = "rdma_link";
-      mem_kind = "mock";
       vseq_type = "rdma_basic_traffic_vseq";
     endfunction
 
     // 功能：应用 plusarg 覆盖，建配置（两 Host 各一 PF）并交给 env。
     // 输入/输出及副作用：设置 config_db，创建 env。
-    // 失败/边界：无效内存类型 UVM_FATAL。
+    // 失败/边界：无。
     function void build_phase(uvm_phase phase);
       super.build_phase(phase);
       void'($value$plusargs("RDMA_LINK=%s", link_type));
-      void'($value$plusargs("RDMA_MEM=%s", mem_kind));
       void'($value$plusargs("RDMA_VSEQ=%s", vseq_type));
       cfg = rdma_env_cfg::type_id::create("cfg");
       cfg.add_func(0);
       cfg.add_func(1);
       cfg.link_type = link_type;
-`ifdef RDMA_HOST_MEM_TEST
-      if (mem_kind == "host_mem")
-        cfg.mem_factory = rdma_host_mem_factory::type_id::create("mem_factory");
-      else
-`endif
-      if (mem_kind == "mock")
-        cfg.mem_factory = rdma_mock_mem_factory::type_id::create("mem_factory");
-      else
-        `uvm_fatal("ENV_TEST", {"unknown RDMA_MEM: ", mem_kind})
       configure(cfg);
       uvm_config_db#(rdma_env_cfg)::set(this, "env", "cfg", cfg);
       env = rdma_env::type_id::create("env", this);
@@ -80,7 +68,7 @@ package rdma_env_test_pkg;
     // 失败/边界：未检查任何东西报 UVM_ERROR。
     task run_phase(uvm_phase phase);
       phase.raise_objection(this);
-      `uvm_info("ENV_TEST", {"link=", cfg.link_type, " mem=", mem_kind, " vseq=", vseq_type},
+      `uvm_info("ENV_TEST", {"link=", cfg.link_type, " vseq=", vseq_type},
                 UVM_LOW)
       run_traffic();
       if (env.sb.checked == 0)
@@ -100,7 +88,7 @@ package rdma_env_test_pkg;
     endtask
   endclass
 
-  // loopback 链路 + mock 内存的全功能流量。
+  // loopback 链路的全功能流量。
   class rdma_env_basic_test extends rdma_env_base_test;
     `uvm_component_utils(rdma_env_basic_test)
 
@@ -112,7 +100,7 @@ package rdma_env_test_pkg;
     endfunction
   endclass
 
-  // net_packet 帧编解码链路 + 真实 host_mem 的全功能流量。
+  // net_packet 帧编解码链路的全功能流量。
   class rdma_env_netpkt_test extends rdma_env_base_test;
     `uvm_component_utils(rdma_env_netpkt_test)
 
@@ -122,11 +110,10 @@ package rdma_env_test_pkg;
     function new(string name = "rdma_env_netpkt_test", uvm_component parent = null);
       super.new(name, parent);
       link_type = "rdma_link_netpkt";
-      mem_kind = "host_mem";
     endfunction
   endclass
 
-  // net_packet 链路 + 真实 host_mem 的大流量。
+  // net_packet 链路的大流量。
   class rdma_env_high_traffic_test extends rdma_env_netpkt_test;
     `uvm_component_utils(rdma_env_high_traffic_test)
 
@@ -138,7 +125,7 @@ package rdma_env_test_pkg;
       vseq_type = "rdma_high_traffic_vseq";
     endfunction
   endclass
-  // 错误场景（loopback + mock）。
+  // 错误场景（loopback）。
   class rdma_env_errors_test extends rdma_env_base_test;
     `uvm_component_utils(rdma_env_errors_test)
 
@@ -261,15 +248,11 @@ package rdma_env_test_pkg;
 
     // 功能：按 dpu 快照建立 PCIe 系统，各 Host 的 Root 绑定其 host_mem。
     // 输入/输出及副作用：创建 env 子组件。
-    // 失败/边界：内存工厂不是 host_mem 时 UVM_FATAL。
+    // 失败/边界：无。
     virtual function void build(rdma_env env);
-      rdma_host_mem_factory mems;
-
-      if (!$cast(mems, env.cfg.mem_factory))
-        `uvm_fatal("PCIE_PLUGIN", "PCIe needs the host_mem factory")
       pcie = rdma_pcie_system::type_id::create("pcie", env);
       pcie.dpu = env.sys;
-      pcie.host_mems = mems.managers;
+      pcie.host_mems = env.sys.mems.managers;
     endfunction
 
     // 功能：DMA：EP 发出与 RC 收到的 MemRd/MemWr 数相等、每个 Function 的 BDF 都发过 DMA 且无未知
@@ -340,7 +323,6 @@ package rdma_env_test_pkg;
     // 失败/边界：无。
     function new(string name = "rdma_env_pcie_test", uvm_component parent = null);
       super.new(name, parent);
-      mem_kind = "host_mem";
     endfunction
 
     // 功能：在基类配置上改为三个 Function 并加入 PCIe 插件。
@@ -379,7 +361,7 @@ package rdma_env_test_pkg;
   endclass
 `endif
 `ifdef RDMA_RXE_TEST
-  // 与 Linux Soft-RoCE 互打：仿真 Function 0（Host0 PF0）↔ 远端 Function 1（rxe），mock 内存；依次运行
+  // 与 Linux Soft-RoCE 互打：仿真 Function 0（Host0 PF0）↔ 远端 Function 1（rxe）；依次运行
   //   basic_traffic、errors、srq、reliability（URC、远端多 SGE、远端受限 MR、超时类场景由序列跳过）。
   class rdma_env_rxe_test extends rdma_env_base_test;
     `uvm_component_utils(rdma_env_rxe_test)

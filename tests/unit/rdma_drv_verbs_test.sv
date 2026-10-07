@@ -3,12 +3,12 @@
 //   与 HMC 一致、arm 的 shadow 与 doorbell、destroy）、SRQ（create/limit/destroy）、RC QP 状态机
 //   （RESET→INIT 无命令、INIT→RTR/RTR→RTS 全量签名、转 ERR 仅状态 + flush doorbell、destroy）与 UD QP，
 //   CMQ 命令失败注入下 QP create/modify/destroy 的回退，最后 remove 归还全部 DMA 内存。
-// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_system（dpu_common）、rdma_mock_host_mem。
-// 所有权与生命周期：测试拥有 mock 内存、设备与驱动对象。
+// 依赖：rdma_drv_*、rdma_dev、rdma_dpu_system（dpu_common）、rdma_host_mem（外部 host_mem）。
+// 所有权与生命周期：测试拥有主机内存、设备与驱动对象。
 class rdma_drv_verbs_test extends uvm_test;
   `uvm_component_utils(rdma_drv_verbs_test)
 
-  rdma_mock_host_mem mem;
+  rdma_host_mem mem;
   rdma_dev dev;
   rdma_drv_dev drv;
   rdma_drv_pd pd;
@@ -30,8 +30,7 @@ class rdma_drv_verbs_test extends uvm_test;
 
     phase.raise_objection(this);
     sys = rdma_dpu_test_system::single_host("verbs");
-    if (!$cast(mem, sys.nodes[0].mem))
-      `uvm_fatal("VERBS", "dpu node memory is not the mock")
+    mem = sys.nodes[0].mem;
     dev = sys.nodes[0].dev;
     sys.probe(0, status);
     expect_ok("probe", status);

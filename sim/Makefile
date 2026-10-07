@@ -1,13 +1,11 @@
 # 目录：sim/Makefile，仿真构建层入口。
-# 职责：定义 core、env（UVM env：host_mem + net_packet）、pcie_work 与 rxe 的编译、预检和 UVM 运行流程。
+# 职责：定义 core、env、pcie_work 与 rxe 的编译、预检和 UVM 运行流程。所有 suite 编译同一份 RDMA 源码
+#   （filelists/rdma.f + tests.f，含外部 host_mem 与 net_packet）；pcie_work、rxe 另加各自的 filelist。
 # 依赖与所有权：依赖 VCS、仓库 filelist 及外部只读源码树；本文件仅管理 build 输出目录，不拥有外部依赖生命周期。
 
 BUILD ?= build/core
-# 53 机上的 /home/ubuntu/workspace/host_mem 是真实 pinned backing 的只读
-# checkout；固定 commit/hash 使 E2E 可复现，同时不把外部源码复制进本仓库。
+# 外部组件（dpu_common、host_mem、net_packet、pcie_work）由使用者经 *_ROOT 指定，直接引用、不锁版本。
 override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
-# 6766c4f is the net_packet master snapshot that contains packet.sv and the
-# RoCEv2/iWARP protocol headers consumed by this adapter.
 TEST ?= rdma_smoke_test
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
@@ -18,6 +16,19 @@ CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
 # dpu_common（Host/PF/VF、BDF、BAR 的逻辑设备配置）：所有编译 tests/rdma_unit_test_pkg 的 suite 都需要；
 # 由 rdma_dpu_adapter_pkg 投影给驱动/设备模型。
 DPU_COMMON_SRC = +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv
+
+# 功能：在 build 目录 $(1) 生成外部组件路径展开后的 filelist（VCS 不替换 filelist 中的 Make 变量），并
+#   编译 tb_top 为 $(1)/simv；$(2) 为附加的 suite filelist（rxe、pcie_work）与选项。
+# 输入输出及副作用：写 $(1) 下的 *.f 与 simv。
+# 失败边界：编译失败返回非零。
+define RDMA_COMPILE
+	mkdir -p $(1); \
+	for list in rdma tests pcie_work rxe; do \
+		sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
+		    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' filelists/$$list.f > $(1)/$$list.f; \
+	done; \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) -f $(1)/rdma.f $(2) -f $(1)/tests.f -top tb_top -o $(1)/simv
+endef
 
 # 功能：把一个 core UVM test 转交给统一 runner 执行并检查 summary。
 # 输入输出及副作用：参数 1 是 UVM test，参数 2 是含 simv 的 build 目录；写独立 log。
@@ -69,10 +80,9 @@ regression:
 	echo "REGRESSION SUMMARY total=$$total pass=$$pass fail=$$fail"; \
 	(( fail == 0 ))
 
-core: dpu_common_preflight
+core: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \
-	mkdir -p $(BUILD); \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) -f filelists/core.f -top tb_top -o $(BUILD)/simv; \
+	$(call RDMA_COMPILE,$(BUILD),); \
 	if [[ "$(TEST)" == regression ]]; then \
 		mapfile -t suite_tests < <(sed -n '/^readonly CORE_TESTS=(/,/^)/p' ../scripts/run_queue_lifecycle_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
 		if (( $${#suite_tests[@]} == 0 )); then echo "core regression manifest is empty" >&2; exit 2; fi; \
@@ -165,48 +175,22 @@ rdma_defs:
 	python3 ../tools/check_cmq_capabilities.py --driver-root "$$kernel_root" --check --repo ..
 
 host_mem_preflight:
-	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then \
-		echo "HOST_MEM_ROOT is required for the host_mem target" >&2; \
-		exit 2; \
-	fi
-	@for dependency in \
-		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv" \
-		"$(HOST_MEM_ROOT)/src/host_mem_manager.sv"; do \
-		if [[ ! -r "$$dependency" ]]; then \
-			echo "Required host_mem dependency is not readable: $$dependency" >&2; \
-			exit 2; \
-		fi; \
-	done
-	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
+	@if [[ -z "$(HOST_MEM_ROOT)" || ! -r "$(HOST_MEM_ROOT)/src/host_mem_pkg.sv" || \
+	      ! -r "$(HOST_MEM_ROOT)/src/host_mem_manager.sv" ]]; then \
+		echo "HOST_MEM_ROOT must point at a host_mem checkout" >&2; exit 2; fi
 
 net_packet_preflight:
-	@if [[ -z "$(NET_PACKET_ROOT)" ]]; then echo "NET_PACKET_ROOT is required for net_packet" >&2; exit 2; fi
-	@preflight_failed=0; \
-	for dependency in \
-		"$(NET_PACKET_ROOT)/src/core/packet.sv" \
-		"../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv" \
-		"../src/adapters/net_packet/rdma_net_packet_bridge.sv" \
-		"../tests/integration/rdma_net_packet_adapter_test.sv"; do \
-		if [[ ! -r "$$dependency" ]]; then echo "Required net_packet dependency is not readable: $$dependency" >&2; preflight_failed=1; fi; \
-	done; \
-	if [[ "$$preflight_failed" != 0 ]]; then exit 2; fi
-	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency net_packet --root "$(NET_PACKET_ROOT)"
+	@if [[ -z "$(NET_PACKET_ROOT)" || ! -r "$(NET_PACKET_ROOT)/src/core/packet.sv" ]]; then \
+		echo "NET_PACKET_ROOT must point at a net_packet checkout" >&2; exit 2; fi
 
-# env suite：UVM env（真实 host_mem + net_packet + dpu_common）的全部场景与 net_packet 适配器测试。
+# env suite：UVM env 的全部场景。
 ENV_TESTS := rdma_env_basic_test rdma_env_netpkt_test rdma_env_high_traffic_test \
 	rdma_env_errors_test rdma_env_reliability_test rdma_env_srq_test rdma_env_lifecycle_test \
-	rdma_env_multifunc_test rdma_env_random_test rdma_net_packet_adapter_test
+	rdma_env_multifunc_test rdma_env_random_test
 
 env: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \
-	mkdir -p build/env; \
-	: "VCS 不会替换 filelist 中的 Make 变量，先生成只读依赖路径展开后的临时 filelist"; \
-	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
-	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
-	    filelists/env.f > build/env/env.expanded.f; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET \
-		+define+RDMA_ENV_TEST $(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
-		-f build/env/env.expanded.f -top tb_top -o build/env/simv; \
+	$(call RDMA_COMPILE,build/env,); \
 	tests="$(TEST)"; \
 	if [[ "$$tests" == regression ]]; then tests="$(ENV_TESTS)"; fi; \
 	rm -rf build/env/simv.vdb/snps/coverage/db/testdata build/env/cov; \
@@ -219,33 +203,12 @@ env: dpu_common_preflight host_mem_preflight net_packet_preflight
 	echo "RDMA_COV merged=$$(awk '/Total Groups Coverage Summary/ {getline; getline; print $$1; exit}' build/env/cov/groups.txt)"
 
 pcie_work_preflight:
-	@if [[ -z "$(PCIE_WORK_ROOT)" ]]; then echo "PCIE_WORK_ROOT is required for pcie_work" >&2; exit 2; fi
-	@if [[ -z "$(HOST_MEM_ROOT)" ]]; then echo "HOST_MEM_ROOT is required for pcie_work" >&2; exit 2; fi
-	@for dependency in \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_if.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_bdf_utils_pkg.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/topology/pcie_topology_pkg.sv" \
-		"$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" \
-		"$(HOST_MEM_ROOT)/src/host_mem_pkg.sv" \
-		"$(HOST_MEM_ROOT)/src/host_mem_manager.sv"; do \
-		if [[ ! -r "$$dependency" ]]; then echo "Required pcie_work dependency is not readable: $$dependency" >&2; exit 2; fi; \
-		done
-	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
-	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency pcie_work --root "$(PCIE_WORK_ROOT)"
+	@if [[ -z "$(PCIE_WORK_ROOT)" || ! -r "$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" ]]; then \
+		echo "PCIE_WORK_ROOT must point at a pcie_work checkout" >&2; exit 2; fi
 
-pcie_work: dpu_common_preflight pcie_work_preflight net_packet_preflight
+pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_work_preflight
 	set -euo pipefail; \
-	mkdir -p build/pcie_work; \
-	: "VCS 不会替换 filelist 中的 GNU make 变量，先生成只读依赖路径展开后的临时 filelist"; \
-	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
-	    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' \
-	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
-	    filelists/pcie_work.f > build/pcie_work/pcie_work.expanded.f; \
-	: "RDMA_HOST_MEM_TEST：host_mem_manager 包进 rdma_host_mem_external_pkg，供各 Host 的统一内存"; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_PCIE_WORK_TEST +define+RDMA_HOST_MEM_TEST \
-		+define+RDMA_NET_PACKET +define+RDMA_ENV_TEST \
-		-f build/pcie_work/pcie_work.expanded.f -top tb_top -o build/pcie_work/simv; \
+	$(call RDMA_COMPILE,build/pcie_work,+define+RDMA_PCIE_WORK_TEST -f build/pcie_work/pcie_work.f); \
 	test_name=$(TEST); \
 	if [[ "$$test_name" == regression ]]; then test_name=rdma_env_pcie_test; fi; \
 	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
@@ -254,14 +217,13 @@ pcie_work: dpu_common_preflight pcie_work_preflight net_packet_preflight
 # Soft-RoCE 互打：需先在本机运行 tools/rxe/rxe_tap_setup.sh up（TAP 网卡 + rxe 设备，需 sudo）。
 RXE_TAP ?= rtap0
 
-rxe: dpu_common_preflight net_packet_preflight
+rxe: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \
-	mkdir -p build/rxe; \
 	if [[ ! -e /sys/class/net/$(RXE_TAP) ]]; then \
 		echo "TAP $(RXE_TAP) is missing: run tools/rxe/rxe_tap_setup.sh up" >&2; exit 2; fi; \
+	mkdir -p build/rxe; \
 	gcc -O2 -Wall -o build/rxe/rxe_peer ../tools/rxe/rxe_peer.c -libverbs; \
-	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/rxe.f > build/rxe/rxe.expanded.f; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_NET_PACKET +define+RDMA_RXE_TEST +define+RDMA_ENV_TEST +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/rxe/rxe.expanded.f ../src/adapters/rxe/rdma_rxe_dpi.c -top tb_top -o build/rxe/simv; \
+	$(call RDMA_COMPILE,build/rxe,+define+RDMA_RXE_TEST -f build/rxe/rxe.f ../src/adapters/rxe/rdma_rxe_dpi.c); \
 	tests=$(TEST); \
 	if [[ "$$tests" == regression ]]; then tests="rdma_rxe_test rdma_rxe_fault_test rdma_env_rxe_test"; fi; \
 	for test_name in $$tests; do \

@@ -3,7 +3,7 @@
 // 职责：源数据生成：用 net_packet 的负载引擎（空协议栈 packet，payload_mode 为 RANDOM/FIXED/
 //   INCREMENT/PATTERN，pkt_len = 长度，do_pack 后 raw_data 即负载）生成 verb 的原始数据。
 //   原始数据由 verb driver 写入源内存并保留在 item 上，scoreboard 以它为唯一判据。
-// 依赖：rdma_net_packet_adapter_pkg 中的 net_packet packet 类与 payload_mode_e。
+// 依赖：rdma_netpkt_pkg 中的 net_packet packet 类与 payload_mode_e。
 // 所有权：一个共享 packet 对象（构造开销大，只建一次）。
 // 生命周期：首次调用时创建，仿真期间常驻。
 

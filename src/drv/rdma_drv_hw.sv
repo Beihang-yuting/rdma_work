@@ -1,7 +1,7 @@
 // 目录：驱动层 src/drv/rdma_drv_hw.sv。
 // 职责：驱动访问硬件的三种原语：BAR 寄存器写（xtrdma_iowrite64be）、DMA 缓冲区
 //   （xtrdma_alloc_dma_mem，按 IOVA 读写）、资源位图（alloc.c / rdma_main.h 的 bitmap 分配）。
-// 依赖：rdma_host_mem_api、rdma_be、rdma_defs.svh。
+// 依赖：rdma_host_mem（外部 host_mem 的 Function 视图）、rdma_be、rdma_defs.svh。
 // 所有权与生命周期：rdma_drv_hw 借用 host_mem 与 BAR；分配出的 rdma_drv_dma 归调用方，free 后失效。
 
 // BAR 写端口：offset 为 BAR 内绝对偏移（xtrdma_hw.h 的 XTRDMA_PF_NTFE_*，即 0x2000 起）。
@@ -23,7 +23,6 @@ endclass
 class rdma_drv_dma extends uvm_object;
   `rdma_object_utils(rdma_drv_dma)
 
-  rdma_dma_mapping mapping;
   bit [63:0] iova;
   int unsigned size;
 
@@ -32,7 +31,6 @@ class rdma_drv_dma extends uvm_object;
   // 失败/边界：无。
   function new(string name = "rdma_drv_dma");
     super.new(name);
-    mapping = null;
     iova = '0;
     size = 0;
   endfunction
@@ -126,9 +124,8 @@ endclass
 class rdma_drv_hw extends uvm_object;
   `rdma_object_utils(rdma_drv_hw)
 
-  rdma_host_mem_api host_mem;
+  rdma_host_mem host_mem;
   rdma_drv_bar bar;
-  protected rdma_dma_request_context dma_ctx;
 
   // 功能：构造未绑定的硬件上下文。
   // 输入/输出及副作用：name 为 UVM 对象名。
@@ -137,20 +134,16 @@ class rdma_drv_hw extends uvm_object;
     super.new(name);
     host_mem = null;
     bar = null;
-    dma_ctx = null;
   endfunction
 
-  // 功能：绑定 BAR、主机内存与 DMA 请求身份（Function 句柄）。
+  // 功能：绑定 BAR 与主机内存。
   // 输入/输出及副作用：保存非拥有引用。
   // 失败/边界：参数为 null 返回 INVALID_ARGUMENT。
-  function rdma_status bind_hw(rdma_drv_bar bar_arg, rdma_host_mem_api host_mem_arg,
-                               rdma_function_handle function_h);
-    if (bar_arg == null || host_mem_arg == null || function_h == null)
+  function rdma_status bind_hw(rdma_drv_bar bar_arg, rdma_host_mem host_mem_arg);
+    if (bar_arg == null || host_mem_arg == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "driver hardware binding is incomplete");
     bar = bar_arg;
     host_mem = host_mem_arg;
-    dma_ctx = rdma_dma_request_context::type_id::create("drv_dma_ctx");
-    dma_ctx.function_h = function_h;
     return rdma_status::success();
   endfunction
 
@@ -159,18 +152,17 @@ class rdma_drv_hw extends uvm_object;
   // 失败/边界：分配或清零失败返回其 status，mem_buf 为 null。
   function rdma_status alloc_dma(int unsigned size, int unsigned align,
                                  output rdma_drv_dma mem_buf);
-    rdma_dma_mapping mapping;
+    bit [63:0] iova;
     rdma_status status;
 
     mem_buf = null;
     if (host_mem == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "driver hardware is not bound");
-    status = host_mem.allocate(dma_ctx, size, align, RDMA_DMA_BIDIRECTIONAL, mapping);
+    status = host_mem.alloc(size, align, iova);
     if (!status.ok())
       return status;
     mem_buf = rdma_drv_dma::type_id::create("drv_dma");
-    mem_buf.mapping = mapping;
-    mem_buf.iova = mapping.iova.value;
+    mem_buf.iova = iova;
     mem_buf.size = size;
     status = write(mem_buf, 0, rdma_be::zeros(size));
     if (!status.ok())
@@ -182,9 +174,9 @@ class rdma_drv_hw extends uvm_object;
   // 输入/输出及副作用：释放 mapping；mem_buf 不再可用。
   // 失败/边界：null 视为成功。
   function rdma_status free_dma(rdma_drv_dma mem_buf);
-    if (mem_buf == null || mem_buf.mapping == null)
+    if (mem_buf == null)
       return rdma_status::success();
-    return host_mem.\release (mem_buf.mapping);
+    return host_mem.free(mem_buf.iova);
   endfunction
 
   // 功能：写缓冲区 offset 处的字节。
@@ -196,7 +188,9 @@ class rdma_drv_hw extends uvm_object;
     data = new[bytes.size()];
     foreach (data[i])
       data[i] = bytes[i];
-    return host_mem.write(mem_buf.mapping, offset, data);
+    if (offset + bytes.size() > mem_buf.size)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "write past the end of a DMA buffer");
+    return host_mem.write(mem_buf.iova + offset, data);
   endfunction
 
   // 功能：读缓冲区 offset 处 size 字节。
@@ -208,7 +202,9 @@ class rdma_drv_hw extends uvm_object;
     rdma_status status;
 
     bytes = new[0];
-    status = host_mem.read(mem_buf.mapping, offset, size, data);
+    if (offset + size > mem_buf.size)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "read past the end of a DMA buffer");
+    status = host_mem.read(mem_buf.iova + offset, size, data);
     if (!status.ok())
       return status;
     bytes = new[data.size()];
