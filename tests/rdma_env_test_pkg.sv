@@ -54,9 +54,6 @@ package rdma_env_test_pkg;
       cfg = rdma_env_cfg::type_id::create("cfg");
       cfg.add_func(0);
       cfg.add_func(1);
-      // 设备模型偏差：RC 请求方收到致命 NAK 后写错误 CQE 但继续处理 SQ（IBTA 要求 QP 转 ERR、其余 WR
-      //   flush；URC 已按此实现）。
-      cfg.deviations.push_back("rc_error_no_flush");
       cfg.link_type = link_type;
 `ifdef RDMA_HOST_MEM_TEST
       if (mem_kind == "host_mem")

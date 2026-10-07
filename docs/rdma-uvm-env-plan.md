@@ -167,9 +167,9 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 
 ## 10. 发现与偏差
 
-- 设备模型 RC 请求方收到致命 NAK（如 REM_ACCESS）后写错误 CQE 但继续处理后续 SQE；IBTA 要求 QP 转 Error、
-  其余 WR flush（URC 已按此实现，rxe 也是如此）。测试配置以偏差 `rc_error_no_flush` 声明，scoreboard 据此
-  不预测 RC 的 flush；修正设备后去掉该偏差即恢复严格检查。
+- 设备模型 RC 请求方收到致命 NAK（如 REM_ACCESS）后曾写错误 CQE 但继续处理后续 SQE；IBTA 要求 QP 转 Error、
+  其余 WR flush。已修正：RC 错误完成后设备把 QPC 置 ERR、写 RQ flush CQE，ERR 下的 SQ/RQ doorbell 写
+  flush CQE（ERR 下投递的 WR 也 flush）；原偏差 `rc_error_no_flush` 已删除，scoreboard 严格预测。
 - rxe 响应方出错后 QP 转 ERR、不再应答（IBTA 行为）；errors 场景在远端对每个错误使用新 QP 对。
 - AckReq 规则只约束 SEND/WRITE 末包（READ/ATOMIC 必有响应）；UD Q_Key 取自 WR，不符时由接收端丢弃，
   不作为发送方违例（scoreboard 验证丢弃）。

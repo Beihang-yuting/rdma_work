@@ -106,7 +106,6 @@ class rdma_env extends uvm_env;
   function void connect_phase(uvm_phase phase);
     ctrl.driver.env = this;
     sb.res = res;
-    sb.exp.rc_error_no_flush = cfg.deviates("rc_error_no_flush");
     res.ap.connect(sb.res_export);
     vseqr.env = this;
     if (checker != null) begin

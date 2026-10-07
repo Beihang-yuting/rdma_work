@@ -6,7 +6,7 @@
 //   预测：远端访问（MR 属于对端 Function 与对端 QP 的 PD、范围内、权限齐全，否则 REM_ACCESS_ERR）；
 //   接收容量不足（请求方 REM_INV_REQ_ERR，远端响应方为 REM_OP_ERR；接收端错误完成；UD 请求方成功）；
 //   UD Q_Key 不符（接收端丢弃）；QP 进入 ERR（在途可 FLUSH，之后投递的全部 FLUSH）；请求方致命错误后
-//   QP 进入错误态、剩余 SQ/RQ 全部 FLUSH（IBTA；cfg.deviations 含 "rc_error_no_flush" 时 RC 不这样预测）；
+//   QP 进入错误态、剩余 SQ/RQ 全部 FLUSH（IBTA）；
 //   QP 销毁/FLR 撤销其期望。
 // 依赖：rdma_verb_item、rdma_res_qp/mr。
 // 所有权：只引用 item。
@@ -15,8 +15,6 @@
 class rdma_expect extends uvm_object;
   `uvm_object_utils(rdma_expect)
 
-  // RC 请求方致命错误后不预测 flush（偏差开关）。
-  bit rc_error_no_flush;
   protected rdma_verb_item sq[longint unsigned][$];
   protected rdma_verb_item rq[longint unsigned][$];
   protected rdma_verb_item inbound[longint unsigned][$];
@@ -130,12 +128,11 @@ class rdma_expect extends uvm_object;
         rq[qp.uid][i].may_flush = 1'b1;
   endfunction
 
-  // 功能：请求方致命错误（非 FLUSH 的错误完成）：QP 进入错误态，剩余 SQ 与 RQ 项期望 FLUSH（RC 且
-  //   rc_error_no_flush 时不预测）。
+  // 功能：请求方致命错误（非 FLUSH 的错误完成）：QP 进入错误态，剩余 SQ 与 RQ 项期望 FLUSH。
   // 输入/输出及副作用：修改 errored 与剩余项的预测；被 flush 的 SEND 不再到达对端。
   // 失败/边界：无。
   function void requester_error(rdma_res_qp qp);
-    if (qp.ud() || (rc_error_no_flush && !qp.urc))
+    if (qp.ud())
       return;
     errored[qp.uid] = 1'b1;
     if (sq.exists(qp.uid))

@@ -67,6 +67,8 @@ class rdma_dev extends uvm_object;
       doorbell_values.push_back(value);
       if (offset == RDMA_DB_SQ_OFFSET)
         nic.sq_doorbell(value);
+      if (offset == RDMA_DB_RQ_OFFSET)
+        nic.rq_doorbell(value);
       if (offset == RDMA_DB_CQ_OFFSET)
         nic.cq_doorbell(value);
       if (offset == RDMA_DB_QP_FLUSH_OFFSET)

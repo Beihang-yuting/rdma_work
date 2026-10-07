@@ -104,6 +104,7 @@ class rdma_dev_nic extends uvm_object;
   // QPC QP_ST 编码（驱动 xtrdma_get_qp_st：INIT1、RTR2、RTS3、ERR4、SQD/SQE5）。
   localparam int unsigned QP_ST_RTR = 2;
   localparam int unsigned QP_ST_RTS = 3;
+  localparam int unsigned QP_ST_ERR = 4;
   localparam int unsigned QP_ST_SQD = 5;
   localparam int unsigned URC_SERVICE_TYPE = 6;
   // 设备保存的 CQC 从 SQE 字节 8 起、EQC 从 SQE 字节 16 起。
@@ -555,6 +556,17 @@ class rdma_dev_nic extends uvm_object;
     void'(sq_kicks.try_put(qpn));
   endtask
 
+  // 功能：RQ doorbell：非 URC 的 QP 处于 ERR 时写 RQ flush CQE（ERR 下投递的 RECV 以 FLUSH 完成）；
+  //   其余状态下设备从 shadow 读取 PI，此处无动作。
+  // 输入/输出及副作用：可能写 CQE。
+  // 失败/边界：无。
+  task rq_doorbell(bit [63:0] value);
+    int unsigned qpn;
+
+    qpn = value[RDMA_NOTIFY_RQ_QPN_LSB +: RDMA_NOTIFY_RQ_QPN_WIDTH];
+    if (!is_urc(qpn) && `RDMA_QPC(qpn, RDMA_QPC_QP_ST) == QP_ST_ERR)
+      write_cqe(qpn, 1'b1, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR, 0, '0, 0);
+  endtask
 
   // 功能：QP 的 SQ/RQ 槽地址（QPC 的 PBA/OM，深度 2^SIZE）。
   // 输入/输出及副作用：iova/depth/ok 输出。
@@ -769,8 +781,9 @@ class rdma_dev_nic extends uvm_object;
       write_cqe(qpn, 1'b1, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR, 0, '0, 0);
   endtask
 
-  // 功能：drain SQ：从设备游标起处理所有 polarity 有效的 SQE；完毕后把 HW_DROP_DB_CNT 写为已见
-  //   doorbell 数（驱动据此判断可再次敲 doorbell）。
+  // 功能：drain SQ：从设备游标起处理所有 polarity 有效的 SQE；非 URC 的 QP 处于 ERR 时改写一个 SQ
+  //   flush CQE（驱动据此 flush 全部未完成 WQE）；完毕后把 HW_DROP_DB_CNT 写为已见 doorbell 数（驱动
+  //   据此判断可再次敲 doorbell）。
   // 输入/输出及副作用：处理 WQE、写 shadow。
   // 失败/边界：QP 不存在或 SQ 不可读报告协议错误。
   task drain_sq(int unsigned qpn);
@@ -797,9 +810,12 @@ class rdma_dev_nic extends uvm_object;
       end
       if (rdma_be::field(wqe, 0, RDMA_SQ_WQE_VALID_LSB, 1) != !((rt.sq_ci / depth) & 1))
         break;
-      // 只在 RTS 取新的 SQE（SQD/ERR 等状态下已投递的 WQE 留在环上）。
-      if (rt.urc_error || `RDMA_QPC(qpn, RDMA_QPC_QP_ST) != QP_ST_RTS)
+      // 只在 RTS 取新的 SQE（SQD 等状态下已投递的 WQE 留在环上，ERR 下 flush）。
+      if (rt.urc_error || `RDMA_QPC(qpn, RDMA_QPC_QP_ST) != QP_ST_RTS) begin
+        if (!is_urc(qpn) && `RDMA_QPC(qpn, RDMA_QPC_QP_ST) == QP_ST_ERR)
+          write_cqe(qpn, 1'b0, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_SQ_FLUSH_ERR, 0, '0, 0);
         break;
+      end
       process_sqe(qpn, rt, wqe);
       rt.sq_ci++;
     end
@@ -864,7 +880,8 @@ class rdma_dev_nic extends uvm_object;
   // 功能：执行一个 SQE：本地准备（签名、SGE/inline 取数）后 UD 直接发包；RC/URC 经 run_request
   //   带重传/RNR 重试执行；结果按 RC 写 SQ CQE（CE 或出错时）或按 URC 推进 HW_CPL/上报异常。
   // 输入/输出及副作用：DMA、发包、写 CQE/CEQE。
-  // 失败/边界：签名错以 WQE_SIGN_ERR、本地访问错以 SQ_KEY_ERR 完成；远端错误见 run_request。
+  // 失败/边界：签名错以 WQE_SIGN_ERR、本地访问错以 SQ_KEY_ERR 完成；远端错误见 run_request。RC 错误
+  //   完成后 QP 转 ERR（IBTA），其余 WQE 由 drain_sq flush。
   protected task process_sqe(int unsigned qpn, rdma_dev_qp_rt rt, rdma_bytes_t wqe);
     bit [63:0] sges[$];
     rdma_bytes_t data;
@@ -926,9 +943,31 @@ class rdma_dev_nic extends uvm_object;
       else
         urc_abnormal(qpn, 1'b0, ecode, synd);
     end
-    else if (`RDMA_BE_GET(wqe, RDMA_SQ_WQE_CE) != 0 || ecode != RDMA_CMQ_SUCCESS_ECODE)
-      write_cqe(qpn, 1'b0, `RDMA_BE_GET(wqe, RDMA_SQ_WQE_INDEX),
-                `RDMA_BE_GET(wqe, RDMA_SQ_WQE_WRAP), ecode, byte_len, '0, 0, synd);
+    else begin
+      if (`RDMA_BE_GET(wqe, RDMA_SQ_WQE_CE) != 0 || ecode != RDMA_CMQ_SUCCESS_ECODE)
+        write_cqe(qpn, 1'b0, `RDMA_BE_GET(wqe, RDMA_SQ_WQE_INDEX),
+                  `RDMA_BE_GET(wqe, RDMA_SQ_WQE_WRAP), ecode, byte_len, '0, 0, synd);
+      if (!ud && ecode != RDMA_CMQ_SUCCESS_ECODE)
+        enter_error(qpn);
+    end
+  endtask
+
+  // 功能：RC 请求方错误后 QP 转 ERR：QPC QP_ST 写为 ERR，非 SRQ 时写 RQ flush CQE（SQ 余下 WQE 由
+  //   drain_sq 在 ERR 下 flush）。
+  // 输入/输出及副作用：修改 QPC、写 CQE。
+  // 失败/边界：QP 不存在时无动作。
+  protected task enter_error(int unsigned qpn);
+    rdma_dev_object obj;
+    rdma_bytes_t qpc;
+
+    if (!ctx.lookup(RDMA_DEV_QP, qpn, obj))
+      return;
+    qpc = obj.bytes;
+    rdma_be::set_field(qpc, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
+                       RDMA_QPC_QP_ST_WIDTH, QP_ST_ERR);
+    obj.bytes = qpc;
+    if (!`RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ))
+      write_cqe(qpn, 1'b1, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR, 0, '0, 0);
   endtask
 
   // 功能：RC/URC 请求的重传循环。PSN 序列 NAK 从 NAK 指出的 PSN 起重发（READ 从第一个缺失的响应
