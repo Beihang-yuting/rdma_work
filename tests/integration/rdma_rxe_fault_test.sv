@@ -2,8 +2,10 @@
 // 层：集成测试（需宿主机 Soft-RoCE）。
 // 职责：在 rdma_rxe_test 的链路/对端之上与 Linux Soft-RoCE 互打 UD、SRQ、RNR、丢包与错误场景，每组用
 //   新建的 QP 对（各自 CQ）：
-//   - UD：双向 SEND（接收方缓冲前 40B 为 GRH、src_qp 为对端 QPN）；Q_Key 不符的 UD 报文被设备静默丢弃。
-//   - SRQ：仿真 RC QP 绑定 SRQ，rxe 的 SEND 依次消费 SRQ WQE。
+//   - UD：双向 SEND（接收方缓冲前 40B 为 GRH、src_qp 为对端 QPN）；Q_Key 不符的 UD 报文被设备静默丢弃；
+//     多 SGE：仿真 UD 发送从 3 个 SGE 收集，UD 接收把 GRH 与数据散写到 3 个 SGE。
+//   - SRQ：仿真 RC QP 绑定 SRQ，rxe 的 SEND 依次消费 SRQ WQE；rxe RC QP 绑定 rxe 的 SRQ，仿真的 SEND（含
+//     多包）依次消费 rxe SRQ WQE。
 //   - RNR：rxe→仿真无 RECV 时设备回 RNR NAK（定时器编码 = 本端 min_rnr），rxe 按定时器重试成功；
 //     仿真→rxe 收到 rxe 的 RNR NAK 后设备按定时器重试成功；RNR 重试耗尽为 vendor 0xB7。
 //   - 丢包（链路注入）：仿真→rxe 中间包丢失，rxe 回 PSN 序列 NAK，设备从 NAK PSN 续传；rxe→仿真中间包
@@ -34,7 +36,9 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
   // 失败/边界：以 UVM_ERROR 报告。
   virtual task run_cases();
     run_ud();
+    run_ud_sge();
     run_srq();
+    run_rxe_srq();
     run_rnr();
     run_loss();
     run_errors();
@@ -170,6 +174,8 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
     init.pd = pd;
     init.send_cq = cq;
     init.recv_cq = cq;
+    init.max_send_sge = 4;
+    init.max_recv_sge = 4;
     rdma_drv_qp::create_qp(drv, init, q, status);
     expect_ok("UD QP", status);
     attr = rdma_drv_qp_attr::type_id::create("rxe_ud_init");
@@ -246,6 +252,119 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
     if (wc != null && (wc.byte_len != 340 || wc.src_qp != pud))
       `uvm_error("UD rxe->sim", $sformatf("byte_len %0d src_qp %0d", wc.byte_len, wc.src_qp))
     expect_local("UD rxe->sim data", 'h6000 + 40, data);
+  endtask
+
+  // 功能：UD 多 SGE：仿真→rxe 的 UD SEND 从本端 3 个不连续 SGE（100+50+70B）收集，rxe 收到其拼接；
+  //   rxe→仿真的 300B UD SEND 进入 3 个 SGE 的接收 WQE（64+100+200B）：GRH 占第一个 SGE 的前 40B，
+  //   数据依次散写 24/100/176B。
+  // 输入/输出及副作用：创建一对 UD QP。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task run_ud_sge();
+    rdma_drv_qp ud;
+    rdma_drv_send_wr wr;
+    rdma_drv_recv_wr rwr;
+    rdma_drv_wc wc;
+    rdma_bytes_t data;
+    rdma_bytes_t part;
+    rdma_status status;
+    string reply;
+    int unsigned pud;
+    int unsigned offs[3];
+    int unsigned lens[3];
+    int unsigned at;
+    longint unsigned rid;
+    longint unsigned sid;
+
+    peer_drain();
+    make_sim_ud(ud);
+    pud = rdma_rxe_peer::field(peer.cmd("qp ud"), "qpn");
+    void'(peer.cmd($sformatf("ud_ready %0d 0x%0h 0x500", pud, UD_QKEY)));
+    offs = '{'h400, 'h900, 'he00};
+    lens = '{100, 50, 70};
+    data = new[0];
+    wr = sim_wr(RDMA_DRV_WR_SEND, offs[0], lens[0]);
+    foreach (offs[k]) begin
+      part = pattern(lens[k], 100 + k);
+      expect_ok("fill", sys.nodes[0].hw.write(data_buf, offs[k], part));
+      data = {data, part};
+      if (k > 0)
+        wr.sges.push_back(rdma_drv_sge::make(data_buf.iova + offs[k], lens[k], mr.key()));
+    end
+    wr.dest_qpn = pud;
+    wr.dmac = rxe_mac;
+    wr.qkey = UD_QKEY;
+    rid = next_wr_id++;
+    void'(peer.cmd($sformatf("recv %0d 0x8000 1064 %0d", pud, rid)));
+    post(wr, ud);
+    wait_sim("UD SGE sim->rxe send", wr.wr_id, wc);
+    wait_peer("UD SGE sim->rxe recv", rid, reply);
+    if (rdma_rxe_peer::field(reply, "len") != 40 + data.size())
+      `uvm_error("UD SGE sim->rxe", {"rxe completion ", reply})
+    expect_bytes("UD SGE sim->rxe data", peer_rbuf('h8000 + 40, data.size()), data);
+    offs = '{'h6000, 'h6800, 'h7000};
+    lens = '{64, 100, 200};
+    rwr = rdma_drv_recv_wr::type_id::create("rxe_ud_sge_recv");
+    rwr.wr_id = next_wr_id++;
+    foreach (offs[k])
+      rwr.sges.push_back(rdma_drv_sge::make(data_buf.iova + offs[k], lens[k], mr.key()));
+    rdma_drv_wr::post_recv(drv, ud, rwr, status);
+    expect_ok("post UD SGE recv", status);
+    data = pattern(300, 77);
+    void'(peer.cmd({"wbuf 0x1000 ", hex_of(data)}));
+    sid = next_wr_id++;
+    void'(peer.cmd($sformatf("send_ud %0d 0x1000 300 %0d %s %0d 0x%0h", pud, sid,
+                             arg("RXE_SIM_IP", "10.79.0.1"), ud.qpn, UD_QKEY)));
+    wait_sim("UD SGE rxe->sim recv", rwr.wr_id, wc);
+    wait_peer("UD SGE rxe->sim send", sid, reply);
+    if (wc != null && (wc.byte_len != 340 || wc.src_qp != pud))
+      `uvm_error("UD SGE rxe->sim", $sformatf("byte_len %0d src_qp %0d", wc.byte_len, wc.src_qp))
+    at = 0;
+    foreach (offs[k]) begin
+      int unsigned skip;
+      int unsigned n;
+
+      skip = (k == 0) ? 40 : 0;
+      n = lens[k] - skip;
+      if (n > data.size() - at)
+        n = data.size() - at;
+      expect_local($sformatf("UD SGE rxe->sim sge %0d", k), offs[k] + skip,
+                   rdma_be::slice(data, at, n));
+      at += n;
+    end
+  endtask
+
+  // 功能：rxe RC QP 绑定 rxe 进程的 SRQ（16 个 WQE），仿真的 600B 与 2500B（3 包）SEND 依次消费 rxe 投递的
+  //   两个 SRQ WQE，rxe 完成的 wr_id 为 SRQ WQE 的 wr_id、qp 为该 QP。
+  // 输入/输出及副作用：创建 rxe SRQ 与 QP 对。
+  // 失败/边界：不符报告 UVM_ERROR。
+  task run_rxe_srq();
+    rdma_drv_send_wr wr[2];
+    rdma_drv_wc wc;
+    rdma_bytes_t data[2];
+    string reply;
+    longint unsigned rid[2];
+
+    void'(peer.cmd("srq 16"));
+    make_pair("rxe_srq", 0, 7, 7, null, 7, 1'b1);
+    foreach (rid[k]) begin
+      rid[k] = next_wr_id++;
+      void'(peer.cmd($sformatf("srq_recv %0d 4096 %0d", 'h4000 + 'h1000 * k, rid[k])));
+    end
+    foreach (data[k]) begin
+      data[k] = pattern(k == 0 ? 600 : 2500, 120 + k);
+      expect_ok("fill", sys.nodes[0].hw.write(data_buf, 'h1000 * k, data[k]));
+      wr[k] = sim_wr(RDMA_DRV_WR_SEND, 'h1000 * k, data[k].size());
+      post(wr[k]);
+    end
+    foreach (data[k]) begin
+      wait_sim($sformatf("rxe SRQ send %0d", k), wr[k].wr_id, wc);
+      wait_peer($sformatf("rxe SRQ recv %0d", k), rid[k], reply);
+      if (rdma_rxe_peer::field(reply, "len") != data[k].size() ||
+          rdma_rxe_peer::field(reply, "qp") != peer_qpn)
+        `uvm_error("rxe SRQ", {"rxe completion ", reply})
+      expect_bytes($sformatf("rxe SRQ data %0d", k), peer_rbuf('h4000 + 'h1000 * k,
+                   data[k].size()), data[k]);
+    end
   endtask
 
   // 功能：仿真 RC QP 绑定 SRQ，rxe 两个 SEND 依次消费 SRQ 的两个 WQE。

@@ -9,7 +9,9 @@
  * 命令（数值十进制或 0x 十六进制；off 为本端 MR 内偏移）：
  *   open <dev> <gid_index>                     -> OK gid=<32 hex>
  *   mr <size>                                  -> OK addr=<hex> rkey=<hex>
- *   qp rc|ud                                   -> OK qpn=<n>
+ *   qp rc|ud [srq]                             -> OK qpn=<n>（srq：RC QP 绑定本进程的 SRQ）
+ *   srq <max_wr>                               -> OK（建本进程唯一的 SRQ）
+ *   srq_recv <off> <len> <wr_id>               -> OK
  *   rc_connect <qp> <dqpn> <rq_psn> <sq_psn> <dip a.b.c.d> <mtu> <timeout> <retry> <rnr>
  *                                              -> OK（INIT->RTR->RTS）
  *   ud_ready <qp> <qkey> <sq_psn>              -> OK（INIT->RTR->RTS）
@@ -30,7 +32,7 @@
 #include <string.h>
 #include <time.h>
 
-#define MAX_QP 16
+#define MAX_QP 64
 
 static struct ibv_context *ctx;
 static struct ibv_pd *pd;
@@ -39,6 +41,7 @@ static struct ibv_mr *mr;
 static uint8_t *buf;
 static size_t buf_size;
 static struct ibv_qp *qps[MAX_QP];
+static struct ibv_srq *srq;
 static int gid_index;
 static const uint8_t port = 1;
 
@@ -134,6 +137,11 @@ static int cmd_qp(char **a)
 	init.send_cq = cq;
 	init.recv_cq = cq;
 	init.qp_type = ud ? IBV_QPT_UD : IBV_QPT_RC;
+	if (a[2] && !strcmp(a[2], "srq")) {
+		if (!srq)
+			return printf("ERR no srq\n");
+		init.srq = srq;
+	}
 	init.cap.max_send_wr = 64;
 	init.cap.max_recv_wr = 64;
 	init.cap.max_send_sge = 1;
@@ -154,6 +162,20 @@ static int cmd_qp(char **a)
 	if (ibv_modify_qp(qps[slot], &attr, mask))
 		return printf("ERR init %d\n", errno);
 	return printf("OK qpn=%u\n", qps[slot]->qp_num);
+}
+
+static int cmd_srq(char **a)
+{
+	struct ibv_srq_init_attr init = {0};
+
+	if (srq)
+		return printf("ERR srq exists\n");
+	init.attr.max_wr = (uint32_t)num(a[1]);
+	init.attr.max_sge = 1;
+	srq = ibv_create_srq(pd, &init);
+	if (!srq)
+		return printf("ERR create_srq %d\n", errno);
+	return printf("OK\n");
 }
 
 static enum ibv_mtu mtu_enum(int mtu)
@@ -244,6 +266,21 @@ static int cmd_recv(char **a)
 	wr.num_sge = 1;
 	if (ibv_post_recv(qp, &wr, &bad))
 		return printf("ERR post_recv %d\n", errno);
+	return printf("OK\n");
+}
+
+static int cmd_srq_recv(char **a)
+{
+	struct ibv_recv_wr wr = {0}, *bad;
+	struct ibv_sge sge;
+
+	if (!srq || sge_of(&sge, a[1], a[2]))
+		return printf("ERR args\n");
+	wr.wr_id = num(a[3]);
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	if (ibv_post_srq_recv(srq, &wr, &bad))
+		return printf("ERR post_srq_recv %d\n", errno);
 	return printf("OK\n");
 }
 
@@ -386,8 +423,12 @@ int main(void)
 			cmd_open(a);
 		else if (!strcmp(a[0], "mr") && n == 2)
 			cmd_mr(a);
-		else if (!strcmp(a[0], "qp") && n == 2)
+		else if (!strcmp(a[0], "qp") && (n == 2 || n == 3))
 			cmd_qp(a);
+		else if (!strcmp(a[0], "srq") && n == 2)
+			cmd_srq(a);
+		else if (!strcmp(a[0], "srq_recv") && n == 4)
+			cmd_srq_recv(a);
 		else if (!strcmp(a[0], "rc_connect") && n == 10)
 			cmd_rc_connect(a);
 		else if (!strcmp(a[0], "ud_ready") && n == 4)
@@ -410,6 +451,8 @@ int main(void)
 	for (int i = 0; i < MAX_QP; i++)
 		if (qps[i])
 			ibv_destroy_qp(qps[i]);
+	if (srq)
+		ibv_destroy_srq(srq);
 	if (mr)
 		ibv_dereg_mr(mr);
 	if (cq)

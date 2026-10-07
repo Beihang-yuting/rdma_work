@@ -260,13 +260,17 @@ Function 可有相同 BDF（各自 PCIe 域）。
 | net_packet 修正 | ICRC 原放在扩展头之后且为异或占位 → 负载与 pad 之后的 4B 尾部，按 IBTA A17 计算；负载补 4B pad；BTH 第 4–11 字节与 DETH 第二字字段位置错（QPN 20 在线上为 0x1480）→ 按规范；新测试用 5 个 rxe 实际帧逐字段与逐字节比对（fork 分支 `fix/rocev2-icrc-trailer`，4dc2e08、fe37a59） |
 | 设备修正 | 请求方 RC/URC SEND/WRITE 末包置 AckReq（rxe 只对 AckReq 包回 ACK）；QPC 写入后加载起始 PSN（RTR：EPSN_REQ，RTR→RTS：RC_TPE_CUR_SQ_PSN，原先两端都从 0 开始）；ACK 按 AETH 类型位 [7:5]=000 判定，回 ACK 信用填 0x1F |
 | P1 互打 | `src/adapters/rxe`（DPI-C：TAP 收发、rxe_peer 子进程）、`tests/integration/rdma_rxe_test.sv`：仿真→rxe SEND（1/3 包）、SEND_IMM、WRITE、WRITE_IMM、READ、FETCH_ADD、CMP_SWAP，rxe→仿真 SEND、SEND_IMM、WRITE、READ、FETCH_ADD，两端完成、立即数与内存一致，双向各 17 帧无丢弃；去掉 AckReq 的变异使测试失败 |
-| P2 故障场景 | `tests/integration/rdma_rxe_fault_test.sv`（链路可注入丢帧，每组新建 QP 对）：UD 双向（GRH、src_qp）与 Q_Key 不符静默丢弃；SRQ 消费；RNR 两方向（设备 NAK 0x21、rxe NAK 后设备按定时器重试）与重试耗尽 0xB7；丢中间包两方向（PSN 序列 NAK 后续传/重传）、丢 ACK（设备超时重发，rxe 重复请求再 ACK）、丢 READ 中间响应（只重新请求缺失部分）；错误 rkey 的 WRITE/READ 两方向（NAK 0x62）、超长 SEND 两方向。双向 26/29 帧、0 错误；去掉 RNR 定时器编码与 PSN 序列 NAK 的变异各被对应检查抓到 |
+| P2 故障场景 | `tests/integration/rdma_rxe_fault_test.sv`（链路可注入丢帧，每组新建 QP 对）：UD 双向（GRH、src_qp）、UD 多 SGE（发送 3 SGE 收集、接收 3 SGE 散写，GRH 在首 SGE）与 Q_Key 不符静默丢弃；SRQ 两侧（仿真 SRQ 消费 rxe SEND；rxe SRQ 消费仿真 SEND，含多包）；RNR 两方向（设备 NAK 0x21、rxe NAK 后设备按定时器重试）与重试耗尽 0xB7；丢中间包两方向（PSN 序列 NAK 后续传/重传）、丢 ACK（设备超时重发，rxe 重复请求再 ACK）、丢 READ 中间响应（只重新请求缺失部分）；错误 rkey 的 WRITE/READ 两方向（NAK 0x62）、超长 SEND 两方向。双向 26/29 帧、0 错误；去掉 RNR 定时器编码与 PSN 序列 NAK 的变异各被对应检查抓到 |
 
 差异记录：接收缓冲放不下 SEND 时，设备回 invalid request NAK（0x61，与 mlx5 等硬件一致，rxe 按 REM_INV_REQ
 接受）；rdma_rxe 5.15 自身回 remote operational error（0x63），测试按 rxe 实际行为断言。
 
 运行：`tools/rxe/rxe_tap_setup.sh up`（sudo，一次）后 `scripts/run_vcs53.sh rxe regression`（两个测试）。仿真时间与
-真实时间：链路空闲时每 100ns 仿真时间等待至多 200us 真实时间；设备 QP 用不超时（IB timeout 0）。
+真实时间：链路空闲时每 100ns 仿真时间等待至多 20us 真实时间（+RXE_WAIT_US）；设备 QP 用不超时（IB timeout 0）。
+
+耗时（53）：`make rxe TEST=regression` 约 70s：编译约 33s；每次 simv 启动约 8.5s 是 VCS license 检出（与 rxe
+无关，任何测试相同）；rdma_rxe_test 用例本身约 0.2s，rdma_rxe_fault_test 约 4s（仿真时间 1.1ms，主要是 RNR
+定时器与 ACK 丢失的超时等待）。
 
 ## 未做与遗留
 
@@ -277,8 +281,7 @@ Function 可有相同 BDF（各自 PCIe 域）。
 - 第一阶段的包级 DAG 计划已被第二阶段的驱动形状重构取代。
 - 尚无 RTL DUT：`src/dev` 设备模型充当设备，接入 DUT 后应退为预测器。
 - 只有 pcie_work suite 的 DMA 走 PCIe；core/host_mem/e2e 仍用后门 DMA 端口（零仿真时间）。
-- 响应方对中间包 AckReq 不单独回 ACK（末包 ACK 已覆盖，长消息下 rxe 的中间 AckReq 只是延后确认）；rxe 侧 SRQ、
-  UD 多 SGE、大于 PMTU 的 UD 未互打。URC/SQD 等 xtrdma 私有行为 rxe 不支持，无法互打。
+- 响应方对中间包 AckReq 不单独回 ACK（末包 ACK 已覆盖，长消息下 rxe 的中间 AckReq 只是延后确认）。URC/SQD 等 xtrdma 私有行为 rxe 不支持，无法互打。
 - net_packet 修正尚未推送到 GitHub（本机与 53 均无推送凭据），53 上用本地 clone。
 - PCIe 路径未开 FC/记分板/覆盖率；Completion 超时、UR/CA 只报为 DMA 失败，未建模设备侧错误上报。
 - core 内的 data/reliability/multifunc 用直连链路，只有 e2e 经 net_packet 帧编解码；设备报文不带 IP

@@ -7,7 +7,8 @@
 //   本类的链路、对端与 QP 对建立（make_pair）覆盖 UD、SRQ、RNR、丢包与错误场景。
 // 前置：tools/rxe/rxe_tap_setup.sh up（TAP + rxe 设备）；+RXE_PEER=<rxe_peer 路径>。
 //   可选：+RXE_TAP（rtap0）、+RXE_DEV（rxe_rtap0）、+RXE_GID（1）、+RXE_IP（10.79.0.2）、
-//   +RXE_SIM_IP（10.79.0.1）、+RXE_SIM_MAC（02:00:00:00:79:01，须与 setup 的静态邻居一致）。
+//   +RXE_SIM_IP（10.79.0.1）、+RXE_SIM_MAC（02:00:00:00:79:01，须与 setup 的静态邻居一致）、
+//   +RXE_WAIT_US（链路空闲时每 100ns 仿真时间等待 rxe 的真实时间上限，默认 20）。
 // 依赖：rdma_rxe_pkg、rdma_net_packet_adapter_pkg、rdma_dpu_test_system。
 // 所有权：测试拥有 dpu 系统、链路与对端进程。
 // 生命周期：build_phase 建 dpu 系统，run_phase 建链路/对端并运行，结束时关闭。
@@ -211,6 +212,7 @@ class rdma_rxe_test extends uvm_test;
     link.adapter.dst_ip = ip_of(arg("RXE_IP", "10.79.0.2"));
     if (!link.open(tap))
       `uvm_fatal("RXE", {"cannot open TAP ", tap})
+    link.wait_us = arg("RXE_WAIT_US", "20").atoi();
     dev = sys.nodes[0].dev;
     link.nic = dev.nic;
     dev.nic.port = link;
@@ -253,11 +255,13 @@ class rdma_rxe_test extends uvm_test;
 
   // 功能：新建一对 RC QP 并互连，成为当前 QP 对（qp/cq/peer_qpn）：仿真侧新 CQ（可绑 SRQ）、PMTU 1024、
   //   min_rnr 1，timeout/retry/rnr_retry 取参数（timeout 0 为不超时）；rxe 侧新 QP，timeout 14、重试 7、
-  //   RNR 重试取 rxe_rnr。PSN：仿真发 0x200 起，rxe 发 0x100 起。先清空 rxe CQ 中的残留完成。
+  //   RNR 重试取 rxe_rnr，rxe_srq 时绑定 rxe 进程的 SRQ。PSN：仿真发 0x200 起，rxe 发 0x100 起。
+  //   先清空 rxe CQ 中的残留完成。
   // 输入/输出及副作用：创建 CQ/QP，修改当前 QP 对。
   // 失败/边界：失败报告 UVM_FATAL。
   task make_pair(string tag, int unsigned timeout = 0, int unsigned retry = 7,
-                 int unsigned rnr_retry = 7, rdma_drv_srq srq = null, int unsigned rxe_rnr = 7);
+                 int unsigned rnr_retry = 7, rdma_drv_srq srq = null, int unsigned rxe_rnr = 7,
+                 bit rxe_srq = 0);
     rdma_drv_qp_init_attr init;
     rdma_drv_qp_attr attr;
     rdma_status status;
@@ -278,7 +282,7 @@ class rdma_rxe_test extends uvm_test;
     attr.access = RDMA_RIGHT_REMOTE_READ | RDMA_RIGHT_REMOTE_WRITE | RDMA_RIGHT_REMOTE_ATOMIC;
     qp.modify(drv, attr, status);
     expect_ok({tag, " INIT"}, status);
-    peer_qpn = rdma_rxe_peer::field(peer.cmd("qp rc"), "qpn");
+    peer_qpn = rdma_rxe_peer::field(peer.cmd(rxe_srq ? "qp rc srq" : "qp rc"), "qpn");
     attr = rdma_drv_qp_attr::type_id::create({tag, "_rtr"});
     attr.mask = rdma_drv_qp_attr::M_STATE | rdma_drv_qp_attr::M_DEST_QPN |
                 rdma_drv_qp_attr::M_RQ_PSN | rdma_drv_qp_attr::M_PATH_MTU |

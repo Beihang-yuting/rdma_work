@@ -128,7 +128,7 @@ package rdma_rxe_pkg;
       super.new(name);
       fd = -1;
       poll_step = 100ns;
-      wait_us = 200;
+      wait_us = 20;
       rx_dropped = 0;
       tx_drop_countdown = 0;
       rx_drop_countdown = 0;
