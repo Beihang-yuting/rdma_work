@@ -266,7 +266,7 @@ endclass
 class rdma_basic_traffic_vseq extends rdma_base_vseq;
   `uvm_object_utils(rdma_basic_traffic_vseq)
 
-  localparam int unsigned BUF_BYTES = 'h10000;
+  localparam int unsigned BUF_BYTES = 'h20000;
 
   // 参与的两个 Function（f0 发起大部分请求）。
   int unsigned f0 = 0;
@@ -294,6 +294,7 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     ud_send();
     if (p.urc)
       urc_traffic();
+    sizes();
     access_error();
     env.wait_idle(500us);
   endtask
@@ -421,6 +422,17 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     it = v(0, RDMA_VERB_WRITE_IMM, 'h5800, 40, 'hf800, 2);
     it.imm = 32'hcafe_0004;
     post(it);
+  endtask
+
+  // 功能：长度两端：8 KiB 的 SEND（进 8 KiB RECV）、WRITE 与回读的 READ，32B 的 READ。
+  // 输入/输出及副作用：Function 1 的 0x10000/0x12000、Function 0 的 0x14000/0x16000 区域写入。
+  // 失败/边界：无。
+  task sizes();
+    post(v(1, RDMA_VERB_RECV, 'h10000, 'h2000));
+    post(v(0, RDMA_VERB_SEND, 'h10000, 'h2000));
+    post(v(0, RDMA_VERB_WRITE, 'h12000, 'h2000, 'h12000));
+    post(v(0, RDMA_VERB_READ, 'h14000, 'h2000, 'h12000));
+    post(v(0, RDMA_VERB_READ, 'h16000, 32, 'h12100));
   endtask
 
   // 功能：WRITE 越过对端 MR 末尾（scoreboard 预测 REM_ACCESS_ERR、对端内存不变）。

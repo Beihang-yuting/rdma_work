@@ -78,14 +78,17 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
       pd_mismatch();
     end
     overflow();
+    local_access();
+    if (p.urc)
+      urc_bad_rkey();
     qp_to_err();
     ud_qkey();
     env.wait_idle(500us);
   endtask
 
   // 功能：f0 用自己的 MR 作远端 WRITE（rkey 不属于对端）→ REM_ACCESS，随后同 QP 的 WRITE 按预测
-  //   flush（远端响应方出错后 QP 进入 ERR、不再应答，故远端时不发）；f1 用自己的 MR 作远端 READ（被测
-  //   设备作响应方，新 QP 对）→ REM_ACCESS。
+  //   flush（远端响应方出错后 QP 进入 ERR、不再应答，故远端时不发）；响应方 f1 随后投递的 RECV 因
+  //   QP 已 ERR 而 FLUSH；f1 用自己的 MR 作远端 READ（被测设备作响应方，新 QP 对）→ REM_ACCESS。
   // 输入/输出及副作用：QP 进入错误态。
   // 失败/边界：无。
   task bad_rkey();
@@ -93,6 +96,7 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
     post(v(0, RDMA_VERB_WRITE, 'h0000, 64, 0, 0, p.mr[0]));
     if (!remote(1))
       post(v(0, RDMA_VERB_WRITE, 'h0100, 64, 'h0100));
+    post(v(1, RDMA_VERB_RECV, 'h0300, 64));
     fresh();
     post(v(1, RDMA_VERB_READ, 'h0200, 64, 0, 0, p.mr[1]));
   endtask
@@ -136,13 +140,36 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
     post(v(0, RDMA_VERB_WRITE, 'h0000, 64, 0, 0, mr2));
   endtask
 
-  // 功能：64B 的 RECV 收 200B 的 SEND：请求方 REM_INV_REQ（rxe 响应方 REM_OP），接收端错误完成。
+  // 功能：64B 的 RECV 收 200B 的 SEND：请求方 REM_INV_REQ（rxe 响应方 REM_OP），接收端错误完成，
+  //   接收端 QP 进入 ERR，其后投递的 RECV FLUSH。
   // 输入/输出及副作用：QP 进入错误态。
   // 失败/边界：无。
   task overflow();
     fresh();
     post(v(1, RDMA_VERB_RECV, 'h1000, 64));
     post(v(0, RDMA_VERB_SEND, 'h0000, 200));
+    post(v(1, RDMA_VERB_RECV, 'h1100, 64));
+  endtask
+
+  // 功能：本地访问错：WRITE 的本地区域越过 f0 的 4 KiB MR 末尾 → GENERAL_ERR（不发包），QP 进入
+  //   ERR，随后的 WRITE FLUSH。
+  // 输入/输出及副作用：注册一个 MR，QP 进入错误态。
+  // 失败/边界：无。
+  task local_access();
+    rdma_res_mr small_mr;
+
+    fresh();
+    reg_mr(p.pd[0], p.mem[0], small_mr, 5'h1f, 'h1000, 'h1000);
+    post(verb(RDMA_VERB_WRITE, p.qp[0][0], small_mr, 'hfe0, 64, p.mr[1], 0));
+    post(v(0, RDMA_VERB_WRITE, 'h0100, 64, 'h0100));
+  endtask
+
+  // 功能：URC READ 用 f0 自己的 MR 作远端 → 对端回 NAK，REM_ACCESS。
+  // 输入/输出及副作用：URC QP 进入错误态。
+  // 失败/边界：无。
+  task urc_bad_rkey();
+    fresh();
+    post(v(0, RDMA_VERB_READ, 'h0000, 64, 0, 2, p.mr[0]));
   endtask
 
   // 功能：f0 的 RC QP 投 3 个 RECV 后转 ERR → 3 个 FLUSH；ERR 状态下投递的 SEND 也 FLUSH。

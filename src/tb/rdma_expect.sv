@@ -3,10 +3,11 @@
 // 职责：期望完成：按 QP（资源 uid）维护在途 SQ 请求、已投递的 RECV（SRQ 上的按 SRQ）与发往该 QP、
 //   会消耗 RQE 的入站请求；投递时依据资源库预测完成状态，完成时依序结算（SQ 含 unsignaled，RQ 按入站
 //   顺序配对，SRQ 按 wr_id）。
-//   预测：远端访问（MR 属于对端 Function 与对端 QP 的 PD、范围内、权限齐全，否则 REM_ACCESS_ERR）；
+//   预测：本地访问（本地 MR 属于本端 QP 的 PD 且覆盖本地区域，否则 GENERAL_ERR）；远端访问（MR 属于
+//   对端 Function 与对端 QP 的 PD、范围内、权限齐全，否则 REM_ACCESS_ERR）；
 //   接收容量不足（请求方 REM_INV_REQ_ERR，远端响应方为 REM_OP_ERR；接收端错误完成；UD 请求方成功）；
 //   UD Q_Key 不符（接收端丢弃）；QP 进入 ERR（在途可 FLUSH，之后投递的全部 FLUSH）；请求方致命错误后
-//   QP 进入错误态、剩余 SQ/RQ 全部 FLUSH（IBTA）；
+//   QP 进入错误态、剩余 SQ/RQ 全部 FLUSH，回致命 NAK 的 RC 响应方 QP 同样进入错误态（IBTA）；
 //   QP 销毁/FLR 撤销其期望。
 // 依赖：rdma_verb_item、rdma_res_qp/mr。
 // 所有权：只引用 item。
@@ -49,6 +50,9 @@ class rdma_expect extends uvm_object;
     sq[it.qp.uid].push_back(it);
     if (it.consumes_rqe() && arrives(it))
       inbound[it.qp.peer.uid].push_back(it);
+    if (it.expect_status inside {RDMA_DRV_WC_REM_ACCESS_ERR, RDMA_DRV_WC_REM_INV_REQ_ERR,
+                                 RDMA_DRV_WC_REM_OP_ERR})
+      responder_error(it.qp.peer);
   endfunction
 
   // 功能：QP 是否已出错（资源状态 ERROR 或预测的致命错误）。
@@ -66,6 +70,8 @@ class rdma_expect extends uvm_object;
     rdma_verb_item recv;
 
     peer = it.qp.peer;
+    if (!local_ok(it))
+      return RDMA_DRV_WC_GENERAL_ERR;
     if (!(it.op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM}) && !access_ok(it))
       return RDMA_DRV_WC_REM_ACCESS_ERR;
     if (!(it.op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM}))
@@ -75,6 +81,18 @@ class rdma_expect extends uvm_object;
     if (!it.overflow || it.qp.ud())
       return RDMA_DRV_WC_SUCCESS;
     return peer.owner.remote ? RDMA_DRV_WC_REM_OP_ERR : RDMA_DRV_WC_REM_INV_REQ_ERR;
+  endfunction
+
+  // 功能：本地访问是否合法：本地 MR 存活、属于本端 QP 的 PD、覆盖本地区域（READ/ATOMIC 需本地写）。
+  // 输入/输出及副作用：纯查询。
+  // 失败/边界：无。
+  protected function bit local_ok(rdma_verb_item it);
+    rdma_res_mr m;
+
+    m = it.lmr;
+    return m != null && m.deps[0] == it.qp.deps[0] &&
+           m.covers(m.va + it.local_offset, it.length,
+                    it.op == RDMA_VERB_READ || it.atomic() ? RDMA_RIGHT_LOCAL_WRITE : 5'h0);
   endfunction
 
   // 功能：远端访问是否合法：MR 存活、属于对端 Function 且与对端 QP 同 PD、范围内、权限齐全。
@@ -143,6 +161,17 @@ class rdma_expect extends uvm_object;
     if (qp.srq == null && rq.exists(qp.uid))
       foreach (rq[qp.uid][i])
         rq[qp.uid][i].expect_status = RDMA_DRV_WC_FLUSH_ERR;
+  endfunction
+
+  // 功能：响应方回致命 NAK（远端访问错、接收容量不足）：RC QP 进入错误态，此后投递的期望 FLUSH，
+  //   在途项可 FLUSH（错误到达前可能已完成）。URC/UD 不转 ERR。
+  // 输入/输出及副作用：修改 errored 与在途项的 may_flush。
+  // 失败/边界：无。
+  function void responder_error(rdma_res_qp qp);
+    if (qp.ud() || qp.urc)
+      return;
+    errored[qp.uid] = 1'b1;
+    qp_error(qp);
   endfunction
 
   // 功能：从对端入站队列移除 it（被 flush、不会到达）。

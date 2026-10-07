@@ -121,6 +121,10 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 
 原 host_mem、net_packet、e2e 三个 suite 并入 env。
 
+env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并全部测试的 covergroup 并打印
+`RDMA_COV merged=`（回归汇总的 merged 字段）。单个测试的 `RDMA_COV total=` 只反映该场景，专项测试
+（srq、high_traffic）天然只覆盖一部分；合并值才是覆盖率指标。
+
 ## 7. 迁移
 
 | 现有测试 | 去向 |
@@ -164,12 +168,18 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 | READ 响应 PSN +1 | basic | rdma_rule_psn |
 | 响应方不查 MR 权限 | errors | scoreboard 状态预测 |
 | 响应方不查 MR 的 PD | errors | scoreboard 状态预测 |
+| 响应方致命 NAK 后不转 ERR | errors | scoreboard（响应方 RECV 未 flush） |
 
 ## 10. 发现与偏差
 
 - 设备模型 RC 请求方收到致命 NAK（如 REM_ACCESS）后曾写错误 CQE 但继续处理后续 SQE；IBTA 要求 QP 转 Error、
   其余 WR flush。已修正：RC 错误完成后设备把 QPC 置 ERR、写 RQ flush CQE，ERR 下的 SQ/RQ doorbell 写
   flush CQE（ERR 下投递的 WR 也 flush）；原偏差 `rc_error_no_flush` 已删除，scoreboard 严格预测。
+- 响应方回致命 NAK（远端访问错、接收容量不足）后 RC QP 同样转 ERR 并 flush（IBTA C 类错误，rxe 亦然）；
+  flush 排在在途 SQ 工作之后，不越过在途 WQE 的完成。scoreboard 在请求预测为 REM_* 时把对端 QP 记为
+  出错（此后投递的期望 FLUSH，在途项可 FLUSH）。URC 响应方不转 ERR（URC 异常经 CEQE/AEQE 上报）。
+- 合并覆盖率中 cg_error/cg_completion 的 REM_OP_ERR 只在 rxe 对端出现（被测设备接收容量不足回 0x61，
+  即 REM_INV_REQ）。
 - rxe 响应方出错后 QP 转 ERR、不再应答（IBTA 行为）；errors 场景在远端对每个错误使用新 QP 对。
 - AckReq 规则只约束 SEND/WRITE 末包（READ/ATOMIC 必有响应）；UD Q_Key 取自 WR，不符时由接收端丢弃，
   不作为发送方违例（scoreboard 验证丢弃）。

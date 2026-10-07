@@ -208,14 +208,18 @@ class rdma_dev_nic extends uvm_object;
     void'(sq_kicks.try_put(SQD_TAG | value[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH]));
   endfunction
 
-  // 功能：QP flush doorbell（转 ERR）：该 QP 没有待处理的 SQ 工作时立即写 flush CQE（先于随后的 CMQ
-  //   命令，如 QPC_DELETE），否则排入 TX 队列在之前的 SQ doorbell 处理完后执行。
-  // 输入/输出及副作用：写 CQE 或投递 TX 任务。
+  // 功能：QP flush doorbell（转 ERR）。
+  // 输入/输出及副作用：见 schedule_flush。
   // 失败/边界：无。
   task qp_flush(bit [63:0] value);
-    int unsigned qpn;
+    schedule_flush(value[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH]);
+  endtask
 
-    qpn = value[RDMA_NOTIFY_QP_QPN_LSB +: RDMA_NOTIFY_QP_QPN_WIDTH];
+  // 功能：QP flush：该 QP 没有待处理的 SQ 工作时立即写 flush CQE（先于随后的 CMQ 命令，如
+  //   QPC_DELETE），否则排入 TX 队列在之前的 SQ 工作处理完后执行（不越过在途 WQE 的完成）。
+  // 输入/输出及副作用：写 CQE 或投递 TX 任务。
+  // 失败/边界：无。
+  task schedule_flush(int unsigned qpn);
     if (qp_rt(qpn).kicks_pending == 0)
       flush_qp(qpn);
     else
@@ -881,7 +885,7 @@ class rdma_dev_nic extends uvm_object;
   //   带重传/RNR 重试执行；结果按 RC 写 SQ CQE（CE 或出错时）或按 URC 推进 HW_CPL/上报异常。
   // 输入/输出及副作用：DMA、发包、写 CQE/CEQE。
   // 失败/边界：签名错以 WQE_SIGN_ERR、本地访问错以 SQ_KEY_ERR 完成；远端错误见 run_request。RC 错误
-  //   完成后 QP 转 ERR（IBTA），其余 WQE 由 drain_sq flush。
+  //   完成后 QP 转 ERR（IBTA，enter_error）。
   protected task process_sqe(int unsigned qpn, rdma_dev_qp_rt rt, rdma_bytes_t wqe);
     bit [63:0] sges[$];
     rdma_bytes_t data;
@@ -952,22 +956,21 @@ class rdma_dev_nic extends uvm_object;
     end
   endtask
 
-  // 功能：RC 请求方错误后 QP 转 ERR：QPC QP_ST 写为 ERR，非 SRQ 时写 RQ flush CQE（SQ 余下 WQE 由
-  //   drain_sq 在 ERR 下 flush）。
-  // 输入/输出及副作用：修改 QPC、写 CQE。
-  // 失败/边界：QP 不存在时无动作。
+  // 功能：RC 请求方错误完成或响应方回致命 NAK 后 QP 转 ERR（IBTA）：QPC QP_ST 写为 ERR 并 flush
+  //   （schedule_flush；ERR 下 drain_sq 也 flush 余下 WQE）。
+  // 输入/输出及副作用：修改 QPC、写 CQE 或投递 TX 任务。
+  // 失败/边界：QP 不存在或已是 ERR 时无动作。
   protected task enter_error(int unsigned qpn);
     rdma_dev_object obj;
     rdma_bytes_t qpc;
 
-    if (!ctx.lookup(RDMA_DEV_QP, qpn, obj))
+    if (!ctx.lookup(RDMA_DEV_QP, qpn, obj) || `RDMA_QPC(qpn, RDMA_QPC_QP_ST) == QP_ST_ERR)
       return;
     qpc = obj.bytes;
     rdma_be::set_field(qpc, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
                        RDMA_QPC_QP_ST_WIDTH, QP_ST_ERR);
     obj.bytes = qpc;
-    if (!`RDMA_QPC(qpn, RDMA_QPC_RC_SRFQ))
-      write_cqe(qpn, 1'b1, 0, 1'b0, RDMA_ECODE_XTRDMA_CQE_ECODE_RQ_FLUSH_ERR, 0, '0, 0);
+    schedule_flush(qpn);
   endtask
 
   // 功能：RC/URC 请求的重传循环。PSN 序列 NAK 从 NAK 指出的 PSN 起重发（READ 从第一个缺失的响应
@@ -1749,8 +1752,9 @@ class rdma_dev_nic extends uvm_object;
     rqe_sges(rqe, $sformatf("SRQ %0d", srqn), sges, ok);
   endtask
 
-  // 功能：发送 ACK/NAK。dup 为重复请求的重发 ACK（不推进 MSN）。
-  // 输入/输出及副作用：新 ACK 推进 msn，经端口发包。
+  // 功能：发送 ACK/NAK。dup 为重复请求的重发 ACK（不推进 MSN）。RC 致命 NAK 后本端 QP 转 ERR（IBTA
+  //   响应方 C 类错误）。
+  // 输入/输出及副作用：新 ACK 推进 msn，经端口发包；致命 NAK 时 enter_error。
   // 失败/边界：无。
   protected task send_ack(int unsigned qpn, rdma_dev_qp_rt rt, bit [23:0] psn,
                           bit [7:0] syndrome, bit dup = 1'b0);
@@ -1769,6 +1773,8 @@ class rdma_dev_nic extends uvm_object;
     pkt.aeth_syndrome = syndrome;
     pkt.aeth_msn = rt.msn;
     emit(pkt, `RDMA_QPC(qpn, RDMA_QPC_DMAC));
+    if (!is_ack(syndrome) && nak_outcome(syndrome) == RSP_FATAL && !is_urc(qpn))
+      enter_error(qpn);
   endtask
 
   // 功能：RC/URC 响应方 PSN 检查：早于期望的为重复请求（重发 ACK / 重放 READ / 回缓存的 ATOMIC

@@ -209,10 +209,14 @@ env: dpu_common_preflight host_mem_preflight net_packet_preflight
 		-f build/env/env.expanded.f -top tb_top -o build/env/simv; \
 	tests="$(TEST)"; \
 	if [[ "$$tests" == regression ]]; then tests="$(ENV_TESTS)"; fi; \
+	rm -rf build/env/simv.vdb/snps/coverage/db/testdata build/env/cov; \
 	for test_name in $$tests; do \
-		build/env/simv +UVM_TESTNAME=$$test_name | tee build/env/$$test_name.log; \
+		build/env/simv +UVM_TESTNAME=$$test_name -cm_name $$test_name | tee build/env/$$test_name.log; \
 		../scripts/check_uvm_summary.sh build/env/$$test_name.log; \
-	done
+	done; \
+	: "各测试的功能覆盖率经 urg 合并，打印合并后的总分（RDMA_COV merged）"; \
+	urg -dir build/env/simv.vdb -format text -report build/env/cov > build/env/urg.log 2>&1; \
+	echo "RDMA_COV merged=$$(awk '/Total Groups Coverage Summary/ {getline; getline; print $$1; exit}' build/env/cov/groups.txt)"
 
 pcie_work_preflight:
 	@if [[ -z "$(PCIE_WORK_ROOT)" ]]; then echo "PCIE_WORK_ROOT is required for pcie_work" >&2; exit 2; fi
