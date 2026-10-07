@@ -473,8 +473,9 @@ class rdma_multifunc_test extends uvm_test;
   endtask
 
   // 功能：非法 IOVA：VF0_2 在自己的域里新分配一页 X 并写入图样；VF0_1 用 X 注册 MR 并从中 SEND。
-  //   VF0_1 的域里没有 X，设备 DMA 失败，VF0_1 得到本地访问错完成；X 在 VF0_2 中不变；全环流量正常。
-  // 输入/输出及副作用：分配一页、注册并注销一个 MR。
+  //   VF0_1 的域里没有 X，设备 DMA 失败，VF0_1 得到本地访问错完成；X 在 VF0_2 中不变；出错 QP 进入
+  //   ERR，链路 1 两端 QP 重建后全环流量正常。
+  // 输入/输出及副作用：分配一页、注册并注销一个 MR，重建链路 1。
   // 失败/边界：不符报告 UVM_ERROR。
   task fault_iova();
     rdma_mf_func a;
@@ -512,6 +513,7 @@ class rdma_multifunc_test extends uvm_test;
       `uvm_error("IOVA fault", "victim page changed")
     mr.dereg(a.drv, status);
     expect_ok("dereg foreign-IOVA MR", status);
+    link_qps(1);
     check_traffic("after IOVA fault", none);
   endtask
 
@@ -532,8 +534,9 @@ class rdma_multifunc_test extends uvm_test;
     recover('{2});
   endtask
 
-  // 功能：错 rkey：PF0 向 VF0_1 WRITE 用错 rkey，PF0 得到 REM_ACCESS 完成，VF0_1 内存不变，全环流量正常。
-  // 输入/输出及副作用：一次被拒的 WRITE。
+  // 功能：错 rkey：PF0 向 VF0_1 WRITE 用错 rkey，PF0 得到 REM_ACCESS 完成，VF0_1 内存不变；出错 QP
+  //   进入 ERR，链路 0 两端 QP 重建后全环流量正常。
+  // 输入/输出及副作用：一次被拒的 WRITE，重建链路 0。
   // 失败/边界：不符报告 UVM_ERROR。
   task fault_bad_rkey();
     rdma_mf_func a;
@@ -553,6 +556,7 @@ class rdma_multifunc_test extends uvm_test;
     wr.rkey = b.mr.key() ^ 32'h1;
     send_one("bad rkey", a, wr, RDMA_DRV_WC_REM_ACCESS_ERR, wc);
     expect_mem("bad rkey target", b, 'h3800, snapshot);
+    link_qps(0);
     check_traffic("after bad rkey", none);
   endtask
 
