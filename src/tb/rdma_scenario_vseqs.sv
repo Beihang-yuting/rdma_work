@@ -87,8 +87,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：f0 用自己的 MR 作远端 WRITE（rkey 不属于对端）→ REM_ACCESS，随后同 QP 的 WRITE 按预测
-  //   flush（远端响应方出错后 QP 进入 ERR、不再应答，故远端时不发）；响应方 f1 随后投递的 RECV 因
-  //   QP 已 ERR 而 FLUSH；f1 用自己的 MR 作远端 READ（被测设备作响应方，新 QP 对）→ REM_ACCESS。
+  //   flush（远端响应方出错后 QP 进入 ERR、不再应答，故远端时不发）；被测设备作响应方时 f1 随后投递的
+  //   RECV 因 QP 已 ERR 而 FLUSH（rxe 5.15 出错后不 flush RQ，远端时不发）；f1 用自己的 MR 作远端 READ（被测设备作响应方，新 QP 对）→ REM_ACCESS。
   // 输入/输出及副作用：QP 进入错误态。
   // 失败/边界：无。
   task bad_rkey();
@@ -96,7 +96,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
     post(v(0, RDMA_VERB_WRITE, 'h0000, 64, 0, 0, p.mr[0]));
     if (!remote(1))
       post(v(0, RDMA_VERB_WRITE, 'h0100, 64, 'h0100));
-    post(v(1, RDMA_VERB_RECV, 'h0300, 64));
+    if (!remote(1))
+      post(v(1, RDMA_VERB_RECV, 'h0300, 64));
     fresh();
     post(v(1, RDMA_VERB_READ, 'h0200, 64, 0, 0, p.mr[1]));
   endtask
@@ -141,14 +142,15 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：64B 的 RECV 收 200B 的 SEND：请求方 REM_INV_REQ（rxe 响应方 REM_OP），接收端错误完成，
-  //   接收端 QP 进入 ERR，其后投递的 RECV FLUSH。
+  //   接收端 QP 进入 ERR，其后投递的 RECV FLUSH（rxe 5.15 不 flush，远端时不发）。
   // 输入/输出及副作用：QP 进入错误态。
   // 失败/边界：无。
   task overflow();
     fresh();
     post(v(1, RDMA_VERB_RECV, 'h1000, 64));
     post(v(0, RDMA_VERB_SEND, 'h0000, 200));
-    post(v(1, RDMA_VERB_RECV, 'h1100, 64));
+    if (!remote(1))
+      post(v(1, RDMA_VERB_RECV, 'h1100, 64));
   endtask
 
   // 功能：本地访问错：WRITE 的本地区域越过 f0 的 4 KiB MR 末尾 → GENERAL_ERR（不发包），QP 进入

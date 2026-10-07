@@ -296,7 +296,7 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
       urc_traffic();
     sizes();
     access_error();
-    env.wait_idle(500us);
+    env.wait_idle(5ms);
   endtask
 
   // 功能：Function n 经第 k 类 QP（0 RC/1 UD/2 URC）的 verb，远端为对端 MR；数据模式轮换；远端

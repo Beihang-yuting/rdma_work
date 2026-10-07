@@ -181,5 +181,7 @@ env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并�
 - 合并覆盖率中 cg_error/cg_completion 的 REM_OP_ERR 只在 rxe 对端出现（被测设备接收容量不足回 0x61，
   即 REM_INV_REQ）。
 - rxe 响应方出错后 QP 转 ERR、不再应答（IBTA 行为）；errors 场景在远端对每个错误使用新 QP 对。
+  5.15 内核的 rxe 响应方出错后不为 RQ 生成 flush 完成（后续内核才有 flush 支持），故响应方 flush 的
+  检查只在被测设备作响应方时进行。
 - AckReq 规则只约束 SEND/WRITE 末包（READ/ATOMIC 必有响应）；UD Q_Key 取自 WR，不符时由接收端丢弃，
   不作为发送方违例（scoreboard 验证丢弃）。
