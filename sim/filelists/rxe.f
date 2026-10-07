@@ -8,6 +8,7 @@
 +incdir+../src/drv
 +incdir+../src/adapters/net_packet
 +incdir+../src/adapters/rxe
++incdir+../src/tb
 +incdir+$(NET_PACKET_ROOT)/src
 +incdir+$(NET_PACKET_ROOT)/src/core
 +incdir+$(NET_PACKET_ROOT)/src/common
@@ -22,5 +23,8 @@
 ../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_net_packet_bridge.sv
 ../src/adapters/rxe/rdma_rxe_pkg.sv
+../src/tb/rdma_env_pkg.sv
+../src/adapters/rxe/rdma_rxe_env.sv
 ../tests/rdma_unit_test_pkg.sv
+../tests/rdma_env_test_pkg.sv
 ../tests/tb_top.sv

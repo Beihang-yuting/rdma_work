@@ -55,6 +55,8 @@ class rdma_env_cfg extends uvm_object;
 
   // 拓扑与平台。
   rdma_env_func_t funcs[$];
+  // 插件提供的远端 Function 数（如 rxe），下标排在 dpu Function 之后。
+  int unsigned remote_funcs;
   rdma_dpu_mem_factory mem_factory;
   string link_type;
   rdma_env_plugin plugins[$];

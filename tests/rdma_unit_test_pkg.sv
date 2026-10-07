@@ -67,9 +67,6 @@ package rdma_unit_test_pkg;
 `ifdef RDMA_NET_PACKET
   `include "integration/rdma_net_packet_adapter_test.sv"
 `endif
-`ifdef RDMA_PCIE_WORK_TEST
-  `include "integration/rdma_pcie_rdma_test.sv"
-`endif
 `ifdef RDMA_RXE_TEST
   `include "integration/rdma_rxe_test.sv"
   `include "integration/rdma_rxe_fault_test.sv"

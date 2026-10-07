@@ -228,18 +228,20 @@ pcie_work_preflight:
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency pcie_work --root "$(PCIE_WORK_ROOT)"
 
-pcie_work: dpu_common_preflight pcie_work_preflight
+pcie_work: dpu_common_preflight pcie_work_preflight net_packet_preflight
 	set -euo pipefail; \
 	mkdir -p build/pcie_work; \
 	: "VCS 不会替换 filelist 中的 GNU make 变量，先生成只读依赖路径展开后的临时 filelist"; \
 	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
 	    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' \
+	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
 	    filelists/pcie_work.f > build/pcie_work/pcie_work.expanded.f; \
 	: "RDMA_HOST_MEM_TEST：host_mem_manager 包进 rdma_host_mem_external_pkg，供各 Host 的统一内存"; \
 	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_PCIE_WORK_TEST +define+RDMA_HOST_MEM_TEST \
+		+define+RDMA_NET_PACKET +define+RDMA_ENV_TEST \
 		-f build/pcie_work/pcie_work.expanded.f -top tb_top -o build/pcie_work/simv; \
 	test_name=$(TEST); \
-	if [[ "$$test_name" == regression ]]; then test_name=rdma_pcie_rdma_test; fi; \
+	if [[ "$$test_name" == regression ]]; then test_name=rdma_env_pcie_test; fi; \
 	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
 	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
 
@@ -253,9 +255,9 @@ rxe: dpu_common_preflight net_packet_preflight
 		echo "TAP $(RXE_TAP) is missing: run tools/rxe/rxe_tap_setup.sh up" >&2; exit 2; fi; \
 	gcc -O2 -Wall -o build/rxe/rxe_peer ../tools/rxe/rxe_peer.c -libverbs; \
 	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/rxe.f > build/rxe/rxe.expanded.f; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_NET_PACKET +define+RDMA_RXE_TEST +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/rxe/rxe.expanded.f ../src/adapters/rxe/rdma_rxe_dpi.c -top tb_top -o build/rxe/simv; \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_NET_PACKET +define+RDMA_RXE_TEST +define+RDMA_ENV_TEST +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/rxe/rxe.expanded.f ../src/adapters/rxe/rdma_rxe_dpi.c -top tb_top -o build/rxe/simv; \
 	tests=$(TEST); \
-	if [[ "$$tests" == regression ]]; then tests="rdma_rxe_test rdma_rxe_fault_test"; fi; \
+	if [[ "$$tests" == regression ]]; then tests="rdma_rxe_test rdma_rxe_fault_test rdma_env_rxe_test"; fi; \
 	for test_name in $$tests; do \
 		build/rxe/simv +UVM_TESTNAME=$$test_name +RXE_TAP=$(RXE_TAP) +RXE_PEER=$$(pwd)/build/rxe/rxe_peer | tee build/rxe/$$test_name.log; \
 		../scripts/check_uvm_summary.sh build/rxe/$$test_name.log; \

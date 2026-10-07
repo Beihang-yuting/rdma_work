@@ -60,6 +60,17 @@ class rdma_mem_model extends uvm_object;
       data.push_back(off + i < img[b.uid].size() ? img[b.uid][off + i] : 8'h00);
   endfunction
 
+  // 功能：以真实内存 [off, off+len) 为期望（内容无法预测的区域，如远端写入的 GRH）。
+  // 输入/输出及副作用：读真实内存，修改镜像。
+  // 失败/边界：读失败报 UVM_ERROR。
+  function void accept(rdma_res_buf b, int unsigned off, int unsigned len);
+    rdma_bytes_t raw;
+
+    if (!b.read(off, len, raw).ok())
+      `uvm_error("RDMA_MEM", {"read failed: ", b.describe()})
+    write(b, off, raw);
+  endfunction
+
   // 功能：真实内存 [off, off+len) 与镜像比对，what 用于定位（如具体 WR）。
   // 输入/输出及副作用：读真实内存；差异报 UVM_ERROR（最多 8 个）。
   // 失败/边界：返回差异字节数（读失败按整段计）。

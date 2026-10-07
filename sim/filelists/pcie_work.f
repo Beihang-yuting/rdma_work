@@ -30,7 +30,13 @@
 +incdir+../src/drv
 +incdir+../src/adapters/pcie_work
 +incdir+../src/adapters/host_mem
++incdir+../src/adapters/net_packet
++incdir+../src/tb
 +incdir+../tests/mocks
++incdir+@NET_PACKET_ROOT@/src
++incdir+@NET_PACKET_ROOT@/src/core
++incdir+@NET_PACKET_ROOT@/src/common
++incdir+@NET_PACKET_ROOT@/src/protocols
 ../src/types/rdma_types_pkg.sv
 ../src/model/rdma_model_pkg.sv
 ../src/codec/rdma_codec_pkg.sv
@@ -40,5 +46,9 @@
 ../src/adapters/dpu/rdma_dpu_adapter_pkg.sv
 ../src/adapters/pcie_work/rdma_pcie_work_pkg.sv
 ../src/adapters/host_mem/rdma_host_mem_adapter_pkg.sv
+../src/adapters/net_packet/rdma_net_packet_adapter_pkg.sv
+../src/adapters/net_packet/rdma_net_packet_bridge.sv
+../src/tb/rdma_env_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
+../tests/rdma_env_test_pkg.sv
 ../tests/tb_top.sv

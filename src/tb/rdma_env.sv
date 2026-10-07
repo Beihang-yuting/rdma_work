@@ -58,7 +58,7 @@ class rdma_env extends uvm_env;
     build_system();
     res = rdma_res_db::type_id::create("res", this);
     ctrl = rdma_ctrl_agent::type_id::create("ctrl", this);
-    verb = new[cfg.funcs.size()];
+    verb = new[cfg.funcs.size() + cfg.remote_funcs];
     foreach (verb[i])
       verb[i] = rdma_verb_agent::type_id::create($sformatf("verb%0d", i), this);
     c = uvm_factory::get().create_component_by_name(cfg.link_type, get_full_name(), "link", this);
@@ -106,7 +106,8 @@ class rdma_env extends uvm_env;
     end
   endfunction
 
-  // 功能：probe 每个 Function，登记到资源库与设备级队列，NIC 接入链路；启动 NIC、插件 start 后就绪。
+  // 功能：probe 每个 Function，登记到资源库与设备级队列，NIC 接入链路；启动 NIC；插件 start（远端
+  //   Function 在此登记）后就绪。
   // 输入/输出及副作用：设置 ready。
   // 失败/边界：probe 失败 UVM_FATAL。
   task run_phase(uvm_phase phase);

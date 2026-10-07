@@ -44,7 +44,7 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   // 功能：按 op 分派。
   // 输入/输出及副作用：调用驱动并更新资源库；item.res/status 输出。
   // 失败/边界：驱动失败经 item.status 返回，不登记资源。
-  protected task execute(rdma_ctrl_item item);
+  protected virtual task execute(rdma_ctrl_item item);
     rdma_res_func f;
 
     f = env.res.funcs[item.func];
@@ -218,8 +218,8 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   //   对端 QPN、RQ PSN 0、MTU、目的 MAC、min_rnr）、RTS（SQ PSN 0、timeout、重试次数）；其它状态只给状态。
   // 输入/输出及副作用：驱动 modify；广播 CHANGED（ERR 时资源状态置 ERROR）。
   // 失败/边界：驱动失败经 status 返回。
-  protected task modify(rdma_res_qp qp, rdma_drv_qp_state_e state, rdma_res_qp peer,
-                        output rdma_status status);
+  protected virtual task modify(rdma_res_qp qp, rdma_drv_qp_state_e state, rdma_res_qp peer,
+                                output rdma_status status);
     rdma_drv_qp_attr attr;
 
     attr = rdma_drv_qp_attr::type_id::create("qp_modify");

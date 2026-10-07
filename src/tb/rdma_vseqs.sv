@@ -13,8 +13,9 @@ class rdma_pair extends uvm_object;
   rdma_res_pd pd[2];
   rdma_res_buf mem[2];
   rdma_res_mr mr[2];
-  // qp[n][0/1/2] = Function n 的 RC/UD/URC QP。
+  // qp[n][0/1/2] = Function n 的 RC/UD/URC QP；URC 为私有扩展，有远端 Function 时不建（urc=0）。
   rdma_res_qp qp[2][3];
+  bit urc;
 
   // 功能：构造。
   // 输入/输出及副作用：name 为 UVM 名。
@@ -156,17 +157,20 @@ class rdma_base_vseq extends uvm_sequence;
 
     f = '{f0, f1};
     p = rdma_pair::type_id::create("pair");
+    p.urc = !env.res.funcs[f0].remote && !env.res.funcs[f1].remote;
     foreach (f[n]) begin
       alloc_pd(f[n], p.pd[n]);
       create_cq(f[n], env.cfg.qp_depth, cq);
-      create_cq(f[n], env.cfg.qp_depth, urc_cq);
       create_qp(p.pd[n], RDMA_DRV_QPT_RC, cq, 1'b0, p.qp[n][0]);
       create_qp(p.pd[n], RDMA_DRV_QPT_UD, cq, 1'b0, p.qp[n][1]);
-      create_qp(p.pd[n], RDMA_DRV_QPT_RC, urc_cq, 1'b1, p.qp[n][2]);
+      if (p.urc) begin
+        create_cq(f[n], env.cfg.qp_depth, urc_cq);
+        create_qp(p.pd[n], RDMA_DRV_QPT_RC, urc_cq, 1'b1, p.qp[n][2]);
+      end
       alloc_buf(f[n], buf_bytes, p.mem[n]);
       reg_mr(p.pd[n], p.mem[n], p.mr[n]);
     end
-    for (int unsigned k = 0; k < 3; k++)
+    for (int unsigned k = 0; k < (p.urc ? 3 : 2); k++)
       connect(p.qp[0][k], p.qp[1][k]);
   endtask
 
@@ -210,6 +214,9 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
 
   localparam int unsigned BUF_BYTES = 'h10000;
 
+  // 参与的两个 Function（f0 发起大部分请求）。
+  int unsigned f0 = 0;
+  int unsigned f1 = 1;
   rdma_pair p;
   protected int unsigned count;
 
@@ -220,23 +227,25 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     super.new(name);
   endfunction
 
-  // 功能：建立 Function 0↔1 拓扑后依次运行全部场景，等待结算。
+  // 功能：建立 f0↔f1 拓扑后依次运行全部场景，等待结算。
   // 输入/输出及副作用：经 sequencer 下发 item。
   // 失败/边界：结果由 scoreboard 判定。
   task body();
-    setup_pair(0, 1, BUF_BYTES, p);
+    setup_pair(f0, f1, BUF_BYTES, p);
     send_recv();
     write_read();
     atomics();
     reverse_write();
     multi_sge();
     ud_send();
-    urc_traffic();
+    if (p.urc)
+      urc_traffic();
     access_error();
     env.wait_idle(500us);
   endtask
 
-  // 功能：Function n 经第 k 类 QP（0 RC/1 UD/2 URC）的 verb，远端为对端 MR；数据模式轮换。
+  // 功能：Function n 经第 k 类 QP（0 RC/1 UD/2 URC）的 verb，远端为对端 MR；数据模式轮换；远端
+  //   Function（rxe 对端进程）只支持单 SGE。
   // 输入/输出及副作用：返回新 item。
   // 失败/边界：无。
   function rdma_verb_item v(int unsigned n, rdma_verb_op_e op, int unsigned local_offset,
@@ -246,6 +255,8 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     bit remote;
 
     remote = !(op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM, RDMA_VERB_RECV});
+    if (p.qp[n][k].owner.remote)
+      sges = 1;
     it = verb(op, p.qp[n][k], p.mr[n], local_offset, length, remote ? p.mr[1 - n] : null,
               remote_offset, sges);
     it.data_mode = payload_mode_e'(count++ % 4);

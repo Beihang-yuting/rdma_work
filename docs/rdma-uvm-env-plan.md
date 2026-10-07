@@ -64,8 +64,15 @@ rdma_res_db ── funcs[uid] : rdma_res_func（每个 Function 一个；rxe 远
   monitor 模拟中断处理：该 Function 全部 CEQ、AEQ、全部 CQ；上报 wc 状态/vendor/src_qp 与 AEQ 事件。
 - **rdma_link**：基类提供 `port(func)`、`tx_ap/rx_ap`、`drop/corrupt/delay(dir, nth)`；loopback 与 netpkt 在
   tb 包内，rxe 在 rxe 包内（工厂按名字创建，tb 不依赖 rxe 包）。
-- **rdma_env_plugin**：钩子 `pre_build(sys)`、`build(env)`、`connect(env)`、`report(env)`。pcie_work（安装覆盖、
-  建 PCIe 系统、TLP 计数检查）与 rxe（远端 Function、对端进程）各一个插件。
+- **rdma_env_plugin**：钩子 `pre_build(env)`、`build(env)`、`start(env)`、`report(env)`。
+  - `rdma_pcie_plugin`（tests/rdma_env_test_pkg，需 host_mem 工厂）：安装 BAR/DMA 覆盖、按快照建 PCIe 系统、
+    结束时检查 MMIO/DMA TLP 计数、每个 BDF 都发过 DMA、MAILBOX 写被拒绝。
+  - `rdma_rxe_plugin`（src/adapters/rxe/rdma_rxe_env.sv）：远端 Function（`cfg.remote_funcs`，下标在 dpu
+    Function 之后）由 rxe_peer 进程承载；覆盖 ctrl/verb driver 与 monitor，远端资源/投递/完成经对端命令，
+    缓冲为 `rdma_rxe_buf`（rbuf/wbuf 分块）；链路 `rdma_link_rxe`（TAP）。对端限制：单 PD/CQ/MR/SRQ、单 SGE、
+    无 URC；Q_Key 用非受控值；仿真侧 QP 不设响应超时。
+- **链路故障注入**：`rdma_link_fault`（DROP/DUP/DELAY/CORRUPT，按源 Function/opcode 过滤、skip/count）；
+  CORRUPT 在 netpkt 链路上翻转帧字节并要求接收端 ICRC 校验拒绝，loopback 上等同丢弃。
 - **rdma_scoreboard**：拆为 `rdma_mem_model`（每个 buf 的期望字节，写入/读取/原子/GRH）与 `rdma_expect`（每 QP
   的期望完成队列：成功/错误码/flush/SRQ 顺序/UD）；scoreboard 只负责接事件与比对。错误预测依据资源库
   （rkey、权限、越界、接收容量、Q_Key），错误后预测 QP 进入 ERR、其后 WR 为 FLUSH；FLR 撤销范围内期望。
@@ -109,8 +116,8 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 | --- | --- | --- |
 | core / cmq_gate / rdma_defs | 模型单元测试（不含 env） | dpu_common |
 | env | env 全部场景（loopback/netpkt × mock/真实 host_mem）＋ net_packet adapter 测试 | dpu_common、host_mem、net_packet |
-| pcie_work | env 场景子集 + PCIe 插件 | 上述 + pcie_work |
-| rxe | env 场景子集 + rxe 链路/插件（需 TAP，手动） | 上述 + DPI、rdma_rxe |
+| pcie_work | rdma_env_pcie_test（PF/VF ↔ 另一 Host 的 basic_traffic）+ PCIe 插件 | 上述 + pcie_work |
+| rxe | rdma_env_rxe_test（basic_traffic ↔ Soft-RoCE）+ 原 rxe 互打测试（需 TAP，手动） | net_packet、DPI、rdma_rxe |
 
 原 host_mem、net_packet、e2e 三个 suite 并入 env。
 
@@ -132,7 +139,7 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | S1 ✅ | 配置、资源层、数据生成、ctrl/verb agent、loopback/netpkt 链路、scoreboard 拆分、env、base vseq、basic_traffic/high_traffic；env suite | 替代 tb_flow/host_mem/e2e/high_traffic，全量通过 |
-| S2 | 链路故障注入；pcie 插件；rxe 链路 + 远端 Function 插件 | basic_traffic 在 4 种传输下通过 |
+| S2 ✅ | 链路故障注入；pcie 插件；rxe 链路 + 远端 Function 插件 | basic_traffic 在 4 种传输下通过 |
 | S3 | 协议检查规则类；scoreboard 错误/flush/SRQ/UD/FLR 预测 | 每条规则有变异检查 |
 | S4 | ud/srq/qp_lifecycle/reliability/errors/multifunc vseq；删旧测试 | 旧检查点全部有对应；全量通过 |
 | S5 | 覆盖率、random vseq、覆盖率报告进入回归汇总 | 覆盖率基线 |

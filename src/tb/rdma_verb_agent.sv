@@ -93,7 +93,8 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
   // 功能：投递 RECV（srq 非空时投到 SRQ）。
   // 输入/输出及副作用：写 RQ/SRQ 并敲 doorbell。
   // 失败/边界：驱动错误经 status 输出。
-  protected task post_recv(rdma_verb_item item, rdma_drv_sge sges[$], output rdma_status status);
+  protected virtual task post_recv(rdma_verb_item item, rdma_drv_sge sges[$],
+                                   output rdma_status status);
     rdma_drv_recv_wr wr;
 
     wr = rdma_drv_recv_wr::type_id::create("recv_wr");
@@ -108,7 +109,8 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
   // 功能：投递 SQ 请求：远端地址/rkey（非 SEND）、atomic 操作数、UD 目的（对端 QPN、Q_Key、MAC）。
   // 输入/输出及副作用：写 SQ/SGB 并按需敲 doorbell。
   // 失败/边界：驱动错误经 status 输出。
-  protected task post_send(rdma_verb_item item, rdma_drv_sge sges[$], output rdma_status status);
+  protected virtual task post_send(rdma_verb_item item, rdma_drv_sge sges[$],
+                                   output rdma_status status);
     rdma_drv_send_wr wr;
 
     wr = rdma_drv_send_wr::type_id::create("send_wr");
@@ -236,7 +238,7 @@ class rdma_verb_monitor extends uvm_monitor;
   // 功能：驱动 WC → rdma_verb_completion，记录并广播。
   // 输入/输出及副作用：更新 seen，触发 seen_event，写 cqe_ap。
   // 失败/边界：无。
-  protected function void publish(rdma_drv_wc wc);
+  function void publish(rdma_drv_wc wc);
     rdma_verb_completion c;
 
     c = rdma_verb_completion::type_id::create("completion");

@@ -1,7 +1,8 @@
 // 目录：验证组件层 tb/rdma_scoreboard.sv。
 // 层：验证组件。
 // 职责：端到端判定：投递事件把原始数据写入期望内存并建立期望完成；完成事件按 QP 结算，比对状态/长度/
-//   立即数/源 QP，按操作语义（WRITE、READ、ATOMIC、SEND→RECV、UD GRH）更新期望内存，并立即比对该 WR
+//   立即数/源 QP，按操作语义（WRITE、READ、ATOMIC、SEND→RECV、UD GRH；远端 Function 写入的 GRH 取实际值）
+//   更新期望内存，并立即比对该 WR
 //   的目的区域（无其它在途 WR 重叠时；URC WRITE 不等 ACK，留给结束比对）；结束时整块比对全部 buffer。
 // 依赖：rdma_mem_model、rdma_expect、rdma_res_db（按 QPN 找 QP）。
 // 所有权：只读资源；期望归子对象。
@@ -249,7 +250,9 @@ class rdma_scoreboard extends uvm_scoreboard;
         check_region(src);
       return;
     end
-    if (grh != 0)
+    if (grh != 0 && qp.owner.remote)
+      mem.accept(recv.lmr.mem, loff(recv), grh);
+    else if (grh != 0)
       mem.write(recv.lmr.mem, loff(recv), grh_bytes(src.length));
     mem.write(recv.lmr.mem, loff(recv) + grh, src.data);
     check_region(recv);
