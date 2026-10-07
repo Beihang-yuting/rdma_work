@@ -463,21 +463,41 @@ class rdma_drv_data_test extends uvm_test;
     expect_mem("CAS target", b, 'h3800, expect_b);
   endtask
 
-  // 功能：错误 rkey 的 WRITE 被 B 以 NAK 拒绝，A 的完成为错误状态，B 内存不变。
-  // 输入/输出及副作用：一个错误完成。
-  // 失败/边界：被接受或内存被改报告 UVM_ERROR。
+  // 功能：新 QP 对上错误 rkey 的 WRITE 被 B 以 NAK 拒绝，A 的完成为错误状态，B 内存不变；QP 随之进入
+  //   ERR，其后的 WRITE 以 FLUSH 完成且不写 B（IBTA）。
+  // 输入/输出及副作用：两个错误完成，销毁该 QP 对。
+  // 失败/边界：被接受、未 flush 或内存被改报告 UVM_ERROR。
   task check_remote_access_error();
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
     rdma_bytes_t snapshot;
     rdma_bytes_t scratch;
-    rdma_drv_send_wr wr;
+    rdma_drv_send_wr bad;
+    rdma_drv_send_wr next;
+    rdma_drv_wc wcs[$];
+    rdma_status status;
 
-    expect_ok("snapshot", b.drv.hw.read(b.data_buf, 'h3c00, 64, snapshot));
-    scratch = fill(a, 'h3c00, 64, 8'h91);
-    wr = send_wr(a, RDMA_DRV_WR_WRITE, '{'h3c00}, '{64});
-    wr.remote_va = b.data_buf.iova + 'h3c00;
-    wr.rkey = b.mr.key() ^ 32'h1;
-    send_and_wait("bad rkey", wr, RDMA_DRV_WC_REM_ACCESS_ERR);
+    make_pair(null, qa, qb);
+    expect_ok("snapshot", b.drv.hw.read(b.data_buf, 'h3c00, 128, snapshot));
+    scratch = fill(a, 'h3c00, 128, 8'h91);
+    bad = send_wr(a, RDMA_DRV_WR_WRITE, '{'h3c00}, '{64});
+    bad.remote_va = b.data_buf.iova + 'h3c00;
+    bad.rkey = b.mr.key() ^ 32'h1;
+    next = send_wr(a, RDMA_DRV_WR_WRITE, '{'h3c40}, '{64});
+    next.remote_va = b.data_buf.iova + 'h3c40;
+    next.rkey = b.mr.key();
+    rdma_drv_wr::post_send(a.drv, qa, bad, status);
+    expect_ok("post bad rkey", status);
+    rdma_drv_wr::post_send(a.drv, qa, next, status);
+    expect_ok("post after bad rkey", status);
+    wait_wcs(a, 2, wcs);
+    expect_wc("bad rkey", wcs[0], bad.wr_id, 1'b0, RDMA_DRV_WC_REM_ACCESS_ERR);
+    expect_wc("flush after bad rkey", wcs[1], next.wr_id, 1'b0, RDMA_DRV_WC_FLUSH_ERR);
     expect_mem("bad rkey target", b, 'h3c00, snapshot);
+    qa.destroy(a.drv, status);
+    expect_ok("destroy bad rkey QP", status);
+    qb.destroy(b.drv, status);
+    expect_ok("destroy bad rkey peer", status);
   endtask
 
   // 功能：A 的 CQ arm 后，下一个完成在 CEQ 产生带该 CQN 的 CEQE，驱动处理后 arm_sn 递增。
