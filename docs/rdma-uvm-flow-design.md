@@ -82,6 +82,8 @@ RC 的统一内存是绑定到该 Root 的 Host host_mem manager；没有 IOMMU�
   “丢一包重传成功 + 持续丢包重试耗尽 0x16”。
 - QP 生命周期：`rdma_drv_qp_lifecycle_test`（RTS→SQD 等 AEQE、doorbell 状态不符、RESET/INIT 接收丢包、
   销毁重建与编号复用）；multifunc 按快照范围做 Function/PF/Host 复位。
+- Soft-RoCE 互打：`rdma_rxe_test`（rxe suite，需 `tools/rxe/rxe_tap_setup.sh up`）：仿真设备经 TAP 与真实
+  rdma_rxe 双向 SEND/WRITE/READ/ATOMIC（含立即数、多包），net_packet 帧带真实 ICRC/pad/AckReq。
 - PCIe：`rdma_pcie_rdma_test`（pcie_work suite）：Host0 PF0/VF1 与 Host1 PF0 经 PCIe 完成 probe 与
   SEND/WRITE，检查 MMIO TLP 解码数、DMA TLP 发出/送达数、各 Function 的 requester BDF、MAILBOX 拒绝。
 

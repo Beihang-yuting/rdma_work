@@ -3,7 +3,7 @@
 日期：2026-10-05。基线：`1ea354f`（`feature/rdma-structural-batch226` 末端，Batch247）。
 本分支不修改其它分支；所有仿真经 `scripts/run_vcs53.sh` 在 `ubuntu@10.11.10.53` 执行。
 
-## 最终总结（2026-10-06，HEAD 0f1fd94，最后一轮全量 v39）
+## 最终总结（2026-10-07，HEAD 6738db6，最后一轮全量 v40）
 
 1. **第一阶段：精简**（v1–v17）。合并重复代码；CMQ 引擎按驱动流程重写（13,763→849 行），70 个驱动 opcode
    的请求/响应与 golden 逐字节对齐；删除按源码文本冻结结构的 Python 门禁；注释改写为三段式。
@@ -18,6 +18,8 @@
    PF/Host/设备范围 FLR 与恢复）；QP 状态门控与 SQD；MMIO 与设备 DMA 都经 pcie_work 传输：dpu_common 生成
    PF/VF 与随机 BAR，pcie_work 承载 TLP（RC→EP MemWr 送 doorbell，EP→RC MemRd/MemWr 访问 Host 内存），
    RDMA 模型产生数据。
+5. **第五阶段：与 Linux Soft-RoCE 互打**（v40）。仿真驱动 + 设备经 TAP 与真实 rdma_rxe 双向收发，用真实实现
+   检验线上协议，修正 net_packet 的 RoCEv2 编码（ICRC、pad、BTH/DETH 字段位置）与设备的三处协议错误。
 
 | | 基线 1ea354f | 最终 HEAD | 变化 |
 | --- | ---: | ---: | ---: |
@@ -26,8 +28,9 @@
 | 分支提交数 | — | 66 | |
 
 第三阶段结束时（v34）src 42,434 行、tests 40,447 行；第四阶段删除老 core/model/codec 层后降至上表。
-最终回归（v39，全部通过）：Python、style、驱动契约门禁、CMQ gate 5、core 14、host_mem、net_packet、pcie_work、
-e2e（`rdma_tb_e2e_test` 与 4096 SEND 高流量）；唯一的 2 条告警来自外部 net_packet 仓库。
+最终回归（v40，全部通过，告警 0）：Python、style、驱动契约门禁、CMQ gate 5、core 14、host_mem、net_packet、
+pcie_work、e2e（`rdma_tb_e2e_test` 与 4096 SEND 高流量）。Soft-RoCE 互打（`make rxe`，需 sudo 建 TAP）13 项
+双向用例全部通过，不在默认全量内。
 新功能均做过变异检查（注入对应缺陷后测试失败）。
 
 ## 目标与取舍
@@ -200,6 +203,7 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 | v37 | abcf720 | 全部通过：MMIO 经 pcie_work（pcie_work suite 重新纳入全量） |
 | v38 | 26d800d | 全部通过：设备 DMA 端口 `rdma_dev_dma`（task 化，默认后门，行为不变） |
 | v39 | 0f1fd94 | 全部通过：设备 DMA 经 pcie_work EP→RC（MemRd 73、MemWr 55 全部送达，requester = Function BDF）；告警 2 来自外部 net_packet |
+| v40 | 6738db6 | 全部通过，告警 0：net_packet 换为修正后的 fe37a59；设备 AckReq、起始 PSN、AETH 类型判定修正；rxe 互打 13/13 |
 
 ## 第三阶段：协议补全与 dpu_common 接入（2026-10-06，v29–v34）
 
@@ -240,6 +244,26 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 假设：PCIe 路径无 IOMMU，设备 DMA 地址即 Host 内存地址（host_mem adapter 用恒等 IOVA）；不同 Host 的
 Function 可有相同 BDF（各自 PCIe 域）。
 
+## 第五阶段：与 Linux Soft-RoCE 互打（2026-10-07，v40）
+
+互打前两端都是本仓库模型（编码与解码同一套理解），协议理解错误互相抵消。改为在仿真机（53，内核 5.15）上
+用 TAP 网卡接一个真实 rdma_rxe：
+
+```
+仿真（VCS）：rdma_drv → rdma_dev ─ rdma_rxe_link（DPI-C）─ TAP rtap0 ─ rdma_rxe（rxe_rtap0）─ rxe_peer（libibverbs）
+                                    net_packet 编解码                                    ↑ 测试经管道逐行驱动
+```
+
+| 步骤 | 内容 |
+| --- | --- |
+| P0 线上格式 | `tools/rxe/roce_frame.py`（RoCEv2 帧与 ICRC 参考实现，同 rxe 算法）、`rxe_icrc_check.py`（Python 经 TAP 扮演对端，13/13：我方帧被 rxe 执行、错误 ICRC 被丢弃、rxe 帧 ICRC 校验通过） |
+| net_packet 修正 | ICRC 原放在扩展头之后且为异或占位 → 负载与 pad 之后的 4B 尾部，按 IBTA A17 计算；负载补 4B pad；BTH 第 4–11 字节与 DETH 第二字字段位置错（QPN 20 在线上为 0x1480）→ 按规范；新测试用 5 个 rxe 实际帧逐字段与逐字节比对（fork 分支 `fix/rocev2-icrc-trailer`，4dc2e08、fe37a59） |
+| 设备修正 | 请求方 RC/URC SEND/WRITE 末包置 AckReq（rxe 只对 AckReq 包回 ACK）；QPC 写入后加载起始 PSN（RTR：EPSN_REQ，RTR→RTS：RC_TPE_CUR_SQ_PSN，原先两端都从 0 开始）；ACK 按 AETH 类型位 [7:5]=000 判定，回 ACK 信用填 0x1F |
+| P1 互打 | `src/adapters/rxe`（DPI-C：TAP 收发、rxe_peer 子进程）、`tests/integration/rdma_rxe_test.sv`：仿真→rxe SEND（1/3 包）、SEND_IMM、WRITE、WRITE_IMM、READ、FETCH_ADD、CMP_SWAP，rxe→仿真 SEND、SEND_IMM、WRITE、READ、FETCH_ADD，两端完成、立即数与内存一致，双向各 17 帧无丢弃；去掉 AckReq 的变异使测试失败 |
+
+运行：`tools/rxe/rxe_tap_setup.sh up`（sudo，一次）后 `scripts/run_vcs53.sh rxe rdma_rxe_test`。仿真时间与
+真实时间：链路空闲时每 100ns 仿真时间等待至多 200us 真实时间；设备 QP 用不超时（IB timeout 0）。
+
 ## 未做与遗留
 
 - CEQ/AEQ 的 request/resource/context model 与 lifecycle policy 仍为平行实现；字段名不同，
@@ -249,6 +273,9 @@ Function 可有相同 BDF（各自 PCIe 域）。
 - 第一阶段的包级 DAG 计划已被第二阶段的驱动形状重构取代。
 - 尚无 RTL DUT：`src/dev` 设备模型充当设备，接入 DUT 后应退为预测器。
 - 只有 pcie_work suite 的 DMA 走 PCIe；core/host_mem/e2e 仍用后门 DMA 端口（零仿真时间）。
+- rxe 互打尚未覆盖 UD、SRQ、RNR/丢包重传、错误 rkey 的 NAK 与异常完成；响应方对中间包 AckReq 不单独回 ACK
+  （末包 ACK 已覆盖）。URC/SQD 等 xtrdma 私有行为 rxe 不支持，无法互打。
+- net_packet 修正尚未推送到 GitHub（本机与 53 均无推送凭据），53 上用本地 clone。
 - PCIe 路径未开 FC/记分板/覆盖率；Completion 超时、UR/CA 只报为 DMA 失败，未建模设备侧错误上报。
 - core 内的 data/reliability/multifunc 用直连链路，只有 e2e 经 net_packet 帧编解码；设备报文不带 IP
   地址，GRH 与 IP 头地址为 0。
