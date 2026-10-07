@@ -9,6 +9,9 @@
 module tb_top;
   import uvm_pkg::*;
   import rdma_unit_test_pkg::*;
+`ifdef RDMA_ENV_TEST
+  import rdma_env_test_pkg::*;
+`endif
 
   initial begin
     run_test();

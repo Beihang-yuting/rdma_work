@@ -11,54 +11,13 @@
 //   host_mem_manager、rdma_mf_net/rdma_mf_port。
 // 所有权：测试拥有 dpu 系统、PCIe 系统与各 Host 的 host_mem。
 // 生命周期：build_phase 建拓扑与 PCIe 环境，run_phase 运行。
-// 每个 Host 一个 host_mem manager（区间按 Host 错开，host_id 为 Host 号），每个 Function 一个恒等
-// IOVA 的 adapter：PCIe 上没有 IOMMU，设备发出的 IOVA 即 Host 内存地址。
-class rdma_pcie_host_mem_factory extends rdma_dpu_mem_factory;
-  `uvm_object_utils(rdma_pcie_host_mem_factory)
-
-  localparam bit [63:0] REGION_BASE = 64'h0000_0040_0000_0000;
-  localparam bit [63:0] REGION_STRIDE = 64'h0000_0001_0000_0000;
-  localparam bit [63:0] REGION_BYTES = 64'h0000_0000_0100_0000;
-
-  host_mem_api managers[int unsigned];
-
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
-  function new(string name = "rdma_pcie_host_mem_factory");
-    super.new(name);
-  endfunction
-
-  // 功能：Function f 的主机内存：其 Host 的 manager（首次使用时建立）之上的恒等 IOVA adapter。
-  // 输入/输出及副作用：可能新建 manager；返回新 adapter。
-  // 失败/边界：无。
-  virtual function rdma_host_mem_api make(rdma_dpu_function f);
-    rdma_host_mem_external_pkg::host_mem_manager manager;
-    rdma_host_mem_adapter adapter;
-    int unsigned h;
-
-    h = f.key.host_id;
-    if (!managers.exists(h)) begin
-      manager = rdma_host_mem_external_pkg::host_mem_manager::type_id::create(
-        $sformatf("pcie_host_mem%0d", h));
-      manager.init_region(REGION_BASE + h * REGION_STRIDE,
-                          REGION_BASE + h * REGION_STRIDE + REGION_BYTES - 1, MODE_BUDDY, 16);
-      manager.set_host_id(h);
-      managers[h] = manager;
-    end
-    adapter = rdma_host_mem_adapter::type_id::create($sformatf("pcie_mem_%0d", f.global_id));
-    adapter.mem = managers[h];
-    return adapter;
-  endfunction
-endclass
-
 class rdma_pcie_rdma_test extends uvm_test;
   `uvm_component_utils(rdma_pcie_rdma_test)
 
   localparam int unsigned BUF_BYTES = 16384;
 
   rdma_dpu_system sys;
-  rdma_pcie_host_mem_factory mems;
+  rdma_host_mem_factory mems;
   rdma_pcie_system pcie;
   rdma_mf_net net;
   bit [47:0] macs[$];
@@ -93,7 +52,7 @@ class rdma_pcie_rdma_test extends uvm_test;
     super.build_phase(phase);
     rdma_pcie_system::install_overrides();
     sys = rdma_dpu_system::type_id::create("pcie_dpu");
-    mems = rdma_pcie_host_mem_factory::type_id::create("pcie_mem_factory");
+    mems = rdma_host_mem_factory::type_id::create("pcie_mem_factory");
     sys.mem_factory = mems;
     sys.add_host(0);
     sys.add_host(1);

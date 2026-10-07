@@ -1,5 +1,5 @@
 # suite test dependency-tags
 core rdma_multifunc_test core
-host_mem rdma_tb_host_mem_test host_mem
-e2e rdma_tb_e2e_test host_mem,net_packet
-e2e rdma_tb_e2e_high_traffic_test host_mem,net_packet
+env rdma_env_basic_test env
+env rdma_env_netpkt_test host_mem,net_packet
+env rdma_env_high_traffic_test host_mem,net_packet

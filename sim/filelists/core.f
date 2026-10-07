@@ -2,7 +2,6 @@
 +incdir+../src/types
 +incdir+../src/model
 +incdir+../src/codec
-+incdir+../src/tb
 +incdir+../src/adapter
 +incdir+../src/dev
 +incdir+../src/drv
@@ -14,6 +13,5 @@
 ../src/dev/rdma_dev_pkg.sv
 ../src/drv/rdma_drv_pkg.sv
 ../src/adapters/dpu/rdma_dpu_adapter_pkg.sv
-../src/tb/rdma_tb_pkg.sv
 ../tests/rdma_unit_test_pkg.sv
 ../tests/tb_top.sv

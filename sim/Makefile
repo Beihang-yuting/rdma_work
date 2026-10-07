@@ -1,10 +1,8 @@
 # 目录：sim/Makefile，仿真构建层入口。
-# 职责：定义 core、host_mem、pcie_work、net_packet 与 e2e 的编译、预检和 UVM 运行流程。
+# 职责：定义 core、env（UVM env：host_mem + net_packet）、pcie_work 与 rxe 的编译、预检和 UVM 运行流程。
 # 依赖与所有权：依赖 VCS、仓库 filelist 及外部只读源码树；本文件仅管理 build 输出目录，不拥有外部依赖生命周期。
 
 BUILD ?= build/core
-HOST_MEM_BUILD ?= build/host_mem
-E2E_BUILD ?= build/e2e
 # 53 机上的 /home/ubuntu/workspace/host_mem 是真实 pinned backing 的只读
 # checkout；固定 commit/hash 使 E2E 可复现，同时不把外部源码复制进本仓库。
 override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
@@ -32,7 +30,7 @@ define RUN_CORE_LOGICAL_TEST
 		"../scripts/check_uvm_summary.sh"
 endef
 
-.PHONY: dpu_common_preflight core cmq_gate sv_style host_mem_preflight host_mem rdma_defs net_packet net_packet_preflight pcie_work pcie_work_preflight rxe e2e regression
+.PHONY: dpu_common_preflight core cmq_gate sv_style host_mem_preflight rdma_defs env net_packet_preflight pcie_work pcie_work_preflight rxe regression
 
 dpu_common_preflight:
 	@if [[ -z "$(DPU_COMMON_ROOT)" || ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then \
@@ -55,7 +53,7 @@ regression:
 		      "$$suite" == axis_vip || "$$test" == *axis* ]]; then \
 			echo "invalid regression manifest row" >&2; exit 2; \
 		fi; \
-		if [[ ! "$$suite" =~ ^(core|host_mem|pcie_work|net_packet|e2e|rdma_defs)$$ || \
+		if [[ ! "$$suite" =~ ^(core|env|pcie_work|rdma_defs)$$ || \
 		      ! "$$test" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]]; then \
 			echo "invalid suite/test in regression manifest: $$suite $$test" >&2; exit 2; \
 		fi; \
@@ -181,25 +179,6 @@ host_mem_preflight:
 	done
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency host_mem --root "$(HOST_MEM_ROOT)"
 
-host_mem: dpu_common_preflight host_mem_preflight
-	set -euo pipefail; \
-	mkdir -p $(HOST_MEM_BUILD); \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_HOST_MEM_TEST \
-		+incdir+$(HOST_MEM_ROOT)/src \
-		$(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
-		-f filelists/host_mem.f -top tb_top -o $(HOST_MEM_BUILD)/simv; \
-	if [[ "$(TEST)" == regression ]]; then \
-		mapfile -t suite_tests < <(sed -n '/^readonly host_mem_tests=(/,/^)/p' ../scripts/run_host_mem_regression53.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*$$/\1/p'); \
-		if (( $${#suite_tests[@]} == 0 )); then echo "host_mem regression manifest is empty" >&2; exit 2; fi; \
-		for test_name in "$${suite_tests[@]}"; do \
-			$(HOST_MEM_BUILD)/simv +UVM_TESTNAME=$$test_name | tee $(HOST_MEM_BUILD)/$$test_name.log; \
-			../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$$test_name.log; \
-		done; \
-	else \
-		$(HOST_MEM_BUILD)/simv +UVM_TESTNAME=$(TEST) | tee $(HOST_MEM_BUILD)/$(TEST).log; \
-		../scripts/check_uvm_summary.sh $(HOST_MEM_BUILD)/$(TEST).log; \
-	fi
-
 net_packet_preflight:
 	@if [[ -z "$(NET_PACKET_ROOT)" ]]; then echo "NET_PACKET_ROOT is required for net_packet" >&2; exit 2; fi
 	@preflight_failed=0; \
@@ -213,16 +192,25 @@ net_packet_preflight:
 	if [[ "$$preflight_failed" != 0 ]]; then exit 2; fi
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency net_packet --root "$(NET_PACKET_ROOT)"
 
-net_packet: dpu_common_preflight net_packet_preflight
+# env suite：UVM env（真实 host_mem + net_packet + dpu_common）的全部场景与 net_packet 适配器测试。
+ENV_TESTS := rdma_env_basic_test rdma_env_netpkt_test rdma_env_high_traffic_test rdma_net_packet_adapter_test
+
+env: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \
-	mkdir -p build/net_packet; \
-	: "VCS 不会替换 filelist 中的 GNU make 变量，先生成只读依赖路径展开后的临时 filelist"; \
-	sed 's|\$$(NET_PACKET_ROOT)|$(NET_PACKET_ROOT)|g' filelists/net_packet.f > build/net_packet/net_packet.expanded.f; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_NET_PACKET +incdir+$(NET_PACKET_ROOT)/src +incdir+$(NET_PACKET_ROOT)/src/common +incdir+$(NET_PACKET_ROOT)/src/protocols -f build/net_packet/net_packet.expanded.f -top tb_top -o build/net_packet/simv; \
-	test_name=$(TEST); \
-	if [[ "$$test_name" == regression ]]; then test_name=rdma_net_packet_adapter_test; fi; \
-	build/net_packet/simv +UVM_TESTNAME=$$test_name | tee build/net_packet/$$test_name.log; \
-	../scripts/check_uvm_summary.sh build/net_packet/$$test_name.log
+	mkdir -p build/env; \
+	: "VCS 不会替换 filelist 中的 Make 变量，先生成只读依赖路径展开后的临时 filelist"; \
+	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
+	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
+	    filelists/env.f > build/env/env.expanded.f; \
+	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET \
+		+define+RDMA_ENV_TEST $(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
+		-f build/env/env.expanded.f -top tb_top -o build/env/simv; \
+	tests="$(TEST)"; \
+	if [[ "$$tests" == regression ]]; then tests="$(ENV_TESTS)"; fi; \
+	for test_name in $$tests; do \
+		build/env/simv +UVM_TESTNAME=$$test_name | tee build/env/$$test_name.log; \
+		../scripts/check_uvm_summary.sh build/env/$$test_name.log; \
+	done
 
 pcie_work_preflight:
 	@if [[ -z "$(PCIE_WORK_ROOT)" ]]; then echo "PCIE_WORK_ROOT is required for pcie_work" >&2; exit 2; fi
@@ -272,18 +260,3 @@ rxe: dpu_common_preflight net_packet_preflight
 		build/rxe/simv +UVM_TESTNAME=$$test_name +RXE_TAP=$(RXE_TAP) +RXE_PEER=$$(pwd)/build/rxe/rxe_peer | tee build/rxe/$$test_name.log; \
 		../scripts/check_uvm_summary.sh build/rxe/$$test_name.log; \
 	done
-
-e2e: dpu_common_preflight host_mem_preflight net_packet_preflight
-	set -euo pipefail; \
-	mkdir -p $(E2E_BUILD); \
-	: "VCS 不会替换 filelist 中的 Make 变量，先生成只读依赖路径展开后的临时 filelist"; \
-	sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' \
-	    -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
-	    filelists/e2e.f > $(E2E_BUILD)/e2e.expanded.f; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) +define+RDMA_HOST_MEM_TEST +define+RDMA_NET_PACKET \
-		$(HOST_MEM_ROOT)/src/host_mem_pkg.sv \
-		-f $(E2E_BUILD)/e2e.expanded.f -top tb_top -o $(E2E_BUILD)/simv; \
-	test_name=$(TEST); \
-	if [[ "$$test_name" == regression ]]; then test_name=rdma_tb_e2e_test; fi; \
-	$(E2E_BUILD)/simv +UVM_TESTNAME=$$test_name | tee $(E2E_BUILD)/$$test_name.log; \
-	../scripts/check_uvm_summary.sh $(E2E_BUILD)/$$test_name.log

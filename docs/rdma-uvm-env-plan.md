@@ -1,0 +1,138 @@
+# RDMA UVM env 改造方案（S1–S5）
+
+日期：2026-10-07。分支：`feature/rdma-arch-slim`。
+目标：把散在各测试里的过程式代码收进一套 UVM env：配置决定拓扑与传输，序列产生激励，资源库管理对象，
+scoreboard/checker/coverage 负责判定与统计；测试只选配置与虚拟序列。代码精简易读，功能覆盖现有全部测试。
+
+## 1. 结构
+
+```
+rdma_base_test ── rdma_env_cfg + vseq
+ └ rdma_env
+    ├ cfg        rdma_env_cfg：拓扑（dpu_common Host/PF/VF）、链路类型、内存、QP 默认值、检查开关、偏差清单
+    ├ sys        rdma_dpu_system：快照 → 每个 Function 的 内存 + 设备 + 驱动；FLR/恢复
+    ├ res        rdma_res_db：全部对象（见第 2 节），控制面 driver 是唯一写入者
+    ├ ctrl       rdma_ctrl_agent：控制面（资源生命周期、QP 连接/状态迁移、FLR/恢复），全部 Function 共用一个
+    ├ verb[f]    rdma_verb_agent：数据面（post_send/recv、SRQ recv、poll CQ/EQ）
+    ├ link       rdma_link（本身即 loopback）及子类 rdma_link_netpkt | rxe，factory 按名字创建；tx/rx analysis、故障注入
+    ├ plugins    rdma_env_plugin：传输相关扩展（pcie_work 承载 MMIO/DMA、rxe 远端 Function）
+    ├ sb         rdma_scoreboard = rdma_mem_model（期望内存）+ rdma_expect（每 QP 期望完成）
+    ├ checker    rdma_proto_checker + rdma_proto_rule 子类（每组 IBTA 规则一个类）
+    ├ cov        rdma_coverage（每个覆盖面一个 covergroup）
+    └ vseqr      rdma_vsequencer（持有全部子 sequencer 与 env 句柄）
+```
+
+## 2. 资源层（每类对象一个类，三层管理）
+
+```
+rdma_res_db ── funcs[uid] : rdma_res_func（每个 Function 一个；rxe 远端为 REMOTE）
+                 ├ cmq、aeq、ceqs : 设备级队列（probe 时登记）
+                 ├ pds/bufs/mrs/cqs/srqs/qps : rdma_res_pool #(T)
+               └ ap : rdma_res_event（CREATED / STATE / DESTROYED）
+```
+
+- `rdma_res`（基类）：kind、uid（全局唯一）、owner、state（ALIVE/ERROR/DESTROYED）、generation（编号复用区分新旧）、
+  deps（QP→PD/CQ/SRQ，MR→PD/BUF，CQ→CEQ）。
+- 子类只持有驱动对象句柄 + 验证需要的元数据，不复制驱动状态：
+
+| 类 | 驱动对象 | 验证元数据 |
+| --- | --- | --- |
+| `rdma_res_cmq` | `rdma_drv_cmq` | —（opcode/ecode 进覆盖率） |
+| `rdma_res_eq` | `rdma_drv_eq` | CEQ/AEQ、深度；monitor 按它轮询 CEQ 与 AEQ（异步事件：QP 错误、SRQ limit、CQ 溢出等） |
+| `rdma_res_pd` | `rdma_drv_pd` | — |
+| `rdma_res_buf` | `rdma_drv_dma` | iova/size；`read/write`（仿真经驱动 hw，rxe 经对端进程，子类实现） |
+| `rdma_res_mr` | `rdma_drv_mr` | buf、VA 范围、权限、key；`covers(va, len, right)` |
+| `rdma_res_cq` | `rdma_drv_cq` | 深度 |
+| `rdma_res_srq` | `rdma_drv_srq` | — |
+| `rdma_res_qp` | `rdma_drv_qp` | 类型、状态镜像、对端 QP、send/recv CQ、SRQ、Q_Key、MTU |
+
+- `rdma_res_pool #(T)`：编号 → 对象；add（编号冲突报错）、get、remove（仍被依赖报错）、all。
+- `rdma_res_db`：跨 Function 查询（`qp(func, qpn)`、`mr_by_key`）、销毁顺序检查、`on_flr(scope)` 整组置
+  DESTROYED 并广播事件。
+- 设备级队列由驱动 probe 创建，env 在 probe 后登记、FLR/remove 时失效；SQ/RQ 是 QP 的一部分，不单列；
+  驱动内部对象（HMC、PBLE、位图）不登记。
+- 边界：在途 WR 属于“期望”，放 scoreboard（按 QP uid），不放资源类。
+
+## 3. 组件
+
+- **rdma_env_cfg**：一个类，字段分组（拓扑、链路、内存、QP 默认、检查）；不再拆成多个子配置类。
+- **rdma_ctrl_agent**（一个，item 带 Function 下标；FLR 范围跨 Function，控制命令本就串行）：item
+  `rdma_ctrl_item`（op：ALLOC_PD/ALLOC_BUF/REG_MR/CREATE_CQ/CREATE_SRQ/CREATE_QP/CONNECT/MODIFY_QP/DESTROY/
+  FLR/RECOVER；属性；expect_fail）。driver 调用 `rdma_drv_*`，结果写资源库；资源库的 analysis 端口即控制面
+  事件流（不另设 monitor）。命令进行中 monitor 暂停取 AEQ（驱动内部等待如 RTS2SQD 自己取）。
+- **rdma_verb_agent**：item 增加 QP/MR 句柄、显式 SGE 列表、SRQ 接收、数据模式（见第 5 节）、期望完成状态；
+  monitor 模拟中断处理：该 Function 全部 CEQ、AEQ、全部 CQ；上报 wc 状态/vendor/src_qp 与 AEQ 事件。
+- **rdma_link**：基类提供 `port(func)`、`tx_ap/rx_ap`、`drop/corrupt/delay(dir, nth)`；loopback 与 netpkt 在
+  tb 包内，rxe 在 rxe 包内（工厂按名字创建，tb 不依赖 rxe 包）。
+- **rdma_env_plugin**：钩子 `pre_build(sys)`、`build(env)`、`connect(env)`、`report(env)`。pcie_work（安装覆盖、
+  建 PCIe 系统、TLP 计数检查）与 rxe（远端 Function、对端进程）各一个插件。
+- **rdma_scoreboard**：拆为 `rdma_mem_model`（每个 buf 的期望字节，写入/读取/原子/GRH）与 `rdma_expect`（每 QP
+  的期望完成队列：成功/错误码/flush/SRQ 顺序/UD）；scoreboard 只负责接事件与比对。错误预测依据资源库
+  （rkey、权限、越界、接收容量、Q_Key），错误后预测 QP 进入 ERR、其后 WR 为 FLUSH；FLR 撤销范围内期望。
+- **rdma_proto_checker**：按 QP 维护 PSN/在途/MSN 状态；规则类 `rdma_rule_frame`（ICRC/pad/UDP/TVer/P_Key）、
+  `rdma_rule_psn`（连续、重传起点、READ 只重读缺失段）、`rdma_rule_ack`（AckReq、ACK/NAK 范围、MSN、NAK 码）、
+  `rdma_rule_rnr`（定时器编码、重试间隔）、`rdma_rule_state`（非 RTS/RTR 不收发、SQD 不发新 SQE）、
+  `rdma_rule_ud`（DETH、Q_Key）。偏差清单按规则名降级为 info。
+- **rdma_coverage**：verb（op × 链路 × 长度区间 × SGE 数 × imm × QP 类型 × 数据模式）、error、qp_state、
+  link_fault、function（PF/VF × 复位范围 × 在途流量）、cmq（opcode × ecode）。
+- **序列**：`rdma_base_vseq`（取资源、发 ctrl/verb、等待）＋每个场景一个 vseq：basic_traffic、ud、srq、
+  qp_lifecycle、reliability、errors、multifunc、high_traffic、random。
+
+## 4. 拆分审查结论
+
+| 部分 | 结论 |
+| --- | --- |
+| 资源 | 每类对象一个类 + 通用池 + 按 Function 分组（第 2 节） |
+| scoreboard | 拆：期望内存 / 期望完成 / 比对三部分，各自可读可测 |
+| 协议检查 | 拆：每组 IBTA 规则一个类，独立开关与偏差降级 |
+| 链路 | 拆：每种传输一个子类；PCIe 不是链路，作为插件 |
+| 序列 | 拆：每个场景一个 vseq，公共动作在 base vseq |
+| 覆盖率 | 一个 subscriber，内部按覆盖面分 covergroup（不再细拆类） |
+| 配置 | 不拆：一个配置类，字段分组即可 |
+| verb item | 不拆：RC/UD/atomic 共用一个 item，字段按用途分组 |
+| 驱动/设备模型 | 不在本次范围（已按对象分类） |
+
+## 5. net_packet 生成数据
+
+`rdma_data_gen` 用 net_packet 的负载引擎生成源数据：空层栈的 `packet`，`payload_mode` = RANDOM/FIXED/
+INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
+
+- verb item 只写数据规格（模式、固定值或样式、长度），driver 生成字节、写入源内存并在 item 上保留原始数据。
+- scoreboard 记录“目的区域 ← 原始数据”：完成时立即读目的内存与原始数据比对（定位到具体 WR），结束时再整块
+  比对一次（发现越界写）。
+- rxe 远端的源数据同样由它生成并写入对端内存。
+- 价值：数据样式可控（全 0/全 1 会掩盖地址错误，递增与随机能暴露），模式进入覆盖率；原始数据是唯一判据。
+
+## 6. 回归 suite
+
+| suite | 内容 | 依赖 |
+| --- | --- | --- |
+| core / cmq_gate / rdma_defs | 模型单元测试（不含 env） | dpu_common |
+| env | env 全部场景（loopback/netpkt × mock/真实 host_mem）＋ net_packet adapter 测试 | dpu_common、host_mem、net_packet |
+| pcie_work | env 场景子集 + PCIe 插件 | 上述 + pcie_work |
+| rxe | env 场景子集 + rxe 链路/插件（需 TAP，手动） | 上述 + DPI、rdma_rxe |
+
+原 host_mem、net_packet、e2e 三个 suite 并入 env。
+
+## 7. 迁移
+
+| 现有测试 | 去向 |
+| --- | --- |
+| drv_cmq_golden、dev_cmq、drv_cmq、drv_dev、drv_verbs、defs、types | 保留（模型单元测试） |
+| tb_flow、tb_host_mem、tb_e2e、e2e_high_traffic | basic_traffic / high_traffic vseq |
+| drv_data、drv_reliability、drv_qp_lifecycle | basic_traffic、ud、srq、reliability、qp_lifecycle vseq |
+| multifunc | multifunc vseq |
+| pcie_rdma | basic_traffic + PCIe 插件 |
+| rxe_test、rxe_fault_test | basic_traffic、ud、srq、reliability、errors + rxe 链路 |
+
+旧测试在新测试覆盖其全部检查点后删除。
+
+## 8. 阶段
+
+| 阶段 | 内容 | 验收 |
+| --- | --- | --- |
+| S1 ✅ | 配置、资源层、数据生成、ctrl/verb agent、loopback/netpkt 链路、scoreboard 拆分、env、base vseq、basic_traffic/high_traffic；env suite | 替代 tb_flow/host_mem/e2e/high_traffic，全量通过 |
+| S2 | 链路故障注入；pcie 插件；rxe 链路 + 远端 Function 插件 | basic_traffic 在 4 种传输下通过 |
+| S3 | 协议检查规则类；scoreboard 错误/flush/SRQ/UD/FLR 预测 | 每条规则有变异检查 |
+| S4 | ud/srq/qp_lifecycle/reliability/errors/multifunc vseq；删旧测试 | 旧检查点全部有对应；全量通过 |
+| S5 | 覆盖率、random vseq、覆盖率报告进入回归汇总 | 覆盖率基线 |

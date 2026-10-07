@@ -10,7 +10,6 @@ readonly CORE_TESTS=(
   rdma_smoke_test
   rdma_types_test
   rdma_aeqe_route_test
-  rdma_tb_flow_test
   rdma_dev_cmq_test
   rdma_drv_cmq_test
   rdma_drv_cmq_golden_test
