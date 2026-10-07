@@ -7,7 +7,8 @@
 //   - rdma_rxe_ctrl_driver / rdma_rxe_verb_driver / rdma_rxe_verb_monitor：远端 Function 的控制面、投递
 //     与完成经对端进程命令完成，仿真 Function 走基类；
 //   - rdma_rxe_plugin：安装上述覆盖、启动对端进程、登记远端 Function。
-//   对端进程限制：一个 PD/CQ/MR/SRQ、单 SGE、无 URC；远端只支持建资源与连接（不支持销毁/FLR）。
+//   对端进程限制：一个 PD/CQ/MR/SRQ（多次分配缓冲返回同一个）、单 SGE、无 URC；远端只支持建资源与
+//   连接（不支持销毁/FLR）。
 // 依赖：rdma_env_pkg、rdma_rxe_pkg（TAP 链路、对端进程）、net_packet 适配器。
 // 所有权：插件持有对端进程；链路持有 TAP。
 // 生命周期：env build 时安装，run_phase 启动，report 时关闭。
@@ -124,13 +125,46 @@ package rdma_rxe_env_pkg;
     endfunction
   endclass
 
+  typedef class rdma_link_rxe;
+
+  // TAP 端口：收到的 rxe 报文经 env 链路的 rx_ap 广播（源为远端 Function）；链路的 DROP 故障规则对
+  //   rxe 发来的报文同样生效。
+  class rdma_rxe_env_tap extends rdma_rxe_link;
+    `uvm_object_utils(rdma_rxe_env_tap)
+
+    rdma_link_rxe link;
+    int unsigned src;
+    int unsigned dst;
+
+    // 功能：构造。
+    // 输入/输出及副作用：name 为 UVM 名。
+    // 失败/边界：无。
+    function new(string name = "rdma_rxe_env_tap");
+      super.new(name);
+    endfunction
+
+    // 功能：命中 DROP 规则则丢弃，否则广播接收报文。
+    // 输入/输出及副作用：写 rx_ap；更新规则计数。
+    // 失败/边界：返回 1 时丢弃。
+    virtual function bit received(rdma_packet pkt);
+      foreach (link.faults[i])
+        if (link.faults[i].kind == RDMA_FAULT_DROP && link.faults[i].hit(src, pkt)) begin
+          `uvm_info("RXE", $sformatf("rx %s psn %06h dropped (injected)", pkt.opcode.name(),
+                    pkt.psn), UVM_MEDIUM)
+          return 1'b1;
+        end
+      link.rx_ap.write(link.observe(src, dst, pkt));
+      return 1'b0;
+    endfunction
+  endclass
+
   // TAP 链路：仿真 Function 发往远端 Function 的报文编码后写入 TAP；TAP 收到的帧解码后交给仿真
   //   Function（只支持一个仿真 Function）。帧地址：仿真侧 +RXE_SIM_MAC/+RXE_SIM_IP，rxe 侧为 TAP 的
   //   MAC 与 +RXE_IP。
   class rdma_link_rxe extends rdma_link;
     `uvm_component_utils(rdma_link_rxe)
 
-    rdma_rxe_link tap;
+    rdma_rxe_env_tap tap;
     bit [47:0] rxe_mac;
 
     // 功能：构造。
@@ -155,7 +189,8 @@ package rdma_rxe_env_pkg;
         `uvm_fatal("RXE", {"TAP ", name, " not found: run tools/rxe/rxe_tap_setup.sh up"})
       $fclose(fd);
       rxe_mac = rdma_rxe_util::mac_of(text);
-      tap = rdma_rxe_link::type_id::create("tap");
+      tap = rdma_rxe_env_tap::type_id::create("tap");
+      tap.link = this;
       tap.adapter = rdma_net_packet_adapter::type_id::create("rxe_adapter");
       tap.wait_us = rdma_rxe_util::arg("RXE_WAIT_US", "20").atoi();
       if (!tap.open(name))
@@ -171,6 +206,7 @@ package rdma_rxe_env_pkg;
       if (f.remote) begin
         funcs[f.index] = f;
         func_of_mac[f.mac] = f.index;
+        tap.src = f.index;
         return null;
       end
       if (!f.node.func.identity(id).ok() || !tap.adapter.configure_function(id).ok())
@@ -181,7 +217,7 @@ package rdma_rxe_env_pkg;
       tap.adapter.src_ip = rdma_rxe_util::ip_of(rdma_rxe_util::arg("RXE_SIM_IP", "10.79.0.1"));
       tap.adapter.dst_ip = rdma_rxe_util::ip_of(rdma_rxe_util::arg("RXE_IP", "10.79.0.2"));
       tap.nic = f.node.dev.nic;
-      tap.rx_ap = rx_ap;
+      tap.dst = f.index;
       return super.attach(f);
     endfunction
 
@@ -202,10 +238,11 @@ package rdma_rxe_env_pkg;
       tap.run();
     endtask
 
-    // 功能：rxe 发来的帧都应能解码；关闭 TAP。
+    // 功能：基类故障规则检查；rxe 发来的帧都应能解码；关闭 TAP。
     // 输入/输出及副作用：报告。
     // 失败/边界：有不可解码帧报 UVM_ERROR。
     function void report_phase(uvm_phase phase);
+      super.report_phase(phase);
       `uvm_info("RXE", $sformatf("frames: sim->rxe %0d, rxe->sim %0d", tap.tx_log.size(),
                 tap.rx_log.size()), UVM_LOW)
       if (tap.rx_dropped != 0)
@@ -218,6 +255,9 @@ package rdma_rxe_env_pkg;
   //   以 rc_connect/ud_ready 完成（INIT→RTR→RTS）。
   class rdma_rxe_ctrl_driver extends rdma_ctrl_driver;
     `uvm_component_utils(rdma_rxe_ctrl_driver)
+
+    // 对端进程只有一个 PD/CQ/MR：首次建立后各次请求都返回同一对象（期望内存按同一 buffer 跟踪）。
+    protected rdma_res shared[rdma_ctrl_op_e];
 
     // 功能：构造。
     // 输入/输出及副作用：name/parent 为 UVM 层级。
@@ -237,6 +277,10 @@ package rdma_rxe_env_pkg;
       f = env.res.funcs[item.func];
       if (!f.remote || item.op inside {RDMA_CTRL_CONNECT, RDMA_CTRL_MODIFY_QP}) begin
         super.execute(item);
+        return;
+      end
+      if (shared.exists(item.op)) begin
+        item.res = shared[item.op];
         return;
       end
       case (item.op)
@@ -264,6 +308,9 @@ package rdma_rxe_env_pkg;
           item.status = rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                           {"rxe peer: ", item.op.name()});
       endcase
+      if (item.status.ok() && item.op inside {RDMA_CTRL_ALLOC_PD, RDMA_CTRL_CREATE_CQ,
+                                              RDMA_CTRL_ALLOC_BUF, RDMA_CTRL_REG_MR})
+        shared[item.op] = item.res;
     endtask
 
     // 功能：远端 MR：覆盖对端进程 MR 的 [offset, offset+len)，key 即其 rkey。
@@ -351,6 +398,7 @@ package rdma_rxe_env_pkg;
       end
       if (!single(item, status))
         return;
+      rdma_rxe_plugin::recv_ids[item.wr_id] = 1'b1;
       if (item.srq != null)
         issue($sformatf("srq_recv %0d %0d 0x%0h", buf_offset(item.lmr, item.local_offset),
                         item.length, item.wr_id), status);
@@ -380,7 +428,7 @@ package rdma_rxe_env_pkg;
           issue($sformatf("send_ud %0d %0d %0d 0x%0h %s %0d 0x%0h", item.qp.id,
                           buf_offset(item.lmr, item.local_offset), item.length, item.wr_id,
                           rdma_rxe_util::arg("RXE_SIM_IP", "10.79.0.1"), item.qp.peer.id,
-                          item.qp.peer.qkey), status);
+                          item.ud_qkey != 0 ? item.ud_qkey : item.qp.peer.qkey), status);
         return;
       end
       line = $sformatf("send %0d %s %0d %0d 0x%0h", item.qp.id, op_name(item.op),
@@ -459,7 +507,8 @@ package rdma_rxe_env_pkg;
     endtask
 
     // 功能：对端应答 → rdma_drv_wc（ibv_wc_status：0 成功、5 FLUSH、9 REM_INV_REQ、10 REM_ACCESS、
-    //   11 REM_OP，其余 GENERAL；opcode ≥ 128 为接收完成）。
+    //   11 REM_OP，其余 GENERAL；opcode ≥ 128 或 wr_id 属于已投递的 RECV 为接收完成——错误完成的
+    //   opcode 无定义）。
     // 输入/输出及副作用：纯函数。
     // 失败/边界：无。
     protected function rdma_drv_wc wc_of(string reply);
@@ -475,7 +524,8 @@ package rdma_rxe_env_pkg;
         11: wc.status = RDMA_DRV_WC_REM_OP_ERR;
         default: wc.status = RDMA_DRV_WC_GENERAL_ERR;
       endcase
-      wc.is_recv = rdma_rxe_peer::field(reply, "opcode") >= 128;
+      wc.is_recv = rdma_rxe_peer::field(reply, "opcode") >= 128 ||
+                   rdma_rxe_plugin::recv_ids.exists(wc.wr_id);
       wc.byte_len = rdma_rxe_peer::field(reply, "len");
       wc.imm = rdma_rxe_peer::field(reply, "imm");
       wc.src_qp = rdma_rxe_peer::field(reply, "src_qp");
@@ -491,6 +541,8 @@ package rdma_rxe_env_pkg;
     `uvm_object_utils(rdma_rxe_plugin)
 
     static rdma_rxe_peer peer;
+    // 投到对端进程的 RECV 的 wr_id（错误完成的 ibv_wc.opcode 无定义，靠它判断方向）。
+    static bit recv_ids[longint unsigned];
 
     // 功能：构造。
     // 输入/输出及副作用：name 为 UVM 名。

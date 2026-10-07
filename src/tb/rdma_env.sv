@@ -32,6 +32,8 @@ class rdma_env extends uvm_env;
   rdma_verb_agent verb[];
   rdma_link link;
   rdma_scoreboard sb;
+  rdma_proto_checker checker;
+  rdma_coverage cov;
   rdma_vsequencer vseqr;
   // 控制面命令进行中（驱动内部等待自己处理 AEQ，monitor 暂停取 AEQ）。
   bit ctrl_busy;
@@ -65,9 +67,15 @@ class rdma_env extends uvm_env;
     if (!$cast(link, c))
       `uvm_fatal("RDMA_ENV", {"link_type is not an rdma_link: ", cfg.link_type})
     sb = rdma_scoreboard::type_id::create("sb", this);
+    if (cfg.checker_enable)
+      checker = rdma_proto_checker::type_id::create("checker", this);
+    if (cfg.cov_enable)
+      cov = rdma_coverage::type_id::create("cov", this);
     vseqr = rdma_vsequencer::type_id::create("vseqr", this);
     foreach (cfg.plugins[i])
       cfg.plugins[i].build(this);
+    foreach (cfg.deviations[i])
+      `uvm_info("RDMA_ENV", {"declared deviation: ", cfg.deviations[i]}, UVM_LOW)
   endfunction
 
   // 功能：按配置声明 Host/Function 并建立 dpu 系统。
@@ -91,18 +99,35 @@ class rdma_env extends uvm_env;
       `uvm_fatal("RDMA_ENV", {"dpu system build failed: ", status.convert2string()})
   endfunction
 
-  // 功能：连接组件：agent 绑定 Function，数据面 → scoreboard。
+  // 功能：连接组件：agent 绑定 Function，数据面与资源事件 → scoreboard，链路 → 协议检查，各事件 →
+  //   覆盖率（verb 经 scoreboard 转发，已带预测状态）。
   // 输入/输出及副作用：建立 TLM 连接。
   // 失败/边界：无。
   function void connect_phase(uvm_phase phase);
     ctrl.driver.env = this;
     sb.res = res;
+    sb.exp.rc_error_no_flush = cfg.deviates("rc_error_no_flush");
+    res.ap.connect(sb.res_export);
     vseqr.env = this;
+    if (checker != null) begin
+      checker.env = this;
+      link.tx_ap.connect(checker.tx_export);
+      link.rx_ap.connect(checker.rx_export);
+    end
     foreach (verb[i]) begin
       verb[i].bind_func(this, i);
       verb[i].driver.posted_ap.connect(sb.posted_export);
       verb[i].monitor.cqe_ap.connect(sb.cqe_export);
       verb[i].monitor.aeq_ap.connect(sb.aeq_export);
+    end
+    if (cov != null) begin
+      cov.env = this;
+      res.ap.connect(cov.res_export);
+      ctrl.driver.ap.connect(cov.ctrl_export);
+      link.tx_ap.connect(cov.wire_export);
+      sb.predicted_ap.connect(cov.verb_export);
+      foreach (verb[i])
+        verb[i].monitor.cqe_ap.connect(cov.cqe_export);
     end
   endfunction
 

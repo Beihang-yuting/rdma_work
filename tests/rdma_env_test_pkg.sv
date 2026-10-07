@@ -54,6 +54,9 @@ package rdma_env_test_pkg;
       cfg = rdma_env_cfg::type_id::create("cfg");
       cfg.add_func(0);
       cfg.add_func(1);
+      // 设备模型偏差：RC 请求方收到致命 NAK 后写错误 CQE 但继续处理 SQ（IBTA 要求 QP 转 ERR、其余 WR
+      //   flush；URC 已按此实现）。
+      cfg.deviations.push_back("rc_error_no_flush");
       cfg.link_type = link_type;
 `ifdef RDMA_HOST_MEM_TEST
       if (mem_kind == "host_mem")
@@ -138,6 +141,105 @@ package rdma_env_test_pkg;
       vseq_type = "rdma_high_traffic_vseq";
     endfunction
   endclass
+  // 错误场景（loopback + mock）。
+  class rdma_env_errors_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_errors_test)
+
+    // 功能：构造。
+    // 输入/输出及副作用：name/parent 为 UVM 层级。
+    // 失败/边界：无。
+    function new(string name = "rdma_env_errors_test", uvm_component parent = null);
+      super.new(name, parent);
+      vseq_type = "rdma_errors_vseq";
+    endfunction
+  endclass
+
+  // 可靠传输（netpkt 链路以覆盖 ICRC 丢弃；响应超时编码 8 ≈ 1ms 使超时重传场景可运行）。
+  class rdma_env_reliability_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_reliability_test)
+
+    // 功能：构造。
+    // 输入/输出及副作用：name/parent 为 UVM 层级。
+    // 失败/边界：无。
+    function new(string name = "rdma_env_reliability_test", uvm_component parent = null);
+      super.new(name, parent);
+      link_type = "rdma_link_netpkt";
+      vseq_type = "rdma_reliability_vseq";
+    endfunction
+
+    // 功能：响应超时编码 8（约 1ms）；verb 同步等待随之放宽到 4 x 1ms。
+    // 输入/输出及副作用：修改 c。
+    // 失败/边界：无。
+    virtual function void configure(rdma_env_cfg c);
+      c.timeout = 8;
+      c.response_timeout = 1ms;
+    endfunction
+  endclass
+
+  // SRQ 共享（双向）。
+  class rdma_env_srq_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_srq_test)
+
+    // 功能：构造。
+    // 输入/输出及副作用：name/parent 为 UVM 层级。
+    // 失败/边界：无。
+    function new(string name = "rdma_env_srq_test", uvm_component parent = null);
+      super.new(name, parent);
+      vseq_type = "rdma_srq_vseq";
+    endfunction
+  endclass
+
+  // QP 生命周期（SQD、销毁重建）。
+  class rdma_env_lifecycle_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_lifecycle_test)
+
+    // 功能：构造。
+    // 输入/输出及副作用：name/parent 为 UVM 层级。
+    // 失败/边界：无。
+    function new(string name = "rdma_env_lifecycle_test", uvm_component parent = null);
+      super.new(name, parent);
+      vseq_type = "rdma_qp_lifecycle_vseq";
+    endfunction
+  endclass
+
+  // 多 Function 与复位范围：Host0 PF0、Host0 VF1、Host1 PF0、Host1 VF1。
+  class rdma_env_multifunc_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_multifunc_test)
+
+    // 功能：构造。
+    // 输入/输出及副作用：name/parent 为 UVM 层级。
+    // 失败/边界：无。
+    function new(string name = "rdma_env_multifunc_test", uvm_component parent = null);
+      super.new(name, parent);
+      vseq_type = "rdma_multifunc_vseq";
+    endfunction
+
+    // 功能：四个 Function。
+    // 输入/输出及副作用：修改 c。
+    // 失败/边界：无。
+    virtual function void configure(rdma_env_cfg c);
+      c.funcs.delete();
+      c.add_func(0);
+      c.add_func(0, 0, DPU_FUNCTION_VF, 1);
+      c.add_func(1);
+      c.add_func(1, 0, DPU_FUNCTION_VF, 1);
+    endfunction
+  endclass
+
+  // 随机流量（netpkt 链路）。
+  class rdma_env_random_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_random_test)
+
+    // 功能：构造。
+    // 输入/输出及副作用：name/parent 为 UVM 层级。
+    // 失败/边界：无。
+    function new(string name = "rdma_env_random_test", uvm_component parent = null);
+      super.new(name, parent);
+      link_type = "rdma_link_netpkt";
+      vseq_type = "rdma_random_vseq";
+    endfunction
+  endclass
+
 `ifdef RDMA_PCIE_WORK_TEST
   // PCIe 承载：install_overrides 让设备 DMA 走 EP MemRd/MemWr、BAR 写走 RC MemWr；每个 Host 一条
   //   RC↔EP 链（rdma_pcie_system），Host 内存为真实 host_mem。结束时检查 TLP 计数一致。
@@ -280,8 +382,8 @@ package rdma_env_test_pkg;
   endclass
 `endif
 `ifdef RDMA_RXE_TEST
-  // 与 Linux Soft-RoCE 互打的全功能流量：仿真 Function 0（Host0 PF0）↔ 远端 Function 1（rxe），
-  //   mock 内存；URC 与远端多 SGE 由序列跳过。
+  // 与 Linux Soft-RoCE 互打：仿真 Function 0（Host0 PF0）↔ 远端 Function 1（rxe），mock 内存；依次运行
+  //   basic_traffic、errors、srq、reliability（URC、远端多 SGE、远端受限 MR、超时类场景由序列跳过）。
   class rdma_env_rxe_test extends rdma_env_base_test;
     `uvm_component_utils(rdma_env_rxe_test)
 
@@ -300,6 +402,19 @@ package rdma_env_test_pkg;
       c.add_func(0);
       c.plugins.push_back(rdma_rxe_plugin::type_id::create("rxe_plugin"));
     endfunction
+
+    // 功能：依次运行各场景序列。
+    // 输入/输出及副作用：启动序列。
+    // 失败/边界：无。
+    virtual task run_traffic();
+      string names[] = '{"rdma_basic_traffic_vseq", "rdma_errors_vseq", "rdma_srq_vseq",
+                         "rdma_reliability_vseq"};
+
+      foreach (names[i]) begin
+        vseq_type = names[i];
+        super.run_traffic();
+      end
+    endtask
   endclass
 `endif
 endpackage

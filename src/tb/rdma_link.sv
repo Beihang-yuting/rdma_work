@@ -12,6 +12,23 @@
 
 typedef class rdma_link;
 
+// 链路上观测到的一个报文：源/目的 Function 下标；netpkt 链路另带编码后的帧。
+class rdma_link_obs extends uvm_object;
+  `uvm_object_utils(rdma_link_obs)
+
+  int unsigned src;
+  int unsigned dst;
+  rdma_packet pkt;
+  byte unsigned frame[$];
+
+  // 功能：构造。
+  // 输入/输出及副作用：name 为 UVM 名。
+  // 失败/边界：无。
+  function new(string name = "rdma_link_obs");
+    super.new(name);
+  endfunction
+endclass
+
 typedef enum {RDMA_FAULT_DROP, RDMA_FAULT_DUP, RDMA_FAULT_DELAY, RDMA_FAULT_CORRUPT} rdma_fault_e;
 
 // 一条故障规则：src/opcode 为 -1 时不过滤。
@@ -77,8 +94,9 @@ endclass
 class rdma_link extends uvm_component;
   `uvm_component_utils(rdma_link)
 
-  uvm_analysis_port #(rdma_packet) tx_ap;
-  uvm_analysis_port #(rdma_packet) rx_ap;
+  // 源 NIC 发出（故障注入前）与交付给目的 NIC 的报文。
+  uvm_analysis_port #(rdma_link_obs) tx_ap;
+  uvm_analysis_port #(rdma_link_obs) rx_ap;
   rdma_link_fault faults[$];
   protected rdma_res_func funcs[int unsigned];
   protected int unsigned func_of_mac[bit [47:0]];
@@ -115,6 +133,17 @@ class rdma_link extends uvm_component;
     status = rdma_status::success();
   endtask
 
+  // 功能：每条故障规则都应作用满 count 个报文（否则场景没有测到它）。
+  // 输入/输出及副作用：报告。
+  // 失败/边界：未作用满报 UVM_ERROR。
+  function void report_phase(uvm_phase phase);
+    foreach (faults[i])
+      if (faults[i].applied < faults[i].count)
+        `uvm_error("RDMA_LINK", $sformatf("%s fault (src %0d opcode %0d skip %0d) applied %0d/%0d",
+                   faults[i].kind.name(), faults[i].src, faults[i].opcode, faults[i].skip,
+                   faults[i].applied, faults[i].count))
+  endfunction
+
   // 功能：加入故障规则（按加入顺序匹配，每个报文至多命中一条）。
   // 输入/输出及副作用：追加 faults。
   // 失败/边界：无。
@@ -129,12 +158,12 @@ class rdma_link extends uvm_component;
     rdma_link_fault f;
     int unsigned dst;
 
-    tx_ap.write(pkt);
     if (!func_of_mac.exists(dmac)) begin
       `uvm_error("RDMA_LINK", $sformatf("destination MAC %012h is not attached", dmac))
       return;
     end
     dst = func_of_mac[dmac];
+    tx_ap.write(observe(src, dst, pkt));
     foreach (faults[i])
       if (f == null && faults[i].hit(src, pkt))
         f = faults[i];
@@ -173,9 +202,22 @@ class rdma_link extends uvm_component;
       `uvm_error("RDMA_LINK", {"carry failed: ", status.convert2string()})
       return;
     end
-    rx_ap.write(delivered);
+    rx_ap.write(observe(src, dst, delivered));
     funcs[dst].node.dev.nic.receive(delivered);
   endtask
+
+  // 功能：构造观测对象（子类可附带帧）。
+  // 输入/输出及副作用：返回新对象。
+  // 失败/边界：无。
+  virtual function rdma_link_obs observe(int unsigned src, int unsigned dst, rdma_packet pkt);
+    rdma_link_obs o;
+
+    o = rdma_link_obs::type_id::create("obs");
+    o.src = src;
+    o.dst = dst;
+    o.pkt = pkt;
+    return o;
+  endfunction
 
   // 功能：损坏报文的传输。loopback 没有帧校验，等同接收端丢弃校验失败的帧。
   // 输入/输出及副作用：无交付。
@@ -191,6 +233,7 @@ class rdma_link_netpkt extends rdma_link;
 
   protected rdma_net_packet_adapter nets[int unsigned];
   protected rdma_net_packet_queue_sink sinks[int unsigned];
+  protected byte unsigned carried[$];
 
   // 功能：构造。
   // 输入/输出及副作用：name/parent 为 UVM 层级。
@@ -227,9 +270,21 @@ class rdma_link_netpkt extends rdma_link;
     nets[src].send_packet(pkt, status);
     if (!status.ok())
       return;
+    carried = nets[src].last_sent_packet.raw_data;
     sinks[dst].enqueue(nets[src].last_sent_packet);
     nets[dst].receive_packet(delivered, status);
   endtask
+
+  // 功能：rx 观测附带刚传输的帧（供帧级协议检查）。
+  // 输入/输出及副作用：返回新对象。
+  // 失败/边界：无。
+  virtual function rdma_link_obs observe(int unsigned src, int unsigned dst, rdma_packet pkt);
+    rdma_link_obs o;
+
+    o = super.observe(src, dst, pkt);
+    o.frame = carried;
+    return o;
+  endfunction
 
   // 功能：编码后翻转帧中载荷/ICRC 区的一个字节，目的适配器解析须失败（ICRC 校验），报文丢弃。
   // 输入/输出及副作用：无交付。

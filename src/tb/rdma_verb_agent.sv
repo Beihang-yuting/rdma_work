@@ -127,7 +127,7 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
     wr.swap = item.swap_add_value;
     if (item.qp.ud()) begin
       wr.dest_qpn = item.qp.peer.id;
-      wr.qkey = item.qp.peer.qkey;
+      wr.qkey = item.ud_qkey != 0 ? item.ud_qkey : item.qp.peer.qkey;
       wr.dmac = item.qp.peer.owner.mac;
     end
     rdma_drv_wr::post_send(env.res.funcs[func].drv(), item.qp.qp, wr, status);
@@ -185,7 +185,8 @@ class rdma_verb_monitor extends uvm_monitor;
     aeq_ap = new("aeq_ap", this);
   endfunction
 
-  // 功能：中断处理循环：全部 CEQ → AEQ（控制面命令进行中时跳过，驱动内部等待自己取 AEQ）→
+  // 功能：中断处理循环：全部 CEQ → AEQ（控制面命令进行中或 FLR 后未恢复时跳过，驱动内部等待自己取
+  //   AEQ）→
   //   全部 CQ 各取至多 16 个 WC；无事可做时等待 poll_interval。
   // 输入/输出及副作用：推进驱动 EQ/CQ 软件状态；永久循环。
   // 失败/边界：处理失败报 UVM_ERROR。
@@ -209,7 +210,7 @@ class rdma_verb_monitor extends uvm_monitor;
         report_fail(status, "CEQ");
       end
       cqns.delete();
-      if (!env.ctrl_busy && f.aeq != null) begin
+      if (!env.ctrl_busy && f.aeq != null && f.aeq.state != RDMA_RES_DESTROYED) begin
         rdma_drv_wr::process_aeq(f.drv(), events, status);
         report_fail(status, "AEQ");
       end

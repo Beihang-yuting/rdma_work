@@ -13,12 +13,15 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   `uvm_component_utils(rdma_ctrl_driver)
 
   rdma_env env;
+  // 执行完成的请求（覆盖率用；资源变化另经资源库广播）。
+  uvm_analysis_port #(rdma_ctrl_item) ap;
 
   // 功能：构造。
   // 输入/输出及副作用：name/parent 为 UVM 层级。
   // 失败/边界：无。
   function new(string name = "rdma_ctrl_driver", uvm_component parent = null);
     super.new(name, parent);
+    ap = new("ap", this);
   endfunction
 
   // 功能：等待 env 就绪后逐个执行 item；结果与 expect_fail 不符时报 UVM_ERROR。
@@ -34,6 +37,7 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       env.ctrl_busy = 1'b1;
       execute(item);
       env.ctrl_busy = 1'b0;
+      ap.write(item);
       if (item.status.ok() == item.expect_fail)
         `uvm_error("RDMA_CTRL", $sformatf("%s: expect_fail=%0b got %s", item.convert2string(),
                    item.expect_fail, item.status.convert2string()))
@@ -214,8 +218,9 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
     end
   endtask
 
-  // 功能：把 qp 迁到 state，属性按目标状态取配置默认值：INIT（UD Q_Key / RC 远端权限）、RTR（RC：
-  //   对端 QPN、RQ PSN 0、MTU、目的 MAC、min_rnr）、RTS（SQ PSN 0、timeout、重试次数）；其它状态只给状态。
+  // 功能：把 qp 迁到 state，属性按迁移取配置默认值：→INIT（UD Q_Key / RC 远端权限）、INIT→RTR（RC：
+  //   对端 QPN、RQ PSN 0、MTU、目的 MAC、min_rnr）、RTR→RTS（SQ PSN 0、timeout、重试次数）；其它迁移
+  //   （SQD、ERR、RESET、SQD→RTS 等）只给状态。
   // 输入/输出及副作用：驱动 modify；广播 CHANGED（ERR 时资源状态置 ERROR）。
   // 失败/边界：驱动失败经 status 返回。
   protected virtual task modify(rdma_res_qp qp, rdma_drv_qp_state_e state, rdma_res_qp peer,
@@ -233,7 +238,7 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       attr.mask |= rdma_drv_qp_attr::M_ACCESS;
       attr.access = RDMA_RIGHT_REMOTE_READ | RDMA_RIGHT_REMOTE_WRITE | RDMA_RIGHT_REMOTE_ATOMIC;
     end
-    else if (state == RDMA_DRV_QPS_RTR && !qp.ud()) begin
+    else if (state == RDMA_DRV_QPS_RTR && !qp.ud() && qp.qp.cur_state == RDMA_DRV_QPS_INIT) begin
       attr.mask |= rdma_drv_qp_attr::M_DEST_QPN | rdma_drv_qp_attr::M_RQ_PSN |
                    rdma_drv_qp_attr::M_PATH_MTU | rdma_drv_qp_attr::M_AV |
                    rdma_drv_qp_attr::M_MIN_RNR;
@@ -243,7 +248,7 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       attr.dmac = peer.owner.mac;
       attr.min_rnr = env.cfg.min_rnr;
     end
-    else if (state == RDMA_DRV_QPS_RTS) begin
+    else if (state == RDMA_DRV_QPS_RTS && qp.qp.cur_state == RDMA_DRV_QPS_RTR) begin
       attr.mask |= rdma_drv_qp_attr::M_SQ_PSN | rdma_drv_qp_attr::M_TIMEOUT |
                    rdma_drv_qp_attr::M_RETRY_CNT | rdma_drv_qp_attr::M_RNR_RETRY;
       attr.sq_psn = 0;

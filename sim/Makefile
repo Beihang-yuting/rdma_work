@@ -193,7 +193,9 @@ net_packet_preflight:
 	@python3 ../tools/check_external_dependency_lock.py verify --lock ../hw/rdma/external_dependencies.tsv --dependency net_packet --root "$(NET_PACKET_ROOT)"
 
 # env suite：UVM env（真实 host_mem + net_packet + dpu_common）的全部场景与 net_packet 适配器测试。
-ENV_TESTS := rdma_env_basic_test rdma_env_netpkt_test rdma_env_high_traffic_test rdma_net_packet_adapter_test
+ENV_TESTS := rdma_env_basic_test rdma_env_netpkt_test rdma_env_high_traffic_test \
+	rdma_env_errors_test rdma_env_reliability_test rdma_env_srq_test rdma_env_lifecycle_test \
+	rdma_env_multifunc_test rdma_env_random_test rdma_net_packet_adapter_test
 
 env: dpu_common_preflight host_mem_preflight net_packet_preflight
 	set -euo pipefail; \

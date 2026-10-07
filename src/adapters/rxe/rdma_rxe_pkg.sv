@@ -107,8 +107,6 @@ package rdma_rxe_pkg;
 
     rdma_net_packet_adapter adapter;
     rdma_dev_nic nic;
-    // 可选：交付给 NIC 前广播接收到的报文（env 链路的 rx_ap）。
-    uvm_analysis_port #(rdma_packet) rx_ap;
     // 链路空闲时每次推进的仿真时间与等待的真实时间（微秒）。
     time poll_step;
     int unsigned wait_us;
@@ -197,6 +195,13 @@ package rdma_rxe_pkg;
                 UVM_HIGH)
     endtask
 
+    // 功能：钩子：解码成功、交给 NIC 之前的报文（子类可观测或丢弃）。
+    // 输入/输出及副作用：缺省无动作。
+    // 失败/边界：返回 1 时丢弃该报文。
+    virtual function bit received(rdma_packet pkt);
+      return 1'b0;
+    endfunction
+
     // 功能：接收进程：TAP 有帧则解码交给 NIC，否则推进 poll_step 并等待至多 wait_us 真实时间。
     // 输入/输出及副作用：永久循环；记入 rx_log。
     // 失败/边界：解码失败（非 RoCEv2、ICRC 错）计入 rx_dropped。
@@ -235,8 +240,8 @@ package rdma_rxe_pkg;
         `uvm_info("RXE_LINK", $sformatf("rx %s %s dqpn %0d psn %06h len %0d", pkt.opcode.name(),
                                         pkt.segment.name(), pkt.destination_qpn, pkt.psn,
                                         pkt.payload.size()), UVM_HIGH)
-        if (rx_ap != null)
-          rx_ap.write(pkt);
+        if (received(pkt))
+          continue;
         nic.receive(pkt);
         #1ns;
       end

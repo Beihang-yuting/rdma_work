@@ -11,6 +11,8 @@ class rdma_pair extends uvm_object;
   `uvm_object_utils(rdma_pair)
 
   rdma_res_pd pd[2];
+  rdma_res_cq cq[2];
+  rdma_res_cq urc_cq[2];
   rdma_res_buf mem[2];
   rdma_res_mr mr[2];
   // qp[n][0/1/2] = Function n 的 RC/UD/URC QP；URC 为私有扩展，有远端 Function 时不建（urc=0）。
@@ -91,17 +93,71 @@ class rdma_base_vseq extends uvm_sequence;
     void'($cast(b, it.res));
   endtask
 
-  // 功能：在整个 b 上注册全权限 MR。
+  // 功能：在 b 的 [offset, offset+len)（len 0 为到末尾）上注册 MR，权限缺省全部。
   // 输入/输出及副作用：mr 输出。
   // 失败/边界：见 ctrl。
-  task reg_mr(rdma_res_pd pd, rdma_res_buf b, output rdma_res_mr mr);
+  task reg_mr(rdma_res_pd pd, rdma_res_buf b, output rdma_res_mr mr,
+              input bit [4:0] rights = 5'h1f, input int unsigned offset = 0,
+              input int unsigned len = 0);
     rdma_ctrl_item it;
 
     it = new_ctrl(RDMA_CTRL_REG_MR, pd.owner.index);
     it.pd = pd;
     it.mem = b;
+    it.rights = rights & rdma_drv_mr::rights_of(1, 1, 1, 1);
+    it.offset = offset;
+    it.len = len;
     ctrl(it);
     void'($cast(mr, it.res));
+  endtask
+
+  // 功能：创建 depth 深度的 SRQ。
+  // 输入/输出及副作用：srq 输出。
+  // 失败/边界：见 ctrl。
+  task create_srq(rdma_res_pd pd, int unsigned depth, output rdma_res_srq srq);
+    rdma_ctrl_item it;
+
+    it = new_ctrl(RDMA_CTRL_CREATE_SRQ, pd.owner.index);
+    it.pd = pd;
+    it.size = depth;
+    ctrl(it);
+    void'($cast(srq, it.res));
+  endtask
+
+  // 功能：把 qp 迁到 state（属性取配置默认值，见控制面 driver）。
+  // 输入/输出及副作用：修改 QP。
+  // 失败/边界：expect_fail 时期望驱动拒绝。
+  task modify_qp(rdma_res_qp qp, rdma_drv_qp_state_e state, bit expect_fail = 1'b0);
+    rdma_ctrl_item it;
+
+    it = new_ctrl(RDMA_CTRL_MODIFY_QP, qp.owner.index);
+    it.qp = qp;
+    it.peer = qp.peer;
+    it.state = state;
+    it.expect_fail = expect_fail;
+    ctrl(it);
+  endtask
+
+  // 功能：销毁资源。
+  // 输入/输出及副作用：释放驱动资源。
+  // 失败/边界：见 ctrl。
+  task destroy(rdma_res r);
+    rdma_ctrl_item it;
+
+    it = new_ctrl(RDMA_CTRL_DESTROY, r.owner.index);
+    it.target = r;
+    ctrl(it);
+  endtask
+
+  // 功能：对 scope 内 Function 复位（op 为 FLR）或复位后恢复（RECOVER：驱动 remove/probe）。
+  // 输入/输出及副作用：清空范围内设备与资源。
+  // 失败/边界：见 ctrl。
+  task reset(rdma_ctrl_op_e op, int unsigned scope[$]);
+    rdma_ctrl_item it;
+
+    it = new_ctrl(op, scope[0]);
+    it.scope = scope;
+    ctrl(it);
   endtask
 
   // 功能：创建 depth 深度的 CQ。
@@ -152,20 +208,18 @@ class rdma_base_vseq extends uvm_sequence;
   // 失败/边界：见 ctrl。
   task setup_pair(int unsigned f0, int unsigned f1, int unsigned buf_bytes, output rdma_pair p);
     int unsigned f[2];
-    rdma_res_cq cq;
-    rdma_res_cq urc_cq;
 
     f = '{f0, f1};
     p = rdma_pair::type_id::create("pair");
     p.urc = !env.res.funcs[f0].remote && !env.res.funcs[f1].remote;
     foreach (f[n]) begin
       alloc_pd(f[n], p.pd[n]);
-      create_cq(f[n], env.cfg.qp_depth, cq);
-      create_qp(p.pd[n], RDMA_DRV_QPT_RC, cq, 1'b0, p.qp[n][0]);
-      create_qp(p.pd[n], RDMA_DRV_QPT_UD, cq, 1'b0, p.qp[n][1]);
+      create_cq(f[n], env.cfg.qp_depth, p.cq[n]);
+      create_qp(p.pd[n], RDMA_DRV_QPT_RC, p.cq[n], 1'b0, p.qp[n][0]);
+      create_qp(p.pd[n], RDMA_DRV_QPT_UD, p.cq[n], 1'b0, p.qp[n][1]);
       if (p.urc) begin
-        create_cq(f[n], env.cfg.qp_depth, urc_cq);
-        create_qp(p.pd[n], RDMA_DRV_QPT_RC, urc_cq, 1'b1, p.qp[n][2]);
+        create_cq(f[n], env.cfg.qp_depth, p.urc_cq[n]);
+        create_qp(p.pd[n], RDMA_DRV_QPT_RC, p.urc_cq[n], 1'b1, p.qp[n][2]);
       end
       alloc_buf(f[n], buf_bytes, p.mem[n]);
       reg_mr(p.pd[n], p.mem[n], p.mr[n]);
@@ -369,15 +423,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     post(it);
   endtask
 
-  // 功能：WRITE 越过对端 MR 末尾，期望 REM_ACCESS_ERR 完成且对端内存不变。
+  // 功能：WRITE 越过对端 MR 末尾（scoreboard 预测 REM_ACCESS_ERR、对端内存不变）。
   // 输入/输出及副作用：RC QP 随后进入错误态，故放在最后。
   // 失败/边界：无。
   task access_error();
-    rdma_verb_item it;
-
-    it = v(0, RDMA_VERB_WRITE, 'h0000, 64, p.mr[1].len - 32);
-    it.expect_status = RDMA_DRV_WC_REM_ACCESS_ERR;
-    post(it);
+    post(v(0, RDMA_VERB_WRITE, 'h0000, 64, p.mr[1].len - 32));
   endtask
 endclass
 

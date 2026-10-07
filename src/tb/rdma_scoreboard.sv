@@ -1,16 +1,18 @@
 // 目录：验证组件层 tb/rdma_scoreboard.sv。
 // 层：验证组件。
-// 职责：端到端判定：投递事件把原始数据写入期望内存并建立期望完成；完成事件按 QP 结算，比对状态/长度/
-//   立即数/源 QP，按操作语义（WRITE、READ、ATOMIC、SEND→RECV、UD GRH；远端 Function 写入的 GRH 取实际值）
-//   更新期望内存，并立即比对该 WR
-//   的目的区域（无其它在途 WR 重叠时；URC WRITE 不等 ACK，留给结束比对）；结束时整块比对全部 buffer。
-// 依赖：rdma_mem_model、rdma_expect、rdma_res_db（按 QPN 找 QP）。
+// 职责：端到端判定：投递事件把原始数据写入期望内存并建立期望完成（rdma_expect 预测状态）；完成事件按
+//   QP 结算，比对状态/长度/立即数/源 QP，按操作语义（WRITE、READ、ATOMIC、SEND→RECV、UD GRH；远端
+//   Function 写入的 GRH 取实际值）更新期望内存，并立即比对该 WR 的目的区域（无其它在途 WR 重叠时；
+//   URC WRITE 不等 ACK，留给结束比对）；结束时整块比对全部 buffer。资源事件：QP 进入 ERR 时在途项可
+//   FLUSH；QP 销毁/FLR 撤销期望，其目的区域以实际内容为准。
+// 依赖：rdma_mem_model、rdma_expect、rdma_res_db（按 QPN 找 QP、资源事件）。
 // 所有权：只读资源；期望归子对象。
 // 生命周期：env 创建，仿真期间常驻。
 
 `uvm_analysis_imp_decl(_posted)
 `uvm_analysis_imp_decl(_cqe)
 `uvm_analysis_imp_decl(_aeq)
+`uvm_analysis_imp_decl(_res)
 
 class rdma_scoreboard extends uvm_scoreboard;
   `uvm_component_utils(rdma_scoreboard)
@@ -23,6 +25,9 @@ class rdma_scoreboard extends uvm_scoreboard;
   uvm_analysis_imp_posted #(rdma_verb_item, rdma_scoreboard) posted_export;
   uvm_analysis_imp_cqe #(rdma_verb_completion, rdma_scoreboard) cqe_export;
   uvm_analysis_imp_aeq #(rdma_aeq_event, rdma_scoreboard) aeq_export;
+  uvm_analysis_imp_res #(rdma_res_event, rdma_scoreboard) res_export;
+  // 投递的 verb 填好预测状态后转发（覆盖率订阅）。
+  uvm_analysis_port #(rdma_verb_item) predicted_ap;
   int unsigned checked;
   int unsigned errors;
   int unsigned aeq_events;
@@ -35,11 +40,13 @@ class rdma_scoreboard extends uvm_scoreboard;
     posted_export = new("posted_export", this);
     cqe_export = new("cqe_export", this);
     aeq_export = new("aeq_export", this);
+    res_export = new("res_export", this);
+    predicted_ap = new("predicted_ap", this);
     mem = rdma_mem_model::type_id::create("mem");
     exp = rdma_expect::type_id::create("exp");
   endfunction
 
-  // 功能：投递：跟踪涉及的 buffer，原始数据写入源区域镜像，登记期望。
+  // 功能：投递：跟踪涉及的 buffer，原始数据写入源区域镜像，登记期望（预测状态）并转发。
   // 输入/输出及副作用：修改期望内存与队列。
   // 失败/边界：无。
   function void write_posted(rdma_verb_item item);
@@ -49,6 +56,7 @@ class rdma_scoreboard extends uvm_scoreboard;
     if (item.data.size() != 0)
       mem.write(item.lmr.mem, loff(item), item.data);
     exp.post(item);
+    predicted_ap.write(item);
   endfunction
 
   // 功能：完成：按 QPN 找 QP 后分 SQ/RQ 结算。
@@ -66,7 +74,29 @@ class rdma_scoreboard extends uvm_scoreboard;
       settle_send(qp, c);
   endfunction
 
-  // 功能：AEQ 事件计数（错误预测在 S3 接入）。
+  // 功能：资源事件：QP 进入 ERR → 在途项可 FLUSH；QP 撤销（销毁/FLR）→ 撤销期望，接受其目的区域。
+  // 输入/输出及副作用：修改期望与期望内存。
+  // 失败/边界：无。
+  function void write_res(rdma_res_event e);
+    rdma_res_qp qp;
+    rdma_verb_item dropped[$];
+    rdma_res_buf b;
+    int unsigned off;
+    int unsigned len;
+
+    if (!$cast(qp, e.res))
+      return;
+    if (e.what == RDMA_RES_CHANGED && qp.state == RDMA_RES_ERROR)
+      exp.qp_error(qp);
+    if (e.what != RDMA_RES_REMOVED)
+      return;
+    exp.forget(qp, dropped);
+    foreach (dropped[i])
+      if (dest(dropped[i], b, off, len))
+        mem.accept(b, off, len);
+  endfunction
+
+  // 功能：AEQ 事件计数。
   // 输入/输出及副作用：aeq_events 加一。
   // 失败/边界：无。
   function void write_aeq(rdma_aeq_event e);
@@ -155,32 +185,38 @@ class rdma_scoreboard extends uvm_scoreboard;
     errors += mem.compare(b, off, len, it.convert2string());
   endfunction
 
-  // 功能：SQ 完成：按序结算到该 wr_id；最后一个比对状态，期望成功的应用效果并立即比对。
-  // 输入/输出及副作用：修改期望内存。
+  // 功能：SQ 完成：按序结算到该 wr_id。最后一个比对状态（预测值，或 QP 转 ERR 时在途的 FLUSH）；
+  //   成功的应用内存效果并立即比对；被 flush 的不再到达对端；致命错误使 QP 进入错误态（预测）。
+  // 输入/输出及副作用：修改期望内存与期望。
   // 失败/边界：找不到请求或状态不符时报错。
   protected function void settle_send(rdma_res_qp qp, rdma_verb_completion c);
     rdma_verb_item done[$];
-    bit last;
+    rdma_verb_item it;
+    bit ok;
 
     if (!exp.settle_send(qp, c.wr_id, done)) begin
       fail({"SQ completion matches no request: ", c.convert2string()});
       return;
     end
+    it = done[done.size() - 1];
+    checked++;
+    if (c.status != it.expect_status && !(it.may_flush && c.status == RDMA_DRV_WC_FLUSH_ERR))
+      fail($sformatf("status %s != expected %s for %s", c.status.name(), it.expect_status.name(),
+                     it.convert2string()));
     foreach (done[i]) begin
-      last = i == done.size() - 1;
-      if (last) begin
-        checked++;
-        if (c.status != done[i].expect_status)
-          fail($sformatf("status %s != expected %s for %s", c.status.name(),
-                         done[i].expect_status.name(), done[i].convert2string()));
-      end
-      if (done[i].expect_status != RDMA_DRV_WC_SUCCESS ||
-          (last && c.status != RDMA_DRV_WC_SUCCESS))
+      ok = i < done.size() - 1 ? done[i].expect_status == RDMA_DRV_WC_SUCCESS || done[i].may_flush :
+           c.status == RDMA_DRV_WC_SUCCESS;
+      if (!ok) begin
+        if (!done[i].overflow)
+          exp.drop_inbound(done[i]);
         continue;
+      end
       apply_send(done[i]);
       if (!(qp.urc && done[i].op inside {RDMA_VERB_WRITE, RDMA_VERB_WRITE_IMM}))
         check_region(done[i]);
     end
+    if (!(c.status inside {RDMA_DRV_WC_SUCCESS, RDMA_DRV_WC_FLUSH_ERR}))
+      exp.requester_error(qp);
   endfunction
 
   // 功能：SQ 请求的内存效果：WRITE 写远端；READ 远端 → 本地；ATOMIC 读改写远端（小端 8B）、原值写回本地。
@@ -220,21 +256,35 @@ class rdma_scoreboard extends uvm_scoreboard;
     return q;
   endfunction
 
-  // 功能：RQ 完成：与入站请求配对，比对状态、长度（UD 含 40B GRH）、立即数、UD 源 QP；SEND 数据写入
-  //   RECV buffer（UD 先预测 GRH），WRITE_IMM 的数据写入其远端区域；随后立即比对。
+  // 功能：RQ 完成：FLUSH 完成须是期望 flush 的 RECV；其余与入站请求配对，比对状态（容量不足为错误）、
+  //   长度（UD 含 40B GRH）、立即数、UD 源 QP；SEND 数据写入 RECV buffer（UD 先放 GRH），WRITE_IMM 的
+  //   数据写入其远端区域；随后立即比对。
   // 输入/输出及副作用：修改期望内存。
   // 失败/边界：不匹配报错。
   protected function void settle_recv(rdma_res_qp qp, rdma_verb_completion c);
     rdma_verb_item recv;
     rdma_verb_item src;
     int unsigned grh;
+    bit flushed;
 
-    if (!exp.settle_recv(qp, c.wr_id, recv, src)) begin
+    flushed = c.status == RDMA_DRV_WC_FLUSH_ERR;
+    if (!exp.settle_recv(qp, c.wr_id, flushed, recv, src)) begin
       fail({"RQ completion matches no RECV/inbound request: ", c.convert2string()});
       return;
     end
     checked++;
+    if (flushed) begin
+      if (recv.expect_status != RDMA_DRV_WC_FLUSH_ERR && !recv.may_flush)
+        fail({"unexpected RQ flush: ", recv.convert2string()});
+      return;
+    end
     grh = qp.ud() ? GRH_BYTES : 0;
+    if (src.overflow) begin
+      if (c.status == RDMA_DRV_WC_SUCCESS)
+        fail({"RQ completion succeeded although the RECV is too small: ", src.convert2string()});
+      mem.accept(recv.lmr.mem, loff(recv), recv.length);
+      return;
+    end
     if (c.status != RDMA_DRV_WC_SUCCESS)
       fail({"RQ completion failed: ", c.convert2string()});
     if (c.byte_len != src.length + grh)

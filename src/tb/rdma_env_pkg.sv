@@ -32,6 +32,9 @@ package rdma_env_pkg;
   `include "rdma_ctrl_agent.sv"
   `include "rdma_verb_agent.sv"
   `include "rdma_scoreboard.sv"
+  `include "rdma_proto_checker.sv"
+  `include "rdma_coverage.sv"
   `include "rdma_env.sv"
   `include "rdma_vseqs.sv"
+  `include "rdma_scenario_vseqs.sv"
 endpackage

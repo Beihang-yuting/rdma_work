@@ -1,7 +1,7 @@
 // 目录：验证组件层 tb/rdma_env_items.sv。
 // 层：验证组件。
 // 职责：env 事务：控制面 rdma_ctrl_item（资源生命周期、QP 连接/迁移、FLR/恢复）、数据面 rdma_verb_item
-//   （资源句柄、数据规格与原始数据、期望完成状态）、monitor 观测的 rdma_verb_completion 与 rdma_aeq_event。
+//   （资源句柄、数据规格与原始数据、scoreboard 预测的完成状态）、monitor 观测的 rdma_verb_completion 与 rdma_aeq_event。
 // 依赖：rdma_res（资源句柄）、rdma_drv_*（类型与状态枚举）、net_packet payload_mode_e。
 // 所有权：item 由序列创建；driver 回填输出字段（资源、wr_id、原始数据）。
 // 生命周期：随序列与 analysis 广播流转。
@@ -104,7 +104,8 @@ class rdma_verb_item extends uvm_sequence_item;
   bit [63:0] compare_value;
   bit [63:0] swap_add_value;
   bit signaled;
-  rdma_drv_wc_status_e expect_status;
+  // UD 目的 Q_Key（0 取对端 QP 的 Q_Key；故意不符时接收端应丢弃）。
+  bit [31:0] ud_qkey;
   payload_mode_e data_mode;
   byte unsigned data_fixed;
   byte unsigned data_pattern[$];
@@ -112,8 +113,13 @@ class rdma_verb_item extends uvm_sequence_item;
   byte unsigned data[$];
   // driver 回填。
   longint unsigned wr_id;
+  // scoreboard 预测：期望完成状态；may_flush 为 QP 转 ERR 时在途（成功或 FLUSH 均可）；overflow 为
+  //   消耗的 RECV 容量不足（接收端以错误完成）。
+  rdma_drv_wc_status_e expect_status;
+  bit may_flush;
+  bit overflow;
 
-  // 功能：构造默认 SEND（signaled、1 个 SGE、RANDOM 数据、期望成功）。
+  // 功能：构造默认 SEND（signaled、1 个 SGE、RANDOM 数据）。
   // 输入/输出及副作用：name 为 UVM 名。
   // 失败/边界：无。
   function new(string name = "rdma_verb_item");
@@ -121,7 +127,6 @@ class rdma_verb_item extends uvm_sequence_item;
     op = RDMA_VERB_SEND;
     sge_count = 1;
     signaled = 1'b1;
-    expect_status = RDMA_DRV_WC_SUCCESS;
     data_mode = PAYLOAD_RANDOM;
   endfunction
 

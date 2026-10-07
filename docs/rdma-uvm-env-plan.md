@@ -127,12 +127,15 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 | --- | --- |
 | drv_cmq_golden、dev_cmq、drv_cmq、drv_dev、drv_verbs、defs、types | 保留（模型单元测试） |
 | tb_flow、tb_host_mem、tb_e2e、e2e_high_traffic | basic_traffic / high_traffic vseq |
-| drv_data、drv_reliability、drv_qp_lifecycle | basic_traffic、ud、srq、reliability、qp_lifecycle vseq |
-| multifunc | multifunc vseq |
-| pcie_rdma | basic_traffic + PCIe 插件 |
-| rxe_test、rxe_fault_test | basic_traffic、ud、srq、reliability、errors + rxe 链路 |
+| drv_data、drv_reliability、drv_qp_lifecycle | 场景级检查点由 basic/errors/reliability/srq/qp_lifecycle vseq 覆盖；
+  保留（其余检查点是驱动/设备内部行为：inline、CQ arm/resize/cq_clean、CEQ cleanup、SRFQ、SRQ limit AEQE、URC frag、
+  SQD doorbell AE、RNR/重试耗尽、QP 编号复用策略，env 层不可表达） |
+| multifunc | 复位范围与隔离由 multifunc vseq 覆盖；保留（BAR 解码拒绝、CMQ 卡死超时、外部 IOVA 访问错为驱动/平台内部） |
+| pcie_rdma | 已删除：rdma_env_pcie_test + PCIe 插件覆盖其全部检查 |
+| rxe_test、rxe_fault_test | env rxe 测试覆盖 basic/errors/srq/reliability；保留（rxe 作请求方的 READ/ATOMIC、rxe 侧 RNR、
+  rxe 请求方丢包等以对端视角断言的检查点未全部迁移；suite 手动运行、代价低） |
 
-旧测试在新测试覆盖其全部检查点后删除。
+原则：旧测试只在其全部检查点都有对应时删除；驱动/设备内部行为的单元测试作为模型单元测试保留。
 
 ## 8. 阶段
 
@@ -140,6 +143,33 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 | --- | --- | --- |
 | S1 ✅ | 配置、资源层、数据生成、ctrl/verb agent、loopback/netpkt 链路、scoreboard 拆分、env、base vseq、basic_traffic/high_traffic；env suite | 替代 tb_flow/host_mem/e2e/high_traffic，全量通过 |
 | S2 ✅ | 链路故障注入；pcie 插件；rxe 链路 + 远端 Function 插件 | basic_traffic 在 4 种传输下通过 |
-| S3 | 协议检查规则类；scoreboard 错误/flush/SRQ/UD/FLR 预测 | 每条规则有变异检查 |
-| S4 | ud/srq/qp_lifecycle/reliability/errors/multifunc vseq；删旧测试 | 旧检查点全部有对应；全量通过 |
-| S5 | 覆盖率、random vseq、覆盖率报告进入回归汇总 | 覆盖率基线 |
+| S3 ✅ | 协议检查规则类；scoreboard 错误/flush/SRQ/UD/FLR 预测 | 每条规则有变异检查（见第 9 节） |
+| S4 ✅ | errors/reliability/srq/qp_lifecycle/multifunc vseq（UD 场景并入 basic/errors）；删已完全覆盖的旧测试 | 全量通过 |
+| S5 ✅ | 覆盖率、random vseq、覆盖率报告进入回归汇总 | 覆盖率基线（回归汇总的 RDMA_COV 行） |
+
+## 9. S3 验收：变异检查
+
+每条规则对设备/适配器做一次临时变异，目标测试须报出对应违例（11/11 检出）：
+
+| 变异 | 目标测试 | 检出规则 |
+| --- | --- | --- |
+| SEND/WRITE 末包不置 AckReq | basic | rdma_rule_ack |
+| 3 包消息中间包 PSN +1 | basic | rdma_rule_psn |
+| RNR NAK 定时器编码 +1 | reliability | rdma_rule_rnr |
+| RNR 重试只等 1/4 定时器 | reliability | rdma_rule_rnr |
+| ACK 源 QPN 错 | basic | rdma_rule_state |
+| ACK MSN 回退 | basic | rdma_rule_ack |
+| UD 报文段类型 LAST | basic | rdma_rule_ud |
+| BTH P_Key 0xFFFE | netpkt | rdma_rule_frame |
+| READ 响应 PSN +1 | basic | rdma_rule_psn |
+| 响应方不查 MR 权限 | errors | scoreboard 状态预测 |
+| 响应方不查 MR 的 PD | errors | scoreboard 状态预测 |
+
+## 10. 发现与偏差
+
+- 设备模型 RC 请求方收到致命 NAK（如 REM_ACCESS）后写错误 CQE 但继续处理后续 SQE；IBTA 要求 QP 转 Error、
+  其余 WR flush（URC 已按此实现，rxe 也是如此）。测试配置以偏差 `rc_error_no_flush` 声明，scoreboard 据此
+  不预测 RC 的 flush；修正设备后去掉该偏差即恢复严格检查。
+- rxe 响应方出错后 QP 转 ERR、不再应答（IBTA 行为）；errors 场景在远端对每个错误使用新 QP 对。
+- AckReq 规则只约束 SEND/WRITE 末包（READ/ATOMIC 必有响应）；UD Q_Key 取自 WR，不符时由接收端丢弃，
+  不作为发送方违例（scoreboard 验证丢弃）。

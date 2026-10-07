@@ -71,8 +71,7 @@ class rdma_env_cfg extends uvm_object;
   // 时间：monitor 轮询间隔、等待一个完成的上限。
   time poll_interval;
   time response_timeout;
-  // 检查开关与协议偏差（按规则名降级为 info）。
-  bit sb_enable;
+  // 检查开关与协议偏差（按规则名降级为 info；"rc_error_no_flush"：RC 致命错误后不预测 flush）。
   bit checker_enable;
   bit cov_enable;
   string deviations[$];
@@ -93,7 +92,6 @@ class rdma_env_cfg extends uvm_object;
     ud_qkey = 32'h8001_0000;
     poll_interval = 10ns;
     response_timeout = 100us;
-    sb_enable = 1'b1;
     checker_enable = 1'b1;
     cov_enable = 1'b1;
   endfunction
