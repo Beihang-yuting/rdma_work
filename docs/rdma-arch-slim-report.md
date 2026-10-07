@@ -257,7 +257,7 @@ Function 可有相同 BDF（各自 PCIe 域）。
 | 步骤 | 内容 |
 | --- | --- |
 | P0 线上格式 | `tools/rxe/roce_frame.py`（RoCEv2 帧与 ICRC 参考实现，同 rxe 算法）、`rxe_icrc_check.py`（Python 经 TAP 扮演对端，13/13：我方帧被 rxe 执行、错误 ICRC 被丢弃、rxe 帧 ICRC 校验通过） |
-| net_packet 修正 | ICRC 原放在扩展头之后且为异或占位 → 负载与 pad 之后的 4B 尾部，按 IBTA A17 计算；负载补 4B pad；BTH 第 4–11 字节与 DETH 第二字字段位置错（QPN 20 在线上为 0x1480）→ 按规范；新测试用 5 个 rxe 实际帧逐字段与逐字节比对（fork 分支 `fix/rocev2-icrc-trailer`，4dc2e08、fe37a59） |
+| net_packet 修正 | ICRC 原放在扩展头之后且为异或占位 → 负载与 pad 之后的 4B 尾部，按 IBTA A17 计算；负载补 4B pad；BTH 第 4–11 字节与 DETH 第二字字段位置错（QPN 20 在线上为 0x1480）→ 按规范；新测试用 5 个 rxe 实际帧逐字段与逐字节比对（4dc2e08、fe37a59，已合入 GitHub net_packet 的 main：b8a4c14，远端只保留 main） |
 | 设备修正 | 请求方 RC/URC SEND/WRITE 末包置 AckReq（rxe 只对 AckReq 包回 ACK）；QPC 写入后加载起始 PSN（RTR：EPSN_REQ，RTR→RTS：RC_TPE_CUR_SQ_PSN，原先两端都从 0 开始）；ACK 按 AETH 类型位 [7:5]=000 判定，回 ACK 信用填 0x1F |
 | P1 互打 | `src/adapters/rxe`（DPI-C：TAP 收发、rxe_peer 子进程）、`tests/integration/rdma_rxe_test.sv`：仿真→rxe SEND（1/3 包）、SEND_IMM、WRITE、WRITE_IMM、READ、FETCH_ADD、CMP_SWAP，rxe→仿真 SEND、SEND_IMM、WRITE、READ、FETCH_ADD，两端完成、立即数与内存一致，双向各 17 帧无丢弃；去掉 AckReq 的变异使测试失败 |
 | P2 故障场景 | `tests/integration/rdma_rxe_fault_test.sv`（链路可注入丢帧，每组新建 QP 对）：UD 双向（GRH、src_qp）、UD 多 SGE（发送 3 SGE 收集、接收 3 SGE 散写，GRH 在首 SGE）与 Q_Key 不符静默丢弃；SRQ 两侧（仿真 SRQ 消费 rxe SEND；rxe SRQ 消费仿真 SEND，含多包）；RNR 两方向（设备 NAK 0x21、rxe NAK 后设备按定时器重试）与重试耗尽 0xB7；丢中间包两方向（PSN 序列 NAK 后续传/重传）、丢 ACK（设备超时重发，rxe 重复请求再 ACK）、丢 READ 中间响应（只重新请求缺失部分）；错误 rkey 的 WRITE/READ 两方向（NAK 0x62）、超长 SEND 两方向。双向 26/29 帧、0 错误；去掉 RNR 定时器编码与 PSN 序列 NAK 的变异各被对应检查抓到 |
@@ -282,7 +282,6 @@ Function 可有相同 BDF（各自 PCIe 域）。
 - 尚无 RTL DUT：`src/dev` 设备模型充当设备，接入 DUT 后应退为预测器。
 - 只有 pcie_work suite 的 DMA 走 PCIe；core/host_mem/e2e 仍用后门 DMA 端口（零仿真时间）。
 - 响应方对中间包 AckReq 不单独回 ACK（末包 ACK 已覆盖，长消息下 rxe 的中间 AckReq 只是延后确认）。URC/SQD 等 xtrdma 私有行为 rxe 不支持，无法互打。
-- net_packet 修正尚未推送到 GitHub（本机与 53 均无推送凭据），53 上用本地 clone。
 - PCIe 路径未开 FC/记分板/覆盖率；Completion 超时、UR/CA 只报为 DMA 失败，未建模设备侧错误上报。
 - core 内的 data/reliability/multifunc 用直连链路，只有 e2e 经 net_packet 帧编解码；设备报文不带 IP
   地址，GRH 与 IP 头地址为 0。
