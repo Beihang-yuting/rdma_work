@@ -19,6 +19,7 @@ readonly CORE_TESTS=(
   rdma_drv_reliability_test
   rdma_drv_qp_lifecycle_test
   rdma_multifunc_test
+  rdma_dpu_interrupt_test
   rdma_defs_test
   rdma_netpkt_codec_test
 )

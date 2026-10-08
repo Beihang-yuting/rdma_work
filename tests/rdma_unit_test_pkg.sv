@@ -38,6 +38,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_drv_reliability_test.sv"
   `include "unit/rdma_drv_qp_lifecycle_test.sv"
   `include "unit/rdma_multifunc_test.sv"
+  `include "unit/rdma_dpu_interrupt_test.sv"
   `include "unit/rdma_defs_test.sv"
   `include "unit/rdma_aeqe_route_test.sv"
   `include "unit/rdma_harness_expected_failure_probe.sv"
