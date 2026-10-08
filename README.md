@@ -79,6 +79,6 @@ scripts/run_queue_lifecycle_regression53.sh
 ## CMQ 门禁
 
 CMQ wire gate 以真实的 `dpu_kernel_rdma-version_0.1.34.tar(1).gz` 归档、source manifest 和 C oracle
-为唯一 ABI 来源：70 个 opcode 的请求逐字节对比驱动 golden（`rdma_cmq_request_golden_test`），字段
-变异契约（`rdma_cmq_driver_field_mutation_test`），驱动模型与设备模型的 CMQ 往返（`rdma_drv_cmq_test`、
-`rdma_dev_cmq_test`、`rdma_drv_verbs_test`）。清单见 `sim/cmq_gate.list`。
+为唯一 ABI 来源：`rdma_drv_cmq_golden_test` 逐字节核对 70 个 opcode 的驱动请求，
+`rdma_dev_cmq_test`、`rdma_drv_cmq_test`、`rdma_drv_dev_test` 和 `rdma_drv_verbs_test` 分别验证设备解码、
+驱动往返、设备生命周期状态效果和 verbs 调用链。权威清单见 `sim/cmq_gate.list`。

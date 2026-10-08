@@ -234,6 +234,41 @@ class ChangedSvStyleTest(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("file header", result.stderr)
 
+    def test_untracked_svh_macro_accepts_adjacent_block_comment_contract(self) -> None:
+        """功能：确认未跟踪 SVH 会受门禁检查，宏展开方法可用独立单行块注释携带三段契约。
+        输入输出及副作用：创建合法与缺标签的 clone 宏头文件并运行 checker；所有文件位于临时仓库。
+        失败边界：若 SVH 未进入 ChangeSet 或块注释未被识别，合法样例会误报或缺标签样例会漏报。"""
+
+        header = (
+            "// 目录：src/types；层次：公共宏层。\n"
+            "// 职责：为测试类生成 clone。\n"
+            "// 依赖：uvm_object。\n"
+            "// 所有权与生命周期：宏不持有对象，返回对象归调用者。\n"
+        )
+        macro = (
+            "`define SAMPLE_CLONE \\\n"
+            "  /* 功能：生成动态对象副本。 */ \\\n"
+            "  /* 输入/输出及副作用：返回新对象，不修改源对象。 */ \\\n"
+            "  /* 失败/边界：创建失败时返回 null。 */ \\\n"
+            "  virtual function uvm_object clone(); \\\n"
+            "    return null; \\\n"
+            "  endfunction\n"
+        )
+        holder, root, base = self.create_repo(self.valid_source())
+        with holder:
+            path = root / "sample.svh"
+            path.write_text(header + macro, encoding="utf-8")
+            valid = self.invoke(root, base)
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+
+            path.write_text(
+                (header + macro).replace("失败/边界：", "删除："),
+                encoding="utf-8",
+            )
+            invalid = self.invoke(root, base)
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertIn("lacks adjacent", invalid.stderr)
+
     def test_changed_line_checks_and_ignored_inputs(self) -> None:
         """功能：检查尾随空白、百列软限制、多语句和单行 if-return，同时忽略 Python/旧长行。
         输入输出及副作用：依次修改临时 SV 并调用 checker，输出稳定硬/soft-limit 诊断。

@@ -74,7 +74,7 @@ def resolve_revision(root: Path, revision: str, label: str) -> str:
 
 
 def parse_diff(text: str) -> ChangeSet:
-    """功能：从 unified=0 diff 提取 SV 路径及新文件中的新增行号。
+    """功能：从 unified=0 diff 提取 SV/SVH 路径及新文件中的新增行号。
     输入输出及副作用：输入 Git diff 文本，返回 ChangeSet；不解析或写回源文件。
     失败边界：非 SV、删除行和无 hunk 元数据被忽略，异常 hunk 仅停止该段解析。
     """
@@ -85,7 +85,7 @@ def parse_diff(text: str) -> ChangeSet:
     for raw in text.splitlines():
         if raw.startswith("+++ b/"):
             current = raw[6:]
-            if not current.endswith(".sv"):
+            if not current.endswith((".sv", ".svh")):
                 current = None
             elif current not in changes.lines:
                 changes.lines[current] = set()
@@ -111,16 +111,16 @@ def parse_diff(text: str) -> ChangeSet:
 
 
 def add_untracked(root: Path, changes: ChangeSet) -> None:
-    """功能：把工作树中未跟踪的 SV 文件作为全量新增内容加入 ChangeSet。
+    """功能：把工作树中未跟踪的 SV/SVH 文件作为全量新增内容加入 ChangeSet。
     输入输出及副作用：输入仓库和已有变更，原地加入路径及每一行号；仅读取 Git 清单和文件。
     失败边界：Git 清单失败或路径无法读取时交由主流程报告，非 SV 文件永不加入。
     """
 
-    result = run_git(root, ["ls-files", "--others", "--exclude-standard", "--", "*.sv"])
+    result = run_git(root, ["ls-files", "--others", "--exclude-standard", "--", "*.sv", "*.svh"])
     if result.returncode != 0:
         raise ValueError(f"cannot list untracked SV files: {result.stderr.strip()}")
     for name in result.stdout.splitlines():
-        if not name.endswith(".sv"):
+        if not name.endswith((".sv", ".svh")):
             continue
         path = root / name
         try:
@@ -233,12 +233,13 @@ def source_lines(root: Path, revision: str | None, path: str) -> list[str]:
 
 
 def is_comment(line: str) -> bool:
-    """功能：判断一行是否为可用于方法邻接块的单行注释。
-    输入输出及副作用：输入源文一行，返回是否去空白后以 // 开头；不产生副作用。
-    失败边界：块注释和代码尾随注释不算邻接注释，空行也会返回 False。
+    """功能：判断一行是否为可用于方法邻接块的独立行注释。
+    输入输出及副作用：输入源文一行，返回是否以 // 或单行 /* 注释开头；不产生副作用。
+    失败边界：代码尾随注释、跨行块注释的中间行和空行不算邻接注释。
     """
 
-    return line.strip().startswith("//")
+    stripped = line.strip()
+    return stripped.startswith("//") or (stripped.startswith("/*") and "*/" in stripped)
 
 
 def method_ranges(cleaned_lines: list[str]) -> list[tuple[int, int, int]]:

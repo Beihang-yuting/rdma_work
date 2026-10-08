@@ -10,6 +10,9 @@
 `define RDMA_OBJECT_MACROS_SVH
 
 `define rdma_alias_safe_clone \
+  /* 功能：为采用 rdma_object_utils 的动态对象生成别名安全 clone，绕开 UVM 全局 copy map。 */ \
+  /* 输入/输出及副作用：无显式输入；返回同动态类型的新对象并复制自动字段与 do_copy 字段，不改写源对象。 */ \
+  /* 失败/边界：create() 返回 null 时原样返回 null；新对象由调用者接管，覆盖 clone 的子类仍可调用本实现。 */ \
   virtual function uvm_object clone(); \
     uvm_object copy_value; \
     copy_value = create(get_name()); \
