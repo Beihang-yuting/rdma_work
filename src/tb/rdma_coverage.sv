@@ -154,9 +154,11 @@ class rdma_coverage extends uvm_component;
     }
   endgroup
 
-  // 功能：构造各 covergroup 与端口。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造覆盖率组件，同时建立五个 analysis export 和八个独立 covergroup 实例。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；采样句柄、历史状态与 cmq_seen 保持空初值，env
+  //   尚未绑定且仅作为后续非拥有引用。
+  // 失败/边界：构造本身不检查 cfg.cov_enable；连接 export 或调用依赖 env 的采样/报告前必须由环境
+  //   完成绑定。
   function new(string name = "rdma_coverage", uvm_component parent = null);
     super.new(name, parent);
     verb_export = new("verb_export", this);
@@ -174,9 +176,10 @@ class rdma_coverage extends uvm_component;
     cg_wire = new();
   endfunction
 
-  // 功能：投递的 verb（scoreboard 已填好预测状态）：采 verb 与 error。
-  // 输入/输出及副作用：采样。
-  // 失败/边界：无。
+  // 功能：采样已由 scoreboard 填好预测状态的 verb，并按 QP 的 RC/UD/URC 类型选择 kind；预测错误时
+  //   额外采样 error covergroup。
+  // 输入/输出及副作用：借用 item 写入当前采样句柄 it，更新 qp_kind 并推进 cg_verb/cg_error bin 计数。
+  // 失败/边界：item.qp 为空时按 RC(kind=0) 退化，仅用于暴露上游缺失；调用者必须传非空 item。
   function void write_cov_verb(rdma_verb_item item);
     it = item;
     qp_kind = 0;
@@ -189,9 +192,9 @@ class rdma_coverage extends uvm_component;
       cg_error.sample();
   endfunction
 
-  // 功能：完成。
-  // 输入/输出及副作用：采样。
-  // 失败/边界：无。
+  // 功能：按完成状态与 SQ/RQ 方向采样一条 verb completion。
+  // 输入/输出及副作用：把非拥有引用 c 暂存为 done，并推进 cg_completion 的 coverpoint/cross 计数。
+  // 失败/边界：c 必须非空且字段已由 monitor 填充；本组件不克隆，采样完成后不依赖其后续生命周期。
   function void write_cov_cqe(rdma_verb_completion c);
     done = c;
     cg_completion.sample();
@@ -214,9 +217,9 @@ class rdma_coverage extends uvm_component;
     sample_cmq();
   endfunction
 
-  // 功能：控制面请求完成：复位范围与 CMQ 执行记录。
-  // 输入/输出及副作用：采样。
-  // 失败/边界：无。
+  // 功能：控制面请求完成时采样 FLR/RECOVER 的操作与作用范围，并捕获由该请求新增的 CMQ opcode。
+  // 输入/输出及副作用：复位操作更新 reset_op/reset_scope 和 cg_reset；所有操作都会调用 sample_cmq。
+  // 失败/边界：非复位请求不采 cg_reset；item 必须非空，空 scope 仍作为零值输入但不会命中声明 bin。
   function void write_cov_ctrl(rdma_ctrl_item item);
     if (item.op inside {RDMA_CTRL_FLR, RDMA_CTRL_RECOVER}) begin
       reset_op = item.op;
@@ -226,17 +229,20 @@ class rdma_coverage extends uvm_component;
     sample_cmq();
   endfunction
 
-  // 功能：链路报文。
-  // 输入/输出及副作用：采样。
-  // 失败/边界：无。
+  // 功能：按链路报文的 opcode 与传输类型采样 wire coverage。
+  // 输入/输出及副作用：借用 o.pkt 写入 pkt 采样句柄并推进 cg_wire，不保留观测对象所有权。
+  // 失败/边界：要求 o 与 o.pkt 非空；非法 UD/opcode 组合由 ignore_bins 排除而非在此报告协议错误。
   function void write_cov_wire(rdma_link_obs o);
     pkt = o.pkt;
     cg_wire.sample();
   endfunction
 
-  // 功能：采各仿真 Function 设备 CMQ 的新执行记录（复位后记录清空，从头采）。
-  // 输入/输出及副作用：采样，更新 cmq_seen。
-  // 失败/边界：无。
+  // 功能：遍历所有仿真 Function，仅采样各设备自上次游标后的 CMQ opcode；设备复位使日志变短时从
+  //   新日志起点重新采样。
+  // 输入/输出及副作用：读取 env.sys.nodes[*].dev.cmq.executed_opcodes，更新 cmq_opcode、cg_cmq 与每个
+  //   Function 的 cmq_seen 游标。
+  // 失败/边界：要求 env/sys/node/dev/cmq 装配完成；日志保持不变时不重复采样，清空后相同 opcode 会作为
+  //   新 epoch 的执行再次计入。
   protected function void sample_cmq();
     rdma_dev_cmq q;
 
@@ -252,9 +258,10 @@ class rdma_coverage extends uvm_component;
     end
   endfunction
 
-  // 功能：按已作用的链路故障规则采样；打印各覆盖面与平均覆盖率。
-  // 输入/输出及副作用：报告。
-  // 失败/边界：无。
+  // 功能：报告阶段采样至少命中过一次的链路故障，读取八个 covergroup 覆盖率并输出分项与算术平均值。
+  // 输入/输出及副作用：phase 只提供生命周期；推进 cg_fault 后生成一条 RDMA_COV UVM_INFO，不修改 DUT。
+  // 失败/边界：未命中的故障不采样；要求 env/link 已绑定且八个 covergroup 均由构造函数创建，平均值
+  //   固定按八项计算而不按是否命中过滤。
   function void report_phase(uvm_phase phase);
     real parts[string];
     real total;
