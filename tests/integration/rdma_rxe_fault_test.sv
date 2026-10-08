@@ -24,9 +24,9 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
   localparam int unsigned IBV_WC_REM_ACCESS_ERR = 10;
   localparam bit [31:0] UD_QKEY = 32'h1234_5678;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 Soft-RoCE 故障集成测试组件，并复用基类的 WR 标识与外部链路 fixture 初始状态。
+  // 输入/输出及副作用：name/parent 传给 rdma_rxe_test 构造函数；本层不新增资源或取得额外对象所有权。
+  // 失败/边界：parent 可为 null 以作为顶层组件；外部 peer、TAP 和故障场景资源均在后续 phase/task 中建立。
   function new(string name = "rdma_rxe_fault_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
@@ -68,9 +68,9 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
     end
   endtask
 
-  // 功能：仿真 WR（本端缓冲 local_off 起 len 字节）。
-  // 输入/输出及副作用：返回新 WR。
-  // 失败/边界：无。
+  // 功能：创建故障场景使用的发送 WR，以 op 操作本端缓冲 [local_off, local_off+len)，并填入远端地址和 rkey。
+  // 输入/输出及副作用：返回含单个 SGE 的新 WR，使用并递增 next_wr_id；SGE 使用当前 data_buf 与 mr.key()。
+  // 失败/边界：不在此处检查 op、范围、remote_va 或 rkey；越界及无效访问由后续投递或完成状态暴露。
   function rdma_drv_send_wr sim_wr(rdma_drv_wr_opcode_e op, int unsigned local_off,
                                    int unsigned len, bit [63:0] remote_va = 0,
                                    bit [31:0] rkey = 0);
@@ -114,9 +114,9 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
     id = rwr.wr_id;
   endtask
 
-  // 功能：rxe 在当前 QP 投递接收缓冲（rxe 缓冲 off 起 len 字节）。
-  // 输入/输出及副作用：与对端交互；返回 wr_id。
-  // 失败/边界：无。
+  // 功能：命令外部 rxe peer 在当前 peer_qpn 上投递覆盖其缓冲 [off, off+len) 的接收 WQE。
+  // 输入/输出及副作用：分配并递增 next_wr_id，向 peer 发送 recv 命令并返回该 wr_id；会改变对端 RQ。
+  // 失败/边界：不解析 recv 命令的即时回复；无效 QP/范围或 peer 失败将由后续完成等待超时或状态断言暴露。
   function longint unsigned peer_recv(int unsigned off, int unsigned len);
     longint unsigned id;
 
@@ -125,9 +125,9 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
     return id;
   endfunction
 
-  // 功能：rxe 在当前 QP 发 SEND（rxe 缓冲 off 起 len 字节）。
-  // 输入/输出及副作用：与对端交互；返回 wr_id。
-  // 失败/边界：无。
+  // 功能：命令外部 rxe peer 从其缓冲 [off, off+len) 在当前 peer_qpn 上投递 SEND。
+  // 输入/输出及副作用：分配并递增 next_wr_id，向 peer 发送 send 命令并返回该 wr_id；会推进对端 SQ。
+  // 失败/边界：不解析 send 命令的即时回复；无效 QP/范围或 peer 失败将由后续完成等待超时或状态断言暴露。
   function longint unsigned peer_send(int unsigned off, int unsigned len);
     longint unsigned id;
 
@@ -146,9 +146,9 @@ class rdma_rxe_fault_test extends rdma_rxe_test;
     expect_bytes(label, got, want);
   endfunction
 
-  // 功能：log[from..] 中 opcode 为 op 的报文数。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：统计 log 中从索引 from 起 opcode 与 op 精确相等的报文数量。
+  // 输入/输出及副作用：只读报文队列和各项 opcode，返回匹配数，不移动或修改日志内容。
+  // 失败/边界：from 大于或等于 log.size() 时返回 0；不把同族的首包/中间包/尾包 opcode 合并计数。
   function int unsigned count_op(rdma_packet log[$], int unsigned from, rdma_network_opcode_e op);
     int unsigned n;
 

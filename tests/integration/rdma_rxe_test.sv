@@ -33,9 +33,10 @@ class rdma_rxe_test extends uvm_test;
   bit [47:0] rxe_mac;
   longint unsigned next_wr_id;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 Soft-RoCE 基础集成测试组件，并把首个测试 WR 标识初始化为 1。
+  // 输入/输出及副作用：name/parent 传给 UVM 基类建立层级；仅初始化 next_wr_id，尚不创建或取得
+  //   dpu 系统、TAP 链路、外部 peer 及驱动资源的所有权。
+  // 失败/边界：parent 可为 null 以作为顶层组件；TAP、peer 与 RDMA 资源失败延后到对应 setup task 报告。
   function new(string name = "rdma_rxe_test", uvm_component parent = null);
     super.new(name, parent);
     next_wr_id = 1;
@@ -50,9 +51,9 @@ class rdma_rxe_test extends uvm_test;
                  status == null ? "null" : status.convert2string()))
   endfunction
 
-  // 功能：字符串 plusarg，缺省取 fallback。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：查询名为 name 的字符串 plusarg，存在时返回命令行值，否则返回 fallback。
+  // 输入/输出及副作用：读取仿真器的 +<name>=<value> 参数，不修改测试对象或命令行状态。
+  // 失败/边界：不校验命令行值的内容；参数缺失或不能按字符串形式匹配时稳定回退到 fallback。
   function string arg(string name, string fallback);
     string value;
 
@@ -83,9 +84,9 @@ class rdma_rxe_test extends uvm_test;
     return {8'(b0), 8'(b1), 8'(b2), 8'(b3), 8'(b4), 8'(b5)};
   endfunction
 
-  // 功能：字节 → 十六进制串。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：按 data 的队列顺序把每个字节编码为两位十六进制文本并拼接返回。
+  // 输入/输出及副作用：只读 data，返回不带前缀和分隔符的字符串，不修改输入队列。
+  // 失败/边界：data 为空时返回空串；每个元素限定为 8 bit，因此始终恰好贡献两个十六进制字符。
   function string hex_of(rdma_bytes_t data);
     string s;
 
@@ -95,9 +96,9 @@ class rdma_rxe_test extends uvm_test;
     return s;
   endfunction
 
-  // 功能：十六进制串 → 字节。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：从 hex 起始位置起每两个字符解析一个字节，返回保持文本顺序的动态字节数组。
+  // 输入/输出及副作用：只读 hex；返回数组长度为 hex.len()/2，不修改调用方状态。
+  // 失败/边界：空串返回空数组；奇数长度会忽略末尾单字符，且本辅助函数不额外拒绝非十六进制字符。
   function rdma_bytes_t bytes_of(string hex);
     rdma_bytes_t data;
 
@@ -107,9 +108,9 @@ class rdma_rxe_test extends uvm_test;
     return data;
   endfunction
 
-  // 功能：长度 n 的样式数据。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：生成 n 字节的确定性测试样式，第 i 字节取 i*13+seed 的低 8 bit。
+  // 输入/输出及副作用：以 n 和 seed 计算并返回新动态数组，不读写测试 fixture 或两端内存。
+  // 失败/边界：n 为 0 时返回空数组；索引公式超过 8 bit 时按字节宽度自然截断并循环。
   function rdma_bytes_t pattern(int unsigned n, int unsigned seed);
     rdma_bytes_t data;
 
@@ -119,9 +120,9 @@ class rdma_rxe_test extends uvm_test;
     return data;
   endfunction
 
-  // 功能：8 字节小端值。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：把 64 bit 的 v 拆成低有效字节在前的八字节动态数组。
+  // 输入/输出及副作用：只读 v 并返回固定长度为 8 的新数组，不修改任何 fixture 状态。
+  // 失败/边界：输入宽度固定为 64 bit，零值和全一值也按同一规则完整保留，不发生长度伸缩。
   function rdma_bytes_t le64(bit [63:0] v);
     rdma_bytes_t b;
 
@@ -307,9 +308,9 @@ class rdma_rxe_test extends uvm_test;
                              arg("RXE_SIM_IP", "10.79.0.1"), rxe_rnr)));
   endtask
 
-  // 功能：取走 rxe CQ 中的全部完成（上一组用例的 flush 等残留）。
-  // 输入/输出及副作用：与对端交互。
-  // 失败/边界：无。
+  // 功能：在建立下一组 QP 对之前，轮询并丢弃 rxe CQ 中上一组用例遗留的完成项。
+  // 输入/输出及副作用：最多向外部 peer 发送 1000 次非阻塞 poll 命令；不返回或保存被取走的完成。
+  // 失败/边界：收到 "OK none" 时立即停止；达到 1000 次上限也直接返回，peer 的异常回复不会在此处升级为错误。
   function void peer_drain();
     for (int i = 0; i < 1000 && peer.cmd("poll 0") != "OK none"; i++)
       ;
@@ -359,9 +360,9 @@ class rdma_rxe_test extends uvm_test;
       `uvm_error(label, {"rxe completion ", reply})
   endtask
 
-  // 功能：rxe 缓冲 [off, off+n) 的内容。
-  // 输入/输出及副作用：与对端交互。
-  // 失败/边界：无。
+  // 功能：请求外部 peer 读取其注册缓冲 [off, off+n)，并把回复中的十六进制负载转换为字节数组。
+  // 输入/输出及副作用：向 peer 发送 rbuf 命令并返回解析结果；只读 rxe 侧内存，不改本端数据缓冲。
+  // 失败/边界：假定回复格式为 "OK <hex>"；本函数不校验 peer 错误、回复长度或负载是否恰为 n 字节。
   function rdma_bytes_t peer_rbuf(int unsigned off, int unsigned n);
     string reply;
 
