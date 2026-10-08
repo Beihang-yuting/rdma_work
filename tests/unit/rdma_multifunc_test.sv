@@ -23,8 +23,8 @@ class rdma_mf_net extends uvm_object;
   int unsigned dropped;
 
   // 功能：构造网络。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name 为 UVM 对象名；devs/drops 映射为空、dropped 清零，设备引用保持非拥有。
+  // 失败/边界：构造不连接任何 MAC；测试必须先填 devs，未知目的由端口 send 报错。
   function new(string name = "rdma_mf_net");
     super.new(name);
     dropped = 0;
@@ -39,8 +39,8 @@ class rdma_mf_port extends rdma_dev_port;
   bit [47:0] src;
 
   // 功能：构造端口。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name 为 UVM 对象名；net 为非拥有空引用，src 使用零初值。
+  // 失败/边界：必须由拓扑构建路径绑定 net 与唯一源 MAC 后再发送，否则会解引用空网络。
   function new(string name = "rdma_mf_port");
     super.new(name);
   endfunction
@@ -83,8 +83,8 @@ class rdma_mf_func extends uvm_object;
   rdma_drv_qp qp_in;
 
   // 功能：构造空 Function。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name 为 UVM 对象名；DPU 投影、设备、驱动与全部资源句柄保持 null/零且未取得所有权。
+  // 失败/边界：仅 build_func 完成装配、probe 和资源创建后才可参与环流量或复位检查。
   function new(string name = "rdma_mf_func");
     super.new(name);
   endfunction
@@ -102,8 +102,8 @@ class rdma_multifunc_test extends uvm_test;
   longint unsigned next_wr_id;
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传给 uvm_test。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 uvm_test；funcs/net/sys 为空，next_wr_id 从 1 开始单调分配。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；DPU 与 Function 所有权直到 run_phase 才建立。
   function new(string name = "rdma_multifunc_test", uvm_component parent = null);
     super.new(name, parent);
     next_wr_id = 1;
@@ -339,8 +339,8 @@ class rdma_multifunc_test extends uvm_test;
   endtask
 
   // 功能：i 是否在 scope 中。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 输入/输出及副作用：顺序读取 scope，精确匹配 i 时返回 1，不修改输入队列。
+  // 失败/边界：空队列或未命中返回 0；重复索引不改变结果，函数不验证索引是否小于 funcs.size()。
   function bit in_scope(int unsigned i, int unsigned scope[$]);
     foreach (scope[k])
       if (scope[k] == i)
@@ -414,8 +414,9 @@ class rdma_multifunc_test extends uvm_test;
   endtask
 
   // 功能：建发送 WR（本地 SGE 在 a 的数据缓冲）。
-  // 输入/输出及副作用：返回新 WR。
-  // 失败/边界：无。
+  // 输入/输出及副作用：创建 WR，分配并推进 next_wr_id，写入 op，并追加指向 a.data_buf 的单个 SGE 后返回。
+  // 失败/边界：要求 a、data_buf、mr 均已建立且 offset+len 在注册范围内；本辅助函数不检查越界，
+  //   非法 opcode 由 post_send 拒绝。
   function rdma_drv_send_wr make_wr(rdma_mf_func a, rdma_drv_wr_opcode_e op, int unsigned offset,
                                     int unsigned len);
     rdma_drv_send_wr wr;
