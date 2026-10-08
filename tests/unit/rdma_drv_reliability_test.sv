@@ -2,6 +2,7 @@
 // 层：单元测试。
 // 职责：两节点（复用 rdma_drv_data_test 的节点、链路与辅助）的可靠传输与异常路径：中间包丢失后从
 //   PSN 序列 NAK 指出的 PSN 起重传、中间 AckReq 的累计 ACK 与 SEND/WRITE 超时部分重传、
+//   RNR 后旧累计 ACK 与新 sequence NAK 的代次交错、QP 重建时序列/RNR 门控清理、transport/QPC 准入、
 //   ACK/ATOMIC ACK 丢失后的重复请求处理（不重复执行）、READ 末段响应丢失后只重新请求缺失部分、
 //   RNR NAK 按定时器编码等待的重试与耗尽（0xB7）、URC 的 SQ/RQ 异常
 //   完成（ABNML CEQE 或 AEQE → REM_ACCESS/REM_INV_REQ + FLUSH、RQ 0x9C）、UD 的 Q_Key 校验与 40B
@@ -36,6 +37,7 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     check_ack_drop();
     check_partial_timeout_retransmit();
     check_rnr();
+    check_rnr_stale_ack_recovery();
     check_ud();
     check_srq_sgb();
     check_urc_sq_abnormal();
@@ -46,6 +48,7 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     check_response_filtering();
     check_segment_state();
     check_non_message_segment_rejects();
+    check_epoch_gate_reset();
   endtask
 
   // 功能：把一个测试 RC QP 按指定起始 PSN、RTO 与 PSN retry 连到 dest_qpn/dmac，供回绕和重试
@@ -87,6 +90,30 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     attr.retry_cnt = retry_cnt;
     qp.modify(drv, attr, status);
     expect_ok("configured RTS", status);
+  endtask
+
+  // 功能：在同一个设备 QPC/runtime 上制造 INIT→RTR 边沿并写入新的接收 PSN，精确验证
+  //   qpc_written 的 RTR epoch 清理，而不走 verbs 层不支持的 RESET 复用路径。
+  // 输入/输出及副作用：n/qp 选择设备 QPC，start_psn 写 EPSN_REQ；先发布 INIT 再发布 RTR，并在每个
+  //   边沿调用 nic.qpc_written；驱动 qp.cur_state 与发送侧字段保持不变，本辅助只服务直接注包测试。
+  // 失败/边界：要求 QPC 仍存在且没有并发 SQ/RX 流量，否则报 UVM_FATAL；该辅助绕过 CMQ，只用于
+  //   隔离设备运行态生命周期，不能作为正常驱动状态迁移接口。
+  task reenter_device_rtr(rdma_drv_data_node n, rdma_drv_qp qp, bit [23:0] start_psn);
+    rdma_dev_object obj;
+    int unsigned old_state;
+
+    if (!n.dev.cmq.lookup(RDMA_DEV_QP, qp.qpn, obj))
+      `uvm_fatal("RTR_EPOCH", $sformatf("device has no QPC %0d", qp.qpn))
+    old_state = rdma_be::field(obj.bytes, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET,
+                               RDMA_QPC_QP_ST_LSB, RDMA_QPC_QP_ST_WIDTH);
+    rdma_be::set_field(obj.bytes, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
+                       RDMA_QPC_QP_ST_WIDTH, 1);
+    n.dev.nic.qpc_written(qp.qpn, old_state);
+    rdma_be::set_field(obj.bytes, RDMA_QPC_EPSN_REQ_WORD_BYTE_OFFSET, RDMA_QPC_EPSN_REQ_LSB,
+                       RDMA_QPC_EPSN_REQ_WIDTH, start_psn);
+    rdma_be::set_field(obj.bytes, RDMA_QPC_QP_ST_WORD_BYTE_OFFSET, RDMA_QPC_QP_ST_LSB,
+                       RDMA_QPC_QP_ST_WIDTH, 2);
+    n.dev.nic.qpc_written(qp.qpn, 1);
   endtask
 
   // 功能：创建一对使用共享 CQ、但拥有独立 QPN 与指定起始 PSN/重试参数的 RC QP。
@@ -166,6 +193,30 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     pkt.aeth_syndrome = syndrome;
     pkt.pack_headers();
     n.dev.nic.receive(pkt);
+  endtask
+
+  // 功能：经测试链路向节点注入一条指定 transport/opcode/segment 的请求，构造 PSN 缺口、RNR 门控或
+  //   transport 伪装等正常驱动不会生成的线上边界。
+  // 输入/输出及副作用：n 选择目的节点，source_qpn/destination_qpn/psn 填 BTH 语义字段；报文固定请求
+  //   ACK 并 pack_headers 后由 link.send 投递，因此计入 sent_to/dropped 观测。
+  // 失败/边界：未填充 opcode 所需扩展头，故只适合无需有效 RETH/原子字段即可到达被测准入分支的请求；
+  //   调用方须保证目标 QP 存在，异步 RX 结果应在调用后留出处理时间。
+  task inject_request(rdma_drv_data_node n, rdma_transport_e transport,
+                      rdma_network_opcode_e opcode, rdma_packet_segment_e segment,
+                      bit [23:0] source_qpn, bit [23:0] destination_qpn,
+                      bit [23:0] psn);
+    rdma_packet pkt;
+
+    pkt = rdma_packet::type_id::create("injected_request");
+    pkt.transport = transport;
+    pkt.opcode = opcode;
+    pkt.segment = segment;
+    pkt.source_qpn = source_qpn;
+    pkt.destination_qpn = destination_qpn;
+    pkt.psn = psn;
+    pkt.ack_req = 1'b1;
+    pkt.pack_headers();
+    link.send(pkt, n.mac);
   endtask
 
   // 功能：分别发送 5 段 RC SEND 和 WRITE；链路放行前 3 段后丢掉末 2 段，要求第 3 段的
@@ -293,11 +344,11 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
   endtask
 
   // 功能：丢失真实响应后注入窗口外致命 NAK、同 PSN 的错误 opcode、窗口外普通 ACK，以及落在已
-  //   累计确认/接收前缀内的陈旧致命 NAK，验证它们不结束 SEND/READ，也不刷新有限 RTO。
+  //   累计确认/接收前缀内的陈旧致命/sequence NAK，验证它们不结束或回退 SEND/READ，也不刷新 RTO。
   // 输入/输出及副作用：使用四对独立 QP；每项由链路丢弃目标响应，再定时注入伪响应并检查成功完成、
   //   一个 RTO 的耗时、RQE（SEND）与目的数据。
   // 失败/边界：窗口外/错误 opcode 响应若被采纳会提前错误完成；无进展响应若刷新 RTO 会延迟重传；
-  //   中间累计 ACK 或首个 READ 响应之后到达的旧 NAK 必须按当前进度过滤，不能回退 resume。
+  //   中间累计 ACK 或首个 READ 响应后的旧 fatal/sequence NAK 必须按当前进度过滤，不能回退 resume。
   task check_response_filtering();
     rdma_bytes_t data;
     rdma_drv_qp qa;
@@ -367,6 +418,9 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
         #1us;
         inject_response(a, qa.qpn, RDMA_NET_NAK, 24'h000351,
                         RDMA_AETH_NAK_REMOTE_ACCESS);
+        #1us;
+        inject_response(a, qa.qpn, RDMA_NET_NAK, 24'h000350,
+                        RDMA_AETH_NAK_PSN_SEQ);
       end
     join
     elapsed = $time - started;
@@ -485,18 +539,38 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
       expect_wc("cross-opcode segment flush", wcs[0], rwr, 1'b1, RDMA_DRV_WC_FLUSH_ERR);
   endtask
 
-  // 功能：分别向空闲 RC QP 注入 READ MIDDLE 和 ATOMIC MIDDLE，验证非 SEND/WRITE 请求只接受
-  //   ONLY；随后再发同 QP 请求，确认 INVALID_REQUEST NAK 已按 RC fatal 契约把响应方转入 ERR。
-  // 输入/输出及副作用：为两种 opcode 各创建一对独立 QP，经 link 注入报文，检查 segment_rejects
-  //   与 state_drops；不投递 RQE，也不产生 CQE。
-  // 失败/边界：READ 的 URC FIRST/MIDDLE/LAST 是数据分段特例，本用例只约束 RC；若非法请求推进
-  //   expected_psn、绕过分段检查或未使 QP 进入 ERR，则拒绝计数或后续状态丢弃计数不符。
+  // 功能：先向 RC QP 注入伪装成 URC 的 READ MIDDLE，验证目标 QPC service type 在 PSN/分段状态机
+  //   之前拒绝它；再分别注入真实 RC READ MIDDLE 与 ATOMIC MIDDLE，验证非 SEND/WRITE 只接受 ONLY。
+  // 输入/输出及副作用：创建三对独立 QP，经 link 注入报文，检查 transport_rejects、segment_rejects、
+  //   state_drops 与响应计数；不投递 RQE，也不产生正常 CQE。
+  // 失败/边界：仅真正 URC QP 的 READ 可用 FIRST/MIDDLE/LAST；伪装包不得推进 expected_psn 或使 RC
+  //   QP 进入 ERR，真实 RC 非 ONLY 请求则须回 fatal INVALID_REQUEST 并使后续请求按状态丢弃。
   task check_non_message_segment_rejects();
     rdma_packet pkt;
     rdma_drv_qp qa;
     rdma_drv_qp qb;
     int unsigned rejected;
     int unsigned dropped;
+    int unsigned transport_rejected;
+    int unsigned to_a;
+
+    make_configured_pair(24'h0005f0, 3, 6, qa, qb);
+    rejected = b.dev.nic.segment_rejects;
+    transport_rejected = b.dev.nic.transport_rejects;
+    to_a = link.sent_to[a.mac];
+    inject_request(b, RDMA_TRANSPORT_URC, RDMA_NET_RDMA_READ_REQUEST, RDMA_SEG_MIDDLE,
+                   qa.qpn, qb.qpn, 24'h0005f0);
+    #100ns;
+    if (b.dev.nic.transport_rejects != transport_rejected + 1 ||
+        b.dev.nic.segment_rejects != rejected || link.sent_to[a.mac] != to_a)
+      `uvm_error("spoofed URC READ MIDDLE",
+                 "transport mismatch was not rejected before RC PSN/segment processing")
+    // 伪装包不得推进 expected_psn 或转 ERR；下一 PSN 应触发指向原 expected_psn 的 sequence NAK。
+    inject_request(b, RDMA_TRANSPORT_RC, RDMA_NET_SEND, RDMA_SEG_ONLY,
+                   qa.qpn, qb.qpn, 24'h0005f1);
+    #100ns;
+    if (link.sent_to[a.mac] != to_a + 1)
+      `uvm_error("spoofed URC READ MIDDLE", "RC QP state or expected PSN changed")
 
     make_configured_pair(24'h000600, 3, 6, qa, qb);
     rejected = b.dev.nic.segment_rejects;
@@ -553,6 +627,50 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     #100ns;
     if (b.dev.nic.state_drops != dropped + 1)
       `uvm_error("RC ATOMIC MIDDLE", "response QP did not enter ERR after fatal NAK")
+  endtask
+
+  // 功能：先后制造 seq_nak_sent 与 rnr_drop，再让同一响应 QP 两次重入 RTR，验证新 epoch 的首个
+  //   缺口都能重新发送 sequence NAK，不受旧门控状态抑制。
+  // 输入/输出及副作用：创建一对 RC QP；第一次未来 PSN 置位 seq_nak_sent，设备重入 RTR 到 0x1100
+  //   后再次制造缺口并以正确首包触发 RNR，随后重入 RTR 到 0x1200；检查发往 A 的响应增量。
+  // 失败/边界：B 不投递 RQE，正确首包必须产生 RNR；若 RTR 未清任一 gate，紧随重建的未来 PSN
+  //   会被静默丢弃且响应增量为 0；测试不依赖受保护运行态字段，也不调用驱动 RESET 复用路径。
+  task check_epoch_gate_reset();
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
+    int unsigned to_a;
+
+    make_configured_pair(24'h001000, 3, 6, qa, qb);
+    to_a = link.sent_to[a.mac];
+    inject_request(b, RDMA_TRANSPORT_RC, RDMA_NET_SEND, RDMA_SEG_ONLY,
+                   qa.qpn, qb.qpn, 24'h001001);
+    #100ns;
+    if (link.sent_to[a.mac] != to_a + 1)
+      `uvm_error("sequence gate seed", "initial PSN gap did not emit sequence NAK")
+
+    reenter_device_rtr(b, qb, 24'h001100);
+    to_a = link.sent_to[a.mac];
+    inject_request(b, RDMA_TRANSPORT_RC, RDMA_NET_SEND, RDMA_SEG_ONLY,
+                   qa.qpn, qb.qpn, 24'h001101);
+    #100ns;
+    if (link.sent_to[a.mac] != to_a + 1)
+      `uvm_error("sequence gate reset", "old seq_nak_sent suppressed the new epoch NAK")
+
+    // 正确 PSN 清除刚置位的 sequence gate，随后因没有 RQE 置位 rnr_drop 并回 RNR。
+    to_a = link.sent_to[a.mac];
+    inject_request(b, RDMA_TRANSPORT_RC, RDMA_NET_SEND, RDMA_SEG_ONLY,
+                   qa.qpn, qb.qpn, 24'h001100);
+    #100ns;
+    if (link.sent_to[a.mac] != to_a + 1)
+      `uvm_error("RNR gate seed", "expected-PSN SEND without RQE did not emit RNR")
+
+    reenter_device_rtr(b, qb, 24'h001200);
+    to_a = link.sent_to[a.mac];
+    inject_request(b, RDMA_TRANSPORT_RC, RDMA_NET_SEND, RDMA_SEG_ONLY,
+                   qa.qpn, qb.qpn, 24'h001201);
+    #100ns;
+    if (link.sent_to[a.mac] != to_a + 1)
+      `uvm_error("RNR gate reset", "old rnr_drop suppressed the new epoch NAK")
   endtask
 
   // 功能：断言 B 在 20us 内没有新的完成。
@@ -696,6 +814,68 @@ class rdma_drv_reliability_test extends rdma_drv_data_test;
     expect_wc("RNR exhausted", wcs[0], wr.wr_id, 1'b0, RDMA_DRV_WC_GENERAL_ERR);
     if (wcs[0].vendor_err != RDMA_ECODE_EC_RPE_RSP_NAK_RNR_ERR_OVERTIME)
       `uvm_error("RNR exhausted", $sformatf("vendor %02h", wcs[0].vendor_err))
+  endtask
+
+  // 功能：5 段 WRITE_IMM 先取得第 3 段累计 ACK、末段因无 RQE 收到 RNR；RNR 等待后整轮重传被
+  //   丢弃，再在该轮 mailbox 清空之后注入旧中间 ACK 与较低 PSN 的 sequence NAK，验证重传点能回到
+  //   首段并由下一轮成功完成。
+  // 输入/输出及副作用：创建起始 PSN=0x800 的独立 QP 对；2us 时向 B 投递 RQE，第二轮 5 个请求全丢，
+  //   11us/12us 向 A 依次注入旧 ACK 与 sequence NAK；校验 A/B 完成、立即数、数据、耗时及链路计数。
+  // 失败/边界：若 RNR 后仍采纳无法证明代次的中间 ACK，且较低 sequence NAK 被 resume 前缀过滤，
+  //   请求会从第 4 段错误重试并在 20us 窗口内无法成功；丢包数或响应数偏离也报告 UVM_ERROR。
+  task check_rnr_stale_ack_recovery();
+    localparam bit [23:0] START_PSN = 24'h000800;
+    rdma_bytes_t data;
+    rdma_drv_qp qa;
+    rdma_drv_qp qb;
+    rdma_drv_send_wr wr;
+    rdma_drv_wc wc;
+    longint unsigned rwr;
+    int unsigned to_a;
+    int unsigned to_b;
+    int unsigned dropped;
+    time started;
+    time elapsed;
+
+    make_configured_pair(START_PSN, 1, 6, qa, qb);
+    data = fill(a, 'h800, PARTIAL_RETRY_BYTES, 8'hc3);
+    wr = send_wr(a, RDMA_DRV_WR_WRITE_IMM, '{'h800}, '{PARTIAL_RETRY_BYTES});
+    wr.remote_va = b.data_buf.iova + 'h2000;
+    wr.rkey = b.mr.key();
+    wr.imm = 32'h51a1_e0c1;
+    to_a = link.sent_to[a.mac];
+    to_b = link.sent_to[b.mac];
+    dropped = link.dropped;
+    // 首轮 5 包均放行并在末包得到 RNR；RNR 后的第二轮 5 包全部丢弃。
+    link.drop_after[b.mac] = 5;
+    link.drops[b.mac] = 5;
+    started = $time;
+    fork
+      send_on_qp_and_wait("RNR stale ACK recovery", a, qa, wr);
+      begin
+        #2us;
+        post_recv_on(b, qb, 'h3f00, 16, rwr);
+        // RNR timer=10us；这些响应在第二轮开头清 mailbox 之后到达，顺序固定为旧 ACK 再缺口 NAK。
+        #9us;
+        inject_response(a, qa.qpn, RDMA_NET_ACK, START_PSN + 2, RDMA_AETH_ACK);
+        #1us;
+        inject_response(a, qa.qpn, RDMA_NET_NAK, START_PSN, RDMA_AETH_NAK_PSN_SEQ);
+      end
+    join
+    elapsed = $time - started;
+    expect_recv("RNR stale ACK recovery rq", rwr, wc);
+    expect_mem("RNR stale ACK recovery data", b, 'h2000, data);
+    if (wc.imm != 32'h51a1_e0c1)
+      `uvm_error("RNR stale ACK recovery", $sformatf("immediate %08h", wc.imm))
+    if (elapsed < 12us || elapsed >= 20us)
+      `uvm_error("RNR stale ACK recovery",
+                 $sformatf("completed after %0t, expected sequence recovery before RTO", elapsed))
+    if (link.sent_to[b.mac] - to_b != 15 || link.sent_to[a.mac] - to_a != 4 ||
+        link.dropped - dropped != 5)
+      `uvm_error("RNR stale ACK recovery",
+                 $sformatf("requests %0d responses %0d drops %0d, expected 15/4/5",
+                           link.sent_to[b.mac] - to_b, link.sent_to[a.mac] - to_a,
+                           link.dropped - dropped))
   endtask
 
   // 功能：建一个 UD QP（max SGE 4，Q_Key = qkey）并推到 RTS。
