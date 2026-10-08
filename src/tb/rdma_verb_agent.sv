@@ -20,9 +20,9 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
   uvm_analysis_port #(rdma_verb_item) posted_ap;
   protected longint unsigned next_wr;
 
-  // 功能：构造 driver 与 analysis 端口。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 verb driver，创建 posted_ap，并把首个自动分配的 WR 序号初始化为 1。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；posted_ap 由本组件拥有，env/monitor 留待后续绑定。
+  // 失败/边界：允许 parent 为 null；构造阶段不验证 Function 下标，也不能在 monitor 连接前运行请求。
   function new(string name = "rdma_verb_driver", uvm_component parent = null);
     super.new(name, parent);
     posted_ap = new("posted_ap", this);
@@ -83,9 +83,9 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
     posted_ap.write(item);
   endtask
 
-  // 功能：MR 内偏移 → 其 buffer 内偏移。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：把 MR 内偏移 off 换算为底层内存对象中的偏移，即 mr.va - mr.mem.iova + off。
+  // 输入/输出及副作用：只读取 mr、mr.mem 与 off 并返回 int unsigned 偏移，不修改 MR 或内存对象。
+  // 失败/边界：要求 mr/mr.mem 非空且换算结果可由 int unsigned 表示；本函数不做范围或下溢检查。
   static function int unsigned buf_offset(rdma_res_mr mr, int unsigned off);
     return mr.va - mr.mem.iova + off;
   endfunction
@@ -176,9 +176,9 @@ class rdma_verb_monitor extends uvm_monitor;
   protected bit seen[longint unsigned];
   protected event seen_event;
 
-  // 功能：构造 monitor 与 analysis 端口。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 verb monitor 及 CQE/AEQ analysis 端口，完成记录 seen 初始为空。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；cqe_ap 与 aeq_ap 由本组件拥有，env 留待绑定。
+  // 失败/边界：允许 parent 为 null；构造阶段不选择 Function，run_phase 前必须由 agent 完成绑定。
   function new(string name = "rdma_verb_monitor", uvm_component parent = null);
     super.new(name, parent);
     cqe_ap = new("cqe_ap", this);
@@ -228,17 +228,17 @@ class rdma_verb_monitor extends uvm_monitor;
     end
   endtask
 
-  // 功能：驱动调用失败时报错。
-  // 输入/输出及副作用：报 UVM_ERROR。
-  // 失败/边界：无。
+  // 功能：检查一次驱动操作状态，并在失败时用操作名 what 和 Function 号形成 UVM_ERROR。
+  // 输入/输出及副作用：只读取 status/what/func；失败时增加 UVM 错误计数，成功时不产生输出。
+  // 失败/边界：status.ok() 为真时是显式 no-op；本函数只报告错误，不终止 monitor 或传播状态。
   protected function void report_fail(rdma_status status, string what);
     if (!status.ok())
       `uvm_error("RDMA_MON", $sformatf("f%0d %s failed: %s", func, what, status.convert2string()))
   endfunction
 
-  // 功能：驱动 WC → rdma_verb_completion，记录并广播。
-  // 输入/输出及副作用：更新 seen，触发 seen_event，写 cqe_ap。
-  // 失败/边界：无。
+  // 功能：把驱动 WC 转换为 rdma_verb_completion，记录 wr_id 已完成并经 cqe_ap 广播。
+  // 输入/输出及副作用：复制 wc 字段与 func，更新 seen，触发 seen_event；新完成对象归订阅方按 UVM 语义使用。
+  // 失败/边界：要求 wc 非空且端口已构造；重复 wr_id 仍会再次触发事件和广播，seen 只保持已出现标记。
   function void publish(rdma_drv_wc wc);
     rdma_verb_completion c;
 
@@ -257,9 +257,9 @@ class rdma_verb_monitor extends uvm_monitor;
     cqe_ap.write(c);
   endfunction
 
-  // 功能：AEQ 事件 {ecode[31:24], id[23:0]} → rdma_aeq_event 广播。
-  // 输入/输出及副作用：写 aeq_ap。
-  // 失败/边界：无。
+  // 功能：把原始 {ecode[31:24], id[23:0]} 解码成带 Function 号的 rdma_aeq_event 并广播。
+  // 输入/输出及副作用：读取 raw/func，输出一条 UVM_HIGH 日志并写 aeq_ap；事件对象经 factory 新建。
+  // 失败/边界：接受任意 32 bit 编码且不验证 ecode/id；要求 factory 对象和 analysis 端口有效。
   protected function void publish_aeq(bit [31:0] raw);
     rdma_aeq_event e;
 
@@ -300,16 +300,16 @@ class rdma_verb_agent extends uvm_agent;
   rdma_verb_driver driver;
   rdma_verb_monitor monitor;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 verb agent 外壳，子 sequencer、driver 与 monitor 留到 build_phase 创建。
+  // 输入/输出及副作用：name/parent 仅建立 UVM 组件层级；构造后三个子组件句柄仍为 null。
+  // 失败/边界：允许 parent 为 null；在 build_phase 完成前不得连接或绑定子组件。
   function new(string name = "rdma_verb_agent", uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：创建子组件。
-  // 输入/输出及副作用：创建 sequencer/driver/monitor。
-  // 失败/边界：无。
+  // 功能：执行父类 build 后，经 UVM factory 创建本 agent 唯一的 sequencer、driver 与 monitor。
+  // 输入/输出及副作用：phase 由 UVM 调度；三个子组件以 this 为 parent，并写入对应成员句柄。
+  // 失败/边界：依赖 UVM build_phase 只执行一次；factory 创建失败或同名重复由 UVM 机制报告。
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
     sequencer = rdma_verb_sequencer::type_id::create("sequencer", this);
@@ -317,17 +317,17 @@ class rdma_verb_agent extends uvm_agent;
     monitor = rdma_verb_monitor::type_id::create("monitor", this);
   endfunction
 
-  // 功能：连接 driver 与 sequencer、monitor。
-  // 输入/输出及副作用：建立 TLM 连接。
-  // 失败/边界：无。
+  // 功能：连接 driver 的 seq_item_port 与 sequencer export，并把 monitor 句柄交给 driver 等待完成。
+  // 输入/输出及副作用：phase 由 UVM 调度；建立持久 TLM 连接并设置 driver.monitor 非拥有引用。
+  // 失败/边界：要求 build_phase 已成功创建三个子组件；重复连接或空句柄错误由 UVM 报告。
   function void connect_phase(uvm_phase phase);
     driver.seq_item_port.connect(sequencer.seq_item_export);
     driver.monitor = monitor;
   endfunction
 
-  // 功能：绑定 env 与 Function 下标。
-  // 输入/输出及副作用：设置 driver/monitor。
-  // 失败/边界：无。
+  // 功能：把同一 env 非拥有引用和 Function 下标同时绑定给 driver 与 monitor，限定该 agent 的作用域。
+  // 输入/输出及副作用：读取 env/func 并覆盖两个子组件的配置字段，不改变 env 资源或 Function 生命周期。
+  // 失败/边界：要求 build_phase 已完成、env 非空且 func 对应 env.res.funcs 的有效项；本函数不自行校验范围。
   function void bind_func(rdma_env env, int unsigned func);
     driver.env = env;
     driver.func = func;

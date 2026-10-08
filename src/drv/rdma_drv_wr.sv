@@ -33,16 +33,16 @@ class rdma_drv_sge extends uvm_object;
   int unsigned length;
   bit [31:0] lkey;
 
-  // 功能：构造 SGE。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造字段均为类型默认值的 SGE，供调用方随后填写地址、长度与 lkey。
+  // 输入/输出及副作用：name 传给 uvm_object 建立对象标识；不取得主机内存或 MR 的所有权。
+  // 失败/边界：本构造函数不校验 addr/length/lkey，零长度项会在描述符编码和数据收集时被跳过。
   function new(string name = "rdma_drv_sge");
     super.new(name);
   endfunction
 
-  // 功能：便捷构造。
-  // 输入/输出及副作用：返回新对象。
-  // 失败/边界：无。
+  // 功能：经 UVM factory 新建 SGE，并把 addr、length 与 lkey 原样写入对应字段。
+  // 输入/输出及副作用：返回独立的 rdma_drv_sge 对象；仅保存参数值，不拥有 addr 指向的内存。
+  // 失败/边界：允许 length 为 0，此类 SGE 随后会被数据路径忽略；不检查地址范围或 lkey 有效性。
   static function rdma_drv_sge make(bit [63:0] addr, int unsigned length, bit [31:0] lkey);
     rdma_drv_sge s;
 
@@ -74,9 +74,9 @@ class rdma_drv_send_wr extends uvm_object;
   bit [47:0] dmac;
   byte unsigned dest_ip[16];
 
-  // 功能：构造空 WR（默认 signaled）。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造默认请求完成通知的空发送 WR；SGE 队列为空，其余字段保留类型默认值。
+  // 输入/输出及副作用：name 传给 uvm_object 建立对象标识，signaled 初始化为 1；不拥有后续加入的 SGE。
+  // 失败/边界：构造时不校验 opcode、远端地址或 UD 目的信息，调用 post_send 前须由调用方补齐所需字段。
   function new(string name = "rdma_drv_send_wr");
     super.new(name);
     signaled = 1'b1;
@@ -89,9 +89,9 @@ class rdma_drv_recv_wr extends uvm_object;
   longint unsigned wr_id;
   rdma_drv_sge sges[$];
 
-  // 功能：构造空 WR。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造 wr_id 为类型默认值且 SGE 队列为空的接收 WR。
+  // 输入/输出及副作用：name 传给 uvm_object 建立对象标识；对象只保存 SGE 句柄，不取得其所有权。
+  // 失败/边界：构造时不要求 SGE，队列容量与 key 合法性留给 post_recv/post_srq_recv 检查。
   function new(string name = "rdma_drv_recv_wr");
     super.new(name);
   endfunction
@@ -110,9 +110,9 @@ class rdma_drv_wc extends uvm_object;
   int unsigned qpn;
   int unsigned src_qp;
 
-  // 功能：构造空 WC。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造待填充的工作完成对象，各完成字段先保留 SystemVerilog 类型默认值。
+  // 输入/输出及副作用：name 传给 uvm_object 建立对象标识；不引用或拥有 CQ、QP 等驱动资源。
+  // 失败/边界：构造函数不赋予有效完成语义，发布前必须由普通或 URC 轮询路径填入状态和标识字段。
   function new(string name = "rdma_drv_wc");
     super.new(name);
   endfunction
@@ -130,16 +130,16 @@ class rdma_drv_wr extends uvm_object;
   localparam int unsigned TX_CE = 2;
   localparam bit [7:0] DB_CNT_SIGN_MASK = 8'h40;
 
-  // 功能：构造（只含静态方法）。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造无实例状态的 WR 数据路径辅助对象；实际服务均由本类静态方法提供。
+  // 输入/输出及副作用：name 仅传给 uvm_object 建立对象标识，不分配队列、DMA 或硬件资源。
+  // 失败/边界：实例本身不绑定 rdma_drv_dev，调用静态方法时仍须显式提供有效设备和资源句柄。
   function new(string name = "rdma_drv_wr");
     super.new(name);
   endfunction
 
-  // 功能：WR opcode → SQ WQE opcode（xtrdma_wqe_opcode_map_table）。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：按 xtrdma_wqe_opcode_map_table 把驱动 WR opcode 转换为 4 bit SQ WQE opcode。
+  // 输入/输出及副作用：读取 op 并返回对应 RDMA_SQ_OPCODE_* 常量，不修改任何驱动状态。
+  // 失败/边界：未命中显式 SEND/WRITE/READ/ATOMIC 分支的值统一映射为 LOCAL_INV。
   static function bit [3:0] wqe_opcode(rdma_drv_wr_opcode_e op);
     case (op)
       RDMA_DRV_WR_SEND: return RDMA_SQ_OPCODE_SEND;
@@ -154,9 +154,9 @@ class rdma_drv_wr extends uvm_object;
     endcase
   endfunction
 
-  // 功能：SGE 列表的 16B 描述符（xtrdma_set_sge：LEN[62:32]|LKEY[31:0]，VA），跳过 0 长度 SGE。
-  // 输入/输出及副作用：返回新数组。
-  // 失败/边界：无。
+  // 功能：按 xtrdma_set_sge 把非零 SGE 编成连续 16B 描述符（LEN[62:32]|LKEY[31:0]，VA）。
+  // 输入/输出及副作用：只读取 sges，按原顺序返回新字节数组；不会修改 SGE 或访问其地址指向的数据。
+  // 失败/边界：length 为 0 的项被省略，长度只编码低 31 bit；本函数不验证 addr 与 lkey 的可访问性。
   static function rdma_bytes_t sge_descriptors(rdma_drv_sge sges[$]);
     rdma_bytes_t out;
     int unsigned n;
@@ -316,9 +316,9 @@ class rdma_drv_wr extends uvm_object;
     notify_sq_db(dev, qp, hdr, status);
   endtask
 
-  // 功能：URC READ 的总包数：各非零 SGE 的 ceil(len / PMTU) 之和，PMTU = 1 << (QPC PMTU + 8)。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：按 QPC 的 PMTU 计算 URC READ 各 SGE 所需分片数之和，单项采用 ceil(length / PMTU)。
+  // 输入/输出及副作用：读取 qp.qpc 与 wr.sges，返回无符号包数；不修改 QP、WR 或硬件映像。
+  // 失败/边界：零长度 SGE 贡献 0；要求 qp/wr 有效且 PMTU 编码可形成非零移位结果，不检查总和溢出。
   static function int unsigned urc_read_packets(rdma_drv_qp qp, rdma_drv_send_wr wr);
     int unsigned pmtu;
     int unsigned n;
@@ -331,9 +331,9 @@ class rdma_drv_wr extends uvm_object;
     return n;
   endfunction
 
-  // 功能：xtrdma_set_rc_wqe：按 opcode 写 RC 字段（长度/立即数、SGE 数、远端 VA/KEY、原子操作数）。
-  // 输入/输出及副作用：修改 wqe。
-  // 失败/边界：无。
+  // 功能：按 xtrdma_set_rc_wqe 和 WR opcode 填写 RC 长度、立即数、远端地址/key 或原子操作数字段。
+  // 输入/输出及副作用：原位修改 wqe；读取 wr、sge_num 与 payload，不推进队列或访问主机内存。
+  // 失败/边界：原子请求要求 wr.sges[0] 存在并固定编码 8B；未匹配的可选字段保持调用方提供的原值。
   static function void fill_rc(inout rdma_bytes_t wqe, input rdma_drv_send_wr wr,
                                input int unsigned sge_num, input longint unsigned payload);
     if (wr.opcode inside {RDMA_DRV_WR_CAS, RDMA_DRV_WR_FAA}) begin
@@ -367,9 +367,9 @@ class rdma_drv_wr extends uvm_object;
     end
   endfunction
 
-  // 功能：xtrdma_set_ud_wqe：目的 IP、hoplimit/DST_QPN/QKEY、PD、SGE 数/DMAC、长度与立即数。
-  // 输入/输出及副作用：修改 wqe。
-  // 失败/边界：无。
+  // 功能：按 xtrdma_set_ud_wqe 填写 UD 目的 IP、QPN/Q_Key、PD、DMAC、SGE 数和负载长度等字段。
+  // 输入/输出及副作用：原位修改 wqe，读取 qp.pd、wr、sge_num 与 payload；SEND_IMM 时同时写立即数。
+  // 失败/边界：要求 wqe 容纳固定 16B 目的 IP 且 qp.pd 非空；不拒绝非 SEND_IMM opcode 或无效目的参数。
   static function void fill_ud(inout rdma_bytes_t wqe, input rdma_drv_qp qp,
                                input rdma_drv_send_wr wr, input int unsigned sge_num,
                                input longint unsigned payload);
@@ -387,10 +387,9 @@ class rdma_drv_wr extends uvm_object;
     end
   endfunction
 
-  // 功能：xtrdma_calculate_wqe_signature：~(头 8B 异或 ^ WQE 8..63 异或 ^ SGB 有效部分异或)，
-  //   写入 qword2 的 SIGNATURE（头也写入 wqe）。
-  // 输入/输出及副作用：修改 wqe。
-  // 失败/边界：无。
+  // 功能：按 xtrdma_calculate_wqe_signature 对头、WQE 余部及可选 SGB 求逐字节异或反码并写 SIGNATURE。
+  // 输入/输出及副作用：先把 hdr 写入 wqe 头，再原位更新签名；use_sgb 为 1 时只读 sgb 有效字节。
+  // 失败/边界：要求 wqe 尺寸满足头与签名字段且签名位调用前为 0；use_sgb 为 0 时忽略非空 sgb。
   static function void sign(inout rdma_bytes_t wqe, input bit [63:0] hdr, input rdma_bytes_t sgb,
                             input bit use_sgb);
     bit [7:0] sum;
@@ -985,10 +984,9 @@ class rdma_drv_wr extends uvm_object;
     end
   endtask
 
-  // 功能：硬件完成位置之后的 URC 完成：abnml 时为该方向的异常 ecode（远端 syndrome =
-  //   FATAL_SYNDROME + 0x60），否则为 SQ/RQ FLUSH。
-  // 输入/输出及副作用：返回新对象。
-  // 失败/边界：无。
+  // 功能：为硬件完成位置之后的 URC WQE 合成异常完成；选择异常 ecode/syndrome 或对应方向 FLUSH。
+  // 输入/输出及副作用：读取 qp、wr_id、is_recv、info 与 abnml，返回由 urc_wc 新建的独立 WC。
+  // 失败/边界：abnml 为 1 时要求 info 至少含方向 ecode 和 FATAL_SYNDROME；不校验其中的硬件编码。
   static function rdma_drv_wc urc_error_wc(rdma_drv_qp qp, longint unsigned wr_id, bit is_recv,
                                            rdma_bytes_t info, bit abnml);
     bit [7:0] ecode;
@@ -1001,9 +999,9 @@ class rdma_drv_wr extends uvm_object;
     return urc_wc(qp, wr_id, is_recv, wc_status(ecode, 8'h60 + info[0][5:4]), ecode);
   endfunction
 
-  // 功能：新建一个 URC 完成。
-  // 输入/输出及副作用：返回新对象。
-  // 失败/边界：无。
+  // 功能：经 UVM factory 新建 URC WC，并填入 WR/QP 标识、收发方向、状态与 vendor ecode。
+  // 输入/输出及副作用：读取 qp.qpn 和各标量参数，返回独立 WC；byte_len、imm、pkt_opcode 留给调用方补充。
+  // 失败/边界：要求 qp 与 factory 返回对象有效；不验证 st/ecode 组合，也不检查 wr_id 是否仍在未完成环中。
   static function rdma_drv_wc urc_wc(rdma_drv_qp qp, longint unsigned wr_id, bit is_recv,
                                      rdma_drv_wc_status_e st, bit [7:0] ecode);
     rdma_drv_wc wc;
