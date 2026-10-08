@@ -206,13 +206,18 @@ pcie_work_preflight:
 	@if [[ -z "$(PCIE_WORK_ROOT)" || ! -r "$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" ]]; then \
 		echo "PCIE_WORK_ROOT must point at a pcie_work checkout" >&2; exit 2; fi
 
+# PCIe suite 同时覆盖正常事务守恒，以及 timeout/UR/CA 经真实 CMQ 路径传播到驱动的负向场景。
+PCIE_WORK_TESTS := rdma_env_pcie_test rdma_env_pcie_fault_test
+
 pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_work_preflight
 	set -euo pipefail; \
 	$(call RDMA_COMPILE,build/pcie_work,+define+RDMA_PCIE_WORK_TEST -f build/pcie_work/pcie_work.f); \
-	test_name=$(TEST); \
-	if [[ "$$test_name" == regression ]]; then test_name=rdma_env_pcie_test; fi; \
-	build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
-	../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log
+	tests="$(TEST)"; \
+	if [[ "$$tests" == regression ]]; then tests="$(PCIE_WORK_TESTS)"; fi; \
+	for test_name in $$tests; do \
+		build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
+		../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log; \
+	done
 
 # Soft-RoCE 互打：需先在本机运行 tools/rxe/rxe_tap_setup.sh up（TAP 网卡 + rxe 设备，需 sudo）。
 RXE_TAP ?= rtap0
