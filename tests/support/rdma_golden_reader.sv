@@ -257,9 +257,10 @@ class rdma_golden_reader;
     return RDMA_SC_OK;
   endfunction
 
-  // 功能：在 rdma_golden_reader 中，read_all 按完整 key/handle 查找唯一权威记录并返回 detached 快照，避免把内部可变引用泄露给调用方。
-  // 输入/输出及副作用：path（输入）、cases（输出）、error（输出）；read_all 读取 path、cases、error 并使用字段 error、state、fd、current、cases，并写入 cases、error；函数返回 bit，不取得调用方资源所有权。
-  // 失败/边界：read_all 在 key/handle 缺失、记录不唯一或 generation/reset epoch 过期时返回明确错误，不回退到默认 authority。
+  // 功能：读取 path 指定的完整 golden 文件，按 marker、case、inputs、byte count、payload 和空行顺序解析所有用例。
+  // 输入/输出及副作用：函数打开并关闭 path；成功时将新建的 rdma_golden_case 对象队列写入 cases 并返回 1；
+  //   失败时保持 cases 为空、通过 error 说明原因并返回 0。
+  // 失败/边界：文件无法打开、行格式或状态顺序错误、case 名重复、payload 非法、内部状态越界、文件截断或不含 case 时失败；所有已打开的文件句柄均在返回前关闭。
   static function bit read_all(
       string path,
       output rdma_golden_case cases[$],
@@ -355,6 +356,11 @@ class rdma_golden_reader;
           // 空行仅分隔 case，不重新进入 marker 状态。
           current = new();
           state = 1;
+        end
+        default: begin
+          error = $sformatf("golden reader entered invalid state %0d", state);
+          $fclose(fd);
+          return 0;
         end
       endcase
     end
