@@ -16,9 +16,9 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   // 执行完成的请求（覆盖率用；资源变化另经资源库广播）。
   uvm_analysis_port #(rdma_ctrl_item) ap;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造控制面 driver 并建立发布已执行请求的 analysis port。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；ap 由本组件拥有，env 仍为待绑定的非拥有空引用。
+  // 失败/边界：构造阶段不访问资源或驱动；run_phase 前必须绑定 env 并连接 sequencer，否则无法取 item。
   function new(string name = "rdma_ctrl_driver", uvm_component parent = null);
     super.new(name, parent);
     ap = new("ap", this);
@@ -314,25 +314,25 @@ class rdma_ctrl_agent extends uvm_agent;
   rdma_ctrl_sequencer sequencer;
   rdma_ctrl_driver driver;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造尚未创建子组件的控制面 agent 容器。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；sequencer 与 driver 保持 null，由 build_phase 拥有并创建。
+  // 失败/边界：parent 可为 null；在 build_phase 前访问或连接两个子组件属于生命周期错误。
   function new(string name = "rdma_ctrl_agent", uvm_component parent = null);
     super.new(name, parent);
   endfunction
 
-  // 功能：创建 sequencer 与 driver。
-  // 输入/输出及副作用：创建子组件。
-  // 失败/边界：无。
+  // 功能：经 UVM factory 创建本 agent 独占的控制 sequencer 与可替换 driver 子组件。
+  // 输入/输出及副作用：phase 传给父类；覆盖 sequencer/driver 句柄并把当前 agent 设为其 parent。
+  // 失败/边界：factory override 必须返回声明的兼容类型；标准 UVM build 仅调用一次，不支持运行期重建。
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
     sequencer = rdma_ctrl_sequencer::type_id::create("sequencer", this);
     driver = rdma_ctrl_driver::type_id::create("driver", this);
   endfunction
 
-  // 功能：连接 driver 与 sequencer。
-  // 输入/输出及副作用：建立 TLM 连接。
-  // 失败/边界：无。
+  // 功能：把 driver 的 seq_item_port 连接到本 agent sequencer 的 seq_item_export。
+  // 输入/输出及副作用：建立唯一请求 TLM 通路；phase 本身不修改，不启动 sequence 或 driver 循环。
+  // 失败/边界：要求 build_phase 已成功创建两个非空子组件；重复或额外连接不在本 agent 契约内。
   function void connect_phase(uvm_phase phase);
     driver.seq_item_port.connect(sequencer.seq_item_export);
   endfunction
