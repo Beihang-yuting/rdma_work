@@ -4,8 +4,8 @@
 //   rdma_pair 为两 Function 的标准拓扑（各一 PD、CQ、URC 专用 CQ、RC/UD/URC QP、数据 MR，同类 QP
 //   互连）；每个场景一个子类：basic_traffic、high_traffic。
 // 依赖：rdma_env（vsequencer 持有）、控制面/数据面 sequencer。
-// 所有权：序列只借用资源句柄。
-// 生命周期：测试 run_phase 启动。
+// 所有权：序列只借用由控制面驱动创建和管理的资源句柄，不拥有外部 env/sequencer。
+// 生命周期：测试在 run_phase 创建并启动序列；reset/destroy 后旧资源句柄失效，序列结束后不再使用。
 
 class rdma_pair extends uvm_object;
   `uvm_object_utils(rdma_pair)
@@ -19,9 +19,9 @@ class rdma_pair extends uvm_object;
   rdma_res_qp qp[2][3];
   bit urc;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：创建一个尚未填充资源的双 Function 拓扑句柄集合。
+  // 输入/输出及副作用：name 传给 uvm_object；pd/cq/mem/mr/qp 句柄保持空，urc 保持默认 0。
+  // 失败/边界：构造过程不分配 RDMA 资源，使用成员前必须由 setup_pair 完整填充对应槽位。
   function new(string name = "rdma_pair");
     super.new(name);
   endfunction
@@ -33,16 +33,16 @@ class rdma_base_vseq extends uvm_sequence;
 
   rdma_env env;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：创建控制面和数据面场景共用的虚拟序列基类实例。
+  // 输入/输出及副作用：name 传给 uvm_sequence；env 保持空，等待 pre_body 从 p_sequencer 绑定。
+  // 失败/边界：构造时不校验或绑定 rdma_vsequencer，启动序列前必须提供兼容的 p_sequencer。
   function new(string name = "rdma_base_vseq");
     super.new(name);
   endfunction
 
-  // 功能：取 env 并等待就绪。
-  // 输入/输出及副作用：阻塞到就绪。
-  // 失败/边界：无。
+  // 功能：从虚拟 sequencer 绑定 env，并等待环境完成初始化后再进入序列主体。
+  // 输入/输出及副作用：无显式参数；写入本对象 env，阻塞调用 env.wait_ready() 直到就绪。
+  // 失败/边界：p_sequencer 及其 env 必须非空；本 task 不设超时，环境永不就绪时会持续阻塞。
   task pre_body();
     env = p_sequencer.env;
     env.wait_ready();
@@ -58,9 +58,10 @@ class rdma_base_vseq extends uvm_sequence;
       `uvm_fatal("RDMA_VSEQ", {it.convert2string(), " failed: ", it.status.convert2string()})
   endtask
 
-  // 功能：构造控制面请求。
-  // 输入/输出及副作用：返回新 item。
-  // 失败/边界：无。
+  // 功能：通过 UVM factory 创建控制面 item，并写入本次操作码与目标 Function 索引。
+  // 输入/输出及副作用：输入 op/func，返回新 rdma_ctrl_item；其余字段保留类型默认值。
+  // 失败/边界：不验证 func 是否存在或 op 所需的附加字段；调用方必须在 ctrl 前补齐，且依赖 factory
+  //   已正确注册 rdma_ctrl_item。
   function rdma_ctrl_item new_ctrl(rdma_ctrl_op_e op, int unsigned func);
     rdma_ctrl_item it;
 
@@ -228,9 +229,10 @@ class rdma_base_vseq extends uvm_sequence;
       connect(p.qp[0][k], p.qp[1][k]);
   endtask
 
-  // 功能：构造 verb：本地区域在 lmr，远端区域在 rmr（可空）。
-  // 输入/输出及副作用：返回新 item。
-  // 失败/边界：无。
+  // 功能：通过 UVM factory 构造 verb item，并填入 QP、本地/远端 MR、偏移、长度与 SGE 数量。
+  // 输入/输出及副作用：输入 op、qp、lmr、rmr 及区域参数，返回独立 item；不修改资源对象。
+  // 失败/边界：允许 rmr 为空以表示 SEND/RECV，但不检查句柄、范围、length 或 sge_count；非法组合
+  //   由数据面驱动和 scoreboard 在投递时处理。
   function rdma_verb_item verb(rdma_verb_op_e op, rdma_res_qp qp, rdma_res_mr lmr,
                                int unsigned local_offset, int unsigned length,
                                rdma_res_mr rmr = null, int unsigned remote_offset = 0,
@@ -249,9 +251,11 @@ class rdma_base_vseq extends uvm_sequence;
     return it;
   endfunction
 
-  // 功能：在所属 Function 的数据面 sequencer 上投递（signaled SQ 请求阻塞到完成）。
-  // 输入/输出及副作用：见 verb driver。
-  // 失败/边界：无。
+  // 功能：按 SRQ 或 QP 的 owner 选择 Function 数据面 sequencer，并完成一次 verb item 交互。
+  // 输入/输出及副作用：输入 it；调用 start_item/finish_item，驱动可更新状态，signaled SQ 请求会
+  //   阻塞到对应完成。
+  // 失败/边界：it 以及所选 srq/qp owner 必须有效，owner.index 必须已有 env.verb；本 task 不设超时，
+  //   driver 不结束 item 时会持续阻塞。
   task post(rdma_verb_item it);
     rdma_res_func f;
 
@@ -274,9 +278,9 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
   rdma_pair p;
   protected int unsigned count;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：创建基础全功能流量序列，并保留默认 Function 0→1 配置与从零开始的数据模式计数。
+  // 输入/输出及副作用：name 传给基类；f0/f1 为 0/1，p 尚未建立，count 保持默认 0。
+  // 失败/边界：构造不检查 Function 数量或分配拓扑，必须由 body 成功执行 setup_pair 后再运行子场景。
   function new(string name = "rdma_basic_traffic_vseq");
     super.new(name);
   endfunction
@@ -301,8 +305,10 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
 
   // 功能：Function n 经第 k 类 QP（0 RC/1 UD/2 URC）的 verb，远端为对端 MR；数据模式轮换；远端
   //   Function（rxe 对端进程）只支持单 SGE。
-  // 输入/输出及副作用：返回新 item。
-  // 失败/边界：无。
+  // 输入/输出及副作用：输入 n/op/偏移/长度/k/sges，返回已绑定本端 MR（远端访问还绑定对端 MR）
+  //   的新 item；每次调用递增 count 以轮换 data_mode。
+  // 失败/边界：p 必须已由 setup_pair 填充，n 只能为 0/1 且 k 必须指向已创建 QP；远端 Function
+  //   强制单 SGE，偏移与长度是否合法留给 driver/scoreboard 判定。
   function rdma_verb_item v(int unsigned n, rdma_verb_op_e op, int unsigned local_offset,
                             int unsigned length, int unsigned remote_offset = 0,
                             int unsigned k = 0, int unsigned sges = 1);
@@ -320,9 +326,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     return it;
   endfunction
 
-  // 功能：SEND 跨 3 个 MTU 包、SEND_IMM 单包；接收端先投 RECV。
-  // 输入/输出及副作用：Function 1 的 0x2000/0x3000 区域被写入。
-  // 失败/边界：无。
+  // 功能：先为 Function 1 投递两个 RECV，再发送跨 3 个 MTU 的 SEND 与携带立即数的单包 SEND_IMM。
+  // 输入/输出及副作用：使用 p.qp[*][0]；成功后 Function 1 的 0x2000/0x3000 区域被写入，第二个
+  //   接收完成携带 32'hcafe_0001。
+  // 失败/边界：要求 setup_pair 已建立 RC QP/MR 且固定区域落在 BUF_BYTES 内；任一投递失败由 verb
+  //   driver 或 scoreboard 报告，本 task 不自行恢复 QP。
   task send_recv();
     rdma_verb_item it;
 
@@ -334,9 +342,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     post(it);
   endtask
 
-  // 功能：unsignaled + signaled WRITE、WRITE_IMM（消耗 RQE），随后 READ 回读写入区域。
-  // 输入/输出及副作用：Function 1 的 0x4000 区域写入，Function 0 的 0x6000 区域回读。
-  // 失败/边界：无。
+  // 功能：依次覆盖 unsignaled/signaled WRITE、消耗 RQE 的 WRITE_IMM，并用 READ 回读连续写入区域。
+  // 输入/输出及副作用：向 Function 1 的 0x4000 区域写入，并把 2448 字节回读到 Function 0 的
+  //   0x6000；WRITE_IMM 使用预投 RECV 并携带 32'hcafe_0002。
+  // 失败/边界：要求 RC QP 仍为 RTS、接收端 RQE 可用且固定本地/远端区域有效；首个 unsignaled
+  //   WRITE 依赖后续 signaled 请求的有序完成来结算。
   task write_read();
     rdma_verb_item it;
 
@@ -373,9 +383,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     post(it);
   endtask
 
-  // 功能：反方向 1 → 0 的 WRITE 与 SEND。
-  // 输入/输出及副作用：Function 0 的 0x8000/0x9000 区域写入。
-  // 失败/边界：无。
+  // 功能：从 Function 1 反向发起 WRITE，并在 Function 0 先投 RECV 后执行反向 SEND。
+  // 输入/输出及副作用：使用反向 RC QP，把 Function 0 的 0x8000/0x9000 区域分别写入远端写和
+  //   接收负载。
+  // 失败/边界：要求双向 QP 均已连接且 Function 0 的接收缓冲至少容纳 1025 字节；投递错误交由
+  //   driver/scoreboard 判定。
   task reverse_write();
     post(v(1, RDMA_VERB_WRITE, 'h0000, 1024, 'h8000));
     post(v(0, RDMA_VERB_RECV, 'h9000, 'h800));
@@ -384,8 +396,10 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
 
   // 功能：多 SGE：4-SGE SEND 进 4-SGE RECV（外部 SGB）、3-SGE SEND 进 2-SGE RECV、3-SGE WRITE、
   //   READ 散写到 3 个 SGE。
-  // 输入/输出及副作用：Function 1 的 0xa000/0xb000、Function 0 的 0xc000 区域写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：构造 2～4 个 SGE 的 RECV/SEND/WRITE/READ，写入 Function 1 的
+  //   0xa000/0xb000 与 Function 0 的 0xc000 区域，并使外部 SGB 路径参与取址。
+  // 失败/边界：要求本地双 Function 路径支持多 SGE/SGB 且固定区域足够大；owner.remote 时 v 会
+  //   强制单 SGE，因此该场景不再覆盖远端进程的多 SGE 能力。
   task multi_sge();
     post(v(1, RDMA_VERB_RECV, 'ha000, 'hc00, 0, 0, 4));
     post(v(1, RDMA_VERB_RECV, 'hac00, 'h400, 0, 0, 2));
@@ -395,9 +409,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     post(v(0, RDMA_VERB_READ, 'hc000, 1800, 'hb100, 0, 3));
   endtask
 
-  // 功能：UD SEND（3 个 SGE 经 SGB，单包 ≤ MTU）与 UD SEND_IMM。
-  // 输入/输出及副作用：Function 1 的 0xd000/0xd400 区域写入（含 40B GRH）。
-  // 失败/边界：无。
+  // 功能：经 UD QP 发送一个三 SGE 单包 SEND 和一个携带立即数的 SEND_IMM，接收端均预投 RQE。
+  // 输入/输出及副作用：写入 Function 1 的 0xd000/0xd400 区域，接收长度计入 40 字节 GRH，立即数
+  //   为 32'hcafe_0003。
+  // 失败/边界：要求 qp[*][1] 已连接且 700 字节负载加 GRH 不超过接收缓冲/MTU；UD 丢包或 Q_Key
+  //   不匹配不会由协议重试，本场景依赖无故障链路。
   task ud_send();
     rdma_verb_item it;
 
@@ -409,9 +425,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     post(it);
   endtask
 
-  // 功能：URC SEND（3 包）、WRITE 与 WRITE_IMM（不等 ACK 即完成）。
-  // 输入/输出及副作用：Function 1 的 0xe000/0xf000/0xf800 区域写入。
-  // 失败/边界：无。
+  // 功能：经 URC QP 发送三包 SEND、WRITE 与 WRITE_IMM，覆盖无需等待 ACK 的完成路径。
+  // 输入/输出及副作用：使用 qp[*][2] 写入 Function 1 的 0xe000/0xf000/0xf800 区域，立即数为
+  //   32'hcafe_0004。
+  // 失败/边界：仅 p.urc 为 1、即双方均为本地 Function 时可调用；否则 qp[*][2] 未创建，body 必须
+  //   保持现有条件保护，且该无确认传输依赖无故障链路。
   task urc_traffic();
     rdma_verb_item it;
 
@@ -424,9 +442,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     post(it);
   endtask
 
-  // 功能：长度两端：8 KiB 的 SEND（进 8 KiB RECV）、WRITE 与回读的 READ，32B 的 READ。
-  // 输入/输出及副作用：Function 1 的 0x10000/0x12000、Function 0 的 0x14000/0x16000 区域写入。
-  // 失败/边界：无。
+  // 功能：覆盖 8 KiB SEND/WRITE/READ 的分段上限路径，并补充一次 32 字节短 READ。
+  // 输入/输出及副作用：写入 Function 1 的 0x10000/0x12000 与 Function 0 的 0x14000/0x16000
+  //   区域，所有请求经 RC QP 投递。
+  // 失败/边界：要求 BUF_BYTES 覆盖最高地址且 QP MTU/队列深度能承载 8 KiB 分段；长度或区域不合法
+  //   时由 driver/scoreboard 报错，本 task 不缩短请求。
   task sizes();
     post(v(1, RDMA_VERB_RECV, 'h10000, 'h2000));
     post(v(0, RDMA_VERB_SEND, 'h10000, 'h2000));
@@ -435,9 +455,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
     post(v(0, RDMA_VERB_READ, 'h16000, 32, 'h12100));
   endtask
 
-  // 功能：WRITE 越过对端 MR 末尾（scoreboard 预测 REM_ACCESS_ERR、对端内存不变）。
-  // 输入/输出及副作用：RC QP 随后进入错误态，故放在最后。
-  // 失败/边界：无。
+  // 功能：故意让 64 字节 WRITE 越过对端 MR 末尾 32 字节，验证 REM_ACCESS_ERR 与内存不变。
+  // 输入/输出及副作用：使用 RC QP 投递预期失败请求；scoreboard 随后把连接预测为错误态，因此本
+  //   场景必须位于该 QP 的最后。
+  // 失败/边界：要求 p.mr[1].len 至少为 32 且此前 RC QP 正常；若后续继续在同一 QP 投递，只应
+  //   期待 FLUSH，而不能复用本场景前的成功预期。
   task access_error();
     post(v(0, RDMA_VERB_WRITE, 'h0000, 64, p.mr[1].len - 32));
   endtask
@@ -456,9 +478,9 @@ class rdma_high_traffic_vseq extends rdma_base_vseq;
 
   rdma_pair p;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：创建高流量窗口序列实例，保留尚未建立的双 Function 拓扑句柄。
+  // 输入/输出及副作用：name 传给基类；p 保持空，流量规模由 PACKETS/WINDOW/RX_SLOTS 常量定义。
+  // 失败/边界：构造不创建资源或验证队列深度，必须由 body 的 setup_pair 成功后才能填充窗口。
   function new(string name = "rdma_high_traffic_vseq");
     super.new(name);
   endfunction
