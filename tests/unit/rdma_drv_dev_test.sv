@@ -12,8 +12,8 @@ class rdma_drv_dev_test extends uvm_test;
   rdma_drv_dev drv;
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传给 uvm_test。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 uvm_test；mem/dev/drv 保持 null，尚未取得系统资源所有权。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；probe/remove 夹具只在 run_phase 建立并收尾。
   function new(string name = "rdma_drv_dev_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction

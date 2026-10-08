@@ -19,8 +19,8 @@ class rdma_dev_cmq_test extends uvm_test;
   rdma_bytes_t scratch;
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传给 uvm_test。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 uvm_test；CMQ ring/context 句柄为空，posted 与地址使用零初值。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；run_phase 建立 ring 后 make/post 辅助才可访问设备。
   function new(string name = "rdma_dev_cmq_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
@@ -97,8 +97,8 @@ class rdma_dev_cmq_test extends uvm_test;
   endfunction
 
   // 功能：新建 64B SQE 并写 qword0 的 opcode 与低位对象号。
-  // 输入/输出及副作用：返回新数组。
-  // 失败/边界：无。
+  // 输入/输出及副作用：返回清零的 64B 新数组，qword0 为 low_fields 与左移 opcode 的按位或，不改输入。
+  // 失败/边界：opcode 固定截为 8 位；调用者不得在 low_fields 中预置 opcode 位，否则按位或会合并而非覆盖。
   function rdma_bytes_t make_sqe(bit [7:0] opcode, bit [63:0] low_fields = 0);
     rdma_bytes_t sqe;
 

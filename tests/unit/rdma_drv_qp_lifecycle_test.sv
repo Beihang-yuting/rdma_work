@@ -11,8 +11,8 @@ class rdma_drv_qp_lifecycle_test extends rdma_drv_data_test;
   `uvm_component_utils(rdma_drv_qp_lifecycle_test)
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 rdma_drv_data_test；沿用其空节点与 next_wr_id 初始状态。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；生命周期用例依赖父类 run_phase 先建立并连接两个 QP。
   function new(string name = "rdma_drv_qp_lifecycle_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction

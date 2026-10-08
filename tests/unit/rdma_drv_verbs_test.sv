@@ -15,8 +15,8 @@ class rdma_drv_verbs_test extends uvm_test;
   rdma_drv_cq cq;
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传给 uvm_test。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 uvm_test；sys/mem/dev/drv/pd/cq 为空，资源由 run_phase 创建销毁。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；任何 verbs 辅助必须晚于 probe 与基础 PD/CQ 建立。
   function new(string name = "rdma_drv_verbs_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
@@ -176,8 +176,8 @@ class rdma_drv_verbs_test extends uvm_test;
   endtask
 
   // 功能：建一个 QP 的初始属性。
-  // 输入/输出及副作用：返回新对象。
-  // 失败/边界：无。
+  // 输入/输出及副作用：创建属性对象，选择 t，借用测试当前 pd/cq 同时作为收发 CQ，并把 send SGE 上限设 4。
+  // 失败/边界：要求 pd/cq 已由 run_phase 建立；t 应为驱动支持的 RC/UD，函数不创建 SRQ 或校验资源状态。
   function rdma_drv_qp_init_attr qp_attr(rdma_drv_qp_type_e t);
     rdma_drv_qp_init_attr a;
 

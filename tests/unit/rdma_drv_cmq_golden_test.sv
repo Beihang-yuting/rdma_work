@@ -13,8 +13,8 @@ class rdma_drv_cmq_golden_test extends uvm_test;
   localparam int unsigned GOLDEN_CASES = 51;
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 uvm_test；不加载 golden、不创建 SQE，也不持有外部归档。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；golden 文件缺失或数量错误在 run_phase 报告。
   function new(string name = "rdma_drv_cmq_golden_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction

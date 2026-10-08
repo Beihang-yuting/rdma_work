@@ -8,9 +8,9 @@
 class rdma_dpu_test_system extends uvm_object;
   `uvm_object_utils(rdma_dpu_test_system)
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造无实例状态的 dpu_common 单元测试夹具对象。
+  // 输入/输出及副作用：name 为 UVM 名；不创建或拥有 rdma_dpu_system，系统所有权由 single_host 调用方取得。
+  // 失败/边界：通常只使用静态 single_host；直接构造不会自动声明 Host/Function 或 build 系统。
   function new(string name = "rdma_dpu_test_system");
     super.new(name);
   endfunction

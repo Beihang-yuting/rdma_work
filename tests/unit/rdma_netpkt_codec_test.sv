@@ -7,8 +7,8 @@ class rdma_netpkt_codec_test extends uvm_test;
   `uvm_component_utils(rdma_netpkt_codec_test)
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；尚未创建 codec 或 packet，测试对象只在 run_phase 持有。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；外部 net_packet 类型/字段不匹配在编译或用例中暴露。
   function new(string name = "rdma_netpkt_codec_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction

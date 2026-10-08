@@ -23,8 +23,8 @@ class rdma_drv_data_link extends rdma_dev_port;
   int unsigned dropped;
 
   // 功能：构造链路。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name 为 UVM 对象名；nodes/drops/drop_after/sent_to 为空，包与丢弃计数清零。
+  // 失败/边界：构造不绑定目的 MAC；send 到未登记地址会报错，故障计数需由具体用例显式配置。
   function new(string name = "rdma_drv_data_link");
     super.new(name);
     packets = 0;
@@ -70,8 +70,8 @@ class rdma_drv_data_node extends uvm_object;
   rdma_drv_mr mr;
 
   // 功能：构造空节点。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name 为 UVM 对象名；system/mem/dev/drv 与 PD/CQ/QP/MR/DMA 均为空且未取得所有权。
+  // 失败/边界：必须由 build_node 完成 probe、缓冲注册和 QP 创建后才能用于 post 或内存检查。
   function new(string name = "rdma_drv_data_node");
     super.new(name);
   endfunction
@@ -88,8 +88,8 @@ class rdma_drv_data_test extends uvm_test;
   longint unsigned next_wr_id;
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传给 uvm_test。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 uvm_test；a/b/link 为空，next_wr_id 从 100 开始单调分配。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；两个节点与链路由 run_phase 建立并拥有到测试结束。
   function new(string name = "rdma_drv_data_test", uvm_component parent = null);
     super.new(name, parent);
     next_wr_id = 100;
@@ -298,8 +298,8 @@ class rdma_drv_data_test extends uvm_test;
   endtask
 
   // 功能：建一个发送 WR（SGE 指向节点缓冲）。
-  // 输入/输出及副作用：返回新 WR。
-  // 失败/边界：无。
+  // 输入/输出及副作用：创建 WR，分配并推进 next_wr_id，设置 op，并按 offsets 顺序追加节点 MR 的 SGE。
+  // 失败/边界：要求 n/data_buf/mr 有效、offsets 与 lens 等长且每段在注册范围内；本函数不提前拒绝越界。
   function rdma_drv_send_wr send_wr(rdma_drv_data_node n, rdma_drv_wr_opcode_e op,
                                     int unsigned offsets[$], int unsigned lens[$]);
     rdma_drv_send_wr wr;

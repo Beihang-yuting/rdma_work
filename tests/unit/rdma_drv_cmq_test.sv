@@ -14,8 +14,8 @@ class rdma_drv_cmq_test extends uvm_test;
   rdma_drv_cmq cmq;
 
   // 功能：构造测试组件。
-  // 输入/输出及副作用：name/parent 透传给 uvm_test。
-  // 失败/边界：无。
+  // 输入/输出及副作用：name/parent 透传给 uvm_test；system/dev/bar/hw/cmq 句柄为空，尚未拥有 ring 或 DMA。
+  // 失败/边界：parent=null 是顶层 test 的正常形式；设备与驱动 CMQ 必须由 run_phase 装配后才能执行用例。
   function new(string name = "rdma_drv_cmq_test", uvm_component parent = null);
     super.new(name, parent);
   endfunction
