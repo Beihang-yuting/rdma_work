@@ -12,9 +12,9 @@ class rdma_vsequencer extends uvm_sequencer;
 
   rdma_env env;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造尚未绑定 RDMA 环境的虚拟 sequencer，作为跨控制面/数据面 sequence 的协调入口。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；env 保持非拥有空引用，不创建子 sequencer。
+  // 失败/边界：必须由 rdma_env.connect_phase 绑定 env 后才能启动访问环境资源的虚拟 sequence。
   function new(string name = "rdma_vsequencer", uvm_component parent = null);
     super.new(name, parent);
   endfunction
@@ -39,9 +39,10 @@ class rdma_env extends uvm_env;
   bit ctrl_busy;
   protected bit ready;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造空的 RDMA UVM 环境容器，并以 ctrl_busy=0、ready=0 开始其 build/run 生命周期。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；cfg、系统及全部子组件句柄保持 null，随后由
+  //   build_phase 创建并由本 env 拥有。
+  // 失败/边界：构造阶段不能运行 sequence 或访问 Function；缺失 cfg 将在 build_phase 以 UVM_FATAL 拒绝。
   function new(string name = "rdma_env", uvm_component parent = null);
     super.new(name, parent);
   endfunction
@@ -100,8 +101,10 @@ class rdma_env extends uvm_env;
 
   // 功能：连接组件：agent 绑定 Function，数据面与资源事件 → scoreboard，链路 → 协议检查，各事件 →
   //   覆盖率（verb 经 scoreboard 转发，已带预测状态）。
-  // 输入/输出及副作用：建立 TLM 连接。
-  // 失败/边界：无。
+  // 输入/输出及副作用：把 env 非拥有引用注入 driver/checker/coverage/vsequencer，建立资源、verb、链路与
+  //   scoreboard/coverage 的 analysis TLM 连接。
+  // 失败/边界：要求 build_phase 已成功创建必选组件，verb 数量与本地加远端 Function 数一致；关闭的
+  //   checker/cov 为 null 时有意跳过其全部连接。
   function void connect_phase(uvm_phase phase);
     ctrl.driver.env = this;
     sb.res = res;
@@ -151,9 +154,10 @@ class rdma_env extends uvm_env;
     ready = 1'b1;
   endtask
 
-  // 功能：把 Function 驱动 probe 建立的设备级队列（CMQ、CEQ、AEQ）登记到资源库。
-  // 输入/输出及副作用：写资源库。
-  // 失败/边界：无。
+  // 功能：把已 probe Function 的 CMQ、全部 CEQ 与 AEQ 包装成资源对象并登记到环境资源库。
+  // 输入/输出及副作用：f 及其驱动队列保持外部所有权；新建 wrapper，写 res，并为每个 EQ 调用 add_eq。
+  // 失败/边界：要求 f 非空、driver probe 成功且 res 已建立；同一 Function 重复登记会产生重复资源，
+  //   正常路径每个 probe/recover epoch 只调用一次并由资源库先处理失效对象。
   function void register_device(rdma_res_func f);
     rdma_res_cmq q;
 
@@ -166,9 +170,9 @@ class rdma_env extends uvm_env;
     add_eq(f, f.drv().aeq);
   endfunction
 
-  // 功能：登记一个 EQ。
-  // 输入/输出及副作用：写资源库。
-  // 失败/边界：无。
+  // 功能：把驱动 EQ 的编号、AEQ/CEQ 类型和深度投影到一个属于 Function 的资源 wrapper。
+  // 输入/输出及副作用：借用 f/eq 引用，新建 rdma_res_eq 并写入 res；不接管驱动 EQ 生命周期。
+  // 失败/边界：要求 f、eq 与 res 非空且 eqn 在该 Function 当前 epoch 唯一；本辅助函数不去重。
   protected function void add_eq(rdma_res_func f, rdma_drv_eq eq);
     rdma_res_eq e;
 
@@ -181,9 +185,9 @@ class rdma_env extends uvm_env;
     res.add(e);
   endfunction
 
-  // 功能：等待 env 就绪（全部 Function probe 并接入链路）。
-  // 输入/输出及副作用：阻塞。
-  // 失败/边界：无。
+  // 功能：阻塞调用 task，直到全部本地 Function probe/链路接入及插件 start 完成后 ready 被置位。
+  // 输入/输出及副作用：只等待本 env 的 ready，不持有 objection，也不推进其他状态。
+  // 失败/边界：没有内部超时；run_phase 在置位前 fatal、被取消或插件 start 永不返回时，本 task 持续等待。
   task wait_ready();
     wait (ready);
   endtask
@@ -204,9 +208,9 @@ class rdma_env extends uvm_env;
     end
   endtask
 
-  // 功能：结束报告：设备模型内部错误、插件检查。
-  // 输入/输出及副作用：报 UVM_ERROR。
-  // 失败/边界：无。
+  // 功能：报告阶段汇总每个本地设备 NIC 留存的协议错误，并按配置顺序调用插件收尾检查。
+  // 输入/输出及副作用：phase 不被修改；非空 errors 产生 UVM_ERROR，插件可报告并释放其自有外部资源。
+  // 失败/边界：要求 build/run 已建立 sys、cfg 与节点；远端 Function 错误由对应插件负责，错误列表不清除。
   function void report_phase(uvm_phase phase);
     foreach (sys.nodes[i])
       if (sys.nodes[i].dev.nic.errors.size() != 0)
