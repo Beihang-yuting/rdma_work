@@ -25,18 +25,18 @@ virtual class rdma_res extends uvm_object;
   int unsigned generation;
   rdma_res deps[$];
 
-  // 功能：构造 ALIVE 状态的资源。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立尚未登记的资源基对象，并把生命周期状态初始化为 ALIVE、复用代数初始化为 0。
+  // 输入/输出及副作用：name 传给 uvm_object；只初始化本对象，uid、id、kind、owner 与依赖由具体资源和资源库补齐。
+  // 失败/边界：不校验 name，也不分配设备资源；对象加入 rdma_res_db 前不得依赖尚未赋值的身份与所有者字段。
   function new(string name = "rdma_res");
     super.new(name);
     state = RDMA_RES_ALIVE;
     generation = 0;
   endfunction
 
-  // 功能：单行描述（日志用）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：把资源种类、Function 下标、设备内编号、uid、复用代数和状态格式化为单行日志文本。
+  // 输入/输出及副作用：返回当前字段的快照字符串，不修改资源或 owner。
+  // 失败/边界：owner 为空时以 Function 下标 -1 表示尚未归属，其余尚未赋值字段按 SystemVerilog 当前值输出。
   virtual function string describe();
     return $sformatf("%s f%0d #%0d (uid %0d g%0d %s)", kind.name(),
                      owner == null ? -1 : int'(owner.index), id, uid, generation, state.name());
@@ -48,9 +48,9 @@ class rdma_res_cmq extends rdma_res;
   `uvm_object_utils(rdma_res_cmq)
   rdma_drv_cmq cmq;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的 CMQ 资源描述，并固定资源种类为 RDMA_RES_CMQ。
+  // 输入/输出及副作用：name 传给资源基类；只修改新对象，cmq 驱动句柄仍由 probe 登记路径绑定。
+  // 失败/边界：构造不创建硬件 CMQ；在 cmq、owner 与 id 赋值前，该对象只能作为未登记描述使用。
   function new(string name = "rdma_res_cmq");
     super.new(name);
     kind = RDMA_RES_CMQ;
@@ -64,17 +64,17 @@ class rdma_res_eq extends rdma_res;
   bit is_aeq;
   int unsigned entries;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的 CEQ/AEQ 资源描述，并固定资源种类为 RDMA_RES_EQ。
+  // 输入/输出及副作用：name 传给资源基类；eq、is_aeq、entries 和身份字段由创建/登记路径随后填写。
+  // 失败/边界：构造不创建驱动 EQ，也不推断 CEQ/AEQ 类型；调用者必须在加入资源库前设置 is_aeq。
   function new(string name = "rdma_res_eq");
     super.new(name);
     kind = RDMA_RES_EQ;
   endfunction
 
-  // 功能：描述（区分 CEQ/AEQ）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：在资源基类描述前添加 CEQ 或 AEQ 前缀，便于日志区分两类事件队列。
+  // 输入/输出及副作用：根据 is_aeq 返回新字符串，不修改队列资源。
+  // 失败/边界：尚未显式设置 is_aeq 时使用其默认假值并显示为 CEQ；owner 为空的处理沿用基类 describe。
   virtual function string describe();
     return {is_aeq ? "AEQ " : "CEQ ", super.describe()};
   endfunction
@@ -84,9 +84,9 @@ class rdma_res_pd extends rdma_res;
   `uvm_object_utils(rdma_res_pd)
   rdma_drv_pd pd;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的保护域资源描述，并固定资源种类为 RDMA_RES_PD。
+  // 输入/输出及副作用：name 传给资源基类；pd 驱动句柄及 owner、id 由控制面创建路径绑定。
+  // 失败/边界：构造不分配保护域；登记前访问空 pd 句柄或未赋值身份字段属于调用顺序错误。
   function new(string name = "rdma_res_pd");
     super.new(name);
     kind = RDMA_RES_PD;
@@ -100,9 +100,9 @@ class rdma_res_buf extends rdma_res;
   bit [63:0] iova;
   int unsigned size;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的缓冲资源描述，并固定资源种类为 RDMA_RES_BUF。
+  // 输入/输出及副作用：name 传给资源基类；dma、iova、size 与 owner 由缓冲分配路径随后填写。
+  // 失败/边界：构造不分配 Host 内存；dma 或 owner/node 未绑定时不得调用 read/write。
   function new(string name = "rdma_res_buf");
     super.new(name);
     kind = RDMA_RES_BUF;
@@ -132,17 +132,17 @@ class rdma_res_mr extends rdma_res;
   bit [4:0] rights;
   bit [31:0] key;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的内存区域资源描述，并固定资源种类为 RDMA_RES_MR。
+  // 输入/输出及副作用：name 传给资源基类；mr、mem、va、len、rights、key 和归属由注册路径随后填写。
+  // 失败/边界：构造不注册 MR，也不取得 mem 所有权；字段绑定完成前 covers 的结果不代表有效注册区间。
   function new(string name = "rdma_res_mr");
     super.new(name);
     kind = RDMA_RES_MR;
   endfunction
 
   // 功能：MR 是否允许以 right 权限访问 [addr, addr+n)（ALIVE、范围内、权限齐全）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 输入/输出及副作用：输入起始地址 addr、长度 n 和所需权限 right，返回布尔判定；不修改 MR。
+  // 失败/边界：MR 非 ALIVE、addr 低于 va、末地址超过 va+len 或 rights 缺少任一请求位时返回 0；调用者须避免地址加法溢出。
   function bit covers(bit [63:0] addr, int unsigned n, bit [4:0] right);
     return state == RDMA_RES_ALIVE && addr >= va && addr + n <= va + len &&
            (rights & right) == right;
@@ -154,9 +154,9 @@ class rdma_res_cq extends rdma_res;
   rdma_drv_cq cq;
   int unsigned depth;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的完成队列资源描述，并固定资源种类为 RDMA_RES_CQ。
+  // 输入/输出及副作用：name 传给资源基类；cq、depth、owner、id 及其 CEQ 依赖由创建路径随后填写。
+  // 失败/边界：构造不创建驱动 CQ；depth 与 cq 句柄绑定前不得用该对象提交或轮询完成。
   function new(string name = "rdma_res_cq");
     super.new(name);
     kind = RDMA_RES_CQ;
@@ -167,9 +167,9 @@ class rdma_res_srq extends rdma_res;
   `uvm_object_utils(rdma_res_srq)
   rdma_drv_srq srq;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的共享接收队列资源描述，并固定资源种类为 RDMA_RES_SRQ。
+  // 输入/输出及副作用：name 传给资源基类；srq 句柄、身份、保护域依赖和归属由创建路径随后填写。
+  // 失败/边界：构造不创建驱动 SRQ；未登记对象不能作为 QP 的共享接收队列使用。
   function new(string name = "rdma_res_srq");
     super.new(name);
     kind = RDMA_RES_SRQ;
@@ -188,17 +188,17 @@ class rdma_res_qp extends rdma_res;
   bit [31:0] qkey;
   int unsigned mtu;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立 ALIVE 的队列对资源描述，并固定资源种类为 RDMA_RES_QP。
+  // 输入/输出及副作用：name 传给资源基类；qp、类型、peer、CQ/SRQ、qkey、mtu 与依赖由 QP 创建/连接路径填写。
+  // 失败/边界：构造不创建或连接 QP；拓扑字段补齐前不得用该对象生成 verb。
   function new(string name = "rdma_res_qp");
     super.new(name);
     kind = RDMA_RES_QP;
   endfunction
 
-  // 功能：是否为 UD QP。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：判断当前资源记录的 QP 类型是否为 RDMA_DRV_QPT_UD。
+  // 输入/输出及副作用：读取 qp_type 并返回精确比较结果，不修改 QP。
+  // 失败/边界：未由创建路径赋值时按 qp_type 的当前默认值判定，不查询底层 qp 句柄作兜底。
   function bit ud();
     return qp_type == RDMA_DRV_QPT_UD;
   endfunction
@@ -209,9 +209,9 @@ class rdma_res_pool #(type T = rdma_res) extends uvm_object;
   `uvm_object_param_utils(rdma_res_pool #(T))
   protected T by_id[int unsigned];
 
-  // 功能：构造空池。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立不含任何设备内编号映射的类型化资源池。
+  // 输入/输出及副作用：name 传给 uvm_object；关联数组 by_id 留空，后续 add 的对象仍归资源库所有。
+  // 失败/边界：不预分配容量或检查参数类型；只有经 add 登记的编号才能被 get/all 观察到。
   function new(string name = "rdma_res_pool");
     super.new(name);
   endfunction
@@ -237,9 +237,9 @@ class rdma_res_pool #(type T = rdma_res) extends uvm_object;
     return by_id[id];
   endfunction
 
-  // 功能：全部未销毁对象。
-  // 输入/输出及副作用：out 输出。
-  // 失败/边界：无。
+  // 功能：收集池中状态不是 RDMA_RES_DESTROYED 的全部对象。
+  // 输入/输出及副作用：先清空调用者传入的 out 队列，再按关联数组迭代顺序写入借用句柄；池本身不变。
+  // 失败/边界：空池或仅含已销毁对象时输出空队列；返回次序只由 by_id 的关联数组顺序决定。
   function void all(ref T out[$]);
     out.delete();
     foreach (by_id[i])
@@ -265,9 +265,9 @@ class rdma_res_func extends uvm_object;
   rdma_res_pool #(rdma_res_srq) srqs;
   rdma_res_pool #(rdma_res_qp) qps;
 
-  // 功能：构造空资源组。
-  // 输入/输出及副作用：创建各池。
-  // 失败/边界：无。
+  // 功能：建立一个 Function 的空资源组，将单例 CMQ/AEQ 置空并创建各类编号资源池。
+  // 输入/输出及副作用：name 传给 uvm_object；本对象拥有新建的池，池内资源仍由 rdma_res_db 管理。
+  // 失败/边界：index、remote、node、mac 由 add_func 随后赋值；构造阶段 drv() 返回 null，all() 返回空队列。
   function new(string name = "rdma_res_func");
     super.new(name);
     cmq = null;
@@ -281,16 +281,16 @@ class rdma_res_func extends uvm_object;
     qps = new("qps");
   endfunction
 
-  // 功能：该 Function 的驱动（远端为 null）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：取得该 Function 节点所引用的 RDMA 驱动，供本地资源操作使用。
+  // 输入/输出及副作用：返回 node.drv 的非拥有句柄，不修改 node 或驱动生命周期。
+  // 失败/边界：node 为空（包括 rxe 远端资源组）时返回 null；不校验非空 node 内的 drv 是否已经 probe。
   function rdma_drv_dev drv();
     return node == null ? null : node.drv;
   endfunction
 
   // 功能：全部未销毁资源（QP、SRQ、CQ、MR、BUF、PD、CEQ、AEQ、CMQ 的顺序，即合法销毁顺序）。
-  // 输入/输出及副作用：out 输出。
-  // 失败/边界：无。
+  // 输入/输出及副作用：先清空 out，再写入各池和单例队列中的非拥有资源句柄；不改变资源状态。
+  // 失败/边界：跳过已销毁资源以及空的 aeq/cmq；Function 尚无资源时输出空队列，顺序仅保证类型间的销毁依赖顺序。
   function void all(ref rdma_res out[$]);
     rdma_res_pd p[$];
     rdma_res_buf b[$];
@@ -327,9 +327,9 @@ class rdma_res_event extends uvm_object;
   rdma_res_event_e what;
   rdma_res res;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：建立尚未填充事件类型和资源句柄的资源事件载体。
+  // 输入/输出及副作用：name 传给 uvm_object；事件只借用 res，不取得资源所有权。
+  // 失败/边界：构造不设置 what/res；只有 publish 填完两个字段后才能发送给 analysis 订阅者。
   function new(string name = "rdma_res_event");
     super.new(name);
   endfunction
@@ -341,9 +341,9 @@ class rdma_res_db extends uvm_component;
   uvm_analysis_port #(rdma_res_event) ap;
   protected longint unsigned next_uid;
 
-  // 功能：构造空资源库。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：建立空资源库、创建资源事件 analysis 端口，并把首个全局 uid 设为 1。
+  // 输入/输出及副作用：name/parent 传给 uvm_component；本组件拥有 ap 与以后建立的 Function 资源组。
+  // 失败/边界：parent 可按 UVM 顶层规则为空；构造阶段 funcs 为空，资源只有经 add_func/add 后才可查询。
   function new(string name = "rdma_res_db", uvm_component parent = null);
     super.new(name, parent);
     ap = new("ap", this);
@@ -351,8 +351,8 @@ class rdma_res_db extends uvm_component;
   endfunction
 
   // 功能：登记一个 Function（index 为其在 funcs 中的位置）。
-  // 输入/输出及副作用：追加 funcs，返回新资源组。
-  // 失败/边界：无。
+  // 输入/输出及副作用：输入非拥有 node、mac 和 remote 标志；追加 funcs，设置连续 index，并返回资源组句柄。
+  // 失败/边界：不检查重复 Function；remote 组允许 node 为空，本地组若传空 node 则后续驱动访问只能得到 null。
   function rdma_res_func add_func(rdma_dpu_node node, bit [47:0] mac, bit remote = 1'b0);
     rdma_res_func f;
 
@@ -402,9 +402,9 @@ class rdma_res_db extends uvm_component;
     publish(RDMA_RES_CREATED, r);
   endfunction
 
-  // 功能：修改资源状态（如 QP 进入 ERR）并广播 CHANGED。
-  // 输入/输出及副作用：修改 r.state。
-  // 失败/边界：无。
+  // 功能：把指定资源切换到给定生命周期状态，并向所有订阅者广播 CHANGED 事件。
+  // 输入/输出及副作用：写 r.state，即使值未变化也创建并发送一次事件；通知不会转移 r 的所有权。
+  // 失败/边界：调用者必须传入非空且已登记的 r；本函数不验证状态迁移合法性，也不抑制幂等通知。
   function void set_state(rdma_res r, rdma_res_state_e state);
     r.state = state;
     publish(RDMA_RES_CHANGED, r);
@@ -425,9 +425,9 @@ class rdma_res_db extends uvm_component;
     publish(RDMA_RES_REMOVED, r);
   endfunction
 
-  // 功能：FLR/复位：范围内 Function 的全部资源失效（编号可复用），逐个广播 REMOVED。
-  // 输入/输出及副作用：修改资源状态。
-  // 失败/边界：无。
+  // 功能：对 scope 中每个 Function 执行 FLR 失效，将其当前全部未销毁资源置为 DESTROYED 并逐个广播 REMOVED。
+  // 输入/输出及副作用：读取 Function 下标队列 scope，修改资源状态并写 ap；保留池映射供后续编号复用递增 generation。
+  // 失败/边界：scope 下标必须落在 funcs 范围内；重复下标第二次看不到已销毁资源，因此不会重复发布其 REMOVED。
   function void on_flr(int unsigned scope[$]);
     rdma_res all_res[$];
 
@@ -447,9 +447,9 @@ class rdma_res_db extends uvm_component;
     return funcs[f].qps.get(qpn);
   endfunction
 
-  // 功能：广播资源事件。
-  // 输入/输出及副作用：写 analysis 端口。
-  // 失败/边界：无。
+  // 功能：为资源状态变化创建事件对象，填入事件类型与资源句柄后通过 analysis 端口同步广播。
+  // 输入/输出及副作用：输入 what 和非拥有 r，分配临时 rdma_res_event 并调用 ap.write；不改变 r。
+  // 失败/边界：不拒绝空 r，也不缓存无订阅者事件；调用方负责只发布语义完整的资源事件。
   protected function void publish(rdma_res_event_e what, rdma_res r);
     rdma_res_event e;
 

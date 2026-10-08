@@ -24,23 +24,23 @@ class rdma_scenario_vseq extends rdma_base_vseq;
   int unsigned f1 = 1;
   rdma_pair p;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：建立场景序列基对象，保留 f0=0、f1=1 的缺省端点并等待场景创建标准资源对。
+  // 输入/输出及副作用：name 传给 rdma_base_vseq；不分配资源，p 只保存 setup_pair 后借用的拓扑句柄。
+  // 失败/边界：构造后 p 仍为空；序列绑定含 env 的虚拟 sequencer 且 fresh/setup_pair 成功前不得调用 v。
   function new(string name = "rdma_scenario_vseq");
     super.new(name);
   endfunction
 
   // 功能：新建 f0↔f1 标准拓扑（错误场景每次一对新 QP）。
-  // 输入/输出及副作用：p 更新。
-  // 失败/边界：见 setup_pair。
+  // 输入/输出及副作用：读取 f0/f1，以 BUF_BYTES 分配并连接新资源，将 p 替换为新拓扑句柄。
+  // 失败/边界：f0/f1 必须是 env.res 中有效 Function；控制面失败由 setup_pair 报告，替换 p 不销毁旧拓扑资源。
   task fresh();
     setup_pair(f0, f1, BUF_BYTES, p);
   endtask
 
   // 功能：Function n（0/1 对应 f0/f1）经第 k 类 QP 的 verb；rmr 缺省为对端 MR（SEND/RECV 无远端）。
-  // 输入/输出及副作用：返回新 item。
-  // 失败/边界：无。
+  // 输入/输出及副作用：读取 p 中第 n 侧的 QP/MR，必要时把 rmr 补成另一侧 MR，返回尚未投递的新 item。
+  // 失败/边界：n 仅允许 0/1，k 必须指向已建立的 QP；p 或所选资源为空时不作兜底，SEND/RECV 可保留空 rmr。
   function rdma_verb_item v(int unsigned n, rdma_verb_op_e op, int unsigned local_offset,
                             int unsigned length, int unsigned remote_offset = 0,
                             int unsigned k = 0, rdma_res_mr rmr = null);
@@ -49,9 +49,9 @@ class rdma_scenario_vseq extends rdma_base_vseq;
     return verb(op, p.qp[n][k], p.mr[n], local_offset, length, rmr, remote_offset);
   endfunction
 
-  // 功能：Function n（0/1）是否为远端（rxe）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：查询场景第 n 侧端点对应的 Function 是否由 rxe 远端模型实现。
+  // 输入/输出及副作用：n=0 读取 f0，n=1 读取 f1，返回目标资源组的 remote 标志；不修改环境。
+  // 失败/边界：n 仅允许 0/1 且映射后的下标必须存在；实现会把其他 n 当成第 1 侧，调用者不得依赖该行为。
   function bit remote(int unsigned n);
     return env.res.funcs[n == 0 ? f0 : f1].remote;
   endfunction
@@ -60,9 +60,9 @@ endclass
 class rdma_errors_vseq extends rdma_scenario_vseq;
   `uvm_object_utils(rdma_errors_vseq)
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：建立错误注入场景序列；具体资源对和错误请求留到各子场景按需创建。
+  // 输入/输出及副作用：name 传给场景基类，不持有额外资源或启动并发任务。
+  // 失败/边界：构造不验证 Function 能力；body 会依据远端能力跳过无法建立受限 MR/第二 PD 的场景。
   function new(string name = "rdma_errors_vseq");
     super.new(name);
   endfunction
@@ -90,8 +90,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
   //   flush（远端响应方出错后 QP 进入 ERR、不再应答，故远端时不发）；被测设备作响应方时 f1 随后投递的
   //   RECV 因 QP 已 ERR 而 FLUSH（rxe 5.15 出错后不 flush RQ，远端时不发）；f1 用自己的 MR 作远端
   //   READ（被测设备作响应方，新 QP 对）→ REM_ACCESS。
-  // 输入/输出及副作用：QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：两次 fresh 建立独立 QP 对并投递错误远端 key 请求；本地响应端还验证后继 WR/RECV flush。
+  // 失败/边界：rxe 响应方不提供相同的 RQ flush 观察，因此相关后继请求被条件跳过；完成状态由 scoreboard 校验。
   task bad_rkey();
     fresh();
     post(v(0, RDMA_VERB_WRITE, 'h0000, 64, 0, 0, p.mr[0]));
@@ -104,16 +104,16 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：READ 越过对端 MR 末尾 → REM_ACCESS。
-  // 输入/输出及副作用：QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：fresh 后以对端 MR 的 len-32 为偏移读取 64 字节，使请求 QP 按错误响应进入错误态。
+  // 失败/边界：标准拓扑 MR 长度必须至少 32 字节，且预期错误依赖请求确实跨越末端；结果由 scoreboard 判定。
   task out_of_range();
     fresh();
     post(v(0, RDMA_VERB_READ, 'h0000, 64, p.mr[1].len - 32));
   endtask
 
   // 功能：对端只读 MR（远端读）：READ 成功，WRITE → REM_ACCESS；ATOMIC（新 QP 对）→ REM_ACCESS。
-  // 输入/输出及副作用：QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：在 f1 注册只含远端读权限的 ro，分别验证 READ 成功以及 WRITE、ATOMIC 拒绝；失败请求使 QP 进入错误态。
+  // 失败/边界：仅适用于可本地注册自定义权限 MR 的 f1，body 在 f1 为 rxe 时跳过；WRITE 后须 fresh 才能测 ATOMIC。
   task rights();
     rdma_res_mr ro;
     rdma_verb_item it;
@@ -130,8 +130,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：对端另一个 PD 上的 MR（与对端 QP 不同 PD）→ REM_ACCESS。
-  // 输入/输出及副作用：QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：在 f1 新建 pd2/mr2 并由绑定原 PD 的 QP 发起 WRITE，使请求 QP 进入错误态。
+  // 失败/边界：仅适用于支持第二保护域的本地 f1，body 在 rxe 远端时跳过；控制面创建失败由基类任务报告。
   task pd_mismatch();
     rdma_res_pd pd2;
     rdma_res_mr mr2;
@@ -144,8 +144,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
 
   // 功能：64B 的 RECV 收 200B 的 SEND：请求方 REM_INV_REQ（rxe 响应方 REM_OP），接收端错误完成，
   //   接收端 QP 进入 ERR，其后投递的 RECV FLUSH（rxe 5.15 不 flush，远端时不发）。
-  // 输入/输出及副作用：QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：先投递 64 字节 RECV 再发送 200 字节，并在本地响应端追加 RECV 以观察 ERR 后的 flush。
+  // 失败/边界：rxe 5.15 不提供相同的 RQ flush 行为，远端场景不投后继 RECV；状态与完成码由 scoreboard 判定。
   task overflow();
     fresh();
     post(v(1, RDMA_VERB_RECV, 'h1000, 64));
@@ -156,8 +156,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
 
   // 功能：本地访问错：WRITE 的本地区域越过 f0 的 4 KiB MR 末尾 → GENERAL_ERR（不发包），QP 进入
   //   ERR，随后的 WRITE FLUSH。
-  // 输入/输出及副作用：注册一个 MR，QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：在 p.mem[0] 注册 4 KiB small_mr，以 0xfe0 偏移访问 64 字节并再投一个 WR 验证本地错误后的 flush。
+  // 失败/边界：依赖标准缓冲足以注册 4 KiB；首个请求必须在发包前被本地范围检查拒绝，完成结果由 scoreboard 判定。
   task local_access();
     rdma_res_mr small_mr;
 
@@ -168,16 +168,16 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：URC READ 用 f0 自己的 MR 作远端 → 对端回 NAK，REM_ACCESS。
-  // 输入/输出及副作用：URC QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：fresh 后经第 2 类 QP 投递错误 rkey READ，预期 URC QP 收到 NAK 后进入错误态。
+  // 失败/边界：仅在 p.urc 为真且双方均建立 qp[][2] 时有效；body 对不支持 URC 的拓扑跳过本任务。
   task urc_bad_rkey();
     fresh();
     post(v(0, RDMA_VERB_READ, 'h0000, 64, 0, 2, p.mr[0]));
   endtask
 
   // 功能：f0 的 RC QP 投 3 个 RECV 后转 ERR → 3 个 FLUSH；ERR 状态下投递的 SEND 也 FLUSH。
-  // 输入/输出及副作用：QP 进入错误态。
-  // 失败/边界：无。
+  // 输入/输出及副作用：在 f0 RC QP 上排入三个 RECV，控制面迁入 ERR 后再投 SEND，观察四个 FLUSH 完成。
+  // 失败/边界：要求 fresh 创建的 QP 仍为 ALIVE 且允许 RTS→ERR；迁移或完成数不符由控制面/scoreboard 报告。
   task qp_to_err();
     fresh();
     for (int unsigned i = 0; i < 3; i++)
@@ -187,8 +187,8 @@ class rdma_errors_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：UD Q_Key 不符的 SEND 被接收端丢弃（发送端成功），随后正确 Q_Key 的 SEND 消耗该 RECV。
-  // 输入/输出及副作用：f1 的 UD RECV 被写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：借用 f1 UD QP 的 qkey 构造一错一对两个 SEND；首包丢弃，第二包写入已投递的 RECV。
+  // 失败/边界：依赖标准拓扑已建立 qp[][1] 且异或最低位必然产生不同 qkey；若错包消耗 RQE，scoreboard 会报错。
   task ud_qkey();
     rdma_verb_item it;
 
@@ -204,9 +204,9 @@ endclass
 class rdma_reliability_vseq extends rdma_scenario_vseq;
   `uvm_object_utils(rdma_reliability_vseq)
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：建立可靠传输场景序列，故障规则和标准拓扑由 body 执行时创建。
+  // 输入/输出及副作用：name 传给场景基类，不立即修改链路故障表或分配资源。
+  // 失败/边界：只有环境启用非零响应超时，body 才运行需要超时触发重传的三个丢响应场景。
   function new(string name = "rdma_reliability_vseq");
     super.new(name);
   endfunction
@@ -231,8 +231,8 @@ class rdma_reliability_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：加一条故障规则（源为 Function n，0/1 对应 f0/f1）。
-  // 输入/输出及副作用：修改链路故障表。
-  // 失败/边界：无。
+  // 输入/输出及副作用：创建一次性规则，设置 kind、源 Function、opcode、skip 和 delay 后追加到 env.link.faults。
+  // 失败/边界：n 仅允许 0/1，其他值会映射到 f1；若后续没有足够的匹配包越过 skip，report_phase 会报规则未命中。
   function void fault(rdma_fault_e kind, int unsigned n, rdma_network_opcode_e op,
                       int unsigned skip = 0, time delay = 3us);
     rdma_link_fault f;
@@ -247,8 +247,8 @@ class rdma_reliability_vseq extends rdma_scenario_vseq;
   endfunction
 
   // 功能：Function n 的 3 包 SEND 丢第 2 包：PSN 序列 NAK 后重传。
-  // 输入/输出及副作用：对端 RECV 被写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：为第 n 侧 SEND 注入跳过首包后丢一个包的规则，向另一侧投 RECV，再发送 2500 字节。
+  // 失败/边界：n 必须为 0/1，且 MTU 必须使该 SEND 至少分成三包；否则故障规则未命中会在 report_phase 报错。
   task lost_middle(int unsigned n);
     fault(RDMA_FAULT_DROP, n, RDMA_NET_SEND, 1);
     post(v(1 - n, RDMA_VERB_RECV, 'h1000, 'h1000));
@@ -256,8 +256,8 @@ class rdma_reliability_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：SEND 包被复制：响应方按重复请求处理，只消耗一个 RECV（第二个 RECV 留给 corrupted）。
-  // 输入/输出及副作用：对端 RECV 被写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：复制 f0 的首个 SEND 包，投递两个 f1 RECV，并验证响应方去重后仅消耗第一个 RQE。
+  // 失败/边界：第二个 RECV 有意留给后续 corrupted 场景；若重复包错误消耗它，后续完成和 scoreboard 数据将不匹配。
   task duplicate();
     fault(RDMA_FAULT_DUP, 0, RDMA_NET_SEND);
     post(v(1, RDMA_VERB_RECV, 'h2000, 'h400));
@@ -266,16 +266,16 @@ class rdma_reliability_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：3 包 WRITE 的首包延迟（后两包先到）：序列 NAK 重传，迟到的首包作为重复包。
-  // 输入/输出及副作用：对端 0x3000 区域被写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：延迟 f0 的首个 WRITE 包并投递 2500 字节 WRITE，使后续包先到并触发序列 NAK/重传。
+  // 失败/边界：WRITE 必须跨至少三包且默认 3us 延迟足以形成乱序；未命中规则或最终数据错误由链路/scoreboard 报告。
   task reorder();
     fault(RDMA_FAULT_DELAY, 0, RDMA_NET_RDMA_WRITE);
     post(v(0, RDMA_VERB_WRITE, 'h0000, 2500, 'h3000));
   endtask
 
   // 功能：SEND 包损坏（netpkt 上 ICRC 校验丢弃，其它链路等同丢包）后重传。
-  // 输入/输出及副作用：对端 RECV 被写入（先消耗 duplicate 留下的 RECV）。
-  // 失败/边界：无。
+  // 输入/输出及副作用：故障规则先跳过一个 SEND，让 1000 字节请求消耗 duplicate 遗留 RQE，再损坏下一 SEND 的首包并验证重传。
+  // 失败/边界：依赖 duplicate 已留下一个可用 RECV；损坏的 2500 字节 SEND 必须匹配规则，未命中会在 report_phase 报错。
   task corrupted();
     fault(RDMA_FAULT_CORRUPT, 0, RDMA_NET_SEND, 1);
     post(v(0, RDMA_VERB_SEND, 'h0000, 1000));
@@ -284,8 +284,8 @@ class rdma_reliability_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：RECV 在 SEND 之后 30us 才投递：响应方 RNR NAK，请求方按定时器重试后成功。
-  // 输入/输出及副作用：对端 RECV 被写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：并发延迟 30us 投递 f1 RECV，同时立即发送 64 字节，最后 wait fork 等待延迟投递与 SEND 完成。
+  // 失败/边界：环境的 RNR 重试次数/间隔必须覆盖 30us 空窗；耗尽重试或未产生 RNR 由 scoreboard 判错。
   task rnr();
     fork
       begin
@@ -298,8 +298,8 @@ class rdma_reliability_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：丢 ACK：请求方超时重发，响应方识别重复请求、重发 ACK 而不重复执行。
-  // 输入/输出及副作用：对端两个 RECV 各被写入一次。
-  // 失败/边界：无。
+  // 输入/输出及副作用：丢弃 f1 的首个 ACK，投递两个 RECV 和两个 SEND，验证超时重发不重复消费首个 RQE。
+  // 失败/边界：仅在 env.cfg.timeout 非零时由 body 调用；若重复请求被再次执行，第二个 SEND 的完成/数据会与预测不符。
   task lost_ack();
     fault(RDMA_FAULT_DROP, 1, RDMA_NET_ACK);
     post(v(1, RDMA_VERB_RECV, 'h1000, 'h100));
@@ -309,16 +309,16 @@ class rdma_reliability_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：3 包 READ 响应丢末包：超时后只重读缺失部分。
-  // 输入/输出及副作用：本端 0x3000 区域被写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：跳过前两个 READ_RESP 后丢末响应包，读取 2500 字节并验证超时后只补取缺失后缀。
+  // 失败/边界：仅在响应超时启用且 READ 响应至少三包时有效；规则未命中或恢复数据不完整会被链路/scoreboard 报告。
   task lost_read_response();
     fault(RDMA_FAULT_DROP, 1, RDMA_NET_RDMA_READ_RESP, 2);
     post(v(0, RDMA_VERB_READ, 'h3000, 2500, 'h0000));
   endtask
 
   // 功能：丢 ATOMIC ACK：重复的 FETCH_ADD 由响应方返回缓存结果，目标只加一次。
-  // 输入/输出及副作用：对端 0x3800 的 8 字节被改写。
-  // 失败/边界：无。
+  // 输入/输出及副作用：丢首个 ATOMIC_ACK，并以加数 0x11 投递 FETCH_ADD，观察重试返回缓存结果且目标只更新一次。
+  // 失败/边界：仅在响应超时启用时调用；远端地址须保持 8 字节对齐，重复执行或规则未命中由 scoreboard/链路报告。
   task lost_atomic_ack();
     rdma_verb_item it;
 
@@ -332,9 +332,9 @@ endclass
 class rdma_srq_vseq extends rdma_scenario_vseq;
   `uvm_object_utils(rdma_srq_vseq)
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：建立共享接收队列场景序列，实际 SRQ、QP 与内存资源在 body/shared 中按方向创建。
+  // 输入/输出及副作用：name 传给场景基类；构造不分配或持有额外驱动资源。
+  // 失败/边界：运行环境的两个目标 Function 都必须支持 SRQ 控制面操作，失败由 shared 调用的基类任务报告。
   function new(string name = "rdma_srq_vseq");
     super.new(name);
   endfunction
@@ -350,8 +350,8 @@ class rdma_srq_vseq extends rdma_scenario_vseq;
 
   // 功能：接收方 r 一个 SRQ、两个 RC QP 绑定它，发送方 s 两个 RC QP 分别互连；SRQ 投 6 个 RECV，两个 QP
   //   交替 SEND 6 个（RECV 按到达顺序被消耗）。
-  // 输入/输出及副作用：r 的缓冲被写入。
-  // 失败/边界：无。
+  // 输入/输出及副作用：为 s/r 分配各自 PD/CQ/BUF/MR，在 r 建 SRQ，连接两对 RC QP，并交替投递六组 RECV/SEND。
+  // 失败/边界：s、r 必须是有效且不同的 Function，BUF_BYTES 和 SRQ 深度须容纳所有偏移/RQE；控制面失败会中止有效流量。
   task shared(int unsigned s, int unsigned r);
     rdma_res_pd pd[2];
     rdma_res_cq cq[2];
@@ -389,9 +389,9 @@ endclass
 class rdma_qp_lifecycle_vseq extends rdma_scenario_vseq;
   `uvm_object_utils(rdma_qp_lifecycle_vseq)
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：建立 QP 生命周期场景序列，资源拓扑留给 body 在确认双方均为本地 Function 后创建。
+  // 输入/输出及副作用：name 传给场景基类；构造不改变 QP 状态或资源库。
+  // 失败/边界：rxe 远端不参与销毁/重建验证，body 检出任一端 remote 后直接返回且不创建拓扑。
   function new(string name = "rdma_qp_lifecycle_vseq");
     super.new(name);
   endfunction
@@ -455,9 +455,9 @@ class rdma_multifunc_vseq extends rdma_scenario_vseq;
   rdma_pair a;
   rdma_pair b;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：建立四 Function 复位隔离场景序列，并保留 a/b 两个拓扑句柄供 body 分阶段重建。
+  // 输入/输出及副作用：name 传给场景基类；a、b 初始为空，序列只借用后续 setup_pair 返回的资源句柄。
+  // 失败/边界：body 要求资源库按文件头约定至少含四个 Function；构造本身不检查拓扑或复位能力。
   function new(string name = "rdma_multifunc_vseq");
     super.new(name);
   endfunction
@@ -498,8 +498,8 @@ class rdma_multifunc_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：对 x 的一轮流量：RECV + SEND、WRITE、READ。
-  // 输入/输出及副作用：经 sequencer 下发 item。
-  // 失败/边界：无。
+  // 输入/输出及副作用：把共享 p 临时指向输入拓扑 x，依次投递 RECV、SEND、WRITE 和 READ；修改两端缓冲与完成队列。
+  // 失败/边界：x 必须含两侧仍为 ALIVE 的标准 QP/MR，且缓冲覆盖到 0x2258；任务不等待全局 idle，由调用者负责同步。
   task traffic(rdma_pair x);
     p = x;
     post(v(1, RDMA_VERB_RECV, 'h1000, 'h400));
@@ -509,8 +509,8 @@ class rdma_multifunc_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：新建 m↔n 的对并跑一轮流量（复位范围外的 Function 间）。
-  // 输入/输出及副作用：见 traffic。
-  // 失败/边界：无。
+  // 输入/输出及副作用：以 m、n 和 BUF_BYTES 创建临时标准拓扑 x，再调用 traffic 下发一轮数据面请求。
+  // 失败/边界：m/n 必须是未处于复位的有效 Function；setup_pair 控制面失败时 x 不完整，后续 traffic 不能正常完成。
   task traffic_pair(int unsigned m, int unsigned n);
     rdma_pair x;
 
@@ -530,9 +530,9 @@ class rdma_random_vseq extends rdma_scenario_vseq;
 
   int unsigned count = 200;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为实例名。
-  // 失败/边界：无。
+  // 功能：建立随机流量场景序列，保留缺省 count=200，并等待 body 根据 plusarg 创建大缓冲标准拓扑。
+  // 输入/输出及副作用：name 传给场景基类；不读取随机数、不分配资源，count 可在 body 中被 RDMA_RANDOM_COUNT 覆盖。
+  // 失败/边界：构造不限制 count；过大的 count 只增加运行时间，所有随机选择仍依赖仿真种子复现。
   function new(string name = "rdma_random_vseq");
     super.new(name);
   endfunction
@@ -549,8 +549,8 @@ class rdma_random_vseq extends rdma_scenario_vseq;
   endtask
 
   // 功能：一个随机 verb（本端偏移 slot，远端偏移 SLOT*SLOTS + slot）。
-  // 输入/输出及副作用：可能先在对端投 RECV。
-  // 失败/边界：无。
+  // 输入/输出及副作用：以 slot 选择双向端点、QP/操作/长度/SGE/数据模式；需 RQE 时先向对端投 RECV，再投随机 item。
+  // 失败/边界：p 必须由 body 完整建立，slot 须小于 SLOT*SLOTS 且按 SLOT 对齐；UD 只选 SEND 类，远端/原子强制单 SGE。
   task one(int unsigned slot);
     rdma_verb_op_e ops[$] = '{RDMA_VERB_SEND, RDMA_VERB_SEND_IMM, RDMA_VERB_WRITE,
                               RDMA_VERB_WRITE_IMM, RDMA_VERB_READ, RDMA_VERB_CMP_SWAP,
