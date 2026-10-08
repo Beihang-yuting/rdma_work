@@ -14,9 +14,9 @@ class rdma_mem_model extends uvm_object;
   protected byte unsigned img[longint unsigned][$];
   protected rdma_res_buf bufs[longint unsigned];
 
-  // 功能：构造空模型。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造尚未跟踪任何 buffer 的期望内存模型。
+  // 输入/输出及副作用：name 为 UVM 名；img 与 bufs 映射为空，后续只拥有镜像字节并非 buffer 本身。
+  // 失败/边界：构造不读取真实内存；首次 track 才建立快照，销毁的 buffer 仍保留历史但会被最终比对跳过。
   function new(string name = "rdma_mem_model");
     super.new(name);
   endfunction
