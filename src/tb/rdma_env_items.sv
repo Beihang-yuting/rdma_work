@@ -54,9 +54,9 @@ class rdma_ctrl_item extends uvm_sequence_item;
   rdma_res res;
   rdma_status status;
 
-  // 功能：构造默认请求（深度 256、SGE 4、RC、全部权限）。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造默认深度 256、最多 4 SGE、RC 类型且开放本地写与全部远端权限的控制面请求。
+  // 输入/输出及副作用：name 为 UVM 名；资源句柄、scope、res/status 输出保持空或零初值，item 不拥有资源。
+  // 失败/边界：默认 op 为枚举零值 ALLOC_PD；执行其他 op 前 sequence 必须补齐该分支要求的句柄和范围。
   function new(string name = "rdma_ctrl_item");
     super.new(name);
     size = 256;
@@ -65,9 +65,9 @@ class rdma_ctrl_item extends uvm_sequence_item;
     rights = rdma_drv_mr::rights_of(1, 1, 1, 1);
   endfunction
 
-  // 功能：单行描述。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：生成包含操作、Function、size 与可选 destroy target 的单行控制请求描述。
+  // 输入/输出及副作用：只读当前字段并返回新字符串；target 非空时调用其 describe，不改变 item 或资源。
+  // 失败/边界：target 为空时省略目标；尚未设置的字段按零/当前枚举名打印，status/res 不进入描述。
   virtual function string convert2string();
     return $sformatf("%s f%0d size=%0d%s", op.name(), func, size,
                      target == null ? "" : {" ", target.describe()});
@@ -119,9 +119,9 @@ class rdma_verb_item extends uvm_sequence_item;
   bit may_flush;
   bit overflow;
 
-  // 功能：构造默认 SEND（signaled、1 个 SGE、RANDOM 数据）。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造默认 signaled、单 SGE、随机数据模式的 SEND verb item。
+  // 输入/输出及副作用：name 为 UVM 名；QP/MR/SRQ 为非拥有空引用，长度/偏移/数据与 wr_id 输出为空或零。
+  // 失败/边界：投递前 sequence 必须提供 QP、本地 MR 及与操作匹配的远端资源；构造不做范围或权限校验。
   function new(string name = "rdma_verb_item");
     super.new(name);
     op = RDMA_VERB_SEND;
@@ -130,30 +130,30 @@ class rdma_verb_item extends uvm_sequence_item;
     data_mode = PAYLOAD_RANDOM;
   endfunction
 
-  // 功能：是否携带源数据（SEND/WRITE 类）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：判断当前 verb 是否需要 driver 从本地 SGE 取得源数据，即 SEND/WRITE 及其立即数变体。
+  // 输入/输出及副作用：只读 op 并返回布尔值，不访问 MR 或修改数据队列。
+  // 失败/边界：READ、ATOMIC、RECV 及强制转换得到的未知 opcode 均返回 0。
   function bit has_data();
     return op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM, RDMA_VERB_WRITE, RDMA_VERB_WRITE_IMM};
   endfunction
 
-  // 功能：是否为 atomic（固定 8 字节）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：判断当前 verb 是否为固定 8 字节的 compare-swap 或 fetch-add 原子操作。
+  // 输入/输出及副作用：只读 op 并返回布尔值，不校验 length、地址对齐或远端权限。
+  // 失败/边界：非两种 atomic opcode（含未知枚举值）返回 0，实际 8B/对齐约束由 driver/scoreboard 检查。
   function bit atomic();
     return op inside {RDMA_VERB_CMP_SWAP, RDMA_VERB_FETCH_ADD};
   endfunction
 
-  // 功能：是否消耗对端 RQE（SEND 类与 WRITE_IMM）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：判断 verb 是否需要对端消费一个 RQE：SEND、SEND_IMM 或 WRITE_IMM。
+  // 输入/输出及副作用：只读 op 并返回 scoreboard/sequence 使用的布尔分类，不修改 item。
+  // 失败/边界：普通 WRITE、READ、ATOMIC、RECV 与未知 opcode 返回 0；本函数不判断 RQE 是否已投递。
   function bit consumes_rqe();
     return op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM, RDMA_VERB_WRITE_IMM};
   endfunction
 
-  // 功能：单行描述。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：生成包含 verb、QP、wr_id、本地/远端偏移、长度、SGE 数与数据模式的单行描述。
+  // 输入/输出及副作用：只读 item；QP 非空时调用 describe，返回字符串且不触碰资源或 payload。
+  // 失败/边界：QP 为空时显示“-”；非法枚举的 name 可能为空，MR/key/status 等详细字段有意不在摘要中。
   virtual function string convert2string();
     return $sformatf("%s qp=%s wr_id=%0h local=+%0h len=%0d sges=%0d remote=+%0h %s",
                      op.name(), qp == null ? "-" : qp.describe(), wr_id, local_offset, length,
@@ -175,16 +175,16 @@ class rdma_verb_completion extends uvm_object;
   int unsigned byte_len;
   bit [31:0] imm;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造尚未填入 monitor 结果的 verb completion 值对象。
+  // 输入/输出及副作用：name 为 UVM 名；身份、状态、长度与立即数字段保持零初值，不持有 QP/CQ 引用。
+  // 失败/边界：必须由 monitor 填完 func/wr_id/qpn/rq/status 后再发布；零值本身可表示成功状态但非有效事件。
   function new(string name = "rdma_verb_completion");
     super.new(name);
   endfunction
 
-  // 功能：单行描述。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：把完成的 Function/QPN/wr_id/方向、状态、vendor、长度和立即数格式化为单行摘要。
+  // 输入/输出及副作用：只读全部标量字段并返回字符串，不修改完成或关联 monitor 状态。
+  // 失败/边界：未填充对象按零值打印；非法 status 枚举的 name 可能为空，不在此补做合法性判断。
   virtual function string convert2string();
     return $sformatf("f%0d qpn=%0d wr_id=%0h rq=%0b %s vendor=%02h len=%0d imm=%08h", func, qpn,
                      wr_id, rq, status.name(), vendor, byte_len, imm);
@@ -199,9 +199,9 @@ class rdma_aeq_event extends uvm_object;
   bit [7:0] ecode;
   int unsigned id;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造尚未填入 Function、错误码与资源编号的 AEQ 事件值对象。
+  // 输入/输出及副作用：name 为 UVM 名；func/ecode/id 保持零初值，对象不持有 AEQ 或 QP/SRQ 资源。
+  // 失败/边界：零值不是“无事件”哨兵；monitor 必须在 analysis 发布前填写与 AEQE 类型相符的 id。
   function new(string name = "rdma_aeq_event");
     super.new(name);
   endfunction
