@@ -1,9 +1,12 @@
-# RDMA 架构精简报告（feature/rdma-arch-slim）
+# RDMA 架构精简与完成报告（feature/rdma-arch-slim-completion）
 
-日期：2026-10-05。基线：`1ea354f`（`feature/rdma-structural-batch226` 末端，Batch247）。
+日期：2026-10-08。基线：`1ea354f`（`feature/rdma-structural-batch226` 末端，Batch247）。
 本分支不修改其它分支；所有仿真经 `scripts/run_vcs53.sh` 在 `ubuntu@10.11.10.53` 执行。
 
-## 最终总结（2026-10-07，HEAD 6738db6，最后一轮全量 v40）
+## 总结（completion 分支最终门禁已收敛）
+
+前五阶段及 v40 回归结果来自原 `feature/rdma-arch-slim` 历史；completion 分支在此基础上补齐中断、部分
+重传和 PCIe Completion 可靠性。静态门禁、core、CMQ、env、PCIe basic/fault 与 RXE 均已完成，结果见验证节。
 
 1. **第一阶段：精简**（v1–v17）。合并重复代码；CMQ 引擎按驱动流程重写（13,763→849 行），70 个驱动 opcode
    的请求/响应与 golden 逐字节对齐；删除按源码文本冻结结构的 Python 门禁；注释改写为三段式。
@@ -20,18 +23,22 @@
    RDMA 模型产生数据。
 5. **第五阶段：与 Linux Soft-RoCE 互打**（v40）。仿真驱动 + 设备经 TAP 与真实 rdma_rxe 双向收发，用真实实现
    检验线上协议，修正 net_packet 的 RoCEv2 编码（ICRC、pad、BTH/DETH 字段位置）与设备的三处协议错误。
+6. **第六阶段：completion 收敛**。补齐每 Function MAILBOX/MSI-X 事件模型；SEND/WRITE 周期 AckReq、累计 ACK
+   后部分重传与可靠性边界；PCIe FC/scoreboard/coverage、Host authority、Completion timeout/UR/CA 诊断和
+   timeout tag quarantine。静态门禁、core 15、CMQ gate 5、env 9、PCIe basic/fault 与 RXE 3 项均通过。
 
-| | 基线 1ea354f | 最终 HEAD | 变化 |
+| | 基线 1ea354f | completion HEAD | 变化 |
 | --- | ---: | ---: | ---: |
-| src（.sv/.svh 行） | 114,092 | 15,261 | −86.6% |
-| tests（.sv/.svh 行） | 164,612 | 6,399 | −96.1% |
-| 分支提交数 | — | 66 | |
+| src（.sv/.svh 行） | 114,092 | 18,520 | −95,572（−83.8%） |
+| tests（.sv/.svh 行） | 164,612 | 8,836 | −155,776（−94.6%） |
+| 相对基线提交数 | — | 106 | 已排除含明文凭据的历史提交 |
 
-第三阶段结束时（v34）src 42,434 行、tests 40,447 行；第四阶段删除老 core/model/codec 层后降至上表。
-最终回归（v40，全部通过，告警 0）：Python、style、驱动契约门禁、CMQ gate 5、core 14、host_mem、net_packet、
+第三阶段结束时（v34）src 42,434 行、tests 40,447 行；原分支第四阶段删除老 core/model/codec 层后曾降至
+src 15,261 行、tests 6,399 行；completion 分支补入新功能与测试后为上表 18,520/8,836 行。
+原分支最终回归（v40，全部通过，告警 0）：Python、style、驱动契约门禁、CMQ gate 5、core 14、host_mem、net_packet、
 pcie_work、e2e（`rdma_tb_e2e_test` 与 4096 SEND 高流量）。Soft-RoCE 互打（`make rxe`，需 sudo 建 TAP）13 项
 双向用例全部通过，不在默认全量内。
-新功能均做过变异检查（注入对应缺陷后测试失败）。
+原分支上述功能均做过变异检查（注入对应缺陷后测试失败）。
 
 ## 目标与取舍
 
@@ -42,9 +49,9 @@ pcie_work、e2e（`rdma_tb_e2e_test` 与 4096 SEND 高流量）。Soft-RoCE 互�
 - 函数注释保留“功能 / 输入/输出及副作用 / 失败/边界”三段，但去掉模板套话并按实现改写；
 - 不再在仓库根目录逐批生成报告，历史报告归档到 `docs/history/batch-reports/`。
 
-## 规模变化（src）
+## 第一阶段阶段性规模变化（历史 src 统计）
 
-| 指标 | 基线 1ea354f | 本分支 | 变化 |
+| 指标 | 基线 1ea354f | 第一阶段统计点 | 变化 |
 | --- | ---: | ---: | ---: |
 | 代码行 | 91,544 | 76,578 | −14,966 |
 | 注释行 | 16,412 | 11,423 | −4,989 |
@@ -134,7 +141,27 @@ tests 179,228→135,872（旧 CMQ 引擎测试 26,435 行下线，新引擎测�
 
 ## 验证
 
-每轮均为全量：Python 门禁、changed-SV style、驱动契约（rdma_defs）、core、CMQ gate、integration、
+### completion 分支最终门禁（2026-10-08）
+
+| 项目 | 结果 |
+| --- | --- |
+| Python unit | 173/173 通过 |
+| profile naming、shell syntax、`git diff --check` | 通过 |
+| changed-SV style | 无 hard diagnostic；23 条既有 soft-limit 长行 |
+| `rdma_defs/rdma_cmq_driver_contract_test` | 通过 |
+| core | 15/15，全部 exit 0，逐项 W/E/F=`0/0/0` |
+| cmq_gate | 5/5，全部 exit 0，逐项 W/E/F=`0/0/0` |
+| env | 9/9，全部 exit 0，逐项 W/E/F=`0/0/0`；`RDMA_COV merged=97.46` |
+| pcie_work 正式依赖 `1a80801e` | basic/fault 均 exit 0，W/E/F=`0/0/0` |
+| RXE | `rdma_rxe_test`、`rdma_rxe_fault_test`、`rdma_env_rxe_test` 3/3 pristine，全部 exit 0，逐项 W/E/F=`0/0/0`；env RXE coverage total=67.4 |
+
+候选 pcie_work `9aedf898` 的 basic/fault 也均为 W/E/F=`0/0/0`；历史 `4b7b8d70` 缺完整 DPU integration，
+只作为编译兼容证据，不计为动态通过。RXE 的 67.4 是 `rdma_env_rxe_test` 单场景 total，不替代 env 回归的
+合并覆盖率 97.46。
+
+### 原分支历史回归
+
+原分支各轮均执行 Python 门禁、changed-SV style、驱动契约（rdma_defs）、core、CMQ gate、integration、
 host_mem、PCIe、E2E（dual env / multi-VF / high traffic）。
 
 | 轮次 | 提交 | 结果 |
@@ -156,8 +183,7 @@ host_mem、PCIe、E2E（dual env / multi-VF / high traffic）。
 | v17 | 31b5719 | 全部通过：Python、style、驱动门禁、CMQ 12、core 93、net_packet、PCIe、host_mem 3、integration 10、E2E 5 组（告警 2 来自外部 net_packet） |
 
 v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线，不是用例失败。注释改写由脚本逐文件校验：
-去除注释与空白后的代码 token 与改写前完全一致。注释改写由脚本逐文件校验：去除注释与空白后的代码 token
-与改写前完全一致。
+去除注释与空白后的代码 token 与改写前完全一致。
 
 ## 第二阶段：驱动形状重构（2026-10-06，S0–S6 / 阶段 A–E）
 
@@ -221,8 +247,9 @@ v14 起 core/CMQ 用例数下降来自旧 CMQ 引擎测试与分片整体下线�
 - RTO_CODE → 超时时长：硬件编码表未公开，取驱动 `xtrdma_rto_code_map` 的逆（编码 0 = 8.192us，31 = 不超时）；
   RC 未设 timeout 时编码 0，超时很短。RC 默认 RNR 编码 0 = 655ms，测试在 RTR 设 min_rnr=1。
 - 驱动 URC 异常位置按环大小回绕（驱动源码 idx+1 不取模，按正确行为建模）。
-- doorbell 所在 BAR 取 DEVICE_MEMORY（BAR0，对应驱动 `pf->hw_addr`）；MAILBOX/MSI-X 只分配，寄存器与中断
-  未建模（EQ 轮询）。
+- doorbell 所在 BAR 取 DEVICE_MEMORY（BAR0，对应驱动 `pf->hw_addr`）；MAILBOX/MSI-X 由每 Function 独立
+  控制器建模，事件携带冻结身份与 reset epoch。它仍是适配器事件队列，不产生真实 PCIe MSI-X MemWr，
+  CEQ/AEQ 仍主要由驱动轮询，尚未全部自动接入该中断路径。
 - dpu_common 无 RDMA 专用队列能力，binding 的 CQ/SRQ/EQ 深度上界取其 VIO qpair 与 MSI-X 数。
 
 构建：所有编译 `tests/rdma_unit_test_pkg.sv` 的 suite 都需要 `DPU_COMMON_ROOT`（`dpu_common_preflight`）。
@@ -272,6 +299,20 @@ Function 可有相同 BDF（各自 PCIe 域）。
 无关，任何测试相同）；rdma_rxe_test 用例本身约 0.2s，rdma_rxe_fault_test 约 4s（仿真时间 1.1ms，主要是 RNR
 定时器与 ACK 丢失的超时等待）。
 
+## 第六阶段：completion 收敛（2026-10-08）
+
+本阶段静态门禁与 core/CMQ/env/PCIe/RXE 验证均已取得上一节所列通过证据。
+
+| 范围 | 已实现能力 | 明确边界 |
+| --- | --- | --- |
+| MAILBOX/MSI-X | 每 Function 独立控制器且只建模 local vector 0；MAILBOX payload/command/status/ack；MSI-X address/data/mask/pending；masked pending、解 mask 投递与 pending 合并；Function key、BDF、global ID、BAR、parent、caps 深拷贝冻结，并在 attach 时与 dpu_common snapshot 逐项复核；事件冻结身份、message、cause 与 reset epoch | `mailbox_msix_vectors` 必须为 1，全局 MSI-X 数量不是每 Function 容量；ACK offset 读出当前 64 位 publication token，只有精确回写才消费发布；错误、重复、旧发布及跨 FLR/recover token 返回 `RDMA_SC_STALE_GENERATION`。这是适配器事件队列，不发真实 PCIe MSI-X MemWr；CEQ/AEQ 尚未全部自动接入 |
+| 可靠传输 | SEND/WRITE 按 `ACK_REQ_TH` 周期设置中间 AckReq，末段强制 AckReq；中间累计 ACK 不推进 MSN；超时从最高累计确认 PSN 的下一段继续；24-bit PSN 回绕；`PSN_RETRY_TH=7` 无限；过滤 opcode 不匹配、越界、陈旧和无进展响应；目标 QPC 冻结 service type 是 transport 权威；RESET/ERR/RTR 清理分段、sequence/RNR 门控和 `atomic_cache` | RNR 后不采纳无法在线上区分代次的中间累计 ACK，但 sequence NAK 可安全恢复；正常代次过滤已确认前缀的陈旧 sequence NAK。QP epoch 切换前必须停流，否则旧无限 RTO WQE 可能悬挂；同一超长 epoch 内 `atomic_cache` 无权威 replay window 可安全退休；`ACK_REQ_TH` 直接按字段值解释，0/1/7 未专项扩测；URC 无独立部分重传专项 |
+| PCIe | 保留 MMIO ingress Host authority，requester/fault 键使用 Host+BDF；启用 FC、事务记分板与功能覆盖率；timeout → 可重试 `RDMA_SC_TIMEOUT`，UR/CA → 保留原始 Completion code 的 `RDMA_SC_PCIE_COMPLETION`；错误读清空数据；scoreboard 按 exact request handle 退休 | timeout tag 在本次仿真剩余生命周期内 quarantine，不再复用；只有 pcie_work suite 的 DMA 走 PCIe，其他 suite 仍使用后门 DMA |
+
+定向测试包括 `rdma_dpu_interrupt_test`、`rdma_drv_reliability_test`、`rdma_env_pcie_test` 与
+`rdma_env_pcie_fault_test`。PCIe 正式依赖 `1a80801e` 与候选 `9aedf898` 的 basic/fault 均为
+W/E/F=`0/0/0`；历史 `4b7b8d70` 只证明编译兼容。
+
 ## 未做与遗留
 
 - CEQ/AEQ 的 request/resource/context model 与 lifecycle policy 仍为平行实现；字段名不同，
@@ -281,8 +322,14 @@ Function 可有相同 BDF（各自 PCIe 域）。
 - 第一阶段的包级 DAG 计划已被第二阶段的驱动形状重构取代。
 - 尚无 RTL DUT：`src/dev` 设备模型充当设备，接入 DUT 后应退为预测器。
 - 只有 pcie_work suite 的 DMA 走 PCIe；core/host_mem/e2e 仍用后门 DMA 端口（零仿真时间）。
-- 响应方对中间包 AckReq 不单独回 ACK（末包 ACK 已覆盖，长消息下 rxe 的中间 AckReq 只是延后确认）。URC/SQD 等 xtrdma 私有行为 rxe 不支持，无法互打。
-- PCIe 路径未开 FC/记分板/覆盖率；Completion 超时、UR/CA 只报为 DMA 失败，未建模设备侧错误上报。
+- `ACK_REQ_TH` 的硬件编码表未公开，当前直接按字段值解释分段间隔；URC/SQD 等 xtrdma 私有行为 rxe
+  不支持，0/1/7 未专项扩测，且 URC 尚无独立的部分重传专项。
+- QP 协议 epoch 切换要求上层先停流；若旧 epoch WQE 配置无限 PSN retry 且 RTO 不超时，并发状态切换
+  无法强制唤醒该等待，可能悬挂。`atomic_cache` 在 RESET/ERR/RTR 清除，但同一超长 epoch 内没有权威
+  replay window 可判定旧条目何时安全退休。
+- PCIe timeout tag 采用仿真生命周期 quarantine；这是为缺少 wire generation 的外部 VIP 避免迟到
+  Completion ABA 的保守策略，不模拟硬件有限 tag 池的长期回收。
 - core 内的 data/reliability/multifunc 用直连链路，只有 e2e 经 net_packet 帧编解码；设备报文不带 IP
   地址，GRH 与 IP 头地址为 0。
-- MAILBOX/MSI-X 寄存器、中断、SEND/WRITE 超时后的部分重传（响应方只对末包 ACK）未建模。
+- MAILBOX/MSI-X 仍是适配器寄存器与事件队列模型，不产生真实 PCIe MSI-X MemWr；CEQ/AEQ 尚未全部
+  自动接到该中断路径。

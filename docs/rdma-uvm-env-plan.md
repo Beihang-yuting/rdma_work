@@ -1,6 +1,6 @@
 # RDMA UVM env 改造方案（S1–S5）
 
-日期：2026-10-07。分支：`feature/rdma-arch-slim`。
+日期：2026-10-08。分支：`feature/rdma-arch-slim-completion`。
 目标：把散在各测试里的过程式代码收进一套 UVM env：配置决定拓扑与传输，序列产生激励，资源库管理对象，
 scoreboard/checker/coverage 负责判定与统计；测试只选配置与虚拟序列。代码精简易读，功能覆盖现有全部测试。
 
@@ -21,6 +21,9 @@ rdma_base_test ── rdma_env_cfg + vseq
     ├ cov        rdma_coverage（每个覆盖面一个 covergroup）
     └ vseqr      rdma_vsequencer（持有全部子 sequencer 与 env 句柄）
 ```
+
+`rdma_dpu_system` 只消费 dpu_common 的冻结快照。中断控制器把 Function key、BDF、global ID、BAR、parent
+与 caps 按值深拷贝，并在 attach 时重新与 snapshot 逐项复核；不会持有可变 Function 投影来替代平台权威。
 
 ## 2. 资源层（每类对象一个类，三层管理）
 
@@ -61,12 +64,17 @@ rdma_res_db ── funcs[uid] : rdma_res_func（每个 Function 一个；rxe 远
   FLR/RECOVER；属性；expect_fail）。driver 调用 `rdma_drv_*`，结果写资源库；资源库的 analysis 端口即控制面
   事件流（不另设 monitor）。命令进行中 monitor 暂停取 AEQ（驱动内部等待如 RTS2SQD 自己取）。
 - **rdma_verb_agent**：item 增加 QP/MR 句柄、显式 SGE 列表、SRQ 接收、数据模式（见第 5 节）、期望完成状态；
-  monitor 模拟中断处理：该 Function 全部 CEQ、AEQ、全部 CQ；上报 wc 状态/vendor/src_qp 与 AEQ 事件。
+  monitor 轮询该 Function 全部 CEQ、AEQ、CQ，并上报 wc 状态/vendor/src_qp 与 AEQ 事件。dpu 适配器另有
+  MAILBOX/MSI-X 寄存器和事件队列模型，但只建模每 Function 的 local vector 0；ACK offset 读出当前 64 位
+  publication token，只有精确回写才消费发布，错误、重复、旧发布或跨 FLR/recover token 返回
+  `RDMA_SC_STALE_GENERATION`。当前没有把全部 CEQ/AEQ 自动改接到 MSI-X 路径。
 - **rdma_link**：基类提供 `port(func)`、`tx_ap/rx_ap`、`drop/corrupt/delay(dir, nth)`；loopback 与 netpkt 在
   tb 包内，rxe 在 rxe 包内（工厂按名字创建，tb 不依赖 rxe 包）。
 - **rdma_env_plugin**：钩子 `pre_build(env)`、`build(env)`、`start(env)`、`report(env)`。
-  - `rdma_pcie_plugin`（tests/rdma_env_test_pkg，RC 应答用各 Host 的 host_mem manager）：安装 BAR/DMA 覆盖、按快照建 PCIe 系统、
-    结束时检查 MMIO/DMA TLP 计数、每个 BDF 都发过 DMA、MAILBOX 写被拒绝。
+  - `rdma_pcie_plugin`（tests/rdma_env_test_pkg，RC 应答用各 Host 的 host_mem manager）：安装 BAR/DMA 覆盖、
+    按快照建 PCIe 系统并保留 MMIO ingress 的 Host authority；启用 FC、事务记分板与功能覆盖率，结束时检查
+    MMIO/DMA TLP 计数、每个 Host+BDF 都发过 DMA 及跨 Host MMIO 不被误路由。fault test 另注入 timeout/UR/CA，
+    检查精确 request 退休与 timeout tag quarantine。
   - `rdma_rxe_plugin`（src/adapters/rxe/rdma_rxe_env.sv）：远端 Function（`cfg.remote_funcs`，下标在 dpu
     Function 之后）由 rxe_peer 进程承载；覆盖 ctrl/verb driver 与 monitor，远端资源/投递/完成经对端命令，
     缓冲为 `rdma_rxe_buf`（rbuf/wbuf 分块）；链路 `rdma_link_rxe`（TAP）。对端限制：单 PD/CQ/MR/SRQ、单 SGE、
@@ -77,7 +85,8 @@ rdma_res_db ── funcs[uid] : rdma_res_func（每个 Function 一个；rxe 远
   的期望完成队列：成功/错误码/flush/SRQ 顺序/UD）；scoreboard 只负责接事件与比对。错误预测依据资源库
   （rkey、权限、越界、接收容量、Q_Key），错误后预测 QP 进入 ERR、其后 WR 为 FLUSH；FLR 撤销范围内期望。
 - **rdma_proto_checker**：按 QP 维护 PSN/在途/MSN 状态；规则类 `rdma_rule_frame`（ICRC/pad/UDP/TVer/P_Key）、
-  `rdma_rule_psn`（连续、重传起点、READ 只重读缺失段）、`rdma_rule_ack`（AckReq、ACK/NAK 范围、MSN、NAK 码）、
+  `rdma_rule_psn`（连续、24-bit 回绕、累计确认后的重传起点、READ 只重读缺失段）、`rdma_rule_ack`（周期
+  AckReq、ACK/NAK opcode 与窗口、MSN、NAK 码）、
   `rdma_rule_rnr`（定时器编码、重试间隔）、`rdma_rule_state`（非 RTS/RTR 不收发、SQD 不发新 SQE）、
   `rdma_rule_ud`（DETH、Q_Key）。偏差清单按规则名降级为 info。
 - **rdma_coverage**：verb（op × 链路 × 长度区间 × SGE 数 × imm × QP 类型 × 数据模式）、error、qp_state、
@@ -116,13 +125,14 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 | --- | --- | --- |
 | core / cmq_gate / rdma_defs | 模型与驱动单元测试、net_packet 帧编解码测试 | dpu_common、host_mem、net_packet |
 | env | env 全部场景（loopback/netpkt 链路） | dpu_common、host_mem、net_packet |
-| pcie_work | rdma_env_pcie_test（PF/VF ↔ 另一 Host 的 basic_traffic）+ PCIe 插件 | 上述 + pcie_work |
+| pcie_work | rdma_env_pcie_test（PF/VF ↔ 另一 Host 的 basic_traffic）+ rdma_env_pcie_fault_test（timeout/UR/CA）+ PCIe 插件 | 上述 + pcie_work |
 | rxe | rdma_env_rxe_test（basic_traffic ↔ Soft-RoCE）+ 原 rxe 互打测试（需 TAP，手动） | 上述 + DPI、rdma_rxe |
 
 原 host_mem、net_packet、e2e 三个 suite 并入 env。外部组件直接引用（不锁版本、不做抽象层）：所有 suite
 编译同一份 RDMA 源码（`sim/filelists/rdma.f` + `tests.f`），主机内存恒为外部 host_mem（每个 Host 一个
 manager，每个 Function 按记账隔离 DMA），帧编解码为 `rdma_netpkt_codec`；pcie_work、rxe 只追加各自的
-filelist。对接代码集中在 `src/adapters/<组件>`。
+filelist。只有 pcie_work suite 通过 PCIe TLP 执行设备 DMA，其余 suite 使用后门 DMA；对接代码集中在
+`src/adapters/<组件>`。
 
 env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并全部测试的 covergroup 并打印
 `RDMA_COV merged=`（回归汇总的 merged 字段）。单个测试的 `RDMA_COV total=` 只反映该场景，专项测试
@@ -160,7 +170,7 @@ env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并�
 
 | 变异 | 目标测试 | 检出规则 |
 | --- | --- | --- |
-| SEND/WRITE 末包不置 AckReq | basic | rdma_rule_ack |
+| SEND/WRITE 周期或末包不置 AckReq | basic / reliability | rdma_rule_ack |
 | 3 包消息中间包 PSN +1 | basic | rdma_rule_psn |
 | RNR NAK 定时器编码 +1 | reliability | rdma_rule_rnr |
 | RNR 重试只等 1/4 定时器 | reliability | rdma_rule_rnr |
@@ -186,5 +196,37 @@ env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并�
 - rxe 响应方出错后 QP 转 ERR、不再应答（IBTA 行为）；errors 场景在远端对每个错误使用新 QP 对。
   5.15 内核的 rxe 响应方出错后不为 RQ 生成 flush 完成（后续内核才有 flush 支持），故响应方 flush 的
   检查只在被测设备作响应方时进行。
-- AckReq 规则只约束 SEND/WRITE 末包（READ/ATOMIC 必有响应）；UD Q_Key 取自 WR，不符时由接收端丢弃，
-  不作为发送方违例（scoreboard 验证丢弃）。
+- SEND/WRITE 按 `ACK_REQ_TH` 周期请求中间累计 ACK，末包始终请求 ACK；累计 ACK 不推进 MSN，请求方只在
+  确认窗口前进时重启 RTO，并从最高确认 PSN 的下一段部分重传。当前把 `ACK_REQ_TH` 字段值直接作为分段
+  间隔，0/1/7 尚未专项扩测；URC 复用协议路径但没有独立的部分重传专项。READ/ATOMIC 依靠各自响应；
+  UD Q_Key 取自 WR，不符时由接收端丢弃，不作为发送方违例（scoreboard 验证丢弃）。
+- `PSN_RETRY_TH=7` 表示无限重试；ACK/NAK 若 opcode 不匹配、PSN 越界/陈旧或不能产生累计进展，不得重启
+  完整 RTO 或修改当前 WQE。RNR 后不接受无法在线上区分代次的中间累计 ACK，但 sequence NAK 可安全恢复；
+  正常代次仍过滤已确认前缀的陈旧 sequence NAK。目标 QPC 的冻结 service type 是 transport 准入权威，
+  transport 不符的请求在触碰 PSN/分段状态前拒绝。
+- RESET/ERR/RTR 会清理孤立分段、`seq_nak_sent`、`rnr_drop` 与 `atomic_cache`。QP epoch 切换前必须先停流；
+  若与旧 epoch 的无限 RTO WQE 并发切换，等待无法被权威唤醒而可能悬挂。同一超长 epoch 内又没有权威
+  replay window 可安全退休 `atomic_cache` 条目。
+- MAILBOX/MSI-X 只支持每 Function 的 local vector 0；Function 身份、BDF、global ID、BAR、parent、caps
+  按值冻结并在 attach 时复核。`mailbox_msix_vectors` 必须为 1；全局 MSI-X 数量不能当作每 Function 容量。
+  ACK offset 的 64 位 publication token 必须精确回写，错误、重复、旧发布或跨 FLR/recover token 返回
+  `RDMA_SC_STALE_GENERATION`。输出是适配器事件，不是真实 PCIe MSI-X MemWr，CEQ/AEQ 也未全部自动接入。
+- PCIe Completion timeout 记为可重试 `RDMA_SC_TIMEOUT`，UR/CA 记为保留硬件 code 的
+  `RDMA_SC_PCIE_COMPLETION`；错误读清空返回数据。timeout tag 在仿真剩余生命周期内 quarantine，避免迟到
+  Completion 的 ABA。正式依赖 `1a80801e` 与候选 `9aedf898` 的 basic/fault 均为 W/E/F=`0/0/0`；历史
+  `4b7b8d70` 只提供编译兼容证据。
+
+## 11. completion 最终验证（2026-10-08）
+
+| 门禁 | 结果 |
+| --- | --- |
+| Python unit | 173/173 通过 |
+| profile naming / shell syntax / `git diff --check` | 通过 |
+| changed-SV style | 无 hard diagnostic；23 条既有 soft-limit 长行 |
+| `rdma_defs/rdma_cmq_driver_contract_test` | 通过 |
+| core / cmq_gate / env | 15/15、5/5、9/9，均 exit 0，逐项 W/E/F=`0/0/0` |
+| env 合并覆盖率 | `RDMA_COV merged=97.46` |
+| pcie_work 正式依赖 `1a80801e` | basic/fault 均 exit 0，W/E/F=`0/0/0` |
+| RXE | 3/3 pristine，均 exit 0，逐项 W/E/F=`0/0/0`；`rdma_env_rxe_test` coverage total=67.4 |
+
+RXE 的 67.4 是单场景 total；env 的最终覆盖率口径仍以 9 项回归合并值 97.46 为准。
