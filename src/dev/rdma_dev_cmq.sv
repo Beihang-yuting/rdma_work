@@ -28,7 +28,7 @@ class rdma_dev_object extends uvm_object;
 
   // 功能：构造对象并置默认状态。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：bytes/resize_sqe 初始为空且 modify_word 为零；对象只保存 context 值，不拥有外部 DMA。
   function new(string name = "rdma_dev_object");
     super.new(name);
     modify_word = '0;
@@ -71,7 +71,7 @@ class rdma_dev_cmq extends uvm_object;
 
   // 功能：构造对象并置默认状态。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：dma 初始为 null 且 CMQ 关闭；必须 configure() 后才能响应 doorbell，NIC 引用由上层绑定。
   function new(string name = "rdma_dev_cmq");
     super.new(name);
     dma = null;
@@ -92,7 +92,7 @@ class rdma_dev_cmq extends uvm_object;
 
   // 功能：设备复位：关闭 CMQ、清空游标与全部 context。
   // 输入/输出及副作用：修改本对象状态。
-  // 失败/边界：无。
+  // 失败/边界：重复复位幂等并保留 dma/nic 非拥有引用；未消费命令和一次性故障注入均被丢弃。
   function void reset();
     enabled = 1'b0;
     stall = 1'b0;
@@ -140,7 +140,7 @@ class rdma_dev_cmq extends uvm_object;
 
   // 功能：某类 context 的数量。
   // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 失败/边界：kind 尚未建立表项或已全部销毁时返回 0，不创建空关联数组。
   function int unsigned count(rdma_dev_kind_e kind);
     if (!objects.exists(kind))
       return 0;

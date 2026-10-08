@@ -218,6 +218,38 @@ class ChangedSvStyleTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("lacks adjacent", result.stderr)
 
+    def test_all_mode_rejects_unchanged_generic_method_comments(self) -> None:
+        """功能：确认 --all 会审查未出现在 diff 中的模板化构造说明和空失败边界。
+        输入输出及副作用：提交含两个精确禁用短语的基线，比较普通模式与全量模式状态；只操作临时仓库。
+        失败边界：普通模式不得审查无变更方法；全量模式必须分别报告构造职责和真实边界两项硬错误。"""
+
+        generic_source = self.valid_source().replace(
+            "功能：更新样例状态。",
+            "功能：构造。",
+        ).replace(
+            "失败/边界：输入不可用时保持原值。",
+            "失败/边界：无。",
+        )
+        holder, root, base = self.create_repo(generic_source)
+        with holder:
+            unchanged = self.invoke(root, base)
+            self.assertEqual(unchanged.returncode, 0, unchanged.stderr)
+            full = self.invoke(root, base, "--all")
+            self.assertNotEqual(full.returncode, 0)
+            self.assertIn("constructor comment", full.stderr)
+            self.assertIn("failure/boundary comment", full.stderr)
+
+    def test_all_mode_rejects_head_combination(self) -> None:
+        """功能：确认全量工作树检查不能与读取提交 blob 的 --head 模式混用。
+        输入输出及副作用：对临时仓库同时传入 --all/--head，读取 argparse 非零状态；不改写 fixture。
+        失败边界：若组合被接受，未跟踪文件与提交快照来源会产生歧义，测试必须失败。"""
+
+        holder, root, base = self.create_repo(self.valid_source())
+        with holder:
+            result = self.invoke(root, base, "--all", "--head", base)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot be combined", result.stderr)
+
     def test_new_file_header_requires_all_four_items(self) -> None:
         """功能：验证新增 SV 文件必须含目录层次、职责、依赖和所有权生命周期四项文件头。
         输入输出及副作用：逐项删除头部字段并运行 checker，输出 file header 硬诊断。

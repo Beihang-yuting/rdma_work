@@ -94,7 +94,8 @@ class rdma_packet extends uvm_object;
   bit [23:0] destination_qpn;
   bit [23:0] source_qpn;
   bit [23:0] psn;
-  // BTH AckReq：请求方要求响应方对本包回 ACK（RC SEND/WRITE 的末包置位；IBTA 9.7.2）。
+  // BTH AckReq：请求方要求响应方回覆覆盖本 PSN 的累计 ACK（RC/URC SEND/WRITE 可在中间包
+  //   按 QPC ACK_REQ_TH 置位，末包始终置位；IBTA 9.7.2）。
   bit ack_req;
   // header_bytes 是 BTH 之后扩展头的线上字节（IBTA 顺序：RETH、AETH、AtomicETH、
   //   AtomicAckETH、ImmDt），由 pack_headers()/unpack_headers() 与下列结构化字段互转。
@@ -117,7 +118,7 @@ class rdma_packet extends uvm_object;
 
   // 功能：构造网络包，默认 RC、SEND、ONLY，QPN/PSN 与扩展头清零。
   // 输入/输出及副作用：name 为 UVM 实例名；仅初始化本地字段。
-  // 失败/边界：无。
+  // 失败/边界：空 name 由 UVM 接受；header_bytes、metadata、payload 初始为空，调用者填充后才可发送。
   function new(string name = "rdma_packet");
     super.new(name);
     transport = RDMA_TRANSPORT_RC;
@@ -143,7 +144,7 @@ class rdma_packet extends uvm_object;
 
   // 功能：判断报文是否携带 RETH（WRITE 首/单包与 READ 请求）。
   // 输入/输出及副作用：只读 opcode/segment。
-  // 失败/边界：无。
+  // 失败/边界：WRITE 的 MIDDLE/LAST 与全部非 WRITE/READ_REQUEST opcode 返回 0。
   function bit has_reth();
     return (opcode inside {RDMA_NET_RDMA_WRITE, RDMA_NET_WRITE_WITH_IMM} &&
             segment inside {RDMA_SEG_FIRST, RDMA_SEG_ONLY}) ||
@@ -152,7 +153,7 @@ class rdma_packet extends uvm_object;
 
   // 功能：判断报文是否携带 AETH（READ 响应首/尾/单包、ACK/NAK、ATOMIC ACK）。
   // 输入/输出及副作用：只读 opcode/segment。
-  // 失败/边界：无。
+  // 失败/边界：READ 响应 MIDDLE 不携带 AETH；不在列举集合的 opcode 返回 0。
   function bit has_aeth();
     return (opcode == RDMA_NET_RDMA_READ_RESP && segment != RDMA_SEG_MIDDLE) ||
            opcode inside {RDMA_NET_ACK, RDMA_NET_NAK, RDMA_NET_ATOMIC_ACK};
@@ -160,14 +161,14 @@ class rdma_packet extends uvm_object;
 
   // 功能：判断报文是否携带 AtomicETH（CMP_SWAP/FETCH_ADD 请求）。
   // 输入/输出及副作用：只读 opcode。
-  // 失败/边界：无。
+  // 失败/边界：Atomic ACK 是响应头而非 AtomicETH，请求集合之外一律返回 0。
   function bit has_atomic_eth();
     return opcode inside {RDMA_NET_ATOMIC_CMP_SWAP, RDMA_NET_ATOMIC_FETCH_ADD};
   endfunction
 
   // 功能：判断报文是否携带 ImmDt（带立即数的 SEND/WRITE 尾包或单包）。
   // 输入/输出及副作用：只读 opcode/segment。
-  // 失败/边界：无。
+  // 失败/边界：FIRST/MIDDLE 不序列化立即数；普通 SEND/WRITE 与其他 opcode 返回 0。
   function bit has_immdt();
     return opcode inside {RDMA_NET_SEND_WITH_IMM, RDMA_NET_WRITE_WITH_IMM} &&
            segment inside {RDMA_SEG_LAST, RDMA_SEG_ONLY};
@@ -175,7 +176,7 @@ class rdma_packet extends uvm_object;
 
   // 功能：按 opcode/segment 计算扩展头总长度（与 pack_headers 一致）。
   // 输入/输出及副作用：只读 opcode/segment。
-  // 失败/边界：无。
+  // 失败/边界：没有扩展头的组合返回 0；未知 opcode 不贡献长度，返回值只覆盖本模型支持的头型。
   function int unsigned header_length();
     int unsigned n;
 
@@ -195,7 +196,7 @@ class rdma_packet extends uvm_object;
 
   // 功能：按 IBTA 顺序把结构化扩展头序列化为 header_bytes（大端）。
   // 输入/输出及副作用：覆盖 header_bytes。
-  // 失败/边界：无；不携带的头不输出。
+  // 失败/边界：函数不返回状态；不携带的头不输出，其结构化字段原值保留但不会进入线上字节。
   function void pack_headers();
     header_bytes.delete();
     if (has_reth()) begin

@@ -8,7 +8,7 @@
 virtual class rdma_drv_bar extends uvm_object;
   // 功能：构造 BAR 端口。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：抽象端口不保存路由或资源；必须由绑定具体 Function authority 的派生类实现 write64。
   function new(string name = "rdma_drv_bar");
     super.new(name);
   endfunction
@@ -28,7 +28,7 @@ class rdma_drv_dma extends uvm_object;
 
   // 功能：构造空缓冲区描述。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：iova=0/size=0 表示尚未分配且不拥有 backing；只有 alloc_dma 成功返回的描述可读写。
   function new(string name = "rdma_drv_dma");
     super.new(name);
     iova = '0;
@@ -109,7 +109,7 @@ class rdma_drv_bitmap extends uvm_object;
 
   // 功能：已用位数。
   // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 失败/边界：未 init 或容量为零时返回 0；只统计当前 used 位，不受 next_pos 影响。
   function int unsigned count();
     int unsigned c;
 

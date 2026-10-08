@@ -37,9 +37,11 @@ class rdma_drv_qp_init_attr extends uvm_object;
   int unsigned max_inline;
   bit sig_all;
 
-  // 功能：以 RC、单 SGE、无 inline 的默认值构造。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造供 create_qp 使用的默认属性，选择 RC、256 项 SQ/RQ、单 SGE、无 inline 且不全量
+  //   产生 CQE。
+  // 输入/输出及副作用：name 为 UVM 对象名；PD、发送/接收 CQ 与可选 SRQ 均初始化为非拥有空引用。
+  // 失败/边界：构造阶段不校验或分配资源；调用者必须在 create_qp 前补齐 PD 和两个 CQ 引用，
+  //   否则 create_qp 返回 INVALID_ARGUMENT。
   function new(string name = "rdma_drv_qp_init_attr");
     super.new(name);
     qp_type = RDMA_DRV_QPT_RC;
@@ -90,9 +92,11 @@ class rdma_drv_qp_attr extends uvm_object;
   bit [47:0] dmac;
   byte unsigned dest_ip[16];
 
-  // 功能：构造空属性（mask=0）。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造 mask=0 的 QP 修改属性，并把未启用的 path_mtu 预置为 4096B。
+  // 输入/输出及副作用：name 为 UVM 对象名；其余值字段保持 SystemVerilog 的零初值，返回对象不拥有
+  //   外部资源。
+  // 失败/边界：mask 为 0 时 modify 不消费任何值字段；调用者启用某个 mask 位前必须填入对应字段，
+  //   状态迁移与 MTU 等合法性由 modify_qp 校验。
   function new(string name = "rdma_drv_qp_attr");
     super.new(name);
     mask = 0;
@@ -161,9 +165,11 @@ class rdma_drv_qp extends uvm_object;
   longint unsigned rq_wr_id[];
   longint unsigned rq_ring_head[];
 
-  // 功能：构造 QP。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造处于 RESET 的空 QP 软件对象，并清零 SQ/RQ 环、polarity 与 doorbell 计数状态。
+  // 输入/输出及副作用：name 为 UVM 对象名；SQ、RQ 与 QPC backing 引用初始化为 null，尚未取得
+  //   QPN、DMA、CQ、PD 或其他资源的所有权。
+  // 失败/边界：该对象只有经 create_qp 成功填充后才能用于 post、modify 或 destroy；直接使用空对象会
+  //   违反缓冲和关联对象非空的不变量。
   function new(string name = "rdma_drv_qp");
     super.new(name);
     cur_state = RDMA_DRV_QPS_RESET;
@@ -274,9 +280,11 @@ class rdma_drv_qp extends uvm_object;
     dev.qp_table[qp.qpn] = qp;
   endtask
 
-  // 功能：xtrdma_set_qp_param：clamp(wr, 256（URC 为 8）, 32768) 后取 2 的幂。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：xtrdma_set_qp_param：把请求 WR 数量提升到普通 QP 的 256 或 URC QP 的 8 项下限，再
+  //   向上取整到 2 的幂作为硬件环深度。
+  // 输入/输出及副作用：wr 为请求项数，urc 选择下限；返回计算后的深度，不修改调用者状态。
+  // 失败/边界：本辅助函数不执行 MAX_WR 上限检查；create_qp 必须先拒绝超过 32768 的请求，零值则
+  //   分别收敛到 256 或 8，已是 2 的幂的值保持不变。
   static function int unsigned round_depth(int unsigned wr, bit urc = 1'b0);
     if (!urc && wr < MIN_WR)
       wr = MIN_WR;
@@ -354,9 +362,12 @@ class rdma_drv_qp extends uvm_object;
       send_cq.modify_urc(dev, 1'b0, 1'b0, 1'b0, 0, 0, ignored);
   endtask
 
-  // 功能：xtrdma_qp_set_urc_info：frag 记录本 QP 的 QPN 与方向，send/recv 环大小取 SQ/RQ 深度。
-  // 输入/输出及副作用：修改 frag CQ 软件状态。
-  // 失败/边界：无。
+  // 功能：xtrdma_qp_set_urc_info：在发送/接收 frag CQ 中登记本 QP 的 QPN、方向和对应环深度，
+  //   并把接收 frag 标记为有效。
+  // 输入/输出及副作用：修改 send_cq 与 recv_cq 的 URC 软件元数据，接收和发送共用 frag 时会更新
+  //   同一个对象的两组字段。
+  // 失败/边界：仅允许在 make_frags 与 CQC URC 配置成功后调用；两个 CQ 引用必须非空且仍指向本 QP
+  //   的 frag，本函数不再校验该生命周期不变量。
   protected function void set_urc_info();
     send_cq.send_flag = 1'b1;
     send_cq.send_qpn = qpn;
@@ -450,8 +461,10 @@ class rdma_drv_qp extends uvm_object;
   // 功能：xtrdma_fill_rc_ud_qpc_info 的 create 初值：服务类型、身份、shadow 地址、端序/fence、
   //   ORQ/EIRQ/UAQ 与大小、INIT 状态、PMTU、重试门限、PD/SRQ、DSCP/ECN/hoplimit/UDP 源端口、
   //   SQ/RQ PBA/大小/OM、CQN。
-  // 输入/输出及副作用：重建 qpc 镜像。
-  // 失败/边界：无。
+  // 输入/输出及副作用：读取 dev 身份配置及 QP 关联资源，覆盖重建本对象的 512B qpc 镜像；不直接
+  //   写 HMC 或下发命令。
+  // 失败/边界：调用前 QPN、PD、CQ、SQ 以及按 QP 类型分配的 side_bufs 必须完整，非 SRQ 模式还要求
+  //   RQ 缓冲有效；资源缺失属于 create_qp 内部不变量破坏，本函数不返回状态。
   protected function void fill_qpc(rdma_drv_dev dev);
     bit [63:0] orq;
 
@@ -523,8 +536,8 @@ class rdma_drv_qp extends uvm_object;
 
   // 功能：xtrdma_get_rto_code：IB timeout（4.096us * 2^t，0 为无限）→ 硬件 RTO 时间编码
   //   （xtrdma_rto_code_map：0→31，1→0，2→1，3→3，4→7，5→11，6→15，7..20→t+10，≥21→31）。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 输入/输出及副作用：timeout 为 IB timeout 指数，返回 5 位硬件 RTO 编码，不修改对象状态。
+  // 失败/边界：timeout=0 映射为无限等待编码 31；7..20 线性映射，超过 20 的输入饱和为 31。
   static function bit [4:0] rto_code(int unsigned timeout);
     bit [4:0] low[7];
 
@@ -539,8 +552,10 @@ class rdma_drv_qp extends uvm_object;
   // 功能：fill_urc_qpc_info 中与 RC 不同的部分（qp.c:1226）：服务类型 6，RSQ/RDSQ/DSQ 地址与大小，
   //   RBSN/RPSN 初值 0x1000、DBSN/DPSN 初值 0，RDSQ/DSQ 预取数 8，LOCAL_RNR_CODE/RTO_CODE 为
   //   urc_rnr_code/urc_rto_code，SQ CE/RQ SE 门限，FC/ECN 同 RC；不写 ORQ/EIRQ/UAQ_IRQ 地址。
-  // 输入/输出及副作用：修改 qpc 镜像。
-  // 失败/边界：无。
+  // 输入/输出及副作用：读取 URC side_bufs 中的 RSQ/RDSQ/DSQ DMA 地址并修改当前 qpc 镜像；不写
+  //   HMC，也不改变缓冲所有权。
+  // 失败/边界：仅可由 fill_qpc 在 URC create 路径调用，要求四个 URC side buffer 已按固定次序分配；
+  //   本函数不检查数组长度，普通 RC/UD QP 不得调用。
   protected function void fill_urc_qpc();
     bit [63:0] rsq;
     bit [63:0] dsq;
@@ -667,8 +682,10 @@ class rdma_drv_qp extends uvm_object;
   endfunction
 
   // 功能：xtrdma_update_qp_context：按 mask 把属性写入 QPC 镜像（PSN 写入全部镜像字段）。
-  // 输入/输出及副作用：修改 qpc。
-  // 失败/边界：无。
+  // 输入/输出及副作用：读取 a 中由 mask 选中的状态、寻址、重试及 PSN 字段并原地修改 qpc；next
+  //   决定写入的硬件状态编码，未置位字段保持原值。
+  // 失败/边界：本函数假定 modify_qp 已验证状态迁移与属性范围；未知或未置位的 mask 位被忽略，
+  //   dest_ip 固定读取完整 16B，调用者必须提供已构造的属性对象。
   protected function void apply_attr(rdma_drv_qp_attr a, rdma_drv_qp_state_e next);
     if (a.mask & rdma_drv_qp_attr::M_DEST_QPN) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_DST_QPN, a.dest_qpn)

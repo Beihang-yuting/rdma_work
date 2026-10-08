@@ -12,9 +12,9 @@ class rdma_hw_cmq_field_body extends rdma_hw_model;
   longint unsigned values[string];
   byte unsigned blobs[string][];
 
-  // 功能：构造空 body。
-  // 输入/输出及副作用：name 为 UVM 实例名。
-  // 失败/边界：无。
+  // 功能：构造尚未携带任何驱动 info 标量或数组字段的 CMQ field body。
+  // 输入/输出及副作用：name 成为 UVM 实例名；values/blobs 保持空关联数组并由本对象拥有。
+  // 失败/边界：空 name 由 UVM 接受；构造阶段不校验 opcode，成员合法性延后到 encode()。
   function new(string name = "rdma_hw_cmq_field_body");
     super.new(name);
   endfunction
@@ -43,7 +43,7 @@ class rdma_hw_cmq_field_body extends rdma_hw_model;
 
   // 功能：返回取值摘要。
   // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 失败/边界：空 body 稳定返回 0 values/0 blobs；摘要不展开成员内容或报告编码合法性。
   virtual function string describe();
     return $sformatf("CMQ field body(%0d values, %0d blobs)", values.num(), blobs.num());
   endfunction
@@ -59,16 +59,16 @@ class rdma_hw_cmq_field_codec extends uvm_object;
   localparam int unsigned SD_CARRIED = 2;
   localparam int unsigned SD_CHUNK_BYTES = 16;
 
-  // 功能：构造无状态 codec。
-  // 输入/输出及副作用：name 为 UVM 实例名。
-  // 失败/边界：无。
+  // 功能：构造按冻结 CMQ 字段表执行编码的无状态 codec 实例。
+  // 输入/输出及副作用：name 成为 UVM 实例名；实例不缓存 opcode、body 或输出 image。
+  // 失败/边界：空 name 由 UVM 接受；字段表缺失与输入错误只在 encode() 时返回状态。
   function new(string name = "rdma_hw_cmq_field_codec");
     super.new(name);
   endfunction
 
   // 功能：opcode 是否由字段表覆盖。
   // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 失败/边界：未知或未生成字段表的 opcode 返回 0，临时 specs 队列不会逸出本函数。
   static function bit supports(bit [7:0] opcode);
     rdma_cmq_field_spec_t specs[$];
 
@@ -215,7 +215,7 @@ class rdma_hw_cmq_field_codec extends uvm_object;
 
   // 功能：字段是否以字节数组承载（memcpy 字段与 MAC）。
   // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 失败/边界：只有 mac48 或以 bytes: 开头的 transform 返回 1，空串及未知变换均返回 0。
   protected function bit is_blob(rdma_cmq_field_spec_t spec);
     return spec.transform == "mac48" || spec.transform.substr(0, 5) == "bytes:";
   endfunction
@@ -251,7 +251,7 @@ class rdma_hw_cmq_field_codec extends uvm_object;
 
   // 功能：按大端 qword 序列化为 CMQ SQE body image。
   // 输入/输出及副作用：返回新 image。
-  // 失败/边界：无。
+  // 失败/边界：输入固定为 8 个 qword 并总生成 64B image；调用者接管工厂创建对象的生命周期。
   protected function rdma_hw_image make_image(bit [63:0] words[8]);
     rdma_hw_image image;
 
@@ -274,21 +274,21 @@ class rdma_hw_cmq_field_codec extends uvm_object;
 
   // 功能：构造错误 status。
   // 输入/输出及副作用：纯构造。
-  // 失败/边界：无。
+  // 失败/边界：空 message 仍生成 RDMA_SC_INVALID_ARGUMENT，函数不改写或补充调用点语义。
   protected function rdma_status invalid_argument(string message);
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, message);
   endfunction
 
   // 功能：构造 codec 错误 status。
   // 输入/输出及副作用：纯构造。
-  // 失败/边界：无。
+  // 失败/边界：空 message 仍生成 RDMA_SC_CODEC_ERROR；具体 codec 上下文必须由调用者提供。
   protected function rdma_status codec_error(string message);
     return rdma_status::make(RDMA_SC_CODEC_ERROR, message);
   endfunction
 
   // 功能：构造不支持 opcode 的 status。
   // 输入/输出及副作用：纯构造。
-  // 失败/边界：无。
+  // 失败/边界：任意 8 位 opcode 都格式化进消息并返回 RDMA_SC_UNSUPPORTED_OPCODE，不查询字段表。
   protected function rdma_status unsupported(bit [7:0] opcode);
     return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                              $sformatf("CMQ opcode 0x%02x has no field layout", opcode));

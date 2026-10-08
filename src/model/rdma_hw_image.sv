@@ -82,9 +82,9 @@ endclass
 // 硬件格式模型基类（CMQ 字段 body 等派生）。
 virtual class rdma_hw_model extends uvm_object;
 
-  // 功能：构造 hw model 基类对象。
-  // 输入/输出及副作用：name 为对象名。
-  // 失败/边界：无。
+  // 功能：构造只定义 validate/describe 契约的硬件模型基类部分。
+  // 输入/输出及副作用：name 成为 UVM 对象名；基类不分配镜像、字段或外部资源。
+  // 失败/边界：空 name 由 UVM 接受；抽象类不能直接实例化，默认状态与所有权由派生类说明。
   function new(string name = "rdma_hw_model");
     super.new(name);
   endfunction
@@ -96,6 +96,6 @@ virtual class rdma_hw_model extends uvm_object;
 
   // 功能：返回 context 模型的稳定文本描述（由各派生类实现）。
   // 输入/输出及副作用：只读；返回 string。
-  // 失败/边界：无。
+  // 失败/边界：派生实现必须能描述默认/未配置状态，并且不得因格式化失败修改模型。
   pure virtual function string describe();
 endclass

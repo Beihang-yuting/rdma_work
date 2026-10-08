@@ -66,7 +66,7 @@ class rdma_drv_cmq extends uvm_object;
 
   // 功能：新建只含 opcode 的 64B SQE（其余字段由调用方按 cmq.c 填充函数写入）。
   // 输入/输出及副作用：返回新数组。
-  // 失败/边界：无。
+  // 失败/边界：任意 8 位 opcode 都会原样写入且不做支持性校验；信封位仍为零，提交前必须 seal。
   static function rdma_bytes_t new_sqe(bit [7:0] opcode);
     rdma_bytes_t sqe;
 
@@ -115,7 +115,7 @@ class rdma_drv_cmq extends uvm_object;
   // 功能：填信封（VALID=polarity，WRAP=!polarity，INDEX=idx）；sign 时置 SIGN_EN 并按
   //   ~(SQE 全部字节异或 ^ extra 字节异或) 写签名（QPC 命令的 extra 为 512B QPC，SD_UPDATE 为扩展表）。
   // 输入/输出及副作用：修改 sqe。
-  // 失败/边界：无。
+  // 失败/边界：调用者须提供 64B SQE 和环深度内 idx；sign=0 时忽略 extra，字段写入按固定位宽截断。
   static function void seal(inout rdma_bytes_t sqe, input int unsigned idx, input bit polarity,
                             input bit sign, input rdma_bytes_t extra);
     bit [63:0] word0;

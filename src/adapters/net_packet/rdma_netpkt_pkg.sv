@@ -25,9 +25,9 @@ package rdma_netpkt_pkg;
     bit [31:0] src_ip;
     bit [31:0] dst_ip;
 
-    // 功能：构造，地址取缺省值。
-    // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
+    // 功能：构造使用固定 loopback MAC/IPv4 端点的 RoCEv2 帧 codec。
+    // 输入/输出及副作用：name 成为 UVM 名；只初始化四个地址值，不持有 packet 或帧对象。
+    // 失败/边界：空 name 由 UVM 接受；真实链路必须在首次 encode 前覆盖地址，否则使用 10.0.0.1→10.0.0.2。
     function new(string name = "rdma_netpkt_codec");
       super.new(name);
       src_mac = 48'h0002_0000_0001;

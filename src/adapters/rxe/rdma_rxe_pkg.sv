@@ -35,7 +35,7 @@ package rdma_rxe_pkg;
 
     // 功能：构造未启动的对端。
     // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
+    // 失败/边界：handle 初始化为 -1；必须先由 start() 获得有效进程句柄才能发送命令。
     function new(string name = "rdma_rxe_peer");
       super.new(name);
       handle = -1;
@@ -158,7 +158,7 @@ package rdma_rxe_pkg;
 
     // 功能：关闭 TAP。
     // 输入/输出及副作用：释放文件描述符。
-    // 失败/边界：无。
+    // 失败/边界：fd 为 -1 时依赖 DPI close 的幂等处理；无论底层状态如何都会把本地 fd 恢复为 -1。
     function void close();
       rdma_rxe_tap_close(fd);
       fd = -1;

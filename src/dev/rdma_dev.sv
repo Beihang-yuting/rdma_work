@@ -25,7 +25,7 @@ class rdma_dev extends uvm_object;
 
   // 功能：绑定设备 DMA 使用的主机内存（CMQ 建立 DMA 端口，NIC 共用）并复位。
   // 输入/输出及副作用：保存非拥有引用。
-  // 失败/边界：无。
+  // 失败/边界：host_mem 为 null 时仍完成复位，但后续 CMQ doorbell 因没有 DMA 端口返回 INVALID_STATE。
   function void configure(rdma_host_mem host_mem);
     cmq.configure(host_mem);
     nic.reset();
@@ -34,7 +34,7 @@ class rdma_dev extends uvm_object;
   // 功能：Function 级复位（FLR）：关闭 CMQ、清空全部 context 与数据面运行状态；主机内存绑定保留。
   //   之后驱动须重新 probe。
   // 输入/输出及副作用：修改设备状态。
-  // 失败/边界：无。
+  // 失败/边界：重复调用保持关闭且空 context 的幂等状态；不会释放外部 host_mem 或驱动侧资源。
   function void flr();
     cmq.reset();
     nic.reset();

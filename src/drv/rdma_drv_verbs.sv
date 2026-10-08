@@ -10,9 +10,9 @@ class rdma_drv_pd extends uvm_object;
 
   int unsigned pd_id;
 
-  // 功能：构造 PD。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造尚未分配硬件编号的 PD 软件对象。
+  // 输入/输出及副作用：name 为 UVM 对象名；pd_id 保持 SystemVerilog 零初值且对象暂不拥有 PD 号。
+  // 失败/边界：只有 alloc 成功后 pd_id 才可作为保护域标识；构造本身不探测编号耗尽。
   function new(string name = "rdma_drv_pd");
     super.new(name);
   endfunction
@@ -27,9 +27,10 @@ class rdma_drv_pd extends uvm_object;
     return rdma_status::success();
   endfunction
 
-  // 功能：xtrdma_ib_dealloc_pd。
-  // 输入/输出及副作用：释放 PD 号。
-  // 失败/边界：无。
+  // 功能：xtrdma_ib_dealloc_pd，把本对象持有的 pd_id 归还设备编号池。
+  // 输入/输出及副作用：修改 dev.pd_ids 的可用集合；对象中的 pd_id 数值不被清零。
+  // 失败/边界：调用者必须保证引用该 PD 的 MR/QP 已销毁且本对象仅释放一次；本函数不检测悬挂引用
+  //   或重复释放。
   function void dealloc(rdma_drv_dev dev);
     dev.pd_ids.free(pd_id);
   endfunction
@@ -48,23 +49,26 @@ class rdma_drv_mr extends uvm_object;
   int unsigned mr_sn;
   protected static int unsigned next_mr_sn = 0;
 
-  // 功能：构造 MR。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造尚未注册的 MR 软件对象。
+  // 输入/输出及副作用：name 为 UVM 对象名；PD、PBL backing 和地址/长度/权限字段保持空引用或零值，
+  //   尚未取得 MPT/PBL 资源所有权。
+  // 失败/边界：必须经 reg 成功后才能发布 key 或执行 dereg；构造阶段不校验地址范围和访问权限。
   function new(string name = "rdma_drv_mr");
     super.new(name);
   endfunction
 
-  // 功能：lkey/rkey（驱动两者相同）。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：返回驱动为本 MR 共用的 lkey/rkey STAG。
+  // 输入/输出及副作用：只读 stag，不修改 MR 或设备状态。
+  // 失败/边界：未完成 reg 或已 dereg 的对象不应发布该值；本函数不跟踪注册态，此时可能返回默认值
+  //   或已经失效的旧 STAG。
   function bit [31:0] key();
     return stag;
   endfunction
 
-  // 功能：xtrdma_get_access：IB 权限 → MRT 权限位；任何写/原子权限隐含本地写。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：xtrdma_get_access：把本地写、远端读/写/原子四个 IB 权限转换为 5 位 MRT 权限，任何远端
+  //   写或原子权限都会补齐硬件要求的本地写位。
+  // 输入/输出及副作用：四个布尔输入决定返回位图；不读取或修改 MR 状态。
+  // 失败/边界：该映射只表达当前四类权限，不验证调用者是否允许组合；全零输入返回零权限。
   static function bit [4:0] rights_of(bit local_write, bit remote_read, bit remote_write,
                                       bit remote_atomic);
     bit [4:0] r;
@@ -235,9 +239,11 @@ class rdma_drv_cq extends uvm_object;
   longint unsigned recv_tail;
   bit recv_vld;
 
-  // 功能：构造 CQ。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造空 CQ 软件对象，初始化消费指针、polarity、arm 序号及 URC frag 跟踪状态。
+  // 输入/输出及副作用：name 为 UVM 对象名；mem_kbuf、ctx_page 与 original 均为非拥有空引用，frags
+  //   和槽位图尚未分配。
+  // 失败/边界：只有 create_cq 或 create_frag 成功后 size、CQN 和 backing 才有效；空 CQ 不能轮询、
+  //   武装、清理或销毁。
   function new(string name = "rdma_drv_cq");
     super.new(name);
     mem_kbuf = null;
@@ -259,8 +265,10 @@ class rdma_drv_cq extends uvm_object;
 
   // 功能：init_cq 的 CQC_CREATE SQE（56B CQC 在 SQE 字节 8 起）：尺寸、状态、当前/下一 PBA、CI 门限、
   //   OM、LAST_ARM_SN、CEQN、shadow 地址；frag CQ 另带 URC_CQ_START_IDX（覆盖 CQ_PI）。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 输入/输出及副作用：根据 cqn、2 的幂环 size、页基址 pba、OM、CEQN、context IOVA 与 frag 起点
+  //   返回完整 CQC_CREATE SQE，不修改设备或 CQ 状态。
+  // 失败/边界：调用者必须保证 size 非零且为 2 的幂、地址满足硬件对齐并且字段值未超宽；本函数只
+  //   截取/编码字段，不单独报告越界。
   static function rdma_bytes_t cqc_sqe(int unsigned cqn, int unsigned size, bit [63:0] pba,
                                        int unsigned om, int unsigned ceqn, bit [63:0] ctx_iova,
                                        int unsigned start);
@@ -487,9 +495,10 @@ class rdma_drv_cq extends uvm_object;
     return dev.hw.write(ctx_page, ctx_offset + URC_INFO_OFFSET, info);
   endfunction
 
-  // 功能：move_cq_ring_tail：tail 加一，回绕时翻转 polarity 与 ci_wrap。
-  // 输入/输出及副作用：修改软件 CI 状态。
-  // 失败/边界：无。
+  // 功能：move_cq_ring_tail：消费一个 CQE，并在 tail 跨越环末尾时同步翻转 polarity 与 ci_wrap。
+  // 输入/输出及副作用：tail 自增，恰逢 size 整数倍时修改两个相位位；不写 CQ shadow 或 doorbell。
+  // 失败/边界：要求已创建 CQ 且 size 非零；本函数不检查空环/越界，也不替调用者执行
+  //   update_shadow_ci。
   function void advance_tail();
     tail++;
     if (tail % size == 0) begin
@@ -707,9 +716,11 @@ class rdma_drv_srq extends uvm_object;
   bit polarity;
   longint unsigned wr_ids[];
 
-  // 功能：构造 SRQ。
-  // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 功能：构造空 SRQ 软件对象，清零 arm/生产消费计数并建立初始 polarity。
+  // 输入/输出及副作用：name 为 UVM 对象名；SRQ/SRFQ backing 与 context 均初始化为 null，槽位图、
+  //   wr_id 表和 SGB 尚未取得所有权。
+  // 失败/边界：必须经 create_srq 成功后 depth、SRQN 和 backing 才有效；空对象不能 post、modify 或
+  //   destroy。
   function new(string name = "rdma_drv_srq");
     super.new(name);
     srq_kbuf = null;

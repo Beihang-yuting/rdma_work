@@ -15,6 +15,10 @@ import sys
 
 
 LABELS = ("功能：", "输入/输出及副作用：", "失败/边界：")
+GENERIC_COMMENT_PATTERNS = (
+    (re.compile(r"^功能：构造。$"), "constructor comment must describe initialized state and ownership"),
+    (re.compile(r"^失败/边界：无。$"), "failure/boundary comment must describe the actual no-op, limit, or invariant"),
+)
 # SystemVerilog allows declaration qualifiers such as ``pure virtual`` and
 # ``extern static`` before the function/task keyword.  Keep the recognizer
 # deliberately qualifier-only so it cannot mistake arbitrary identifiers for
@@ -129,6 +133,27 @@ def add_untracked(root: Path, changes: ChangeSet) -> None:
             raise ValueError(f"cannot read {name}: {exc}") from exc
         changes.lines[name] = set(range(1, count + 1))
         changes.new_files.add(name)
+
+
+def all_tracked_sources(root: Path) -> ChangeSet:
+    """功能：构造覆盖仓库全部已跟踪及未跟踪 SV/SVH 行的全量检查集合。
+    输入输出及副作用：输入仓库根，返回每个源文件的完整行号并把它们标为需检查文件头；仅读取 Git 与工作树。
+    失败边界：Git 清单失败、路径不可读或 UTF-8 解码失败时抛出 ValueError，不静默跳过任何源文件。"""
+
+    result = run_git(root, ["ls-files", "--", "*.sv", "*.svh"])
+    if result.returncode != 0:
+        raise ValueError(f"cannot list tracked SV/SVH files: {result.stderr.strip()}")
+    changes = ChangeSet()
+    for name in result.stdout.splitlines():
+        path = root / name
+        try:
+            count = len(path.read_text(encoding="utf-8").splitlines())
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"cannot read {name}: {exc}") from exc
+        changes.lines[name] = set(range(1, count + 1))
+        changes.new_files.add(name)
+    add_untracked(root, changes)
+    return changes
 
 
 @dataclass
@@ -307,6 +332,17 @@ def check_method_comments(
             diagnostics.append(Diagnostic(path, start, "function/task lacks adjacent 功能/输入输出及副作用/失败边界 comments"))
         elif block:
             claimed[key] = start
+            normalized_comments = []
+            for item in block:
+                comment = lines[item].strip().rstrip("\\").strip()
+                if comment.startswith("//"):
+                    comment = comment[2:].strip()
+                elif comment.startswith("/*") and comment.endswith("*/"):
+                    comment = comment[2:-2].strip()
+                normalized_comments.append(comment)
+            for pattern, message in GENERIC_COMMENT_PATTERNS:
+                if any(pattern.fullmatch(comment) for comment in normalized_comments):
+                    diagnostics.append(Diagnostic(path, start, message))
 
 
 def check_file_header(path: str, lines: list[str], diagnostics: list[Diagnostic]) -> None:
@@ -446,19 +482,23 @@ def run_checks(root: Path, changes: ChangeSet, revision: str | None) -> list[Dia
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    """功能：解析 checker 的 base 和可选 head 命令行参数。
+    """功能：解析 checker 的 base、可选 head 和全量审查开关。
     输入输出及副作用：输入 argv，返回 argparse 命名空间；不访问 Git 或修改文件。
-    失败边界：缺少必需 base 或重复选项由 argparse 以非零状态退出。
+    失败边界：缺少必需 base、重复选项或把 --all 与 --head 同用时以非零状态退出。
     """
 
     parser = argparse.ArgumentParser(description="check changed SystemVerilog style")
     parser.add_argument("--base", required=True)
     parser.add_argument("--head")
-    return parser.parse_args(argv)
+    parser.add_argument("--all", action="store_true", help="check every tracked and untracked SV/SVH file")
+    args = parser.parse_args(argv)
+    if args.all and args.head:
+        parser.error("--all cannot be combined with --head")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
-    """功能：执行 diff-aware SV 风格门禁并输出稳定诊断及退出状态。
+    """功能：执行 diff-aware 或全仓 SV 风格门禁并输出稳定诊断及退出状态。
     输入输出及副作用：输入 CLI 参数，stdout/stderr 输出诊断；仅读取 Git、工作树和提交 blob。
     失败边界：提交解析或输入读取失败返回 2；硬诊断返回 1，只有 soft-limit 时返回 0。
     """
@@ -478,8 +518,8 @@ def main(argv: list[str] | None = None) -> int:
             diff_result = run_git(root, ["diff", "--unified=0", "--no-ext-diff", "--diff-filter=ACMR", base, "--"])
         if diff_result.returncode != 0:
             raise ValueError(f"cannot inspect diff: {diff_result.stderr.strip()}")
-        changes = parse_diff(diff_result.stdout)
-        if head is None:
+        changes = all_tracked_sources(root) if args.all else parse_diff(diff_result.stdout)
+        if head is None and not args.all:
             add_untracked(root, changes)
         diagnostics = run_checks(root, changes, head)
     except ValueError as exc:

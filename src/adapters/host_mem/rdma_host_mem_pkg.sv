@@ -85,14 +85,14 @@ package rdma_host_mem_pkg;
 
     // 功能：本 Function 当前的分配数。
     // 输入/输出及副作用：纯查询。
-    // 失败/边界：无。
+    // 失败/边界：未绑定或尚未分配时返回 0；计数只含本视图账本，不统计同 Host 的其他 Function。
     function int unsigned live_allocations();
       return sizes.num();
     endfunction
 
     // 功能：[iova, iova+n) 是否落在本 Function 的一次分配内。
     // 输入/输出及副作用：纯查询。
-    // 失败/边界：无。
+    // 失败/边界：找不到起始分配返回 0；65 位端点加法拒绝地址回绕，n=0 允许落在分配闭合尾端。
     protected function bit owns(bit [63:0] iova, int unsigned n);
       bit [63:0] base;
 
@@ -104,7 +104,7 @@ package rdma_host_mem_pkg;
 
     // 功能：未映射访问的错误。
     // 输入/输出及副作用：纯函数。
-    // 失败/边界：无。
+    // 失败/边界：任意 iova/n（含零长度）都生成 RDMA_SC_DMA_TRANSLATION，仅负责格式化而不查询账本。
     protected function rdma_status unmapped(bit [63:0] iova, int unsigned n);
       return rdma_status::make(RDMA_SC_DMA_TRANSLATION,
                                $sformatf("IOVA %016h+%0d is not mapped", iova, n));
@@ -121,16 +121,16 @@ package rdma_host_mem_pkg;
 
     host_mem_api managers[int unsigned];
 
-    // 功能：构造。
-    // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
+    // 功能：构造尚未为任何 Host 建立 manager 的主机内存视图工厂。
+    // 输入/输出及副作用：name 成为 UVM 名；managers 关联数组初始为空并由工厂拥有后续 manager。
+    // 失败/边界：空 name 由 UVM 接受；构造不预留 Host 地址区间，首次 make() 才创建资源。
     function new(string name = "rdma_host_mems");
       super.new(name);
     endfunction
 
     // 功能：Host host 上一个 Function 的内存视图（Host 的 manager 首次使用时建立，区间 256 MiB）。
     // 输入/输出及副作用：可能新建 manager；返回新视图。
-    // 失败/边界：无。
+    // 失败/边界：同一 host 重用 manager 但始终返回独立账本视图；host 需保证 REGION_BASE+stride 不回绕。
     function rdma_host_mem make(int unsigned host, string name);
       host_mem_manager manager;
       rdma_host_mem view;

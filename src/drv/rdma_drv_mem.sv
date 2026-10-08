@@ -17,7 +17,7 @@ class rdma_drv_kbuf extends uvm_object;
 
   // 功能：构造空缓冲。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：默认 HUGE、size=0、pages 为空且 pd_tbl=null；alloc 成功前 base_iova 返回 0 且不可读写。
   function new(string name = "rdma_drv_kbuf");
     super.new(name);
     alloc_type = RDMA_ALLOC_TYPE_HUGE;
@@ -182,7 +182,7 @@ class rdma_drv_pble extends uvm_object;
 
   // 功能：xtrdma_init_pble：以 HMC PBL 对象页作为池。
   // 输入/输出及副作用：保存非拥有引用。
-  // 失败/边界：无。
+  // 失败/边界：hw_arg 为 null 或页为空时仍建立零容量池，后续 get 失败；调用者管理页与 hw 生命周期。
   function void init(rdma_drv_hw hw_arg, rdma_drv_dma pbl_pages[$]);
     hw = hw_arg;
     pages = pbl_pages;
@@ -239,7 +239,7 @@ class rdma_drv_pble extends uvm_object;
 
   // 功能：已分配条目数。
   // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 失败/边界：init 前或零页池返回 0；按对齐后实际置位数统计，可能大于客户端请求 cnt。
   function int unsigned in_use();
     int unsigned c;
 

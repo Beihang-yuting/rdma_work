@@ -29,7 +29,7 @@ class rdma_drv_config extends uvm_object;
 
   // 功能：以小规模仿真默认值构造配置。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：默认容量只用于仿真且尚未绑定 topology；probe 前调用者可覆盖，但各 max 值必须非零。
   function new(string name = "rdma_drv_config");
     super.new(name);
     vf_id = 0;
@@ -61,7 +61,7 @@ class rdma_drv_hmc_obj extends uvm_object;
 
   // 功能：构造空对象类描述。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：obj_type/max_cnt/size/fvm_soa 默认为零且 pages 为空，配置完成前 locate() 只能失败。
   function new(string name = "rdma_drv_hmc_obj");
     super.new(name);
   endfunction
@@ -97,7 +97,7 @@ class rdma_drv_eq extends uvm_object;
 
   // 功能：构造未创建的 EQ。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：mem_kbuf 为 null、tail 为 0、首圈 polarity 为 1；创建并设置非零 entries 前不得 ack/poll。
   function new(string name = "rdma_drv_eq");
     super.new(name);
     mem_kbuf = null;
@@ -197,7 +197,7 @@ class rdma_drv_dev extends uvm_object;
 
   // 功能：构造未 probe 的设备。
   // 输入/输出及副作用：name 为 UVM 对象名。
-  // 失败/边界：无。
+  // 失败/边界：cfg/hw/aeq 均为 null 且 probed=0；必须成功 probe 后才能分配 verbs 资源。
   function new(string name = "rdma_drv_dev");
     super.new(name);
     cfg = null;
@@ -263,7 +263,7 @@ class rdma_drv_dev extends uvm_object;
 
   // 功能：保留第一个失败。
   // 输入/输出及副作用：可能修改 status。
-  // 失败/边界：无。
+  // 失败/边界：已有失败保持不变；调用契约要求 status/one 均为非 null，后续成功不能覆盖先前错误。
   protected function void keep_first(inout rdma_status status, input rdma_status one);
     if (status.ok() && !one.ok())
       status = one;
@@ -272,7 +272,7 @@ class rdma_drv_dev extends uvm_object;
   // 功能：xtrdma_initialize_hw_rsrc：QP/CQ/MR/PD 位图，QPN 0/1 预留给 SMI/GSI；SRQN（驱动由 GRM
   //   分配）用本地位图代替。
   // 输入/输出及副作用：重建位图。
-  // 失败/边界：无。
+  // 失败/边界：要求 cfg 非 null；max_qp 小于 2 时 reserve 越界项被位图忽略，但 QP0/QP1 语义不可满足。
   protected function void init_bitmaps();
     qp_ids = rdma_drv_bitmap::type_id::create("qp_ids");
     cq_ids = rdma_drv_bitmap::type_id::create("cq_ids");
@@ -346,7 +346,7 @@ class rdma_drv_dev extends uvm_object;
 
   // 功能：IFA_UPDATE 的 data 字：VALID|MODE(INDIRECT)|SIZE(log2)|MOUNT(max_cnt-1)|FVM_SOA。
   // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 失败/边界：obj.max_cnt 必须至少为 1，size_factor/fvm_soa 必须适配冻结字段宽度，否则硬件字段会截断。
   protected function bit [63:0] ifa_data(rdma_drv_hmc_obj obj, int unsigned size_factor);
     bit [63:0] data;
 
@@ -361,7 +361,7 @@ class rdma_drv_dev extends uvm_object;
 
   // 功能：PD/SD 表项：PBA|VF_ID|VLD。
   // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 失败/边界：iova 必须按 PBA 粒度对齐且地址与 cfg.vf_id 可由字段表示，调用点负责在编码前保证。
   protected function bit [63:0] pd_entry(bit [63:0] iova);
     bit [63:0] entry;
 
@@ -483,7 +483,7 @@ class rdma_drv_dev extends uvm_object;
 
   // 功能：xtrdma_init_pble：PBL 对象页作为 PBLE 池。
   // 输入/输出及副作用：建池。
-  // 失败/边界：无。
+  // 失败/边界：要求 HMC_PBL 已建立；空页集合会生成容量为零的池，后续 get 返回 RESOURCE_EXHAUSTED。
   protected function void init_pble();
     pble = rdma_drv_pble::type_id::create("pble");
     pble.init(hw, hmc[HMC_PBL].pages);

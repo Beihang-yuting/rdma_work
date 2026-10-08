@@ -100,7 +100,7 @@ virtual class rdma_be;
 
   // 功能：新建 size 字节的全零数组。
   // 输入/输出及副作用：返回新数组。
-  // 失败/边界：无。
+  // 失败/边界：size 为 0 时返回合法空数组；SystemVerilog 动态数组分配没有可返回的失败状态。
   static function rdma_bytes_t zeros(int unsigned size);
     rdma_bytes_t out;
 
