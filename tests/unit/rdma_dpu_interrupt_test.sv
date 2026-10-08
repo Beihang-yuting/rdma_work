@@ -1,8 +1,8 @@
 // 目录：单元测试层 tests/unit/rdma_dpu_interrupt_test.sv。
 // 层：dpu_common 外部适配器单元测试。
-// 职责：验证冻结 Function 快照控制的 MAILBOX/MSI-X 最小完整路径：寄存器编程、masked pending、
-//   pending 合并、解 mask 投递、状态/ack、显式设备中断、失败恢复、跨 Host domain 拒绝、Function
-//   隔离与 FLR epoch。
+// 职责：验证冻结 Function 快照控制的 MAILBOX/MSI-X 最小完整路径：单 mailbox vector 权限、
+//   寄存器编程、masked pending、token ACK 的同 epoch/跨 FLR 防 ABA、投影按值冻结、伪造 attach 拒绝、
+//   显式设备中断、失败恢复、跨 Host domain 拒绝、Function 隔离与 recover 双 epoch 推进。
 // 依赖：rdma_dpu_adapter_pkg、dpu_resource_pkg、rdma_types_pkg；不依赖 pcie_work 或外部 DUT。
 // 所有权：测试拥有 rdma_dpu_system；节点拥有各自中断控制器与事件队列，快照/BAR 身份由 dpu_common
 //   生成并冻结。
@@ -26,15 +26,18 @@ class rdma_dpu_interrupt_test extends uvm_test;
     sys = null;
   endfunction
 
-  // 功能：建立 Host0 PF0/VF1 与 Host1 PF0，依次验证 masked MAILBOX 路径、失败恢复和复位隔离。
+  // 功能：建立 Host0 PF0/VF1 与 Host1 PF0，依次验证 vector/attach 权限、token ACK、冻结投影与复位隔离。
   // 输入/输出及副作用：phase objection 覆盖全部同步检查；创建并修改 sys 的控制面状态。
   // 失败/边界：build 或关键前置操作失败用 UVM_FATAL 停止；契约不符用 UVM_ERROR 报告后继续收集。
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     build_system();
+    check_controller_authority();
     check_masked_mailbox_path();
     check_failure_recovery();
+    check_frozen_projection_and_direct_masked();
     check_function_and_reset_isolation();
+    check_stale_ack_across_recover();
     phase.drop_objection(this);
   endtask
 
@@ -56,6 +59,29 @@ class rdma_dpu_interrupt_test extends uvm_test;
                  status == null ? "null" : status.convert2string(), expected.name()))
   endfunction
 
+  // 功能：深拷贝一份 rdma_dpu_function 值投影，供伪造权限与 configure 冻结边界测试修改。
+  // 输入/输出及副作用：source/name 为输入；返回拥有独立 caps 副本的新对象，不改动节点原投影。
+  // 失败/边界：source 为 null 时返回 null；source.caps 为 null 时保留新对象 caps=null，由被测边界拒绝。
+  function rdma_dpu_function clone_function_projection(rdma_dpu_function source, string name);
+    rdma_dpu_function result;
+
+    if (source == null)
+      return null;
+    result = rdma_dpu_function::type_id::create(name);
+    result.key = source.key;
+    result.pcie_id = source.pcie_id;
+    result.global_id = source.global_id;
+    result.bar0 = source.bar0;
+    result.mailbox = source.mailbox;
+    result.msix = source.msix;
+    result.parent_pcie_id = source.parent_pcie_id;
+    if (source.caps != null) begin
+      result.caps = dpu_dut_caps::type_id::create({name, "_caps"});
+      result.caps.copy_from(source.caps);
+    end
+    return result;
+  endfunction
+
   // 功能：声明两个 Host 的三个 Function 并 build，确认每个节点都有独立控制器且初始 epoch=1、vector0 masked。
   // 输入/输出及副作用：创建 sys、冻结 dpu_common 快照并分配节点控制面；不 probe 驱动、不启动 NIC。
   // 失败/边界：build 失败、节点数不为三、控制器缺失或复位默认值错误时发 UVM_FATAL/ERROR。
@@ -75,11 +101,65 @@ class rdma_dpu_interrupt_test extends uvm_test;
     foreach (sys.nodes[i]) begin
       if (sys.nodes[i].interrupt_ctrl == null ||
           sys.nodes[i].interrupt_ctrl.reset_epoch != 1 ||
-          sys.nodes[i].interrupt_ctrl.vectors.size() == 0 ||
+          sys.nodes[i].interrupt_ctrl.vectors.size() !=
+            RDMA_DPU_MODELED_MAILBOX_VECTOR_COUNT ||
           !sys.nodes[i].interrupt_ctrl.vectors[0].masked)
         `uvm_error("DPU_IRQ", $sformatf("node %0d has invalid interrupt reset state", i))
     end
   endfunction
+
+  // 功能：验证控制器不把 DUT 全局 vector 池当作每 Function 容量，并对伪造 ctrl/BDF/BAR/caps
+  //   以及 configure 后变异的投影执行 attach 拒绝。
+  // 输入/输出及副作用：从 node0/node1 深拷贝临时投影和控制器；只尝试失败 attach，不改写已登记 route。
+  // 失败/边界：global_msix_vector_count 缩小后仍必须只建模 vector0；mailbox_msix_vectors>1
+  //   必须在 configure 拒绝，已冻结控制器必须拒绝重配；伪造值若落到 duplicate-key 才拒绝
+  //   也视为测试失败。
+  task check_controller_authority();
+    rdma_dpu_node node0;
+    rdma_dpu_function projection;
+    rdma_dpu_interrupt_ctrl ctrl;
+
+    node0 = sys.nodes[0];
+    projection = clone_function_projection(node0.func, "small_global_projection");
+    projection.caps.global_msix_vector_count = 16;
+    ctrl = rdma_dpu_interrupt_ctrl::type_id::create("small_global_ctrl");
+    expect_ok("configure with a small global MSI-X pool", ctrl.configure(projection));
+    if (ctrl.vectors.size() != RDMA_DPU_MODELED_MAILBOX_VECTOR_COUNT)
+      `uvm_error("DPU_IRQ", $sformatf("small global pool created %0d Function vectors",
+                                      ctrl.vectors.size()))
+    expect_code("reject interrupt-controller reconfiguration", RDMA_SC_RESOURCE_BUSY,
+                ctrl.configure(node0.func));
+
+    projection = clone_function_projection(node0.func, "multi_mailbox_projection");
+    projection.caps.mailbox_msix_vectors = 2;
+    ctrl = rdma_dpu_interrupt_ctrl::type_id::create("multi_mailbox_ctrl");
+    expect_code("configure multiple unmodeled MAILBOX vectors", RDMA_SC_INVALID_ARGUMENT,
+                ctrl.configure(projection));
+
+    expect_code("attach a controller frozen for another Function", RDMA_SC_INVALID_ARGUMENT,
+                sys.router.attach(node0.func, node0.dev, sys.nodes[1].interrupt_ctrl));
+
+    projection = clone_function_projection(node0.func, "mutated_bdf_projection");
+    ctrl = rdma_dpu_interrupt_ctrl::type_id::create("mutated_bdf_ctrl");
+    expect_ok("freeze projection before BDF mutation", ctrl.configure(projection));
+    projection.pcie_id.bdf ^= 16'h0001;
+    expect_code("attach projection mutated after configure", RDMA_SC_INVALID_ARGUMENT,
+                sys.router.attach(projection, node0.dev, ctrl));
+
+    projection = clone_function_projection(node0.func, "forged_bar_projection");
+    projection.msix.base += RDMA_DPU_MSIX_ENTRY_BYTES;
+    ctrl = rdma_dpu_interrupt_ctrl::type_id::create("forged_bar_ctrl");
+    expect_ok("configure forged BAR projection", ctrl.configure(projection));
+    expect_code("attach forged BAR projection", RDMA_SC_INVALID_ARGUMENT,
+                sys.router.attach(projection, node0.dev, ctrl));
+
+    projection = clone_function_projection(node0.func, "forged_caps_projection");
+    projection.caps.max_hosts++;
+    ctrl = rdma_dpu_interrupt_ctrl::type_id::create("forged_caps_ctrl");
+    expect_ok("configure forged caps projection", ctrl.configure(projection));
+    expect_code("attach forged caps projection", RDMA_SC_INVALID_ARGUMENT,
+                sys.router.attach(projection, node0.dev, ctrl));
+  endtask
 
   // 功能：经快照路由向节点 node_index 的 MSI-X BAR 写 vector0 address 与 data/control。
   // 输入/输出及副作用：address/data/masked 组成 table entry；每次成功写增加 router.routed，pending 时可能投递。
@@ -126,6 +206,18 @@ class rdma_dpu_interrupt_test extends uvm_test;
     sys.router.read(node.func.pcie_id.domain, node.func.mailbox.base + offset, value, status);
   endtask
 
+  // 功能：读取节点当前 MAILBOX publication 的完整 64 位 ACK token，供后续精确回写。
+  // 输入/输出及副作用：node_index 选择 Function，token 返回 ACK 寄存器值；只读取，不消费发布。
+  // 失败/边界：寄存器读失败或活动发布返回 token=0 都发 UVM_FATAL，避免用无效 token 继续测试。
+  task read_ack_token(int unsigned node_index, output bit [63:0] token);
+    rdma_status status;
+
+    mailbox_read(node_index, RDMA_DPU_MAILBOX_ACK_OFFSET, token, status);
+    expect_ok("read MAILBOX ACK token", status);
+    if (token == 0)
+      `uvm_fatal("DPU_IRQ", "active MAILBOX publication returned a zero ACK token")
+  endtask
+
   // 功能：核对 irq 精确携带 node 的 Function key、PCIe ID、vector0、消息地址/数据、cause 与 reset epoch。
   // 输入/输出及副作用：只读 irq/node 及期望值；不弹出队列或确认 MAILBOX。
   // 失败/边界：irq=null 立即 UVM_FATAL；任一身份或载荷字段不符发 UVM_ERROR，避免跨 Function 串线被掩盖。
@@ -142,9 +234,11 @@ class rdma_dpu_interrupt_test extends uvm_test;
                                       what, dpu_function_key_name(node.func.key), epoch))
   endfunction
 
-  // 功能：验证 vector0 初始 mask 时 MAILBOX command 只置 pending，解 mask 后投递一次事件并由 ack 清发布。
-  // 输入/输出及副作用：编程 node0，读取 MSI-X/MAILBOX 寄存器，消费一条事件并确认发布。
-  // 失败/边界：mask 期间错误投递、pending/sequence/epoch 位错误、ack 过早成功或事件字段不符均报错。
+  // 功能：验证 vector0 初始 mask 时 MAILBOX command 只置 pending，解 mask 后投递，且只接受当前
+  //   publication token 的 ACK；随后在同 epoch 发布第二条命令，证明第一条的延迟 ACK 不会 ABA。
+  // 输入/输出及副作用：编程 node0，读取 MSI-X/MAILBOX/ACK 寄存器，消费两条事件并精确确认。
+  // 失败/边界：mask 期间错误投递、pending/sequence/epoch 位错误、过早/错 token/重复 ACK 成功、
+  //   token 重用或事件字段不符均报错。
   task check_masked_mailbox_path();
     rdma_dpu_node node;
     rdma_dpu_interrupt_event irq;
@@ -152,7 +246,10 @@ class rdma_dpu_interrupt_test extends uvm_test;
     bit [63:0] value;
     bit [63:0] payload;
     bit [63:0] command;
+    bit [63:0] next_command;
     bit [63:0] control;
+    bit [63:0] token;
+    bit [63:0] next_token;
 
     node = sys.nodes[0];
     payload = 64'h1122_3344_5566_7788;
@@ -167,6 +264,7 @@ class rdma_dpu_interrupt_test extends uvm_test;
     expect_ok("write MAILBOX payload", status);
     mailbox_write(0, RDMA_DPU_MAILBOX_COMMAND_OFFSET, command, status);
     expect_ok("publish masked MAILBOX command", status);
+    read_ack_token(0, token);
     mailbox_read(0, RDMA_DPU_MAILBOX_PAYLOAD_OFFSET, value, status);
     expect_ok("read MAILBOX payload", status);
     if (value != payload)
@@ -187,7 +285,9 @@ class rdma_dpu_interrupt_test extends uvm_test;
       `uvm_error("DPU_IRQ", $sformatf("masked MSI-X data/control is %016h", value))
     expect_code("masked interrupt queue", RDMA_SC_QUEUE_EMPTY,
                 sys.router.pop_interrupt(node.func.key, irq));
-    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, 64'h1, status);
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, token ^ 64'h8000_0000_0000_0000, status);
+    expect_code("reject wrong ACK token", RDMA_SC_STALE_GENERATION, status);
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, token, status);
     expect_code("ack while pending", RDMA_SC_RESOURCE_BUSY, status);
     control = '0;
     control[31:0] = MESSAGE_DATA_0;
@@ -208,10 +308,10 @@ class rdma_dpu_interrupt_test extends uvm_test;
     expect_ok("read delivered MAILBOX status", status);
     if (value[3:0] != 4'b0101)
       `uvm_error("DPU_IRQ", $sformatf("delivered MAILBOX status is %016h", value))
-    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, 64'h1, status);
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, token, status);
     expect_ok("ack delivered MAILBOX", status);
-    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, 64'h1, status);
-    expect_ok("repeat MAILBOX ack", status);
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, token, status);
+    expect_code("reject repeated MAILBOX ack", RDMA_SC_STALE_GENERATION, status);
     mailbox_read(0, RDMA_DPU_MAILBOX_STATUS_OFFSET, value, status);
     expect_ok("read acknowledged MAILBOX status", status);
     if (value[3:0] != 4'b0000 || value[31:16] != 16'h1)
@@ -220,6 +320,29 @@ class rdma_dpu_interrupt_test extends uvm_test;
     expect_ok("read cleared MAILBOX payload", status);
     if (value != 0)
       `uvm_error("DPU_IRQ", $sformatf("ack left MAILBOX payload %016h", value))
+
+    next_command = 64'h0000_0000_0000_00a2;
+    mailbox_write(0, RDMA_DPU_MAILBOX_COMMAND_OFFSET, next_command, status);
+    expect_ok("publish second same-epoch MAILBOX command", status);
+    read_ack_token(0, next_token);
+    if (next_token == token)
+      `uvm_error("DPU_IRQ", "same-epoch MAILBOX publications reused an ACK token")
+    expect_ok("pop second same-epoch MAILBOX interrupt",
+              sys.router.pop_interrupt(node.func.key, irq));
+    check_event("second same-epoch MAILBOX", irq, node, MESSAGE_ADDRESS_0, MESSAGE_DATA_0,
+                next_command, node.interrupt_ctrl.reset_epoch);
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, token, status);
+    expect_code("reject prior publication ACK", RDMA_SC_STALE_GENERATION, status);
+    mailbox_read(0, RDMA_DPU_MAILBOX_STATUS_OFFSET, value, status);
+    expect_ok("read publication after stale ACK", status);
+    if (value[3:0] != 4'b0101 || value[31:16] != 16'h2)
+      `uvm_error("DPU_IRQ", $sformatf("stale ACK changed MAILBOX status %016h", value))
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, next_token, status);
+    expect_ok("ack second same-epoch MAILBOX", status);
+    mailbox_read(0, RDMA_DPU_MAILBOX_ACK_OFFSET, value, status);
+    expect_ok("read inactive MAILBOX ACK token", status);
+    if (value != 0)
+      `uvm_error("DPU_IRQ", $sformatf("inactive MAILBOX exposes ACK token %016h", value))
   endtask
 
   // 功能：验证未配置地址的 unmasked command 返回失败但保留发布/pending，后续地址编程可恢复投递；
@@ -234,6 +357,7 @@ class rdma_dpu_interrupt_test extends uvm_test;
     bit [63:0] value;
     bit [63:0] control;
     bit [63:0] command;
+    bit [63:0] token;
 
     node = sys.nodes[0];
     scope = '{0};
@@ -247,6 +371,7 @@ class rdma_dpu_interrupt_test extends uvm_test;
     command = 64'h0000_0000_0000_00b2;
     mailbox_write(0, RDMA_DPU_MAILBOX_COMMAND_OFFSET, command, status);
     expect_code("publish without MSI-X address", RDMA_SC_INVALID_STATE, status);
+    read_ack_token(0, token);
     mailbox_read(0, RDMA_DPU_MAILBOX_STATUS_OFFSET, value, status);
     expect_ok("read failed MAILBOX status", status);
     if (value[3:0] != 4'b1011)
@@ -255,7 +380,7 @@ class rdma_dpu_interrupt_test extends uvm_test;
     expect_code("overwrite active MAILBOX command", RDMA_SC_RESOURCE_BUSY, status);
     mailbox_write(0, RDMA_DPU_MAILBOX_PAYLOAD_OFFSET, 64'h55, status);
     expect_code("overwrite active MAILBOX payload", RDMA_SC_RESOURCE_BUSY, status);
-    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, 64'h1, status);
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, token, status);
     expect_code("ack failed pending command", RDMA_SC_RESOURCE_BUSY, status);
     sys.router.write(node.func.pcie_id.domain,
                      node.func.msix.base + RDMA_DPU_MSIX_ADDRESS_OFFSET,
@@ -265,7 +390,7 @@ class rdma_dpu_interrupt_test extends uvm_test;
               sys.router.pop_interrupt(node.func.key, irq));
     check_event("repaired MAILBOX", irq, node, MESSAGE_ADDRESS_0, MESSAGE_DATA_0,
                 command, node.interrupt_ctrl.reset_epoch);
-    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, 64'h1, status);
+    mailbox_write(0, RDMA_DPU_MAILBOX_ACK_OFFSET, token, status);
     expect_ok("ack repaired MAILBOX", status);
     mailbox_write(0, RDMA_DPU_MAILBOX_COMMAND_OFFSET, 64'h0, status);
     expect_code("zero MAILBOX command", RDMA_SC_INVALID_ARGUMENT, status);
@@ -284,6 +409,71 @@ class rdma_dpu_interrupt_test extends uvm_test;
     expect_code("raise invalid MSI-X vector", RDMA_SC_INVALID_ARGUMENT,
                 sys.router.raise_interrupt(node.func.key, node.interrupt_ctrl.vectors.size(),
                                            node.interrupt_ctrl.reset_epoch, 64'hdead));
+  endtask
+
+  // 功能：在 attach 完成后篡改 node2 的 key/BDF/MSI-X BAR/caps 原投影，验证 router 与控制器仍使用
+  //   snapshot/内部冻结值；同时覆盖 direct interrupt 在 vector0 masked 时先 pending、解 mask 后投递。
+  // 输入/输出及副作用：复位并编程 node2，临时修改后逐字段恢复 node.func，消费一条 direct 事件。
+  // 失败/边界：投影变异若改变 route/事件身份、mask 时早投递、解 mask 不投递，或非零
+  //   vector 被接受均报错；任务结束前必须恢复原投影以供后续 scope 检查。
+  task check_frozen_projection_and_direct_masked();
+    rdma_dpu_node node;
+    rdma_dpu_function saved;
+    rdma_dpu_interrupt_event irq;
+    rdma_status status;
+    rdma_reset_epoch_t epoch;
+    int unsigned scope[$];
+    bit [63:0] control;
+    bit [63:0] cause;
+
+    node = sys.nodes[2];
+    scope = '{2};
+    sys.flr(scope);
+    program_vector0(2, MESSAGE_ADDRESS_1, MESSAGE_DATA_1, 1'b1);
+    saved = clone_function_projection(node.func, "saved_attached_projection");
+    epoch = node.interrupt_ctrl.reset_epoch;
+    cause = 64'hd1ec_7000_0000_0002;
+
+    node.func.key.vf_id = 32'hf002;
+    node.func.pcie_id.bdf ^= 16'h0001;
+    node.func.msix.base += RDMA_DPU_MSIX_ENTRY_BYTES;
+    node.func.caps.global_msix_vector_count = 1;
+    node.func.caps.mailbox_msix_vectors = 2;
+    expect_ok("raise direct interrupt after projection mutation",
+              sys.router.raise_interrupt(saved.key, RDMA_DPU_MAILBOX_VECTOR_INDEX,
+                                         epoch, cause));
+    expect_code("masked direct interrupt queue", RDMA_SC_QUEUE_EMPTY,
+                sys.router.pop_interrupt(saved.key, irq));
+    if (!node.interrupt_ctrl.vectors[0].pending ||
+        node.interrupt_ctrl.vectors[0].pending_cause != cause ||
+        node.interrupt_ctrl.vectors.size() != RDMA_DPU_MODELED_MAILBOX_VECTOR_COUNT)
+      `uvm_error("DPU_IRQ", "projection mutation changed frozen masked-vector state")
+
+    control = '0;
+    control[31:0] = MESSAGE_DATA_1;
+    sys.router.write(saved.pcie_id.domain,
+                     saved.msix.base + RDMA_DPU_MSIX_DATA_CTRL_OFFSET,
+                     control, status);
+    expect_ok("unmask direct interrupt through frozen route", status);
+    expect_ok("pop direct interrupt after projection mutation",
+              sys.router.pop_interrupt(saved.key, irq));
+
+    node.func.key = saved.key;
+    node.func.pcie_id = saved.pcie_id;
+    node.func.global_id = saved.global_id;
+    node.func.bar0 = saved.bar0;
+    node.func.mailbox = saved.mailbox;
+    node.func.msix = saved.msix;
+    node.func.parent_pcie_id = saved.parent_pcie_id;
+    node.func.caps.copy_from(saved.caps);
+    check_event("frozen direct interrupt", irq, node, MESSAGE_ADDRESS_1, MESSAGE_DATA_1,
+                cause, epoch);
+    expect_code("reject nonzero unallocated local vector", RDMA_SC_INVALID_ARGUMENT,
+                sys.router.raise_interrupt(saved.key, 1, epoch, 64'hbad1));
+    sys.router.write(saved.pcie_id.domain,
+                     saved.msix.base + RDMA_DPU_MSIX_ENTRY_BYTES,
+                     MESSAGE_ADDRESS_1, status);
+    expect_code("reject nonzero MSI-X table entry", RDMA_SC_INVALID_ARGUMENT, status);
   endtask
 
   // 功能：让 node1 保留 masked MAILBOX pending，并把同 vector 的设备事件合并到首个 cause；只 FLR node0
@@ -383,5 +573,66 @@ class rdma_dpu_interrupt_test extends uvm_test;
         node1.interrupt_ctrl.mailbox_published ||
         node1.interrupt_ctrl.delivered_events.size() != 0)
       `uvm_error("DPU_IRQ", "PF FLR did not isolate and clear PF/VF interrupt state")
+  endtask
+
+  // 功能：保留 node2 一个已投递发布的 ACK token，经 flr 和 recover 的再次清理后验证 epoch
+  //   精确推进两次，且旧 token 在空状态与新发布上都会被拒绝。
+  // 输入/输出及副作用：在 node2 发布/消费两条事件，调用 sys.flr 与 sys.recover；recover 会
+  //   为 node2 重建驱动，其他 Function 不变。
+  // 失败/边界：recover/probe 失败终止测试；epoch 少/多推进、token 复用、stale ACK 成功或破坏
+  //   新发布状态都报错。
+  task check_stale_ack_across_recover();
+    rdma_dpu_node node;
+    rdma_dpu_interrupt_event irq;
+    rdma_status status;
+    rdma_reset_epoch_t epoch_before;
+    int unsigned scope[$];
+    bit [63:0] old_token;
+    bit [63:0] new_token;
+    bit [63:0] value;
+    bit [63:0] old_command;
+    bit [63:0] new_command;
+
+    node = sys.nodes[2];
+    program_vector0(2, MESSAGE_ADDRESS_1, MESSAGE_DATA_1, 1'b0);
+    old_command = 64'h0000_0000_0000_0e01;
+    mailbox_write(2, RDMA_DPU_MAILBOX_COMMAND_OFFSET, old_command, status);
+    expect_ok("publish MAILBOX before recover", status);
+    read_ack_token(2, old_token);
+    expect_ok("pop MAILBOX before recover",
+              sys.router.pop_interrupt(node.func.key, irq));
+    check_event("MAILBOX before recover", irq, node, MESSAGE_ADDRESS_1, MESSAGE_DATA_1,
+                old_command, node.interrupt_ctrl.reset_epoch);
+
+    epoch_before = node.interrupt_ctrl.reset_epoch;
+    scope = '{2};
+    sys.flr(scope);
+    sys.recover(scope, status);
+    expect_ok("recover node2 interrupt incarnation", status);
+    if (node.interrupt_ctrl.reset_epoch != epoch_before + 2)
+      `uvm_error("DPU_IRQ", $sformatf("flr+recover advanced epoch %0d -> %0d",
+                                      epoch_before, node.interrupt_ctrl.reset_epoch))
+    mailbox_write(2, RDMA_DPU_MAILBOX_ACK_OFFSET, old_token, status);
+    expect_code("reject pre-FLR ACK without publication", RDMA_SC_STALE_GENERATION, status);
+
+    program_vector0(2, MESSAGE_ADDRESS_1, MESSAGE_DATA_1, 1'b0);
+    new_command = 64'h0000_0000_0000_0e02;
+    mailbox_write(2, RDMA_DPU_MAILBOX_COMMAND_OFFSET, new_command, status);
+    expect_ok("publish MAILBOX after recover", status);
+    read_ack_token(2, new_token);
+    if (new_token == old_token)
+      `uvm_error("DPU_IRQ", "recover reused a pre-FLR MAILBOX ACK token")
+    mailbox_write(2, RDMA_DPU_MAILBOX_ACK_OFFSET, old_token, status);
+    expect_code("reject pre-FLR ACK against new publication", RDMA_SC_STALE_GENERATION, status);
+    mailbox_read(2, RDMA_DPU_MAILBOX_STATUS_OFFSET, value, status);
+    expect_ok("read new publication after pre-FLR ACK", status);
+    if (value[3:0] != 4'b0101 || value[63:32] != node.interrupt_ctrl.reset_epoch[31:0])
+      `uvm_error("DPU_IRQ", $sformatf("pre-FLR ACK changed new publication %016h", value))
+    expect_ok("pop MAILBOX after recover",
+              sys.router.pop_interrupt(node.func.key, irq));
+    check_event("MAILBOX after recover", irq, node, MESSAGE_ADDRESS_1, MESSAGE_DATA_1,
+                new_command, node.interrupt_ctrl.reset_epoch);
+    mailbox_write(2, RDMA_DPU_MAILBOX_ACK_OFFSET, new_token, status);
+    expect_ok("ack MAILBOX after recover", status);
   endtask
 endclass

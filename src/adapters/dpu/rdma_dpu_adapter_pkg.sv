@@ -22,11 +22,18 @@ package rdma_dpu_adapter_pkg;
   import rdma_drv_pkg::*;
 
   // MAILBOX 是本项目内的显式适配契约：payload/command 形成一次发布，status 暴露发布、pending、
-  // delivered、failed、序号与 reset epoch，ack 在投递完成后消费该发布。每个寄存器宽 64 位。
+  // delivered、failed、序号与 reset epoch。ACK 寄存器读出当前发布的 64 位 token，只有在投递
+  // 完成后回写完全相同的 token 才会消费发布；因此旧发布或 FLR 前的延迟 ACK 不能命中新发布。
+  // 每个寄存器宽 64 位。
   localparam bit [63:0] RDMA_DPU_MAILBOX_PAYLOAD_OFFSET = 64'h0000;
   localparam bit [63:0] RDMA_DPU_MAILBOX_COMMAND_OFFSET = 64'h0008;
   localparam bit [63:0] RDMA_DPU_MAILBOX_STATUS_OFFSET  = 64'h0010;
   localparam bit [63:0] RDMA_DPU_MAILBOX_ACK_OFFSET     = 64'h0018;
+
+  // dpu_device_snapshot 当前不导出 mailbox 的 Function-local→global MSI-X 切片。适配器因此只
+  // 建模现有 MAILBOX 寄存器实际触发的 local vector 0，不从 DUT 全局 vector 池推导每 Function 容量。
+  localparam int unsigned RDMA_DPU_MODELED_MAILBOX_VECTOR_COUNT = 1;
+  localparam int unsigned RDMA_DPU_MAILBOX_VECTOR_INDEX = 0;
 
   // MSI-X BAR 按标准 16B table entry 的前两组 64 位访问建模：+0 为 message address，+8 的
   // [31:0] 为 message data、[32] 为 mask；读取时 [33] 额外暴露 PBA pending，写入该位会被拒绝。
@@ -255,18 +262,22 @@ package rdma_dpu_adapter_pkg;
     endfunction
   endclass
 
-  // 每个 Function 独占一个控制器。控制器从冻结投影取得 MSI-X BAR 容量与 PCIe 身份，拥有寄存器、
-  // pending 位和事件队列；它只借用 rdma_dpu_function，不能修改 dpu_common 的 BAR、BDF 或拓扑。
+  // 每个 Function 独占一个控制器。控制器在 configure 时深拷贝 Function key、PCIe ID、global ID、
+  // BAR lease 与 DUT caps，之后不再借用可变 rdma_dpu_function 投影；它拥有寄存器、pending 位和
+  // 事件队列，router 在 attach 边界把这份冻结副本与 dpu_common snapshot 重新逐项核对。
   class rdma_dpu_interrupt_ctrl extends uvm_object;
     `uvm_object_utils(rdma_dpu_interrupt_ctrl)
 
-    rdma_dpu_function func;
+    protected rdma_dpu_function frozen_func;
     rdma_reset_epoch_t reset_epoch;
     rdma_dpu_msix_entry_t vectors[];
     rdma_dpu_interrupt_event delivered_events[$];
     bit [63:0] mailbox_payload;
     bit [63:0] mailbox_command;
     int unsigned mailbox_sequence;
+    protected bit [63:0] mailbox_generation;
+    protected bit [63:0] mailbox_publication_token;
+    protected bit mailbox_generation_exhausted;
     bit mailbox_published;
     bit mailbox_delivered;
     bit mailbox_failed;
@@ -275,15 +286,18 @@ package rdma_dpu_adapter_pkg;
     int unsigned rejected_count;
 
     // 功能：构造未连接的 Function 中断控制器，所有计数和 MAILBOX 状态从零开始。
-    // 输入/输出及副作用：name 仅作为 UVM 对象名；func 保持 null，vectors 与事件队列为空。
+    // 输入/输出及副作用：name 仅作为 UVM 对象名；frozen_func 保持 null，vectors 与事件队列为空。
     // 失败/边界：configure 成功前寄存器访问、raise_interrupt 与事件读取均返回 INVALID_STATE。
     function new(string name = "rdma_dpu_interrupt_ctrl");
       super.new(name);
-      func = null;
+      frozen_func = null;
       reset_epoch = '0;
       mailbox_payload = '0;
       mailbox_command = '0;
       mailbox_sequence = 0;
+      mailbox_generation = '0;
+      mailbox_publication_token = '0;
+      mailbox_generation_exhausted = 1'b0;
       mailbox_published = 1'b0;
       mailbox_delivered = 1'b0;
       mailbox_failed = 1'b0;
@@ -292,57 +306,204 @@ package rdma_dpu_adapter_pkg;
       rejected_count = 0;
     endfunction
 
-    // 功能：绑定一个冻结 Function 投影，并按 MSI-X BAR 可容纳的 16B entry 数与 DUT 全局上限取较小值
-    //   建立本 Function 的独立 vector 表；随后进入 epoch 1 的复位态。
-    // 输入/输出及副作用：func_arg 作为非拥有只读引用保存；重建 vectors，清空旧 MAILBOX 和事件状态。
-    // 失败/边界：func_arg/caps 为空、MSI-X BAR 小于一个 entry、全局能力为零或 MAILBOX 没有可用
-    //   vector 时返回 INVALID_ARGUMENT；失败不产生可访问的半配置控制器。
-    function rdma_status configure(rdma_dpu_function func_arg);
-      longint unsigned bar_vector_count;
-      int unsigned vector_count;
+    // 功能：比较两个 BAR lease 的 role、BAR 号、base 和 size，供冻结投影权限核验复用。
+    // 输入/输出及副作用：lhs/rhs 均为值输入；返回完全相等判定，不修改 lease。
+    // 失败/边界：任一字段不同都返回 0，不用 BAR 区间重叠代替精确身份匹配。
+    protected static function bit same_bar(dpu_bar_pair_lease_t lhs,
+                                           dpu_bar_pair_lease_t rhs);
+      return lhs.role == rhs.role && lhs.even_bar_id == rhs.even_bar_id &&
+             lhs.base == rhs.base && lhs.size == rhs.size;
+    endfunction
 
-      func = null;
-      vectors = new[0];
-      delivered_events.delete();
+    // 功能：比较两份 dpu_dut_caps 的全部标量能力和 BAR profile 顺序/内容。
+    // 输入/输出及副作用：lhs/rhs 为只读对象引用；返回值语义相等结果，不暴露内部 caps。
+    // 失败/边界：任一对象为 null、标量字段、profile 数量或 profile 字段不同均返回 0。
+    protected static function bit same_caps(dpu_dut_caps lhs, dpu_dut_caps rhs);
+      if (lhs == null || rhs == null)
+        return 0;
+      if (lhs.max_hosts != rhs.max_hosts ||
+          lhs.max_pfs_per_host != rhs.max_pfs_per_host ||
+          lhs.max_vfs_per_pf != rhs.max_vfs_per_pf ||
+          lhs.max_functions != rhs.max_functions ||
+          lhs.global_msix_vector_count != rhs.global_msix_vector_count ||
+          lhs.mailbox_msix_vectors != rhs.mailbox_msix_vectors ||
+          lhs.af_extra_msix_vectors != rhs.af_extra_msix_vectors ||
+          lhs.af_extra_queue_count != rhs.af_extra_queue_count ||
+          lhs.vio_global_qpair_count != rhs.vio_global_qpair_count ||
+          lhs.max_vio_net_qpairs_per_device != rhs.max_vio_net_qpairs_per_device ||
+          lhs.vio_notify_entries_per_bank != rhs.vio_notify_entries_per_bank ||
+          lhs.bar_profiles.size() != rhs.bar_profiles.size())
+        return 0;
+      foreach (lhs.bar_profiles[i]) begin
+        if (lhs.bar_profiles[i].kind != rhs.bar_profiles[i].kind ||
+            lhs.bar_profiles[i].role != rhs.bar_profiles[i].role ||
+            lhs.bar_profiles[i].even_bar_id != rhs.bar_profiles[i].even_bar_id ||
+            lhs.bar_profiles[i].size != rhs.bar_profiles[i].size ||
+            lhs.bar_profiles[i].alignment != rhs.bar_profiles[i].alignment)
+          return 0;
+      end
+      return 1;
+    endfunction
+
+    // 功能：报告控制器是否已成功冻结一个 Function 投影。
+    // 输入/输出及副作用：无输入；返回 frozen_func 是否非空，不返回可变对象引用。
+    // 失败/边界：configure 从未成功时稳定返回 0，配置后不因原投影变异而改变。
+    function bit is_configured();
+      return frozen_func != null;
+    endfunction
+
+    // 功能：核对 candidate 与 configure 时冻结的 key、PCIe ID、global ID、三类 BAR、父 PF 和 caps。
+    // 输入/输出及副作用：candidate 只读；返回匹配结果，why 返回首个权限差异，不修改控制器。
+    // 失败/边界：未配置、candidate/caps 为空或任一冻结字段不等时返回 0。
+    function bit matches_projection(rdma_dpu_function candidate, output string why);
+      why = "";
+      if (frozen_func == null) begin
+        why = "interrupt controller is not configured";
+        return 0;
+      end
+      if (candidate == null || candidate.caps == null) begin
+        why = "interrupt controller projection is incomplete";
+        return 0;
+      end
+      if (!dpu_same_function_key(candidate.key, frozen_func.key) ||
+          !dpu_same_domain_key(candidate.pcie_id.domain, frozen_func.pcie_id.domain) ||
+          candidate.pcie_id.bdf != frozen_func.pcie_id.bdf ||
+          candidate.global_id != frozen_func.global_id ||
+          !same_bar(candidate.bar0, frozen_func.bar0) ||
+          !same_bar(candidate.mailbox, frozen_func.mailbox) ||
+          !same_bar(candidate.msix, frozen_func.msix) ||
+          !dpu_same_domain_key(candidate.parent_pcie_id.domain,
+                               frozen_func.parent_pcie_id.domain) ||
+          candidate.parent_pcie_id.bdf != frozen_func.parent_pcie_id.bdf ||
+          !same_caps(candidate.caps, frozen_func.caps)) begin
+        why = {"interrupt controller frozen projection differs from ",
+               dpu_function_key_name(frozen_func.key)};
+        return 0;
+      end
+      return 1;
+    endfunction
+
+    // 功能：从冻结 dpu_common snapshot 重新投影控制器所属 Function，并对比全部冻结身份。
+    // 输入/输出及副作用：snapshot 只读；why 返回 dpu_common 查询或匹配失败原因，不保存 snapshot 引用。
+    // 失败/边界：snapshot/控制器未就绪、Function/BAR/caps 查询失败或 VF 父 PF 不匹配时返回 0。
+    function bit matches_snapshot(dpu_device_snapshot snapshot, output string why);
+      rdma_dpu_function expected;
+      dpu_function_key_t parent;
+
+      why = "";
+      if (snapshot == null || frozen_func == null) begin
+        why = "interrupt controller snapshot authority is incomplete";
+        return 0;
+      end
+      expected = rdma_dpu_function::type_id::create({get_name(), "_snapshot_projection"});
+      expected.key = frozen_func.key;
+      expected.caps = snapshot.snapshot_dut_caps();
+      if (expected.caps == null) begin
+        why = "snapshot DUT capabilities are unavailable";
+        return 0;
+      end
+      if (!snapshot.get_pcie_id(expected.key, expected.pcie_id, why) ||
+          !snapshot.get_global_function_id(expected.key, expected.global_id, why) ||
+          !snapshot.get_bar(expected.key, DPU_BAR_DEVICE_MEMORY, expected.bar0, why) ||
+          !snapshot.get_bar(expected.key, DPU_BAR_MAILBOX, expected.mailbox, why) ||
+          !snapshot.get_bar(expected.key, DPU_BAR_MSIX, expected.msix, why))
+        return 0;
+      if (expected.key.kind == DPU_FUNCTION_VF) begin
+        parent = expected.key;
+        parent.kind = DPU_FUNCTION_PF;
+        parent.vf_id = 0;
+        if (!snapshot.get_pcie_id(parent, expected.parent_pcie_id, why))
+          return 0;
+      end
+      return matches_projection(expected, why);
+    endfunction
+
+    // 功能：按值冻结 Function 投影，并且只建立寄存器契约明确支持的 MAILBOX local vector 0。
+    // 输入/输出及副作用：func_arg 只在本调用内读取；成功时深拷贝 caps/身份/BAR，创建一个
+    //   vector 并进入 epoch 1，之后 func_arg 变异不会影响控制器。
+    // 失败/边界：重复配置返回 RESOURCE_BUSY；空投影、BAR role/尺寸不足、全局池为零，或
+    //   mailbox_msix_vectors 不是唯一可建模数量 1 时返回 INVALID_ARGUMENT，不留半配置状态。
+    function rdma_status configure(rdma_dpu_function func_arg);
+      if (frozen_func != null)
+        return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
+                                 "interrupt controller is already configured");
       if (func_arg == null || func_arg.caps == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "interrupt controller requires a Function snapshot");
-      bar_vector_count = func_arg.msix.size / RDMA_DPU_MSIX_ENTRY_BYTES;
-      if (bar_vector_count == 0 || func_arg.caps.global_msix_vector_count == 0 ||
-          func_arg.caps.mailbox_msix_vectors == 0)
+      if (func_arg.bar0.role != DPU_BAR_DEVICE_MEMORY ||
+          func_arg.mailbox.role != DPU_BAR_MAILBOX ||
+          func_arg.msix.role != DPU_BAR_MSIX)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "Function MSI-X BAR has no usable vector entry");
-      if (bar_vector_count < func_arg.caps.global_msix_vector_count)
-        vector_count = int'(bar_vector_count);
-      else
-        vector_count = func_arg.caps.global_msix_vector_count;
-      if (func_arg.caps.mailbox_msix_vectors > vector_count)
+                                 "interrupt controller Function BAR roles are inconsistent");
+      if (func_arg.mailbox.size < RDMA_DPU_MAILBOX_ACK_OFFSET + 8 ||
+          func_arg.msix.size < RDMA_DPU_MSIX_ENTRY_BYTES)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 "Function MSI-X table cannot cover MAILBOX vectors");
-      func = func_arg;
-      vectors = new[vector_count];
+                                 "Function control BAR cannot cover modeled registers");
+      if (func_arg.caps.global_msix_vector_count == 0 ||
+          func_arg.caps.mailbox_msix_vectors >
+            func_arg.caps.global_msix_vector_count)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "DUT global MSI-X pool cannot cover MAILBOX capability");
+      if (func_arg.caps.mailbox_msix_vectors !=
+          RDMA_DPU_MODELED_MAILBOX_VECTOR_COUNT)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT,
+          "adapter models exactly one MAILBOX local MSI-X vector");
+
+      frozen_func = rdma_dpu_function::type_id::create({get_name(), "_frozen_func"});
+      frozen_func.key = func_arg.key;
+      frozen_func.pcie_id = func_arg.pcie_id;
+      frozen_func.global_id = func_arg.global_id;
+      frozen_func.bar0 = func_arg.bar0;
+      frozen_func.mailbox = func_arg.mailbox;
+      frozen_func.msix = func_arg.msix;
+      frozen_func.parent_pcie_id = func_arg.parent_pcie_id;
+      frozen_func.caps = dpu_dut_caps::type_id::create({get_name(), "_frozen_caps"});
+      frozen_func.caps.copy_from(func_arg.caps);
+      vectors = new[RDMA_DPU_MODELED_MAILBOX_VECTOR_COUNT];
+      delivered_events.delete();
       reset_epoch = '0;
+      mailbox_generation = '0;
+      mailbox_generation_exhausted = 1'b0;
       reset();
       return rdma_status::success();
     endfunction
 
-    // 功能：执行 Function 级控制面复位：推进 reset_epoch，清空 MAILBOX 发布、事件与统计，并把全部
-    //   MSI-X entry 恢复为地址/数据零、masked=1、pending=0。
+    // 功能：推进跨发布和跨复位共用的 64 位单调 generation，作为新 ACK token 的唯一性基础。
+    // 输入/输出及副作用：无输入；成功时 generation 加一并返回 1，不直接更改发布状态。
+    // 失败/边界：generation 已耗尽或到达全 1 时设置 exhausted 并返回 0，禁止回绕造成 ABA。
+    protected function bit advance_mailbox_generation();
+      if (mailbox_generation_exhausted)
+        return 0;
+      if (mailbox_generation == '1) begin
+        mailbox_generation_exhausted = 1'b1;
+        return 0;
+      end
+      mailbox_generation++;
+      return 1;
+    endfunction
+
+    // 功能：执行 Function 级控制面复位：推进 reset_epoch 与 ACK generation，清空 MAILBOX
+    //   发布、事件与统计，并把全部 MSI-X entry 恢复为地址/数据零、masked=1、pending=0。
     // 输入/输出及副作用：只修改本控制器拥有的状态；已导出的事件对象仍是旧 epoch 的值快照。
-    // 失败/边界：未 configure 时保持 epoch 0 且只清空局部状态；epoch 全 1 时回到 1，永不发布 epoch 0。
+    // 失败/边界：未 configure 时保持 epoch/generation 0；epoch 全 1 时回到 1。generation 不回绕，
+    //   耗尽后所有后续发布都安全拒绝，不重用旧 ACK token。
     function void reset();
-      if (func != null) begin
+      if (frozen_func != null) begin
         if (reset_epoch == '1)
           reset_epoch = 1;
         else
           reset_epoch++;
+        void'(advance_mailbox_generation());
       end
       else begin
         reset_epoch = '0;
+        mailbox_generation = '0;
       end
       mailbox_payload = '0;
       mailbox_command = '0;
       mailbox_sequence = 0;
+      mailbox_publication_token = '0;
       mailbox_published = 1'b0;
       mailbox_delivered = 1'b0;
       mailbox_failed = 1'b0;
@@ -363,7 +524,7 @@ package rdma_dpu_adapter_pkg;
     // 输入/输出及副作用：expected_epoch 为调用方捕获的 epoch；返回成功或明确状态，不修改寄存器与队列。
     // 失败/边界：未配置返回 INVALID_STATE；epoch 不等返回 STALE_GENERATION，包含旧/新 epoch 诊断。
     protected function rdma_status validate_epoch(rdma_reset_epoch_t expected_epoch);
-      if (func == null)
+      if (frozen_func == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "interrupt controller is not configured");
       if (expected_epoch != reset_epoch)
@@ -394,15 +555,15 @@ package rdma_dpu_adapter_pkg;
       if (vectors[vector_index].message_address == 0 ||
           vectors[vector_index].message_address[1:0] != 2'b00) begin
         rejected_count++;
-        if (vector_index == 0 && mailbox_published)
+        if (vector_index == RDMA_DPU_MAILBOX_VECTOR_INDEX && mailbox_published)
           mailbox_failed = 1'b1;
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "pending MSI-X vector has no valid message address");
       end
       irq = rdma_dpu_interrupt_event::type_id::create(
         $sformatf("%s_irq%0d_e%0d", get_name(), vector_index, reset_epoch));
-      irq.function_key = func.key;
-      irq.pcie_id = func.pcie_id;
+      irq.function_key = frozen_func.key;
+      irq.pcie_id = frozen_func.pcie_id;
       irq.vector_index = vector_index;
       irq.message_address = vectors[vector_index].message_address;
       irq.message_data = vectors[vector_index].message_data;
@@ -412,7 +573,7 @@ package rdma_dpu_adapter_pkg;
       vectors[vector_index].pending = 1'b0;
       vectors[vector_index].pending_cause = '0;
       delivered_count++;
-      if (vector_index == 0 && mailbox_published) begin
+      if (vector_index == RDMA_DPU_MAILBOX_VECTOR_INDEX && mailbox_published) begin
         mailbox_delivered = 1'b1;
         mailbox_failed = 1'b0;
       end
@@ -451,15 +612,15 @@ package rdma_dpu_adapter_pkg;
     endfunction
 
     // 功能：按本项目 MAILBOX 布局执行一次 64 位写；payload/command 构成原子发布，command 触发
-    //   vector 0，ack 在投递完成后消费发布。
+    //   唯一建模的 local vector 0，ACK 只在投递完成后且回写当前 64 位 publication token 时消费。
     // 输入/输出及副作用：offset/value 为 BAR 内偏移和值；更新 MAILBOX、vector 0 pending 或事件队列。
-    // 失败/边界：非 8B 对齐/未知/只读 offset、零 command、未完成发布上的覆盖或 vector 0 已有其他
-    //   pending cause 分别返回 INVALID_ARGUMENT、UNSUPPORTED_OPCODE 或 RESOURCE_BUSY；pending 未投递时
-    //   ack 返回 RESOURCE_BUSY。
+    // 失败/边界：非 8B 对齐/未知/只读 offset、零 command、generation 耗尽、未完成发布上的
+    //   覆盖或 vector 0 已 pending 返回明确错误；ACK token 不等/无活动发布返回 STALE_GENERATION，
+    //   token 正确但仍 pending 返回 RESOURCE_BUSY。
     function rdma_status write_mailbox(bit [63:0] offset, bit [63:0] value);
       rdma_status status;
 
-      if (func == null)
+      if (frozen_func == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "MAILBOX controller is not configured");
       if (offset[2:0] != 3'b000)
@@ -480,15 +641,19 @@ package rdma_dpu_adapter_pkg;
           if (mailbox_published)
             return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                      "MAILBOX already has an active publication");
-          if (vectors[0].pending)
+          if (vectors[RDMA_DPU_MAILBOX_VECTOR_INDEX].pending)
             return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                      "MAILBOX MSI-X vector already has a pending cause");
+          if (!advance_mailbox_generation())
+            return rdma_status::make(RDMA_SC_INVALID_STATE,
+                                     "MAILBOX publication generation is exhausted");
           mailbox_command = value;
           mailbox_sequence++;
+          mailbox_publication_token = mailbox_generation;
           mailbox_published = 1'b1;
           mailbox_delivered = 1'b0;
           mailbox_failed = 1'b0;
-          status = raise_interrupt(0, reset_epoch, value);
+          status = raise_interrupt(RDMA_DPU_MAILBOX_VECTOR_INDEX, reset_epoch, value);
           if (!status.ok())
             mailbox_failed = 1'b1;
           return status;
@@ -497,12 +662,15 @@ package rdma_dpu_adapter_pkg;
           return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                    "MAILBOX status register is read-only");
         RDMA_DPU_MAILBOX_ACK_OFFSET: begin
-          if (value != 64'h1)
-            return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                     "MAILBOX ack accepts only bit 0 set");
           if (!mailbox_published)
-            return rdma_status::success("MAILBOX publication is already acknowledged");
-          if (vectors[0].pending)
+            return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                     "MAILBOX ACK has no active publication");
+          if (value == 0 || value != mailbox_publication_token)
+            return rdma_status::make(
+              RDMA_SC_STALE_GENERATION,
+              $sformatf("MAILBOX ACK token %016h does not match active token %016h",
+                        value, mailbox_publication_token));
+          if (vectors[RDMA_DPU_MAILBOX_VECTOR_INDEX].pending)
             return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                      "MAILBOX interrupt is still pending");
           if (!mailbox_delivered)
@@ -510,6 +678,7 @@ package rdma_dpu_adapter_pkg;
                                      "MAILBOX publication has no delivered interrupt");
           mailbox_payload = '0;
           mailbox_command = '0;
+          mailbox_publication_token = '0;
           mailbox_published = 1'b0;
           mailbox_delivered = 1'b0;
           mailbox_failed = 1'b0;
@@ -521,14 +690,14 @@ package rdma_dpu_adapter_pkg;
       endcase
     endfunction
 
-    // 功能：读取 payload、command 或组合 status；status 位 0..3 依次是 published、pending、delivered、
-    //   failed，[31:16] 是发布序号，[63:32] 是当前 reset epoch 低 32 位。
+    // 功能：读取 payload、command、组合 status 或 ACK token；status 位 0..3 依次是 published、pending、
+    //   delivered、failed，[31:16] 是当前 epoch 内发布序号，[63:32] 是 reset epoch 低 32 位。
     // 输入/输出及副作用：offset 为 BAR 内偏移，value 返回寄存器快照；读取不消费发布或事件。
-    // 失败/边界：未配置、非 8B 对齐、ACK 写专用或未知 offset 返回 INVALID_STATE、INVALID_ARGUMENT 或
-    //   UNSUPPORTED_OPCODE，失败时 value 保持零。
+    // 失败/边界：未配置、非 8B 对齐或未知 offset 返回 INVALID_STATE、INVALID_ARGUMENT 或
+    //   UNSUPPORTED_OPCODE；无活动发布时 ACK 读值为零，失败时 value 也保持零。
     function rdma_status read_mailbox(bit [63:0] offset, output bit [63:0] value);
       value = '0;
-      if (func == null)
+      if (frozen_func == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "MAILBOX controller is not configured");
       if (offset[2:0] != 3'b000)
@@ -539,15 +708,14 @@ package rdma_dpu_adapter_pkg;
         RDMA_DPU_MAILBOX_COMMAND_OFFSET: value = mailbox_command;
         RDMA_DPU_MAILBOX_STATUS_OFFSET: begin
           value[0] = mailbox_published;
-          value[1] = vectors[0].pending;
+          value[1] = vectors[RDMA_DPU_MAILBOX_VECTOR_INDEX].pending;
           value[2] = mailbox_delivered;
           value[3] = mailbox_failed;
           value[31:16] = mailbox_sequence[15:0];
           value[63:32] = reset_epoch[31:0];
         end
         RDMA_DPU_MAILBOX_ACK_OFFSET:
-          return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
-                                   "MAILBOX ack register is write-only");
+          value = mailbox_publication_token;
         default:
           return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                    $sformatf("MAILBOX register %0h is not modeled", offset));
@@ -564,7 +732,7 @@ package rdma_dpu_adapter_pkg;
       int unsigned vector_index;
       bit [63:0] entry_offset;
 
-      if (func == null)
+      if (frozen_func == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "MSI-X controller is not configured");
       if (offset[2:0] != 3'b000)
@@ -606,7 +774,7 @@ package rdma_dpu_adapter_pkg;
       bit [63:0] entry_offset;
 
       value = '0;
-      if (func == null)
+      if (frozen_func == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "MSI-X controller is not configured");
       if (offset[2:0] != 3'b000)
@@ -637,7 +805,7 @@ package rdma_dpu_adapter_pkg;
     // 失败/边界：未配置返回 INVALID_STATE，队列为空返回 QUEUE_EMPTY；两种失败均令 irq=null。
     function rdma_status pop_interrupt(output rdma_dpu_interrupt_event irq);
       irq = null;
-      if (func == null)
+      if (frozen_func == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "interrupt controller is not configured");
       if (delivered_events.size() == 0)
@@ -668,30 +836,31 @@ package rdma_dpu_adapter_pkg;
       routed = 0;
     endfunction
 
-    // 功能：按 dpu_common Function key 登记其设备与独占 MAILBOX/MSI-X 控制器，供地址解码后分派；
-    //   登记前重新从冻结 snapshot 核对 Function 的 PCIe ID 和控制器归属。
-    // 输入/输出及副作用：f 只提供稳定投影；dev/interrupt_ctrl 作为非拥有引用写入两个关联数组。
-    // 失败/边界：快照或参数为空、key/PCIe 投影不一致返回 INVALID_STATE/INVALID_ARGUMENT；重复 key 返回
-    //   RESOURCE_BUSY，失败不覆盖现有 route。
+    // 功能：按 dpu_common Function key 登记其设备与独占 MAILBOX/MSI-X 控制器；登记前同时核对
+    //   f、控制器内部冻结副本与 snapshot 的 key/PCIe/global ID/三个 BAR/父 PF/caps。
+    // 输入/输出及副作用：f 仅在 attach 期间读取，不被 router 保存；dev/interrupt_ctrl 作为非拥有引用
+    //   写入两个关联数组，后续 f 变异不会改写路由身份或事件身份。
+    // 失败/边界：快照/参数/控制器未就绪返回 INVALID_STATE/INVALID_ARGUMENT；任一冻结字段不同
+    //   按 INVALID_ARGUMENT 拒绝；重复 key 返回 RESOURCE_BUSY，失败不覆盖现有 route。
     function rdma_status attach(rdma_dpu_function f, rdma_dev dev,
                                 rdma_dpu_interrupt_ctrl interrupt_ctrl);
-      dpu_pcie_function_id_t expected_pcie_id;
       string name;
       string why;
 
       if (snapshot == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE,
                                  "BAR router cannot attach without a snapshot");
-      if (f == null || dev == null || interrupt_ctrl == null || interrupt_ctrl.func == null)
+      if (f == null || dev == null || interrupt_ctrl == null ||
+          !interrupt_ctrl.is_configured())
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                                  "BAR router Function attachment is incomplete");
       name = dpu_function_key_name(f.key);
-      if (!snapshot.get_pcie_id(f.key, expected_pcie_id, why))
-        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, {"snapshot Function: ", why});
-      if (dpu_pcie_function_id_name(expected_pcie_id) != dpu_pcie_function_id_name(f.pcie_id) ||
-          dpu_function_key_name(interrupt_ctrl.func.key) != name)
+      if (!interrupt_ctrl.matches_projection(f, why))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                 {"BAR router authority mismatch for ", name});
+                                 {"BAR router projection mismatch for ", name, ": ", why});
+      if (!interrupt_ctrl.matches_snapshot(snapshot, why))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 {"BAR router snapshot mismatch for ", name, ": ", why});
       if (devs.exists(name) || interrupt_ctrls.exists(name))
         return rdma_status::make(RDMA_SC_RESOURCE_BUSY,
                                  {"BAR router already has a route for ", name});
