@@ -32,9 +32,10 @@ class rdma_scoreboard extends uvm_scoreboard;
   int unsigned errors;
   int unsigned aeq_events;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 scoreboard、四个输入 export、预测输出端口，以及独占的期望内存和完成队列模型。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；本组件拥有端口、mem 与 exp，res 保持待绑定的
+  //   非拥有空引用，checked/errors/aeq_events 从零开始。
+  // 失败/边界：接收完成或资源事件前必须由 env 绑定 res 并连接各端口；factory 必须返回非空模型对象。
   function new(string name = "rdma_scoreboard", uvm_component parent = null);
     super.new(name, parent);
     posted_export = new("posted_export", this);
@@ -46,9 +47,11 @@ class rdma_scoreboard extends uvm_scoreboard;
     exp = rdma_expect::type_id::create("exp");
   endfunction
 
-  // 功能：投递：跟踪涉及的 buffer，原始数据写入源区域镜像，登记期望（预测状态）并转发。
-  // 输入/输出及副作用：修改期望内存与队列。
-  // 失败/边界：无。
+  // 功能：处理已成功投递的 verb：跟踪本地/可选远端 buffer，把 driver 生成的源数据写入镜像，登记
+  //   完成与入站预测，再将带预测字段的 item 转发给 coverage。
+  // 输入/输出及副作用：修改 mem/exp，predicted_ap 发布同一非拥有 item 引用；不修改真实设备内存。
+  // 失败/边界：要求 item、lmr 及其 buffer 有效且偏移已由 driver 门禁；rmr 为空时跳过远端跟踪，
+  //   空 data 不覆盖本地镜像。
   function void write_posted(rdma_verb_item item);
     mem.track(item.lmr.mem);
     if (item.rmr != null)
@@ -74,9 +77,10 @@ class rdma_scoreboard extends uvm_scoreboard;
       settle_send(qp, c);
   endfunction
 
-  // 功能：资源事件：QP 进入 ERR → 在途项可 FLUSH；QP 撤销（销毁/FLR）→ 撤销期望，接受其目的区域。
-  // 输入/输出及副作用：修改期望与期望内存。
-  // 失败/边界：无。
+  // 功能：消费 QP 资源事件：进入 ERROR 时把在途项标为可 flush；移除时撤销其期望，并以实际内容接受
+  //   已撤销 WR 可能触及的目的区域。
+  // 输入/输出及副作用：更新 exp 和 mem；非 QP 事件、非 ERROR 的 CHANGED 以及非 REMOVED 均不处理。
+  // 失败/边界：dest 不存在的撤销项无区域可接受；要求 e/e.res 有效，mem.accept 读取失败会自行报错。
   function void write_res(rdma_res_event e);
     rdma_res_qp qp;
     rdma_verb_item dropped[$];
@@ -96,9 +100,9 @@ class rdma_scoreboard extends uvm_scoreboard;
         mem.accept(b, off, len);
   endfunction
 
-  // 功能：AEQ 事件计数。
-  // 输入/输出及副作用：aeq_events 加一。
-  // 失败/边界：无。
+  // 功能：记录 monitor 发布的 AEQ 事件总数，供结束摘要确认异步路径被观测。
+  // 输入/输出及副作用：每次调用仅将 aeq_events 加一；e 的内容由场景断言消费，本 scoreboard 不保留引用。
+  // 失败/边界：所有 ecode 均计数且不去重；调用者应传非空事件，但本函数有意不解引用其字段。
   function void write_aeq(rdma_aeq_event e);
     aeq_events++;
   endfunction
@@ -117,31 +121,31 @@ class rdma_scoreboard extends uvm_scoreboard;
               UVM_LOW)
   endfunction
 
-  // 功能：全部期望是否已结算。
-  // 输入/输出及副作用：纯查询。
-  // 失败/边界：无。
+  // 功能：查询 SQ/RQ/入站完成模型中是否已没有待结算期望。
+  // 输入/输出及副作用：直接返回 exp.idle，不修改队列、内存模型或统计计数。
+  // 失败/边界：只代表 scoreboard 期望为空，不证明链路/设备 mailbox 已空，也不执行最终整块内存比对。
   function bit idle();
     return exp.idle();
   endfunction
 
-  // 功能：记录错误。
-  // 输入/输出及副作用：errors 加一并报 UVM_ERROR。
-  // 失败/边界：无。
+  // 功能：把一条 scoreboard 契约违例同时计入本地 errors 并发布为 UVM_ERROR。
+  // 输入/输出及副作用：errors 无条件加一，message 原样进入 RDMA_SB 报告；不停止后续结算。
+  // 失败/边界：空 message 仍形成有效错误；函数不去重，同一根因的独立检查可能分别计数。
   protected function void fail(string message);
     errors++;
     `uvm_error("RDMA_SB", message)
   endfunction
 
-  // 功能：本地区域在其 buffer 内的偏移。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：把 verb 的 local_offset 从 MR 相对坐标换算成其 backing buffer 相对坐标。
+  // 输入/输出及副作用：读取 it.lmr 的 VA、buffer IOVA 与 item 偏移并返回差值，不修改资源。
+  // 失败/边界：要求 it/lmr/mem 非空且 MR VA 不低于 buffer IOVA；范围合法性由投递门禁保证。
   protected function int unsigned loff(rdma_verb_item it);
     return rdma_verb_driver::buf_offset(it.lmr, it.local_offset);
   endfunction
 
-  // 功能：远端区域在其 buffer 内的偏移。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：把 verb 的 remote_offset 从远端 MR 相对坐标换算成其 backing buffer 相对坐标。
+  // 输入/输出及副作用：读取 it.rmr 的 VA、buffer IOVA 与 item 偏移并返回差值，不修改资源。
+  // 失败/边界：仅适用于需要 rmr 的 WRITE/READ/ATOMIC，要求 it/rmr/mem 非空且范围已通过门禁。
   protected function int unsigned roff(rdma_verb_item it);
     return rdma_verb_driver::buf_offset(it.rmr, it.remote_offset);
   endfunction
@@ -245,9 +249,9 @@ class rdma_scoreboard extends uvm_scoreboard;
     end
   endfunction
 
-  // 功能：64 位值的小端 8 字节。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 功能：把 64 位原子值按最低有效字节优先转换成恰好 8 项的字节队列。
+  // 输入/输出及副作用：读取 v，返回新队列 q，不修改调用者数据或内存模型。
+  // 失败/边界：输入宽度固定为 64 位，零值仍返回八个零字节，不执行地址对齐或权限判断。
   protected function rdma_byte_q le8(bit [63:0] v);
     rdma_byte_q q;
 
@@ -310,8 +314,10 @@ class rdma_scoreboard extends uvm_scoreboard;
 
   // 功能：UD 接收缓冲开头 40B GRH（RoCEv2 IPv4：前 20B 为 0，IPv4 头 0x45、总长 = IP+UDP+BTH+DETH+
   //   载荷+ICRC、TTL 64、协议 UDP，其余为 0）。
-  // 输入/输出及副作用：纯函数。
-  // 失败/边界：无。
+  // 输入/输出及副作用：len 为 RDMA payload 字节数；返回固定 40B 的新队列，仅填 IPv4 版本、总长、
+  //   TTL 与 UDP 协议字段，不修改模型状态。
+  // 失败/边界：调用者必须保证计算后的 IPv4 total 可由 16 位字段表示；校验和与地址保持零，真实远端
+  //   GRH 由 mem.accept 路径处理而不使用此模板。
   protected function rdma_byte_q grh_bytes(int unsigned len);
     rdma_byte_q g;
     int unsigned total;
