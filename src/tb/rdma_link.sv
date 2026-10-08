@@ -21,9 +21,9 @@ class rdma_link_obs extends uvm_object;
   rdma_packet pkt;
   byte unsigned frame[$];
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造尚未填充路由和报文的链路观测快照。
+  // 输入/输出及副作用：name 为 UVM 名；src/dst 为零初值、pkt 为 null、frame 队列为空，快照不拥有链路。
+  // 失败/边界：必须由 observe 填入非空 packet 后才能交给 checker；无帧的 loopback 观测保留空 frame。
   function new(string name = "rdma_link_obs");
     super.new(name);
   endfunction
@@ -44,9 +44,9 @@ class rdma_link_fault extends uvm_object;
   int unsigned seen;
   int unsigned applied;
 
-  // 功能：构造（不过滤、不跳过、作用 1 个报文、延迟 1us）。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造默认 DROP 故障规则：不过滤源/opcode、不跳过、作用一个匹配报文，延迟参数预置 1us。
+  // 输入/输出及副作用：name 为 UVM 名；src/opcode=-1、count=1、delay=1us，seen/applied 从零开始。
+  // 失败/边界：delay 仅对 DELAY 生效；调用者把 count 设为零会禁用规则，计数只在 hit 中推进。
   function new(string name = "rdma_link_fault");
     super.new(name);
     src = -1;
@@ -55,9 +55,9 @@ class rdma_link_fault extends uvm_object;
     delay = 1us;
   endfunction
 
-  // 功能：报文是否命中本规则（命中即计数）。
-  // 输入/输出及副作用：更新 seen/applied。
-  // 失败/边界：无。
+  // 功能：按可选源/opcode 过滤候选报文，跳过前 skip 个匹配项，再让至多 count 个命中故障。
+  // 输入/输出及副作用：通过过滤的候选推进 seen，实际命中推进 applied 并返回 1；其他情况返回 0。
+  // 失败/边界：达到 count 后不再更新计数；opcode 过滤启用时 pkt 必须非空，未通过过滤的报文不计入 skip。
   function bit hit(int unsigned from, rdma_packet pkt);
     if ((src >= 0 && from != src) || (opcode >= 0 && int'(pkt.opcode) != opcode) ||
         applied >= count)
@@ -76,9 +76,9 @@ class rdma_link_port extends rdma_dev_port;
   rdma_link link;
   int unsigned src;
 
-  // 功能：构造。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：无。
+  // 功能：构造尚未绑定链路和源 Function 的 NIC 出口端口。
+  // 输入/输出及副作用：name 为 UVM 名；link 为非拥有空引用，src 使用零初值，不创建传输线程。
+  // 失败/边界：端口只能使用 attach 返回的已绑定实例；直接调用空端口 send 会解引用 null link。
   function new(string name = "rdma_link_port");
     super.new(name);
   endfunction
@@ -101,9 +101,10 @@ class rdma_link extends uvm_component;
   protected rdma_res_func funcs[int unsigned];
   protected int unsigned func_of_mac[bit [47:0]];
 
-  // 功能：构造链路与 analysis 端口。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 loopback 链路及发送/交付两个 analysis port，初始不接入任何 Function 或故障规则。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；本组件拥有 tx_ap/rx_ap 和后续注入的规则引用，
+  //   funcs 中的设备引用保持非拥有。
+  // 失败/边界：目的 Function 必须先 attach 才能传输；构造阶段不验证 MAC 唯一性或连接 subscriber。
   function new(string name = "rdma_link", uvm_component parent = null);
     super.new(name, parent);
     tx_ap = new("tx_ap", this);
@@ -144,9 +145,9 @@ class rdma_link extends uvm_component;
                    faults[i].applied, faults[i].count))
   endfunction
 
-  // 功能：加入故障规则（按加入顺序匹配，每个报文至多命中一条）。
-  // 输入/输出及副作用：追加 faults。
-  // 失败/边界：无。
+  // 功能：把故障规则按优先次序追加到链路，传输时每个报文只执行首条命中的规则。
+  // 输入/输出及副作用：保存 f 的非拥有引用到 faults，不克隆也不重置 seen/applied。
+  // 失败/边界：f 必须非空且应在流量开始前完成配置；重复注入同一对象会共享计数并可能导致报告歧义。
   function void inject(rdma_link_fault f);
     faults.push_back(f);
   endfunction
@@ -206,9 +207,9 @@ class rdma_link extends uvm_component;
     funcs[dst].node.dev.nic.receive(delivered);
   endtask
 
-  // 功能：构造观测对象（子类可附带帧）。
-  // 输入/输出及副作用：返回新对象。
-  // 失败/边界：无。
+  // 功能：为指定源、目的与 packet 构造一条 analysis 观测，供子类追加 wire frame。
+  // 输入/输出及副作用：返回新建 rdma_link_obs，保存 pkt 非拥有引用；不克隆或发送报文。
+  // 失败/边界：调用者必须传入非空 pkt 和已解析的索引；基类 frame 留空，隔离副本由 carry 负责。
   virtual function rdma_link_obs observe(int unsigned src, int unsigned dst, rdma_packet pkt);
     rdma_link_obs o;
 
@@ -233,9 +234,9 @@ class rdma_link_netpkt extends rdma_link;
   protected rdma_netpkt_codec codec;
   protected byte unsigned carried[$];
 
-  // 功能：构造。
-  // 输入/输出及副作用：name/parent 为 UVM 层级。
-  // 失败/边界：无。
+  // 功能：构造 net_packet 链路并创建本链路独占的 RoCEv2 codec，初始 carried frame 为空。
+  // 输入/输出及副作用：name/parent 建立 UVM 层级；codec 由链路拥有，Function 与 fault 状态沿用空基类。
+  // 失败/边界：codec factory override 必须返回非空兼容对象；地址配置使用 codec 默认值或由上层后续设置。
   function new(string name = "rdma_link_netpkt", uvm_component parent = null);
     super.new(name, parent);
     codec = rdma_netpkt_codec::type_id::create("codec");
@@ -252,9 +253,10 @@ class rdma_link_netpkt extends rdma_link;
       status = codec.decode(carried, delivered);
   endtask
 
-  // 功能：rx 观测附带刚传输的帧（供帧级协议检查）。
-  // 输入/输出及副作用：返回新对象。
-  // 失败/边界：无。
+  // 功能：在基类观测上复制最近一次 carry 生成的 RoCEv2 frame，供 RX 帧级协议规则检查。
+  // 输入/输出及副作用：返回新观测并把 carried 值复制到 o.frame，不转移 codec 或队列所有权。
+  // 失败/边界：只有紧随成功 carry 的 RX 观测保证 frame 对应该 packet；TX 观测可能携带空或上一帧，
+  //   帧规则按设计只消费 RX。
   virtual function rdma_link_obs observe(int unsigned src, int unsigned dst, rdma_packet pkt);
     rdma_link_obs o;
 
