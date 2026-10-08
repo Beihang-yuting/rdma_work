@@ -26,9 +26,9 @@ package rdma_rxe_env_pkg;
 
   // 文本工具：plusarg、地址解析、十六进制转换。
   class rdma_rxe_util;
-    // 功能：+name=value，缺省 fallback。
-    // 输入/输出及副作用：纯查询。
-    // 失败/边界：无。
+    // 功能：读取 +name=value 形式的仿真参数，未提供时返回调用者给定的 fallback。
+    // 输入/输出及副作用：name 不含前导加号，fallback 可为空；只查询 simulator plusarg，不修改状态。
+    // 失败/边界：空字符串和值格式不在此处校验；存在同名参数时遵循 $value$plusargs 的匹配结果。
     static function string arg(string name, string fallback);
       string value;
 
@@ -59,9 +59,9 @@ package rdma_rxe_env_pkg;
       return {8'(b0), 8'(b1), 8'(b2), 8'(b3), 8'(b4), 8'(b5)};
     endfunction
 
-    // 功能：data[off, off+n) → 十六进制串（用于至多 1KiB 的块）。
-    // 输入/输出及副作用：纯函数。
-    // 失败/边界：无。
+    // 功能：把 data[off, off+n) 按字节顺序转换为无分隔符的小写十六进制串，供 wbuf 命令使用。
+    // 输入/输出及副作用：读取 data 指定窗口并返回长度 2*n 的字符串，不修改输入队列。
+    // 失败/边界：调用者必须保证 off+n 不超过 data.size()；n=0 返回空串，分块上限由调用者控制。
     static function string hex_of(rdma_bytes_t data, int unsigned off, int unsigned n);
       string s;
 
@@ -82,9 +82,9 @@ package rdma_rxe_env_pkg;
 
     bit [31:0] rkey;
 
-    // 功能：构造。
-    // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
+    // 功能：构造尚未关联对端 MR 的远端缓冲代理。
+    // 输入/输出及副作用：name 为 UVM 名；iova、size 与 rkey 保持零初值，不启动或占有 peer 进程。
+    // 失败/边界：必须由 ALLOC_BUF 路径填入对端返回的地址、长度与 rkey 后才能读写。
     function new(string name = "rdma_rxe_buf");
       super.new(name);
     endfunction
@@ -136,9 +136,9 @@ package rdma_rxe_env_pkg;
     int unsigned src;
     int unsigned dst;
 
-    // 功能：构造。
-    // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
+    // 功能：构造尚未连接 env 链路的 TAP 端点对象。
+    // 输入/输出及副作用：name 为 UVM 名；link 保持 null，src/dst 使用零初值，文件描述符仍由 open 建立。
+    // 失败/边界：received 只能在 build_phase 绑定 link、codec 和方向索引并成功打开 TAP 后调用。
     function new(string name = "rdma_rxe_env_tap");
       super.new(name);
     endfunction
@@ -167,9 +167,9 @@ package rdma_rxe_env_pkg;
     rdma_rxe_env_tap tap;
     bit [47:0] rxe_mac;
 
-    // 功能：构造。
-    // 输入/输出及副作用：name/parent 为 UVM 层级。
-    // 失败/边界：无。
+    // 功能：构造尚未打开 TAP、也未接入 Function 的 rxe 链路组件。
+    // 输入/输出及副作用：name/parent 建立 UVM 层级；tap 仍为空，实际 TAP 所有权在 build_phase 取得。
+    // 失败/边界：parent 可为 null；任何发送或接入动作都必须晚于成功的 build_phase，否则缺少 tap/codec。
     function new(string name = "rdma_link_rxe", uvm_component parent = null);
       super.new(name, parent);
     endfunction
@@ -197,9 +197,12 @@ package rdma_rxe_env_pkg;
         `uvm_fatal("RXE", {"cannot open TAP ", name})
     endfunction
 
-    // 功能：接入 Function：远端只登记 MAC；仿真 Function 配置 TAP 帧地址并接收 TAP 报文。
-    // 输入/输出及副作用：见基类。
-    // 失败/边界：无。
+    // 功能：接入 Function：远端只登记 MAC 与 TAP 来源索引；仿真 Function 配置帧地址、NIC 目标并按
+    //   基类建立设备端口。
+    // 输入/输出及副作用：f 为资源库中的 Function；更新 funcs/func_of_mac 或 tap 的地址、NIC、dst 状态，
+    //   远端返回 null，本地返回基类端口。
+    // 失败/边界：要求 tap 已在 build_phase 建立且 f 非空；适配器只支持一个仿真 Function，重复接入本地
+    //   Function 会覆盖 TAP 的目的配置。
     virtual function rdma_dev_port attach(rdma_res_func f);
       if (f.remote) begin
         funcs[f.index] = f;
@@ -227,9 +230,9 @@ package rdma_rxe_env_pkg;
         super.deliver(src, dst, pkt);
     endtask
 
-    // 功能：TAP 接收循环。
-    // 输入/输出及副作用：常驻。
-    // 失败/边界：无。
+    // 功能：运行 TAP 接收循环，把对端帧持续解码并送入仿真 Function。
+    // 输入/输出及副作用：phase 仅提供 UVM 生命周期上下文；task 委托 tap.run 并常驻读取文件描述符。
+    // 失败/边界：要求 TAP 已成功打开；循环没有正常返回路径，由 UVM phase 结束时终止。
     task run_phase(uvm_phase phase);
       tap.run();
     endtask
@@ -255,9 +258,10 @@ package rdma_rxe_env_pkg;
     // 对端进程只有一个 PD/CQ/MR：首次建立后各次请求都返回同一对象（期望内存按同一 buffer 跟踪）。
     protected rdma_res shared[rdma_ctrl_op_e];
 
-    // 功能：构造。
-    // 输入/输出及副作用：name/parent 为 UVM 层级。
-    // 失败/边界：无。
+    // 功能：构造远端控制驱动组件，并保留空的共享资源缓存供首次远端创建后复用。
+    // 输入/输出及副作用：name/parent 建立 UVM 层级；不启动 peer，也不创建 PD/CQ/MR/SRQ/QP。
+    // 失败/边界：组件必须由 env 完成绑定且插件 start 成功后才能处理远端请求；共享缓存只适用于单一
+    //   peer 的受限资源模型。
     function new(string name = "rdma_rxe_ctrl_driver", uvm_component parent = null);
       super.new(name, parent);
     endfunction
@@ -309,9 +313,12 @@ package rdma_rxe_env_pkg;
         shared[item.op] = item.res;
     endtask
 
-    // 功能：远端 MR：覆盖对端进程 MR 的 [offset, offset+len)，key 即其 rkey。
-    // 输入/输出及副作用：写资源库。
-    // 失败/边界：无。
+    // 功能：为对端唯一 MR 的 [offset, offset+len) 建立资源视图，零 len 表示延伸到缓冲末尾，key 复用
+    //   peer 返回的 rkey。
+    // 输入/输出及副作用：读取 item.mem/offset/len/rights，创建 rdma_res_mr 并通过 register 写入资源库
+    //   和 item.res。
+    // 失败/边界：要求 item.mem 确为 rdma_rxe_buf 且 offset/len 位于其 size 内；范围由上层请求门禁保证，
+    //   本函数的 void cast 与无符号减法不提供二次拒绝。
     protected function void reg_mr_remote(rdma_res_func f, rdma_ctrl_item item);
       rdma_rxe_buf b;
       rdma_res_mr mr;
@@ -376,9 +383,9 @@ package rdma_rxe_env_pkg;
   class rdma_rxe_verb_driver extends rdma_verb_driver;
     `uvm_component_utils(rdma_rxe_verb_driver)
 
-    // 功能：构造。
-    // 输入/输出及副作用：name/parent 为 UVM 层级。
-    // 失败/边界：无。
+    // 功能：构造把远端 Function verb 投递转换成 peer 文本命令的驱动组件。
+    // 输入/输出及副作用：name/parent 建立 UVM 层级；不保存或取得 peer 所有权，也不投递 WR。
+    // 失败/边界：只有 env 绑定完成且插件已启动静态 peer 后才能执行远端 post；本地 Function 仍委托基类。
     function new(string name = "rdma_rxe_verb_driver", uvm_component parent = null);
       super.new(name, parent);
     endfunction
@@ -475,16 +482,18 @@ package rdma_rxe_env_pkg;
   class rdma_rxe_verb_monitor extends rdma_verb_monitor;
     `uvm_component_utils(rdma_rxe_verb_monitor)
 
-    // 功能：构造。
-    // 输入/输出及副作用：name/parent 为 UVM 层级。
-    // 失败/边界：无。
+    // 功能：构造远端完成监视器；实际轮询方向在 run_phase 根据 Function 的 remote 标志选择。
+    // 输入/输出及副作用：name/parent 建立 UVM 层级；不启动轮询、不消费 peer CQ，也不拥有 peer。
+    // 失败/边界：运行前必须完成 env/func 绑定；本地 Function 走基类监视器，不访问 rxe peer。
     function new(string name = "rdma_rxe_verb_monitor", uvm_component parent = null);
       super.new(name, parent);
     endfunction
 
-    // 功能：远端 Function：循环 poll，有完成即广播，否则等待 poll_interval。
-    // 输入/输出及副作用：常驻。
-    // 失败/边界：无。
+    // 功能：env ready 后为远端 Function 循环执行非阻塞 poll，有完成就转换并广播，无完成则等待配置的
+    //   poll_interval；本地 Function 完整委托基类循环。
+    // 输入/输出及副作用：持续消费 peer CQ，并经 publish 更新监视流；phase 只限定 UVM 生命周期。
+    // 失败/边界：要求 peer 已启动且应答为 "OK none" 或含完整完成字段；循环没有正常返回路径，由 phase
+    //   结束终止，畸形应答会在 wc_of 字段解析处暴露。
     task run_phase(uvm_phase phase);
       string reply;
 
@@ -505,8 +514,10 @@ package rdma_rxe_env_pkg;
     // 功能：对端应答 → rdma_drv_wc（ibv_wc_status：0 成功、5 FLUSH、9 REM_INV_REQ、10 REM_ACCESS、
     //   11 REM_OP，其余 GENERAL；opcode ≥ 128 或 wr_id 属于已投递的 RECV 为接收完成——错误完成的
     //   opcode 无定义）。
-    // 输入/输出及副作用：纯函数。
-    // 失败/边界：无。
+    // 输入/输出及副作用：读取 reply 的 wr_id/status/opcode/len/imm/src_qp/qp 字段和 recv_ids 辅助表，
+    //   返回新建的完成对象，不消费辅助表条目。
+    // 失败/边界：未知 status 映射为 GENERAL_ERR；要求 reply 含 peer 约定的全部字段，错误完成 opcode
+    //   无定义时仅能依赖此前登记且唯一的 wr_id 判断接收方向。
     protected function rdma_drv_wc wc_of(string reply);
       rdma_drv_wc wc;
 
@@ -540,17 +551,18 @@ package rdma_rxe_env_pkg;
     // 投到对端进程的 RECV 的 wr_id（错误完成的 ibv_wc.opcode 无定义，靠它判断方向）。
     static bit recv_ids[longint unsigned];
 
-    // 功能：构造。
-    // 输入/输出及副作用：name 为 UVM 名。
-    // 失败/边界：无。
+    // 功能：构造尚未安装 factory override、也未启动对端进程的 rxe env 插件对象。
+    // 输入/输出及副作用：name 为 UVM 名；静态 peer 与 recv_ids 属于插件类型共享状态，不在构造时清理。
+    // 失败/边界：同一仿真只支持一个活动 peer；必须依次执行 pre_build、start，最后由 report 收尾。
     function new(string name = "rdma_rxe_plugin");
       super.new(name);
     endfunction
 
     // 功能：安装覆盖、选择链路、声明一个远端 Function、仿真侧不超时；Q_Key 用非受控值（最高位为 1 的
     //   受控 Q_Key 需要特权才能设置到 rxe QP）。
-    // 输入/输出及副作用：修改 env 配置与 factory。
-    // 失败/边界：无。
+    // 输入/输出及副作用：修改 env 配置并安装全局 UVM factory override；不创建进程或打开 TAP。
+    // 失败/边界：必须在 env 子组件构造前调用；override 具有全局作用域，当前插件只支持一个远端
+    //   Function，重复或与其他插件并用会共享该类型选择。
     virtual function void pre_build(rdma_env env);
       rdma_ctrl_driver::type_id::set_type_override(rdma_rxe_ctrl_driver::get_type());
       rdma_verb_driver::type_id::set_type_override(rdma_rxe_verb_driver::get_type());
@@ -578,9 +590,9 @@ package rdma_rxe_env_pkg;
       void'(link.attach(f));
     endtask
 
-    // 功能：停止对端进程。
-    // 输入/输出及副作用：结束子进程。
-    // 失败/边界：无。
+    // 功能：在报告阶段停止本插件 start 创建的对端进程并回收其通信资源。
+    // 输入/输出及副作用：env 仅保持接口一致；调用静态 peer.stop，结束子进程，recv_ids 不在此清空。
+    // 失败/边界：要求 start 已成功建立 peer；生命周期应只收尾一次，本函数不处理空 peer。
     virtual function void report(rdma_env env);
       peer.stop();
     endfunction
