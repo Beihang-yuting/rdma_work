@@ -118,6 +118,62 @@ cfg.dut_link_plugin = <external adapter plugin>
 plugin.bind_endpoint(env.link, endpoint, dut_port, dut_mac)
 ```
 
+### 5.1 统一参数传递与所有权
+
+`rdma_dut_link` 不直接解析 AIP 字符串，也不直接改写 QPC/SQE。之前约定的参数必须经过“输入 profile → resolver → immutable snapshot”三步后传入各层：
+
+```text
+aip_int / Tcl / test override
+    → rdma_flow_plan / rdma_*_profile
+    → rdma_config_resolver
+    → qpc_snapshot + resource_snapshot + message_snapshot + netpacket_snapshot
+    → driver / dev / sequencer / rdma_dut_link
+```
+
+建议的 profile 入口与职责如下：
+
+| profile | 可配置内容 | resolver/环境自动关联内容 | 消费者 |
+| --- | --- | --- | --- |
+| `rdma_flow_plan` | `managed_link`/`static_peer`、TX/RX QP 数、QP 配对、每 QP message 列表 | peer 关系、方向和索引完整性 | env/vseq |
+| `rdma_qp_profile` | RC/UD/URC、SQ/RQ depth、MTU、PKEY/QKEY、PSN、dest QPN、retry/timeout、max SGE/inline | `qp_h`、local QPN 分配、QP 生命周期 | ctrl/verb/dev |
+| `rdma_qpc_profile` | PD/CQ/SRQ 逻辑引用、DMAC/IP、VLAN、FWD、tunnel、LAG/vport、访问权限 | PD/CQ/SRQ handle、CQN、SQ/RQ backing、QPC shadow、PBL/PBLE 地址 | CMQ driver/dev |
+| `rdma_hmc_profile` | `page_size`、PBL mode、SD `VLD`、VF_ID、PBA 对齐策略 | HMC page/PBA、SD/PBL 表地址、生命周期 | drv/dev/scoreboard |
+| `rdma_message_profile` | SQE/WR 类型、SGE、lkey/rkey、remote VA、imm、atomic 参数、业务 payload | WQE 物理位置、MR/PD 关联、PSN 消耗 | verb/dev/predictor |
+| `rdma_netpacket_profile` | RoCE/隧道类型、外层 Ethernet/IP/UDP、VLAN、VNI/GRE、业务 header/payload | 默认 QPN/PSN/DETH/RETH 等来自 message/QPC snapshot 的只读视图 | codec/link |
+| `rdma_endpoint_profile` | DUT port、peer MAC、MTU/frame 上限、队列/backpressure、收发 timeout、reset epoch | endpoint handle、port state 和外部资源生命周期 | plugin/`rdma_dut_link` |
+| `rdma_fault_profile` | 按方向/Function/QP/QPN/opcode/segment/frame offset 筛选的 DROP、DUP、DELAY、REORDER、CORRUPT、ICRC/VLAN/FWD/endpoint-error | 故障作用方向、窗口、skip/count/probability 和计数 | link/endpoint/checker |
+
+自动关联的字段包括：`qp_h`、`local_qpn`、`send_cq_h`、`recv_cq_h`、`sq_backing`、`rq_backing`、`qpc_shadow`、PD/CQ/EQ handle、CQN、PBL/PBLE 地址、AEQ/CEQ/UAQ backing、HMC PBA、endpoint handle。用户显式可控的字段包括：QP 类型/数量、深度、PSN、dest QPN、PKEY/QKEY、MTU、MAC/IP、UDP source port、VLAN、FWD、tunnel、DSCP/ECN/hop limit、MR page mode、PBL mode、CQ/EQ depth/vector、SD page size、SD `VLD` 和 `VF_ID`。
+
+QPC/PD/MR/SD 的错误组合（wrong PD、wrong rkey/lkey、`VLD=0`、VF_ID 错误、PBA 未对齐、保留 FWD 编码等）仍在对应 profile 中以 `INVALID` 表达，由 resolver/driver/dev 执行；它们不能被 link fault 隐式伪造。
+
+所有字段支持 `AUTO`、`FIXED`、`RANDOM_LEGAL`、`INVALID` 四种策略；`INVALID` 只允许由 fault profile 启用，不能意外流入正常建链路径。
+
+### 5.2 QPC 与 netpacket 的只读关系
+
+QPC snapshot 是硬件上下文的唯一来源。`rdma_dut_link` 和 codec 可以读取它来校验目的 QPN、PSN、路径地址、VLAN/FWD/tunnel 能力，但不得回写 QPC，也不得用 netpacket 的同名字段覆盖 QPC。
+
+`netpacket_profile` 只描述本次 wire frame 的封装和业务内容。正常模式下，resolver 对 netpacket 的显式外层字段与 QPC snapshot 做兼容性检查：
+
+- 未指定时，从 snapshot 生成默认 wire 字段；
+- 指定且一致时，保留 netpacket profile 的 wire 选择；
+- 指定但与 QPC 不一致时，返回配置错误；
+- 需要验证 DUT 对不一致字段的行为时，必须使用 fault profile，形成可追踪的负向测试。
+
+因此可以做到“QPC 独立设置、netpacket 设置报文属性和业务内容”，同时避免 netpacket 隐式改变 DUT 上下文。
+
+### 5.3 与 AIP 的边界
+
+AIP（包括 `aip_int`、动态结构体数组、范围/候选/权重随机和 Tcl `set_param`）只负责参数注册、解析和随机化；跨字段约束由 `rdma_config_resolver` 统一检查。resolver 生成的 snapshot 必须在 CMQ/QP 创建前冻结，并将同一个 snapshot 句柄传给 driver、dev、codec、`rdma_dut_link`、scoreboard 和 coverage。这样 QPC 字段、SQE 字段和 wire 字段的来源可追溯，且真实 DUT 模式不会由 link 自己重新随机一份配置。
+
+`rdma_dut_link` 最终只接收 `rdma_dut_link_snapshot`，其中包含 endpoint binding、DUT/peer route、codec 所需的只读 wire snapshot、已编译的 fault rules 和 reset epoch。它不直接读取 AIP/Tcl/profile 对象，也不生成 `qp_h`、`local_qpn`、`send_cq_h`、`sq_backing`、`rq_backing`、`qpc_shadow`、PD/PBL/CQ/AEQ/UAQ 等资源字段。解析顺序固定为：
+
+```text
+qpc_snapshot → message_snapshot → netpacket_snapshot → wire_frame
+```
+
+netpacket 中与 QPC 同名的 path 字段只能作为一致性断言；需要故意发送不一致 frame 时，必须走显式 `field_override` fault，并在观测中标记 `injected_fault`。
+
 若外部 VIP 已经完全管理网络路由，后续可以不实例化 `rdma_dut_link`，但必须发布等价的 `rdma_link_obs`/原始 frame 事件；本规范的 checker、coverage 和 scoreboard 不直接依赖具体 link 类。
 
 ## 6. 错误、并发与所有权
@@ -147,4 +203,3 @@ plugin.bind_endpoint(env.link, endpoint, dut_port, dut_mac)
 - 本设计不把 `rdma_dut_link` 变成完整交换机，不实现 VLAN/FWD/IP 路由、重传、拥塞或 QP 状态机。
 - 本设计不把 `SEND_WITH_INV`、IPv6、VXLAN/GRE、VLAN 等缺失 wire 语义偷偷映射成 SEND；它们需要扩展 `rdma_packet`、codec、NIC 行为和 checker/coverage。
 - 本设计不改变 CMQ、QP、MR、PBL、CQ、AEQ/CEQ 的资源所有权；真实 DUT 控制面使用独立 driver/backend。
-
