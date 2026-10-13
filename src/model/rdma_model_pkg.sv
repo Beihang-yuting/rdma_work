@@ -10,4 +10,6 @@ package rdma_model_pkg;
 
   `include "rdma_hw_image.sv"
   `include "rdma_semantic_requests.sv"
+  `include "rdma_flow_profiles.sv"
+  `include "rdma_flow_resolver.sv"
 endpackage
