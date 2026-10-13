@@ -60,6 +60,10 @@ class rdma_env_cfg extends uvm_object;
   int unsigned remote_funcs;
   string link_type;
   rdma_env_plugin plugins[$];
+  // 声明式 RDMA 流量输入与 resolver 生成的冻结快照。flow_plan 与 resolved_config 由测试拥有；
+  // env 只在缺少 resolved_config 时读取 plan 并保存发布结果，之后各组件消费只读快照。
+  rdma_flow_plan flow_plan;
+  rdma_resolved_config resolved_config;
   // DUT link 外部 endpoint 与 frozen route snapshot；仅 rdma_dut_link 使用，普通 loopback 忽略。
   rdma_dut_frame_endpoint dut_endpoint;
   rdma_dut_link_snapshot dut_link_snapshot;
@@ -87,6 +91,8 @@ class rdma_env_cfg extends uvm_object;
   function new(string name = "rdma_env_cfg");
     super.new(name);
     link_type = "rdma_link";
+    flow_plan = null;
+    resolved_config = null;
     dut_endpoint = null;
     dut_link_snapshot = null;
     dut_port = 0;

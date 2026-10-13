@@ -60,6 +60,15 @@ class rdma_env extends uvm_env;
       `uvm_fatal("RDMA_ENV", "rdma_env_cfg not set (config_db key \"cfg\")")
     foreach (cfg.plugins[i])
       cfg.plugins[i].pre_build(this);
+    if (cfg.flow_plan != null && cfg.resolved_config == null) begin
+      link_status = rdma_flow_resolver::resolve(cfg.flow_plan,
+                                                cfg.resolved_config,
+                                                cfg.dut_link_snapshot);
+      if (!link_status.ok())
+        `uvm_fatal("RDMA_ENV", {"flow plan resolve failed: ", link_status.convert2string()})
+    end
+    if (cfg.resolved_config != null && cfg.dut_link_snapshot == null)
+      `uvm_warning("RDMA_ENV", "resolved_config is provided without a DUT link snapshot")
     build_system();
     res = rdma_res_db::type_id::create("res", this);
     ctrl = rdma_ctrl_agent::type_id::create("ctrl", this);

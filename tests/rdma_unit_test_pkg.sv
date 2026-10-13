@@ -16,6 +16,7 @@ package rdma_unit_test_pkg;
   import dpu_resource_pkg::*;
   import rdma_dpu_adapter_pkg::*;
   import rdma_netpkt_pkg::*;
+  import rdma_env_pkg::*;
 `ifdef RDMA_PCIE_WORK_TEST
   import pcie_tl_pkg::*;
   import rdma_pcie_work_pkg::*;
@@ -43,6 +44,8 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_aeqe_route_test.sv"
   `include "unit/rdma_harness_expected_failure_probe.sv"
   `include "unit/rdma_netpkt_codec_test.sv"
+  `include "unit/rdma_flow_profiles_test.sv"
+  `include "unit/rdma_dut_link_test.sv"
 `ifdef RDMA_RXE_TEST
   `include "integration/rdma_rxe_test.sv"
   `include "integration/rdma_rxe_fault_test.sv"
