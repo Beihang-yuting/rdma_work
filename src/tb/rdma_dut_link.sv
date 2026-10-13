@@ -266,8 +266,8 @@ class rdma_dut_link extends rdma_link;
 
   // 功能：把冻结 fault snapshot 投影为基类可执行的链路故障规则。
   // 输入/输出及副作用：新增一条 rdma_link_fault 到 faults；不修改 snapshot 或 packet。
-  // 失败/边界：禁用规则跳过；REORDER/坏 VLAN/FWD/ICRC 映射为现有 delay/corrupt 能力，无法表达的
-  //   工作 opcode 不过滤而保留 function/计数条件，避免把网络 opcode 数值误当成 WR opcode。
+  // 失败/边界：禁用规则跳过；REORDER/坏 VLAN/FWD/ICRC 映射为现有 delay/corrupt 能力；
+  //   当前没有独立线上表示的管理类 WR 保留 function/计数过滤而不误匹配网络 opcode。
   protected function void install_snapshot_fault(rdma_fault_snapshot value);
     rdma_link_fault rule;
 
@@ -422,6 +422,7 @@ class rdma_dut_link extends rdma_link;
   virtual task transmit(int unsigned src, rdma_packet pkt, bit [47:0] dmac);
     rdma_link_fault fault;
     rdma_dut_link_route_snapshot route;
+    rdma_netpkt_codec route_codec;
     int unsigned dst;
     byte unsigned frame[$];
     rdma_status status;
@@ -444,9 +445,13 @@ class rdma_dut_link extends rdma_link;
     end
     if (snapshot != null) begin
       status = select_snapshot_route(pkt, route);
-      if (status.ok())
-        status = codec.encode_snapshot(pkt, route.qp, route.qpc, route.message,
-                                       route.netpacket, frame);
+      if (status.ok()) begin
+        // 每次发送使用独立 codec，避免多 QP 并发编码时互相覆盖 VLAN/MAC/IP/UDP 配置。
+        route_codec = rdma_netpkt_codec::type_id::create(
+          $sformatf("dut_route_codec_%0d", route.message_index));
+        status = route_codec.encode_snapshot(pkt, route.qp, route.qpc, route.message,
+                                             route.netpacket, frame);
+      end
     end
     else
       status = codec.encode(pkt, frame);
@@ -563,12 +568,10 @@ class rdma_dut_link extends rdma_link;
         break;
       rx_frames_captured++;
       decoded = null;
-      // 单 route 沿用 snapshot-aware 校验；多 route 先通用解码，再按目的 QPN 选择对应路由，
-      // 避免拿首个 QP 去校验其它 QP 的 DUT TX frame。
-      if (snapshot != null && snapshot.routes.size() <= 1)
-        status = codec.decode_snapshot(frame, snapshot.qp, decoded);
-      else
-        status = codec.decode(frame, decoded);
+      // snapshot.qp 是模型→DUT 的发送方向快照；DUT→模型 可能使用另一侧 QP，不能拿发送
+      // 方向的 dest_qpn/PSN 去拒绝真实 DUT TX。先做通用 codec 解码，随后按 routes 的目标
+      // QPN 选择接收归属；需要严格 RX QP 校验时由调用方提供独立 RX snapshot。
+      status = codec.decode(frame, decoded);
       if (!status.ok() || decoded == null) begin
         decode_errors++;
         `uvm_error("RDMA_DUT_LINK", {"DUT frame decode failed: ", status.convert2string()})

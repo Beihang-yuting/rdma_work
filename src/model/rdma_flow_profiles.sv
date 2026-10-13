@@ -772,10 +772,8 @@ class rdma_dut_link_route_snapshot extends uvm_object;
       return 1'b0;
     if (netpacket.message_index != message_index)
       return 1'b0;
-    void'(qp.freeze());
-    void'(qpc.freeze());
-    void'(message.freeze());
-    void'(netpacket.freeze());
+    if (!qp.freeze() || !qpc.freeze() || !message.freeze() || !netpacket.freeze())
+      return 1'b0;
     frozen = 1'b1;
     return 1'b1;
   endfunction
@@ -1001,6 +999,8 @@ class rdma_dut_link_snapshot extends uvm_object;
     // 兼容手工构造 route 表：单数兼容视图缺失时从首路由补齐；空 route 表仍要求旧字段完整。
     if ((qp == null || qpc == null || message == null || netpacket == null) &&
         routes.size() != 0) begin
+      if (routes[0] == null)
+        return 1'b0;
       qp = routes[0].qp;
       qpc = routes[0].qpc;
       message = routes[0].message;
@@ -1008,18 +1008,17 @@ class rdma_dut_link_snapshot extends uvm_object;
     end
     if (qp == null || qpc == null || message == null || netpacket == null)
       return 1'b0;
-    void'(qp.freeze());
-    void'(qpc.freeze());
-    void'(message.freeze());
-    void'(endpoint.freeze());
-    void'(netpacket.freeze());
+    if (!qp.freeze() || !qpc.freeze() || !message.freeze() ||
+        !endpoint.freeze() || !netpacket.freeze())
+      return 1'b0;
     foreach (routes[i]) begin
       if (routes[i] == null || !routes[i].freeze())
         return 1'b0;
     end
     foreach (faults[i]) begin
       if (faults[i] == null) return 1'b0;
-      void'(faults[i].freeze());
+      if (!faults[i].freeze())
+        return 1'b0;
     end
     dut_mac = endpoint.dut_mac;
     dut_port = endpoint.dut_port;
@@ -1055,6 +1054,10 @@ class rdma_dut_link_snapshot extends uvm_object;
     foreach (routes[i]) begin
       if (routes[i] == null)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null DUT route snapshot");
+      if (routes[i].qp == null || routes[i].qp.source_id != source_id ||
+          routes[i].qp.reset_epoch != reset_epoch)
+        return rdma_status::make(RDMA_SC_STALE_GENERATION,
+                                 "DUT route identity does not match link snapshot");
       s = routes[i].validate();
       if (!s.ok()) return s;
     end

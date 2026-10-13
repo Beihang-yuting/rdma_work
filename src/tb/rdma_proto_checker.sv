@@ -87,11 +87,35 @@ class rdma_proto_checker extends uvm_component;
     end
   endfunction
 
+  // 功能：判断观测源是否属于远端或真实 DUT 网络边界。
+  // 输入/输出及副作用：读取资源库中 Function 的非拥有引用；未登记的哨兵源按远端处理，不修改资源状态。
+  // 失败/边界：env/res 尚未绑定或索引不存在时返回 1，避免 DUT link 的哨兵下标解引用空句柄。
+  function bit source_is_remote(int unsigned index);
+    if (env == null || env.res == null)
+      return 1'b1;
+    foreach (env.res.funcs[i])
+      if (i == index && env.res.funcs[i] != null)
+        return env.res.funcs[i].remote;
+    return 1'b1;
+  endfunction
+
+  // 功能：判断观测目的是否属于远端或真实 DUT 网络边界。
+  // 输入/输出及副作用：读取资源库中目的 Function；未知目的按远端处理，不创建或修改资源对象。
+  // 失败/边界：未登记的 DUT 哨兵/外部 Function 返回 1，使状态规则跳过本地 QP 存在性断言。
+  function bit destination_is_remote(int unsigned index);
+    if (env == null || env.res == null)
+      return 1'b1;
+    foreach (env.res.funcs[i])
+      if (i == index && env.res.funcs[i] != null)
+        return env.res.funcs[i].remote;
+    return 1'b1;
+  endfunction
+
   // 功能：仿真 NIC 发出的报文交给各规则（远端 Function 发出的不是被测对象）。
   // 输入/输出及副作用：读取 env 中源 Function 的 remote 标志；本地源观测按顺序调用全部规则并更新其状态。
   // 失败/边界：远端源发送观测有意跳过以免把外部实现当 DUT；要求 o、pkt、env 及源索引均有效。
   function void write_tx(rdma_link_obs o);
-    if (env.res.funcs[o.src].remote)
+    if (source_is_remote(o.src))
       return;
     foreach (rules[i])
       rules[i].on_tx(o);
@@ -275,7 +299,7 @@ class rdma_rule_psn extends rdma_proto_rule;
   // 输入/输出及副作用：远端源观测调用 track_read，并读取目的 QP 的 MTU；其他观测不修改状态。
   // 失败/边界：本地来源已在 on_tx 登记，故此处有意跳过以免重复；缺失 QP 时 span 按一个包退化。
   virtual function void on_rx(rdma_link_obs o);
-    if (chk.env.res.funcs[o.src].remote)
+    if (chk.source_is_remote(o.src))
       track_read(o, chk.receiver(o));
   endfunction
 
@@ -360,7 +384,7 @@ class rdma_rule_ack extends rdma_proto_rule;
   // 输入/输出及副作用：仅 remote 且属于请求集合时调用 note_request 更新 last_req。
   // 失败/边界：本地请求已由 on_tx 登记而有意跳过；非请求和远端标志为零时保持状态不变。
   virtual function void on_rx(rdma_link_obs o);
-    if (chk.env.res.funcs[o.src].remote && rdma_proto_checker::request(o.pkt))
+    if (chk.source_is_remote(o.src) && rdma_proto_checker::request(o.pkt))
       note_request(o);
   endfunction
 
@@ -463,7 +487,7 @@ class rdma_rule_rnr extends rdma_proto_rule;
   // 输入/输出及副作用：仅 remote 且 rnr_nak 为真时调用 note 更新 hold，其他观测不变。
   // 失败/边界：本地响应方的 NAK 已由 on_tx 处理而有意跳过；此处不校验远端 timer 是否匹配本地配置。
   virtual function void on_rx(rdma_link_obs o);
-    if (chk.env.res.funcs[o.src].remote && rnr_nak(o))
+    if (chk.source_is_remote(o.src) && rnr_nak(o))
       note(o);
   endfunction
 
@@ -515,7 +539,7 @@ class rdma_rule_state extends rdma_proto_rule;
       fail(o, {"request sent in state ", st.name()});
     if (!rdma_proto_checker::request(o.pkt) && st inside {RDMA_DRV_QPS_RESET, RDMA_DRV_QPS_INIT})
       fail(o, {"response sent in state ", st.name()});
-    if (!chk.env.res.funcs[o.dst].remote && chk.receiver(o) == null)
+    if (!chk.destination_is_remote(o.dst) && chk.receiver(o) == null)
       fail(o, $sformatf("destination QP %0d does not exist", o.pkt.destination_qpn));
   endfunction
 endclass

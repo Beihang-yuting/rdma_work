@@ -165,8 +165,8 @@ class rdma_env extends uvm_env;
     end
   endfunction
 
-  // 功能：probe 每个 Function，登记到资源库与设备级队列，NIC 接入链路；启动 NIC；插件 start（远端
-  //   Function 在此登记）后就绪。
+  // 功能：probe 每个 Function，登记到资源库与设备级队列，NIC 接入链路；启动 NIC；等待真实 DUT
+  //   link 的 endpoint running 后执行插件 start（远端 Function 在此登记）并宣告环境就绪。
   // 输入/输出及副作用：设置 ready。
   // 失败/边界：probe 失败 UVM_FATAL。
   task run_phase(uvm_phase phase);
@@ -183,10 +183,10 @@ class rdma_env extends uvm_env;
       sys.nodes[i].dev.nic.port = link.attach(f);
     end
     sys.start();
-    foreach (cfg.plugins[i])
-      cfg.plugins[i].start(this);
     if ($cast(dut_link, link))
       dut_link.wait_started();
+    foreach (cfg.plugins[i])
+      cfg.plugins[i].start(this);
     ready = 1'b1;
   endtask
 
