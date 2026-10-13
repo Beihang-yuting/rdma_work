@@ -133,6 +133,258 @@ package rdma_netpkt_pkg;
       return status;
     endfunction
 
+    // 功能：把已经冻结的 QP/QPC/message/netpacket snapshot 投影为一次待编码 rdma_packet，再复用
+    //   旧 encode 路径生成 raw RoCEv2 frame。
+    // 输入/输出及副作用：value 只读；snapshots 只读；frame 输出独立字节队列；codec 地址按 snapshot
+    //   设置。函数不会回写 QP/QPC，也不会修改 value 的 QPN、PSN、payload 或扩展头。
+    // 失败/边界：任一 snapshot 为空、未冻结/校验失败、同名 QPC/netpacket 字段冲突、message opcode
+    //   不支持或 frame 编码失败返回对应 status，frame 保持为空；故障注入不得通过此入口伪造 QPC。
+    function rdma_status encode_snapshot(
+      rdma_packet value,
+      rdma_qp_snapshot qp,
+      rdma_qpc_snapshot qpc,
+      rdma_message_snapshot message,
+      rdma_netpacket_snapshot netpacket,
+      output byte unsigned frame[$]
+    );
+      rdma_packet projected;
+      rdma_status status;
+
+      frame.delete();
+      status = validate_snapshot_inputs(qp, qpc, message, netpacket);
+      if (!status.ok())
+        return status;
+      projected = rdma_deep_copy#(rdma_packet)::of(value, "snapshot packet copy failed");
+      if (projected == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "snapshot packet is null");
+      status = project_packet(projected, qp, qpc, message, netpacket);
+      if (!status.ok()) begin
+        frame.delete();
+        return status;
+      end
+      configure_snapshot_addresses(qpc, netpacket);
+      status = encode(projected, frame);
+      return status;
+    endfunction
+
+    // 功能：解码 raw frame，并用冻结 QP snapshot 对 source/destination QPN 与 PSN 做只读一致性校验。
+    // 输入/输出及副作用：frame、qp 只读；value 输出新 rdma_packet；不修改 qp，也不以报文字段覆盖 QPC。
+    // 失败/边界：解码失败或 snapshot path 字段冲突返回 CODEC/INVALID_ARGUMENT，value 清空；AUTO 字段
+    //   只做解码，不凭报文反向生成或补写 QPC。
+    function rdma_status decode_snapshot(
+      byte unsigned frame[$],
+      rdma_qp_snapshot qp,
+      output rdma_packet value
+    );
+      rdma_status status;
+
+      value = null;
+      if (qp == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP snapshot is null");
+      if (!qp.frozen || qp.source_id == "" || qp.reset_epoch == 0)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "QP snapshot is not frozen");
+      status = qp.validate();
+      if (!status.ok())
+        return status;
+      status = decode(frame, value);
+      if (!status.ok() || value == null)
+        return status;
+      // RC BTH 没有 DETH，source_qpn 不在线上出现；只有 UD/URC 的 DETH 才能校验源 QPN。
+      if (qp.local_qpn != 0 && value.transport inside {RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC} &&
+          value.source_qpn != qp.local_qpn) begin
+        value = null;
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "decoded source QPN conflicts with QP snapshot");
+      end
+      if (qp.dest_qpn != 0 && value.destination_qpn != qp.dest_qpn) begin
+        value = null;
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "decoded destination QPN conflicts with QP snapshot");
+      end
+      if (qp.psn_mode == RDMA_FIELD_FIXED && value.psn != qp.psn) begin
+        value = null;
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "decoded PSN conflicts with QP snapshot");
+      end
+      return rdma_status::success();
+    endfunction
+
+    // 功能：校验 snapshot 输入的冻结状态、来源身份、reset epoch 和各自 profile 合法性。
+    // 输入/输出及副作用：只读四个 snapshot；返回首个失败 status，不改写任何输入。
+    // 失败/边界：null、未冻结、身份/epoch 不一致或 INVALID 字段立即拒绝；此处不创建缺失资源、不调用 endpoint。
+    protected static function rdma_status validate_snapshot_inputs(
+      rdma_qp_snapshot qp,
+      rdma_qpc_snapshot qpc,
+      rdma_message_snapshot message,
+      rdma_netpacket_snapshot netpacket
+    );
+      rdma_status status;
+
+      if (qp == null || qpc == null || message == null || netpacket == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "snapshot input is null");
+      if (!qp.frozen || !qpc.frozen || !message.frozen || !netpacket.frozen)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "snapshot input is not frozen");
+      if (qp.source_id == "" || qpc.source_id == "" || message.source_id == "" ||
+          netpacket.source_id == "")
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "snapshot source identity is incomplete");
+      if (qp.source_id != qpc.source_id || qp.source_id != message.source_id ||
+          qp.source_id != netpacket.source_id)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "snapshot source identity conflicts");
+      if (qp.reset_epoch == 0 || qpc.reset_epoch == 0 || message.reset_epoch == 0 ||
+          netpacket.reset_epoch == 0)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "snapshot reset epoch is zero");
+      if (qp.reset_epoch != qpc.reset_epoch || qp.reset_epoch != message.reset_epoch ||
+          qp.reset_epoch != netpacket.reset_epoch)
+        return rdma_status::make(RDMA_SC_STALE_GENERATION, "snapshot reset epoch conflicts");
+      status = qp.validate();
+      if (!status.ok()) return status;
+      status = qpc.validate();
+      if (!status.ok()) return status;
+      status = message.validate();
+      if (!status.ok()) return status;
+      status = netpacket.validate();
+      if (!status.ok()) return status;
+      return rdma_status::success();
+    endfunction
+
+    // 功能：把 message opcode、QPN/PSN、payload 和 netpacket transport 投影到独立 packet 副本。
+    // 输入/输出及副作用：packet 为可写的临时副本；四个 snapshot 只读；返回投影状态。
+    // 失败/边界：固定字段冲突、不支持的 WR/transport、远端字段不完整或 imm/atomic 语义不匹配返回
+    //   错误；原 packet 和 QPC snapshot 保持不变。
+    protected static function rdma_status project_packet(
+      rdma_packet packet,
+      rdma_qp_snapshot qp,
+      rdma_qpc_snapshot qpc,
+      rdma_message_snapshot message,
+      rdma_netpacket_snapshot netpacket
+    );
+      rdma_network_opcode_e network_opcode;
+      rdma_status status;
+
+      if (packet == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "project packet is null");
+      status = network_opcode_from_work(message.opcode, network_opcode);
+      if (!status.ok())
+        return status;
+      if (netpacket.transport_mode == RDMA_FIELD_FIXED &&
+          netpacket.transport != transport_from_qp(qp.qp_type))
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "netpacket transport conflicts with QP type");
+      packet.transport = netpacket.transport_mode == RDMA_FIELD_AUTO ?
+                         transport_from_qp(qp.qp_type) : netpacket.transport;
+      if (!(packet.transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC}))
+        return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, "snapshot transport is unsupported");
+      packet.opcode = network_opcode;
+      if (packet.source_qpn == 0)
+        packet.source_qpn = qp.local_qpn;
+      else if (packet.source_qpn != qp.local_qpn)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "packet source QPN conflicts with QP snapshot");
+      if (packet.destination_qpn == 0)
+        packet.destination_qpn = qp.dest_qpn;
+      else if (qp.dest_qpn != 0 && packet.destination_qpn != qp.dest_qpn)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "packet destination QPN conflicts with QP snapshot");
+      if (packet.psn == 0)
+        packet.psn = qp.psn;
+      else if (qp.psn_mode == RDMA_FIELD_FIXED && packet.psn != qp.psn)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "packet PSN conflicts with QP snapshot");
+      if (netpacket.qpn_mode == RDMA_FIELD_FIXED && netpacket.qpn != packet.source_qpn)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "netpacket QPN conflicts with packet source QPN");
+      if (netpacket.psn_mode == RDMA_FIELD_FIXED && netpacket.psn != packet.psn)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "netpacket PSN conflicts with packet PSN");
+      if (message.payload.size() != 0 && packet.payload.size() == 0)
+        packet.payload = message.payload;
+      if (netpacket.payload.size() != 0)
+        packet.payload = netpacket.payload;
+      if (message.opcode == RDMA_WR_SEND_WITH_IMM || message.opcode == RDMA_WR_WRITE_WITH_IMM)
+        packet.imm = message.imm;
+      if (message.opcode == RDMA_WR_ATOMIC_CMP_SWAP ||
+          message.opcode == RDMA_WR_ATOMIC_FETCH_ADD) begin
+        packet.atomic_swap_add = message.atomic_swap_add;
+        packet.atomic_compare = message.atomic_compare;
+      end
+      if (message.opcode inside {RDMA_WR_RDMA_WRITE, RDMA_WR_WRITE_WITH_IMM,
+                                 RDMA_WR_RDMA_READ}) begin
+        packet.reth_va = message.remote_va;
+        packet.reth_rkey = message.rkey;
+        packet.reth_len = message.length;
+      end
+      if (packet.transport == RDMA_TRANSPORT_UD && packet.deth_qkey == 0)
+        packet.deth_qkey = qp.qkey;
+      if (qpc.dmac_mode == RDMA_FIELD_FIXED && netpacket.dmac_mode == RDMA_FIELD_FIXED &&
+          qpc.dmac != netpacket.dmac)
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "QPC DMAC conflicts with netpacket DMAC");
+      // encode() 从 header_bytes 读取线上扩展头；先把 message 的结构化字段序列化，避免沿用
+      // 调用方 packet 副本中的陈旧头字节。netpacket.business_header 仅是外层声明性字段，不能
+      // 覆盖 RETH/Imm/AtomicETH 等 QP 语义头。
+      packet.pack_headers();
+      return rdma_status::success();
+    endfunction
+
+    // 功能：把 driver/dev 认可的 WR opcode映射为 codec 使用的 network opcode。
+    // 输入/输出及副作用：opcode 为输入；network_opcode 输出；不访问 QPC 或 packet。
+    // 失败/边界：LOCAL_INVALIDATE、REG_MR、BIND_MW、FLUSH 等当前 wire 未实现，返回 UNSUPPORTED_OPCODE。
+    protected static function rdma_status network_opcode_from_work(
+      rdma_work_opcode_e opcode,
+      output rdma_network_opcode_e network_opcode
+    );
+      case (opcode)
+        RDMA_WR_SEND: network_opcode = RDMA_NET_SEND;
+        RDMA_WR_RECV:
+          begin
+            network_opcode = RDMA_NET_SEND;
+            return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                      "RECV has no outbound RoCE wire opcode");
+          end
+        RDMA_WR_SEND_WITH_IMM: network_opcode = RDMA_NET_SEND_WITH_IMM;
+        RDMA_WR_RDMA_WRITE: network_opcode = RDMA_NET_RDMA_WRITE;
+        RDMA_WR_WRITE_WITH_IMM: network_opcode = RDMA_NET_WRITE_WITH_IMM;
+        RDMA_WR_RDMA_READ: network_opcode = RDMA_NET_RDMA_READ_REQUEST;
+        RDMA_WR_ATOMIC_CMP_SWAP: network_opcode = RDMA_NET_ATOMIC_CMP_SWAP;
+        RDMA_WR_ATOMIC_FETCH_ADD: network_opcode = RDMA_NET_ATOMIC_FETCH_ADD;
+        default: begin
+          network_opcode = RDMA_NET_SEND;
+          return rdma_status::make(
+            RDMA_SC_UNSUPPORTED_OPCODE, "message WR opcode is unsupported by RoCE codec");
+        end
+      endcase
+      return rdma_status::success();
+    endfunction
+
+    // 功能：把 flow QP 类型转换为 rdma_packet transport 枚举。
+    // 输入/输出及副作用：qp_type 为输入；返回 transport，不修改 QP snapshot。
+    // 失败/边界：未知 QP 类型保守返回 CUSTOM，由调用方在 project_packet 中拒绝编码。
+    protected static function rdma_transport_e transport_from_qp(rdma_flow_qp_type_e qp_type);
+      case (qp_type)
+        RDMA_FLOW_QP_RC: return RDMA_TRANSPORT_RC;
+        RDMA_FLOW_QP_UD: return RDMA_TRANSPORT_UD;
+        RDMA_FLOW_QP_URC: return RDMA_TRANSPORT_URC;
+        default: return RDMA_TRANSPORT_CUSTOM;
+      endcase
+    endfunction
+
+    // 功能：将 QPC/netpacket 的 wire 地址投影到 codec 自有配置。
+    // 输入/输出及副作用：修改 codec 的地址值，不修改 snapshot；netpacket 固定值优先，QPC 只作默认路径。
+    // 失败/边界：零地址保持 codec 原默认值；一致性冲突已由 project_packet 拒绝。
+    protected function void configure_snapshot_addresses(rdma_qpc_snapshot qpc,
+                                                          rdma_netpacket_snapshot netpacket);
+      if (netpacket.dmac_mode == RDMA_FIELD_FIXED && netpacket.dmac != 0)
+        dst_mac = netpacket.dmac;
+      else if (qpc.dmac_mode == RDMA_FIELD_FIXED && qpc.dmac != 0)
+        dst_mac = qpc.dmac;
+      if (netpacket.smac_mode == RDMA_FIELD_FIXED && netpacket.smac != 0)
+        src_mac = netpacket.smac;
+      if (netpacket.source_ip_mode == RDMA_FIELD_FIXED && netpacket.source_ip != 0)
+        src_ip = netpacket.source_ip;
+      if (netpacket.destination_ip_mode == RDMA_FIELD_FIXED && netpacket.destination_ip != 0)
+        dst_ip = netpacket.destination_ip;
+    endfunction
+
     // 功能：BTH 在帧中的偏移与有效帧终点（按 IPv4 total_length/UDP length 去掉以太网补齐）。
     // 输入/输出及副作用：纯查询。
     // 失败/边界：缺长度字段时终点为帧长。
