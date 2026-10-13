@@ -80,6 +80,13 @@ function automatic bit rdma_field_mode_is_invalid(rdma_field_mode_e mode);
   return mode == RDMA_FIELD_INVALID;
 endfunction
 
+// 功能：判断策略能否进入正常 profile/resolver 路径。
+// 输入/输出及副作用：mode 为输入；返回 bit，无副作用。
+// 失败/边界：AUTO/FIXED/RANDOM_LEGAL 返回 1；INVALID 或 X/Z 返回 0，INVALID 只能由 fault 规则显式使用。
+function automatic bit rdma_field_mode_normal(rdma_field_mode_e mode);
+  return rdma_field_mode_valid(mode) && !rdma_field_mode_is_invalid(mode);
+endfunction
+
 // 设计说明：profile base 只保存来源身份和 freeze 状态，子类保存具体配置。resolver 将来源
 // identity 复制到 snapshot，避免后续修改 profile 影响已经发布的运行时输入。
 virtual class rdma_flow_profile_base extends uvm_object;
@@ -189,8 +196,13 @@ class rdma_qp_profile extends rdma_flow_profile_base;
     rdma_status s;
     s = super.validate();
     if (!s.ok()) return s;
-    if (!rdma_field_mode_valid(qp_type_mode) || rdma_field_mode_is_invalid(qp_type_mode))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP type mode is invalid");
+    if (!rdma_field_mode_normal(qp_type_mode) || !rdma_field_mode_normal(sq_depth_mode) ||
+        !rdma_field_mode_normal(rq_depth_mode) || !rdma_field_mode_normal(mtu_mode) ||
+        !rdma_field_mode_normal(pkey_mode) || !rdma_field_mode_normal(qkey_mode) ||
+        !rdma_field_mode_normal(psn_mode) || !rdma_field_mode_normal(dest_qpn_mode) ||
+        !rdma_field_mode_normal(max_send_sge_mode) || !rdma_field_mode_normal(max_recv_sge_mode) ||
+        !rdma_field_mode_normal(max_inline_mode))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP field mode is invalid");
     if (sq_depth == 0 || rq_depth == 0 || mtu == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QP depth and MTU must be nonzero");
     if (max_send_sge == 0 || max_recv_sge == 0)
@@ -280,8 +292,12 @@ class rdma_qpc_profile extends rdma_flow_profile_base;
     rdma_status s;
     s = super.validate();
     if (!s.ok()) return s;
-    if (rdma_field_mode_is_invalid(dmac_mode) || rdma_field_mode_is_invalid(access_mode))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QPC path or access mode is INVALID");
+    if (!rdma_field_mode_normal(pd_ref_mode) || !rdma_field_mode_normal(send_cq_ref_mode) ||
+        !rdma_field_mode_normal(recv_cq_ref_mode) || !rdma_field_mode_normal(srq_ref_mode) ||
+        !rdma_field_mode_normal(dmac_mode) || !rdma_field_mode_normal(vlan_mode) ||
+        !rdma_field_mode_normal(fwd_mode) || !rdma_field_mode_normal(tunnel_mode) ||
+        !rdma_field_mode_normal(access_mode))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QPC field mode is invalid");
     if (dmac_mode == RDMA_FIELD_FIXED && dmac == 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "fixed QPC DMAC is zero");
     if (fwd_mode == RDMA_FIELD_FIXED && fwd > 8'h0f)
@@ -338,6 +354,10 @@ class rdma_hmc_profile extends rdma_flow_profile_base;
     rdma_status s;
     s = super.validate();
     if (!s.ok()) return s;
+    if (!rdma_field_mode_normal(page_size_mode) || !rdma_field_mode_normal(pbl_mode_mode) ||
+        !rdma_field_mode_normal(sd_vld_mode) || !rdma_field_mode_normal(vf_id_mode) ||
+        !rdma_field_mode_normal(pba_alignment_mode))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "HMC field mode is invalid");
     if (page_size == 0 || pba_alignment == 0 || (page_size & (page_size - 1)) != 0 ||
         (pba_alignment & (pba_alignment - 1)) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "HMC page/alignment must be powers of two");
@@ -419,8 +439,12 @@ class rdma_message_profile extends rdma_flow_profile_base;
     rdma_status s;
     s = super.validate();
     if (!s.ok()) return s;
-    if (rdma_field_mode_is_invalid(opcode_mode) || rdma_field_mode_is_invalid(sge_count_mode))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "message opcode/SGE mode is INVALID");
+    if (!rdma_field_mode_normal(opcode_mode) || !rdma_field_mode_normal(sge_count_mode) ||
+        !rdma_field_mode_normal(local_offset_mode) || !rdma_field_mode_normal(length_mode) ||
+        !rdma_field_mode_normal(lkey_mode) || !rdma_field_mode_normal(rkey_mode) ||
+        !rdma_field_mode_normal(remote_va_mode) || !rdma_field_mode_normal(imm_mode) ||
+        !rdma_field_mode_normal(atomic_mode))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "message field mode is invalid");
     if (sge_count == 0 || length > 0 && payload.size() != 0 && length != payload.size())
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "message length or SGE count is invalid");
     if (opcode inside {RDMA_WR_ATOMIC_CMP_SWAP, RDMA_WR_ATOMIC_FETCH_ADD} && length != 8)
@@ -498,8 +522,12 @@ class rdma_netpacket_profile extends rdma_flow_profile_base;
     rdma_status s;
     s = super.validate();
     if (!s.ok()) return s;
-    if (rdma_field_mode_is_invalid(transport_mode) || rdma_field_mode_is_invalid(qpn_mode))
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "netpacket mode is INVALID");
+    if (!rdma_field_mode_normal(transport_mode) || !rdma_field_mode_normal(dmac_mode) ||
+        !rdma_field_mode_normal(smac_mode) || !rdma_field_mode_normal(source_ip_mode) ||
+        !rdma_field_mode_normal(destination_ip_mode) || !rdma_field_mode_normal(udp_source_port_mode) ||
+        !rdma_field_mode_normal(udp_destination_port_mode) || !rdma_field_mode_normal(vlan_mode) ||
+        !rdma_field_mode_normal(qpn_mode) || !rdma_field_mode_normal(psn_mode))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "netpacket field mode is invalid");
     if (!(transport inside {RDMA_TRANSPORT_RC, RDMA_TRANSPORT_UD, RDMA_TRANSPORT_URC}))
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE, "netpacket transport is unsupported");
     if (udp_source_port == 0 || udp_destination_port == 0)
@@ -560,6 +588,10 @@ class rdma_endpoint_profile extends rdma_flow_profile_base;
     rdma_status s;
     s = super.validate();
     if (!s.ok()) return s;
+    if (!rdma_field_mode_normal(dut_port_mode) || !rdma_field_mode_normal(dut_mac_mode) ||
+        !rdma_field_mode_normal(peer_mac_mode) || !rdma_field_mode_normal(mtu_mode) ||
+        !rdma_field_mode_normal(frame_limit_mode) || !rdma_field_mode_normal(queue_depth_mode))
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "endpoint field mode is invalid");
     if (mtu == 0 || frame_limit == 0 || queue_depth == 0 || frame_limit < mtu)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "endpoint size or queue is invalid");
     if (dut_mac_mode == RDMA_FIELD_FIXED && dut_mac == 0)
