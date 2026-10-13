@@ -395,10 +395,6 @@ package rdma_netpkt_pkg;
     // 失败/边界：零地址保持 codec 原默认值；一致性冲突已由 project_packet 拒绝。
     protected function void configure_snapshot_addresses(rdma_qpc_snapshot qpc,
                                                           rdma_netpacket_snapshot netpacket);
-      if (netpacket.dmac_mode == RDMA_FIELD_FIXED && netpacket.dmac != 0)
-        dst_mac = netpacket.dmac;
-      else if (qpc.dmac_mode == RDMA_FIELD_FIXED && qpc.dmac != 0)
-        dst_mac = qpc.dmac;
       src_mac = 48'h0002_0000_0001;
       dst_mac = 48'h0002_0000_0002;
       src_ip = 32'h0a00_0001;
@@ -407,6 +403,10 @@ package rdma_netpkt_pkg;
       udp_dst_port = 16'd4791;
       vlan_enable = 1'b0;
       vlan_id = '0;
+      if (netpacket.dmac_mode == RDMA_FIELD_FIXED && netpacket.dmac != 0)
+        dst_mac = netpacket.dmac;
+      else if (qpc.dmac_mode == RDMA_FIELD_FIXED && qpc.dmac != 0)
+        dst_mac = qpc.dmac;
       if (netpacket.smac_mode == RDMA_FIELD_FIXED && netpacket.smac != 0)
         src_mac = netpacket.smac;
       if (netpacket.source_ip_mode == RDMA_FIELD_FIXED && netpacket.source_ip != 0)
