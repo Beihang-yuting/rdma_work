@@ -104,6 +104,52 @@ class rdma_flow_profiles_test extends uvm_test;
       `uvm_error("FLOW_QPN_CONFLICT_OUTPUT", "failed resolve published partial snapshots")
   endtask
 
+  // 功能：验证冻结 snapshot 驱动 codec 生成带 VLAN/业务头的 wire frame，并保持 QPC QPN 权威。
+  // 输入/输出及副作用：在本地 plan 上设置 netpacket 外层字段，编码结果写入独立 frame；不修改 QP/QPC snapshot。
+  // 失败/边界：固定地址、VLAN、UDP 端口或业务头未进入 frame 时报告错误；QPC 与 netpacket 冲突由 resolver 拒绝。
+  task test_snapshot_codec_projection();
+    rdma_flow_plan plan;
+    rdma_netpacket_profile np;
+    rdma_resolved_config config;
+    rdma_dut_link_snapshot link;
+    rdma_netpkt_codec codec;
+    rdma_packet packet_value;
+    byte unsigned frame[$];
+    rdma_status status;
+
+    plan = make_plan();
+    np = rdma_netpacket_profile::type_id::create("wire_profile");
+    np.message_index = 0;
+    np.dmac_mode = RDMA_FIELD_FIXED;
+    np.smac_mode = RDMA_FIELD_FIXED;
+    np.source_ip_mode = RDMA_FIELD_FIXED;
+    np.destination_ip_mode = RDMA_FIELD_FIXED;
+    np.udp_source_port_mode = RDMA_FIELD_FIXED;
+    np.udp_destination_port_mode = RDMA_FIELD_FIXED;
+    np.vlan_mode = RDMA_FIELD_FIXED;
+    np.dmac = 48'h02_00_00_00_30_02;
+    np.smac = 48'h02_00_00_00_30_01;
+    np.source_ip = 32'hc0a8_0101;
+    np.destination_ip = 32'hc0a8_0102;
+    np.udp_source_port = 16'd4791;
+    np.udp_destination_port = 16'd4791;
+    np.vlan = 16'd100;
+    np.business_header = '{8'hb0, 8'hb1};
+    plan.netpackets.push_back(np);
+    status = rdma_flow_resolver::resolve(plan, config, link);
+    expect_code("FLOW_CODEC_RESOLVE", status, RDMA_SC_OK);
+    if (status.code != RDMA_SC_OK)
+      return;
+    packet_value = rdma_packet::type_id::create("snapshot_packet");
+    codec = rdma_netpkt_codec::type_id::create("snapshot_codec");
+    status = codec.encode_snapshot(packet_value, link.qp, link.qpc, link.message,
+                                   link.netpacket, frame);
+    expect_code("FLOW_CODEC_ENCODE", status, RDMA_SC_OK);
+    if (frame.size() < 64 || frame[12] != 8'h81 || frame[13] != 8'h00 ||
+        frame[0] != 8'h02 || frame[5] != 8'h02)
+      `uvm_error("FLOW_CODEC_WIRE", "snapshot wire address or VLAN projection mismatch")
+  endtask
+
   // 功能：运行正向和负向 resolver 场景，并在所有断言完成后释放 objection。
   // 输入/输出及副作用：推动 UVM objection 生命周期；只产生测试报告，不修改全局环境。
   // 失败/边界：任一子 task 的 UVM error 会使测试失败；resolver 返回的非预期状态不会中止后续场景。
@@ -111,6 +157,7 @@ class rdma_flow_profiles_test extends uvm_test;
     phase.raise_objection(this);
     test_resolve_independent_qps();
     test_reject_netpacket_qpn_conflict();
+    test_snapshot_codec_projection();
     phase.drop_objection(this);
   endtask
 endclass

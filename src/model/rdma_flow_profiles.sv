@@ -889,6 +889,10 @@ class rdma_dut_link_snapshot extends uvm_object;
   string source_id;
   longint unsigned reset_epoch;
   bit frozen;
+  // 编码路径使用的发送方向快照；它们与 netpacket 共用 source_id/reset_epoch，均为非拥有引用。
+  rdma_qp_snapshot qp;
+  rdma_qpc_snapshot qpc;
+  rdma_message_snapshot message;
   rdma_endpoint_snapshot endpoint;
   rdma_netpacket_snapshot netpacket;
   rdma_fault_snapshot faults[$];
@@ -903,6 +907,9 @@ class rdma_dut_link_snapshot extends uvm_object;
     source_id = "";
     reset_epoch = '0;
     frozen = 1'b0;
+    qp = null;
+    qpc = null;
+    message = null;
     endpoint = null;
     netpacket = null;
     faults.delete();
@@ -914,8 +921,12 @@ class rdma_dut_link_snapshot extends uvm_object;
   // 输入/输出及副作用：设置 frozen=1；子对象由本对象引用但不取得外部 endpoint 生命周期。
   // 失败/边界：source/epoch、endpoint/netpacket 缺失或 fault 为 null 时返回 0。
   function bit freeze();
-    if (source_id == "" || reset_epoch == 0 || endpoint == null || netpacket == null)
+    if (source_id == "" || reset_epoch == 0 || qp == null || qpc == null || message == null ||
+        endpoint == null || netpacket == null)
       return 1'b0;
+    void'(qp.freeze());
+    void'(qpc.freeze());
+    void'(message.freeze());
     void'(endpoint.freeze());
     void'(netpacket.freeze());
     foreach (faults[i]) begin
@@ -933,8 +944,18 @@ class rdma_dut_link_snapshot extends uvm_object;
   // 失败/边界：未冻结、epoch/route 不一致、子 snapshot 非法均拒绝；不检查外部 endpoint 当前状态。
   function rdma_status validate();
     rdma_status s;
-    if (!frozen || source_id == "" || reset_epoch == 0 || endpoint == null || netpacket == null)
+    if (!frozen || source_id == "" || reset_epoch == 0 || qp == null || qpc == null ||
+        message == null || endpoint == null || netpacket == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "DUT link snapshot is incomplete");
+    if (qp.source_id != source_id || qpc.source_id != source_id || message.source_id != source_id ||
+        netpacket.source_id != source_id || endpoint.source_id != source_id ||
+        qp.reset_epoch != reset_epoch || qpc.reset_epoch != reset_epoch ||
+        message.reset_epoch != reset_epoch || netpacket.reset_epoch != reset_epoch ||
+        endpoint.reset_epoch != reset_epoch)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION, "DUT link child snapshot epoch conflicts");
+    s = qp.validate(); if (!s.ok()) return s;
+    s = qpc.validate(); if (!s.ok()) return s;
+    s = message.validate(); if (!s.ok()) return s;
     s = endpoint.validate(); if (!s.ok()) return s;
     s = netpacket.validate(); if (!s.ok()) return s;
     foreach (faults[i]) begin

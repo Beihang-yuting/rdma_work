@@ -54,6 +54,8 @@ class rdma_env extends uvm_env;
     uvm_component c;
     rdma_dut_link dut_link;
     rdma_status link_status;
+    int unsigned dut_port;
+    bit [47:0] dut_mac;
 
     super.build_phase(phase);
     if (!uvm_config_db#(rdma_env_cfg)::get(this, "", "cfg", cfg))
@@ -86,7 +88,15 @@ class rdma_env extends uvm_env;
         if (!link_status.ok())
           `uvm_fatal("RDMA_ENV", {"DUT link snapshot bind failed: ", link_status.convert2string()})
       end
-      link_status = dut_link.bind_endpoint(cfg.dut_endpoint, cfg.dut_port, cfg.dut_mac);
+      dut_port = cfg.dut_port;
+      dut_mac = cfg.dut_mac;
+      if (cfg.dut_link_snapshot != null && dut_port == 0 && cfg.dut_link_snapshot.dut_port != 0)
+        dut_port = cfg.dut_link_snapshot.dut_port;
+      if (dut_mac == 0 && cfg.dut_link_snapshot != null)
+        dut_mac = cfg.dut_link_snapshot.dut_mac;
+      if (cfg.dut_endpoint == null)
+        `uvm_fatal("RDMA_ENV", "rdma_dut_link requires cfg.dut_endpoint")
+      link_status = dut_link.bind_endpoint(cfg.dut_endpoint, dut_port, dut_mac);
       if (!link_status.ok())
         `uvm_fatal("RDMA_ENV", {"DUT endpoint bind failed: ", link_status.convert2string()})
     end

@@ -31,7 +31,9 @@ class rdma_dut_frame extends uvm_object;
   function void set_frame(int unsigned from_port, byte unsigned from_bytes[$]);
     port = from_port;
     close_marker = 1'b0;
-    bytes = from_bytes;
+    bytes.delete();
+    foreach (from_bytes[i])
+      bytes.push_back(from_bytes[i]);
   endfunction
 endclass
 
@@ -102,7 +104,7 @@ class rdma_memory_frame_endpoint extends rdma_dut_frame_endpoint;
 
   // 功能：停止 memory endpoint，并放入关闭标记唤醒正在 poll 的接收线程。
   // 输入/输出及副作用：更新生命周期并向 from_dut 追加一个 close marker；重复 stop 不重复入队。
-  // 失败/边界：已有 frame 仍按 FIFO 先交付；关闭标记被取出后 poll 返回 INVALID_STATE。
+  // 失败/边界：停止后不再保证已排队 frame 被消费；关闭标记被取出后 poll 返回 INVALID_STATE。
   virtual function rdma_status stop();
     rdma_dut_frame marker;
     rdma_status status;
@@ -112,7 +114,7 @@ class rdma_memory_frame_endpoint extends rdma_dut_frame_endpoint;
     status = super.stop();
     marker = rdma_dut_frame::type_id::create("endpoint_close");
     marker.close_marker = 1'b1;
-    from_dut.put(marker);
+    void'(from_dut.try_put(marker));
     return status;
   endfunction
 
@@ -160,7 +162,8 @@ class rdma_memory_frame_endpoint extends rdma_dut_frame_endpoint;
       status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "memory endpoint port mismatch");
       return;
     end
-    frame = item.bytes;
+    foreach (item.bytes[i])
+      frame.push_back(item.bytes[i]);
     status = rdma_status::success();
   endtask
 
@@ -176,7 +179,8 @@ class rdma_memory_frame_endpoint extends rdma_dut_frame_endpoint;
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "cannot inject an empty Ethernet frame");
     item = rdma_dut_frame::type_id::create("from_dut_frame");
     item.set_frame(port, frame);
-    from_dut.put(item);
+    if (!from_dut.try_put(item))
+      return rdma_status::make(RDMA_SC_RESOURCE_BUSY, "memory endpoint RX mailbox is unavailable");
     return rdma_status::success();
   endfunction
 
@@ -189,7 +193,8 @@ class rdma_memory_frame_endpoint extends rdma_dut_frame_endpoint;
     frame.delete();
     if (!to_dut.try_get(item) || item == null || item.close_marker || item.port != port)
       return 1'b0;
-    frame = item.bytes;
+    foreach (item.bytes[i])
+      frame.push_back(item.bytes[i]);
     return 1'b1;
   endfunction
 endclass
@@ -246,13 +251,42 @@ class rdma_dut_link extends rdma_link;
                                "cannot bind snapshot while DUT link is running");
     if (value == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT link snapshot is null");
+    if (snapshot == value)
+      return rdma_status::success();
     status = value.validate();
     if (!status.ok())
       return status;
     if (snapshot != null && snapshot != value)
       return rdma_status::make(RDMA_SC_RESOURCE_BUSY, "DUT link snapshot is already bound");
     snapshot = value;
+    foreach (value.faults[i])
+      install_snapshot_fault(value.faults[i]);
     return rdma_status::success();
+  endfunction
+
+  // 功能：把冻结 fault snapshot 投影为基类可执行的链路故障规则。
+  // 输入/输出及副作用：新增一条 rdma_link_fault 到 faults；不修改 snapshot 或 packet。
+  // 失败/边界：禁用规则跳过；REORDER/坏 VLAN/FWD/ICRC 映射为现有 delay/corrupt 能力，无法表达的
+  //   工作 opcode 不过滤而保留 function/计数条件，避免把网络 opcode 数值误当成 WR opcode。
+  protected function void install_snapshot_fault(rdma_fault_snapshot value);
+    rdma_link_fault rule;
+
+    if (value == null || !value.enabled)
+      return;
+    rule = rdma_link_fault::type_id::create($sformatf("snapshot_fault_%0d", value.index));
+    rule.src = value.function_index == '1 ? -1 : int'(value.function_index);
+    rule.opcode = -1;
+    rule.skip = value.skip;
+    rule.count = value.count;
+    rule.delay = value.delay;
+    case (value.kind)
+      RDMA_FLOW_FAULT_DROP:      rule.kind = RDMA_FAULT_DROP;
+      RDMA_FLOW_FAULT_DUPLICATE: rule.kind = RDMA_FAULT_DUP;
+      RDMA_FLOW_FAULT_DELAY,
+      RDMA_FLOW_FAULT_REORDER:   rule.kind = RDMA_FAULT_DELAY;
+      default:                   rule.kind = RDMA_FAULT_CORRUPT;
+    endcase
+    faults.push_back(rule);
   endfunction
 
   // 功能：绑定外部 endpoint、端口和 DUT MAC，并校验与已 attach Function 的 MAC 不冲突。
@@ -316,7 +350,7 @@ class rdma_dut_link extends rdma_link;
   // 功能：停止接收循环并调用 endpoint.stop，保证 final/reset 路径幂等。
   // 输入/输出及副作用：清除 running，唤醒并关闭 endpoint；不释放外部 endpoint 所有权。
   // 失败/边界：未绑定 endpoint 只清运行标志；重复 stop 不重复产生错误，外部 endpoint 自行处理关闭。
-  function void stop();
+  function void shutdown();
     rdma_status status;
 
     running = 1'b0;
@@ -335,17 +369,17 @@ class rdma_dut_link extends rdma_link;
   endfunction
 
   // 功能：UVM final 阶段关闭外部接收线程，避免 mailbox poll 跨越仿真结束。
-  // 输入/输出及副作用：调用 stop；phase 仅用于生命周期定位，不修改 phase objection。
+  // 输入/输出及副作用：调用 shutdown；phase 仅用于生命周期定位，不修改 phase objection。
   // 失败/边界：停止必须支持重复调用；线程无法被外部 endpoint 唤醒时由其实现负责返回关闭状态。
   virtual function void final_phase(uvm_phase phase);
-    stop();
+    shutdown();
   endfunction
 
   // 功能：报告 endpoint、decode、frame 发送和故障计数，并复用基类故障规则检查。
   // 输入/输出及副作用：phase 不修改；非零 endpoint/decode 错误产生 UVM_ERROR，随后检查 base faults。
   // 失败/边界：未关闭 receiver_active、未完成 fault 规则或接收线程残留均报告诊断但不伪造成功。
   virtual function void report_phase(uvm_phase phase);
-    stop();
+    shutdown();
     if (receiver_active)
       `uvm_info("RDMA_DUT_LINK", "DUT link receiver thread is draining after stop", UVM_LOW)
     if (endpoint_errors != 0)
@@ -381,7 +415,11 @@ class rdma_dut_link extends rdma_link;
       fault_drops++;
       return;
     end
-    status = codec.encode(pkt, frame);
+    if (snapshot != null)
+      status = codec.encode_snapshot(pkt, snapshot.qp, snapshot.qpc, snapshot.message,
+                                     snapshot.netpacket, frame);
+    else
+      status = codec.encode(pkt, frame);
     if (!status.ok()) begin
       endpoint_errors++;
       `uvm_error("RDMA_DUT_LINK", {"DUT TX encode failed: ", status.convert2string()})

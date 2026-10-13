@@ -24,6 +24,10 @@ package rdma_netpkt_pkg;
     bit [47:0] dst_mac;
     bit [31:0] src_ip;
     bit [31:0] dst_ip;
+    bit [15:0] udp_src_port;
+    bit [15:0] udp_dst_port;
+    bit vlan_enable;
+    bit [11:0] vlan_id;
 
     // 功能：构造使用固定 loopback MAC/IPv4 端点的 RoCEv2 帧 codec。
     // 输入/输出及副作用：name 成为 UVM 名；只初始化四个地址值，不持有 packet 或帧对象。
@@ -34,6 +38,10 @@ package rdma_netpkt_pkg;
       dst_mac = 48'h0002_0000_0002;
       src_ip = 32'h0a00_0001;
       dst_ip = 32'h0a00_0002;
+      udp_src_port = 16'd4791;
+      udp_dst_port = 16'd4791;
+      vlan_enable = 1'b0;
+      vlan_id = '0;
     endfunction
 
     // 功能：把 rdma_packet 编码为完整 Ethernet 帧（不足 64B 补零）。
@@ -52,9 +60,11 @@ package rdma_netpkt_pkg;
       if (!status.ok())
         return status;
       net_value = new();
-      if (!net_value.add_layer(eth_header::create(dst_mac, src_mac, ETHERTYPE_IPV4)) ||
+      if (!net_value.add_layer(eth_header::create(dst_mac, src_mac,
+                                                  vlan_enable ? ETHERTYPE_VLAN : ETHERTYPE_IPV4)) ||
+          (vlan_enable && !net_value.add_layer(vlan_header::create(vlan_id))) ||
           !net_value.add_layer(ipv4_header::create(src_ip, dst_ip, IP_PROTO_UDP, 64)) ||
-          !net_value.add_layer(udp_header::create(16'd4791, 16'd4791)) ||
+          !net_value.add_layer(udp_header::create(udp_src_port, udp_dst_port)) ||
           !net_value.add_layer(roce))
         return rdma_status::make(RDMA_SC_CODEC_ERROR, "failed to add RoCEv2 layers");
       header_bytes = 0;
@@ -300,6 +310,14 @@ package rdma_netpkt_pkg;
         packet.payload = message.payload;
       if (netpacket.payload.size() != 0)
         packet.payload = netpacket.payload;
+      if (netpacket.business_header.size() != 0) begin
+        byte unsigned business_payload[$];
+        foreach (netpacket.business_header[i])
+          business_payload.push_back(netpacket.business_header[i]);
+        foreach (packet.payload[i])
+          business_payload.push_back(packet.payload[i]);
+        packet.payload = business_payload;
+      end
       if (message.opcode == RDMA_WR_SEND_WITH_IMM || message.opcode == RDMA_WR_WRITE_WITH_IMM)
         packet.imm = message.imm;
       if (message.opcode == RDMA_WR_ATOMIC_CMP_SWAP ||
@@ -319,6 +337,10 @@ package rdma_netpkt_pkg;
           qpc.dmac != netpacket.dmac)
         return rdma_status::make(
           RDMA_SC_INVALID_ARGUMENT, "QPC DMAC conflicts with netpacket DMAC");
+      if (qpc.vlan_mode == RDMA_FIELD_FIXED && netpacket.vlan_mode == RDMA_FIELD_FIXED &&
+          qpc.vlan[11:0] != netpacket.vlan[11:0])
+        return rdma_status::make(
+          RDMA_SC_INVALID_ARGUMENT, "QPC VLAN conflicts with netpacket VLAN");
       // encode() 从 header_bytes 读取线上扩展头；先把 message 的结构化字段序列化，避免沿用
       // 调用方 packet 副本中的陈旧头字节。netpacket.business_header 仅是外层声明性字段，不能
       // 覆盖 RETH/Imm/AtomicETH 等 QP 语义头。
@@ -377,12 +399,32 @@ package rdma_netpkt_pkg;
         dst_mac = netpacket.dmac;
       else if (qpc.dmac_mode == RDMA_FIELD_FIXED && qpc.dmac != 0)
         dst_mac = qpc.dmac;
+      src_mac = 48'h0002_0000_0001;
+      dst_mac = 48'h0002_0000_0002;
+      src_ip = 32'h0a00_0001;
+      dst_ip = 32'h0a00_0002;
+      udp_src_port = 16'd4791;
+      udp_dst_port = 16'd4791;
+      vlan_enable = 1'b0;
+      vlan_id = '0;
       if (netpacket.smac_mode == RDMA_FIELD_FIXED && netpacket.smac != 0)
         src_mac = netpacket.smac;
       if (netpacket.source_ip_mode == RDMA_FIELD_FIXED && netpacket.source_ip != 0)
         src_ip = netpacket.source_ip;
       if (netpacket.destination_ip_mode == RDMA_FIELD_FIXED && netpacket.destination_ip != 0)
         dst_ip = netpacket.destination_ip;
+      if (netpacket.udp_source_port_mode == RDMA_FIELD_FIXED && netpacket.udp_source_port != 0)
+        udp_src_port = netpacket.udp_source_port;
+      if (netpacket.udp_destination_port_mode == RDMA_FIELD_FIXED && netpacket.udp_destination_port != 0)
+        udp_dst_port = netpacket.udp_destination_port;
+      if (netpacket.vlan_mode == RDMA_FIELD_FIXED) begin
+        vlan_enable = 1'b1;
+        vlan_id = netpacket.vlan[11:0];
+      end
+      else if (qpc.vlan_mode == RDMA_FIELD_FIXED) begin
+        vlan_enable = 1'b1;
+        vlan_id = qpc.vlan[11:0];
+      end
     endfunction
 
     // 功能：BTH 在帧中的偏移与有效帧终点（按 IPv4 total_length/UDP length 去掉以太网补齐）。
@@ -394,9 +436,11 @@ package rdma_netpkt_pkg;
       udp_header udp;
       int unsigned offset;
       int unsigned udp_offset;
+      int unsigned ip_offset;
 
       rdma_offset = 0;
       udp_offset = 0;
+      ip_offset = 0;
       offset = 0;
       frame_end = net_value.raw_data.size();
       foreach (net_value.layer_stack[i]) begin
@@ -404,11 +448,13 @@ package rdma_netpkt_pkg;
           rdma_offset = offset;
         if (net_value.layer_stack[i].proto_type == PROTO_UDP)
           udp_offset = offset;
+        if (net_value.layer_stack[i].proto_type == PROTO_IPV4)
+          ip_offset = offset;
         offset += net_value.layer_stack[i].get_header_length();
       end
       ip4 = net_value.get_ipv4();
-      if (ip4 != null && ip4.total_length != 0 && 14 + ip4.total_length < frame_end)
-        frame_end = 14 + ip4.total_length;
+      if (ip4 != null && ip4.total_length != 0 && ip_offset + ip4.total_length < frame_end)
+        frame_end = ip_offset + ip4.total_length;
       udp = net_value.get_udp();
       if (udp != null && udp.length >= 8 && udp_offset + udp.length < frame_end)
         frame_end = udp_offset + udp.length;

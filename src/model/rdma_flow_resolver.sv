@@ -378,6 +378,15 @@ class rdma_config_resolver;
 
     link = rdma_dut_link_snapshot::type_id::create("dut_link_snapshot");
     link.source_id = source_id; link.reset_epoch = epoch;
+    link.message = config.messages.size() != 0 ? config.messages[0] : null;
+    if (link.message != null) begin
+      link.qp = qp_for_message(config, link.message.qp_index);
+      foreach (config.qpcs[i])
+        if (config.qpcs[i].qp_index == link.message.qp_index)
+          link.qpc = config.qpcs[i];
+      if (link.qpc == null && config.qpcs.size() != 0)
+        link.qpc = config.qpcs[0];
+    end
     link.endpoint = config.endpoints[0];
     link.netpacket = config.netpackets[0];
     foreach (config.faults[i]) link.faults.push_back(config.faults[i]);
