@@ -263,6 +263,16 @@ class rdma_config_resolver;
       if (plan.qpcs[i] == null) begin config = null; return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null QPC profile"); end
       qpc = rdma_qpc_snapshot::type_id::create($sformatf("qpc_snapshot_%0d", i));
       copy_qpc(plan.qpcs[i], qpc); stamp(plan.qpcs[i], qpc, source_id, epoch);
+      if (qpc.qp_index >= config.tx_qps.size() + config.rx_qps.size()) begin
+        config = null;
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "QPC QP index is out of range");
+      end
+      if (qpc.qp_h == 0)
+        qpc.qp_h = qp_for_message(config, qpc.qp_index).qp_h;
+      if (qpc.send_cqn == 0 && qpc.send_cq_ref_mode == RDMA_FIELD_AUTO)
+        qpc.send_cqn = qpc.qp_index;
+      if (qpc.recv_cqn == 0 && qpc.recv_cq_ref_mode == RDMA_FIELD_AUTO)
+        qpc.recv_cqn = qpc.qp_index;
       qpc.qpc_shadow = qpc.qpc_shadow == 0 ? 64'h4000 + i : qpc.qpc_shadow;
       qpc.sq_backing = qpc.sq_backing == 0 ? 64'h5000 + i : qpc.sq_backing;
       qpc.rq_backing = qpc.rq_backing == 0 ? 64'h6000 + i : qpc.rq_backing;

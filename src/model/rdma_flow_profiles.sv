@@ -349,7 +349,8 @@ class rdma_hmc_profile extends rdma_flow_profile_base;
 
   // 功能：校验 HMC 页/PBL/SD/VF 参数组合。
   // 输入/输出及副作用：只读；返回 status。
-  // 失败/边界：页大小或 PBA 对齐非 2 的幂、SD VLD 为 0、PBL INVALID 或零 PBA 均拒绝。
+  // 失败/边界：页大小或 PBA 对齐非 2 的幂、PBL INVALID 或非法策略均拒绝；sd_vld=0
+  //   是合法的“该 SD 项无效”配置，是否允许由上层测试组合决定。
   virtual function rdma_status validate();
     rdma_status s;
     s = super.validate();
@@ -361,8 +362,8 @@ class rdma_hmc_profile extends rdma_flow_profile_base;
     if (page_size == 0 || pba_alignment == 0 || (page_size & (page_size - 1)) != 0 ||
         (pba_alignment & (pba_alignment - 1)) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "HMC page/alignment must be powers of two");
-    if (pbl_mode == RDMA_FLOW_PBL_INVALID || !sd_vld)
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "HMC PBL or SD is invalid");
+    if (pbl_mode == RDMA_FLOW_PBL_INVALID)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "HMC PBL mode is invalid");
     if (hmc_pba != 0 && (hmc_pba % pba_alignment) != 0)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "HMC PBA is not aligned");
     return rdma_status::make(RDMA_SC_OK, "");
