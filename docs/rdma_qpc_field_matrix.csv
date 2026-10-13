@@ -1,0 +1,109 @@
+﻿序号,字段,字节偏移,字节范围,bit范围,宽度,生效类型,配置所有权,使用阶段,中文描述,重叠组,重叠说明,源码
+1,RDMA_QPC_TVER,0,0-7,63:62,2,公共,硬件/环境,QPC_CREATE,QPC 镜像格式版本。,,,src/codec/rdma/rdma_defs.svh:334
+2,RDMA_QPC_MIG,0,0-7,61:61,1,公共,测试参数,QPC_CREATE/MODIFY,是否允许路径迁移。,,,src/codec/rdma/rdma_defs.svh:335
+3,RDMA_QPC_SERVICE_TYPE,0,0-7,60:58,3,公共,测试参数,QPC_CREATE,QP 服务类型，决定 RC/UD/URC 字段复用。,,,src/codec/rdma/rdma_defs.svh:336
+4,RDMA_QPC_HOST_ID,0,0-7,54:52,3,公共,平台自动,QPC_CREATE,所属 Host 标识，由 topology/dpu_common 提供。,,,src/codec/rdma/rdma_defs.svh:337
+5,RDMA_QPC_VF_ID,0,0-7,51:40,12,公共,平台自动/负向可配,QPC_CREATE,所属 VF 标识；错误 VF 用于权限/地址负向测试。,,,src/codec/rdma/rdma_defs.svh:338
+6,RDMA_QPC_ICOS,0,0-7,39:37,3,公共,测试参数,QPC_CREATE,内部服务或调度类别。,,,src/codec/rdma/rdma_defs.svh:339
+7,RDMA_QPC_QPN,0,0-7,36:16,21,公共,环境自动,QPC_CREATE,本地 QP 编号；通常由设备/资源 resolver 分配。,,,src/codec/rdma/rdma_defs.svh:340
+8,RDMA_QPC_STAT_IDX,0,0-7,15:8,8,公共,环境自动,QPC_CREATE,统计索引，通常与 QP 资源自动关联。,,,src/codec/rdma/rdma_defs.svh:341
+9,RDMA_QPC_UD_QKEY_H,0,0-7,7:0,8,UD,测试参数,QPC_CREATE/MODIFY,UD Q_Key 高 8 位；与 RC/URC 的同位段复用。,W000_O09,部分重叠：UD 的 QKEY[31:24] 使用 qword0[7:0]；RC 的 ORQ_PBA 高段只使用 qword0[3:0]，URC 的 RSQ_PBA 高段同样只使用 qword0[3:0]，qword0[7:4] 不属于这两个 PBA 字段。 复用字段：RDMA_QPC_UD_QKEY_H；RDMA_QPC_URC_RSQ_PBA_H；RDMA_QPC_RC_ORQ_PBA_H,src/codec/rdma/rdma_defs.svh:342
+10,RDMA_QPC_URC_RSQ_PBA_H,0,0-7,3:0,4,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RSQ_PBA_H；具体语义取决于 service type 和复用布局。,W000_O09,部分重叠：UD 的 QKEY[31:24] 使用 qword0[7:0]；RC 的 ORQ_PBA 高段只使用 qword0[3:0]，URC 的 RSQ_PBA 高段同样只使用 qword0[3:0]，qword0[7:4] 不属于这两个 PBA 字段。 复用字段：RDMA_QPC_UD_QKEY_H；RDMA_QPC_URC_RSQ_PBA_H；RDMA_QPC_RC_ORQ_PBA_H,src/codec/rdma/rdma_defs.svh:344
+11,RDMA_QPC_RC_ORQ_PBA_H,0,0-7,3:0,4,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_ORQ_PBA_H；具体语义取决于 service type 和复用布局。,W000_O09,部分重叠：UD 的 QKEY[31:24] 使用 qword0[7:0]；RC 的 ORQ_PBA 高段只使用 qword0[3:0]，URC 的 RSQ_PBA 高段同样只使用 qword0[3:0]，qword0[7:4] 不属于这两个 PBA 字段。 复用字段：RDMA_QPC_UD_QKEY_H；RDMA_QPC_URC_RSQ_PBA_H；RDMA_QPC_RC_ORQ_PBA_H,src/codec/rdma/rdma_defs.svh:423
+12,RDMA_QPC_UD_QKEY_L,8,8-15,63:40,24,UD,测试参数,QPC_CREATE/MODIFY,UD Q_Key 低 24 位；与 RC/URC 的同位段复用。,W008_O01,部分重叠：UD 的 QKEY[23:0] 使用 qword8[63:40]；RC 的 ORQ_PBA、URC 的 RSQ_PBA 使用 qword8[63:16]，因此 qword8[63:40] 是重叠区，qword8[39:16] 只属于 PBA。 复用字段：RDMA_QPC_UD_QKEY_L；RDMA_QPC_URC_RSQ_PBA_L；RDMA_QPC_RC_ORQ_PBA_L,src/codec/rdma/rdma_defs.svh:343
+13,RDMA_QPC_URC_RSQ_PBA_L,8,8-15,63:16,48,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RSQ_PBA_L；具体语义取决于 service type 和复用布局。,W008_O01,部分重叠：UD 的 QKEY[23:0] 使用 qword8[63:40]；RC 的 ORQ_PBA、URC 的 RSQ_PBA 使用 qword8[63:16]，因此 qword8[63:40] 是重叠区，qword8[39:16] 只属于 PBA。 复用字段：RDMA_QPC_UD_QKEY_L；RDMA_QPC_URC_RSQ_PBA_L；RDMA_QPC_RC_ORQ_PBA_L,src/codec/rdma/rdma_defs.svh:345
+14,RDMA_QPC_RC_ORQ_PBA_L,8,8-15,63:16,48,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_ORQ_PBA_L；具体语义取决于 service type 和复用布局。,W008_O01,部分重叠：UD 的 QKEY[23:0] 使用 qword8[63:40]；RC 的 ORQ_PBA、URC 的 RSQ_PBA 使用 qword8[63:16]，因此 qword8[63:40] 是重叠区，qword8[39:16] 只属于 PBA。 复用字段：RDMA_QPC_UD_QKEY_L；RDMA_QPC_URC_RSQ_PBA_L；RDMA_QPC_RC_ORQ_PBA_L,src/codec/rdma/rdma_defs.svh:424
+15,RDMA_QPC_PKEY,8,8-15,15:0,16,RC/UD/URC,测试参数,QPC_CREATE/MODIFY,分区键，用于端到端分区/权限匹配。,,,src/codec/rdma/rdma_defs.svh:346
+16,RDMA_QPC_SHADOW_PBA,16,16-23,63:9,55,公共,环境自动,QPC_CREATE,QP runtime shadow 的物理基址。,,,src/codec/rdma/rdma_defs.svh:347
+17,RDMA_QPC_TX_ENDIAN_SWAP,16,16-23,6:6,1,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 TX_ENDIAN_SWAP；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:348
+18,RDMA_QPC_RX_ENDIAN_SWAP,16,16-23,5:5,1,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 RX_ENDIAN_SWAP；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:349
+19,RDMA_QPC_SQ_CE_EN,16,16-23,4:4,1,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 SQ_CE_EN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:350
+20,RDMA_QPC_RA_FENCE,16,16-23,3:3,1,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 RA_FENCE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:351
+21,RDMA_QPC_AA_FENCE,16,16-23,2:2,1,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 AA_FENCE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:352
+22,RDMA_QPC_FC_EN,16,16-23,1:1,1,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 FC_EN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:353
+23,RDMA_QPC_QP1,16,16-23,0:0,1,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 QP1；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:425
+24,RDMA_QPC_CC_TYPE,24,24-31,63:62,2,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 CC_TYPE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:354
+25,RDMA_QPC_URC_RSQ_SIZE,24,24-31,61:59,3,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RSQ_SIZE；具体语义取决于 service type 和复用布局。,W024_O02,URC：该 bit 区间表示 RSQ_SIZE；RC：同一 bit 区间表示 ORQ_SIZE。 复用字段：RDMA_QPC_URC_RSQ_SIZE；RDMA_QPC_RC_ORQ_SIZE,src/codec/rdma/rdma_defs.svh:355
+26,RDMA_QPC_RC_ORQ_SIZE,24,24-31,61:59,3,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_ORQ_SIZE；具体语义取决于 service type 和复用布局。,W024_O02,URC：该 bit 区间表示 RSQ_SIZE；RC：同一 bit 区间表示 ORQ_SIZE。 复用字段：RDMA_QPC_URC_RSQ_SIZE；RDMA_QPC_RC_ORQ_SIZE,src/codec/rdma/rdma_defs.svh:426
+27,RDMA_QPC_QP_ST,24,24-31,58:56,3,公共,状态机/driver,QPC_MODIFY,QP 状态：RESET、INIT、RTR、RTS、SQD、ERR 等。,,,src/codec/rdma/rdma_defs.svh:356
+28,RDMA_QPC_RQ_CQE_MODE,24,24-31,55:54,2,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 RQ_CQE_MODE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:427
+29,RDMA_QPC_SQ_CQE_MODE,24,24-31,53:52,2,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 SQ_CQE_MODE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:428
+30,RDMA_QPC_PMTU,24,24-31,50:48,3,RC/UD/URC,测试参数,INIT→RTR,路径 MTU 编码，影响报文分段。,,,src/codec/rdma/rdma_defs.svh:357
+31,RDMA_QPC_RNR_RETRY_TH,24,24-31,47:45,3,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 RNR_RETRY_TH；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:358
+32,RDMA_QPC_LOCAL_RNR_CODE,24,24-31,44:40,5,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 LOCAL_RNR_CODE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:429
+33,RDMA_QPC_QP_SN,24,24-31,39:32,8,公共,环境自动,QPC_CREATE,QP sequence 编号，不等同于线上 PSN。,,,src/codec/rdma/rdma_defs.svh:359
+34,RDMA_QPC_RC_SRFQ,24,24-31,31:31,1,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_SRFQ；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:360
+35,RDMA_QPC_RC_SRFQN,24,24-31,30:16,15,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_SRFQN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:361
+36,RDMA_QPC_PD_IDX,24,24-31,15:0,16,公共,资源自动,QPC_CREATE,所属 PD 索引；必须与 MR/CQ 关联一致。,,,src/codec/rdma/rdma_defs.svh:362
+37,RDMA_QPC_URC_RDSQ_PBA,32,32-39,63:12,52,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RDSQ_PBA；具体语义取决于 service type 和复用布局。,W032_O01,URC：该 bit 区间表示 RDSQ_PBA；RC/UD：同一 bit 区间表示 EIRQ_PBA。 复用字段：RDMA_QPC_URC_RDSQ_PBA；RDMA_QPC_RC_EIRQ_PBA,src/codec/rdma/rdma_defs.svh:364
+38,RDMA_QPC_RC_EIRQ_PBA,32,32-39,63:12,52,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_EIRQ_PBA；具体语义取决于 service type 和复用布局。,W032_O01,URC：该 bit 区间表示 RDSQ_PBA；RC/UD：同一 bit 区间表示 EIRQ_PBA。 复用字段：RDMA_QPC_URC_RDSQ_PBA；RDMA_QPC_RC_EIRQ_PBA,src/codec/rdma/rdma_defs.svh:430
+39,RDMA_QPC_URC_RDSQ_SIZE,32,32-39,10:8,3,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RDSQ_SIZE；具体语义取决于 service type 和复用布局。,W032_O02,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_URC_RDSQ_SIZE；RDMA_QPC_RC_IRQ_SIZE,src/codec/rdma/rdma_defs.svh:365
+40,RDMA_QPC_RC_IRQ_SIZE,32,32-39,10:8,3,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_IRQ_SIZE；具体语义取决于 service type 和复用布局。,W032_O02,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_URC_RDSQ_SIZE；RDMA_QPC_RC_IRQ_SIZE,src/codec/rdma/rdma_defs.svh:431
+41,RDMA_QPC_QP_ACCESS_FLAG,32,32-39,4:0,5,RC/UD/URC,测试参数,QPC_CREATE/MODIFY,本地/远端读写及 atomic 访问权限。,,,src/codec/rdma/rdma_defs.svh:363
+42,RDMA_QPC_UAQ_IRQ_PBA,40,40-47,63:12,52,RC/UD,环境自动,QPC_CREATE,字段 UAQ_IRQ_PBA；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:432
+43,RDMA_QPC_UAQ_SIZE,40,40-47,10:8,3,RC/UD,环境自动,QPC_CREATE,字段 UAQ_SIZE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:433
+44,RDMA_QPC_PSN_RETRY_TH,40,40-47,7:5,3,RC/URC,测试参数,RTR→RTS,PSN 错误或响应缺失时的重试次数。,,,src/codec/rdma/rdma_defs.svh:366
+45,RDMA_QPC_RTO_CODE,40,40-47,4:0,5,RC/URC,测试参数,RTR→RTS,响应超时编码；0 通常表示不启用超时。,,,src/codec/rdma/rdma_defs.svh:367
+46,RDMA_QPC_EIRQ_PBA_EXTRA,48,48-55,63:12,52,RC/UD,环境自动,QPC_CREATE,字段 EIRQ_PBA_EXTRA；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:434
+47,RDMA_QPC_ACK_REQ_TH,48,48-55,7:4,4,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 ACK_REQ_TH；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:435
+48,RDMA_QPC_VLAN,56,56-63,63:63,1,路径,测试参数,QPC_CREATE/MODIFY,VLAN 能力开关；开启后应与 VLAN wire 配置一致。,,,src/codec/rdma/rdma_defs.svh:368
+49,RDMA_QPC_IPV6,56,56-63,62:62,1,路径,测试参数,QPC_CREATE/MODIFY,IPv6 路径能力开关。,,,src/codec/rdma/rdma_defs.svh:369
+50,RDMA_QPC_TUNNEL,56,56-63,61:61,1,路径,测试参数,QPC_CREATE/MODIFY,RDMA 隧道能力开关。,,,src/codec/rdma/rdma_defs.svh:370
+51,RDMA_QPC_LAG,56,56-63,60:60,1,路径,测试参数,QPC_CREATE/MODIFY,是否经 LAG/聚合端口转发。,,,src/codec/rdma/rdma_defs.svh:371
+52,RDMA_QPC_FWD,56,56-63,59:58,2,路径,测试参数,QPC_CREATE/MODIFY,硬件转发方式；保留编码应由 resolver 拒绝。,,,src/codec/rdma/rdma_defs.svh:372
+53,RDMA_QPC_DST_VPORT_ID,56,56-63,54:44,11,路径,测试参数,QPC_CREATE/MODIFY,目标虚拟端口。,,,src/codec/rdma/rdma_defs.svh:373
+54,RDMA_QPC_SRC_ADDR_IDX,56,56-63,43:32,12,路径,资源/测试参数,QPC_CREATE/MODIFY,源地址表索引。,,,src/codec/rdma/rdma_defs.svh:374
+55,RDMA_QPC_SRQ_SN,56,56-63,31:28,4,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 SRQ_SN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:436
+56,RDMA_QPC_DST_PORT,56,56-63,27:24,4,路径,测试参数,QPC_CREATE/MODIFY,目标端口或路径端口编码。,,,src/codec/rdma/rdma_defs.svh:375
+57,RDMA_QPC_DST_QPN,56,56-63,23:0,24,路径,建链/resolver,INIT→RTR,对端 QPN，必须关联 peer 的 local QPN。,,,src/codec/rdma/rdma_defs.svh:376
+58,RDMA_QPC_DMAC,64,64-71,63:16,48,路径,测试参数/resolver,INIT→RTR,目标 MAC；link 路由和 wire 外层目的 MAC 的权威来源。,,,src/codec/rdma/rdma_defs.svh:377
+59,RDMA_QPC_PRI,64,64-71,15:13,3,路径,测试参数,QPC_CREATE/MODIFY,VLAN 优先级 PCP。,,,src/codec/rdma/rdma_defs.svh:378
+60,RDMA_QPC_CFI,64,64-71,12:12,1,路径,测试参数,QPC_CREATE/MODIFY,VLAN CFI/DEI 位。,,,src/codec/rdma/rdma_defs.svh:379
+61,RDMA_QPC_VLAN_ID,64,64-71,11:0,12,路径,测试参数,QPC_CREATE/MODIFY,VLAN ID；VLAN 开关开启时参与一致性检查。,,,src/codec/rdma/rdma_defs.svh:380
+62,RDMA_QPC_SRC_VPORT_ID,72,72-79,62:52,11,路径,测试参数,QPC_CREATE/MODIFY,源虚拟端口。,,,src/codec/rdma/rdma_defs.svh:382
+63,RDMA_QPC_FLOW_LABEL,72,72-79,51:32,20,路径,测试参数,QPC_CREATE/MODIFY,IPv6 flow label。,,,src/codec/rdma/rdma_defs.svh:381
+64,RDMA_QPC_DSCP,72,72-79,31:26,6,路径,测试参数,QPC_CREATE/MODIFY,IP DSCP。,,,src/codec/rdma/rdma_defs.svh:383
+65,RDMA_QPC_ECN,72,72-79,25:24,2,路径,测试参数,QPC_CREATE/MODIFY,IP ECN。,,,src/codec/rdma/rdma_defs.svh:384
+66,RDMA_QPC_HOPLIMIT,72,72-79,23:16,8,路径,测试参数,QPC_CREATE/MODIFY,IPv6 hop limit。,,,src/codec/rdma/rdma_defs.svh:385
+67,RDMA_QPC_CUR_UDP_SPORT,72,72-79,15:0,16,路径,测试参数,QPC_CREATE/MODIFY,当前 UDP 源端口。,,,src/codec/rdma/rdma_defs.svh:386
+68,RDMA_QPC_DEST_IP,80,80-95,127:0,128,路径,测试参数/resolver,INIT→RTR,目标 IP；当前 codec 主要使用 IPv4，字段可容纳 IPv6。,,,src/codec/rdma/rdma_defs.svh:396-397
+69,RDMA_QPC_URC_TX_RBSN,96,96-103,47:24,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_TX_RBSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:389
+70,RDMA_QPC_URC_TX_DBSN,96,96-103,23:0,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_TX_DBSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:390
+71,RDMA_QPC_URC_RX_RBSN,128,128-135,47:24,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RX_RBSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:391
+72,RDMA_QPC_URC_RX_DBSN,128,128-135,23:0,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RX_DBSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:392
+73,RDMA_QPC_RC_TPE_CUR_SQ_PSN,160,160-167,23:0,24,RC,运行时,数据面,RC 当前发送 SQ PSN。,,,src/codec/rdma/rdma_defs.svh:393
+74,RDMA_QPC_RC_LAST_READ_PSN,208,208-215,23:0,24,RC,运行时,数据面,最近一次 RC READ PSN。,,,src/codec/rdma/rdma_defs.svh:394
+75,RDMA_QPC_SQ_PBA,216,216-223,63:12,52,RC/UD/URC,环境自动,QPC_CREATE,发送队列 backing 物理基址。,,,src/codec/rdma/rdma_defs.svh:395
+76,RDMA_QPC_SQ_SIZE,216,216-223,11:8,4,RC/UD/URC,环境自动/测试参数,QPC_CREATE,发送队列深度编码。,,,src/codec/rdma/rdma_defs.svh:396
+77,RDMA_QPC_SQ_OM,216,216-223,7:6,2,RC/UD/URC,环境自动/测试参数,QPC_CREATE,发送队列组织模式。,,,src/codec/rdma/rdma_defs.svh:397
+78,RDMA_QPC_RC_EIRQ_PSN_MAX,224,224-231,47:24,24,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_EIRQ_PSN_MAX；具体语义取决于 service type 和复用布局。,W224_O01,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_RC_EIRQ_PSN_MAX；RDMA_QPC_URC_RX_SRBSN,src/codec/rdma/rdma_defs.svh:398
+79,RDMA_QPC_URC_RX_SRBSN,224,224-231,47:24,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RX_SRBSN；具体语义取决于 service type 和复用布局。,W224_O01,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_RC_EIRQ_PSN_MAX；RDMA_QPC_URC_RX_SRBSN,src/codec/rdma/rdma_defs.svh:400
+80,RDMA_QPC_URC_NXT_RDSQ_FETCH_NUM,224,224-231,21:16,6,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_NXT_RDSQ_FETCH_NUM；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:399
+81,RDMA_QPC_URC_CUR_TX_DPSN,232,232-239,47:24,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_CUR_TX_DPSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:402
+82,RDMA_QPC_EIRQ_CUR_SEND_PSN,232,232-239,23:0,24,RC/UD,环境自动,QPC_CREATE,字段 EIRQ_CUR_SEND_PSN；具体语义取决于 service type 和复用布局。,W232_O02,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_EIRQ_CUR_SEND_PSN；RDMA_QPC_URC_CUR_TX_RPSN,src/codec/rdma/rdma_defs.svh:401
+83,RDMA_QPC_URC_CUR_TX_RPSN,232,232-239,23:0,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_CUR_TX_RPSN；具体语义取决于 service type 和复用布局。,W232_O02,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_EIRQ_CUR_SEND_PSN；RDMA_QPC_URC_CUR_TX_RPSN,src/codec/rdma/rdma_defs.svh:403
+84,RDMA_QPC_EPSN_REQ,288,288-295,39:16,24,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 EPSN_REQ；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:404
+85,RDMA_QPC_URC_RXED_DBSN,296,296-303,23:0,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RXED_DBSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:405
+86,RDMA_QPC_URC_RQ_SE_TH,320,320-327,23:20,4,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_RQ_SE_TH；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:406
+87,RDMA_QPC_URC_SQ_CE_TH,320,320-327,19:16,4,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_SQ_CE_TH；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:407
+88,RDMA_QPC_URC_TX_SRBSN,328,328-335,47:24,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_TX_SRBSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:408
+89,RDMA_QPC_URC_MAX_TX_SRBSN,328,328-335,23:0,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_MAX_TX_SRBSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:409
+90,RDMA_QPC_RC_PSN_MAX_RPE,344,344-351,55:32,24,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_PSN_MAX_RPE；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:410
+91,RDMA_QPC_RC_EPSN_RSP,352,352-359,39:16,24,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_EPSN_RSP；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:411
+92,RDMA_QPC2_RC_EPSN_RSP,376,376-383,55:32,24,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RDMA_QPC2_RC_EPSN_RSP；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:412
+93,RDMA_QPC_URC_CUR_DSQ_PBA_H,384,384-391,39:0,40,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_CUR_DSQ_PBA_H；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:413
+94,RDMA_QPC_URC_CUR_DSQ_PBA_L,392,392-399,63:52,12,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_CUR_DSQ_PBA_L；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:414
+95,RDMA_QPC_URC_NXT_DSQ_PBA,392,392-399,51:0,52,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_NXT_DSQ_PBA；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:415
+96,RDMA_QPC_URC_TPE_RPSN_MAX,400,400-407,63:40,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_TPE_RPSN_MAX；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:416
+97,RDMA_QPC_RC_PSN_MAX_TPE,416,416-423,63:40,24,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_PSN_MAX_TPE；具体语义取决于 service type 和复用布局。,W416_O01,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_RC_PSN_MAX_TPE；RDMA_QPC_URC_TPE_DPSN_MAX,src/codec/rdma/rdma_defs.svh:417
+98,RDMA_QPC_URC_TPE_DPSN_MAX,416,416-423,63:40,24,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_TPE_DPSN_MAX；具体语义取决于 service type 和复用布局。,W416_O01,URC 与 RC/UD 的队列或运行字段复用；以 SERVICE_TYPE 决定解释。 复用字段：RDMA_QPC_RC_PSN_MAX_TPE；RDMA_QPC_URC_TPE_DPSN_MAX,src/codec/rdma/rdma_defs.svh:418
+99,RDMA_QPC_URC_NXT_DSQ_FETCH_NUM,416,416-423,37:32,6,URC,环境自动/运行时,QPC_CREATE/数据面,字段 URC_NXT_DSQ_FETCH_NUM；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:419
+100,RDMA_QPC_RC_RETRY_FPSN,424,424-431,23:0,24,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_RETRY_FPSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:420
+101,RDMA_QPC_RC_RETRY_PSN,432,432-439,23:0,24,RC,环境自动/运行时,QPC_CREATE/数据面,字段 RC_RETRY_PSN；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:421
+102,RDMA_QPC_SQ_CQN,448,448-455,39:20,20,RC/UD/URC,资源自动,QPC_CREATE,发送完成队列编号。,,,src/codec/rdma/rdma_defs.svh:437
+103,RDMA_QPC_RQ_CQN,448,448-455,19:0,20,RC/UD/URC,资源自动,QPC_CREATE,接收完成队列编号。,,,src/codec/rdma/rdma_defs.svh:438
+104,RDMA_QPC_LOAD_RQ_PI_TH,480,480-487,23:16,8,公共/复用,需按服务类型判断,QPC_CREATE/MODIFY 或数据面,字段 LOAD_RQ_PI_TH；具体语义取决于 service type 和复用布局。,,,src/codec/rdma/rdma_defs.svh:439
+105,RDMA_QPC_RQ_PBA,496,496-503,63:12,52,RC/UD/URC,环境自动,QPC_CREATE,接收队列 backing 物理基址。,,,src/codec/rdma/rdma_defs.svh:440
+106,RDMA_QPC_RQ_SIZE,496,496-503,11:8,4,RC/UD/URC,环境自动/测试参数,QPC_CREATE,接收队列深度编码。,,,src/codec/rdma/rdma_defs.svh:441
+107,RDMA_QPC_RQ_OM,496,496-503,7:6,2,RC/UD/URC,环境自动/测试参数,QPC_CREATE,接收队列组织模式。,,,src/codec/rdma/rdma_defs.svh:442
+108,RDMA_QPC_RUNTIME_SHADOW,504,504-511,63:0,64,公共,运行时/readback,数据面/readback,runtime shadow 中的硬件计数、PI 和 wrap 状态。,,,src/codec/rdma/rdma_defs.svh:449-451
