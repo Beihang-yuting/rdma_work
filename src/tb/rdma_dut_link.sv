@@ -275,7 +275,7 @@ class rdma_dut_link extends rdma_link;
       return;
     rule = rdma_link_fault::type_id::create($sformatf("snapshot_fault_%0d", value.index));
     rule.src = value.function_index == '1 ? -1 : int'(value.function_index);
-    rule.opcode = -1;
+    rule.opcode = value.opcode == RDMA_WR_RECV ? -1 : wire_opcode_for_fault(value.opcode);
     rule.skip = value.skip;
     rule.count = value.count;
     rule.delay = value.delay;
@@ -287,6 +287,24 @@ class rdma_dut_link extends rdma_link;
       default:                   rule.kind = RDMA_FAULT_CORRUPT;
     endcase
     faults.push_back(rule);
+  endfunction
+
+  // 功能：把声明性 fault 的 WR opcode 转为链路规则使用的线上 opcode。
+  // 输入/输出及副作用：opcode 为 flow profile 的工作请求枚举；返回 rdma_packet.opcode 对应数值，
+  //   不修改 snapshot 或 link 状态。
+  // 失败/边界：RECV、LOCAL_INVALIDATE、REG_MR、BIND_MW、FLUSH 没有独立出站 RoCE opcode，返回 -1
+  //   表示不按 opcode 过滤；其余当前 codec 支持的 SEND/WRITE/READ/ATOMIC 请求精确过滤。
+  protected static function int wire_opcode_for_fault(rdma_work_opcode_e opcode);
+    case (opcode)
+      RDMA_WR_SEND:             return int'(RDMA_NET_SEND);
+      RDMA_WR_SEND_WITH_IMM:    return int'(RDMA_NET_SEND_WITH_IMM);
+      RDMA_WR_RDMA_WRITE:       return int'(RDMA_NET_RDMA_WRITE);
+      RDMA_WR_WRITE_WITH_IMM:   return int'(RDMA_NET_WRITE_WITH_IMM);
+      RDMA_WR_RDMA_READ:        return int'(RDMA_NET_RDMA_READ_REQUEST);
+      RDMA_WR_ATOMIC_CMP_SWAP:  return int'(RDMA_NET_ATOMIC_CMP_SWAP);
+      RDMA_WR_ATOMIC_FETCH_ADD: return int'(RDMA_NET_ATOMIC_FETCH_ADD);
+      default:                  return -1;
+    endcase
   endfunction
 
   // 功能：绑定外部 endpoint、端口和 DUT MAC，并校验与已 attach Function 的 MAC 不冲突。
@@ -302,7 +320,7 @@ class rdma_dut_link extends rdma_link;
     if (func_of_mac.exists(mac))
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT MAC conflicts with a model Function");
     if (snapshot != null) begin
-      if (snapshot.dut_port != port && snapshot.endpoint.dut_port != 0)
+      if (snapshot.dut_port != port && snapshot.dut_port != 0)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT port conflicts with snapshot");
       if (snapshot.dut_mac != 0 && snapshot.dut_mac != mac)
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT MAC conflicts with snapshot");
@@ -367,6 +385,14 @@ class rdma_dut_link extends rdma_link;
   function bit is_running();
     return running;
   endfunction
+
+  // 功能：等待 endpoint 已完成 start 并进入可发送/接收状态，给 env 在发布 ready 前建立启动屏障。
+  // 输入/输出及副作用：阻塞读取 running，不修改 endpoint、route 或统计；返回表示 link 已运行的时刻。
+  // 失败/边界：若 bind_endpoint 未成功，run_phase 会 fatal，调用者不应在该错误路径单独等待本 task；
+  //   stop 后不会重新置位 running，复位场景需重新创建/绑定 link。
+  task wait_started();
+    wait (running);
+  endtask
 
   // 功能：UVM final 阶段关闭外部接收线程，避免 mailbox poll 跨越仿真结束。
   // 输入/输出及副作用：调用 shutdown；phase 仅用于生命周期定位，不修改 phase objection。
@@ -486,7 +512,10 @@ class rdma_dut_link extends rdma_link;
         break;
       rx_frames_captured++;
       decoded = null;
-      status = codec.decode(frame, decoded);
+      if (snapshot != null)
+        status = codec.decode_snapshot(frame, snapshot.qp, decoded);
+      else
+        status = codec.decode(frame, decoded);
       if (!status.ok() || decoded == null) begin
         decode_errors++;
         `uvm_error("RDMA_DUT_LINK", {"DUT frame decode failed: ", status.convert2string()})

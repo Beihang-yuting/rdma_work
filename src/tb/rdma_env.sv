@@ -172,6 +172,7 @@ class rdma_env extends uvm_env;
   task run_phase(uvm_phase phase);
     rdma_res_func f;
     rdma_status status;
+    rdma_dut_link dut_link;
 
     foreach (sys.nodes[i]) begin
       sys.probe(i, status);
@@ -184,6 +185,8 @@ class rdma_env extends uvm_env;
     sys.start();
     foreach (cfg.plugins[i])
       cfg.plugins[i].start(this);
+    if ($cast(dut_link, link))
+      dut_link.wait_started();
     ready = 1'b1;
   endtask
 
