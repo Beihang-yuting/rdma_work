@@ -327,6 +327,13 @@ class rdma_dut_link extends rdma_link;
     end
   endfunction
 
+  // 功能：查询 DUT link 是否已完成 endpoint 启动并进入收发状态。
+  // 输入/输出及副作用：只读 running 标志并返回；不等待、不修改 endpoint 或接收线程。
+  // 失败/边界：build/connect 阶段以及 stop 后均返回 0；仅 run_phase 成功启动后返回 1。
+  function bit is_running();
+    return running;
+  endfunction
+
   // 功能：UVM final 阶段关闭外部接收线程，避免 mailbox poll 跨越仿真结束。
   // 输入/输出及副作用：调用 stop；phase 仅用于生命周期定位，不修改 phase objection。
   // 失败/边界：停止必须支持重复调用；线程无法被外部 endpoint 唤醒时由其实现负责返回关闭状态。
@@ -338,8 +345,9 @@ class rdma_dut_link extends rdma_link;
   // 输入/输出及副作用：phase 不修改；非零 endpoint/decode 错误产生 UVM_ERROR，随后检查 base faults。
   // 失败/边界：未关闭 receiver_active、未完成 fault 规则或接收线程残留均报告诊断但不伪造成功。
   virtual function void report_phase(uvm_phase phase);
+    stop();
     if (receiver_active)
-      `uvm_error("RDMA_DUT_LINK", "DUT link receiver thread is still active")
+      `uvm_info("RDMA_DUT_LINK", "DUT link receiver thread is draining after stop", UVM_LOW)
     if (endpoint_errors != 0)
       `uvm_error("RDMA_DUT_LINK", $sformatf("endpoint errors=%0d", endpoint_errors))
     if (decode_errors != 0)

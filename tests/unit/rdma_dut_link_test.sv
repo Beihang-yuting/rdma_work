@@ -55,7 +55,8 @@ class rdma_dut_link_test extends uvm_test;
     rdma_packet pkt;
     byte unsigned frame[$];
 
-    #(1ns);
+    while (!link.is_running())
+      #(1ns);
     pkt = make_packet("model_to_dut");
     link.transmit(0, pkt, DUT_MAC);
     if (!endpoint.try_pop_to_dut(DUT_PORT, frame)) begin
@@ -72,7 +73,6 @@ class rdma_dut_link_test extends uvm_test;
   // 失败/边界：编码失败、接收线程未运行或 decode 失败均报告错误；该测试不要求存在模型 Function 路由。
   task test_dut_to_model_observation();
     rdma_packet pkt;
-    rdma_packet decoded;
     rdma_netpkt_codec codec;
     byte unsigned frame[$];
     rdma_status status;
@@ -98,7 +98,6 @@ class rdma_dut_link_test extends uvm_test;
     if (link.rx_frames_captured != 1 || link.decode_errors != 0)
       `uvm_error("DUT_LINK_RX", $sformatf("rx_count=%0d decode_errors=%0d",
                                            link.rx_frames_captured, link.decode_errors))
-    void'(decoded);
   endtask
 
   // 功能：执行模型出站和 DUT 入站两个方向的 endpoint/link 契约测试。
