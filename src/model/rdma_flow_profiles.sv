@@ -738,6 +738,78 @@ class rdma_fault_snapshot extends rdma_fault_profile;
   endfunction
 endclass
 
+// 设计说明：DUT link 的发送配置不能再用单个 message/netpacket 隐含代表整个 flow plan。
+// 每个 route snapshot 把一个 message、它绑定的 QP/QPC 和 wire netpacket 绑成不可分割的
+// 路由单元；link 按报文 QPN 选择路由，避免多 QP 场景误用第一个 QP 的 QPC。
+class rdma_dut_link_route_snapshot extends uvm_object;
+  `rdma_object_utils(rdma_dut_link_route_snapshot)
+
+  int unsigned message_index;
+  bit frozen;
+  rdma_qp_snapshot qp;
+  rdma_qpc_snapshot qpc;
+  rdma_message_snapshot message;
+  rdma_netpacket_snapshot netpacket;
+
+  // 功能：构造尚未冻结的单 message DUT 路由快照，所有子对象由 resolver 后续绑定。
+  // 输入/输出及副作用：初始化索引、冻结状态和子对象引用；不复制或取得资源所有权。
+  // 失败/边界：缺少任一 QP/QPC/message/netpacket 的路由不能冻结，也不能交给 DUT link。
+  function new(string name = "rdma_dut_link_route_snapshot");
+    super.new(name);
+    message_index = 0;
+    frozen = 1'b0;
+    qp = null;
+    qpc = null;
+    message = null;
+    netpacket = null;
+  endfunction
+
+  // 功能：冻结 route 所引用的四个子 snapshot，形成 link 可复用的只读绑定单元。
+  // 输入/输出及副作用：调用子对象 freeze 并设置 frozen；不修改字段值或外部资源生命周期。
+  // 失败/边界：任一子对象为空、子对象 freeze 失败或 message/netpacket 索引不一致时返回 0。
+  function bit freeze();
+    if (qp == null || qpc == null || message == null || netpacket == null)
+      return 1'b0;
+    if (netpacket.message_index != message_index)
+      return 1'b0;
+    void'(qp.freeze());
+    void'(qpc.freeze());
+    void'(message.freeze());
+    void'(netpacket.freeze());
+    frozen = 1'b1;
+    return 1'b1;
+  endfunction
+
+  // 功能：检查 route 的子 snapshot 身份、QP 索引和 netpacket message 索引一致。
+  // 输入/输出及副作用：只读 route；返回首个失败状态，不改写任何子对象。
+  // 失败/边界：未冻结、空子对象、QPC 不指向 QP、netpacket 不指向本 message 或任一子校验失败时拒绝。
+  function rdma_status validate();
+    rdma_status status;
+
+    if (!frozen || qp == null || qpc == null || message == null || netpacket == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "DUT route snapshot is incomplete");
+    if (qpc.qp_index != message.qp_index)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT route QPC does not match message QP");
+    if (netpacket.message_index != message_index)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT route netpacket index conflicts");
+    if (qp.source_id == "" || qp.source_id != qpc.source_id ||
+        qp.source_id != message.source_id || qp.source_id != netpacket.source_id)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT route source identity conflicts");
+    if (qp.reset_epoch == 0 || qp.reset_epoch != qpc.reset_epoch ||
+        qp.reset_epoch != message.reset_epoch || qp.reset_epoch != netpacket.reset_epoch)
+      return rdma_status::make(RDMA_SC_STALE_GENERATION, "DUT route reset epoch conflicts");
+    status = qp.validate();
+    if (!status.ok()) return status;
+    status = qpc.validate();
+    if (!status.ok()) return status;
+    status = message.validate();
+    if (!status.ok()) return status;
+    status = netpacket.validate();
+    if (!status.ok()) return status;
+    return rdma_status::success();
+  endfunction
+endclass
+
 // 设计说明：flow plan 是唯一可修改入口，固定 TX/RX QP 数量、配对关系和 message/netpacket/fault
 // 列表；resolver 只读取它并生成独立 snapshot，不把两个方向的 QP 合并。
 class rdma_flow_plan extends rdma_flow_profile_base;
@@ -895,6 +967,8 @@ class rdma_dut_link_snapshot extends uvm_object;
   rdma_message_snapshot message;
   rdma_endpoint_snapshot endpoint;
   rdma_netpacket_snapshot netpacket;
+  // 多 QP/multi-message flow 的完整路由表；上面的单数成员保留给旧调用者作为首路由兼容视图。
+  rdma_dut_link_route_snapshot routes[$];
   rdma_fault_snapshot faults[$];
   bit [47:0] dut_mac;
   int unsigned dut_port;
@@ -912,6 +986,7 @@ class rdma_dut_link_snapshot extends uvm_object;
     message = null;
     endpoint = null;
     netpacket = null;
+    routes.delete();
     faults.delete();
     dut_mac = '0;
     dut_port = '0;
@@ -921,14 +996,27 @@ class rdma_dut_link_snapshot extends uvm_object;
   // 输入/输出及副作用：设置 frozen=1；子对象由本对象引用但不取得外部 endpoint 生命周期。
   // 失败/边界：source/epoch、endpoint/netpacket 缺失或 fault 为 null 时返回 0。
   function bit freeze();
-    if (source_id == "" || reset_epoch == 0 || qp == null || qpc == null || message == null ||
-        endpoint == null || netpacket == null)
+    if (source_id == "" || reset_epoch == 0 || endpoint == null)
+      return 1'b0;
+    // 兼容手工构造 route 表：单数兼容视图缺失时从首路由补齐；空 route 表仍要求旧字段完整。
+    if ((qp == null || qpc == null || message == null || netpacket == null) &&
+        routes.size() != 0) begin
+      qp = routes[0].qp;
+      qpc = routes[0].qpc;
+      message = routes[0].message;
+      netpacket = routes[0].netpacket;
+    end
+    if (qp == null || qpc == null || message == null || netpacket == null)
       return 1'b0;
     void'(qp.freeze());
     void'(qpc.freeze());
     void'(message.freeze());
     void'(endpoint.freeze());
     void'(netpacket.freeze());
+    foreach (routes[i]) begin
+      if (routes[i] == null || !routes[i].freeze())
+        return 1'b0;
+    end
     foreach (faults[i]) begin
       if (faults[i] == null) return 1'b0;
       void'(faults[i].freeze());
@@ -964,6 +1052,12 @@ class rdma_dut_link_snapshot extends uvm_object;
     end
     if (dut_mac != endpoint.dut_mac || dut_port != endpoint.dut_port)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "DUT route does not match endpoint snapshot");
+    foreach (routes[i]) begin
+      if (routes[i] == null)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null DUT route snapshot");
+      s = routes[i].validate();
+      if (!s.ok()) return s;
+    end
     return rdma_status::make(RDMA_SC_OK, "");
   endfunction
 endclass

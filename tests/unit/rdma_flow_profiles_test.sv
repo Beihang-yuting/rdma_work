@@ -150,6 +150,41 @@ class rdma_flow_profiles_test extends uvm_test;
       `uvm_error("FLOW_CODEC_WIRE", "snapshot wire address or VLAN projection mismatch")
   endtask
 
+  // 功能：验证两个 message/QP 生成两个独立 DUT route，且每个 route 保留自己的 QPN/QPC/netpacket。
+  // 输入/输出及副作用：扩展本地 flow plan 并读取 resolver 输出；不启动 endpoint 或修改全局环境。
+  // 失败/边界：route 数量缺失、message_index/QPN 交叉错配或两个 route 共享 snapshot 均报告错误。
+  task test_multi_message_dut_routes();
+    rdma_flow_plan plan;
+    rdma_qp_profile tx_qp;
+    rdma_message_profile msg;
+    rdma_resolved_config config;
+    rdma_dut_link_snapshot link;
+    rdma_status status;
+
+    plan = make_plan();
+    plan.tx_qp_count = 2;
+    tx_qp = rdma_qp_profile::type_id::create("tx_qp1");
+    tx_qp.index = 1;
+    plan.tx_qps.push_back(tx_qp);
+    msg = rdma_message_profile::type_id::create("send_message1");
+    msg.index = 1;
+    msg.qp_index = 1;
+    msg.payload = '{8'h11, 8'h12, 8'h13, 8'h14};
+    msg.length = 4;
+    plan.messages.push_back(msg);
+    status = rdma_flow_resolver::resolve(plan, config, link);
+    expect_code("FLOW_MULTI_ROUTE_RESOLVE", status, RDMA_SC_OK);
+    if (status.code != RDMA_SC_OK || link == null || link.routes.size() != 2)
+      return;
+    if (link.routes[0] == null || link.routes[1] == null ||
+        link.routes[0].message_index != 0 || link.routes[1].message_index != 1 ||
+        link.routes[0].message.qp_index != 0 || link.routes[1].message.qp_index != 1 ||
+        link.routes[0].qp.local_qpn == link.routes[1].qp.local_qpn ||
+        link.routes[0].netpacket.message_index != 0 ||
+        link.routes[1].netpacket.message_index != 1)
+      `uvm_error("FLOW_MULTI_ROUTE_BINDING", "multi-message DUT route table is not one-to-one");
+  endtask
+
   // 功能：运行正向和负向 resolver 场景，并在所有断言完成后释放 objection。
   // 输入/输出及副作用：推动 UVM objection 生命周期；只产生测试报告，不修改全局环境。
   // 失败/边界：任一子 task 的 UVM error 会使测试失败；resolver 返回的非预期状态不会中止后续场景。
@@ -158,6 +193,7 @@ class rdma_flow_profiles_test extends uvm_test;
     test_resolve_independent_qps();
     test_reject_netpacket_qpn_conflict();
     test_snapshot_codec_projection();
+    test_multi_message_dut_routes();
     phase.drop_objection(this);
   endtask
 endclass

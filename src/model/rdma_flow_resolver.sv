@@ -235,6 +235,8 @@ class rdma_config_resolver;
     rdma_fault_snapshot fault;
     string source_id;
     longint unsigned epoch;
+    bit seen_netpacket[int unsigned];
+    rdma_dut_link_route_snapshot route;
 
     config = null;
     link = null;
@@ -327,6 +329,12 @@ class rdma_config_resolver;
     foreach (plan.netpackets[i]) begin
       if (plan.netpackets[i] == null) begin config = null; return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "null netpacket profile"); end
       if (plan.netpackets[i].message_index >= config.messages.size()) begin config = null; return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "netpacket message index is out of range"); end
+      if (seen_netpacket.exists(plan.netpackets[i].message_index)) begin
+        config = null;
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                 "multiple netpackets bind the same message index");
+      end
+      seen_netpacket[plan.netpackets[i].message_index] = 1'b1;
       np = rdma_netpacket_snapshot::type_id::create($sformatf("netpacket_snapshot_%0d", i));
       copy_netpacket(plan.netpackets[i], np); stamp(plan.netpackets[i], np, source_id, epoch);
       status = resolve_netpacket(np, config.messages[plan.netpackets[i].message_index],
@@ -357,8 +365,10 @@ class rdma_config_resolver;
       ep.source_id = source_id; ep.reset_epoch = epoch; void'(ep.freeze());
       config.endpoints.push_back(ep);
     end
-    if (config.netpackets.size() == 0) begin
-      foreach (config.messages[i]) begin
+    // 每个 message 都必须有且只有一个 wire snapshot；不能因第一个 netpacket 已存在而让
+    // 后续 message 隐式复用首个 netpacket。未显式配置的 message 使用 QP 关联的 AUTO netpacket。
+    foreach (config.messages[i]) begin
+      if (!seen_netpacket.exists(i)) begin
         np = rdma_netpacket_snapshot::type_id::create($sformatf("netpacket_snapshot_%0d", i));
         np.message_index = i;
         np.source_id = source_id; np.reset_epoch = epoch;
@@ -366,12 +376,15 @@ class rdma_config_resolver;
         if (!status.ok()) begin config = null; return status; end
         void'(np.freeze());
         config.netpackets.push_back(np);
+        seen_netpacket[i] = 1'b1;
       end
-      if (config.netpackets.size() == 0) begin
-        np = rdma_netpacket_snapshot::type_id::create("netpacket_snapshot_0");
-        np.source_id = source_id; np.reset_epoch = epoch; void'(np.freeze());
-        config.netpackets.push_back(np);
-      end
+    end
+    if (config.netpackets.size() == 0) begin
+      np = rdma_netpacket_snapshot::type_id::create("netpacket_snapshot_0");
+      np.source_id = source_id;
+      np.reset_epoch = epoch;
+      void'(np.freeze());
+      config.netpackets.push_back(np);
     end
     if (!config.freeze()) begin config = null; return rdma_status::make(RDMA_SC_INVALID_STATE, "failed to freeze resolved config"); end
     status = config.validate(); if (!status.ok()) begin config = null; return status; end
@@ -389,6 +402,46 @@ class rdma_config_resolver;
     end
     link.endpoint = config.endpoints[0];
     link.netpacket = config.netpackets[0];
+    // 生成一张与 message 顺序一一对应的 DUT route 表。route 保存非拥有 snapshot 引用，
+    // link 运行时按 packet source_qpn 选择，而不是固定使用 config.messages[0]。
+    foreach (config.messages[i]) begin
+      route = rdma_dut_link_route_snapshot::type_id::create($sformatf("dut_route_%0d", i));
+      route.message_index = i;
+      route.message = config.messages[i];
+      route.qp = qp_for_message(config, route.message.qp_index);
+      route.qpc = null;
+      foreach (config.qpcs[j])
+        if (config.qpcs[j].qp_index == route.message.qp_index)
+          route.qpc = config.qpcs[j];
+      if (route.qpc == null || route.qp == null) begin
+        config = null;
+        link = null;
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                  "message route has no matching QP/QPC snapshot");
+      end
+      route.netpacket = null;
+      foreach (config.netpackets[j])
+        if (config.netpackets[j].message_index == i)
+          route.netpacket = config.netpackets[j];
+      if (route.netpacket == null) begin
+        config = null;
+        link = null;
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                  "message route has no matching netpacket snapshot");
+      end
+      if (!route.freeze()) begin
+        config = null;
+        link = null;
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "failed to freeze DUT route snapshot");
+      end
+      status = route.validate();
+      if (!status.ok()) begin
+        config = null;
+        link = null;
+        return status;
+      end
+      link.routes.push_back(route);
+    end
     foreach (config.faults[i]) link.faults.push_back(config.faults[i]);
     if (!link.freeze()) begin config = null; link = null; return rdma_status::make(RDMA_SC_INVALID_STATE, "failed to freeze DUT link snapshot"); end
     status = link.validate(); if (!status.ok()) begin config = null; link = null; return status; end

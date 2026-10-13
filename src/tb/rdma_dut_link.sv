@@ -421,6 +421,7 @@ class rdma_dut_link extends rdma_link;
   //   按首条命中的 base fault 规则处理，故障计数仍由 rdma_link_fault 管理。
   virtual task transmit(int unsigned src, rdma_packet pkt, bit [47:0] dmac);
     rdma_link_fault fault;
+    rdma_dut_link_route_snapshot route;
     int unsigned dst;
     byte unsigned frame[$];
     rdma_status status;
@@ -441,9 +442,12 @@ class rdma_dut_link extends rdma_link;
       fault_drops++;
       return;
     end
-    if (snapshot != null)
-      status = codec.encode_snapshot(pkt, snapshot.qp, snapshot.qpc, snapshot.message,
-                                     snapshot.netpacket, frame);
+    if (snapshot != null) begin
+      status = select_snapshot_route(pkt, route);
+      if (status.ok())
+        status = codec.encode_snapshot(pkt, route.qp, route.qpc, route.message,
+                                       route.netpacket, frame);
+    end
     else
       status = codec.encode(pkt, frame);
     if (!status.ok()) begin
@@ -463,6 +467,52 @@ class rdma_dut_link extends rdma_link;
     if (fault != null && fault.kind == RDMA_FAULT_DUP)
       send_frame(src, dst, pkt, frame, 0);
   endtask
+
+  // 功能：依据 semantic packet 的 source/destination QPN 选择多 QP DUT 路由。
+  // 输入/输出及副作用：pkt 只读；route 输出已绑定的非拥有 route 引用；不修改 snapshot 或 packet。
+  // 失败/边界：无 route 时回退到兼容的单数 snapshot；多 route 且 QPN 未命中会返回 INVALID_ARGUMENT，
+  //   禁止静默使用首个 QP，避免 QPC/netpacket 与真实报文错配。
+  protected function rdma_status select_snapshot_route(
+    rdma_packet pkt,
+    output rdma_dut_link_route_snapshot route
+  );
+    route = null;
+    if (snapshot == null || pkt == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT snapshot route input is null");
+    if (snapshot.routes.size() == 0) begin
+      route = rdma_dut_link_route_snapshot::type_id::create("compatibility_route");
+      route.message_index = snapshot.message == null ? 0 : snapshot.message.index;
+      route.qp = snapshot.qp;
+      route.qpc = snapshot.qpc;
+      route.message = snapshot.message;
+      route.netpacket = snapshot.netpacket;
+      if (route.qp == null || route.qpc == null || route.message == null || route.netpacket == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "DUT snapshot has no complete route");
+      return rdma_status::success();
+    end
+    if (pkt.source_qpn != 0)
+      foreach (snapshot.routes[i])
+        if (snapshot.routes[i] != null && snapshot.routes[i].qp.local_qpn == pkt.source_qpn) begin
+          route = snapshot.routes[i];
+          return rdma_status::success();
+        end
+    if (pkt.destination_qpn != 0)
+      foreach (snapshot.routes[i])
+        if (snapshot.routes[i] != null &&
+            (snapshot.routes[i].qp.local_qpn == pkt.destination_qpn ||
+             snapshot.routes[i].qp.dest_qpn == pkt.destination_qpn)) begin
+          route = snapshot.routes[i];
+          return rdma_status::success();
+        end
+    if (snapshot.routes.size() == 1) begin
+      route = snapshot.routes[0];
+      if (route == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "DUT snapshot route is null");
+      return rdma_status::success();
+    end
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "packet QPN does not select a unique DUT snapshot route");
+  endfunction
 
   // 功能：按可选延迟向 endpoint 发送单个 frame，成功后发布拥有独立字节副本的 TX 观测。
   // 输入/输出及副作用：调用 endpoint.send_to_dut，更新 tx_frames_sent/endpoint_errors/tx_ap；不修改 frame。
@@ -496,6 +546,7 @@ class rdma_dut_link extends rdma_link;
     rdma_packet decoded;
     rdma_status status;
     rdma_link_obs observation;
+    rdma_dut_link_route_snapshot route;
     int unsigned dst;
 
     receiver_active = 1'b1;
@@ -512,7 +563,9 @@ class rdma_dut_link extends rdma_link;
         break;
       rx_frames_captured++;
       decoded = null;
-      if (snapshot != null)
+      // 单 route 沿用 snapshot-aware 校验；多 route 先通用解码，再按目的 QPN 选择对应路由，
+      // 避免拿首个 QP 去校验其它 QP 的 DUT TX frame。
+      if (snapshot != null && snapshot.routes.size() <= 1)
         status = codec.decode_snapshot(frame, snapshot.qp, decoded);
       else
         status = codec.decode(frame, decoded);
@@ -521,6 +574,14 @@ class rdma_dut_link extends rdma_link;
         `uvm_error("RDMA_DUT_LINK", {"DUT frame decode failed: ", status.convert2string()})
         continue;
       end
+      if (snapshot != null && snapshot.routes.size() > 1) begin
+        status = select_rx_snapshot_route(decoded, route);
+        if (!status.ok()) begin
+          decode_errors++;
+          `uvm_error("RDMA_DUT_LINK", {"DUT RX route selection failed: ", status.convert2string()})
+          continue;
+        end
+      end
       dst = route_dst_from_frame(frame);
       observation = super.observe(RDMA_DUT_LINK_DST, dst, decoded);
       observation.frame = frame;
@@ -528,6 +589,29 @@ class rdma_dut_link extends rdma_link;
     end
     receiver_active = 1'b0;
   endtask
+
+  // 功能：为 DUT TX 解码结果选择目标模型 QP，防止多 QP RX 观测丢失或错误归属。
+  // 输入/输出及副作用：decoded 只读；route 输出非拥有引用；不重写解码报文或 QP snapshot。
+  // 失败/边界：多 route 时 destination_qpn 必须命中模型 QP local/dest QPN；RC/UD 无可路由 QPN 时拒绝，
+  //   单 route 由 receiver_loop 直接接受以兼容旧 DUT frame。
+  protected function rdma_status select_rx_snapshot_route(
+    rdma_packet decoded,
+    output rdma_dut_link_route_snapshot route
+  );
+    route = null;
+    if (decoded == null || snapshot == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT RX route input is null");
+    if (decoded.destination_qpn != 0)
+      foreach (snapshot.routes[i])
+        if (snapshot.routes[i] != null &&
+            (snapshot.routes[i].qp.local_qpn == decoded.destination_qpn ||
+             snapshot.routes[i].qp.dest_qpn == decoded.destination_qpn)) begin
+          route = snapshot.routes[i];
+          return rdma_status::success();
+        end
+    return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                             "DUT RX destination QPN does not match a model route");
+  endfunction
 
   // 功能：从 Ethernet frame 前六字节读取目的 MAC，并映射到已 attach 的模型 Function。
   // 输入/输出及副作用：frame 只读；返回 Function 下标，未知/短帧返回 DUT 哨兵值。
