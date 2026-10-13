@@ -828,13 +828,14 @@ class rdma_resolved_config extends uvm_object;
 
   // 功能：校验顶层发布身份、数量对应关系和每个子 snapshot 的合法性。
   // 输入/输出及副作用：只读；返回 status。
-  // 失败/边界：未冻结、空 source/epoch、TX/RX 数量不等或子项 validate 失败均拒绝。
+  // 失败/边界：未冻结、空 source/epoch、任一方向为空或子项 validate 失败均拒绝；TX/RX
+  //   数量可以不同，配对关系由 flow plan 的 tx_rx_pair 单独约束。
   function rdma_status validate();
     rdma_status s;
     if (source_id == "" || reset_epoch == 0 || !frozen)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "resolved config is not frozen");
-    if (tx_qps.size() == 0 || tx_qps.size() != rx_qps.size())
-      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "resolved TX/RX QP count mismatch");
+    if (tx_qps.size() == 0 || rx_qps.size() == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "resolved TX/RX QP list is empty");
     foreach (tx_qps[i]) begin s = tx_qps[i].validate(); if (!s.ok()) return s; end
     foreach (rx_qps[i]) begin s = rx_qps[i].validate(); if (!s.ok()) return s; end
     foreach (qpcs[i]) begin s = qpcs[i].validate(); if (!s.ok()) return s; end
