@@ -54,7 +54,8 @@ virtual class rdma_dut_frame_endpoint extends uvm_object;
   // 失败/边界：重复启动幂等成功；已停止 endpoint 不允许重新启动，需创建新 endpoint 或由插件复位。
   virtual function rdma_status start();
     if (stopped)
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "DUT frame endpoint cannot restart after stop");
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "DUT frame endpoint cannot restart after stop");
     started = 1'b1;
     return rdma_status::success();
   endfunction
@@ -241,7 +242,8 @@ class rdma_dut_link extends rdma_link;
     rdma_status status;
 
     if (running)
-      return rdma_status::make(RDMA_SC_INVALID_STATE, "cannot bind snapshot while DUT link is running");
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+                               "cannot bind snapshot while DUT link is running");
     if (value == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "DUT link snapshot is null");
     status = value.validate();

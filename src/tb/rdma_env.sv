@@ -52,6 +52,8 @@ class rdma_env extends uvm_env;
   // 失败/边界：缺配置、系统建立失败或链路类型无效时 UVM_FATAL。
   function void build_phase(uvm_phase phase);
     uvm_component c;
+    rdma_dut_link dut_link;
+    rdma_status link_status;
 
     super.build_phase(phase);
     if (!uvm_config_db#(rdma_env_cfg)::get(this, "", "cfg", cfg))
@@ -67,6 +69,18 @@ class rdma_env extends uvm_env;
     c = uvm_factory::get().create_component_by_name(cfg.link_type, get_full_name(), "link", this);
     if (!$cast(link, c))
       `uvm_fatal("RDMA_ENV", {"link_type is not an rdma_link: ", cfg.link_type})
+    if (cfg.link_type == "rdma_dut_link") begin
+      if (!$cast(dut_link, link))
+        `uvm_fatal("RDMA_ENV", "rdma_dut_link factory object did not cast to rdma_dut_link")
+      if (cfg.dut_link_snapshot != null) begin
+        link_status = dut_link.bind_snapshot(cfg.dut_link_snapshot);
+        if (!link_status.ok())
+          `uvm_fatal("RDMA_ENV", {"DUT link snapshot bind failed: ", link_status.convert2string()})
+      end
+      link_status = dut_link.bind_endpoint(cfg.dut_endpoint, cfg.dut_port, cfg.dut_mac);
+      if (!link_status.ok())
+        `uvm_fatal("RDMA_ENV", {"DUT endpoint bind failed: ", link_status.convert2string()})
+    end
     sb = rdma_scoreboard::type_id::create("sb", this);
     if (cfg.checker_enable)
       checker = rdma_proto_checker::type_id::create("checker", this);

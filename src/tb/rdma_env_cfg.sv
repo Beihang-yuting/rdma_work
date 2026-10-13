@@ -7,6 +7,7 @@
 // 生命周期：测试 build_phase 创建，env build_phase 读取。
 
 typedef class rdma_env;
+typedef class rdma_dut_frame_endpoint;
 
 // 一个 Function 的声明（交给 rdma_dpu_system）。
 typedef struct {
@@ -59,6 +60,11 @@ class rdma_env_cfg extends uvm_object;
   int unsigned remote_funcs;
   string link_type;
   rdma_env_plugin plugins[$];
+  // DUT link 外部 endpoint 与 frozen route snapshot；仅 rdma_dut_link 使用，普通 loopback 忽略。
+  rdma_dut_frame_endpoint dut_endpoint;
+  rdma_dut_link_snapshot dut_link_snapshot;
+  int unsigned dut_port;
+  bit [47:0] dut_mac;
   // QP 默认属性（IB timeout 0 为不超时）。
   int unsigned mtu;
   int unsigned timeout;
@@ -81,6 +87,10 @@ class rdma_env_cfg extends uvm_object;
   function new(string name = "rdma_env_cfg");
     super.new(name);
     link_type = "rdma_link";
+    dut_endpoint = null;
+    dut_link_snapshot = null;
+    dut_port = 0;
+    dut_mac = '0;
     mtu = 1024;
     timeout = 14;
     retry = 7;

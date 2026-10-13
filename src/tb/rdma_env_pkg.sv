@@ -26,6 +26,7 @@ package rdma_env_pkg;
   `include "rdma_data_gen.sv"
   `include "rdma_env_items.sv"
   `include "rdma_link.sv"
+  `include "rdma_dut_link.sv"
   `include "rdma_mem_model.sv"
   `include "rdma_expect.sv"
   `include "rdma_ctrl_agent.sv"
