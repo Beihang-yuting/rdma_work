@@ -20,6 +20,9 @@ typedef enum {
   RDMA_CTRL_RECOVER
 } rdma_ctrl_op_e;
 
+// 业务模板在 item 之后定义（它依赖 rdma_verb_op_e），此处前置声明供 CREATE_QP 引用。
+typedef class rdma_biz_cfg;
+
 // 控制面请求：按 op 使用对应字段；driver 回填 res 与 status。
 class rdma_ctrl_item extends uvm_sequence_item;
   `rdma_object_utils(rdma_ctrl_item)
@@ -41,6 +44,8 @@ class rdma_ctrl_item extends uvm_sequence_item;
   rdma_res_cq recv_cq;
   rdma_res_srq srq;
   int unsigned max_sge;
+  // CREATE_QP：业务模板（非空时 QP 链路参数与报文属性取模板，否则取 env 默认）。
+  rdma_biz_cfg biz;
   // CONNECT（qp ↔ peer 双向推到 RTS）/ MODIFY_QP（qp 迁到 state）。
   rdma_res_qp qp;
   rdma_res_qp peer;
@@ -54,8 +59,9 @@ class rdma_ctrl_item extends uvm_sequence_item;
   rdma_res res;
   rdma_status status;
 
-  // 功能：构造默认深度 256、最多 4 SGE、RC 类型且开放本地写与全部远端权限的控制面请求。
-  // 输入/输出及副作用：name 为 UVM 名；资源句柄、scope、res/status 输出保持空或零初值，item 不拥有资源。
+  // 功能：构造默认深度 256、最多 4 SGE、RC 类型且开放本地写与全部远端权限、无业务模板的控制面请求。
+  // 输入/输出及副作用：name 为 UVM 名；资源句柄、业务模板、scope、res/status 输出保持空或零初值，
+  //   item 不拥有资源。
   // 失败/边界：默认 op 为枚举零值 ALLOC_PD；执行其他 op 前 sequence 必须补齐该分支要求的句柄和范围。
   function new(string name = "rdma_ctrl_item");
     super.new(name);
@@ -63,6 +69,7 @@ class rdma_ctrl_item extends uvm_sequence_item;
     max_sge = 4;
     qp_type = RDMA_DRV_QPT_RC;
     rights = rdma_drv_mr::rights_of(1, 1, 1, 1);
+    biz = null;
   endfunction
 
   // 功能：生成包含操作、Function、size 与可选 destroy target 的单行控制请求描述。

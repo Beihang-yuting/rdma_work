@@ -47,9 +47,10 @@ class rdma_env extends uvm_env;
     super.new(name, parent);
   endfunction
 
-  // 功能：取配置（键 "cfg"）→ 插件 pre_build → 建 dpu 系统 → 建组件（链路按 cfg.link_type）→ 插件 build。
-  // 输入/输出及副作用：创建子组件与系统。
-  // 失败/边界：缺配置、系统建立失败或链路类型无效时 UVM_FATAL。
+  // 功能：取配置（键 "cfg"）→ 插件 pre_build → 配置 finalize（解析业务模板继承值、校验、冻结）并打印
+  //   最终生效配置 → 建 dpu 系统 → 建组件（链路按 cfg.link_type）→ 插件 build。
+  // 输入/输出及副作用：创建子组件与系统；以 UVM_LOW 打印生效配置。
+  // 失败/边界：缺配置、配置校验失败、系统建立失败或链路类型无效时 UVM_FATAL。
   function void build_phase(uvm_phase phase);
     uvm_component c;
     rdma_dut_link dut_link;
@@ -62,6 +63,10 @@ class rdma_env extends uvm_env;
       `uvm_fatal("RDMA_ENV", "rdma_env_cfg not set (config_db key \"cfg\")")
     foreach (cfg.plugins[i])
       cfg.plugins[i].pre_build(this);
+    link_status = cfg.finalize();
+    if (!link_status.ok())
+      `uvm_fatal("RDMA_ENV", {"configuration rejected: ", link_status.convert2string()})
+    `uvm_info("RDMA_ENV", cfg.describe(), UVM_LOW)
     if (cfg.flow_plan != null && cfg.resolved_config == null) begin
       link_status = rdma_flow_resolver::resolve(cfg.flow_plan,
                                                 cfg.resolved_config,

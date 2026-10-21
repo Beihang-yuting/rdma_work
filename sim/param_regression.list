@@ -1,0 +1,22 @@
+# 参数化回归清单（scripts/run_local_regress.sh）：<suite> <test> [tag ...] [+plusarg ...]
+# 含特殊字符（{}[]:,）的 plusarg 在本文件中无需加引号：runner 按空白拆分后原样传给 simv。
+
+# 基线：不带参数时与原行为一致。
+env rdma_env_basic_test baseline
+env rdma_env_random_test baseline
+env rdma_env_reliability_test baseline
+
+# 全部内置业务，默认参数。
+env rdma_env_biz_test biz +rdma.biz.write.trf.count=16
+
+# 单业务 + QP 参数：WRITE 业务大 MTU、非零起始 PSN、长度权重分布、部分 unsignaled。
+env rdma_env_biz_test biz,qp +rdma.biz.en=write +rdma.biz.write.qp.mtu=4096 +rdma.biz.write.qp.psn=0xfffff0 +rdma.biz.write.trf.len={[1:256]:/30,[257:4096]:/70} +rdma.biz.write.trf.signaled_pct=50 +rdma.biz.write.trf.count=64
+
+# READ/ATOMIC：内存参数（缓冲、槽、MR 偏移）与 SGE 分布。
+env rdma_env_biz_test biz,mem +rdma.biz.en=read,atomic +rdma.biz.read.mem.buf_bytes=0x40000 +rdma.biz.read.mem.slot_bytes=0x2000 +rdma.biz.read.mem.mr_offset=0x1000 +rdma.biz.read.trf.len=[1:8192] +rdma.biz.read.trf.sge=[1,2,4] +rdma.biz.atomic.trf.w_cas=3 +rdma.biz.atomic.trf.w_faa=1
+
+# SEND/UD：报文属性（VLAN、IP、UDP 源端口）与小 MTU。
+env rdma_env_biz_test biz,pkt +rdma.biz.en=send,ud +rdma.biz.send.pkt.vlan_en=1 +rdma.biz.send.pkt.vlan_id=100 +rdma.biz.send.pkt.src_ip=10.1.0.1 +rdma.biz.send.pkt.dst_ip=10.1.0.2 +rdma.biz.send.pkt.udp_sport=50000 +rdma.biz.ud.qp.mtu=512 +rdma.biz.ud.pkt.vlan_en=1 +rdma.biz.ud.pkt.vlan_id=7
+
+# URC 业务 + 环境级参数（全局 QP 深度与超时由业务继承）。
+env rdma_env_biz_test biz,env +rdma.biz.en=urc,send +rdma.env.qp_depth=64 +rdma.env.timeout=10 +rdma.biz.urc.trf.count=48

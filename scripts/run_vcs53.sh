@@ -40,7 +40,7 @@ sync_repo() {
 
 main() {
   # 功能：校验 suite/test，建立隔离远端目录，同步输入并在登录 shell 中运行指定 Make 目标。
-  # 输入输出及副作用：输入两个命令行参数和五个 allowlisted root 环境变量；通过 SSH/rsync 运行远端仿真并清理目录。
+  # 输入输出及副作用：输入两个命令行参数和 allowlisted 环境变量（*_ROOT、VCS_EXTRA_FLAGS、RDMA_ARCHIVE）；通过 SSH/rsync 运行远端仿真并清理目录。
   # 失败边界：非法参数、远端路径格式、同步/SSH/Make 失败均返回非零；清理失败会提升成功状态。
   if [[ $# -ne 2 ]]; then
   usage
@@ -90,7 +90,8 @@ trap cleanup EXIT
 sync_repo "$repo_root" "$REMOTE_HOST:$remote_dir"
 
 remote_env=()
-for var_name in HOST_MEM_ROOT DPU_COMMON_ROOT PCIE_WORK_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT; do
+for var_name in HOST_MEM_ROOT DPU_COMMON_ROOT PCIE_WORK_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT \
+                AIP_CORE_ROOT VCS_EXTRA_FLAGS RDMA_ARCHIVE; do
   if [[ -v "$var_name" ]]; then
     printf -v quoted_value '%q' "${!var_name}"
     remote_env+=("$var_name=$quoted_value")

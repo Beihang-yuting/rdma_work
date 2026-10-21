@@ -1,20 +1,23 @@
 // 目录：验证组件层 tb/rdma_env_cfg.sv。
 // 层：验证组件。
-// 职责：env 配置：拓扑（dpu_common 的 Host/PF/VF）、链路类型、插件、QP 默认属性、时间参数与
-//   检查开关。测试经 uvm_config_db 把它交给 env（键 "cfg"）。
-// 依赖：rdma_dpu_adapter_pkg（Function 声明）。
-// 所有权：配置对象只持有插件引用。
-// 生命周期：测试 build_phase 创建，env build_phase 读取。
+// 职责：env 配置根：运行模式、拓扑（dpu_common 的 Host/PF/VF 与 Function 角色）、链路类型、插件、
+//   QP 环境默认属性、时间参数、检查开关，以及业务模板 biz（资源与流量参数的唯一配置源）。测试经
+//   uvm_config_db 把它交给 env（键 "cfg"）。
+// 依赖：rdma_dpu_adapter_pkg（Function 声明）、rdma_biz_cfg（业务模板与表达式求值器）。
+// 所有权：配置对象持有插件引用、业务模板与表达式求值器。
+// 生命周期：测试 build_phase 创建并加载参数；env build_phase 在插件 pre_build 之后调用 finalize
+//   解析继承值、校验并冻结，之后各组件只读。
 
 typedef class rdma_env;
 typedef class rdma_dut_frame_endpoint;
 
-// 一个 Function 的声明（交给 rdma_dpu_system）。
+// 一个 Function 的声明（交给 rdma_dpu_system）；role 决定设备由模型还是 RTL 承担。
 typedef struct {
   int unsigned host;
   int unsigned pf;
   dpu_function_kind_e kind;
   int unsigned vf;
+  rdma_func_role_e role;
 } rdma_env_func_t;
 
 // 传输相关扩展：PCIe 承载、rxe 远端等在各自包内实现。
@@ -54,6 +57,8 @@ endclass
 class rdma_env_cfg extends uvm_object;
   `uvm_object_utils(rdma_env_cfg)
 
+  // 运行模式（PEER / RXE / DUT）；rxe 插件在 pre_build 中切换为 RXE。
+  rdma_env_mode_e mode;
   // 拓扑与平台。
   rdma_env_func_t funcs[$];
   // 插件提供的远端 Function 数（如 rxe），下标排在 dpu Function 之后。
@@ -84,12 +89,20 @@ class rdma_env_cfg extends uvm_object;
   bit checker_enable;
   bit cov_enable;
   string deviations[$];
+  // 业务模板（每种业务一个）与分布表达式求值器（适配层可替换为 aip_core 实现）。
+  rdma_biz_cfg biz[$];
+  rdma_value_spec spec;
+  protected bit finalized;
 
-  // 功能：构造默认配置：链路 rdma_link（loopback），PMTU 1024，timeout 14，重试 7，min_rnr 1，深度 256。
-  // 输入/输出及副作用：name 为 UVM 名。
-  // 失败/边界：拓扑须由测试填写。
+  // 功能：构造默认配置：PEER 模式，链路 rdma_link（loopback），PMTU 1024，timeout 14，重试 7，
+  //   min_rnr 1，深度 256；为六种内置业务各建一个默认模板，表达式求值器为最小语法实现。
+  // 输入/输出及副作用：name 为 UVM 名；创建业务模板与求值器对象并由本配置持有。
+  // 失败/边界：拓扑须由测试填写；业务模板只在业务序列中使用，其他序列不读取。
   function new(string name = "rdma_env_cfg");
+    rdma_biz_kind_e k;
+
     super.new(name);
+    mode = RDMA_ENV_MODE_PEER;
     link_type = "rdma_link";
     flow_plan = null;
     resolved_config = null;
@@ -108,20 +121,109 @@ class rdma_env_cfg extends uvm_object;
     response_timeout = 100us;
     checker_enable = 1'b1;
     cov_enable = 1'b1;
+    finalized = 1'b0;
+    spec = rdma_value_spec::type_id::create("value_spec");
+    k = k.first();
+    do begin
+      biz.push_back(rdma_biz_cfg::type_id::create({"biz_", k.name()}));
+      biz[$].set_kind(k);
+      k = k.next();
+    end while (k != k.first());
   endfunction
 
   // 功能：把 host/PF/kind/VF 四元组追加为一个待交给 rdma_dpu_system 的 Function 声明。
   // 输入/输出及副作用：构造值类型 rdma_env_func_t 并保持调用顺序追加到 funcs，不立即修改 dpu_common。
   // 失败/边界：本函数不去重或验证拓扑编号；重复 key、VF/PF kind 与 vf 不一致等由系统 build 拒绝。
   function void add_func(int unsigned host, int unsigned pf = 0,
-                         dpu_function_kind_e kind = DPU_FUNCTION_PF, int unsigned vf = 0);
+                         dpu_function_kind_e kind = DPU_FUNCTION_PF, int unsigned vf = 0,
+                         rdma_func_role_e role = RDMA_FUNC_ROLE_MODEL);
     rdma_env_func_t f;
 
     f.host = host;
     f.pf = pf;
     f.kind = kind;
     f.vf = vf;
+    f.role = role;
     funcs.push_back(f);
+  endfunction
+
+  // 功能：按参数名（send/write/read/atomic/ud/urc）查找业务模板。
+  // 输入/输出及副作用：纯查询，返回模板句柄（仍归本配置所有）。
+  // 失败/边界：名字区分大小写；未知名字返回 null。
+  function rdma_biz_cfg find_biz(string name);
+    foreach (biz[i])
+      if (biz[i].biz_name() == name)
+        return biz[i];
+    return null;
+  endfunction
+
+  // 功能：只启用名单内的业务，其余禁用；空名单表示全部启用。
+  // 输入/输出及副作用：names 为业务参数名列表；修改各模板的 enable。
+  // 失败/边界：名单含未知业务名时 uvm_error 并忽略该名字。
+  function void enable_biz(string names[$]);
+    foreach (biz[i])
+      biz[i].enable = names.size() == 0;
+    foreach (names[i]) begin
+      rdma_biz_cfg b;
+
+      b = find_biz(names[i]);
+      if (b == null)
+        `uvm_error("RDMA_CFG", {"unknown business in rdma.biz.en: ", names[i]})
+      else
+        b.enable = 1'b1;
+    end
+  endfunction
+
+  // 功能：校验模式与拓扑，并让每个业务模板解析继承值（取本配置的 QP 默认属性）、校验、冻结。
+  // 输入/输出及副作用：修改业务模板的继承字段并置 finalized，返回首个错误状态或成功。
+  // 失败/边界：拓扑为空、存在 DUT 角色 Function（V1 未实现 DUT 桥接与 RM）、mode 与链路/远端
+  //   Function 不一致、任一业务模板非法均返回错误；重复调用幂等。
+  function rdma_status finalize();
+    rdma_status status;
+
+    if (finalized)
+      return rdma_status::success();
+    if (funcs.size() == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "rdma_env_cfg has no Function");
+    foreach (funcs[i])
+      if (funcs[i].role == RDMA_FUNC_ROLE_DUT)
+        return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
+                                 $sformatf("f%0d role DUT: DUT bridge/RM not implemented yet", i));
+    if (mode == RDMA_ENV_MODE_DUT && link_type != "rdma_dut_link")
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                               "mode DUT requires link_type rdma_dut_link");
+    if (mode == RDMA_ENV_MODE_RXE && remote_funcs == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "mode RXE requires a remote Function");
+    foreach (biz[i]) begin
+      status = biz[i].finalize(qp_depth, mtu, ud_qkey, timeout, retry, rnr_retry, min_rnr);
+      if (!status.ok())
+        return status;
+    end
+    finalized = 1'b1;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：生成最终生效配置的多行摘要（模式、拓扑、链路、环境默认、时间、检查开关、全部业务模板）。
+  // 输入/输出及副作用：纯格式化，不修改配置。
+  // 失败/边界：finalize 之前调用时业务继承字段显示为 0/-1。
+  function string describe();
+    string s;
+
+    s = $sformatf("RDMA effective configuration\n  mode=%s link=%s funcs=%0d remote_funcs=%0d\n",
+                  mode.name(), link_type, funcs.size(), remote_funcs);
+    foreach (funcs[i])
+      s = {s, $sformatf("  f%0d host=%0d pf=%0d kind=%s vf=%0d role=%s\n", i, funcs[i].host,
+                        funcs[i].pf, funcs[i].kind.name(), funcs[i].vf, funcs[i].role.name())};
+    s = {s, $sformatf({"  rdma.env: qp_depth=%0d mtu=%0d timeout=%0d retry=%0d rnr_retry=%0d ",
+                       "min_rnr=%0d ud_qkey=0x%08h poll=%0t response_timeout=%0t checker=%0b ",
+                       "cov=%0b\n"},
+                      qp_depth, mtu, timeout, retry, rnr_retry, min_rnr, ud_qkey, poll_interval,
+                      response_timeout, checker_enable, cov_enable)};
+    foreach (deviations[i])
+      s = {s, "  deviation: ", deviations[i], "\n"};
+    foreach (biz[i])
+      s = {s, biz[i].describe(), "\n"};
+    return s;
   endfunction
 
   // 功能：按完整字符串判断协议规则 name 是否已列入偏差清单。

@@ -2,9 +2,10 @@
 // 层：测试。
 // 职责：env 测试：基类按配置（两 Function：Host0 PF0、Host1 PF0）建立 rdma_env 并运行一个虚拟序列；
 //   子类只选链路与序列（主机内存恒为外部 host_mem）。+RDMA_LINK=<链路类名>、+RDMA_VSEQ=<序列类名>
-//   可覆盖默认值。
+//   可覆盖默认值；随后经 aip_core 加载 +rdma.env.* / +rdma.biz.* 参数（命令行优先于测试 configure）。
+//   rdma_env_biz_test 按业务模板生成流量。
 //   pcie_work suite 另有 PCIe 插件与 rdma_env_pcie_test；rxe suite 另有 rdma_env_rxe_test。
-// 依赖：rdma_drv_pkg、rdma_env_pkg、rdma_unit_test_pkg、pcie_work（可选）。
+// 依赖：rdma_drv_pkg、rdma_env_pkg、rdma_aip_cfg_pkg、rdma_unit_test_pkg、pcie_work（可选）。
 // 所有权：测试拥有配置与 env。
 // 生命周期：build 建 env，run_phase 运行序列。
 package rdma_env_test_pkg;
@@ -16,6 +17,7 @@ package rdma_env_test_pkg;
   import dpu_resource_pkg::*;
   import rdma_dpu_adapter_pkg::*;
   import rdma_env_pkg::*;
+  import rdma_aip_cfg_pkg::*;
   import rdma_unit_test_pkg::*;
 `ifdef RDMA_PCIE_WORK_TEST
   import pcie_tl_pkg::*;
@@ -42,9 +44,12 @@ package rdma_env_test_pkg;
       vseq_type = "rdma_basic_traffic_vseq";
     endfunction
 
-    // 功能：解析链路/序列 plusarg，建立两 Host 各一 PF 的默认配置，经 configure 后创建测试 env。
-    // 输入/输出及副作用：phase 传给基类；创建并持有 cfg/env，向 env 实例写入 config_db。
-    // 失败/边界：未知链路由 env factory 创建阶段报告；未知序列延迟到 run_traffic 报 UVM_FATAL。
+    // 功能：解析链路/序列 plusarg，建立两 Host 各一 PF 的默认配置，经 configure 后再由 aip_core 加载
+    //   +rdma.env.* 与 +rdma.biz.* 参数（以当前配置为默认值），最后创建测试 env。
+    // 输入/输出及副作用：phase 传给基类；创建并持有 cfg/env，向 env 实例写入 config_db；vseq_type 可被
+    //   +rdma.env.vseq 覆盖。
+    // 失败/边界：未知链路由 env factory 创建阶段报告；未知序列延迟到 run_traffic 报 UVM_FATAL；参数
+    //   语法错误由 aip_core FATAL，取值约束在 env finalize 时校验。
     function void build_phase(uvm_phase phase);
       super.build_phase(phase);
       void'($value$plusargs("RDMA_LINK=%s", link_type));
@@ -54,6 +59,7 @@ package rdma_env_test_pkg;
       cfg.add_func(1);
       cfg.link_type = link_type;
       configure(cfg);
+      rdma_aip_cfg_loader::load(cfg, vseq_type);
       uvm_config_db#(rdma_env_cfg)::set(this, "env", "cfg", cfg);
       env = rdma_env::type_id::create("env", this);
     endfunction
@@ -222,6 +228,20 @@ package rdma_env_test_pkg;
       super.new(name, parent);
       link_type = "rdma_link_netpkt";
       vseq_type = "rdma_random_vseq";
+    endfunction
+  endclass
+
+  // 按业务模板生成流量（netpkt 链路，使报文属性体现在帧上）；业务与参数由 +rdma.biz.* 选择。
+  class rdma_env_biz_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_biz_test)
+
+    // 功能：构造在 net_packet 链路上运行 rdma_biz_vseq 的环境测试；默认启用全部内置业务。
+    // 输入/输出及副作用：name/parent 建立层级；覆盖 link_type 与 vseq_type，不创建资源。
+    // 失败/边界：业务参数非法时 env finalize 报 UVM_FATAL；种子由仿真器/runner 管理。
+    function new(string name = "rdma_env_biz_test", uvm_component parent = null);
+      super.new(name, parent);
+      link_type = "rdma_link_netpkt";
+      vseq_type = "rdma_biz_vseq";
     endfunction
   endclass
 

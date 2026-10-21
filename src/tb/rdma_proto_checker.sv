@@ -3,7 +3,9 @@
 // 职责：IBTA 协议检查：rdma_proto_checker 订阅链路观测（tx：仿真 NIC 发出的报文，即被测对象；rx：交付的
 //   报文，含远端 rxe 发来的与 netpkt 链路的帧），分发给规则类；每组规则一个类，可按规则名列入
 //   cfg.deviations 降级为 info。
-//   - rdma_rule_frame：RoCEv2 帧（netpkt）：以太类型/IPv4/UDP 4791/长度、BTH TVer 0、P_Key 0xFFFF、pad、ICRC。
+//   - rdma_rule_frame：RoCEv2 帧（netpkt）：以太类型（可带 802.1Q 标签）/IPv4/UDP 4791/长度、BTH TVer 0、
+//     P_Key 0xFFFF、pad、ICRC。
+//   - rdma_rule_pkt_attr：帧的 VLAN、源/目的 IPv4、UDP 源端口与发送 QP 记录的业务报文属性一致。
 //   - rdma_rule_psn：请求 PSN 不跳号（重传可回退），READ 请求占用响应包数个 PSN；READ 响应在请求范围内。
 //   - rdma_rule_ack：RC/URC SEND/WRITE 末包 AckReq；ACK/NAK 的 PSN 不超过已收请求；MSN 不回退；syndrome 合法。
 //   - rdma_rule_rnr：RNR NAK 的定时器编码为响应方 QP 的 min_rnr（URC 为 URC_RNR_CODE）；请求方不早于
@@ -75,8 +77,8 @@ class rdma_proto_checker extends uvm_component;
   // 失败/边界：factory 必须为每个名字返回兼容 rdma_proto_rule 的非空对象；void cast 不提供恢复，
   //   类型注册缺失属于测试环境配置错误。
   function void build_phase(uvm_phase phase);
-    string names[] = '{"rdma_rule_frame", "rdma_rule_psn", "rdma_rule_ack", "rdma_rule_rnr",
-                       "rdma_rule_state", "rdma_rule_ud"};
+    string names[] = '{"rdma_rule_frame", "rdma_rule_pkt_attr", "rdma_rule_psn", "rdma_rule_ack",
+                       "rdma_rule_rnr", "rdma_rule_state", "rdma_rule_ud"};
     rdma_proto_rule r;
 
     super.build_phase(phase);
@@ -217,12 +219,21 @@ class rdma_rule_frame extends rdma_proto_rule;
     super.new(name);
   endfunction
 
-  // 功能：检查 netpkt 链路传输的帧（Ethernet/IPv4/UDP/BTH/ICRC，BTH 在偏移 42）：IP 数据报止于
-  //   14 + IP 总长（其后只允许把帧补足 64 字节的填充），ICRC 为数据报末 4 字节（低字节在前）。
+  // 功能：返回帧的 IPv4 头偏移：无标签为 14，带一个 802.1Q 标签（以太类型 0x8100）为 18。
+  // 输入/输出及副作用：f 为原始帧，纯计算。
+  // 失败/边界：调用者须保证帧至少 14 字节；多层标签（QinQ）不支持，按单标签处理。
+  static function int unsigned l3_offset(byte unsigned f[$]);
+    return {f[12], f[13]} == 16'h8100 ? 18 : 14;
+  endfunction
+
+  // 功能：检查 netpkt 链路传输的帧（Ethernet[/802.1Q]/IPv4/UDP/BTH/ICRC，BTH 在 IPv4 头后 28 字节）：
+  //   IP 数据报止于 IPv4 偏移 + IP 总长（其后只允许把帧补足 64 字节的填充），ICRC 为数据报末 4 字节
+  //   （低字节在前）。
   // 输入/输出及副作用：无。
-  // 失败/边界：无帧的观测跳过。
+  // 失败/边界：无帧或长度不足以容纳 BTH 的观测跳过。
   virtual function void on_rx(rdma_link_obs o);
     byte unsigned f[$];
+    int unsigned l3;
     int unsigned ip_len;
     int unsigned last;
     bit [31:0] icrc;
@@ -231,27 +242,94 @@ class rdma_rule_frame extends rdma_proto_rule;
     f = o.frame;
     if (f.size() < 62)
       return;
+    l3 = l3_offset(f);
+    if (f.size() < l3 + 48)
+      return;
     checked++;
-    ip_len = {f[16], f[17]};
-    last = 14 + ip_len;
-    if ({f[12], f[13]} != 16'h0800 || f[14] != 8'h45 || f[23] != 8'd17)
+    ip_len = {f[l3 + 2], f[l3 + 3]};
+    last = l3 + ip_len;
+    if ({f[l3 - 2], f[l3 - 1]} != 16'h0800 || f[l3] != 8'h45 || f[l3 + 9] != 8'd17)
       fail(o, "not an IPv4/UDP frame");
     if (last > f.size() || (last < f.size() && f.size() > 64) ||
-        {f[38], f[39]} != ip_len - 20) begin
+        {f[l3 + 24], f[l3 + 25]} != ip_len - 20) begin
       fail(o, $sformatf("IP length %0d / UDP length %0d for a %0dB frame", ip_len,
-                        {f[38], f[39]}, f.size()));
+                        {f[l3 + 24], f[l3 + 25]}, f.size()));
       return;
     end
-    if ({f[36], f[37]} != 16'd4791)
+    if ({f[l3 + 22], f[l3 + 23]} != 16'd4791)
       fail(o, "UDP destination port is not 4791");
-    if (f[43][3:0] != 0 || {f[44], f[45]} != 16'hffff)
-      fail(o, $sformatf("BTH TVer %0d P_Key %04h", f[43][3:0], {f[44], f[45]}));
-    pad = f[43][5:4];
+    if (f[l3 + 29][3:0] != 0 || {f[l3 + 30], f[l3 + 31]} != 16'hffff)
+      fail(o, $sformatf("BTH TVer %0d P_Key %04h", f[l3 + 29][3:0], {f[l3 + 30], f[l3 + 31]}));
+    pad = f[l3 + 29][5:4];
     if (pad != (4 - o.pkt.payload.size() % 4) % 4)
       fail(o, $sformatf("pad %0d for %0dB payload", pad, o.pkt.payload.size()));
     icrc = {f[last - 1], f[last - 2], f[last - 3], f[last - 4]};
-    if (icrc != rocev2_bth::calc_icrc(f, 14, last - 4))
+    if (icrc != rocev2_bth::calc_icrc(f, l3, last - 4))
       fail(o, "ICRC mismatch");
+  endfunction
+endclass
+
+// 设计说明：报文属性（VLAN/IP/UDP 源端口）属于 QP 上下文而不是单条报文，业务模板在建 QP 时把属性记入
+//   rdma_res_qp。本规则用发送 QP 的记录核对帧头；loopback 下由链路按同一记录编码，DUT 模式下用于检查
+//   DUT 发出的帧是否带上了配置的属性。
+class rdma_rule_pkt_attr extends rdma_proto_rule;
+  `uvm_object_utils(rdma_rule_pkt_attr)
+
+  // 功能：构造无持久状态的报文属性规则对象。
+  // 输入/输出及副作用：name 作为规则/偏差标识交给基类；不持有资源。
+  // 失败/边界：由 checker 绑定 chk 后才可报告；无帧或远端发送的观测由 on_rx 跳过。
+  function new(string name = "rdma_rule_pkt_attr");
+    super.new(name);
+  endfunction
+
+  // 功能：定位发送 QP：UD 报文带 DETH 源 QPN，直接在源 Function 中查；RC/URC 的 BTH 不带源 QPN，
+  //   经目的 Function 中的接收 QP（BTH 目的 QPN）取其对端。
+  // 输入/输出及副作用：读取资源库，返回发送 QP 或 null。
+  // 失败/边界：目的为远端/DUT 哨兵、接收 QP 不存在或未连接时返回 null。
+  protected function rdma_res_qp sender_qp(rdma_link_obs o);
+    rdma_res_qp rx;
+
+    if (o.pkt.transport == RDMA_TRANSPORT_UD)
+      return chk.env.res.funcs[o.src].qps.get(o.pkt.source_qpn);
+    if (chk.destination_is_remote(o.dst))
+      return null;
+    rx = chk.env.res.funcs[o.dst].qps.get(o.pkt.destination_qpn);
+    return rx == null ? null : rx.peer;
+  endfunction
+
+  // 功能：取本地发送 QP，核对帧的 VLAN 有无与 VLAN ID、非零配置的源/目的 IPv4 与 UDP 源端口。
+  // 输入/输出及副作用：读取资源库与帧，违例经 fail 报告。
+  // 失败/边界：无帧、帧过短、远端源、找不到发送 QP 时跳过；属性为 0 的字段表示沿用链路默认，不检查。
+  virtual function void on_rx(rdma_link_obs o);
+    byte unsigned f[$];
+    int unsigned l3;
+    rdma_res_qp qp;
+    bit tagged;
+
+    f = o.frame;
+    if (f.size() < 62 || chk.source_is_remote(o.src))
+      return;
+    qp = sender_qp(o);
+    if (qp == null)
+      return;
+    l3 = rdma_rule_frame::l3_offset(f);
+    if (f.size() < l3 + 24)
+      return;
+    checked++;
+    tagged = l3 == 18;
+    if (tagged != qp.pkt.vlan_en || (tagged && {f[14][3:0], f[15]} != qp.pkt.vlan_id[11:0]))
+      fail(o, $sformatf("VLAN tagged=%0b id=%0d, QP %0d (%s) expects vlan_en=%0b id=%0d", tagged,
+                        tagged ? {f[14][3:0], f[15]} : 0, qp.id, qp.biz, qp.pkt.vlan_en,
+                        qp.pkt.vlan_id));
+    if (qp.pkt.src_ip != 0 && {f[l3 + 12], f[l3 + 13], f[l3 + 14], f[l3 + 15]} != qp.pkt.src_ip)
+      fail(o, $sformatf("source IP %08h, QP %0d expects %08h",
+                        {f[l3 + 12], f[l3 + 13], f[l3 + 14], f[l3 + 15]}, qp.id, qp.pkt.src_ip));
+    if (qp.pkt.dst_ip != 0 && {f[l3 + 16], f[l3 + 17], f[l3 + 18], f[l3 + 19]} != qp.pkt.dst_ip)
+      fail(o, $sformatf("destination IP %08h, QP %0d expects %08h",
+                        {f[l3 + 16], f[l3 + 17], f[l3 + 18], f[l3 + 19]}, qp.id, qp.pkt.dst_ip));
+    if (qp.pkt.udp_sport != 0 && {f[l3 + 20], f[l3 + 21]} != qp.pkt.udp_sport[15:0])
+      fail(o, $sformatf("UDP source port %0d, QP %0d expects %0d", {f[l3 + 20], f[l3 + 21]},
+                        qp.id, qp.pkt.udp_sport));
   endfunction
 endclass
 

@@ -43,6 +43,7 @@ CMQ/codec 基线来自 `/home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.ta
 | host_mem | `HOST_MEM_ROOT` | 全部 suite |
 | net_packet | `NET_PACKET_ROOT` | 全部 suite |
 | pcie_work | `PCIE_WORK_ROOT` | pcie_work suite |
+| aip_core（update 分支） | `AIP_CORE_ROOT` | 全部 suite：`+rdma.env.*` / `+rdma.biz.*` 命令行参数 |
 
 外部源码不会同步进本仓库，也不应把访问令牌写入 remote URL、脚本或配置文件。
 
@@ -56,6 +57,27 @@ git diff --check
 ```
 
 本地 Python 检查不需要 VCS license，也不替代 53 主机上的 SystemVerilog 编译。
+
+## 业务参数化与本机回归
+
+配置根 `rdma_env_cfg` 含运行模式（PEER/RXE/DUT）与六个业务模板（send/write/read/atomic/ud/urc），每个模板
+分 `qp`（深度、MTU、SGE、起始 PSN、Q_Key、timeout/retry/rnr）、`mem`（缓冲、槽、MR 偏移与权限）、`pkt`
+（VLAN、IP、UDP 源端口）、`trf`（数量、verb 权重、长度/SGE 分布、数据模式、signaled 比例、方向）四组参数，
+经 aip_core 从命令行加载，env build 时打印最终生效配置。设计见 `docs/rdma-biz-param-design.md`。
+
+```bash
+simv +UVM_TESTNAME=rdma_env_biz_test +rdma.biz.en=write,read +rdma.biz.write.qp.mtu=4096 \
+  '+rdma.biz.write.trf.len={[1:256]:/30,[257:4096]:/70}' +rdma.biz.send.pkt.vlan_en=1
+```
+
+本机（无远端同步）回归：每个 suite 编译一次，按清单运行（清单行可带 plusargs，未给种子时随机并打印）：
+
+```bash
+export AIP_CORE_ROOT=... DPU_COMMON_ROOT=... HOST_MEM_ROOT=... NET_PACKET_ROOT=...
+export VCS_EXTRA_FLAGS="-LDFLAGS -Wl,--no-as-needed +define+AIP_VCS2018_COMPAT"   # 仅 VCS O-2018.09
+scripts/run_local_regress.sh                      # 默认 sim/param_regression.list
+scripts/run_local_regress.sh sim/regression.list  # 也可直接使用原清单
+```
 
 ## VCS53 回归入口
 

@@ -164,9 +164,10 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       register(item, f, r, r.srq.srqn, {item.pd});
   endtask
 
-  // 功能：创建 QP（urc 时以 rc_to_urc 创建 RC QP）；Q_Key、MTU 取配置。
+  // 功能：创建 QP（urc 时以 rc_to_urc 创建 RC QP），并把该 QP 自己的链路参数记入资源：item.biz 非空时
+  //   Q_Key、MTU、起始 PSN、timeout/retry/rnr_retry/min_rnr 与报文属性取业务模板，否则取 env 默认值。
   // 输入/输出及副作用：见 register；编号为 QPN。
-  // 失败/边界：驱动失败经 item.status 返回。
+  // 失败/边界：驱动失败经 item.status 返回；业务模板必须已 finalize（继承值已解析）。
   protected task create_qp(rdma_res_func f, rdma_ctrl_item item);
     rdma_drv_qp_init_attr attr;
     rdma_res_qp r;
@@ -193,8 +194,25 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
     r.send_cq = item.send_cq;
     r.recv_cq = item.recv_cq;
     r.srq = item.srq;
-    r.qkey = env.cfg.ud_qkey;
-    r.mtu = env.cfg.mtu;
+    if (item.biz != null) begin
+      r.biz = item.biz.biz_name();
+      r.qkey = item.biz.qp.qkey;
+      r.mtu = item.biz.qp.mtu;
+      r.psn = item.biz.qp.psn;
+      r.timeout = item.biz.qp.timeout;
+      r.retry = item.biz.qp.retry;
+      r.rnr_retry = item.biz.qp.rnr_retry;
+      r.min_rnr = item.biz.qp.min_rnr;
+      r.pkt = item.biz.pkt;
+    end
+    else begin
+      r.qkey = env.cfg.ud_qkey;
+      r.mtu = env.cfg.mtu;
+      r.timeout = env.cfg.timeout;
+      r.retry = env.cfg.retry;
+      r.rnr_retry = env.cfg.rnr_retry;
+      r.min_rnr = env.cfg.min_rnr;
+    end
     deps = {item.pd, item.send_cq, item.recv_cq};
     if (item.srq != null)
       deps.push_back(item.srq);
@@ -218,9 +236,9 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
     end
   endtask
 
-  // 功能：把 qp 迁到 state，属性按迁移取配置默认值：→INIT（UD Q_Key / RC 远端权限）、INIT→RTR（RC：
-  //   对端 QPN、RQ PSN 0、MTU、目的 MAC、min_rnr）、RTR→RTS（SQ PSN 0、timeout、重试次数）；其它迁移
-  //   （SQD、ERR、RESET、SQD→RTS 等）只给状态。
+  // 功能：把 qp 迁到 state，属性取该 QP 资源记录的链路参数：→INIT（UD Q_Key / RC 远端权限）、
+  //   INIT→RTR（RC：对端 QPN、RQ PSN = 对端起始 PSN、MTU、目的 MAC、min_rnr）、RTR→RTS（SQ PSN = 本端
+  //   起始 PSN、timeout、重试次数）；其它迁移（SQD、ERR、RESET、SQD→RTS 等）只给状态。
   // 输入/输出及副作用：驱动 modify；广播 CHANGED（ERR 时资源状态置 ERROR）。
   // 失败/边界：驱动失败经 status 返回。
   protected virtual task modify(rdma_res_qp qp, rdma_drv_qp_state_e state, rdma_res_qp peer,
@@ -243,18 +261,18 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
                    rdma_drv_qp_attr::M_PATH_MTU | rdma_drv_qp_attr::M_AV |
                    rdma_drv_qp_attr::M_MIN_RNR;
       attr.dest_qpn = peer.id;
-      attr.rq_psn = 0;
+      attr.rq_psn = peer.psn;
       attr.path_mtu = qp.mtu;
       attr.dmac = peer.owner.mac;
-      attr.min_rnr = env.cfg.min_rnr;
+      attr.min_rnr = qp.min_rnr;
     end
     else if (state == RDMA_DRV_QPS_RTS && qp.qp.cur_state == RDMA_DRV_QPS_RTR) begin
       attr.mask |= rdma_drv_qp_attr::M_SQ_PSN | rdma_drv_qp_attr::M_TIMEOUT |
                    rdma_drv_qp_attr::M_RETRY_CNT | rdma_drv_qp_attr::M_RNR_RETRY;
-      attr.sq_psn = 0;
-      attr.timeout = env.cfg.timeout;
-      attr.retry_cnt = env.cfg.retry;
-      attr.rnr_retry = env.cfg.rnr_retry;
+      attr.sq_psn = qp.psn;
+      attr.timeout = qp.timeout;
+      attr.retry_cnt = qp.retry;
+      attr.rnr_retry = qp.rnr_retry;
     end
     qp.qp.modify(qp.owner.drv(), attr, status);
     if (status.ok())

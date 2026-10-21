@@ -233,21 +233,57 @@ class rdma_link_netpkt extends rdma_link;
 
   protected rdma_netpkt_codec codec;
   protected byte unsigned carried[$];
+  // codec 构造时的链路默认地址；每帧先恢复默认，再叠加发送 QP 的报文属性。
+  protected bit [31:0] default_src_ip;
+  protected bit [31:0] default_dst_ip;
+  protected bit [15:0] default_udp_sport;
 
-  // 功能：构造 net_packet 链路并创建本链路独占的 RoCEv2 codec，初始 carried frame 为空。
+  // 功能：构造 net_packet 链路并创建本链路独占的 RoCEv2 codec，记录 codec 的默认 IP/UDP 源端口，
+  //   初始 carried frame 为空。
   // 输入/输出及副作用：name/parent 建立 UVM 层级；codec 由链路拥有，Function 与 fault 状态沿用空基类。
   // 失败/边界：codec factory override 必须返回非空兼容对象；地址配置使用 codec 默认值或由上层后续设置。
   function new(string name = "rdma_link_netpkt", uvm_component parent = null);
     super.new(name, parent);
     codec = rdma_netpkt_codec::type_id::create("codec");
+    default_src_ip = codec.src_ip;
+    default_dst_ip = codec.dst_ip;
+    default_udp_sport = codec.udp_src_port;
   endfunction
 
-  // 功能：编码为帧 → 解析回报文。
+  // 功能：按发送 QP（src Function 内 QPN = pkt.source_qpn）记录的报文属性配置 codec：VLAN 标签、
+  //   源/目的 IPv4、UDP 源端口；属性为 0 或找不到 QP 时使用链路默认。
+  // 输入/输出及副作用：修改 codec 的 VLAN/IP/UDP 字段，供紧随其后的 encode 使用。
+  // 失败/边界：远端（rxe）Function、未登记或已销毁的 QP 一律按默认编码；不改变 MAC。
+  protected function void apply_qp_attrs(int unsigned src, rdma_packet pkt);
+    rdma_res_qp qp;
+
+    codec.vlan_enable = 1'b0;
+    codec.vlan_id = '0;
+    codec.src_ip = default_src_ip;
+    codec.dst_ip = default_dst_ip;
+    codec.udp_src_port = default_udp_sport;
+    qp = null;
+    if (funcs.exists(src) && !funcs[src].remote)
+      qp = funcs[src].qps.get(pkt.source_qpn);
+    if (qp == null)
+      return;
+    codec.vlan_enable = qp.pkt.vlan_en;
+    codec.vlan_id = qp.pkt.vlan_id[11:0];
+    if (qp.pkt.src_ip != 0)
+      codec.src_ip = qp.pkt.src_ip;
+    if (qp.pkt.dst_ip != 0)
+      codec.dst_ip = qp.pkt.dst_ip;
+    if (qp.pkt.udp_sport != 0)
+      codec.udp_src_port = qp.pkt.udp_sport[15:0];
+  endfunction
+
+  // 功能：按发送 QP 的报文属性编码为帧 → 解析回报文。
   // 输入/输出及副作用：见基类；记下帧供观测。
   // 失败/边界：编码/解析失败经 status 返回。
   virtual task carry(int unsigned src, int unsigned dst, rdma_packet pkt,
                      output rdma_packet delivered, output rdma_status status);
     delivered = null;
+    apply_qp_attrs(src, pkt);
     status = codec.encode(pkt, carried);
     if (status.ok())
       status = codec.decode(carried, delivered);
@@ -272,6 +308,7 @@ class rdma_link_netpkt extends rdma_link;
     byte unsigned frame[$];
     rdma_packet decoded;
 
+    apply_qp_attrs(src, pkt);
     if (!codec.encode(pkt, frame).ok()) begin
       `uvm_error("RDMA_LINK", "encode failed")
       return;

@@ -356,8 +356,8 @@ package rdma_rxe_env_pkg;
       register(item, f, qp, rdma_rxe_peer::field(reply, "qpn"), {item.pd, item.send_cq});
     endfunction
 
-    // 功能：远端 QP 只在迁到 RTS 时一次完成连接（RC：rc_connect，PSN 0、rxe 侧 timeout 14；UD：ud_ready）；
-    //   仿真 QP 走基类。
+    // 功能：远端 QP 只在迁到 RTS 时一次完成连接（RC：rc_connect，RQ PSN 取仿真对端 QP 的起始 PSN、
+    //   SQ PSN 取远端 QP 记录的起始 PSN（默认 0）、rxe 侧 timeout 14；UD：ud_ready）；仿真 QP 走基类。
     // 输入/输出及副作用：对端进程命令；广播 CHANGED。
     // 失败/边界：其它迁移不动作（INIT/RTR 由 RTS 一步完成）。
     protected virtual task modify(rdma_res_qp qp, rdma_drv_qp_state_e state, rdma_res_qp peer,
@@ -370,11 +370,12 @@ package rdma_rxe_env_pkg;
       if (state != RDMA_DRV_QPS_RTS)
         return;
       if (qp.ud())
-        void'(rdma_rxe_plugin::peer.cmd($sformatf("ud_ready %0d 0x%0h 0", qp.id, qp.qkey)));
+        void'(rdma_rxe_plugin::peer.cmd($sformatf("ud_ready %0d 0x%0h %0d", qp.id, qp.qkey,
+              qp.psn)));
       else
-        void'(rdma_rxe_plugin::peer.cmd($sformatf("rc_connect %0d %0d 0 0 %s %0d 14 %0d %0d",
-              qp.id, peer.id, rdma_rxe_util::arg("RXE_SIM_IP", "10.79.0.1"), qp.mtu,
-              env.cfg.retry, env.cfg.rnr_retry)));
+        void'(rdma_rxe_plugin::peer.cmd($sformatf("rc_connect %0d %0d %0d %0d %s %0d 14 %0d %0d",
+              qp.id, peer.id, peer.psn, qp.psn, rdma_rxe_util::arg("RXE_SIM_IP", "10.79.0.1"),
+              qp.mtu, env.cfg.retry, env.cfg.rnr_retry)));
       env.res.set_state(qp, RDMA_RES_ALIVE);
     endtask
   endclass
@@ -558,8 +559,9 @@ package rdma_rxe_env_pkg;
       super.new(name);
     endfunction
 
-    // 功能：安装覆盖、选择链路、声明一个远端 Function、仿真侧不超时；Q_Key 用非受控值（最高位为 1 的
-    //   受控 Q_Key 需要特权才能设置到 rxe QP）。
+    // 功能：安装覆盖、切换到 RXE 模式并选择链路、声明一个远端 Function、仿真侧不超时；Q_Key 用非受控值
+    //   （最高位为 1 的受控 Q_Key 需要特权才能设置到 rxe QP）。业务模板的继承字段在其后 finalize 时取到
+    //   这里调整后的环境默认值。
     // 输入/输出及副作用：修改 env 配置并安装全局 UVM factory override；不创建进程或打开 TAP。
     // 失败/边界：必须在 env 子组件构造前调用；override 具有全局作用域，当前插件只支持一个远端
     //   Function，重复或与其他插件并用会共享该类型选择。
@@ -567,6 +569,7 @@ package rdma_rxe_env_pkg;
       rdma_ctrl_driver::type_id::set_type_override(rdma_rxe_ctrl_driver::get_type());
       rdma_verb_driver::type_id::set_type_override(rdma_rxe_verb_driver::get_type());
       rdma_verb_monitor::type_id::set_type_override(rdma_rxe_verb_monitor::get_type());
+      env.cfg.mode = RDMA_ENV_MODE_RXE;
       env.cfg.link_type = "rdma_link_rxe";
       env.cfg.remote_funcs = 1;
       env.cfg.timeout = 0;

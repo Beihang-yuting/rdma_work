@@ -21,10 +21,12 @@ package rdma_env_pkg;
 
   typedef byte unsigned rdma_byte_q[$];
 
-  `include "rdma_env_cfg.sv"
+  `include "rdma_biz_types.sv"
   `include "rdma_res.sv"
   `include "rdma_data_gen.sv"
   `include "rdma_env_items.sv"
+  `include "rdma_biz_cfg.sv"
+  `include "rdma_env_cfg.sv"
   `include "rdma_link.sv"
   `include "rdma_dut_link.sv"
   `include "rdma_mem_model.sv"
@@ -37,4 +39,5 @@ package rdma_env_pkg;
   `include "rdma_env.sv"
   `include "rdma_vseqs.sv"
   `include "rdma_scenario_vseqs.sv"
+  `include "rdma_biz_vseqs.sv"
 endpackage

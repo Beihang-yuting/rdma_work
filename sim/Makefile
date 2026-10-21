@@ -4,18 +4,23 @@
 # 依赖与所有权：依赖 VCS、仓库 filelist 及外部只读源码树；本文件仅管理 build 输出目录，不拥有外部依赖生命周期。
 
 BUILD ?= build/core
-# 外部组件（dpu_common、host_mem、net_packet、pcie_work）由使用者经 *_ROOT 指定，直接引用、不锁版本。
-override RDMA_ARCHIVE := /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
+# 外部组件（dpu_common、host_mem、net_packet、pcie_work、aip_core）由使用者经 *_ROOT 指定，直接引用、不锁版本。
+# 驱动归档路径默认沿用 53 主机位置，其它机器可经环境变量或命令行 RDMA_ARCHIVE=... 覆盖。
+RDMA_ARCHIVE ?= /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
 TEST ?= rdma_smoke_test
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
 VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_access+class
+# 本机附加编译选项（不改仓库即可适配工具链），例如 VCS O-2018.09 + Ubuntu 20.04：
+#   VCS_EXTRA_FLAGS="-LDFLAGS -Wl,--no-as-needed +define+AIP_VCS2018_COMPAT"
+VCS_EXTRA_FLAGS ?=
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 CORE_LOGICAL_RUNNER := ../scripts/run_core_logical_test.sh
 # dpu_common（Host/PF/VF、BDF、BAR 的逻辑设备配置）：所有编译 tests/rdma_unit_test_pkg 的 suite 都需要；
 # 由 rdma_dpu_adapter_pkg 投影给驱动/设备模型。
 DPU_COMMON_SRC = +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv
+# aip_core（命令行参数解析）：filelist 中 aip_core_pkg.sv 必须是本编译单元首个 AIP 文件。
 
 # 功能：在 build 目录 $(1) 生成外部组件路径展开后的 filelist（VCS 不替换 filelist 中的 Make 变量），并
 #   编译 tb_top 为 $(1)/simv；$(2) 为附加的 suite filelist（rxe、pcie_work）与选项。
@@ -25,9 +30,11 @@ define RDMA_COMPILE
 	mkdir -p $(1); \
 	for list in rdma tests pcie_work rxe; do \
 		sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
-		    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' filelists/$$list.f > $(1)/$$list.f; \
+		    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' -e 's|@AIP_CORE_ROOT@|$(AIP_CORE_ROOT)|g' \
+		    filelists/$$list.f > $(1)/$$list.f; \
 	done; \
-	$(VCS) $(VCS_FLAGS) $(DPU_COMMON_SRC) -f $(1)/rdma.f $(2) -f $(1)/tests.f -top tb_top -o $(1)/simv
+	$(VCS) $(VCS_FLAGS) $(VCS_EXTRA_FLAGS) $(DPU_COMMON_SRC) -f $(1)/rdma.f $(2) -f $(1)/tests.f \
+		-top tb_top -o $(1)/simv
 endef
 
 # 功能：把一个 core UVM test 转交给统一 runner 执行并检查 summary。
@@ -41,11 +48,30 @@ define RUN_CORE_LOGICAL_TEST
 		"../scripts/check_uvm_summary.sh"
 endef
 
-.PHONY: dpu_common_preflight core cmq_gate sv_style host_mem_preflight rdma_defs env net_packet_preflight pcie_work pcie_work_preflight rxe regression
+.PHONY: dpu_common_preflight aip_core_preflight build_core build_env build_pcie_work core cmq_gate sv_style host_mem_preflight rdma_defs env net_packet_preflight pcie_work pcie_work_preflight rxe regression
 
 dpu_common_preflight:
 	@if [[ -z "$(DPU_COMMON_ROOT)" || ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then \
 		echo "DPU_COMMON_ROOT must point at a dpu_common checkout" >&2; exit 2; fi
+
+aip_core_preflight:
+	@if [[ -z "$(AIP_CORE_ROOT)" || ! -r "$(AIP_CORE_ROOT)/aip_core_pkg.sv" || \
+	      ! -r "$(AIP_CORE_ROOT)/src/sv/core/aip_cmdline.sv" ]]; then \
+		echo "AIP_CORE_ROOT must point at an aip_core checkout (update branch)" >&2; exit 2; fi
+
+# 只编译不运行：本地回归脚本（scripts/run_local_regress.sh）每个 suite 编译一次、按清单多次运行。
+build_core: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core_preflight
+	set -euo pipefail; \
+	$(call RDMA_COMPILE,build/core,)
+
+build_env: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core_preflight
+	set -euo pipefail; \
+	$(call RDMA_COMPILE,build/env,)
+
+build_pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_work_preflight \
+	aip_core_preflight
+	set -euo pipefail; \
+	$(call RDMA_COMPILE,build/pcie_work,+define+RDMA_PCIE_WORK_TEST -f build/pcie_work/pcie_work.f)
 
 # 变更 SV 的注释/单语句门禁与 Git 空白检查共用明确的基线提交，避免隐式读取工作树历史。
 sv_style:
@@ -80,7 +106,7 @@ regression:
 	echo "REGRESSION SUMMARY total=$$total pass=$$pass fail=$$fail"; \
 	(( fail == 0 ))
 
-core: dpu_common_preflight host_mem_preflight net_packet_preflight
+core: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core_preflight
 	set -euo pipefail; \
 	$(call RDMA_COMPILE,$(BUILD),); \
 	if [[ "$(TEST)" == regression ]]; then \
@@ -186,9 +212,9 @@ net_packet_preflight:
 # env suite：UVM env 的全部场景。
 ENV_TESTS := rdma_env_basic_test rdma_env_netpkt_test rdma_env_high_traffic_test \
 	rdma_env_errors_test rdma_env_reliability_test rdma_env_srq_test rdma_env_lifecycle_test \
-	rdma_env_multifunc_test rdma_env_random_test
+	rdma_env_multifunc_test rdma_env_random_test rdma_env_biz_test
 
-env: dpu_common_preflight host_mem_preflight net_packet_preflight
+env: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core_preflight
 	set -euo pipefail; \
 	$(call RDMA_COMPILE,build/env,); \
 	tests="$(TEST)"; \
@@ -209,7 +235,8 @@ pcie_work_preflight:
 # PCIe suite 同时覆盖正常事务守恒，以及 timeout/UR/CA 经真实 CMQ 路径传播到驱动的负向场景。
 PCIE_WORK_TESTS := rdma_env_pcie_test rdma_env_pcie_fault_test
 
-pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_work_preflight
+pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_work_preflight \
+	aip_core_preflight
 	set -euo pipefail; \
 	$(call RDMA_COMPILE,build/pcie_work,+define+RDMA_PCIE_WORK_TEST -f build/pcie_work/pcie_work.f); \
 	tests="$(TEST)"; \
@@ -222,7 +249,7 @@ pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_wor
 # Soft-RoCE 互打：需先在本机运行 tools/rxe/rxe_tap_setup.sh up（TAP 网卡 + rxe 设备，需 sudo）。
 RXE_TAP ?= rtap0
 
-rxe: dpu_common_preflight host_mem_preflight net_packet_preflight
+rxe: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core_preflight
 	set -euo pipefail; \
 	if [[ ! -e /sys/class/net/$(RXE_TAP) ]]; then \
 		echo "TAP $(RXE_TAP) is missing: run tools/rxe/rxe_tap_setup.sh up" >&2; exit 2; fi; \

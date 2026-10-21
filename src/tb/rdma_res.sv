@@ -185,15 +185,32 @@ class rdma_res_qp extends rdma_res;
   rdma_res_cq send_cq;
   rdma_res_cq recv_cq;
   rdma_res_srq srq;
+  // 每个 QP 自己的链路参数：创建时取业务模板（无模板时取 env 默认），建链（RTR/RTS）时使用。
   bit [31:0] qkey;
   int unsigned mtu;
+  int unsigned psn;
+  int unsigned timeout;
+  int unsigned retry;
+  int unsigned rnr_retry;
+  int unsigned min_rnr;
+  // 该 QP 发出报文的属性（VLAN/IP/UDP 源端口），帧编码链路使用；biz 为所属业务名（空为非业务 QP）。
+  rdma_biz_pkt_t pkt;
+  string biz;
 
-  // 功能：建立 ALIVE 的队列对资源描述，并固定资源种类为 RDMA_RES_QP。
-  // 输入/输出及副作用：name 传给资源基类；qp、类型、peer、CQ/SRQ、qkey、mtu 与依赖由 QP 创建/连接路径填写。
+  // 功能：建立 ALIVE 的队列对资源描述，并固定资源种类为 RDMA_RES_QP；链路参数取 IB 常用默认
+  //   （PSN 0、timeout 14、retry 7、rnr_retry 7、min_rnr 1），报文属性全部沿用链路默认。
+  // 输入/输出及副作用：name 传给资源基类；qp、类型、peer、CQ/SRQ、链路参数与依赖由 QP 创建/连接路径填写。
   // 失败/边界：构造不创建或连接 QP；拓扑字段补齐前不得用该对象生成 verb。
   function new(string name = "rdma_res_qp");
     super.new(name);
     kind = RDMA_RES_QP;
+    psn = 0;
+    timeout = 14;
+    retry = 7;
+    rnr_retry = 7;
+    min_rnr = 1;
+    pkt = '{default: '0};
+    biz = "";
   endfunction
 
   // 功能：判断当前资源记录的 QP 类型是否为 RDMA_DRV_QPT_UD。

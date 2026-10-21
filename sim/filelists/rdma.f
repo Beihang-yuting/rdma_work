@@ -10,6 +10,14 @@
 +incdir+@NET_PACKET_ROOT@/src/common
 +incdir+@NET_PACKET_ROOT@/src/protocols
 @HOST_MEM_ROOT@/src/host_mem_pkg.sv
++incdir+@AIP_CORE_ROOT@
++incdir+@AIP_CORE_ROOT@/src/sv
++incdir+@AIP_CORE_ROOT@/src/sv/core
++incdir+@AIP_CORE_ROOT@/src/sv/bridge
++incdir+@AIP_CORE_ROOT@/src/sv/util
++incdir+@AIP_CORE_ROOT@/src/sv/plugin
++incdir+@AIP_CORE_ROOT@/src/sv/cpu_mem
+@AIP_CORE_ROOT@/aip_core_pkg.sv
 ../src/types/rdma_types_pkg.sv
 ../src/model/rdma_model_pkg.sv
 ../src/codec/rdma_codec_pkg.sv
@@ -19,3 +27,4 @@
 ../src/adapters/dpu/rdma_dpu_adapter_pkg.sv
 ../src/adapters/net_packet/rdma_netpkt_pkg.sv
 ../src/tb/rdma_env_pkg.sv
+../src/adapters/aip/rdma_aip_cfg_pkg.sv
