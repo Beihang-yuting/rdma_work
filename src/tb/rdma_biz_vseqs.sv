@@ -108,28 +108,28 @@ class rdma_biz_vseq extends rdma_base_vseq;
                                     f1, p.qp[1].id), UVM_MEDIUM)
   endtask
 
-  // 功能：按模板流量分布生成 trf.count 条消息；连续 unsigned 达到 QP 深度一半时强制 signaled，最后一条
-  //   总是 signaled，避免 SQ 被未回收的 WQE 占满。
+  // 功能：按模板流量分布生成 trf.count 条消息。unsigned WR 只有在同一 QP 后续出现 signaled WR 时才会被
+  //   回收与结算，因此按方向分别计数连续 unsigned：达到 QP 深度一半时强制 signaled；全部消息之后，
+  //   对仍有未结算 unsigned 的方向各补一条 signaled 消息。
   // 输入/输出及副作用：p 为业务资源组；投递消息（及所需的对端 RECV）。
-  // 失败/边界：分布表达式非法时 uvm_fatal（见 rdma_biz_cfg::draw）。
+  // 失败/边界：分布表达式非法时 uvm_fatal（见 rdma_biz_cfg::draw）；补发消息不计入 trf.count。
   task traffic(rdma_biz_pair p);
-    int unsigned quiet;
-    bit last;
+    int unsigned quiet[2];
 
-    quiet = 0;
-    for (int unsigned i = 0; i < p.biz.trf.count; i++) begin
-      last = i == p.biz.trf.count - 1;
-      one(p, i, last || quiet + 1 >= p.biz.qp.depth / 2, quiet);
-    end
+    quiet = '{0, 0};
+    for (int unsigned i = 0; i < p.biz.trf.count; i++)
+      one(p, i, -1, quiet);
+    foreach (quiet[n])
+      if (quiet[n] != 0)
+        one(p, p.biz.trf.count + n, n, quiet);
   endtask
 
-  // 功能：生成一条消息：选方向与 verb，按槽计算本地/远端偏移，按表达式抽长度与 SGE（原子固定 8 字节
-  //   单 SGE；UD 长度不超过 MTU 与“槽 - GRH”；远端 Function 单 SGE），随机数据模式/立即数/原子操作数，
-  //   消耗 RQE 的 verb 先在对端投递一个整槽 RECV。
-  // 输入/输出及副作用：p 为资源组、i 为消息序号、force_signal 要求本条 signaled；quiet 为连续 unsigned
-  //   计数（输入输出）。
-  // 失败/边界：长度与 SGE 被夹到合法范围；signaled 不满足比例时也会因 force_signal 置位。
-  task one(rdma_biz_pair p, int unsigned i, bit force_signal, inout int unsigned quiet);
+  // 功能：生成一条消息：选方向（dir_override ≥ 0 时固定方向并强制 signaled）与 verb，按槽计算本地/远端
+  //   偏移，按表达式抽长度与 SGE（原子固定 8 字节单 SGE；UD 长度不超过 MTU 与“槽 - GRH”；远端
+  //   Function 单 SGE），随机数据模式/立即数/原子操作数，消耗 RQE 的 verb 先在对端投递一个整槽 RECV。
+  // 输入/输出及副作用：p 为资源组、i 为消息序号；quiet 为两个方向的连续 unsigned 计数（输入输出）。
+  // 失败/边界：长度与 SGE 被夹到合法范围；某方向连续 unsigned 达到 QP 深度一半时本条强制 signaled。
+  task one(rdma_biz_pair p, int unsigned i, int dir_override, ref int unsigned quiet[2]);
     rdma_biz_cfg b;
     rdma_verb_item it;
     rdma_verb_op_e op;
@@ -143,6 +143,8 @@ class rdma_biz_vseq extends rdma_base_vseq;
 
     b = p.biz;
     n = b.trf.dir == 2 ? $urandom_range(1, 0) : b.trf.dir;
+    if (dir_override >= 0)
+      n = dir_override;
     op = b.pick_op();
     slot = (i % b.mem.slots) * b.mem.slot_bytes;
     base = b.mem.slots * b.mem.slot_bytes;
@@ -164,8 +166,9 @@ class rdma_biz_vseq extends rdma_base_vseq;
     it.imm = $urandom;
     it.compare_value = $urandom_range(1, 0);
     it.swap_add_value = {$urandom, $urandom};
-    it.signaled = force_signal || $urandom_range(99, 0) < b.trf.signaled_pct;
-    quiet = it.signaled ? 0 : quiet + 1;
+    it.signaled = dir_override >= 0 || quiet[n] + 1 >= b.qp.depth / 2 ||
+                  $urandom_range(99, 0) < b.trf.signaled_pct;
+    quiet[n] = it.signaled ? 0 : quiet[n] + 1;
     if (it.consumes_rqe())
       post(verb(RDMA_VERB_RECV, p.qp[1 - n], p.mr[1 - n], base + slot, b.mem.slot_bytes));
     post(it);
