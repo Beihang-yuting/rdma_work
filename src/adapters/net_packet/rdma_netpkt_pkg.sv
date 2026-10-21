@@ -2,11 +2,17 @@
 // 职责：直接使用外部 net_packet 做 RoCEv2 帧编解码：设备内部的 rdma_packet（RDMA 语义字段）编码为
 //   Ethernet + IPv4 + UDP + BTH/扩展头 + 负载 + ICRC 帧，并把帧解析回 rdma_packet（校验各层与 ICRC）。
 //   RC/UD 按 IBTA opcode；URC 用 0b110 前缀，扩展头随负载前缀原样携带（net_packet 不识别 URC 扩展头）。
-// 依赖：外部 net_packet（packet.sv 及协议头，经 NET_PACKET_ROOT）、rdma_types_pkg、rdma_model_pkg。
+// 依赖：外部 net_packet（packet.sv 及协议头，经 NET_PACKET_ROOT）、rdma_types_pkg、rdma_model_pkg；
+//   编译了 aip_core 时导入 aip_core_pkg（上游协议头的参数加载）。
 // 所有权：codec 只持有帧地址配置；编解码产生新对象，不修改输入。
 // 生命周期：随使用方存在。
 
 package rdma_netpkt_pkg;
+  // 编译 aip_core 后其 aip_cmdline.sv 定义 AIP_CMDLINE_SV，上游协议头的 load_params 随之启用并引用
+  //   aip_cmdline/aip_str；按上游 net_packet_pkg 的约定在包内显式导入（aip_core_pkg 须先于本包编译）。
+`ifdef AIP_CMDLINE_SV
+  import aip_core_pkg::*;
+`endif
   // 上游 packet/header 声明在编译单元作用域，VCS 不允许 package 内 forward typedef 绑定外部 $unit
   // 类；故在本 package 内 include packet.sv，使协议类型同处一个作用域（不复制源码）。
   `include "packet.sv"
