@@ -304,7 +304,7 @@ class rdma_rule_pkt_attr extends rdma_proto_rule;
     byte unsigned f[$];
     int unsigned l3;
     rdma_res_qp qp;
-    bit tagged;
+    bit has_vlan;
 
     f = o.frame;
     if (f.size() < 62 || chk.source_is_remote(o.src))
@@ -316,11 +316,12 @@ class rdma_rule_pkt_attr extends rdma_proto_rule;
     if (f.size() < l3 + 24)
       return;
     checked++;
-    tagged = l3 == 18;
-    if (tagged != qp.pkt.vlan_en || (tagged && {f[14][3:0], f[15]} != qp.pkt.vlan_id[11:0]))
-      fail(o, $sformatf("VLAN tagged=%0b id=%0d, QP %0d (%s) expects vlan_en=%0b id=%0d", tagged,
-                        tagged ? {f[14][3:0], f[15]} : 0, qp.id, qp.biz, qp.pkt.vlan_en,
-                        qp.pkt.vlan_id));
+    has_vlan = l3 == 18;
+    if (has_vlan != qp.pkt.vlan_en ||
+        (has_vlan && {f[14][3:0], f[15]} != qp.pkt.vlan_id[11:0]))
+      fail(o, $sformatf("VLAN present=%0b id=%0d, QP %0d (%s) expects vlan_en=%0b id=%0d",
+                        has_vlan, has_vlan ? {f[14][3:0], f[15]} : 0, qp.id, qp.biz,
+                        qp.pkt.vlan_en, qp.pkt.vlan_id));
     if (qp.pkt.src_ip != 0 && {f[l3 + 12], f[l3 + 13], f[l3 + 14], f[l3 + 15]} != qp.pkt.src_ip)
       fail(o, $sformatf("source IP %08h, QP %0d expects %08h",
                         {f[l3 + 12], f[l3 + 13], f[l3 + 14], f[l3 + 15]}, qp.id, qp.pkt.src_ip));
