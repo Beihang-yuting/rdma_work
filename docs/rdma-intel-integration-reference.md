@@ -2,6 +2,8 @@
 
 这是按 Virtio 当前 [integration/project](../../virtio_work/integration/project/README.md) 方式整理的**设计案例**，不是本分支已经可运行的 DUT test。公共 API 的调用片段来自当前依赖源码；拟新增的 RDMA/project 接口会单独注明。完整职责与改动范围见 [设计文档](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。
 
+当前范围：先做 RDMA、固定单 bank、身份和共享额度统一向 DPU 申请。配置、初始化和业务均由 Tcl 显式启动，环境阶段不自动执行。共存只保留架构边界，不在本轮引入 VIO 编译依赖或混合 seq。目录入口见 [integration/project](../integration/project/README.md)。
+
 ## 1. 用户工程的最小组成
 
 建议参考入口放在以下位置；这些源码文件尚未创建，避免把设计片段误加入生产编译：
@@ -10,15 +12,17 @@
 integration/project/
     rdma_project_cfg.sv       # 用户 cfg 的组合示例
     rdma_project_env.sv       # 创建、绑定、发布句柄与 AIP 入口
-    project_dut_cfg_seq.sv    # 一个主 seq 编排公共配置及 RDMA/VIO
+    rdma_project_cfg_seq.sv   # 只编排 RDMA 必需配置
     rdma_project_test.sv      # 平台 hooks 与启动顺序
     rdma_project_pkg.sv       # 上述文件的唯一 include 入口
+    rdma_project_commands.sv  # AIP task/sequence/reg 宏注册
+    rdma_start.tcl            # 用户显式 source 的配置/初始化/业务示例
     README.md
-sim/filelists/
-    project_integration.f    # 可选参考工程入口
+integration/filelists/
+    rdma_project.f           # 用户显式加入工程的独立入口
 ```
 
-现有 `src/adapters/dpu`、`host_mem`、`pcie_work` 和 `aip` 负责改造自己的能力，不再新建另一套同名 BAR registry、公共配置对象或 task 管理器。参考 cfg/env 使用 `rdma_project_*` 命名；混合工程只保留一个 `project_dut_cfg_seq` 入口，用户可直接合入自己的 env/cfg。
+现有 `src/adapters/dpu`、`host_mem`、`pcie_work` 和 `aip` 负责改造自己的能力，不再新建另一套同名 BAR registry、公共配置对象或 task 管理器。参考 cfg/env 使用 `rdma_project_*` 命名，用户可直接合入自己的 env/cfg。原有 `sim/filelists/*.f` 不增加 include 或源码条目，也不通过现有 package 间接编译示例。
 
 ```mermaid
 flowchart TD
@@ -50,9 +54,11 @@ int unsigned			tl_slot_by_host[int unsigned];
 
 平台在 DPU resolve 前使用公共 authoring 类型声明 Host、Function、RDMA service 和资源需求，并提供 `function_policies` 的真实 requester/Intel PF/VF，以及适用表的布局和内容。DPU 是最终资源的唯一权威。
 
-当前 `dpu_env_cfg.load_params()` 默认创建 VIO 输入，不能把它当作 RDMA 自动配置，也不能在平台已经构造非空拓扑后再调用。这里选择**平台提供已完成 authoring 的 dpu_cfg**；RDMA 只加载自己的业务参数。`dpu_device_env` 随后进行一次解析。
+当前 `dpu_env_cfg.load_params()` 默认创建 VIO 输入，不能把它当作 RDMA 自动配置，也不能在平台已经构造非空拓扑后再调用。这里选择**平台提供已完成 authoring 的 dpu_cfg，RDMA 提交自己的资源需求**；DPU 随后进行一次解析。请求必须在冻结前提交，实际 RDMA 对象和内存在冻结后按结果创建。
 
-首个具体场景采用 Host0 的管理 PF0 加一个平台支持的 RDMA VF：PF0 承担 AF/管理 BAR 访问，VF 的 Notify owner、8-bit RDMA ID 和实际 doorbell 地址由平台提供，表行号按驱动的查找 key 排序生成。混合场景再给另一实际 Function 声明 VIO service，两者共享同一 DPU 配置与 Host 内存。该场景不把 `global_id`、PCIe VF index 或 Notify 行号当作 RDMA ID，也不填入猜测的 BDF/BAR 数值。
+首个具体场景采用 Host0 的管理 PF0 加一个平台支持的 RDMA VF：PF0 承担 AF/管理 BAR 访问，Function、global ID 和 BAR 来自 DPU 冻结结果。当前约定 `rdma_vf_id = global_function_id`，写表和 probe 前校验该值小于 256，不再分配另一套 ID。doorbell 地址按该 BAR 加 RDMA 窗口偏移得到，表行号按驱动的查找 key 排序生成；PCIe VF index 和 Notify 行号仍是独立概念。
+
+当前 DPU 没有 RDMA 资源额度请求/binding，且资源 manager 仍无条件要求 `virtio.qpair` profile。这些共享资源契约仍需补齐；Function ID 已能从 device snapshot 取得，无需为当前恒等映射新增 RDMA `allocate()`。不采用平台手填另一套 RDMA ID 或增加假 VIO 服务的兼容方式。
 
 ## 3. 创建组件与绑定共享内存
 
@@ -177,7 +183,7 @@ pure virtual task finish_platform();
 
 ## 6. 复用 DPU 配置步骤
 
-拟新增的 `project_dut_cfg_seq` 派生 `dpu_cfg_seq`。下面先展示 RDMA-only 配置片段，`public_scope` 和 `rdma_scope` 来自已验证的真实 Function 选择，`cfg` 由父类 `pre_start()` 从 RC sequencer 的 `dpu_cfg` 获取。RDMA scope 使用非空 Function 集合及表类别，RDMA service 另外在快照中验证；当前公共 scope 的显式 service 校验只支持 VIO。
+拟新增的 `rdma_project_cfg_seq` 派生 `dpu_cfg_seq`。下面展示 RDMA 配置片段，`public_scope` 和 `rdma_scope` 来自已验证的真实 Function 选择，`cfg` 由父类 `pre_start()` 从 RC sequencer 的 `dpu_cfg` 获取。RDMA scope 使用非空 Function 集合及表类别，RDMA service 另外在快照中验证；当前公共 scope 的显式 service 校验只支持 VIO。
 
 ```systemverilog
 declare_af(ok, error_msg);
@@ -193,7 +199,7 @@ configure_qsch_rnet(rdma_scope, ok, error_msg);
 if (!completed_step("configure_qsch_rnet", ok)) return;
 ```
 
-这不是完整 RDMA 初始化 body。平台选用的 MSI-X/公共表、CMQ probe、CQ/QP/MR 准备仍须按真实资源依赖插入；只有所有必需步骤成功才能设置 `success=1`。父类默认 body 是 VIO 流程，不能用 `super.body()` 替代 RDMA 组装。
+这只是配置 body 的片段。平台选用的 MSI-X/公共表按真实依赖补齐，全部配置步骤成功才能设置 `success=1`。CMQ probe 由后续 `rdma_init` 命令触发，业务 CQ/QP/MR 由显式业务入口准备，不塞进配置 seq。父类默认 body 是 VIO 流程，不能用 `super.body()` 替代 RDMA 组装；也不照搬 Virtio base_test 在 `run_phase` 自动启动配置的部分。
 
 公共 Notify 方法会从 `frozen_controls` 取显式记录，先完整验证范围，再写表；全部成功后才写管理 BAR 的 `+0x80044=1`。缺少实际 RDMA 记录不能因“零条写成功”而将业务标为就绪；project 预检必须覆盖被选择的 RDMA 服务。
 
@@ -212,11 +218,13 @@ int unsigned	qp_depth;
 
 长度/SGE 等表达式使用字符串保存，生成每条 WR 时由 AIP 解释一次；重载、日志和队列满重试不能额外采样。同一参数不在 project、RDMA cfg、driver 各读一遍。
 
-以下宏签名来自 `aip_core_set_param_expr` 当前版本。`project_dut_cfg_seq` 和 `project_rdma_load_params` 是本设计拟新增的入口；`project_rc_sqr` 是项目发布的非拥有 sequencer 引用，必须在进入 Tcl 前绑定。
+以下宏签名来自 `aip_core_set_param_expr` 当前版本。`rdma_project_cfg_seq` 和 `project_rdma_load_params` 是本设计拟新增的入口；`project_rc_sqr` 是项目发布的非拥有 sequencer 引用，必须在进入 Tcl 前绑定。
 
 ```systemverilog
 `aip_cmd_task(rdma_load_params, project_rdma_load_params)
-`aip_cmd_user_seq(dut_config, project_dut_cfg_seq, project_rc_sqr)
+`aip_cmd_task(rdma_init, project_rdma_init)
+`aip_cmd_task(rdma_run, project_rdma_run)
+`aip_cmd_user_seq(dut_config, rdma_project_cfg_seq, project_rc_sqr)
 `aip_cmd_reg(reg_acc, dpu_bar_reg_seq, project_rc_sqr, seq.error_msg, seq.check_read_data)
 ```
 
@@ -252,19 +260,23 @@ task project_rdma_load_params();
 endtask
 ```
 
-完成上述实现后，平台就绪且尚未创建当前代 RDMA 队列的 Tcl 场景可按以下命令约定执行。当前分支尚未注册这些项目命令：
+完成上述实现后，Tcl 场景按以下命令约定执行。test 只进入 bridge；平台就绪由 `dut_config` 显式触发，不能在进入 Tcl 前自动运行配置或 probe。当前分支尚未注册这些项目命令：
 
 ```tcl
 set_param path=rdma.env.qp_depth value=256
 rdma_load_params
 dut_config
 reg_acc read 0x1010 check_read_data=0
-# 随后启动项目注册的 RDMA 业务 sequence，并在 finish_platform 检查真实完成。
+rdma_init
+rdma_run
+# Tcl 退出后，由 finish_platform 检查真实完成并确认 DMA 静止。
 ```
 
 `dpu_bar_reg_seq` 当前针对 Host0/PF0 BAR0，`addr` 为 BAR 内字节偏移。`check_read_data=0` 只关闭 PCIe scoreboard 的历史 RAM 值比较，仍检查 Completion；这里读取 AF 状态还需要调用者判断其值是否为 8。其他 Function/BAR 用公共配置 sequence 的 `pcie_bar_write_by_name()` 等命名访问方法。
 
 资源活动期间 `rdma_load_params` 返回错误；需要先由平台停止业务/DMA、释放当前代，再重载。恢复快照也不自动重采样，不允许借重载改变冻结的 Host/BDF/BAR 或重新绑定外部对象。
+
+命令顺序必须可诊断：`rdma_init` 在配置成功前直接返回非零状态，`rdma_run` 在初始化前同样拒绝，不调用会无限等待 ready 的 sequence。命令注册是构建动作，命令执行才会产生 DUT 副作用。
 
 ## 8. 编译与验证边界
 
@@ -277,11 +289,11 @@ UVM / AIP
   → RDMA AIP
   → Intel interface/adapter
   → dpu_common/filelists/dpu_pcie.f
-  → 改造后的 RDMA PCIe 适配器 / 混合工程所需的 virtio_dpu_pkg
+  → 改造后的 RDMA PCIe 适配器
   → 用户 env package 或 rdma_project_pkg
 ```
 
-RDMA PCIe adapter 引入公共 map 后必须排在 `dpu_pcie_pkg` 之后。普通 `.sv` 被 package include 时不能再单独编译；生产核心 filelist 不自动引入 project 示例。AIP 使用 `aip_core_set_param_expr`，不要同时编译旧 `aip_core` package；Host manager/pool 使用 `host_mem_pkg` 中的类型。
+RDMA PCIe adapter 引入公共 map 后必须排在 `dpu_pcie_pkg` 之后。普通 `.sv` 被 package include 时不能再单独编译；示例仅由新的 `integration/filelists/rdma_project.f` 显式引入，原有 filelist 不修改。独立案例不编译 `virtio_dpu_pkg`。AIP 使用 `aip_core_set_param_expr`，不要同时编译旧 `aip_core` package；Host manager/pool 使用 `host_mem_pkg` 中的类型。
 
 软件侧需在 `ubuntu@10.11.10.53` 的 VCS 环境验证共享资源、双 Host/双实例路由、错误拒绝、AIP 结果、配置顺序和原有模型回归。实际 DUT 引脚、复位、Intel 交互、DMA/网络数据和恢复结果由平台接入后验证。
 
@@ -304,6 +316,8 @@ RDMA PCIe adapter 引入公共 map 后必须排在 `dpu_pcie_pkg` 之后。普�
 - `af_mng.c:1180`，`dpu_af_insert_rdma_notify_tbl_entry()`：输入地址已经右移 13 位，按 `{host_id[2:0], address[60:13]}` 升序插入；填入 8 位 `rdma_vf_id`，通过 `wr32_for_high_order()` 写 8B 表项。
 - `af_mng.c:1338`，`dpu_af_alloc_rdma_vf_id()`：从 256 项 RDMA bitmap 分配 ID，不取 global Function ID。
 - `af_mng.c:1358` 的注释及 `:1363` 的 `dpu_af_configure_rdma_vf()`：名称中的 VF 实际指 PCI Function；依次配置 Notify、RDMA QSCH/RNET 以及相关 MSI-X。
+
+独立 bitmap 是该驱动的分配策略，不要求本项目另建 ID 池。当前 RDMA 配置统一取 DPU 的 global Function ID，验证 8 位范围后用于 RDMA 硬件字段；只有平台要求不同编号时再扩展映射。
 
 生成当前表项时，先验证实际 Notify 窗口的 8KiB 对齐、地址可编码范围、Host 和 RDMA ID 位宽，再组装：
 
@@ -328,59 +342,8 @@ sort_key    = entry[50:0]
 
 当前使能行为已有 [Virtio 设计记录](../../virtio_work/docs/superpowers/specs/2026-11-09-dpu-config-consolidation-design.md) 明确说明。采用驱动的字段来源、排序与资源身份规则，保留当前硬件布局和使能约定；不能因为找到旧源码就恢复旧 bank 或 `+0x48`。当前 VF-only 校验也不能据此宣称硬件仅支持 VF。
 
-## 10. RDMA 与 VIO 由一个 seq 配置
+## 10. 为后续共存保留的边界
 
-一个 `project_dut_cfg_seq` 持有同一 `dpu_cfg`、公共 map 和执行结果。是否需要 VIO/RDMA 由已解析的服务清单决定；混合 cfg 直接多组合一份 `virtio_net_env_config`，不再套一层统一业务配置对象。
+本轮不实现混合 seq。将来 RDMA/VIO 向同一个 DPU 提交各自需求，再消费同一组冻结快照；公共身份、BAR 和共享中断资源只分配一次。VIO 的 Function 内 pair index 与 global qpair ID 属于队列资源，不等于 global Function ID；共存本身不要求拆开 RDMA 与全局 Function 编号。实际 ring/QP/CQ/MR 与内存生命周期仍由各业务负责。
 
-```text
-统一预检：快照 / Function / RDMA ID / BAR / 表布局
-  → AF + 公共 BDF/BAR/MSI-X（按需求并集配置一次）
-  → VIO 准备实际 ring；读取已冻结的 RDMA Notify 映射
-  → 各自生成 Notify 记录；主 seq 合批写入
-  → 每个管理 BAR 一次 Notify 使能
-  → VIO QSCH/VTX/VRX；RDMA QSCH/RNET 路由
-  → RDMA probe 与实际 QP/CQ/MR 准备；其余必需配置与检查
-  → 全部成功后确认 READY，允许业务启动
-```
-
-RDMA Notify/RNET 所需的是冻结 Function 身份、RDMA ID 与实际 BAR 窗口，在 connect 的 `publish()` 前形成显式记录。主 seq 必须先完成这些路由配置，再启动会发送 CMQ 的 probe。QP/CQ/MR 的后续配置和网络投影才使用创建后的资源结果。
-
-VIO 生命周期复用当前 helper，不另抄 prepare/commit/release 实现：
-
-```systemverilog
-// 主 seq 内部片段：只借用 helper 的资源方法，所有 MMIO 仍由主 seq 发出。
-vio = vio_dpu_cfg_seq::type_id::create("vio_lifecycle");
-vio.cfg = cfg;
-vio.set_sequencer(m_sequencer);
-vio.prepare_vio_configuration(vio_scope, ok, error_msg);
-if (!completed_step("prepare_vio", ok)) return;
-```
-
-当前 helper 会查找每个 DPU Host 的 `vio_env_h<H>`；混合工程需完整发布这些句柄，无 VIO 服务的 Host 不创建 ring。不能只发布部分 Host 后假设 helper 会自动跳过。
-
-Notify 合批使用已存在的 API；下列片段位于主 seq 内，`has_vio/has_rdma` 从实际服务清单产生，scope 已完成校验。无服务时跳过生成，不能传一个空成员 scope 代表“空集合”。
-
-```systemverilog
-dpu_table_item_t	batch[$];
-dpu_table_item_t	items[$];
-dpu_table_kind_e	vio_kinds[$] = '{DPU_TABLE_NOTIFY};
-
-if (has_vio) begin
-	if (!cfg.queue_records(vio_scope, vio_kinds, items, error_msg)) return;
-	foreach (items[i]) batch.push_back(items[i]);
-end
-if (has_rdma) begin
-	if (!cfg.public_records(DPU_TABLE_RDMA_NOTIFY, rdma_scope, items, error_msg)) return;
-	foreach (items[i]) batch.push_back(items[i]);
-end
-
-// 两类记录都成功生成后，统一预检、发送、按管理 BAR 去重使能。
-write_records(batch, ok, error_msg);
-if (!completed_step("configure_notify", ok)) return;
-```
-
-这样既保留两种格式，又只有一次批次提交；任一记录生成失败不会写出另一类 Notify，任一表写失败不会发送本批使能。其他类别也由主 seq 的公共方法执行，AF 写计数不会在两类业务间重新开始。
-
-混合场景不能为同一个 RC 分别安装 VIO 和 RDMA driver override；一个接收入口按 Function/service 路由到正确的 DMA 检查，仍由 PCIe 唯一 responder 应答。首个案例使用不同 Function 承载两类业务；同一 Function 同时承载两类服务时，还需按实际地址分配和中断身份分派，不能仅靠 Requester ID 区分，当前案例不宣称已支持。
-
-混合工程的 AIP 命令只保留 `dut_config`、一个协调重载 task 和已有 `reg_acc`。重载必须先确认两类资源都处于允许阶段，再验证全部候选后一次提交；不能先改好 VIO 再发现 RDMA 活动而返回失败。
+后续项目级 seq 可以复用当前独立类别接口统一编排，不需要现在增加通用服务注册器、跨业务状态机或 VIO 编译依赖。RDMA 的外部绑定接口只接收 DPU 结果和必要的 PCIe/内存/网络句柄，不反向修改快照，这样保留后续组合能力。
