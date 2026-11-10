@@ -18,6 +18,10 @@ package rdma_env_pkg;
   import dpu_resource_pkg::*;
   import rdma_dpu_adapter_pkg::*;
   import rdma_netpkt_pkg::*;
+`ifdef RDMA_NETPKT_USE_NET_PACKET_PKG
+  // 组合环境直接导入协议枚举，确保 payload_mode_e 等名称与 VIO 使用同一类型身份。
+  import net_packet_pkg::*;
+`endif
 
   typedef byte unsigned rdma_byte_q[$];
 

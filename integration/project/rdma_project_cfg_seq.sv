@@ -39,10 +39,10 @@ class rdma_project_cfg_seq extends dpu_cfg_seq;
     output string			why
   );
 
-  // 功能：预检全部必需表和每个 Function 的记录覆盖，并建立公共/中断/RDMA scope。
+  // 功能：公开无写入的完整预检供组合序列复用，检查必需表及 Function 覆盖并建立三个 scope。
   // 输入/输出及副作用：读取已发布 cfg 和 rdma_functions；三个 scope 为输出，不发 MMIO、不修改冻结 catalog。
   // 失败/边界：拒绝未发布/异源资源、缺表、编码/排序错误、重复目录及含尾项的容量/溢出/对齐/重叠/管理窗口错误。
-  extern protected function bit preflight(
+  extern function bit preflight(
     output dpu_cfg_scope	bdf_scope,
     output dpu_cfg_scope	msix_scope,
     output dpu_cfg_scope	rdma_scope,
@@ -408,7 +408,7 @@ function bit rdma_project_cfg_seq::validate_targets(
   return 1;
 endfunction
 
-// 功能：预检全部必需表和每个 Function 的记录覆盖，并建立公共/中断/RDMA scope。
+// 功能：公开无写入的完整预检供组合序列复用，检查必需表及 Function 覆盖并建立三个 scope。
 // 输入/输出及副作用：读取已发布 cfg 和 rdma_functions；三个 scope 为输出，不发 MMIO、不修改冻结 catalog。
 // 失败/边界：拒绝未发布/异源资源、缺表、编码/排序错误、重复目录及含尾项的容量/溢出/对齐/重叠/管理窗口错误。
 function bit rdma_project_cfg_seq::preflight(

@@ -2,7 +2,7 @@
 // 职责：直接使用外部 net_packet 做 RoCEv2 帧编解码：设备内部的 rdma_packet（RDMA 语义字段）编码为
 //   Ethernet + IPv4 + UDP + BTH/扩展头 + 负载 + ICRC 帧，并把帧解析回 rdma_packet（校验各层与 ICRC）。
 //   RC/UD 按 IBTA opcode；URC 用 0b110 前缀，扩展头随负载前缀原样携带（net_packet 不识别 URC 扩展头）。
-// 依赖：外部 net_packet（packet.sv 及协议头，经 NET_PACKET_ROOT）、rdma_types_pkg、rdma_model_pkg；
+// 依赖：外部 net_packet（组合环境导入 net_packet_pkg，独立环境包含 packet.sv）、rdma_types_pkg、rdma_model_pkg；
 //   编译了 aip_core 时导入 aip_core_pkg（上游协议头的参数加载）。
 // 所有权：codec 只持有帧地址配置；编解码产生新对象，不修改输入。
 // 生命周期：随使用方存在。
@@ -13,9 +13,16 @@ package rdma_netpkt_pkg;
 `ifdef AIP_CMDLINE_SV
   import aip_core_pkg::*;
 `endif
+  // 组合 project_env 时复用 virtio_work 已编译的 net_packet_pkg，避免同一 packet/header
+  // 源码被两个 package 以不同类型身份展开；旧独立 filelist 仍保留本地 include 路径。
+`ifdef RDMA_NETPKT_USE_NET_PACKET_PKG
+  import net_packet_pkg::*;
+  export net_packet_pkg::*;
+`else
   // 上游 packet/header 声明在编译单元作用域，VCS 不允许 package 内 forward typedef 绑定外部 $unit
-  // 类；故在本 package 内 include packet.sv，使协议类型同处一个作用域（不复制源码）。
+  // 类；故独立环境在本 package 内 include packet.sv，使协议类型同处一个作用域（不复制源码）。
   `include "packet.sv"
+`endif
   import uvm_pkg::*;
   import rdma_types_pkg::*;
   import rdma_model_pkg::*;
@@ -36,7 +43,7 @@ package rdma_netpkt_pkg;
     bit [11:0] vlan_id;
 
     // 功能：构造使用固定 loopback MAC/IPv4 端点的 RoCEv2 帧 codec。
-    // 输入/输出及副作用：name 成为 UVM 名；只初始化四个地址值，不持有 packet 或帧对象。
+    // 输入/输出及副作用：name 成为 UVM 名；初始化 MAC/IP、UDP 端口和 VLAN 默认值，不持有 packet/帧对象。
     // 失败/边界：空 name 由 UVM 接受；真实链路必须在首次 encode 前覆盖地址，否则使用 10.0.0.1→10.0.0.2。
     function new(string name = "rdma_netpkt_codec");
       super.new(name);
@@ -51,8 +58,8 @@ package rdma_netpkt_pkg;
     endfunction
 
     // 功能：把 rdma_packet 编码为完整 Ethernet 帧（不足 64B 补零）。
-    // 输入/输出及副作用：frame 输出新字节队列。
-    // 失败/边界：opcode/分段组合不被该传输支持或 pack 失败时返回错误，frame 为空。
+    // 输入/输出及副作用：value 只读；frame 先清空，成功输出包含填充及 ICRC 的新字节队列。
+    // 失败/边界：value 为空、opcode/分段不支持、协议层添加失败或打包帧过短时返回错误，frame 为空。
     function rdma_status encode(rdma_packet value, output byte unsigned frame[$]);
       packet net_value;
       rocev2_bth roce;
@@ -98,7 +105,7 @@ package rdma_netpkt_pkg;
 
     // 功能：解析 Ethernet 帧为 rdma_packet：header_bytes 为 BTH（与 DETH）之后的扩展头，payload 去掉
     //   pad 与 ICRC；校验 net_packet 各层与 ICRC。
-    // 输入/输出及副作用：value 输出新对象。
+    // 输入/输出及副作用：frame 只读；value 输出解码后的独立对象，含扩展头和去除填充的 payload。
     // 失败/边界：长度不足、不是 RoCEv2、边界非法、校验失败或未知 opcode 返回错误，value 为 null。
     function rdma_status decode(byte unsigned frame[$], output rdma_packet value);
       packet net_value;
@@ -226,7 +233,7 @@ package rdma_netpkt_pkg;
     endfunction
 
     // 功能：校验 snapshot 输入的冻结状态、来源身份、reset epoch 和各自 profile 合法性。
-    // 输入/输出及副作用：只读四个 snapshot；返回首个失败 status，不改写任何输入。
+    // 输入/输出及副作用：qp/qpc/message/netpacket 只读；返回首个来源、epoch 或各自 validate 的失败状态。
     // 失败/边界：null、未冻结、身份/epoch 不一致或 INVALID 字段立即拒绝；此处不创建缺失资源、不调用 endpoint。
     protected static function rdma_status validate_snapshot_inputs(
       rdma_qp_snapshot qp,
@@ -265,8 +272,8 @@ package rdma_netpkt_pkg;
 
     // 功能：把 message opcode、QPN/PSN、payload 和 netpacket transport 投影到独立 packet 副本。
     // 输入/输出及副作用：packet 为可写的临时副本；四个 snapshot 只读；返回投影状态。
-    // 失败/边界：固定字段冲突、不支持的 WR/transport、远端字段不完整或 imm/atomic 语义不匹配返回
-    //   错误；原 packet 和 QPC snapshot 保持不变。
+    // 失败/边界：空 packet、不支持的 WR/transport、固定 QPN/PSN/DMAC/VLAN 冲突返回错误；
+    //   失败可能已更新该临时 packet 的前序字段，调用方必须丢弃它，四个 snapshot 始终不变。
     protected static function rdma_status project_packet(
       rdma_packet packet,
       rdma_qp_snapshot qp,
@@ -397,8 +404,8 @@ package rdma_netpkt_pkg;
     endfunction
 
     // 功能：将 QPC/netpacket 的 wire 地址投影到 codec 自有配置。
-    // 输入/输出及副作用：修改 codec 的地址值，不修改 snapshot；netpacket 固定值优先，QPC 只作默认路径。
-    // 失败/边界：零地址保持 codec 原默认值；一致性冲突已由 project_packet 拒绝。
+    // 输入/输出及副作用：只读 qpc/netpacket；先重置 codec 默认地址，再投影非零固定地址和固定 VLAN。
+    // 失败/边界：两 snapshot 须非空且已通过 project_packet 校验；零地址保留本次重置值，固定 VLAN=0 仍启用。
     protected function void configure_snapshot_addresses(rdma_qpc_snapshot qpc,
                                                           rdma_netpacket_snapshot netpacket);
       src_mac = 48'h0002_0000_0001;
@@ -433,9 +440,9 @@ package rdma_netpkt_pkg;
       end
     endfunction
 
-    // 功能：BTH 在帧中的偏移与有效帧终点（按 IPv4 total_length/UDP length 去掉以太网补齐）。
-    // 输入/输出及副作用：纯查询。
-    // 失败/边界：缺长度字段时终点为帧长。
+    // 功能：按协议层长度定位 BTH，并用 IPv4/UDP 声明长度收窄帧的有效终点。
+    // 输入/输出及副作用：net_value 只读；rdma_offset 输出 RoCE 层偏移，frame_end 输出最小有效终点。
+    // 失败/边界：net_value 须非空；未找到 RoCE 层时偏移为 0，没有可收窄的长度字段时终点为 raw_data 长度。
     protected static function void locate_bounds(packet net_value, output int unsigned rdma_offset,
                                                  output int unsigned frame_end);
       ipv4_header ip4;
@@ -466,24 +473,24 @@ package rdma_netpkt_pkg;
         frame_end = udp_offset + udp.length;
     endfunction
 
-    // 功能：大端读 32 位扩展头字段。
-    // 输入/输出及副作用：纯函数。
-    // 失败/边界：长度不足返回 0。
+    // 功能：以网络字节序读取一个 32 位扩展头字段。
+    // 输入/输出及副作用：bytes/offset 只读；返回从 offset 起四字节的高位到低位拼接。
+    // 失败/边界：不足四字节返回 0；offset 来自有界帧偏移，调用方须保证 offset+4 不溢出。
     protected static function bit [31:0] be32(byte unsigned bytes[$], int unsigned offset);
       if (offset + 4 > bytes.size())
         return '0;
       return {bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]};
     endfunction
 
-    // 功能：大端读 64 位扩展头字段。
-    // 输入/输出及副作用：纯函数。
-    // 失败/边界：长度不足的部分为 0。
+    // 功能：组合两个网络序 DWORD，读取 64 位扩展头字段。
+    // 输入/输出及副作用：bytes/offset 只读；返回 be32(offset) 为高半部、be32(offset+4) 为低半部的值。
+    // 失败/边界：不完整的四字节半部整体置零；调用方须保证 offset+8 在无符号索引范围内。
     protected static function bit [63:0] be64(byte unsigned bytes[$], int unsigned offset);
       return {be32(bytes, offset), be32(bytes, offset + 4)};
     endfunction
 
     // 功能：按 IBTA 表把 (opcode, segment) 映射为 BTH opcode 低 5 位（RC/UD 共用编号）。
-    // 输入/输出及副作用：low 输出；纯函数。
+    // 输入/输出及副作用：opcode/segment 只读；low 输出 wire 低五位，返回值表示该分段组合可编码。
     // 失败/边界：组合不存在（如 READ 请求分段、ACK 分段）返回 0。
     protected static function bit low_opcode(rdma_network_opcode_e opcode,
                                              rdma_packet_segment_e segment, output bit [4:0] low);
@@ -524,8 +531,8 @@ package rdma_netpkt_pkg;
 
     // 功能：rdma_packet → 完整 BTH opcode：RC 前缀 000、UD 011（仅 SEND ONLY）、URC 110（READ 请求
     //   可分 FIRST/MIDDLE/LAST 0x0d-0x0f，每个请求包对应一个 READ 响应 ONLY）。
-    // 输入/输出及副作用：opcode 输出；纯函数。
-    // 失败/边界：组合不被该传输支持返回 UNSUPPORTED_OPCODE。
+    // 输入/输出及副作用：value 须非空且只读；opcode 先清零，成功输出 transport 前缀与操作低五位。
+    // 失败/边界：操作/分段未知、URC READ 响应非 ONLY、UD 非 SEND ONLY 或其他 transport 均返回 UNSUPPORTED_OPCODE。
     protected static function rdma_status map_opcode(rdma_packet value, output bit [7:0] opcode);
       bit [4:0] low;
 
@@ -556,8 +563,8 @@ package rdma_netpkt_pkg;
 
     // 功能：由 rdma_packet 填 BTH/DETH 与扩展头（header_bytes 依次为 RETH、AETH、AtomicETH、
     //   AtomicAckETH、ImmDt、IETH 中该 opcode 带的部分）。
-    // 输入/输出及副作用：roce 输出新对象。
-    // 失败/边界：opcode 不支持时返回 map_opcode 的错误。
+    // 输入/输出及副作用：value 须非空且只读；roce 成功输出启用 ICRC 的新协议头对象。
+    // 失败/边界：opcode 不支持时 roce=null 并返回 map_opcode 错误；缺少完整 DWORD 的扩展字段由 be32/be64 补零。
     protected static function rdma_status populate_roce_header(rdma_packet value,
                                                                output rocev2_bth roce);
       bit [7:0] opcode;
@@ -617,8 +624,8 @@ package rdma_netpkt_pkg;
     endfunction
 
     // 功能：SEND/WRITE 组内偏移（0..5：FIRST、MIDDLE、LAST、LAST_IMM、ONLY、ONLY_IMM）→ 分段。
-    // 输入/输出及副作用：纯函数。
-    // 失败/边界：越界偏移按 ONLY。
+    // 输入/输出及副作用：offset 只读；0/1 返回 FIRST/MIDDLE，2/3 返回 LAST，其他值返回 ONLY。
+    // 失败/边界：4/5 和范围外偏移均走 ONLY，不报告错误或修改状态。
     protected static function rdma_packet_segment_e seg_of(bit [4:0] offset);
       case (offset)
         5'd0: return RDMA_SEG_FIRST;
@@ -629,8 +636,8 @@ package rdma_netpkt_pkg;
     endfunction
 
     // 功能：BTH/DETH → rdma_packet 的传输、opcode、分段、QPN、PSN、Q_Key。
-    // 输入/输出及副作用：value 输出新对象。
-    // 失败/边界：未知前缀或 opcode、UD 非 SEND ONLY 返回 UNSUPPORTED_OPCODE。
+    // 输入/输出及副作用：roce 须非空且只读；value 创建并填入协议字段，NAK 的 wire 编号先解释为 ACK。
+    // 失败/边界：未知前缀/opcode 或 UD 非 SEND ONLY 返回 UNSUPPORTED_OPCODE；失败留下部分对象，由 decode 清空。
     protected static function rdma_status decode_roce_header(rocev2_bth roce,
                                                              output rdma_packet value);
       bit [7:0] full;
@@ -682,8 +689,8 @@ package rdma_netpkt_pkg;
     endfunction
 
     // 功能：URC：按 opcode/分段的扩展头长度把负载前缀切回 header_bytes。
-    // 输入/输出及副作用：修改 value.header_bytes/payload。
-    // 失败/边界：负载短于扩展头返回 CODEC_ERROR。
+    // 输入/输出及副作用：value 须非空；以 header_length() 为界，把 payload 前缀移入重新清空的 header_bytes。
+    // 失败/边界：负载短于扩展头返回 CODEC_ERROR 且对象不变；扩展头长度为 0 时只清空旧 header_bytes。
     protected static function rdma_status split_urc_headers(rdma_packet value);
       int unsigned n;
 
