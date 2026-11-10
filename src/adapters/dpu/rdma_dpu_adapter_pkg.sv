@@ -1,7 +1,7 @@
 // 目录：外部适配器实现层 adapters/dpu/rdma_dpu_adapter_pkg.sv。
 // 层：外部适配器。
 // 职责：dpu_common 是全局 Function 的唯一控制方。rdma_dpu_system 按快照为每个 Function 建立设备、
-//   主机内存域、BAR、驱动并 probe，并按快照的 PF→VF/Host 关系给出 FLR、PF FLR、Host 与整设备复位
+//   主机内存域、BAR、驱动；外部模式借用冻结快照与硬件，显式预检拒绝缺失的 RDMA 资源契约。模型按快照给出复位
 //   范围；下层把 dpu_common 的逻辑设备配置接入 RDMA 驱动/设备模型：按 Host/PF/VF 声明生成
 //   dpu_device_cfg（BAR 请求取 dut_caps.bar_profiles），经 dpu_device_resolver 解析并冻结快照；
 //   把快照中每个 Function 投影为 host_id、global Function ID（驱动 QPC/PD 的 VF_ID）、BDF、BAR，
@@ -9,10 +9,12 @@
 //   Function 的设备；MAILBOX/MSI-X 控制面同样只接受快照解码出的 Function，并以独立 reset epoch
 //   隔离 FLR 前后的寄存器状态、pending 位与中断事件。
 // 依赖：dpu_common（dpu_resource_pkg）、rdma_types/model、rdma_host_mem_pkg、rdma_dev、rdma_drv。
-// 所有权：快照与 cfg 由调用方持有；Function 投影为值快照；路由器只借用设备引用。
+// 所有权：模型 cfg/dev/router 与公共 host_mem_pool 由系统持有；外部快照、hw、driver cfg 和 pool 归平台。
+//   pool 唯一持有各 Host manager，节点只拥有 Function 分配账本并借用 manager；发布后不得替换 pool。
 // 生命周期：测试建立拓扑时创建，仿真期间常驻。
 package rdma_dpu_adapter_pkg;
   import uvm_pkg::*;
+  import host_mem_pkg::*;
   `include "uvm_macros.svh"
   import dpu_resource_pkg::*;
   import rdma_types_pkg::*;
@@ -120,37 +122,14 @@ package rdma_dpu_adapter_pkg;
       super.new(name);
     endfunction
 
-    // 功能：声明一个 Host 及其 PCIe domain（segment 为负时取 host_id，BDF 0x0010..0x00ff，MMIO 窗口
-    //   [4GiB*(host+1), +4GiB) 允许 DEVICE_MEMORY/MAILBOX/MSI-X，BAR 随机放置）。
-    // 输入/输出及副作用：追加 cfg.hosts；该 Host 的 Function 用同一 segment。
-    // 失败/边界：无（合法性由 resolver 校验）。
-    static function void add_host(dpu_device_cfg cfg, int unsigned host_id,
-                                  int segment_id = -1);
-      dpu_host_cfg host;
-      dpu_pcie_domain_cfg domain;
-      dpu_mmio_window_cfg window;
-      dpu_bdf_range_t range;
-
-      host = dpu_host_cfg::type_id::create($sformatf("host%0d", host_id));
-      host.host_id = host_id;
-      domain = dpu_pcie_domain_cfg::type_id::create($sformatf("domain%0d", host_id));
-      domain.key.host_id = host_id;
-      domain.key.segment_id = segment_id < 0 ? host_id : segment_id;
-      range.first_bdf = 16'h0010;
-      range.last_bdf = 16'h00ff;
-      domain.bdf_ranges.push_back(range);
-      window = dpu_mmio_window_cfg::type_id::create($sformatf("window%0d", host_id));
-      window.base = MMIO_WINDOW_BYTES * (host_id + 1);
-      window.limit = window.base + MMIO_WINDOW_BYTES;
-      window.allowed_roles.push_back(DPU_BAR_DEVICE_MEMORY);
-      window.allowed_roles.push_back(DPU_BAR_MAILBOX);
-      window.allowed_roles.push_back(DPU_BAR_MSIX);
-      domain.mmio_windows.push_back(window);
-      // BAR 基址由 dpu_common resolver 在窗口内随机放置（满足对齐/同域不重叠），随快照冻结。
-      domain.bar_placement_policy = DPU_BAR_PLACEMENT_RANDOM;
-      host.pcie_domains.push_back(domain);
-      cfg.hosts.push_back(host);
-    endfunction
+    // 功能：声明模型 Host 的 PCIe domain、4GiB MMIO 窗口与256MiB GPA，供冻结后公共 pool 消费。
+    // 输入/输出及副作用：cfg 追加 host_id；segment_id<0 时取 host_id，BAR 仍由 DPU 随机放置。
+    // 失败/边界：不创建内存或解析拓扑；重复 Host、地址位宽和窗口合法性由后续 DPU resolver 拒绝。
+    extern static function void add_host(
+      dpu_device_cfg	cfg,
+      int unsigned	host_id,
+      int		segment_id = -1
+    );
 
     // 功能：声明一个 PF/VF（BDF 与 BAR 自动分配；BAR 请求按 dut_caps.bar_profiles 中该类型的
     //   全部角色），并声明 RDMA 服务。第一个声明的 Function 作为 AF 请求者。
@@ -261,6 +240,43 @@ package rdma_dpu_adapter_pkg;
       return snapshot.get_pcie_id(parent, f.parent_pcie_id, why);
     endfunction
   endclass
+
+  // 功能：声明模型 Host 的 PCIe domain、4GiB MMIO 窗口与256MiB GPA，供冻结后公共 pool 消费。
+  // 输入/输出及副作用：cfg 追加 host_id；segment_id<0 时取 host_id，BAR 仍由 DPU 随机放置。
+  // 失败/边界：不创建内存或解析拓扑；重复 Host、地址位宽和窗口合法性由后续 DPU resolver 拒绝。
+  function void rdma_dpu_topology::add_host(
+    dpu_device_cfg	cfg,
+    int unsigned	host_id,
+    int		segment_id = -1
+  );
+    dpu_host_cfg		host;
+    dpu_pcie_domain_cfg	domain;
+    dpu_mmio_window_cfg	window;
+    dpu_bdf_range_t		range;
+
+    host = dpu_host_cfg::type_id::create($sformatf("host%0d", host_id));
+    host.host_id          = host_id;
+    host.has_gpa_aperture = 1;
+    host.gpa_base         = 64'h40_0000_0000 + 64'(host_id) * 64'h1_0000_0000;
+    host.gpa_limit        = host.gpa_base + 64'h1000_0000;
+    domain = dpu_pcie_domain_cfg::type_id::create($sformatf("domain%0d", host_id));
+    domain.key.host_id    = host_id;
+    domain.key.segment_id = segment_id < 0 ? host_id : segment_id;
+    range.first_bdf = 16'h0010;
+    range.last_bdf  = 16'h00ff;
+    domain.bdf_ranges.push_back(range);
+    window = dpu_mmio_window_cfg::type_id::create($sformatf("window%0d", host_id));
+    window.base  = MMIO_WINDOW_BYTES * (host_id + 1);
+    window.limit = window.base + MMIO_WINDOW_BYTES;
+    window.allowed_roles.push_back(DPU_BAR_DEVICE_MEMORY);
+    window.allowed_roles.push_back(DPU_BAR_MAILBOX);
+    window.allowed_roles.push_back(DPU_BAR_MSIX);
+    domain.mmio_windows.push_back(window);
+    // BAR 基址由 dpu_common resolver 在窗口内随机放置（满足对齐/同域不重叠），随快照冻结。
+    domain.bar_placement_policy = DPU_BAR_PLACEMENT_RANDOM;
+    host.pcie_domains.push_back(domain);
+    cfg.hosts.push_back(host);
+  endfunction
 
   // 每个 Function 独占一个控制器。控制器在 configure 时深拷贝 Function key、PCIe ID、global ID、
   // BAR lease 与 DUT caps，之后不再借用可变 rdma_dpu_function 投影；它拥有寄存器、pending 位和
@@ -1058,218 +1074,524 @@ package rdma_dpu_adapter_pkg;
     endtask
   endclass
 
-  // 一个 Function 的全部模型对象。
+  // Function 投影节点：模型对象由系统拥有；外部模式只借用平台快照、硬件端口及驱动配置。
   class rdma_dpu_node extends uvm_object;
     `uvm_object_utils(rdma_dpu_node)
 
-    rdma_dpu_function func;
-    rdma_host_mem mem;
-    rdma_dev dev;
-    rdma_dpu_interrupt_ctrl interrupt_ctrl;
-    rdma_dpu_bar bar;
-    rdma_drv_hw hw;
-    rdma_drv_dev drv;
+    rdma_dpu_function		func;
+    rdma_host_mem		mem;
+    rdma_dev			dev;
+    rdma_dpu_interrupt_ctrl	interrupt_ctrl;
+    dpu_device_snapshot		source_snapshot;
+    bit				external_configuration;
+    rdma_drv_config		drv_cfg;
+    rdma_drv_bar		bar;
+    rdma_drv_hw			hw;
+    rdma_drv_dev		drv;
 
     // 功能：构造尚未装配 Function 投影、设备、MAILBOX/MSI-X 控制器、驱动 BAR 与硬件绑定的空节点。
-    // 输入/输出及副作用：name 仅作为 UVM 对象名；成员由 rdma_dpu_system::build 按快照统一赋值。
+    // 输入/输出及副作用：name 为 UVM 名；引用清空且 external_configuration=0，build/bind_snapshot 后才拥有模型或借用外部句柄。
     // 失败/边界：build 完成前成员引用为空，调用方不得用空节点发 MMIO、DMA 或中断事务。
-    function new(string name = "rdma_dpu_node");
-      super.new(name);
-      func = null;
-      mem = null;
-      dev = null;
-      interrupt_ctrl = null;
-      bar = null;
-      hw = null;
-      drv = null;
-    endfunction
+    extern function new(string	name = "rdma_dpu_node");
   endclass
+
+  // 功能：构造尚未装配 Function 投影、设备、MAILBOX/MSI-X 控制器、驱动 BAR 与硬件绑定的空节点。
+  // 输入/输出及副作用：name 为 UVM 名；引用清空且 external_configuration=0，build/bind_snapshot 后才拥有模型或借用外部句柄。
+  // 失败/边界：build 完成前成员引用为空，调用方不得用空节点发 MMIO、DMA 或中断事务。
+  function rdma_dpu_node::new(string	name = "rdma_dpu_node");
+    super.new(name);
+    func = null;
+    mem = null;
+    dev = null;
+    interrupt_ctrl = null;
+    bar = null;
+    hw = null;
+    drv = null;
+    drv_cfg = null;
+    source_snapshot = null;
+    external_configuration = 0;
+  endfunction
 
   // 全局 Function 控制：dpu_common 拓扑 → 每个 Function 的设备/内存/BAR/驱动，复位范围由快照推出。
   class rdma_dpu_system extends uvm_object;
     `uvm_object_utils(rdma_dpu_system)
 
-    dpu_device_cfg cfg;
-    dpu_device_snapshot snapshot;
-    rdma_dpu_bar_router router;
-    // 各 Host 的 host_mem（Function 在其 Host 的 manager 上分配）。
-    rdma_host_mems mems;
-    rdma_dpu_node nodes[$];
+    dpu_device_cfg		cfg;
+    dpu_device_snapshot		snapshot;
+    dpu_resource_snapshot	resources;
+    protected bit		binding_locked;
+    bit				external_configuration;
+    rdma_dpu_bar_router		router;
+    // 公共 pool 是唯一 Host 映射；build/bind_snapshot 发布后仅供消费者借用，不得直接替换。
+    host_mem_pool		mem_pool;
+    rdma_dpu_node		nodes[$];
 
-    // 功能：构造可追加 Host/Function 的空系统，创建本系统拥有的 cfg 与 host_mem 管理器。
-    // 输入/输出及副作用：name 派生 cfg/mems 名称；snapshot/router 为 null，nodes 为空，外部依赖尚未启动。
+    // 功能：构造可追加 Host/Function 的空系统，仅创建本系统拥有的 cfg。
+    // 输入/输出及副作用：name 派生 cfg 名称；snapshot/router/mem_pool 为 null，nodes 为空，不创建 Host backing。
     // 失败/边界：调用 build 前不能 probe/start/发 MMIO；配置合法性与容量约束延迟到 resolver。
-    function new(string name = "rdma_dpu_system");
-      super.new(name);
-      cfg = dpu_device_cfg::type_id::create({name, "_cfg"});
-      snapshot = null;
-      router = null;
-      mems = rdma_host_mems::type_id::create({name, "_mems"});
-    endfunction
+    extern function new(string	name = "rdma_dpu_system");
 
     // 功能：声明 Host（见 rdma_dpu_topology::add_host）。
     // 输入/输出及副作用：写 cfg。
     // 失败/边界：合法性由 build 时的 resolver 校验。
-    function void add_host(int unsigned host_id, int segment_id = -1);
-      rdma_dpu_topology::add_host(cfg, host_id, segment_id);
-    endfunction
+    extern function void add_host(int unsigned	host_id, int	segment_id = -1);
 
     // 功能：声明 PF/VF（见 rdma_dpu_topology::add_function）。
     // 输入/输出及副作用：写 cfg。
     // 失败/边界：合法性由 build 时的 resolver 校验。
-    function void add_function(int unsigned host_id, int unsigned pf_id, dpu_function_kind_e kind,
-                               int unsigned vf_id);
-      rdma_dpu_topology::add_function(cfg, host_id, pf_id, kind, vf_id);
-    endfunction
+    extern function void add_function(int unsigned	host_id, int unsigned	pf_id, dpu_function_kind_e	kind,
+                               int unsigned	vf_id);
+
+    // 功能：校验并一次性发布外部 RDMA Function 的冻结身份投影，不运行 resolver 或创建模型设备。
+    // 输入/输出及副作用：source/pool 借自平台，keys 指定节点顺序；成功发布 mem_pool/nodes/snapshot，不分配 Host 内存。
+    // 失败/边界：已有拓扑、未冻结 source、空 pool/keys、重复/非RDMA/ID>255/BAR缺失或 Host manager 的身份/初始化/GPA不符均拒绝；不部分发布。
+    extern function rdma_status bind_snapshot(
+      dpu_device_snapshot	source,
+      dpu_function_key_t		keys[$],
+      host_mem_pool		pool
+    );
+
+    // 功能：记录与设备快照同源的冻结资源快照，仅证明来源，不把 VIO 分配解释为 RDMA 许可。
+    // 输入/输出及副作用：value 借用不转移所有权；成功更新 resources，不发 MMIO。
+    // 失败/边界：非外部系统、未冻结/异源 value、已绑定不同资源或初始化开始均拒绝；同句柄重复绑定在启动前幂等。
+    extern function rdma_status bind_resources(dpu_resource_snapshot	value);
+
+    // 功能：为外部节点借用平台已绑定的硬件上下文和显式驱动配置，保持 Host 视图唯一。
+    // 输入/输出及副作用：i 选择节点，hw/cfg_arg 归调用方所有；成功保存 hw/bar/drv_cfg，不 probe。
+    // 失败/边界：非外部、越界、空配置/端口、Host 视图不一致、替换已绑定上下文或启动后修改均拒绝。
+    extern function rdma_status bind_external_hw(int unsigned	i, rdma_drv_hw	hw, rdma_drv_config	cfg_arg);
+
+    // 功能：在任何 probe/MMIO 前检查整个系统的初始化契约，纯查询不替换节点或驱动。
+    // 输入/输出及副作用：返回首个缺失依赖的 status；模型只检查完整装配，外部进一步检查配置与资源来源。
+    // 失败/边界：空系统、缺失硬件/内存、视图与 pool 不一致、外部缺显式配置或同源资源均 INVALID_STATE；当前外部缺 RDMA shared grant 仍拒绝。
+    extern function rdma_status validate_initialization();
+
+    // 功能：关闭外部装配入口，防止初始化请求与后续配置替换交错。
+    // 输入/输出及副作用：置 binding_locked；不访问节点驱动或 MMIO，重复调用幂等。
+    // 失败/边界：即使随后预检失败也不重新开放，恢复须建立新的环境生命周期。
+    extern function void lock_bindings();
+
+    // 功能：预检完整复位范围，避免先复位模型节点后才发现外部 FLR 无平台支持。
+    // 输入/输出及副作用：scope 为节点索引队列；只返回 status，不改资源库、epoch 或设备。
+    // 失败/边界：外部系统或无模型节点 INVALID_STATE；模型越界 INVALID_ARGUMENT，模型空范围成功。
+    extern function rdma_status validate_reset(int unsigned	scope[$]);
 
     // 功能：解析冻结快照，按快照顺序为每个 Function 建立节点：所属 Host 的主机内存、设备、独占
     //   MAILBOX/MSI-X 控制器、BAR 路由与驱动硬件绑定；不启动 NIC、不 probe。
-    // 输入/输出及副作用：设置 snapshot/router/nodes；控制器容量、BDF 和三个 BAR 均来自同一冻结投影。
-    // 失败/边界：拓扑解析、中断控制器配置或硬件绑定失败立即返回其 status；失败节点不加入 nodes。
-    function rdma_status build();
-      rdma_dpu_function funcs[$];
-      rdma_dpu_node n;
-      rdma_status status;
-      string name;
-
-      status = rdma_dpu_topology::resolve(cfg, snapshot, funcs);
-      if (!status.ok())
-        return status;
-      router = rdma_dpu_bar_router::type_id::create({get_name(), "_router"});
-      router.snapshot = snapshot;
-      nodes.delete();
-      foreach (funcs[i]) begin
-        name = $sformatf("%s_f%0d", get_name(), funcs[i].global_id);
-        n = rdma_dpu_node::type_id::create(name);
-        n.func = funcs[i];
-        n.mem = mems.make(funcs[i].key.host_id, {name, "_mem"});
-        n.dev = rdma_dev::type_id::create({name, "_dev"});
-        n.dev.configure(n.mem);
-        n.interrupt_ctrl = rdma_dpu_interrupt_ctrl::type_id::create({name, "_interrupt_ctrl"});
-        status = n.interrupt_ctrl.configure(funcs[i]);
-        if (!status.ok())
-          return status;
-        n.bar = rdma_dpu_bar::type_id::create({name, "_bar"});
-        n.bar.router = router;
-        n.bar.func = funcs[i];
-        n.hw = rdma_drv_hw::type_id::create({name, "_hw"});
-        status = n.hw.bind_hw(n.bar, n.mem);
-        if (!status.ok())
-          return status;
-        status = router.attach(funcs[i], n.dev, n.interrupt_ctrl);
-        if (!status.ok())
-          return status;
-        n.drv = null;
-        nodes.push_back(n);
-      end
-      return rdma_status::success();
-    endfunction
+    // 输入/输出及副作用：创建 mem_pool，并按 snapshot GPA 创建各 Host manager；设置 router/nodes，不重用外部运行期资源。
+    // 失败/边界：已绑定拓扑/已开始初始化、GPA缺失或pool创建失败拒绝；其余解析/绑定失败透传，失败节点不发布。
+    extern function rdma_status build();
 
     // 功能：为 build 后的每个节点启动一个 NIC 收发常驻进程，端口由调用方在本 task 前接入。
     // 输入/输出及副作用：借用 nodes[i].dev 并以 fork/join_none 返回；进程生命周期由仿真结束或外部停止控制。
-    // 失败/边界：nodes 为空时幂等返回；重复调用会为同一 NIC 启动重复 run 进程，调用方必须避免。
-    task start();
-      foreach (nodes[i]) begin
-        automatic rdma_dev d = nodes[i].dev;
-        fork
-          d.nic.run();
-        join_none
-      end
-    endtask
+    // 失败/边界：空节点集合或外部节点无 dev 时跳过；模型重复调用仍会启动重复进程，调用方必须避免。
+    extern task start();
 
     // 功能：probe 第 i 个节点的驱动：driver cfg（为 null 时用默认）的 host_id 与 vf_id（global
     //   Function ID）取自快照。
     // 输入/输出及副作用：替换节点驱动。
-    // 失败/边界：i 越界返回 INVALID_ARGUMENT；probe 失败返回其 status。
-    task probe(int unsigned i, output rdma_status status, input rdma_drv_config drv_cfg = null);
-      if (i >= nodes.size()) begin
-        status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "no such dpu node");
-        return;
-      end
-      if (drv_cfg == null)
-        drv_cfg = rdma_drv_config::type_id::create({nodes[i].get_name(), "_drv_cfg"});
-      drv_cfg.host_id = nodes[i].func.key.host_id;
-      drv_cfg.vf_id = nodes[i].func.global_id;
-      nodes[i].drv = rdma_drv_dev::type_id::create({nodes[i].get_name(), "_drv"});
-      nodes[i].drv.probe(drv_cfg, nodes[i].hw, status);
-    endtask
+    // 失败/边界：i 越界 INVALID_ARGUMENT；全系统预检失败或已有驱动 INVALID_STATE；probe 失败保留失败驱动并返回 status。
+    extern task probe(int unsigned	i, output rdma_status	status, input rdma_drv_config	drv_cfg = null);
 
     // 功能：快照中 key 对应的节点下标。
     // 输入/输出及副作用：纯查询。
     // 失败/边界：不存在返回 -1。
-    function int find(dpu_function_key_t key);
-      foreach (nodes[i])
-        if (dpu_function_key_name(nodes[i].func.key) == dpu_function_key_name(key))
-          return i;
-      return -1;
-    endfunction
+    extern function int find(dpu_function_key_t	key);
 
     // 功能：PF FLR 范围：Host host_id 上 PF pf_id 及其全部 VF。
     // 输入/输出及副作用：scope 输出节点下标。
     // 失败/边界：无匹配时为空。
-    function void pf_scope(int unsigned host_id, int unsigned pf_id, output int unsigned scope[$]);
-      scope.delete();
-      foreach (nodes[i])
-        if (nodes[i].func.key.host_id == host_id && nodes[i].func.key.pf_id == pf_id)
-          scope.push_back(i);
-    endfunction
+    extern function void pf_scope(int unsigned	host_id, int unsigned	pf_id, output int unsigned	scope[$]);
 
     // 功能：Host 范围：该 Host 的全部 Function。
     // 输入/输出及副作用：scope 输出节点下标。
     // 失败/边界：无匹配时为空。
-    function void host_scope(int unsigned host_id, output int unsigned scope[$]);
-      scope.delete();
-      foreach (nodes[i])
-        if (nodes[i].func.key.host_id == host_id)
-          scope.push_back(i);
-    endfunction
+    extern function void host_scope(int unsigned	host_id, output int unsigned	scope[$]);
 
     // 功能：按 nodes 当前稳定顺序生成覆盖整设备全部 Function 的复位下标范围。
     // 输入/输出及副作用：先清空 output scope，再依次追加 0..nodes.size()-1；不修改节点状态。
     // 失败/边界：尚未 build 或设备没有 Function 时返回空 scope，不伪造默认节点。
-    function void device_scope(output int unsigned scope[$]);
-      scope.delete();
-      foreach (nodes[i])
-        scope.push_back(i);
-    endfunction
+    extern function void device_scope(output int unsigned	scope[$]);
 
     // 功能：对 scope 内 Function 执行 FLR，同时清设备 context/NIC 与 MAILBOX/MSI-X 状态并推进独立
     //   reset_epoch；驱动对象保留，后续须 recover 重新 probe。
-    // 输入/输出及副作用：scope 是节点下标队列；只修改合法下标对应的 dev 与 interrupt_ctrl。
-    // 失败/边界：越界下标幂等忽略；同一 Function 每次合法调用都推进一次 epoch 并使旧 epoch 中断失效。
-    function void flr(int unsigned scope[$]);
-      foreach (scope[k])
-        if (scope[k] < nodes.size()) begin
-          nodes[scope[k]].dev.flr();
-          nodes[scope[k]].interrupt_ctrl.reset();
-        end
-    endfunction
+    // 输入/输出及副作用：scope 是节点下标队列；预检全部成功后修改 dev/interrupt_ctrl，返回 status。
+    // 失败/边界：越界或外部节点整组拒绝且无副作用；模型每次成功调用推进 epoch，使旧中断失效。
+    extern function rdma_status flr(int unsigned	scope[$]);
 
     // 功能：恢复 scope：先再次 FLR 保证设备与 MAILBOX/MSI-X 干净，再以 after_reset remove 驱动并
     //   重新 probe；既可接在 flr 后，也可单独作为复位恢复入口。
     // 输入/输出及副作用：替换 scope 内节点驱动；每个合法节点的第二次清理也推进一次 reset_epoch，
     //   因而恢复期间捕获的旧事件同样不能跨过重新 probe 边界。
-    // 失败/边界：scope 下标越界返回 INVALID_ARGUMENT；remove/probe 失败立即返回其 status，已恢复节点保留。
-    task recover(int unsigned scope[$], output rdma_status status,
-                 input rdma_drv_config drv_cfg = null);
-      status = rdma_status::success();
-      foreach (scope[k]) begin
-        if (scope[k] >= nodes.size()) begin
-          status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-                                     "reset recovery scope contains no such dpu node");
-          return;
-        end
+    // 失败/边界：先拒绝任何越界或外部节点且无副作用；remove/probe 失败立即返回 status，已恢复节点保留。
+    extern task recover(int unsigned	scope[$], output rdma_status	status,
+                 input rdma_drv_config	drv_cfg = null);
+  endclass
+
+  // 功能：构造可追加 Host/Function 的空系统，仅创建本系统拥有的 cfg。
+  // 输入/输出及副作用：name 派生 cfg 名称；snapshot/router/mem_pool 为 null，nodes 为空，不创建 Host backing。
+  // 失败/边界：调用 build 前不能 probe/start/发 MMIO；配置合法性与容量约束延迟到 resolver。
+  function rdma_dpu_system::new(string	name = "rdma_dpu_system");
+    super.new(name);
+    cfg = dpu_device_cfg::type_id::create({name, "_cfg"});
+    snapshot = null;
+    router = null;
+    resources = null;
+    binding_locked = 0;
+    external_configuration = 0;
+    mem_pool = null;
+  endfunction
+
+  // 功能：声明 Host（见 rdma_dpu_topology::add_host）。
+  // 输入/输出及副作用：写 cfg。
+  // 失败/边界：合法性由 build 时的 resolver 校验。
+  function void rdma_dpu_system::add_host(int unsigned	host_id, int	segment_id = -1);
+    rdma_dpu_topology::add_host(cfg, host_id, segment_id);
+  endfunction
+
+  // 功能：声明 PF/VF（见 rdma_dpu_topology::add_function）。
+  // 输入/输出及副作用：写 cfg。
+  // 失败/边界：合法性由 build 时的 resolver 校验。
+  function void rdma_dpu_system::add_function(int unsigned	host_id, int unsigned	pf_id, dpu_function_kind_e	kind,
+                             int unsigned	vf_id);
+    rdma_dpu_topology::add_function(cfg, host_id, pf_id, kind, vf_id);
+  endfunction
+
+  // 功能：校验并一次性发布外部 RDMA Function 的冻结身份投影，不运行 resolver 或创建模型设备。
+  // 输入/输出及副作用：source/pool 借自平台，keys 指定节点顺序；成功发布 mem_pool/nodes/snapshot，不分配 Host 内存。
+  // 失败/边界：已有拓扑、未冻结 source、空 pool/keys、重复/非RDMA/ID>255/BAR缺失或 Host manager 的身份/初始化/GPA不符均拒绝；不部分发布。
+  function rdma_status rdma_dpu_system::bind_snapshot(
+    dpu_device_snapshot	source,
+    dpu_function_key_t	keys[$],
+    host_mem_pool		pool
+  );
+    rdma_dpu_function	projections[$];
+    rdma_dpu_node		candidates[$];
+    dpu_service_key_t	services[$];
+    bit			seen[string];
+    bit			has_rdma;
+    string			why;
+    string			name;
+    rdma_dpu_function	f;
+    rdma_dpu_node		n;
+    dpu_host_info_t		host;
+    host_mem_manager		manager;
+
+    if (binding_locked || snapshot != null || nodes.size() != 0)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "system topology is already bound");
+    if (source == null || !source.is_frozen())
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "external device snapshot must be frozen");
+    if (pool == null || keys.size() == 0)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "external pool or Function selection is empty");
+    source.list_services(DPU_SERVICE_RDMA, services);
+    // 先验证全部身份与 pool 成员，再一次发布视图；缺 Host 不创建 fallback，也不部分接管平台资源。
+    foreach (keys[i]) begin
+      name = dpu_function_key_name(keys[i]);
+      if (seen.exists(name))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, {"duplicate Function: ", name});
+      seen[name] = 1;
+      has_rdma = 0;
+      foreach (services[j])
+        if (dpu_same_function_key(keys[i], services[j].function_key))
+          has_rdma = 1;
+      if (!has_rdma)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, {"Function has no RDMA service: ", name});
+      f = rdma_dpu_function::type_id::create(name);
+      f.key = keys[i];
+      if (!rdma_dpu_topology::project(source, f, why))
+        return rdma_status::make(RDMA_SC_INVALID_STATE, why);
+      if (f.global_id > 255)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "global Function ID exceeds RDMA 8-bit field");
+      if (!pool.has_host(keys[i].host_id))
+        return rdma_status::make(RDMA_SC_INVALID_STATE, {"Host missing from shared pool: ", name});
+      manager = pool.get_host(keys[i].host_id);
+      if (!source.lookup_host(keys[i].host_id, host, why) || !host.has_gpa_aperture ||
+          host.gpa_limit <= host.gpa_base || manager == null || !manager.is_initialized() ||
+          manager.get_host_id() != host.host_id ||
+          !manager.contains_range(host.gpa_base, host.gpa_limit - host.gpa_base))
+        return rdma_status::make(RDMA_SC_INVALID_STATE, {"Host pool identity/initialization/GPA mismatch: ", name});
+      projections.push_back(f);
+    end
+    foreach (projections[i]) begin
+      n = rdma_dpu_node::type_id::create(projections[i].get_name());
+      n.func = projections[i];
+      n.source_snapshot = source;
+      n.external_configuration = 1;
+      n.mem = rdma_host_mem::type_id::create({n.get_name(), "_mem"});
+      n.mem.mem = pool.get_host(n.func.key.host_id);
+      candidates.push_back(n);
+    end
+    mem_pool = pool;
+    snapshot = source;
+    nodes = candidates;
+    external_configuration = 1;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：记录与设备快照同源的冻结资源快照，仅证明来源，不把 VIO 分配解释为 RDMA 许可。
+  // 输入/输出及副作用：value 借用不转移所有权；成功更新 resources，不发 MMIO。
+  // 失败/边界：非外部系统、未冻结/异源 value、已绑定不同资源或初始化开始均拒绝；同句柄重复绑定在启动前幂等。
+  function rdma_status rdma_dpu_system::bind_resources(dpu_resource_snapshot	value);
+    if (binding_locked || !external_configuration || snapshot == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "external resource binding is closed");
+    if (value == null || !value.is_frozen() || !value.references_device_snapshot(snapshot))
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "resource snapshot must be frozen and reference the device snapshot");
+    if (resources != null && resources != value)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "resource snapshot is already bound");
+    resources = value;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：为外部节点借用平台已绑定的硬件上下文和显式驱动配置，保持 Host 视图唯一。
+  // 输入/输出及副作用：i 选择节点，hw/cfg_arg 归调用方所有；成功保存 hw/bar/drv_cfg，不 probe。
+  // 失败/边界：非外部、越界、空配置/端口、Host 视图不一致、替换已绑定上下文或启动后修改均拒绝。
+  function rdma_status rdma_dpu_system::bind_external_hw(int unsigned	i, rdma_drv_hw	hw, rdma_drv_config	cfg_arg);
+    if (binding_locked || !external_configuration)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "external hardware binding is closed");
+    if (i >= nodes.size() || hw == null || cfg_arg == null)
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "external node/hardware/configuration is missing");
+    if (hw.bar == null || hw.host_mem != nodes[i].mem)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "external hardware must use the node Host memory view");
+    if (nodes[i].drv != null ||
+        (nodes[i].hw != null && (nodes[i].hw != hw || nodes[i].drv_cfg != cfg_arg)))
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "external node binding is already in use");
+    nodes[i].hw = hw;
+    nodes[i].bar = hw.bar;
+    nodes[i].drv_cfg = cfg_arg;
+    return rdma_status::success();
+  endfunction
+
+  // 功能：在任何 probe/MMIO 前检查整个系统的初始化契约，纯查询不替换节点或驱动。
+  // 输入/输出及副作用：返回首个缺失依赖的 status；模型只检查完整装配，外部进一步检查配置与资源来源。
+  // 失败/边界：空系统、缺失硬件/内存、视图与 pool 不一致、外部缺显式配置或同源资源均 INVALID_STATE；当前外部缺 RDMA shared grant 仍拒绝。
+  function rdma_status rdma_dpu_system::validate_initialization();
+    if (snapshot == null || nodes.size() == 0 || mem_pool == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "system has no bound Function snapshot or Host pool");
+    foreach (nodes[i]) begin
+      if (nodes[i].mem == null || !mem_pool.has_host(nodes[i].func.key.host_id) ||
+          nodes[i].mem.mem != mem_pool.get_host(nodes[i].func.key.host_id))
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "Function view differs from shared Host pool");
+      if (nodes[i].hw == null || nodes[i].hw.bar == null || nodes[i].hw.host_mem != nodes[i].mem)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "node hardware binding is incomplete");
+      if (external_configuration && nodes[i].drv_cfg == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "external driver configuration is required");
+    end
+    if (external_configuration) begin
+      if (resources == null || !resources.references_device_snapshot(snapshot))
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "same-source frozen resource snapshot is required");
+      // 现有 dpu_common 只导出 VIO qpair，不提供 RDMA QP/SD/CEQ 的共享分配证明。
+      // 禁止把显式整数配置、VIO lease 或模型默认范围升级为共享资源授权。
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+        "dpu_common lacks RDMA shared QP/SD/CEQ grants; external initialization is unsupported");
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：关闭外部装配入口，防止初始化请求与后续配置替换交错。
+  // 输入/输出及副作用：置 binding_locked；不访问节点驱动或 MMIO，重复调用幂等。
+  // 失败/边界：即使随后预检失败也不重新开放，恢复须建立新的环境生命周期。
+  function void rdma_dpu_system::lock_bindings();
+    binding_locked = 1;
+  endfunction
+
+  // 功能：预检完整复位范围，避免先复位模型节点后才发现外部 FLR 无平台支持。
+  // 输入/输出及副作用：scope 为节点索引队列；只返回 status，不改资源库、epoch 或设备。
+  // 失败/边界：外部系统或无模型节点 INVALID_STATE；模型越界 INVALID_ARGUMENT，模型空范围成功。
+  function rdma_status rdma_dpu_system::validate_reset(int unsigned	scope[$]);
+    if (external_configuration)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "external FLR requires an unavailable platform reset contract");
+    foreach (scope[k]) begin
+      if (scope[k] >= nodes.size())
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "reset scope contains no such dpu node");
+      if (nodes[scope[k]].external_configuration || nodes[scope[k]].dev == null ||
+          nodes[scope[k]].interrupt_ctrl == null)
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "external FLR requires an unavailable platform reset contract");
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：解析冻结快照，按快照顺序为每个 Function 建立节点：所属 Host 的主机内存、设备、独占
+  //   MAILBOX/MSI-X 控制器、BAR 路由与驱动硬件绑定；不启动 NIC、不 probe。
+  // 输入/输出及副作用：创建 mem_pool，并按 snapshot GPA 创建各 Host manager；设置 router/nodes，不重用外部运行期资源。
+  // 失败/边界：已绑定拓扑/已开始初始化、GPA缺失或pool创建失败拒绝；其余解析/绑定失败透传，失败节点不发布。
+  function rdma_status rdma_dpu_system::build();
+    rdma_dpu_function	funcs[$];
+    rdma_dpu_node		n;
+    rdma_dpu_bar		model_bar;
+    rdma_status		status;
+    dpu_host_info_t		host;
+    string			why;
+    string			name;
+
+    if (binding_locked || snapshot != null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "system topology is already bound");
+    status = rdma_dpu_topology::resolve(cfg, snapshot, funcs);
+    if (!status.ok())
+      return status;
+    mem_pool = host_mem_pool::type_id::create({get_name(), "_mem_pool"});
+    router = rdma_dpu_bar_router::type_id::create({get_name(), "_router"});
+    router.snapshot = snapshot;
+    nodes.delete();
+    foreach (funcs[i]) begin
+      name = $sformatf("%s_f%0d", get_name(), funcs[i].global_id);
+      n = rdma_dpu_node::type_id::create(name);
+      n.func = funcs[i];
+      n.source_snapshot = snapshot;
+      if (!mem_pool.has_host(funcs[i].key.host_id)) begin
+        if (!snapshot.lookup_host(funcs[i].key.host_id, host, why) || !host.has_gpa_aperture ||
+            host.gpa_limit <= host.gpa_base)
+          return rdma_status::make(RDMA_SC_INVALID_STATE, "model Host requires a frozen GPA aperture");
+        if (!mem_pool.create_host(host.host_id, host.gpa_base, host.gpa_limit - 1, MODE_BUDDY, 16))
+          return rdma_status::make(RDMA_SC_INVALID_STATE, "model Host pool creation failed");
+      end
+      n.mem = rdma_host_mem::type_id::create({name, "_mem"});
+      n.mem.mem = mem_pool.get_host(funcs[i].key.host_id);
+      n.dev = rdma_dev::type_id::create({name, "_dev"});
+      n.dev.configure(n.mem);
+      n.interrupt_ctrl = rdma_dpu_interrupt_ctrl::type_id::create({name, "_interrupt_ctrl"});
+      status = n.interrupt_ctrl.configure(funcs[i]);
+      if (!status.ok())
+        return status;
+      model_bar = rdma_dpu_bar::type_id::create({name, "_bar"});
+      model_bar.router = router;
+      model_bar.func = funcs[i];
+      n.bar = model_bar;
+      n.hw = rdma_drv_hw::type_id::create({name, "_hw"});
+      status = n.hw.bind_hw(n.bar, n.mem);
+      if (!status.ok())
+        return status;
+      status = router.attach(funcs[i], n.dev, n.interrupt_ctrl);
+      if (!status.ok())
+        return status;
+      n.drv = null;
+      nodes.push_back(n);
+    end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：为 build 后的每个节点启动一个 NIC 收发常驻进程，端口由调用方在本 task 前接入。
+  // 输入/输出及副作用：借用 nodes[i].dev 并以 fork/join_none 返回；进程生命周期由仿真结束或外部停止控制。
+  // 失败/边界：空节点集合或外部节点无 dev 时跳过；模型重复调用仍会启动重复进程，调用方必须避免。
+  task rdma_dpu_system::start();
+    foreach (nodes[i]) begin
+      automatic rdma_dev	d = nodes[i].dev;
+      if (d == null)
+        continue;
+      fork
+        d.nic.run();
+      join_none
+    end
+  endtask
+
+  // 功能：probe 第 i 个节点的驱动：driver cfg（为 null 时用默认）的 host_id 与 vf_id（global
+  //   Function ID）取自快照。
+  // 输入/输出及副作用：替换节点驱动。
+  // 失败/边界：i 越界 INVALID_ARGUMENT；全系统预检失败或已有驱动 INVALID_STATE；probe 失败保留失败驱动并返回 status。
+  task rdma_dpu_system::probe(int unsigned	i, output rdma_status	status, input rdma_drv_config	drv_cfg = null);
+    if (i >= nodes.size()) begin
+      status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "no such dpu node");
+      return;
+    end
+    binding_locked = 1'b1;
+    status = validate_initialization();
+    if (!status.ok())
+      return;
+    if (nodes[i].drv != null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE, "node driver already exists");
+      return;
+    end
+    if (drv_cfg == null)
+      drv_cfg = rdma_drv_config::type_id::create({nodes[i].get_name(), "_drv_cfg"});
+    drv_cfg.host_id = nodes[i].func.key.host_id;
+    drv_cfg.vf_id = nodes[i].func.global_id;
+    nodes[i].drv = rdma_drv_dev::type_id::create({nodes[i].get_name(), "_drv"});
+    nodes[i].drv.probe(drv_cfg, nodes[i].hw, status);
+  endtask
+
+  // 功能：快照中 key 对应的节点下标。
+  // 输入/输出及副作用：纯查询。
+  // 失败/边界：不存在返回 -1。
+  function int rdma_dpu_system::find(dpu_function_key_t	key);
+    foreach (nodes[i])
+      if (dpu_function_key_name(nodes[i].func.key) == dpu_function_key_name(key))
+        return i;
+    return -1;
+  endfunction
+
+  // 功能：PF FLR 范围：Host host_id 上 PF pf_id 及其全部 VF。
+  // 输入/输出及副作用：scope 输出节点下标。
+  // 失败/边界：无匹配时为空。
+  function void rdma_dpu_system::pf_scope(int unsigned	host_id, int unsigned	pf_id, output int unsigned	scope[$]);
+    scope.delete();
+    foreach (nodes[i])
+      if (nodes[i].func.key.host_id == host_id && nodes[i].func.key.pf_id == pf_id)
+        scope.push_back(i);
+  endfunction
+
+  // 功能：Host 范围：该 Host 的全部 Function。
+  // 输入/输出及副作用：scope 输出节点下标。
+  // 失败/边界：无匹配时为空。
+  function void rdma_dpu_system::host_scope(int unsigned	host_id, output int unsigned	scope[$]);
+    scope.delete();
+    foreach (nodes[i])
+      if (nodes[i].func.key.host_id == host_id)
+        scope.push_back(i);
+  endfunction
+
+  // 功能：按 nodes 当前稳定顺序生成覆盖整设备全部 Function 的复位下标范围。
+  // 输入/输出及副作用：先清空 output scope，再依次追加 0..nodes.size()-1；不修改节点状态。
+  // 失败/边界：尚未 build 或设备没有 Function 时返回空 scope，不伪造默认节点。
+  function void rdma_dpu_system::device_scope(output int unsigned	scope[$]);
+    scope.delete();
+    foreach (nodes[i])
+      scope.push_back(i);
+  endfunction
+
+  // 功能：对 scope 内 Function 执行 FLR，同时清设备 context/NIC 与 MAILBOX/MSI-X 状态并推进独立
+  //   reset_epoch；驱动对象保留，后续须 recover 重新 probe。
+  // 输入/输出及副作用：scope 是节点下标队列；预检全部成功后修改 dev/interrupt_ctrl，返回 status。
+  // 失败/边界：越界或外部节点整组拒绝且无副作用；模型每次成功调用推进 epoch，使旧中断失效。
+  function rdma_status rdma_dpu_system::flr(int unsigned	scope[$]);
+    rdma_status	status;
+
+    status = validate_reset(scope);
+    if (!status.ok())
+      return status;
+    foreach (scope[k])
+      if (scope[k] < nodes.size()) begin
         nodes[scope[k]].dev.flr();
         nodes[scope[k]].interrupt_ctrl.reset();
-        if (nodes[scope[k]].drv != null) begin
-          nodes[scope[k]].drv.remove(status, 1'b1);
-          if (!status.ok())
-            return;
-        end
-        probe(scope[k], status, drv_cfg);
+      end
+    return rdma_status::success();
+  endfunction
+
+  // 功能：恢复 scope：先再次 FLR 保证设备与 MAILBOX/MSI-X 干净，再以 after_reset remove 驱动并
+  //   重新 probe；既可接在 flr 后，也可单独作为复位恢复入口。
+  // 输入/输出及副作用：替换 scope 内节点驱动；每个合法节点的第二次清理也推进一次 reset_epoch，
+  //   因而恢复期间捕获的旧事件同样不能跨过重新 probe 边界。
+  // 失败/边界：先拒绝任何越界或外部节点且无副作用；remove/probe 失败立即返回 status，已恢复节点保留。
+  task rdma_dpu_system::recover(int unsigned	scope[$], output rdma_status	status,
+               input rdma_drv_config	drv_cfg = null);
+    status = validate_reset(scope);
+    if (!status.ok())
+      return;
+    foreach (scope[k]) begin
+      if (scope[k] >= nodes.size()) begin
+        status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+                                   "reset recovery scope contains no such dpu node");
+        return;
+      end
+      nodes[scope[k]].dev.flr();
+      nodes[scope[k]].interrupt_ctrl.reset();
+      if (nodes[scope[k]].drv != null) begin
+        nodes[scope[k]].drv.remove(status, 1'b1);
         if (!status.ok())
           return;
       end
-    endtask
-  endclass
+      nodes[scope[k]].drv = null;
+      probe(scope[k], status, drv_cfg);
+      if (!status.ok())
+        return;
+    end
+  endtask
 endpackage

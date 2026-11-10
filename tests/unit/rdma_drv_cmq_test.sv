@@ -2,7 +2,7 @@
 // 职责：驱动 CMQ（rdma_drv_cmq）与设备 CMQ（rdma_dev_cmq）经 BAR/DMA 端到端对接：CMQC 寄存器编程、
 //   跨圈回绕、context 命令往返、ecode 透传，以及驱动签名被设备按 cmq.c 规则接受。
 // 依赖：rdma_drv_hw/rdma_drv_cmq、rdma_dev、rdma_dpu_system（dpu_common）、rdma_host_mem（外部 host_mem）。
-// 所有权与生命周期：测试拥有主机内存、设备与驱动对象。
+// 所有权与生命周期：测试拥有 system 与驱动 CMQ；mem/dev/bar/hw 借用模型节点对象，覆盖 run_phase 全程。
 class rdma_drv_cmq_test extends uvm_test;
   `uvm_component_utils(rdma_drv_cmq_test)
 
@@ -20,28 +20,10 @@ class rdma_drv_cmq_test extends uvm_test;
     super.new(name, parent);
   endfunction
 
-  // 功能：建立驱动与设备，依次执行用例。
-  // 输入/输出及副作用：持有 objection 直到用例结束。
-  // 失败/边界：用例内以 UVM_ERROR/FATAL 报告。
-  task run_phase(uvm_phase phase);
-    rdma_status status;
-
-    phase.raise_objection(this);
-    sys = rdma_dpu_test_system::single_host("drv_cmq");
-    mem = sys.nodes[0].mem;
-    dev = sys.nodes[0].dev;
-    bar = sys.nodes[0].bar;
-    hw = sys.nodes[0].hw;
-    cmq = rdma_drv_cmq::type_id::create("drv_cmq");
-    cmq.create_cmq(hw, status);
-    expect_ok("create", status);
-    check_registers();
-    check_wrap();
-    check_context_roundtrip();
-    check_signed_qpc();
-    expect_ok("destroy", cmq.destroy());
-    phase.drop_objection(this);
-  endtask
+  // 功能：建立单 Host 模型系统，检查 BAR 观察器类型，再执行寄存器、环回绕、context 和签名用例。
+  // 输入/输出及副作用：phase 持有 objection 至 CMQ 销毁；借用节点句柄并创建驱动 CMQ，推进设备状态。
+  // 失败/边界：BAR 不是 rdma_dpu_bar 时立即 fatal；创建/命令失败由 expect_ok 拒绝，内容不符由各用例报告。
+  extern task run_phase(uvm_phase	phase);
 
   // 功能：断言 status 成功。
   // 输入/输出及副作用：what 用于报告。
@@ -143,3 +125,27 @@ class rdma_drv_cmq_test extends uvm_test;
     expect_ok("free QPC buffer", hw.free_dma(qpc_buf));
   endtask
 endclass
+
+// 功能：建立单 Host 模型系统，检查 BAR 观察器类型，再执行寄存器、环回绕、context 和签名用例。
+// 输入/输出及副作用：phase 持有 objection 至 CMQ 销毁；借用节点句柄并创建驱动 CMQ，推进设备状态。
+// 失败/边界：BAR 不是 rdma_dpu_bar 时立即 fatal；创建/命令失败由 expect_ok 拒绝，内容不符由各用例报告。
+task rdma_drv_cmq_test::run_phase(uvm_phase	phase);
+  rdma_status	status;
+
+  phase.raise_objection(this);
+  sys = rdma_dpu_test_system::single_host("drv_cmq");
+  mem = sys.nodes[0].mem;
+  dev = sys.nodes[0].dev;
+  if (!$cast(bar, sys.nodes[0].bar))
+    `uvm_fatal("DRV_CMQ", "model CMQ fixture requires a model BAR observer")
+  hw = sys.nodes[0].hw;
+  cmq = rdma_drv_cmq::type_id::create("drv_cmq");
+  cmq.create_cmq(hw, status);
+  expect_ok("create", status);
+  check_registers();
+  check_wrap();
+  check_context_roundtrip();
+  check_signed_qpc();
+  expect_ok("destroy", cmq.destroy());
+  phase.drop_objection(this);
+endtask

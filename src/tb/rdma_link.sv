@@ -193,19 +193,8 @@ class rdma_link extends uvm_component;
 
   // 功能：交付：carry → 广播 rx → 目的 NIC 接收。
   // 输入/输出及副作用：写 rx_ap 与目的 NIC 接收队列。
-  // 失败/边界：carry 失败报 UVM_ERROR 并丢弃。
-  virtual task deliver(int unsigned src, int unsigned dst, rdma_packet pkt);
-    rdma_packet delivered;
-    rdma_status status;
-
-    carry(src, dst, pkt, delivered, status);
-    if (!status.ok() || delivered == null) begin
-      `uvm_error("RDMA_LINK", {"carry failed: ", status.convert2string()})
-      return;
-    end
-    rx_ap.write(observe(src, dst, delivered));
-    funcs[dst].node.dev.nic.receive(delivered);
-  endtask
+  // 失败/边界：目标越界/无 node/dev 或 carry 失败报 UVM_ERROR 并丢弃，外部端口须由专用链路承载。
+  extern virtual task deliver(int unsigned	src, int unsigned	dst, rdma_packet	pkt);
 
   // 功能：为指定源、目的与 packet 构造一条 analysis 观测，供子类追加 wire frame。
   // 输入/输出及副作用：返回新建 rdma_link_obs，保存 pkt 非拥有引用；不克隆或发送报文。
@@ -226,6 +215,27 @@ class rdma_link extends uvm_component;
   virtual task corrupt(int unsigned src, int unsigned dst, rdma_packet pkt);
   endtask
 endclass
+
+// 功能：交付：carry → 广播 rx → 目的 NIC 接收。
+// 输入/输出及副作用：写 rx_ap 与目的 NIC 接收队列。
+// 失败/边界：目标越界/无 node/dev 或 carry 失败报 UVM_ERROR 并丢弃，外部端口须由专用链路承载。
+task rdma_link::deliver(int unsigned	src, int unsigned	dst, rdma_packet	pkt);
+  rdma_packet	delivered;
+  rdma_status	status;
+
+  if (!funcs.exists(dst) || funcs[dst] == null || funcs[dst].node == null ||
+      funcs[dst].node.dev == null) begin
+    `uvm_error("RDMA_LINK", "loopback delivery requires a model destination NIC")
+    return;
+  end
+  carry(src, dst, pkt, delivered, status);
+  if (!status.ok() || delivered == null) begin
+    `uvm_error("RDMA_LINK", {"carry failed: ", status.convert2string()})
+    return;
+  end
+  rx_ap.write(observe(src, dst, delivered));
+  funcs[dst].node.dev.nic.receive(delivered);
+endtask
 
 // 报文经 net_packet 编码为 RoCEv2 帧、再解析回报文后交付（帧地址取 codec 缺省值）。
 class rdma_link_netpkt extends rdma_link;

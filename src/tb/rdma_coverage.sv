@@ -241,22 +241,9 @@ class rdma_coverage extends uvm_component;
   //   新日志起点重新采样。
   // 输入/输出及副作用：读取 env.sys.nodes[*].dev.cmq.executed_opcodes，更新 cmq_opcode、cg_cmq 与每个
   //   Function 的 cmq_seen 游标。
-  // 失败/边界：要求 env/sys/node/dev/cmq 装配完成；日志保持不变时不重复采样，清空后相同 opcode 会作为
+  // 失败/边界：要求 env/sys/node 装配完成；无 dev 的外部节点跳过；日志未变不重复采样，清空后相同 opcode 会作为
   //   新 epoch 的执行再次计入。
-  protected function void sample_cmq();
-    rdma_dev_cmq q;
-
-    foreach (env.sys.nodes[f]) begin
-      q = env.sys.nodes[f].dev.cmq;
-      if (!cmq_seen.exists(f) || cmq_seen[f] > q.executed_opcodes.size())
-        cmq_seen[f] = 0;
-      for (int unsigned i = cmq_seen[f]; i < q.executed_opcodes.size(); i++) begin
-        cmq_opcode = q.executed_opcodes[i];
-        cg_cmq.sample();
-      end
-      cmq_seen[f] = q.executed_opcodes.size();
-    end
-  endfunction
+  extern protected function void sample_cmq();
 
   // 功能：报告阶段采样至少命中过一次的链路故障，读取八个 covergroup 覆盖率并输出分项与算术平均值。
   // 输入/输出及副作用：phase 只提供生命周期；推进 cg_fault 后生成一条 RDMA_COV UVM_INFO，不修改 DUT。
@@ -290,3 +277,26 @@ class rdma_coverage extends uvm_component;
     `uvm_info("RDMA_COV", $sformatf("total=%0.1f%s", total / parts.size(), line), UVM_LOW)
   endfunction
 endclass
+
+// 功能：遍历所有仿真 Function，仅采样各设备自上次游标后的 CMQ opcode；设备复位使日志变短时从
+//   新日志起点重新采样。
+// 输入/输出及副作用：读取 env.sys.nodes[*].dev.cmq.executed_opcodes，更新 cmq_opcode、cg_cmq 与每个
+//   Function 的 cmq_seen 游标。
+// 失败/边界：要求 env/sys/node 装配完成；无 dev 的外部节点跳过；日志未变不重复采样，清空后相同 opcode 会作为
+//   新 epoch 的执行再次计入。
+function void rdma_coverage::sample_cmq();
+  rdma_dev_cmq	q;
+
+  foreach (env.sys.nodes[f]) begin
+    if (env.sys.nodes[f].dev == null)
+      continue;
+    q = env.sys.nodes[f].dev.cmq;
+    if (!cmq_seen.exists(f) || cmq_seen[f] > q.executed_opcodes.size())
+      cmq_seen[f] = 0;
+    for (int unsigned i = cmq_seen[f]; i < q.executed_opcodes.size(); i++) begin
+      cmq_opcode = q.executed_opcodes[i];
+      cg_cmq.sample();
+    end
+    cmq_seen[f] = q.executed_opcodes.size();
+  end
+endfunction

@@ -10,19 +10,19 @@
 class rdma_pair extends uvm_object;
   `uvm_object_utils(rdma_pair)
 
-  rdma_res_pd pd[2];
-  rdma_res_cq cq[2];
-  rdma_res_cq urc_cq[2];
-  rdma_res_buf mem[2];
-  rdma_res_mr mr[2];
+  rdma_res_pd	pd[2];
+  rdma_res_cq	cq[2];
+  rdma_res_cq	urc_cq[2];
+  rdma_res_buf	mem[2];
+  rdma_res_mr	mr[2];
   // qp[n][0/1/2] = Function n 的 RC/UD/URC QP；URC 为私有扩展，有远端 Function 时不建（urc=0）。
-  rdma_res_qp qp[2][3];
-  bit urc;
+  rdma_res_qp	qp[2][3];
+  bit	urc;
 
   // 功能：创建一个尚未填充资源的双 Function 拓扑句柄集合。
   // 输入/输出及副作用：name 传给 uvm_object；pd/cq/mem/mr/qp 句柄保持空，urc 保持默认 0。
   // 失败/边界：构造过程不分配 RDMA 资源，使用成员前必须由 setup_pair 完整填充对应槽位。
-  function new(string name = "rdma_pair");
+  function new(string	name = "rdma_pair");
     super.new(name);
   endfunction
 endclass
@@ -31,12 +31,12 @@ class rdma_base_vseq extends uvm_sequence;
   `uvm_object_utils(rdma_base_vseq)
   `uvm_declare_p_sequencer(rdma_vsequencer)
 
-  rdma_env env;
+  rdma_env	env;
 
   // 功能：创建控制面和数据面场景共用的虚拟序列基类实例。
   // 输入/输出及副作用：name 传给 uvm_sequence；env 保持空，等待 pre_body 从 p_sequencer 绑定。
   // 失败/边界：构造时不校验或绑定 rdma_vsequencer，启动序列前必须提供兼容的 p_sequencer。
-  function new(string name = "rdma_base_vseq");
+  function new(string	name = "rdma_base_vseq");
     super.new(name);
   endfunction
 
@@ -51,7 +51,7 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：执行控制面请求。
   // 输入/输出及副作用：阻塞到 driver 完成。
   // 失败/边界：非预期失败 UVM_FATAL（后续步骤依赖其结果）。
-  task ctrl(rdma_ctrl_item it);
+  task ctrl(rdma_ctrl_item	it);
     start_item(it, -1, env.ctrl.sequencer);
     finish_item(it);
     if (!it.status.ok() && !it.expect_fail)
@@ -62,8 +62,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 输入/输出及副作用：输入 op/func，返回新 rdma_ctrl_item；其余字段保留类型默认值。
   // 失败/边界：不验证 func 是否存在或 op 所需的附加字段；调用方必须在 ctrl 前补齐，且依赖 factory
   //   已正确注册 rdma_ctrl_item。
-  function rdma_ctrl_item new_ctrl(rdma_ctrl_op_e op, int unsigned func);
-    rdma_ctrl_item it;
+  function rdma_ctrl_item new_ctrl(rdma_ctrl_op_e	op, int unsigned	func);
+    rdma_ctrl_item	it;
 
     it = rdma_ctrl_item::type_id::create(op.name());
     it.op = op;
@@ -74,8 +74,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：分配 PD。
   // 输入/输出及副作用：pd 输出。
   // 失败/边界：见 ctrl。
-  task alloc_pd(int unsigned func, output rdma_res_pd pd);
-    rdma_ctrl_item it;
+  task alloc_pd(int unsigned	func, output rdma_res_pd	pd);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_ALLOC_PD, func);
     ctrl(it);
@@ -85,8 +85,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：分配 size 字节 DMA 缓冲。
   // 输入/输出及副作用：b 输出。
   // 失败/边界：见 ctrl。
-  task alloc_buf(int unsigned func, int unsigned size, output rdma_res_buf b);
-    rdma_ctrl_item it;
+  task alloc_buf(int unsigned	func, int unsigned	size, output rdma_res_buf	b);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_ALLOC_BUF, func);
     it.size = size;
@@ -97,10 +97,10 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：在 b 的 [offset, offset+len)（len 0 为到末尾）上注册 MR，权限缺省全部。
   // 输入/输出及副作用：mr 输出。
   // 失败/边界：见 ctrl。
-  task reg_mr(rdma_res_pd pd, rdma_res_buf b, output rdma_res_mr mr,
-              input bit [4:0] rights = 5'h1f, input int unsigned offset = 0,
-              input int unsigned len = 0);
-    rdma_ctrl_item it;
+  task reg_mr(rdma_res_pd	pd, rdma_res_buf	b, output rdma_res_mr	mr,
+              input bit [4:0]	rights = 5'h1f, input int unsigned	offset = 0,
+              input int unsigned	len = 0);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_REG_MR, pd.owner.index);
     it.pd = pd;
@@ -115,8 +115,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：创建 depth 深度的 SRQ。
   // 输入/输出及副作用：srq 输出。
   // 失败/边界：见 ctrl。
-  task create_srq(rdma_res_pd pd, int unsigned depth, output rdma_res_srq srq);
-    rdma_ctrl_item it;
+  task create_srq(rdma_res_pd	pd, int unsigned	depth, output rdma_res_srq	srq);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_CREATE_SRQ, pd.owner.index);
     it.pd = pd;
@@ -128,8 +128,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：把 qp 迁到 state（属性取配置默认值，见控制面 driver）。
   // 输入/输出及副作用：修改 QP。
   // 失败/边界：expect_fail 时期望驱动拒绝。
-  task modify_qp(rdma_res_qp qp, rdma_drv_qp_state_e state, bit expect_fail = 1'b0);
-    rdma_ctrl_item it;
+  task modify_qp(rdma_res_qp	qp, rdma_drv_qp_state_e	state, bit	expect_fail = 1'b0);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_MODIFY_QP, qp.owner.index);
     it.qp = qp;
@@ -142,8 +142,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：销毁资源。
   // 输入/输出及副作用：释放驱动资源。
   // 失败/边界：见 ctrl。
-  task destroy(rdma_res r);
-    rdma_ctrl_item it;
+  task destroy(rdma_res	r);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_DESTROY, r.owner.index);
     it.target = r;
@@ -153,8 +153,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：对 scope 内 Function 复位（op 为 FLR）或复位后恢复（RECOVER：驱动 remove/probe）。
   // 输入/输出及副作用：清空范围内设备与资源。
   // 失败/边界：见 ctrl。
-  task reset(rdma_ctrl_op_e op, int unsigned scope[$]);
-    rdma_ctrl_item it;
+  task reset(rdma_ctrl_op_e	op, int unsigned	scope[$]);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(op, scope[0]);
     it.scope = scope;
@@ -164,8 +164,8 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：创建 depth 深度的 CQ。
   // 输入/输出及副作用：cq 输出。
   // 失败/边界：见 ctrl。
-  task create_cq(int unsigned func, int unsigned depth, output rdma_res_cq cq);
-    rdma_ctrl_item it;
+  task create_cq(int unsigned	func, int unsigned	depth, output rdma_res_cq	cq);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_CREATE_CQ, func);
     it.size = depth;
@@ -176,27 +176,13 @@ class rdma_base_vseq extends uvm_sequence;
   // 功能：创建 QP（收发同一 CQ，深度取配置）。
   // 输入/输出及副作用：qp 输出。
   // 失败/边界：见 ctrl。
-  task create_qp(rdma_res_pd pd, rdma_drv_qp_type_e qp_type, rdma_res_cq cq, bit urc,
-                 output rdma_res_qp qp, input rdma_res_srq srq = null);
-    rdma_ctrl_item it;
-
-    it = new_ctrl(RDMA_CTRL_CREATE_QP, pd.owner.index);
-    it.pd = pd;
-    it.qp_type = qp_type;
-    it.urc = urc;
-    it.send_cq = cq;
-    it.recv_cq = cq;
-    it.srq = srq;
-    it.size = env.cfg.qp_depth;
-    ctrl(it);
-    void'($cast(qp, it.res));
-  endtask
+  extern task create_qp(rdma_res_pd	pd, rdma_drv_qp_type_e	qp_type, rdma_res_cq	cq, bit	urc, output rdma_res_qp	qp, input rdma_res_srq	srq = null);
 
   // 功能：a ↔ b 互连并推到 RTS。
   // 输入/输出及副作用：修改两个 QP。
   // 失败/边界：见 ctrl。
-  task connect(rdma_res_qp a, rdma_res_qp b);
-    rdma_ctrl_item it;
+  task connect(rdma_res_qp	a, rdma_res_qp	b);
+    rdma_ctrl_item	it;
 
     it = new_ctrl(RDMA_CTRL_CONNECT, a.owner.index);
     it.qp = a;
@@ -204,40 +190,20 @@ class rdma_base_vseq extends uvm_sequence;
     ctrl(it);
   endtask
 
-  // 功能：建立 Function f0 ↔ f1 的标准拓扑（见文件头）。
-  // 输入/输出及副作用：p 输出。
-  // 失败/边界：见 ctrl。
-  task setup_pair(int unsigned f0, int unsigned f1, int unsigned buf_bytes, output rdma_pair p);
-    int unsigned f[2];
-
-    f = '{f0, f1};
-    p = rdma_pair::type_id::create("pair");
-    p.urc = !env.res.funcs[f0].remote && !env.res.funcs[f1].remote;
-    foreach (f[n]) begin
-      alloc_pd(f[n], p.pd[n]);
-      create_cq(f[n], env.cfg.qp_depth, p.cq[n]);
-      create_qp(p.pd[n], RDMA_DRV_QPT_RC, p.cq[n], 1'b0, p.qp[n][0]);
-      create_qp(p.pd[n], RDMA_DRV_QPT_UD, p.cq[n], 1'b0, p.qp[n][1]);
-      if (p.urc) begin
-        create_cq(f[n], env.cfg.qp_depth, p.urc_cq[n]);
-        create_qp(p.pd[n], RDMA_DRV_QPT_RC, p.urc_cq[n], 1'b1, p.qp[n][2]);
-      end
-      alloc_buf(f[n], buf_bytes, p.mem[n]);
-      reg_mr(p.pd[n], p.mem[n], p.mr[n]);
-    end
-    for (int unsigned k = 0; k < (p.urc ? 3 : 2); k++)
-      connect(p.qp[0][k], p.qp[1][k]);
-  endtask
+  // 功能：建立通用回归拓扑：每端 PD/CQ、RC和UD QP、buf_bytes缓冲/MR；两端均本地时额外建URC专用CQ/QP。
+  // 输入/输出及副作用：f0/f1 为既有 Function 索引；p 输出借用资源集合，按同类 QP 互连到 RTS，深度取统一场景。
+  // 失败/边界：索引必须有效；任一远端端点跳过URC，控制面非预期失败 fatal，不将本拓扑当作单场景资源复用测试。
+  extern task setup_pair(int unsigned	f0, int unsigned	f1, int unsigned	buf_bytes, output rdma_pair	p);
 
   // 功能：通过 UVM factory 构造 verb item，并填入 QP、本地/远端 MR、偏移、长度与 SGE 数量。
   // 输入/输出及副作用：输入 op、qp、lmr、rmr 及区域参数，返回独立 item；不修改资源对象。
   // 失败/边界：允许 rmr 为空以表示 SEND/RECV，但不检查句柄、范围、length 或 sge_count；非法组合
   //   由数据面驱动和 scoreboard 在投递时处理。
-  function rdma_verb_item verb(rdma_verb_op_e op, rdma_res_qp qp, rdma_res_mr lmr,
-                               int unsigned local_offset, int unsigned length,
-                               rdma_res_mr rmr = null, int unsigned remote_offset = 0,
-                               int unsigned sge_count = 1);
-    rdma_verb_item it;
+  function rdma_verb_item verb(rdma_verb_op_e	op, rdma_res_qp	qp, rdma_res_mr	lmr,
+                               int unsigned	local_offset, int unsigned	length,
+                               rdma_res_mr	rmr = null, int unsigned	remote_offset = 0,
+                               int unsigned	sge_count = 1);
+    rdma_verb_item	it;
 
     it = rdma_verb_item::type_id::create(op.name());
     it.op = op;
@@ -256,8 +222,8 @@ class rdma_base_vseq extends uvm_sequence;
   //   阻塞到对应完成。
   // 失败/边界：it 以及所选 srq/qp owner 必须有效，owner.index 必须已有 env.verb；本 task 不设超时，
   //   driver 不结束 item 时会持续阻塞。
-  task post(rdma_verb_item it);
-    rdma_res_func f;
+  task post(rdma_verb_item	it);
+    rdma_res_func	f;
 
     f = it.srq != null ? it.srq.owner : it.qp.owner;
     start_item(it, -1, env.verb[f.index].sequencer);
@@ -265,23 +231,66 @@ class rdma_base_vseq extends uvm_sequence;
   endtask
 endclass
 
+  // 功能：建立通用回归拓扑：每端 PD/CQ、RC和UD QP、buf_bytes缓冲/MR；两端均本地时额外建URC专用CQ/QP。
+  // 输入/输出及副作用：f0/f1 为既有 Function 索引；p 输出借用资源集合，按同类 QP 互连到 RTS，深度取统一场景。
+  // 失败/边界：索引必须有效；任一远端端点跳过URC，控制面非预期失败 fatal，不将本拓扑当作单场景资源复用测试。
+task rdma_base_vseq::setup_pair(int unsigned	f0, int unsigned	f1, int unsigned	buf_bytes, output rdma_pair	p);
+    int unsigned	f[2];
+
+    f = '{f0, f1};
+    p = rdma_pair::type_id::create("pair");
+    p.urc = !env.res.funcs[f0].remote && !env.res.funcs[f1].remote;
+    foreach (f[n]) begin
+      alloc_pd(f[n], p.pd[n]);
+      create_cq(f[n], env.cfg.scenario.qp.depth, p.cq[n]);
+      create_qp(p.pd[n], RDMA_DRV_QPT_RC, p.cq[n], 1'b0, p.qp[n][0]);
+      create_qp(p.pd[n], RDMA_DRV_QPT_UD, p.cq[n], 1'b0, p.qp[n][1]);
+      if (p.urc) begin
+        create_cq(f[n], env.cfg.scenario.qp.depth, p.urc_cq[n]);
+        create_qp(p.pd[n], RDMA_DRV_QPT_RC, p.urc_cq[n], 1'b1, p.qp[n][2]);
+      end
+      alloc_buf(f[n], buf_bytes, p.mem[n]);
+      reg_mr(p.pd[n], p.mem[n], p.mr[n]);
+    end
+    for (int unsigned	k = 0; k < (p.urc ? 3 : 2); k++)
+      connect(p.qp[0][k], p.qp[1][k]);
+endtask
+
+  // 功能：创建 QP（收发同一 CQ，深度取配置）。
+  // 输入/输出及副作用：qp 输出。
+  // 失败/边界：见 ctrl。
+task rdma_base_vseq::create_qp(rdma_res_pd	pd, rdma_drv_qp_type_e	qp_type, rdma_res_cq	cq, bit	urc, output rdma_res_qp	qp, input rdma_res_srq	srq = null);
+    rdma_ctrl_item	it;
+
+    it = new_ctrl(RDMA_CTRL_CREATE_QP, pd.owner.index);
+    it.pd = pd;
+    it.qp_type = qp_type;
+    it.urc = urc;
+    it.send_cq = cq;
+    it.recv_cq = cq;
+    it.srq = srq;
+    it.size = env.cfg.scenario.qp.depth;
+    ctrl(it);
+    void'($cast(qp, it.res));
+endtask
+
 // 两 Function 全功能流量：SEND/RECV 跨 MTU、SEND_IMM、WRITE(+IMM、unsignaled)、READ、ATOMIC、反向、
 //   多 SGE/外部 SGB、UD、URC、越界访问错误。源数据轮流使用 net_packet 的四种负载模式。
 class rdma_basic_traffic_vseq extends rdma_base_vseq;
   `uvm_object_utils(rdma_basic_traffic_vseq)
 
-  localparam int unsigned BUF_BYTES = 'h20000;
+  localparam int unsigned	BUF_BYTES = 'h20000;
 
   // 参与的两个 Function（f0 发起大部分请求）。
-  int unsigned f0 = 0;
-  int unsigned f1 = 1;
-  rdma_pair p;
-  protected int unsigned count;
+  int unsigned	f0 = 0;
+  int unsigned	f1 = 1;
+  rdma_pair	p;
+  protected int unsigned	count;
 
   // 功能：创建基础全功能流量序列，并保留默认 Function 0→1 配置与从零开始的数据模式计数。
   // 输入/输出及副作用：name 传给基类；f0/f1 为 0/1，p 尚未建立，count 保持默认 0。
   // 失败/边界：构造不检查 Function 数量或分配拓扑，必须由 body 成功执行 setup_pair 后再运行子场景。
-  function new(string name = "rdma_basic_traffic_vseq");
+  function new(string	name = "rdma_basic_traffic_vseq");
     super.new(name);
   endfunction
 
@@ -309,11 +318,11 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
   //   的新 item；每次调用递增 count 以轮换 data_mode。
   // 失败/边界：p 必须已由 setup_pair 填充，n 只能为 0/1 且 k 必须指向已创建 QP；远端 Function
   //   强制单 SGE，偏移与长度是否合法留给 driver/scoreboard 判定。
-  function rdma_verb_item v(int unsigned n, rdma_verb_op_e op, int unsigned local_offset,
-                            int unsigned length, int unsigned remote_offset = 0,
-                            int unsigned k = 0, int unsigned sges = 1);
-    rdma_verb_item it;
-    bit remote;
+  function rdma_verb_item v(int unsigned	n, rdma_verb_op_e	op, int unsigned	local_offset,
+                            int unsigned	length, int unsigned	remote_offset = 0,
+                            int unsigned	k = 0, int unsigned	sges = 1);
+    rdma_verb_item	it;
+    bit	remote;
 
     remote = !(op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM, RDMA_VERB_RECV});
     if (p.qp[n][k].owner.remote)
@@ -332,7 +341,7 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
   // 失败/边界：要求 setup_pair 已建立 RC QP/MR 且固定区域落在 BUF_BYTES 内；任一投递失败由 verb
   //   driver 或 scoreboard 报告，本 task 不自行恢复 QP。
   task send_recv();
-    rdma_verb_item it;
+    rdma_verb_item	it;
 
     post(v(1, RDMA_VERB_RECV, 'h2000, 'h1000));
     post(v(1, RDMA_VERB_RECV, 'h3000, 'h100));
@@ -348,7 +357,7 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
   // 失败/边界：要求 RC QP 仍为 RTS、接收端 RQE 可用且固定本地/远端区域有效；首个 unsignaled
   //   WRITE 依赖后续 signaled 请求的有序完成来结算。
   task write_read();
-    rdma_verb_item it;
+    rdma_verb_item	it;
 
     it = v(0, RDMA_VERB_WRITE, 'h0800, 300, 'h4000);
     it.signaled = 1'b0;
@@ -365,7 +374,7 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
   // 输入/输出及副作用：Function 1 的 0x7800 的 8 字节被改写。
   // 失败/边界：比较值基于该区域初始为零。
   task atomics();
-    rdma_verb_item it;
+    rdma_verb_item	it;
 
     it = v(0, RDMA_VERB_FETCH_ADD, 'h7000, 8, 'h7800);
     it.swap_add_value = 64'h5;
@@ -415,7 +424,7 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
   // 失败/边界：要求 qp[*][1] 已连接且 700 字节负载加 GRH 不超过接收缓冲/MTU；UD 丢包或 Q_Key
   //   不匹配不会由协议重试，本场景依赖无故障链路。
   task ud_send();
-    rdma_verb_item it;
+    rdma_verb_item	it;
 
     post(v(1, RDMA_VERB_RECV, 'hd000, 'h400, 0, 1));
     post(v(1, RDMA_VERB_RECV, 'hd400, 'h100, 0, 1));
@@ -431,7 +440,7 @@ class rdma_basic_traffic_vseq extends rdma_base_vseq;
   // 失败/边界：仅 p.urc 为 1、即双方均为本地 Function 时可调用；否则 qp[*][2] 未创建，body 必须
   //   保持现有条件保护，且该无确认传输依赖无故障链路。
   task urc_traffic();
-    rdma_verb_item it;
+    rdma_verb_item	it;
 
     post(v(1, RDMA_VERB_RECV, 'he000, 'h900, 0, 2));
     post(v(1, RDMA_VERB_RECV, 'he900, 'h10, 0, 2));
@@ -470,18 +479,18 @@ endclass
 class rdma_high_traffic_vseq extends rdma_base_vseq;
   `uvm_object_utils(rdma_high_traffic_vseq)
 
-  localparam int unsigned PACKETS = 4096;
-  localparam int unsigned PAYLOAD = 256;
-  localparam int unsigned WINDOW = 256;
-  localparam int unsigned RX_SLOTS = 64;
-  localparam int unsigned RX_BASE = 'h8000;
+  localparam int unsigned	PACKETS = 4096;
+  localparam int unsigned	PAYLOAD = 256;
+  localparam int unsigned	WINDOW = 256;
+  localparam int unsigned	RX_SLOTS = 64;
+  localparam int unsigned	RX_BASE = 'h8000;
 
-  rdma_pair p;
+  rdma_pair	p;
 
   // 功能：创建高流量窗口序列实例，保留尚未建立的双 Function 拓扑句柄。
   // 输入/输出及副作用：name 传给基类；p 保持空，流量规模由 PACKETS/WINDOW/RX_SLOTS 常量定义。
   // 失败/边界：构造不创建资源或验证队列深度，必须由 body 的 setup_pair 成功后才能填充窗口。
-  function new(string name = "rdma_high_traffic_vseq");
+  function new(string	name = "rdma_high_traffic_vseq");
     super.new(name);
   endfunction
 
@@ -489,15 +498,15 @@ class rdma_high_traffic_vseq extends rdma_base_vseq;
   // 输入/输出及副作用：经 sequencer 下发 item。
   // 失败/边界：结果由 scoreboard 判定。
   task body();
-    rdma_verb_item it;
+    rdma_verb_item	it;
 
     setup_pair(0, 1, 'h10000, p);
-    for (int unsigned w = 0; w < PACKETS / WINDOW; w++) begin
-      for (int unsigned k = 0; k < WINDOW; k++)
+    for (int unsigned	w = 0; w < PACKETS / WINDOW; w++) begin
+      for (int unsigned	k = 0; k < WINDOW; k++)
         post(verb(RDMA_VERB_RECV, p.qp[1][0], p.mr[1], RX_BASE + (k % RX_SLOTS) * PAYLOAD,
                   PAYLOAD));
       check_rq_full();
-      for (int unsigned k = 0; k < WINDOW; k++) begin
+      for (int unsigned	k = 0; k < WINDOW; k++) begin
         it = verb(RDMA_VERB_SEND, p.qp[0][0], p.mr[0], k * PAYLOAD, PAYLOAD);
         it.signaled = k == WINDOW - 1;
         post(it);
@@ -510,8 +519,8 @@ class rdma_high_traffic_vseq extends rdma_base_vseq;
   // 输入/输出及副作用：无（投递被拒绝）。
   // 失败/边界：返回其它结果报 UVM_ERROR。
   task check_rq_full();
-    rdma_drv_recv_wr wr;
-    rdma_status status;
+    rdma_drv_recv_wr	wr;
+    rdma_status	status;
 
     wr = rdma_drv_recv_wr::type_id::create("overflow");
     wr.wr_id = 64'hdead;

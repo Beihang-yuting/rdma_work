@@ -2,21 +2,22 @@
 // 职责：验证设备侧 CMQ 消费者 rdma_dev_cmq：CMQC 配置、doorbell 批处理与回绕、CQE envelope/owner，
 //   以及 QP/MR/CQ/EQ/SRQ context 的创建、修改、查询、删除效果和协议错误拒绝。
 //   SQE 按驱动 cmq.c 的字段布局直接构造（驱动编码本身由 CMQ golden 门禁保证）。
-// 依赖：rdma_dev_cmq、rdma_host_mem（外部 host_mem）。
-// 所有权与生命周期：测试拥有主机内存、缓冲与设备实例，随测试结束释放。
+// 依赖：rdma_dev_cmq、rdma_host_mem 和外部 host_mem_pkg 的公共 pool。
+// 所有权与生命周期：测试拥有 pool、Function 视图、缓冲与设备；pool 持有 manager，借用关系保持至仿真结束。
 class rdma_dev_cmq_test extends uvm_test;
   `uvm_component_utils(rdma_dev_cmq_test)
 
   localparam int unsigned DEPTH = 32;
   localparam int unsigned CQ_OFFSET = DEPTH * 64;
 
-  rdma_host_mem mem;
-  rdma_dev_cmq dev;
-  bit [63:0] ring;
-  bit [63:0] qpc_buf;
-  longint unsigned posted;
+  host_mem_pkg::host_mem_pool	pool;
+  rdma_host_mem			mem;
+  rdma_dev_cmq			dev;
+  bit [63:0]			ring;
+  bit [63:0]			qpc_buf;
+  longint unsigned		posted;
   // 丢弃型调用的 CQE 接收变量（VCS 对 void'() 丢弃动态数组返回值会崩溃）。
-  rdma_bytes_t scratch;
+  rdma_bytes_t	scratch;
 
   // 功能：构造测试组件。
   // 输入/输出及副作用：name/parent 透传给 uvm_test；CMQ ring/context 句柄为空，posted 与地址使用零初值。
@@ -44,20 +45,10 @@ class rdma_dev_cmq_test extends uvm_test;
     phase.drop_objection(this);
   endtask
 
-  // 功能：分配 CMQ 环（4KiB）与 QPC 缓冲区（512B 对齐），配置并使能设备 CMQ。
-  // 输入/输出及副作用：创建 mem/dev/ring/qpc_buf。
-  // 失败/边界：任一步失败报告 UVM_FATAL。
-  task setup();
-    rdma_host_mems mems;
-
-    mems = rdma_host_mems::type_id::create("dev_cmq_mems");
-    mem = mems.make(0, "dev_cmq_mem");
-    dev = rdma_dev_cmq::type_id::create("dev_cmq");
-    ring = alloc(4096, 4096);
-    qpc_buf = alloc(512, 512);
-    dev.configure(mem);
-    enable();
-  endtask
+  // 功能：通过公共 Host pool 创建 Host0 backing，分配4KiB CMQ环和512B对齐QPC缓冲并使能设备。
+  // 输入/输出及副作用：测试持有 pool，mem 借用其 manager；创建 dev/ring/qpc_buf，不另维护 Host 表。
+  // 失败/边界：pool 创建、分配或设备配置失败报告 UVM_FATAL；只供独立 CMQ 模型，不绑定外部平台。
+  extern task setup();
 
   // 功能：从主机内存分配一段 DMA 缓冲。
   // 输入/输出及副作用：返回 IOVA。
@@ -400,3 +391,19 @@ class rdma_dev_cmq_test extends uvm_test;
       `uvm_error("ABSENT_MR", "KEY_QUERY on an absent MR was accepted")
   endtask
 endclass
+
+// 功能：通过公共 Host pool 创建 Host0 backing，分配4KiB CMQ环和512B对齐QPC缓冲并使能设备。
+// 输入/输出及副作用：测试持有 pool，mem 借用其 manager；创建 dev/ring/qpc_buf，不另维护 Host 表。
+// 失败/边界：pool 创建、分配或设备配置失败报告 UVM_FATAL；只供独立 CMQ 模型，不绑定外部平台。
+task rdma_dev_cmq_test::setup();
+  pool = host_mem_pkg::host_mem_pool::type_id::create("dev_cmq_pool");
+  if (!pool.create_host(0, 64'h40_0000_0000, 64'h40_0fff_ffff, host_mem_pkg::MODE_BUDDY, 16))
+    `uvm_fatal("DEV_CMQ", "could not create Host0 memory")
+  mem = rdma_host_mem::type_id::create("dev_cmq_mem");
+  mem.mem = pool.get_host(0);
+  dev = rdma_dev_cmq::type_id::create("dev_cmq");
+  ring = alloc(4096, 4096);
+  qpc_buf = alloc(512, 512);
+  dev.configure(mem);
+  enable();
+endtask

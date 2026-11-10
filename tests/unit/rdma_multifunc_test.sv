@@ -175,29 +175,7 @@ class rdma_multifunc_test extends uvm_test;
   //   NIC，probe 驱动并建资源。
   // 输入/输出及副作用：追加 funcs，注册到网络。
   // 失败/边界：失败报告 UVM_FATAL。
-  task add_func(string name, int unsigned i);
-    rdma_mf_func f;
-    rdma_mf_port port;
-
-    f = rdma_mf_func::type_id::create(name);
-    f.idx = i;
-    f.dpu = sys.nodes[i].func;
-    f.mac = {32'h0200_0000, 8'(f.dpu.key.host_id), 8'(f.dpu.global_id)};
-    f.mem = sys.nodes[i].mem;
-    f.dev = sys.nodes[i].dev;
-    f.bar = sys.nodes[i].bar;
-    f.hw = sys.nodes[i].hw;
-    port = rdma_mf_port::type_id::create({name, "_port"});
-    port.net = net;
-    port.src = f.mac;
-    f.dev.nic.port = port;
-    net.devs[f.mac] = f.dev;
-    fork
-      f.dev.nic.run();
-    join_none
-    probe(f);
-    funcs.push_back(f);
-  endtask
+  extern task add_func(string	name, int unsigned	i);
 
   // 功能：快照投影检查：global Function ID 互不相同；每个 Function 的设备 QPC 带快照的 HOST_ID 与
   //   global ID（VF_ID）；每个设备都收到过经路由器的 doorbell；MAILBOX BAR 与另一 Host 的 BAR0
@@ -668,3 +646,32 @@ class rdma_multifunc_test extends uvm_test;
     check_traffic("after recovery", none);
   endtask
 endclass
+
+// 功能：接入 rdma_dpu_system 的第 i 个节点：MAC 为 02:00:00:00:<host>:<global ID>，挂到网络，启动
+//   NIC，probe 驱动并建资源。
+// 输入/输出及副作用：追加 funcs，注册到网络。
+// 失败/边界：失败报告 UVM_FATAL。
+task rdma_multifunc_test::add_func(string	name, int unsigned	i);
+  rdma_mf_func	f;
+  rdma_mf_port	port;
+
+  f = rdma_mf_func::type_id::create(name);
+  f.idx = i;
+  f.dpu = sys.nodes[i].func;
+  f.mac = {32'h0200_0000, 8'(f.dpu.key.host_id), 8'(f.dpu.global_id)};
+  f.mem = sys.nodes[i].mem;
+  f.dev = sys.nodes[i].dev;
+  if (!$cast(f.bar, sys.nodes[i].bar))
+    `uvm_fatal("MULTIFUNC", "model fixture requires a model BAR observer")
+  f.hw = sys.nodes[i].hw;
+  port = rdma_mf_port::type_id::create({name, "_port"});
+  port.net = net;
+  port.src = f.mac;
+  f.dev.nic.port = port;
+  net.devs[f.mac] = f.dev;
+  fork
+    f.dev.nic.run();
+  join_none
+  probe(f);
+  funcs.push_back(f);
+endtask

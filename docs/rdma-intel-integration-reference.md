@@ -1,305 +1,121 @@
-# RDMA + DPU + Intel PCIe 集成参考
+# RDMA Intel 项目接入参考
 
-这是按 Virtio 当前 [integration/project](../../virtio_work/integration/project/README.md) 方式整理的**设计案例**，不是本分支已经可运行的 DUT test。公共 API 的调用片段来自当前依赖源码；拟新增的 RDMA/project 接口会单独注明。完整职责与改动范围见 [设计文档](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。
+本文对应实际实现；入口与验证命令见 [项目 README](../integration/project/README.md)，版本/结果见 [验证记录](../integration/project/VALIDATION.md)，设计约束见 [设计](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。当前为软件集成和受控 fixture，尚无完整真实 DUT 验收。公共 DPU 的 RDMA QP/SD/CEQ/AEQ grant 缺口必须独立解决。
 
-当前范围：先做 RDMA、固定单 bank、身份和共享额度统一向 DPU 申请。配置、初始化和业务均由 Tcl 显式启动，环境阶段不自动执行。共存只保留架构边界，不在本轮引入 VIO 编译依赖或混合 seq。目录入口见 [integration/project](../integration/project/README.md)。
+## 配置与类型组合
 
-## 1. 用户工程的最小组成
+`rdma_project_env_cfg` 直接保存 `dpu_env_cfg dpu`、`rdma_env_cfg rdma`、`pcie_tl_env_config pcie` 和 `functions[$]`。平台提供并拥有这三份既有配置，参考 project 只借用。用户也可在自己的 cfg 直接组合相同类型，不要求继承参考类或增加公共包装对象。
 
-建议参考入口放在以下位置；这些源码文件尚未创建，避免把设计片段误加入生产编译：
+| 文件 | 实际职责 |
+| --- | --- |
+| `integration/project/rdma_project_transport_pkg.sv` | Intel RC 的 Host/Requester/Function authority 与 BAR 绑定；复用 PCIe responder |
+| `integration/project/rdma_project_cfg_seq.sv` | `rdma_project_cfg_seq extends dpu_cfg_seq`，单 bank 公共表编排 |
+| `integration/project/rdma_project_pkg.sv` | 仅配置 sequence 的包入口 |
+| `integration/project/rdma_project_runtime_pkg.sv` | include `rdma_project_env_cfg.sv` 与 `rdma_project_env.sv`，无注册副作用 |
+| `integration/project/rdma_project_test.sv` | 最终 test package include 的平台 hooks 与 AIP bridge 基类 |
+| `integration/project/rdma_project_commands.sv` | 最终编译单元显式 include 的唯一命令注册 |
+| `integration/filelists/rdma_project.f` | 完整可复用类型入口，无 wrapper/test/top/注册 |
 
-```text
-integration/project/
-    rdma_project_cfg.sv       # 用户 cfg 的组合示例
-    rdma_project_env.sv       # 创建、绑定、发布句柄与 AIP 入口
-    rdma_project_cfg_seq.sv   # 只编排 RDMA 必需配置
-    rdma_project_test.sv      # 平台 hooks 与启动顺序
-    rdma_project_pkg.sv       # 上述文件的唯一 include 入口
-    rdma_project_commands.sv  # AIP task/sequence/reg 宏注册
-    rdma_start.tcl            # 用户显式 source 的配置/初始化/业务示例
-    README.md
-integration/filelists/
-    rdma_project.f           # 用户显式加入工程的独立入口
-```
+完整类型编译顺序为 AIP → Host memory → DPU resource → PCIe interface/shared/topology/TL/integration → Intel interface/adapter → RDMA 核心/适配器/env/AIP/PCIe → DPU PCIe → project transport/config/runtime。普通 `.sv` 被 package include 后不能单独再编译。`rdma_pcie_work_pkg` 依赖 `pcie_dpu_integration_pkg`；真正使用 `dpu_pcie_pkg` 的 Task3 transport 放在后面。AIP 使用 expression-capable checkout，不同时编译旧 aip_core 包；net_packet 沿用 RDMA adapter 的 include 方式。
 
-现有 `src/adapters/dpu`、`host_mem`、`pcie_work` 和 `aip` 负责改造自己的能力，不再新建另一套同名 BAR registry、公共配置对象或 task 管理器。参考 cfg/env 使用 `rdma_project_*` 命名，用户可直接合入自己的 env/cfg。原有 `sim/filelists/*.f` 不增加 include 或源码条目，也不通过现有 package 间接编译示例。
+[完整 Intel fixture](../integration/project/tests/project_intel.f) 只追加 wrapper、control interface、既有 test 与 top。[run_intel.sh](../integration/project/tests/run_intel.sh) 展开两份清单并显式选择 `rdma_project_transport_top`。模型/Tcl 使用独立 runtime 边界；config-only 测试不因此引入 RDMA/AIP/Intel。旧生产 filelist 不变。
 
-```mermaid
-flowchart TD
-    C[用户 env_cfg: dpu_cfg / rdma_cfg / pcie_cfg] --> E[用户 env]
-    E --> D[dpu_device_env: 一次解析]
-    D --> R[rdma_env: 消费冻结快照]
-    E --> P[pcie_tl_env: 每 Host 一个 RC]
-    M[共享 Host memory pool] --> R
-    M --> P
-    B[同一 dpu_pcie_bar_map] --> Q[RDMA 配置 sequence]
-    B --> P
-    R --> P
-    P --> I[Intel HARD_IP wrapper]
-    I --> T[真实 DUT EP application]
-```
+## 权威身份、共享内存与真实传输
 
-## 2. cfg 直接组合；authoring 只做一次
+平台在 DPU authoring 中声明 Host/PF/VF、服务和资源请求，经一次 resolver 发布同源 device/resource snapshot、BAR map。RDMA 外部路径选择 `external_configuration`，绑定已有 `external_system`，由其 `bind_resources()` 借用同源资源快照；`bind_snapshot` 创建只读节点投影，不再次 resolve，不创建设备模型。一个 `rdma_env` 统一管理所有选定 Function，`global_function_id < 256` 直接进入 RDMA Function 字段；Notify 行号、Intel VF index、VIO local/global qpair ID 都不是该 ID。
 
-放在用户 cfg 类中的字段片段如下；构造函数创建三份配置即可。无需继承参考 cfg。
+平台统一持有 `host_mem_pkg::host_mem_pool`，通过 `dpu.host_mem_pool_ref` 发布真实 pool 句柄。`rdma_dpu_system::bind_snapshot(source, keys, pool)` 借用同一个 pool，先检查全部选中 Function 的 Host manager 已初始化、Host ID 正确且覆盖冻结 GPA，再一次发布节点；缺项直接拒绝，不创建私有 backing。`rdma_host_mems` 工厂及 PCIe 的重复 Host 映射已删除。
+
+平台按冻结快照的 `list_hosts()`/`lookup_host()` 建立 pool；对尚不存在的 Host 调用 `create_host(host_id, gpa_base, gpa_limit - 1, MODE_BUDDY, 16)`，其中 DPU 的 `gpa_limit` 为开区间终点，pool 的末地址为闭区间。已由 Virtio/project 建立的 pool 直接复用，不重复初始化 manager。以下片段放在平台装配阶段，`keys`、`host_id`、`rc_slot` 均来自现有映射：
 
 ```systemverilog
-// 用户 cfg 拥有三份子配置；pool 由用户环境拥有，配置只借用。
-dpu_env_cfg				dpu_cfg;
-rdma_env_cfg				rdma_cfg;
-pcie_tl_env_config		pcie_cfg;
-host_mem_pool			shared_pool;
-int unsigned			tl_slot_by_host[int unsigned];
+host_mem_pool pool;
+rdma_status status;
+string why;
+
+if (!$cast(pool, dpu.host_mem_pool_ref) || pool == null)
+  `uvm_fatal("RDMA_PROJECT", "platform host_mem_pool is required")
+status = system.bind_snapshot(dpu.device_snapshot, keys, pool);
+if (!status.ok())
+  `uvm_fatal("RDMA_PROJECT", status.convert2string())
+if (!pcie_cfg.bind_host_memory(rc_slot, host_id, pool.get_host(host_id), why))
+  `uvm_fatal("RDMA_PROJECT", why)
 ```
 
-平台在 DPU resolve 前使用公共 authoring 类型声明 Host、Function、RDMA service 和资源需求，并提供 `function_policies` 的真实 requester/Intel PF/VF，以及适用表的布局和内容。DPU 是最终资源的唯一权威。
+同 Host 的 RDMA/PCIe 消费同一 manager，不同 Host 可以使用数值相同的 GPA，backing 仍然隔离。`rdma_host_mem` 仅保留各 Function 的分配账本和 DMA 范围检查；完整区间必须属于本 Function 的一次存活分配。独立模型的 `build()` 同样使用公共 pool，范围来自模型 authoring 冻结后的 GPA。pool 和 manager 必须覆盖所有借用者及未释放分配；发布后不能替换，`load_params` 与 AIP restore 保持其身份。
 
-当前 `dpu_env_cfg.load_params()` 默认创建 VIO 输入，不能把它当作 RDMA 自动配置，也不能在平台已经构造非空拓扑后再调用。这里选择**平台提供已完成 authoring 的 dpu_cfg，RDMA 提交自己的资源需求**；DPU 随后进行一次解析。请求必须在冻结前提交，实际 RDMA 对象和内存在冻结后按结果创建。
+每 Host 一个 Intel 端口/RC slot，同 Host PF/VF 共用；Host ID 不必等于 slot。平台创建 `pcie_tl_env` 前调用 `intel_pcie_configure_env()`，给 RC 设置 `rdma_project_rc_driver` 实例 override；真实 DUT 路径开启 RC，关闭模型 EP/ep_auto_response，wrapper 使用 HARD_IP。`rdma_project_pcie_bar` 复用已有大端8字节 write64；公共表仍按现有 DWORD 顺序写。
 
-首个具体场景采用 Host0 的管理 PF0 加一个平台支持的 RDMA VF：PF0 承担 AF/管理 BAR 访问，Function、global ID 和 BAR 来自 DPU 冻结结果。当前约定 `rdma_vf_id = global_function_id`，写表和 probe 前校验该值小于 256，不再分配另一套 ID。doorbell 地址按该 BAR 加 RDMA 窗口偏移得到，表行号按驱动的查找 key 排序生成；PCIe VF index 和 Notify 行号仍是独立概念。
+DPU map 必须包含所有 Function 的显式 Intel policy 和实际 sequencer。支持每 Host segment0、PF0..7、VF0..2047，PF 的 vf_index=-1；BDF、Requester ID 和 Intel PF/VF sideband 分别消费真实映射。不存在的 Host/Function、缺 policy、跨 BAR/溢出、未知 Requester 或旧 epoch 都拒绝，不回退 RC0。Function 数量由 dpu_common 能力、Host/Function 表和 Notify bank 容量约束，RDMA 代码不固定为两端。
 
-当前 DPU 没有 RDMA 资源额度请求/binding，且资源 manager 仍无条件要求 `virtio.qpair` profile。这些共享资源契约仍需补齐；Function ID 已能从 device snapshot 取得，无需为当前恒等映射新增 RDMA `allocate()`。不采用平台手填另一套 RDMA ID 或增加假 VIO 服务的兼容方式。
+当前 transport 为保证授权检查至 enqueue 无等待，要求 infinite credit、关闭 shaper/link delay，并验证实际 driver/Intel 状态。`prepare_platform` 完成初始 reset/readiness 后调用 RC `bind_transport(...)`，再调用 BAR `bind_project(...)`；connect 可先发布尚未绑定的 BAR。绑定一次性捕获非零 generation/reset epoch，FLR 前 `revoke_function(key)`，链路 teardown 前 `revoke()`；物理复位后旧绑定永久失效，无 rearm。平台须确认 DMA 静止后释放业务分配。
 
-## 3. 创建组件与绑定共享内存
+## 公共表、驱动与 grant 的边界
 
-以下是用户 env `build_phase` 中可复用的公共 API 片段。前置条件是三份 cfg、Host→slot 映射和 Intel VIF 已检查；`host_count` 来自 DPU authoring 的 Host 数量，不从 RDMA 再生成一份拓扑。
+`rdma_project_cfg_seq` 验证完整 RDMA Function 目录、同源 snapshot/map、PF/VF Function owner、8位 ID、表布局/对齐/全物理跨度不重叠及实际 Notify 窗口。Notify 按 `{host_id, address[60:13]}` 排序，行号与 global ID 分离，固定单 bank；成功后每个管理 BAR `+0x80044=1`，不写旧 `+0x48`。先 AF/公共表，再 Notify/QSCH/RNET；不调用基类 VIO 默认 body，不 probe。
 
-```systemverilog
-cfg.pcie_cfg.rc_agent_enable = 1;
-cfg.pcie_cfg.rc_is_active    = UVM_ACTIVE;
-cfg.pcie_cfg.num_rc          = host_count;
-cfg.pcie_cfg.ep_agent_enable = 0;
-cfg.pcie_cfg.num_ep          = 0;
-cfg.pcie_cfg.ep_auto_response = 0;
-cfg.pcie_cfg.use_unified_mem = 1;
-cfg.pcie_cfg.mem_access_mode = PCIE_TL_MEM_PER_BUFFER;
+非空 MSI-X 路径在有效表配置后、`enable_msix()` 前调用继承的 `process_msix_tail(0, ...)`，将单 bank 全部未用行设为非 reserved 字段全1、reserved 字段全0；`verify_readback` 时以 `process_msix_tail(1, ...)` 验证尾部，失败立即停止 Notify/RNET。首笔 AF/MMIO 前校验完整 bank 的容量、地址溢出、BAR范围、直接访问/DWORD对齐及每个尾行8B访问的4KB边界，并检查尾部与有效表/AF/Notify enable 的物理跨度冲突；有效行不与自身所属 bank 误判重叠。无消息路径不访问 MSI-X。显式 table-only 策略下 MSI-X Function enable 没有MMIO副作用，fixture验证的是尾部操作先于实际 Notify使能及后续类别。
 
-uvm_config_db#(dpu_env_cfg)::set(this, "dpu_env", "cfg", cfg.dpu_cfg);
-uvm_config_db#(dpu_env_cfg)::set(this, "pcie_env.*", "dpu_cfg", cfg.dpu_cfg);
-dpu_env = dpu_device_env::type_id::create("dpu_env", this);
+非空 CONTROL/FUNCTION catalog 会涉及当前未实现的公共 hooks，因此预检在 AF/MMIO 前拒绝；table-only 策略按既有显式契约设置。公共 sequence 保留 success/error_msg 和继承的 fatal post_start；已经发出的 posted write 不承诺回滚。公共 scope 用非空 Function 列表与明确类别选择，另行核对 RDMA service，不能把 RDMA service 塞入只支持 VIO 的 service 校验。
 
-intel_pcie_configure_env(this, cfg.pcie_cfg, "pcie_env");
-// 在 create 前安装改造后的 RDMA RC driver 实例 override，不能全局覆盖全部 RC。
-pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
-```
+表配置成功只说明路由前提成立。DPU 目前没有 RDMA QP/SD/CEQ/AEQ grant，resource snapshot/manager 还要求 VIO qpair capacity/profile；RDMA 外部初始化在 MMIO/CMQ 前明确拒绝。模型测试合法发布的 VIO 资源/消息只能验证同源及公共表，不能冒充 RDMA grant；测试不编译 VIO 包，也不实现混合运行。`first_qp` 目前只是 bitmap 轮转起点，手填范围不能形成全局租约隔离。
 
-真实 RC driver override 与 RDMA 子环境创建依赖尚待实现的外部绑定路径，上面没有把当前 `rdma_env` 当作已支持该路径。当前 `rdma_env_cfg.finalize()` 仍拒绝 DUT Function；不能只移除该检查而保留 `node.dev.nic` 等模型依赖。
+## 独立启动与已有 project 接入
 
-共享内存绑定使用下列现有接口，必须在 PCIe 子组件 build 前完成。`manager` 是平台 pool 中属于 `host` 的唯一 manager；其 Host 身份、GPA 范围、分配策略必须与 DPU 一致，`slot` 由完整映射得到：
+独立最终 test package 按实际 [command test package](../integration/project/tests/rdma_project_command_test_pkg.sv) 的结构导入 runtime/config/AIP 类型，前置声明 `rdma_project_test`，声明非拥有 `project_context` 与 `project_rc_sqr`，然后依次 include test 基类、commands 和平台子类。当前注册为：
 
 ```systemverilog
-if (!cfg.pcie_cfg.bind_host_memory(slot, host, manager, why)) begin
-	`uvm_fatal("RDMA_PROJECT", why)
-end
-
-// 每个 Function 新建一个记账视图，背后的 manager 与 PCIe 相同。
-function_mem = rdma_host_mem::type_id::create(function_name);
-function_mem.mem = manager;
-```
-
-集成路径不能继续调用会自动创建固定地址 manager 的 `rdma_host_mems.make()`。现有 `rdma_host_mem` 的分配/访问账本可复用；PCIe DMA 接收还须按 requester 找到对应 Function 并执行这一隔离检查，不能仅凭共享 manager 地址有效就允许访问。
-
-## 4. connect 阶段发布同一 BAR/Intel map
-
-下面是组装函数内的调用片段，不是独立编译单元。组装前需要检查：快照非空，Host→slot 完整且一一对应，slot 在 RC 数组内，每个 RC sequencer 非空。`map` 的所有权属于用户 env，DPU cfg/RC/配置 sequence 借用它。
-
-```systemverilog
-dpu_pcie_bar_map		map;
-dpu_function_key_t	keys[$];
-dpu_function_policy_t	policy;
-string				why;
-string				name;
-
-map = dpu_pcie_bar_map::type_id::create("bar_map");
-if (!map.initialize(dpu_env.get_snapshot(), 1, why)) begin
-	`uvm_fatal("RDMA_PROJECT", why)
-end
-
-foreach (cfg.tl_slot_by_host[host]) begin
-	int unsigned	slot;
-
-	slot = cfg.tl_slot_by_host[host];
-	if (!map.bind_host(host, slot, why)) begin
-		`uvm_fatal("RDMA_PROJECT", why)
-	end
-	map.rc_sequencers[slot] = pcie_env.rc_agents[slot].sequencer;
-end
-
-dpu_env.get_snapshot().list_functions(keys);
-foreach (keys[i]) begin
-	name = dpu_function_key_name(keys[i]);
-	if (!cfg.dpu_cfg.function_policies.exists(name)) begin
-		`uvm_fatal("RDMA_PROJECT", {"missing Intel policy: ", name})
-	end
-	policy = cfg.dpu_cfg.function_policies[name];
-	if (dpu_function_key_name(policy.key) != name || $isunknown(policy.requester)) begin
-		`uvm_fatal("RDMA_PROJECT", {"invalid Intel policy: ", name})
-	end
-	if (!map.bind_function(
-		keys[i], policy.intel_pf, policy.intel_vf, policy.requester, why
-	)) begin
-		`uvm_fatal("RDMA_PROJECT", why)
-	end
-end
-
-if (!map.freeze(why)) begin
-	`uvm_fatal("RDMA_PROJECT", why)
-end
-if (!cfg.dpu_cfg.publish(
-	dpu_env.get_snapshot(), dpu_env.get_resource_snapshot(), map, why
-)) begin
-	`uvm_fatal("RDMA_PROJECT", why)
-end
-```
-
-随后把**同一个 map** 和当前 Host/segment/slot 注入改造后的 RDMA RC driver。这个注入接口尚待实现；不能直接调用 Virtio 的 `install_receive_path()`，因为它包含 VIO 的 IOMMU/MSI-X 语义。
-
-参考 [公共 map](../../dpu_common/integration/pcie/dpu_pcie_bar_map.sv) 的 `route_memory()`、`route_completion()`、`resolve_requester()`，补充 Function 内存所有权与 epoch 检查。发送仍调用 PCIe 父类，保留 tags、严格顺序和 Completion 错误处理。
-
-## 5. Intel wrapper 与平台 hooks
-
-复用 [Intel wrapper](../../pcie_intel/bind/intel_pcie_bind_wrapper.sv) 的 `intel_pcie_bind_wrapper_inout`：`SIDE="HARD_IP"`，`ADAPTER_PATH` 指向实际 RC adapter，例如 `uvm_test_top.env.pcie_env.rc_adapter_0`。它按该路径发布 `vif` 和 `intel_cfg`。
-
-每个 Host 连接自己的真实 Intel AVST 接口，wrapper 几何参数和本地 credit 配置与 RTL 一致。公共 TL 无限 credit 不替代 Intel 本地信用。不同端口不共享同一可变配置/VIF。时间 0 先完成发布，再由唯一 top 调用 `run_test`，必要时使用 `#0` 排定顺序。
-
-参考 base_test 的三个平台接口如下；这是拟新增类的声明片段，具体实现由平台提供：
-
-```systemverilog
-// 功能：将平台已创建的 Intel/网络接口和共享 pool 绑定到项目配置。
-// 输入输出及副作用：使用派生 test 的平台句柄；不重新解析拓扑或取得对象所有权。
-// 失败边界：缺失必需接口、Host/slot 错配或跨端口复用时拒绝构建。
-pure virtual function void bind_platform_handles();
-
-// 功能：执行平台复位并等待 Intel 接口及外部 endpoint 就绪。
-// 输入输出及副作用：可能驱动 reset；正常返回表示允许开始 DUT 配置。
-// 失败边界：必须有平台超时；就绪失败或任务被取消时不能继续配置。
-pure virtual task prepare_platform();
-
-// 功能：排空业务，检查数据、DMA 和 PCIe/网络结果，并确认 DUT 停止访问资源。
-// 输入输出及副作用：消费平台检查结果；确认静止后才允许释放 RDMA 当前代资源。
-// 失败边界：未排空、数据错误或停机超时必须报告失败，Tcl 返回不代表检查通过。
-pure virtual task finish_platform();
-```
-
-## 6. 复用 DPU 配置步骤
-
-拟新增的 `rdma_project_cfg_seq` 派生 `dpu_cfg_seq`。下面展示 RDMA 配置片段，`public_scope` 和 `rdma_scope` 来自已验证的真实 Function 选择，`cfg` 由父类 `pre_start()` 从 RC sequencer 的 `dpu_cfg` 获取。RDMA scope 使用非空 Function 集合及表类别，RDMA service 另外在快照中验证；当前公共 scope 的显式 service 校验只支持 VIO。
-
-```systemverilog
-declare_af(ok, error_msg);
-if (!completed_step("declare_af", ok)) return;
-
-configure_bdf_table(public_scope, ok, error_msg);
-if (!completed_step("configure_bdf_table", ok)) return;
-
-configure_rdma_notify(rdma_scope, ok, error_msg);
-if (!completed_step("configure_rdma_notify", ok)) return;
-
-configure_qsch_rnet(rdma_scope, ok, error_msg);
-if (!completed_step("configure_qsch_rnet", ok)) return;
-```
-
-这只是配置 body 的片段。平台选用的 MSI-X/公共表按真实依赖补齐，全部配置步骤成功才能设置 `success=1`。CMQ probe 由后续 `rdma_init` 命令触发，业务 CQ/QP/MR 由显式业务入口准备，不塞进配置 seq。父类默认 body 是 VIO 流程，不能用 `super.body()` 替代 RDMA 组装；也不照搬 Virtio base_test 在 `run_phase` 自动启动配置的部分。
-
-公共 Notify 方法会从 `frozen_controls` 取显式记录，先完整验证范围，再写表；全部成功后才写管理 BAR 的 `+0x80044=1`。缺少实际 RDMA 记录不能因“零条写成功”而将业务标为就绪；project 预检必须覆盖被选择的 RDMA 服务。
-
-保留父类失败 fatal 的 `post_start()`。如果将来改成 Tcl 可恢复错误，需要同步显式返回 AIP 非零状态；仅保留 `success=0` 不足以让 `aip_cmd_user_seq` 自动识别失败。
-
-## 7. 参数读取与 AIP 注册案例
-
-参数宏可以直接复用。以下片段放在加载器中，`cfg` 为现有 `rdma_env_cfg`，局部同名变量保持外部路径 `rdma.env.qp_depth`：
-
-```systemverilog
-int unsigned	qp_depth;
-
-`aip_int("rdma.env", int unsigned, qp_depth, cfg.qp_depth)
-// 在局部候选中完成范围/相互约束校验，再提交；不能边读边修改活动资源。
-```
-
-长度/SGE 等表达式使用字符串保存，生成每条 WR 时由 AIP 解释一次；重载、日志和队列满重试不能额外采样。同一参数不在 project、RDMA cfg、driver 各读一遍。
-
-以下宏签名来自 `aip_core_set_param_expr` 当前版本。`rdma_project_cfg_seq` 和 `project_rdma_load_params` 是本设计拟新增的入口；`project_rc_sqr` 是项目发布的非拥有 sequencer 引用，必须在进入 Tcl 前绑定。
-
-```systemverilog
-`aip_cmd_task(rdma_load_params, project_rdma_load_params)
+`aip_cmd_task(dut_config, project_dut_config)
 `aip_cmd_task(rdma_init, project_rdma_init)
 `aip_cmd_task(rdma_run, project_rdma_run)
-`aip_cmd_user_seq(dut_config, rdma_project_cfg_seq, project_rc_sqr)
+`aip_cmd_task(load_params, rdma_project_load_params)
 `aip_cmd_reg(reg_acc, dpu_bar_reg_seq, project_rc_sqr, seq.error_msg, seq.check_read_data)
 ```
 
-宏只编译/注册一次。既有工程已注册 `reg_acc` 时沿用原入口；不能为了 RDMA 再注册同名命令。使用项目已有 virtual sequencer 时，可以把 `project_rc_sqr` 替换成其已发布的 RC 引用。
+`dut_config` 采用短 task 调用 prepare 再执行 sequence，不能直接用 user_seq 宏跳过平台就绪步骤。test 的 `run_phase()` 只运行 bridge 与 finish；默认 prepare 明确失败，真实平台提供完成/超时判定、一次绑定和安全收尾。driver/router 不读取全局命令上下文。
 
-下面是无参 task 的**拟实现契约示例**，其中 `project_runtime_env.load_params(ok, why)` 尚不存在，需要按设计中的候选验证/提交语义实现。它只为 AIP 入口保留一个环境引用，driver/router 不依赖这个引用。
+已有 project 只导入无副作用的类型包，沿用自己的 test/registry。在其唯一 load_params 中先检查所有组件生命周期，再各自构造候选，完整验证后统一无时间推进提交；DPU 只读一次，RDMA 不读取 DPU/VIO 参数。可复用 `rdma_aip_cfg_loader::make_runtime_candidate`、`rdma_env::validate_runtime_candidate/apply_runtime_candidate`；不要顺序调用多个已自行提交的子 loader。配置使用 `rdma_project_cfg_seq`，初始化调用 `rdma_env::initialize`，业务复用 `rdma_traffic_vseq`。
 
-```systemverilog
-// 功能：把 AIP 当前参数重载到空闲的 RDMA 配置，不重新分配全局资源或写 DUT。
-// 输入输出及副作用：从同名 command 获取 args_in，调用环境重载并发布 status/result_out。
-// 失败边界：命令未注册时 fatal；带参数、环境未绑定、资源活动或候选非法时返回错误。
-task project_rdma_load_params();
-	aip_cmd	command;
-	bit		ok;
-	string	why;
-
-	command = aip_cmd::get_handle("rdma_load_params");
-	if (command == null) begin
-		`uvm_fatal("RDMA_PROJECT", "rdma_load_params is not registered")
-		return;
-	end
-	if (command.args_in != "" || project_runtime_env == null) begin
-		command.status = 1;
-		command.result_out = command.args_in != ""
-			? "ERROR: rdma_load_params takes no arguments"
-			: "ERROR: RDMA environment is not ready";
-		return;
-	end
-
-	project_runtime_env.load_params(ok, why);
-	command.status     = ok ? 0 : 1;
-	command.result_out = ok ? "OK: RDMA parameters reloaded" : {"ERROR: ", why};
-endtask
-```
-
-完成上述实现后，Tcl 场景按以下命令约定执行。test 只进入 bridge；平台就绪由 `dut_config` 显式触发，不能在进入 Tcl 前自动运行配置或 probe。当前分支尚未注册这些项目命令：
+模型 fixture 的 VF global IDs 为1/2；生产平台应从已发布目录选择实际 peer，也可以通过 `cfg.rdma.flow_groups` 声明多条业务边。平台已进入 bridge 并 source 匹配 loader 后：
 
 ```tcl
-set_param path=rdma.env.qp_depth value=256
-rdma_load_params
-dut_config
-reg_acc read 0x1010 check_read_data=0
-rdma_init
-rdma_run
-# Tcl 退出后，由 finish_platform 检查真实完成并确认 DMA 静止。
+set_param path=rdma.traffic.op value=write
+if {[aip_check_status] != 0} { error [aip_read_result] }
+set_param path=rdma.traffic.count value=100
+if {[aip_check_status] != 0} { error [aip_read_result] }
+foreach command {load_params dut_config rdma_init {rdma_run f0=1 f1=2}} {
+    aip_send_cmd $command
+    if {[aip_check_status] != 0} { error [aip_read_result] }
+}
+end_test drain=100ns
+if {[aip_check_status] != 0} { error [aip_read_result] }
+run
 ```
 
-`dpu_bar_reg_seq` 当前针对 Host0/PF0 BAR0，`addr` 为 BAR 内字节偏移。`check_read_data=0` 只关闭 PCIe scoreboard 的历史 RAM 值比较，仍检查 Completion；这里读取 AF 状态还需要调用者判断其值是否为 8。其他 Function/BAR 用公共配置 sequence 的 `pcie_bar_write_by_name()` 等命名访问方法。
+反序、重复初始化、缺失/相同端点和活动重入立即返回错误，不等待下一条 Tcl 命令。首次初始化尝试后，无论成功/失败/空闲均关闭 reload；取消不会自动清 busy 来假装可重入。没有释放后重新初始化或热改 traffic API。
 
-资源活动期间 `rdma_load_params` 返回错误；需要先由平台停止业务/DMA、释放当前代，再重载。恢复快照也不自动重采样，不允许借重载改变冻结的 Host/BDF/BAR 或重新绑定外部对象。
+## 参数和 checkpoint
 
-命令顺序必须可诊断：`rdma_init` 在配置成功前直接返回非零状态，`rdma_run` 在初始化前同样拒绝，不调用会无限等待 ready 的 sequence。命令注册是构建动作，命令执行才会产生 DUT 副作用。
+当前唯一 `cfg.scenario` 拥有 qp/mem/pkt/traffic；`cfg.flow_groups` 保存 global Function ID 对和每条边的 `qp_count`，由同一个 `rdma_traffic_vseq` 顺序运行。细节见 [单场景参数](rdma-biz-param-design.md)。RC 支持七种操作，UD只支持send/send_imm，URC映射RC+urc且只支持send/write/write_imm。默认SGE1；每条WR按原分支采样，非法值报完整路径和范围，不裁剪/重抽。pkt覆盖目前仅netpkt软件codec可用，DUT非默认值在资源分配前拒绝。
 
-## 8. 编译与验证边界
+项目 reload 的 DPU 消费范围仅 print_bar_map/verify_readback，PCIe保持构建值。全部候选合法后原地保留对象身份并清 configured，不提前MMIO或WR采样。完整override > leaf override > 完整CLI > leaf CLI > 默认值；可变字段的缺键使用新默认，固定mode/link/vseq/checker/cov缺键保留活动值、显式改变拒绝。AIP非法语法仍是hard fatal。
 
-包依赖顺序如下；这是顺序约束，尚未创建对应的新 filelist：
+同一 binary 在初始化前保存；续跑脚本在顶层恢复，下一行重建AIP Tcl入口，再定义用户proc或source后续脚本。以下是平台通用顺序，base及AIP_CORE须先设置：
 
-```text
-UVM / AIP
-  → host_mem / DPU resource / PCIe TL / net_packet
-  → RDMA types/model/driver/env 及必要适配器
-  → RDMA AIP
-  → Intel interface/adapter
-  → dpu_common/filelists/dpu_pcie.f
-  → 改造后的 RDMA PCIe 适配器
-  → 用户 env package 或 rdma_project_pkg
+```tcl
+aip_restore base
+source [file join $::env(AIP_CORE) dist aip_init_so.tcl]
+# 快照override仍优先；需要新CLI接管此键时显式清除。
+clear_param path=rdma.traffic.count
+if {[aip_check_status] != 0} { error [aip_read_result] }
+load_params
+if {[aip_check_status] != 0} { error [aip_read_result] }
+# 随后显式dut_config、rdma_init、带实际f0/f1或group索引的rdma_run。
 ```
 
-RDMA PCIe adapter 引入公共 map 后必须排在 `dpu_pcie_pkg` 之后。普通 `.sv` 被 package include 时不能再单独编译；示例仅由新的 `integration/filelists/rdma_project.f` 显式引入，原有 filelist 不修改。独立案例不编译 `virtio_dpu_pkg`。AIP 使用 `aip_core_set_param_expr`，不要同时编译旧 `aip_core` package；Host manager/pool 使用 `host_mem_pkg` 中的类型。
+[rdma_restore.tcl](../integration/project/rdma_restore.tcl) 是模型验收脚本，使用测试专有 project_observe/common assertions；[run_commands.sh](../integration/project/tests/run_commands.sh) 负责独立进程保存/恢复及匹配AIP dist。不能把同进程set_param测试当跨进程恢复证据。完整结果和外部能力限制见验证记录。
 
-软件侧需在 `ubuntu@10.11.10.53` 的 VCS 环境验证共享资源、双 Host/双实例路由、错误拒绝、AIP 结果、配置顺序和原有模型回归。实际 DUT 引脚、复位、Intel 交互、DMA/网络数据和恢复结果由平台接入后验证。
-
-本案例目前完成接口核对与文档静态检查，未编译这些片段，也未声称 DUT 集成已经通过。
-
-## 9. 已核对的 53 驱动来源
+## 驱动字段来源与保留的硬件约定
 
 2026-11-09 实际登录 `ubuntu@10.11.10.53` 进行只读核对，未运行仿真，也未修改远端文件：
 
@@ -338,12 +154,10 @@ sort_key    = entry[50:0]
 | RDMA Notify 表相对 PCOMPLETER 偏移 | `0x10000` | `0xc000` | `0xc000`，参考管理 BAR 内绝对偏移 `0x8c000` |
 | RDMA Notify ready/select | `PCOMPLETER+0x48` | `PCOMPLETER+0x48` | 两类 Notify 使用 `管理 BAR+0x80044=1` |
 | bank/写入批次 | 头文件带 `sel` | 整表写、读回重试、双 bank 翻转 | 单 bank、有效项批次、失败停止 |
-| owner 类型 | 字段名为 `pfvf_id` | RDMA ID 对应 PCI Function，可含 PF | 当前公共校验暂限 VF |
+| owner 类型 | 字段名为 `pfvf_id` | RDMA ID 对应 PCI Function，可含 PF/VF | 当前 catalog 接受已声明 RDMA service 的 PF/VF |
 
-当前使能行为已有 [Virtio 设计记录](../../virtio_work/docs/superpowers/specs/2026-11-09-dpu-config-consolidation-design.md) 明确说明。采用驱动的字段来源、排序与资源身份规则，保留当前硬件布局和使能约定；不能因为找到旧源码就恢复旧 bank 或 `+0x48`。当前 VF-only 校验也不能据此宣称硬件仅支持 VF。
+当前使能行为与参考仓库 `virtio_work/docs/superpowers/specs/2026-11-09-dpu-config-consolidation-design.md` 的设计记录一致。采用驱动的字段来源、排序与资源身份规则，保留当前硬件布局和使能约定；不能因为找到旧源码就恢复旧 bank 或 `+0x48`。PF/VF 的身份由 dpu_common 发布，RDMA 不根据字段名推导额外编号。
 
-## 10. 为后续共存保留的边界
+## 边界与后续范围
 
-本轮不实现混合 seq。将来 RDMA/VIO 向同一个 DPU 提交各自需求，再消费同一组冻结快照；公共身份、BAR 和共享中断资源只分配一次。VIO 的 Function 内 pair index 与 global qpair ID 属于队列资源，不等于 global Function ID；共存本身不要求拆开 RDMA 与全局 Function 编号。实际 ring/QP/CQ/MR 与内存生命周期仍由各业务负责。
-
-后续项目级 seq 可以复用当前独立类别接口统一编排，不需要现在增加通用服务注册器、跨业务状态机或 VIO 编译依赖。RDMA 的外部绑定接口只接收 DPU 结果和必要的 PCIe/内存/网络句柄，不反向修改快照，这样保留后续组合能力。
+RDMA/VIO 共用同一 DPU 权威快照、Host pool 和 PCIe 路由；VIO 可以按 Host 拆分 env，RDMA 保持一个 env 并以 flow group 绑定任意 Function 对，实际 ring/QP/CQ/MR 仍由各业务管理。当前已支持每条边的多个对称 QP；不同 QP 的独立 SQ/RQ/CQ 深度和 CQ 共享、吞吐优化、完整表达式引擎迁移仍另行处理。真实 DUT 接线、网络端点和硬件验收由平台负责，公共 grant 缺口不能以接线或 fixture 替代。

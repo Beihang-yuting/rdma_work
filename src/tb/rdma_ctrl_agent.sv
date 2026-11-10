@@ -12,14 +12,14 @@ typedef uvm_sequencer #(rdma_ctrl_item) rdma_ctrl_sequencer;
 class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   `uvm_component_utils(rdma_ctrl_driver)
 
-  rdma_env env;
+  rdma_env	env;
   // 执行完成的请求（覆盖率用；资源变化另经资源库广播）。
   uvm_analysis_port #(rdma_ctrl_item) ap;
 
   // 功能：构造控制面 driver 并建立发布已执行请求的 analysis port。
   // 输入/输出及副作用：name/parent 建立 UVM 层级；ap 由本组件拥有，env 仍为待绑定的非拥有空引用。
   // 失败/边界：构造阶段不访问资源或驱动；run_phase 前必须绑定 env 并连接 sequencer，否则无法取 item。
-  function new(string name = "rdma_ctrl_driver", uvm_component parent = null);
+  function new(string	name = "rdma_ctrl_driver", uvm_component	parent = null);
     super.new(name, parent);
     ap = new("ap", this);
   endfunction
@@ -27,8 +27,8 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   // 功能：等待 env 就绪后逐个执行 item；结果与 expect_fail 不符时报 UVM_ERROR。
   // 输入/输出及副作用：永久循环。
   // 失败/边界：见各操作。
-  task run_phase(uvm_phase phase);
-    rdma_ctrl_item item;
+  task run_phase(uvm_phase	phase);
+    rdma_ctrl_item	item;
 
     env.wait_ready();
     forever begin
@@ -47,40 +47,14 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
 
   // 功能：按 op 分派。
   // 输入/输出及副作用：调用驱动并更新资源库；item.res/status 输出。
-  // 失败/边界：驱动失败经 item.status 返回，不登记资源。
-  protected virtual task execute(rdma_ctrl_item item);
-    rdma_res_func f;
-
-    f = env.res.funcs[item.func];
-    case (item.op)
-      RDMA_CTRL_ALLOC_PD:   alloc_pd(f, item);
-      RDMA_CTRL_ALLOC_BUF:  alloc_buf(f, item);
-      RDMA_CTRL_REG_MR:     reg_mr(f, item);
-      RDMA_CTRL_CREATE_CQ:  create_cq(f, item);
-      RDMA_CTRL_CREATE_SRQ: create_srq(f, item);
-      RDMA_CTRL_CREATE_QP:  create_qp(f, item);
-      RDMA_CTRL_CONNECT:    connect_pair(item);
-      RDMA_CTRL_MODIFY_QP:  modify(item.qp, item.state, item.peer, item.status);
-      RDMA_CTRL_DESTROY:    destroy(item);
-      RDMA_CTRL_FLR: begin
-        env.sys.flr(item.scope);
-        env.res.on_flr(item.scope);
-      end
-      default: begin
-        env.res.on_flr(item.scope);
-        env.sys.recover(item.scope, item.status);
-        foreach (item.scope[i])
-          if (item.status.ok())
-            env.register_device(env.res.funcs[item.scope[i]]);
-      end
-    endcase
-  endtask
+  // 失败/边界：环境未就绪或外部/越界复位范围先拒绝且不改资源；驱动失败经 item.status 返回，不登记资源。
+  extern protected virtual task execute(rdma_ctrl_item	item);
 
   // 功能：登记新资源（status 成功时）：owner、编号、依赖。
   // 输入/输出及副作用：写资源库与 item.res。
   // 失败/边界：status 失败时不登记。
-  protected function void register(rdma_ctrl_item item, rdma_res_func f, rdma_res r,
-                                   int unsigned id, rdma_res deps[$]);
+  protected function void register(rdma_ctrl_item	item, rdma_res_func	f, rdma_res	r,
+                                   int unsigned	id, rdma_res	deps[$]);
     if (!item.status.ok())
       return;
     r.owner = f;
@@ -93,8 +67,8 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   // 功能：分配 PD。
   // 输入/输出及副作用：见 register；编号为 PD 号。
   // 失败/边界：驱动失败经 item.status 返回。
-  protected task alloc_pd(rdma_res_func f, rdma_ctrl_item item);
-    rdma_res_pd r;
+  protected task alloc_pd(rdma_res_func	f, rdma_ctrl_item	item);
+    rdma_res_pd	r;
 
     r = rdma_res_pd::type_id::create("pd");
     item.status = rdma_drv_pd::alloc(f.drv(), r.pd);
@@ -102,47 +76,21 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       register(item, f, r, r.pd.pd_id, {});
   endtask
 
-  // 功能：分配 item.size 字节、4KiB 对齐的 DMA 缓冲（编号取页号）。
-  // 输入/输出及副作用：见 register。
-  // 失败/边界：驱动失败经 item.status 返回。
-  protected task alloc_buf(rdma_res_func f, rdma_ctrl_item item);
-    rdma_res_buf r;
+  // 功能：通过目标 Function 的硬件端口分配 item.size 字节、4KiB 对齐的 DMA 缓冲。
+  // 输入/输出及副作用：f 提供 Host memory 绑定；成功登记 IOVA 页号资源并回填 item.res/status、缓冲实际大小。
+  // 失败/边界：要求 f.node.hw 有效；分配失败仅返回 item.status，不登记缓冲或发布资源事件。
+  extern protected task alloc_buf(rdma_res_func	f, rdma_ctrl_item	item);
 
-    r = rdma_res_buf::type_id::create("buf");
-    item.status = f.node.hw.alloc_dma(item.size, 4096, r.dma);
-    if (!item.status.ok())
-      return;
-    r.iova = r.dma.iova;
-    r.size = r.dma.size;
-    register(item, f, r, r.iova >> 12, {});
-  endtask
-
-  // 功能：在 mem 的 [offset, offset+len) 上注册 MR（VA = IOVA），页表按 4KiB 列出。
-  // 输入/输出及副作用：见 register；编号为 key。
-  // 失败/边界：驱动失败经 item.status 返回。
-  protected task reg_mr(rdma_res_func f, rdma_ctrl_item item);
-    rdma_res_mr r;
-    bit [63:0] pages[$];
-
-    r = rdma_res_mr::type_id::create("mr");
-    r.mem = item.mem;
-    r.va = item.mem.iova + item.offset;
-    r.len = item.len != 0 ? item.len : item.mem.size - item.offset;
-    r.rights = item.rights;
-    for (bit [63:0] a = r.va & ~64'hfff; a < r.va + r.len; a += 4096)
-      pages.push_back(a);
-    rdma_drv_mr::reg_mr(f.drv(), item.pd.pd, r.va, r.len, r.rights, pages, r.mr, item.status);
-    if (!item.status.ok())
-      return;
-    r.key = r.mr.key();
-    register(item, f, r, r.key, {item.pd, item.mem});
-  endtask
+  // 功能：用 item.pd 在 item.mem 的偏移区间注册 MR，VA 取 IOVA+item.offset，并列出覆盖的4KiB页。
+  // 输入/输出及副作用：item.len=0 时长度取 item.mem.size-item.offset，权限取 item.rights；成功登记 key 并回填 item.res/status。
+  // 失败/边界：调用者须提供有效 PD/BUF 且 offset/len 在缓冲内；驱动注册失败返回状态，不登记 MR 或依赖关系。
+  extern protected task reg_mr(rdma_res_func	f, rdma_ctrl_item	item);
 
   // 功能：创建 item.size 深度的 CQ（完成向量 0，依赖其 CEQ）。
   // 输入/输出及副作用：见 register；编号为 CQN。
   // 失败/边界：驱动失败经 item.status 返回。
-  protected task create_cq(rdma_res_func f, rdma_ctrl_item item);
-    rdma_res_cq r;
+  protected task create_cq(rdma_res_func	f, rdma_ctrl_item	item);
+    rdma_res_cq	r;
 
     r = rdma_res_cq::type_id::create("cq");
     rdma_drv_cq::create_cq(f.drv(), item.size, 0, r.cq, item.status);
@@ -155,8 +103,8 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   // 功能：创建 item.size 深度的 SRQ（limit 0）。
   // 输入/输出及副作用：见 register；编号为 SRQN。
   // 失败/边界：驱动失败经 item.status 返回。
-  protected task create_srq(rdma_res_func f, rdma_ctrl_item item);
-    rdma_res_srq r;
+  protected task create_srq(rdma_res_func	f, rdma_ctrl_item	item);
+    rdma_res_srq	r;
 
     r = rdma_res_srq::type_id::create("srq");
     rdma_drv_srq::create_srq(f.drv(), item.pd.pd, item.size, 0, r.srq, item.status);
@@ -164,66 +112,17 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       register(item, f, r, r.srq.srqn, {item.pd});
   endtask
 
-  // 功能：创建 QP（urc 时以 rc_to_urc 创建 RC QP），并把该 QP 自己的链路参数记入资源：item.biz 非空时
-  //   Q_Key、MTU、起始 PSN、timeout/retry/rnr_retry/min_rnr 与报文属性取业务模板，否则取 env 默认值。
-  // 输入/输出及副作用：见 register；编号为 QPN。
-  // 失败/边界：驱动失败经 item.status 返回；业务模板必须已 finalize（继承值已解析）。
-  protected task create_qp(rdma_res_func f, rdma_ctrl_item item);
-    rdma_drv_qp_init_attr attr;
-    rdma_res_qp r;
-    rdma_res deps[$];
-
-    attr = rdma_drv_qp_init_attr::type_id::create("qp_attr");
-    attr.qp_type = item.qp_type;
-    attr.pd = item.pd.pd;
-    attr.send_cq = item.send_cq.cq;
-    attr.recv_cq = item.recv_cq.cq;
-    attr.srq = item.srq == null ? null : item.srq.srq;
-    attr.max_send_sge = item.max_sge;
-    attr.max_recv_sge = item.max_sge;
-    attr.max_send_wr = item.size;
-    attr.max_recv_wr = item.size;
-    r = rdma_res_qp::type_id::create("qp");
-    f.drv().cfg.rc_to_urc = item.urc;
-    rdma_drv_qp::create_qp(f.drv(), attr, r.qp, item.status);
-    f.drv().cfg.rc_to_urc = 1'b0;
-    if (!item.status.ok())
-      return;
-    r.qp_type = item.qp_type;
-    r.urc = item.urc;
-    r.send_cq = item.send_cq;
-    r.recv_cq = item.recv_cq;
-    r.srq = item.srq;
-    if (item.biz != null) begin
-      r.biz = item.biz.biz_name();
-      r.qkey = item.biz.qp.qkey;
-      r.mtu = item.biz.qp.mtu;
-      r.psn = item.biz.qp.psn;
-      r.timeout = item.biz.qp.timeout;
-      r.retry = item.biz.qp.retry;
-      r.rnr_retry = item.biz.qp.rnr_retry;
-      r.min_rnr = item.biz.qp.min_rnr;
-      r.pkt = item.biz.pkt;
-    end
-    else begin
-      r.qkey = env.cfg.ud_qkey;
-      r.mtu = env.cfg.mtu;
-      r.timeout = env.cfg.timeout;
-      r.retry = env.cfg.retry;
-      r.rnr_retry = env.cfg.rnr_retry;
-      r.min_rnr = env.cfg.min_rnr;
-    end
-    deps = {item.pd, item.send_cq, item.recv_cq};
-    if (item.srq != null)
-      deps.push_back(item.srq);
-    register(item, f, r, r.qp.qpn, deps);
-  endtask
+  // 功能：创建 QP（urc 时以 rc_to_urc 创建 RC QP），并把统一场景的链路参数记入该 QP 资源：
+  //   Q_Key、MTU、起始 PSN、timeout/retry/rnr_retry/min_rnr 与报文属性取 env.cfg.scenario。
+  // 输入/输出及副作用：f 提供驱动，item 提供 PD/CQ/SRQ、类型/深度/SGE；成功登记 QP 并回填 item.res/status。
+  // 失败/边界：驱动失败经 item.status 返回；场景必须已 finalize；无运行期资源参数替换。
+  extern protected task create_qp(rdma_res_func	f, rdma_ctrl_item	item);
 
   // 功能：qp ↔ peer 互为对端，双方依次 INIT → RTR → RTS。
   // 输入/输出及副作用：修改两个 QP 与资源库。
   // 失败/边界：任一步失败即返回其 status。
-  protected task connect_pair(rdma_ctrl_item item);
-    rdma_drv_qp_state_e steps[3] = '{RDMA_DRV_QPS_INIT, RDMA_DRV_QPS_RTR, RDMA_DRV_QPS_RTS};
+  protected task connect_pair(rdma_ctrl_item	item);
+    rdma_drv_qp_state_e	steps[3] = '{RDMA_DRV_QPS_INIT, RDMA_DRV_QPS_RTR, RDMA_DRV_QPS_RTS};
 
     item.qp.peer = item.peer;
     item.peer.peer = item.qp;
@@ -241,9 +140,9 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   //   起始 PSN、timeout、重试次数）；其它迁移（SQD、ERR、RESET、SQD→RTS 等）只给状态。
   // 输入/输出及副作用：驱动 modify；广播 CHANGED（ERR 时资源状态置 ERROR）。
   // 失败/边界：驱动失败经 status 返回。
-  protected virtual task modify(rdma_res_qp qp, rdma_drv_qp_state_e state, rdma_res_qp peer,
-                                output rdma_status status);
-    rdma_drv_qp_attr attr;
+  protected virtual task modify(rdma_res_qp	qp, rdma_drv_qp_state_e	state, rdma_res_qp	peer,
+                                output rdma_status	status);
+    rdma_drv_qp_attr	attr;
 
     attr = rdma_drv_qp_attr::type_id::create("qp_modify");
     attr.mask = rdma_drv_qp_attr::M_STATE;
@@ -282,14 +181,14 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   // 功能：销毁 target（按类型调用驱动），成功后资源库置 DESTROYED（依赖检查在资源库）。
   // 输入/输出及副作用：释放驱动资源。
   // 失败/边界：驱动失败经 item.status 返回，资源保持；设备级队列只随 FLR/remove 失效。
-  protected task destroy(rdma_ctrl_item item);
-    rdma_res_func f;
-    rdma_res_pd pd;
-    rdma_res_buf b;
-    rdma_res_mr mr;
-    rdma_res_cq cq;
-    rdma_res_srq srq;
-    rdma_res_qp qp;
+  protected task destroy(rdma_ctrl_item	item);
+    rdma_res_func	f;
+    rdma_res_pd	pd;
+    rdma_res_buf	b;
+    rdma_res_mr	mr;
+    rdma_res_cq	cq;
+    rdma_res_srq	srq;
+    rdma_res_qp	qp;
 
     f = item.target.owner;
     case (item.target.kind)
@@ -326,23 +225,144 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   endtask
 endclass
 
+  // 功能：通过目标 Function 的硬件端口分配 item.size 字节、4KiB 对齐的 DMA 缓冲。
+  // 输入/输出及副作用：f 提供 Host memory 绑定；成功登记 IOVA 页号资源并回填 item.res/status、缓冲实际大小。
+  // 失败/边界：要求 f.node.hw 有效；分配失败仅返回 item.status，不登记缓冲或发布资源事件。
+task rdma_ctrl_driver::alloc_buf(rdma_res_func	f, rdma_ctrl_item	item);
+    rdma_res_buf	r;
+
+    r = rdma_res_buf::type_id::create("buf");
+    item.status = f.node.hw.alloc_dma(item.size, 4096, r.dma);
+    if (!item.status.ok())
+      return;
+    r.iova = r.dma.iova;
+    r.size = r.dma.size;
+    register(item, f, r, r.iova >> 12, {});
+endtask
+
+  // 功能：用 item.pd 在 item.mem 的偏移区间注册 MR，VA 取 IOVA+item.offset，并列出覆盖的4KiB页。
+  // 输入/输出及副作用：item.len=0 时长度取 item.mem.size-item.offset，权限取 item.rights；成功登记 key 并回填 item.res/status。
+  // 失败/边界：调用者须提供有效 PD/BUF 且 offset/len 在缓冲内；驱动注册失败返回状态，不登记 MR 或依赖关系。
+task rdma_ctrl_driver::reg_mr(rdma_res_func	f, rdma_ctrl_item	item);
+    rdma_res_mr	r;
+    bit [63:0]	pages[$];
+
+    r = rdma_res_mr::type_id::create("mr");
+    r.mem = item.mem;
+    r.va = item.mem.iova + item.offset;
+    r.len = item.len != 0 ? item.len : item.mem.size - item.offset;
+    r.rights = item.rights;
+    for (bit [63:0]	a = r.va & ~64'hfff; a < r.va + r.len; a += 4096)
+      pages.push_back(a);
+    rdma_drv_mr::reg_mr(f.drv(), item.pd.pd, r.va, r.len, r.rights, pages, r.mr, item.status);
+    if (!item.status.ok())
+      return;
+    r.key = r.mr.key();
+    register(item, f, r, r.key, {item.pd, item.mem});
+endtask
+
+  // 功能：创建 QP（urc 时以 rc_to_urc 创建 RC QP），并把统一场景的链路参数记入该 QP 资源：
+  //   Q_Key、MTU、起始 PSN、timeout/retry/rnr_retry/min_rnr 与报文属性取 env.cfg.scenario。
+  // 输入/输出及副作用：f 提供驱动，item 提供 PD/CQ/SRQ、类型/深度/SGE；成功登记 QP 并回填 item.res/status。
+  // 失败/边界：驱动失败经 item.status 返回；场景必须已 finalize；无运行期资源参数替换。
+task rdma_ctrl_driver::create_qp(rdma_res_func	f, rdma_ctrl_item	item);
+    rdma_drv_qp_init_attr	attr;
+    rdma_res_qp	r;
+    rdma_res	deps[$];
+
+    attr = rdma_drv_qp_init_attr::type_id::create("qp_attr");
+    attr.qp_type = item.qp_type;
+    attr.pd = item.pd.pd;
+    attr.send_cq = item.send_cq.cq;
+    attr.recv_cq = item.recv_cq.cq;
+    attr.srq = item.srq == null ? null : item.srq.srq;
+    attr.max_send_sge = item.max_sge;
+    attr.max_recv_sge = item.max_sge;
+    attr.max_send_wr = item.size;
+    attr.max_recv_wr = item.size;
+    r = rdma_res_qp::type_id::create("qp");
+    f.drv().cfg.rc_to_urc = item.urc;
+    rdma_drv_qp::create_qp(f.drv(), attr, r.qp, item.status);
+    f.drv().cfg.rc_to_urc = 1'b0;
+    if (!item.status.ok())
+      return;
+    r.qp_type = item.qp_type;
+    r.urc = item.urc;
+    r.send_cq = item.send_cq;
+    r.recv_cq = item.recv_cq;
+    r.srq = item.srq;
+    r.qkey = env.cfg.scenario.qp.qkey;
+    r.mtu = env.cfg.scenario.qp.mtu;
+    r.psn = env.cfg.scenario.qp.psn;
+    r.timeout = env.cfg.scenario.qp.timeout;
+    r.retry = env.cfg.scenario.qp.retry;
+    r.rnr_retry = env.cfg.scenario.qp.rnr_retry;
+    r.min_rnr = env.cfg.scenario.qp.min_rnr;
+    r.pkt = env.cfg.scenario.pkt;
+    deps = {item.pd, item.send_cq, item.recv_cq};
+    if (item.srq != null)
+      deps.push_back(item.srq);
+    register(item, f, r, r.qp.qpn, deps);
+endtask
+
+// 功能：按 op 分派。
+// 输入/输出及副作用：调用驱动并更新资源库；item.res/status 输出。
+// 失败/边界：环境未就绪或外部/越界复位范围先拒绝且不改资源；驱动失败经 item.status 返回，不登记资源。
+task rdma_ctrl_driver::execute(rdma_ctrl_item	item);
+  rdma_res_func	f;
+
+  if (!env.is_ready()) begin
+    item.status = rdma_status::make(RDMA_SC_INVALID_STATE, "environment is not ready");
+    return;
+  end
+  if (item.op == RDMA_CTRL_FLR || item.op == RDMA_CTRL_RECOVER) begin
+    item.status = env.sys.validate_reset(item.scope);
+    if (!item.status.ok())
+      return;
+  end
+  f = env.res.funcs[item.func];
+  case (item.op)
+    RDMA_CTRL_ALLOC_PD:   alloc_pd(f, item);
+    RDMA_CTRL_ALLOC_BUF:  alloc_buf(f, item);
+    RDMA_CTRL_REG_MR:     reg_mr(f, item);
+    RDMA_CTRL_CREATE_CQ:  create_cq(f, item);
+    RDMA_CTRL_CREATE_SRQ: create_srq(f, item);
+    RDMA_CTRL_CREATE_QP:  create_qp(f, item);
+    RDMA_CTRL_CONNECT:    connect_pair(item);
+    RDMA_CTRL_MODIFY_QP:  modify(item.qp, item.state, item.peer, item.status);
+    RDMA_CTRL_DESTROY:    destroy(item);
+    RDMA_CTRL_FLR: begin
+      item.status = env.sys.flr(item.scope);
+      if (item.status.ok())
+        env.res.on_flr(item.scope);
+    end
+    default: begin
+      env.res.on_flr(item.scope);
+      env.sys.recover(item.scope, item.status);
+      foreach (item.scope[i])
+        if (item.status.ok())
+          env.register_device(env.res.funcs[item.scope[i]]);
+    end
+  endcase
+endtask
+
 class rdma_ctrl_agent extends uvm_agent;
   `uvm_component_utils(rdma_ctrl_agent)
 
-  rdma_ctrl_sequencer sequencer;
-  rdma_ctrl_driver driver;
+  rdma_ctrl_sequencer	sequencer;
+  rdma_ctrl_driver	driver;
 
   // 功能：构造尚未创建子组件的控制面 agent 容器。
   // 输入/输出及副作用：name/parent 建立 UVM 层级；sequencer 与 driver 保持 null，由 build_phase 拥有并创建。
   // 失败/边界：parent 可为 null；在 build_phase 前访问或连接两个子组件属于生命周期错误。
-  function new(string name = "rdma_ctrl_agent", uvm_component parent = null);
+  function new(string	name = "rdma_ctrl_agent", uvm_component	parent = null);
     super.new(name, parent);
   endfunction
 
   // 功能：经 UVM factory 创建本 agent 独占的控制 sequencer 与可替换 driver 子组件。
   // 输入/输出及副作用：phase 传给父类；覆盖 sequencer/driver 句柄并把当前 agent 设为其 parent。
   // 失败/边界：factory override 必须返回声明的兼容类型；标准 UVM build 仅调用一次，不支持运行期重建。
-  function void build_phase(uvm_phase phase);
+  function void build_phase(uvm_phase	phase);
     super.build_phase(phase);
     sequencer = rdma_ctrl_sequencer::type_id::create("sequencer", this);
     driver = rdma_ctrl_driver::type_id::create("driver", this);
@@ -351,7 +371,7 @@ class rdma_ctrl_agent extends uvm_agent;
   // 功能：把 driver 的 seq_item_port 连接到本 agent sequencer 的 seq_item_export。
   // 输入/输出及副作用：建立唯一请求 TLM 通路；phase 本身不修改，不启动 sequence 或 driver 循环。
   // 失败/边界：要求 build_phase 已成功创建两个非空子组件；重复或额外连接不在本 agent 契约内。
-  function void connect_phase(uvm_phase phase);
+  function void connect_phase(uvm_phase	phase);
     driver.seq_item_port.connect(sequencer.seq_item_export);
   endfunction
 endclass
