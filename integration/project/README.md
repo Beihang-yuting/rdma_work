@@ -1,5 +1,9 @@
 # RDMA 独立集成入口
 
+需要在 **virtio_work 的 project_env/project_env_cfg 上加入 RDMA** 时，使用
+[组合环境示例 ../virtio](../virtio/README.md)；它直接继承原 virtio 类型并保留两类业务。
+本目录继续提供独立 RDMA 入口、公共配置 sequence 和已有回归 fixture。
+
 本目录提供冻结快照接入、Intel BAR/DMA 传输、单 bank 配置 sequence 和显式 Tcl 生命周期。软件/模型与 Intel wire fixture 的验证范围见 [验证记录](VALIDATION.md)，平台实际接线见 [接入参考](../../docs/rdma-intel-integration-reference.md)。**公共 DPU 的 RDMA QP/SD/CEQ/AEQ grant 契约仍缺失，当前不能宣称完整 Intel RDMA 初始化或真实 DUT 业务通过。**
 
 ## 编译边界

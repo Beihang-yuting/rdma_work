@@ -32,6 +32,8 @@
 
 独立 Intel/Tcl 集成使用 [integration/project](integration/project/README.md) 的显式入口，
 不加入旧生产 filelist；实际依赖、模型/传输验证与公共 DPU grant 限制见 [验证记录](integration/project/VALIDATION.md)。
+在 virtio_work 的 `project_env/project_env_cfg` 上组合 VIO 与 RDMA，使用
+[integration/virtio](integration/virtio/README.md)，共享同一 DPU 快照、Intel PCIe 和 Host 内存池。
 
 ## 外部依赖
 
