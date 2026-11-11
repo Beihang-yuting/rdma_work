@@ -1,25 +1,26 @@
 # 在 virtio project_env 上加入 RDMA
 
-本目录直接编译 `virtio_work/integration/project/project_env_pkg.sv`，在其环境上增加 RDMA；原 VIO 的 Host 内存、Intel RC、DPU 解析、协议连接及业务命令均复用。独立 RDMA 示例仍在 [../project](../project/README.md)。
+本目录用本仓库的 `project_env_cfg` overlay 组成 `project_env_pkg`，再包含 `virtio_work` 原有的 `project_env`、配置 sequence 和 `project_base_test`。外部 checkout 不改动，原 VirtIO filelist 也不受影响；独立 RDMA 示例仍在 [../project](../project/README.md)。
 
 ```text
-rdma_virtio_env_cfg extends project_env_cfg
-  dpu_cfg / pcie_cfg / vio_cfg / vio_cfg_by_host / VIF / pool  ← 原 virtio 字段
-  rdma_cfg / rdma_enabled / rdma_functions                  ← 本项目新增
+project_env_cfg                         ← integration overlay，直接持有全部配置
+  dpu_cfg / pcie_cfg / vio_cfg / VIF / pool
+  rdma_cfg / rdma_enabled / rdma_functions
 
-rdma_virtio_env extends project_env
-  pcie_env                 ← 原 virtio 创建，每 Host 一个 Intel RC
-  shared_pool              ← 全项目唯一 host_mem_pool
-  dpu_env                  ← 原 dpu_device_env，只解析一次身份/资源
-    vio_h0, vio_h1, ...     ← 原 virtio 创建，每 Host 一个 VIO env
-    rdma                   ← 新增一个 RDMA env，包含所选 Host/PF/VF 的全部节点
+rdma_virtio_env extends project_env       ← 只接入组合生命周期
+  pcie_env                                 ← 原 virtio，每 Host 一个 Intel RC
+  shared_pool                              ← 全项目唯一 host_mem_pool
+  dpu_env                                  ← 原 dpu_device_env，只解析一次身份/资源
+    vio_h0, vio_h1, ...                    ← 原 virtio，每 Host 一个 VIO env
+    rdma : rdma_env                        ← 基础 RDMA env，不再派生 RDMA 子类
 ```
 
 两个业务均在 DPU 子树构建，消费同一 `device_snapshot/resource_snapshot`。RDMA 默认关闭；只有 `rdma_enabled=1`，或显式提供 `rdma_functions`/RDMA grant 时才创建 RDMA 子环境和 service。RDMA 开启但未给出 Function 时才选择全部 DPU Function，VIO-only 场景不会因为 DPU 有 Function 就触发 RDMA 配置。RDMA Function 的 `host_mem_manager` 与同 Host 的 VIO、PCIe 完全相同；不同 Host 使用独立 manager。global Function ID/BDF/BAR 仍由 DPU 唯一分配，RDMA 不重新 resolve。
 
 | 文件 | 复用关系与职责 |
 | --- | --- |
-| [rdma_virtio_env_cfg.sv](rdma_virtio_env_cfg.sv) | 继承 `project_env_cfg`；仅追加 RDMA service 需求及参数 |
+| [project_env_cfg.sv](project_env_cfg.sv) | integration-only `project_env_cfg` overlay；直接创建 `rdma_cfg` 并门控 RDMA 参数 |
+| [rdma_project_env_pkg.sv](rdma_project_env_pkg.sv) | 使用 overlay，继续包含外部 `project_env`/`project_base_test`，不修改 virtio_work |
 | [rdma_virtio_env.sv](rdma_virtio_env.sv) | 继承 `project_env`；追加一个 RDMA 子环境及显式生命周期 |
 | [rdma_virtio_cfg_seq.sv](rdma_virtio_cfg_seq.sv) | 继承 `vio_dpu_cfg_seq`；复用 RDMA 预检和 Notify/RNET 写表 |
 | [rdma_virtio_test.sv](rdma_virtio_test.sv) | 继承 `project_base_test` 的三个平台钩子；run 阶段只运行 AIP bridge |
@@ -31,11 +32,11 @@ rdma_virtio_env extends project_env
 
 平台 test 继承 `rdma_virtio_test`，继续实现 virtio 已有的接口：
 
-1. `bind_platform_handles()`：在 cfg 加载后、env build 前注入 Intel VIF、可选已有 pool/IOMMU 和网络 endpoint。通过 `$cast(combined, cfg)` 取得 `rdma_virtio_env_cfg`，用 `combined.rdma_cfg` 设置 RDMA link/endpoint；原 `cfg.intel_rc_vifs` 等字段直接沿用。
+1. `bind_platform_handles()`：在 cfg 加载后、env build 前注入 Intel VIF、可选已有 pool/IOMMU 和网络 endpoint。`cfg` 本身就是 integration 的 `project_env_cfg`，直接使用 `cfg.rdma_cfg` 及原有 `cfg.intel_rc_vifs` 等字段。
 2. `prepare_platform()`：仅由 Tcl `dut_config` 调用。等待真实 reset/readiness，并用 `project.rdma.sys` 给各 Function 绑定硬件上下文与明确的 RDMA 资源授权。失败按原 virtio 钩子契约报 fatal。
 3. `finish_platform()`：Tcl 结束后检查数据、完成和资源，确认 DUT 不再 DMA，再撤销平台借出的句柄。
 
-需要在加载参数前自定义默认值/Function 选择时，先创建 `rdma_virtio_env_cfg`，通过 `uvm_config_db#(project_env_cfg)` 的 `project_cfg` 键提供给 test，并设置 `rdma_enabled=1`。也可以使用 `+rdma.enabled=1`；显式 Function/grant 会自动打开 RDMA。父类的 `cfg/env` 字段与新增 `project/project_cfg` 引用指向同一对象，没有兼容字段同步或配置复制。
+需要在加载参数前自定义默认值/Function 选择时，直接创建 `project_env_cfg`，通过 `uvm_config_db#(project_env_cfg)` 的 `project_cfg` 键提供给 test，并设置 `rdma_enabled=1`。也可以使用 `+rdma.enabled=1`；显式 Function/grant 会自动打开 RDMA。父类 `cfg` 与组合 env 的 `project_cfg` 指向同一对象，没有兼容字段同步或配置复制。
 
 普通业务参数继续使用 `+rdma.qp.*`、`+rdma.mem.*`、`+rdma.pkt.*`、`+rdma.traffic.*`；VIO/DPU 参数完全沿用 virtio 项目。VIO 默认 pairs=0，需要业务时按 virtio 的契约提供 Packed/Custom 队列几何、Notify 和完成模式。真实表布局、Function 策略与 MSI-X 消息由平台提供；本示例不会猜测硬件偏移或 requester 编码。
 

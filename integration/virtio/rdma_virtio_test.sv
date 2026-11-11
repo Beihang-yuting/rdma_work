@@ -42,17 +42,12 @@ virtual class rdma_virtio_test extends project_base_test;
 
   // 功能：在 virtio 原构建流程中使用组合 cfg 和 env，保留其平台句柄注入时机。
   // 输入/输出及副作用：允许 config_db 提供派生 cfg；局部 factory override 只影响本 test 的 env。
-  // 失败/边界：用户提供的 cfg 必须可转为 rdma_virtio_env_cfg，否则 fatal；不修改外部仓库或全局类型。
+  // 失败/边界：用户提供的 cfg 必须是本 filelist 的 project_env_cfg；不修改外部仓库或全局类型。
   virtual function void build_phase(uvm_phase phase);
-    rdma_virtio_env_cfg combined;
-
     if (!uvm_config_db#(project_env_cfg)::get(this, "", "project_cfg", cfg)) begin
-      combined = rdma_virtio_env_cfg::type_id::create("cfg");
-      cfg = combined;
+      cfg = project_env_cfg::type_id::create("cfg");
       uvm_config_db#(project_env_cfg)::set(this, "", "project_cfg", cfg);
     end
-    if (!$cast(combined, cfg))
-      `uvm_fatal("RDMA_VIRTIO_TEST", "project_cfg must include both VIO and RDMA configuration")
     project_env::type_id::set_inst_override(rdma_virtio_env::get_type(), "env", this);
     super.build_phase(phase);
     if (!$cast(project, env))

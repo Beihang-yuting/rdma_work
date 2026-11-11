@@ -1,6 +1,6 @@
 // 目录/层次：integration/virtio；virtio_work project_env 的 RDMA 扩展入口。
 // 职责：按 cfg → seq → env → test 顺序定义组合示例，不替换或复制外部 package。
-// 依赖：原始 project_env_pkg、RDMA 核心/AIP/DPU 和配置 sequence 包。
+// 依赖：integration project_env_pkg overlay、RDMA 核心/AIP/DPU 和配置 sequence 包。
 // 所有权/生命周期：package 只定义类型；命令由具体 test 在 EOE 注册，资源由 env/平台拥有。
 package rdma_virtio_pkg;
   timeunit 1ns;
@@ -22,7 +22,6 @@ package rdma_virtio_pkg;
   import rdma_project_pkg::*;
   `include "uvm_macros.svh"
 
-  `include "rdma_virtio_env_cfg.sv"
   `include "rdma_virtio_cfg_seq.sv"
   `include "rdma_virtio_env.sv"
   `include "rdma_virtio_test.sv"

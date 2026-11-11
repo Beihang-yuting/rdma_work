@@ -5,7 +5,7 @@
 `uvm_analysis_imp_decl(_project_posted)
 `uvm_analysis_imp_decl(_project_cqe)
 
-class rdma_project_model_env extends rdma_project_manual_env;
+class rdma_project_model_env extends rdma_env;
   `uvm_component_utils(rdma_project_model_env)
   // 功能：创建借用测试预装配系统的模型子环境。
   // 输入/输出及副作用：name/parent透传，无模型创建副作用。
@@ -15,6 +15,10 @@ class rdma_project_model_env extends rdma_project_manual_env;
   // 输入/输出及副作用：读取model_system配置引用并赋sys。
   // 失败/边界：空系统或external模式fatal，不修改任何ready/grant/mode字段。
   extern protected virtual function void build_system();
+  // 功能：保持模型夹具的显式命令生命周期，避免基础 rdma_env 在 run_phase 自动初始化。
+  // 输入/输出及副作用：phase 不推进状态；rdma_init 仍是唯一 probe/ready 入口。
+  // 失败/边界：该覆盖仅用于模型测试夹具，生产 project env 直接使用基础 rdma_env。
+  extern task run_phase(uvm_phase phase);
 endclass
 
 class rdma_project_draw_spy extends rdma_aip_value_spec;
@@ -140,6 +144,12 @@ function void rdma_project_model_env::build_system();
     `uvm_fatal("PROJECT_MODEL", "fresh model system required; external-mode bypass is forbidden")
 endfunction
 
+// 功能：保持模型夹具的显式命令生命周期，避免基础 rdma_env 自动调用 initialize。
+// 输入/输出及副作用：phase 不推进状态；Tcl 命令仍通过 project_env 显式驱动初始化。
+// 失败/边界：仅该 fixture 禁止自动启动，基础 RDMA env 和外部平台契约不受影响。
+task rdma_project_model_env::run_phase(uvm_phase phase);
+endtask
+
 // 功能：创建实际AIP求值器的记录替身。
 // 输入/输出及副作用：name透传，静态draws不在构造重置。
 // 失败/边界：继承真实求值语义，禁止为了验证重载而额外抽样。
@@ -183,7 +193,7 @@ function void rdma_project_model_test::build_phase(uvm_phase	phase);
   string	why;
   string	vseq;
 
-  rdma_project_manual_env::type_id::set_type_override(rdma_project_model_env::get_type());
+  rdma_env::type_id::set_type_override(rdma_project_model_env::get_type());
   rdma_aip_value_spec::type_id::set_type_override(rdma_project_draw_spy::get_type());
   pcie_tl_reg_seq::type_id::set_type_override(rdma_config_reg_fixture::get_type());
   fixture_rc = new("fixture_rc", this);

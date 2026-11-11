@@ -1,23 +1,11 @@
 // 目录/层次：integration/project；项目生命周期与候选事务。
 // 职责：只在显式命令中配置/初始化/运行；所有候选先验证再原地提交。
 // 依赖：RDMA/DPU既有API；平台负责实际PCIe连接与prepare。
-// 所有权/生命周期：项目拥有RDMA子环境，借用cfg/RC；取消中的操作保持busy以禁止不安全重入。
-class rdma_project_manual_env extends rdma_env;
-  `uvm_component_utils(rdma_project_manual_env)
-  // 功能：构造只允许显式initialize的RDMA子环境。
-  // 输入/输出及副作用：name/parent透传；不改变模型或外部模式。
-  // 失败/边界：平台必须自行组装cfg并显式启动初始化。
-  extern function new(string	name, uvm_component	parent);
-  // 功能：禁用模型基类run_phase的隐式初始化。
-  // 输入/输出及副作用：phase不变，无probe/MMIO/等待。
-  // 失败/边界：仅命令initialize能够使环境ready，空run不代表就绪。
-  extern task run_phase(uvm_phase	phase);
-endclass
-
+// 所有权/生命周期：项目拥有基础 rdma_env 子环境，借用 cfg/RC；取消中的操作保持 busy 以禁止不安全重入。
 class rdma_project_env extends uvm_env;
   `uvm_component_utils(rdma_project_env)
   rdma_project_env_cfg	cfg;
-  rdma_project_manual_env	rdma;
+  rdma_env	rdma;
   uvm_sequencer #(pcie_tl_tlp)	rc;
   bit	configured;
   bit	busy;
@@ -31,9 +19,9 @@ class rdma_project_env extends uvm_env;
   // 输入/输出及副作用：name/parent交给UVM，状态和观测计数默认零。
   // 失败/边界：build前需通过config_db提供project_cfg，RC在connect绑定。
   extern function new(string	name, uvm_component	parent);
-  // 功能：借用平台配置并创建禁止隐式启动的RDMA子环境。
-  // 输入/输出及副作用：phase透传，向rdma发布同一cfg引用。
-  // 失败/边界：缺任一组合配置或目录为空fatal，不创建替代身份。
+  // 功能：借用平台配置并创建基础 RDMA 子环境。
+  // 输入/输出及副作用：phase透传，向 rdma 发布同一 cfg 引用；外部配置模式由 cfg 控制显式初始化。
+  // 失败/边界：缺任一组合配置或目录为空 fatal，不创建替代身份。
   extern function void build_phase(uvm_phase	phase);
   // 功能：按唯一DPU和RDMA候选完成全项目无时间推进提交。
   // 输入/输出及副作用：ok/why报告结果；成功保留句柄、清configured并增加loads，无MMIO或WR抽样。
@@ -59,19 +47,6 @@ class rdma_project_env extends uvm_env;
   extern task run_flow_group(int unsigned	group_index, output bit	ok, output string	why);
 endclass
 
-// 功能：构造只允许显式initialize的RDMA子环境。
-// 输入/输出及副作用：name/parent透传；不改变模型或外部模式。
-// 失败/边界：平台必须自行组装cfg并显式启动初始化。
-function rdma_project_manual_env::new(string	name, uvm_component	parent);
-  super.new(name, parent);
-endfunction
-
-// 功能：禁用模型基类run_phase的隐式初始化。
-// 输入/输出及副作用：phase不变，无probe/MMIO/等待。
-// 失败/边界：仅命令initialize能够使环境ready，空run不代表就绪。
-task rdma_project_manual_env::run_phase(uvm_phase	phase);
-endtask
-
 // 功能：创建尚未配置、未初始化的项目容器。
 // 输入/输出及副作用：name/parent交给UVM，状态和观测计数默认零。
 // 失败/边界：build前需通过config_db提供project_cfg，RC在connect绑定。
@@ -79,9 +54,9 @@ function rdma_project_env::new(string	name, uvm_component	parent);
   super.new(name, parent);
 endfunction
 
-// 功能：借用平台配置并创建禁止隐式启动的RDMA子环境。
-// 输入/输出及副作用：phase透传，向rdma发布同一cfg引用。
-// 失败/边界：缺任一组合配置或目录为空fatal，不创建替代身份。
+// 功能：借用平台配置并创建基础 RDMA 子环境。
+// 输入/输出及副作用：phase透传，向 rdma 发布同一 cfg 引用；外部配置模式由 cfg 控制显式初始化。
+// 失败/边界：缺任一组合配置或目录为空 fatal，不创建替代身份。
 function void rdma_project_env::build_phase(uvm_phase	phase);
   bit grants_match;
 
@@ -101,7 +76,7 @@ function void rdma_project_env::build_phase(uvm_phase	phase);
       `uvm_fatal("RDMA_PROJECT", "project and RDMA grant lists disagree")
   end
   uvm_config_db#(rdma_env_cfg)::set(this, "rdma", "cfg", cfg.rdma);
-  rdma = rdma_project_manual_env::type_id::create("rdma", this);
+  rdma = rdma_env::type_id::create("rdma", this);
 endfunction
 
 // 功能：按唯一DPU和RDMA候选完成全项目无时间推进提交。

@@ -3,28 +3,29 @@
 // 依赖：project_env_pkg、RDMA 外部系统和组合 cfg_seq；不复制父类资源创建/连接逻辑。
 // 所有权/生命周期：RDMA 借用同一冻结快照和 pool；配置/初始化/发包均由 Tcl 显式调用。
 
-// RDMA 与 VIO 同挂 DPU 子树，保证 UVM 先解析 DPU，再构建消费者；不依赖兄弟组件名称排序。
-class rdma_virtio_child_env extends rdma_env;
-  `uvm_component_utils(rdma_virtio_child_env)
+// RDMA 与 VIO 同挂 DPU 子树，保证 dpu_common 先发布快照，RDMA 再借用同源资源。
+// 基础 rdma_env 通过已有 plugin pre_build 钩子完成 snapshot/resource/grant 绑定，生产层不再派生 RDMA env。
+class rdma_virtio_bind_plugin extends rdma_env_plugin;
+  `uvm_object_utils(rdma_virtio_bind_plugin)
 
-  // 功能：构造 RDMA 子环境壳，外部模式由组合 cfg 固定。
-  // 输入/输出及副作用：name/parent 透传，不创建第二个 DPU 环境或 Host 内存池。
-  // 失败/边界：parent 必须是拥有冻结快照的 dpu_device_env，由 build 检查。
-  function new(string name, uvm_component parent);
-    super.new(name, parent);
+  project_env_cfg project_cfg;
+
+  // 功能：构造只保存组合 project_cfg 非拥有引用的绑定插件。
+  // 输入/输出及副作用：name 传给 UVM；project_cfg 由组合 env 在 rdma_env 创建前注入。
+  // 失败/边界：构造不访问 DPU 快照或分配资源；缺少 project_cfg 时 pre_build 明确 fatal。
+  function new(string name = "rdma_virtio_bind_plugin");
+    super.new(name);
   endfunction
 
-  // 功能：在核心 build 前绑定 DPU 已发布的快照、资源和共享内存，再复用 RDMA 正常组件创建。
-  // 输入/输出及副作用：借用 project_cfg；创建的 external_system 只保存 Function 投影，不运行 resolver。
-  // 失败/边界：缺父 DPU/配置、已有系统、身份或 pool 不符均 fatal；不 probe 或自动 initialize。
-  virtual function void build_phase(uvm_phase phase);
+  // 功能：在基础 rdma_env finalize 前把 dpu_common 快照、资源和平台 grant 绑定到外部系统。
+  // 输入/输出及副作用：更新 rdma_cfg.external_system；系统只借用 DPU snapshot、resource_snapshot 和共享 Host pool。
+  // 失败/边界：父级不是 dpu_device_env、快照不同源、重复绑定或 grant 不匹配时 fatal；不执行 probe/初始化。
+  virtual function void pre_build(rdma_env env);
     dpu_device_env dpu;
-    rdma_virtio_env_cfg project_cfg;
     rdma_status status;
 
-    if (!$cast(dpu, get_parent()) ||
-        !uvm_config_db#(rdma_virtio_env_cfg)::get(this, "", "project_cfg", project_cfg))
-      `uvm_fatal("RDMA_VIRTIO", "RDMA must be built below the authoritative DPU env")
+    if (project_cfg == null || env == null || !$cast(dpu, env.get_parent()))
+      `uvm_fatal("RDMA_VIRTIO", "RDMA plugin requires a dpu_device_env parent and project_cfg")
     if (project_cfg.rdma_cfg.external_system != null)
       `uvm_fatal("RDMA_VIRTIO",
         "combined env owns the RDMA projection; do not inject a second system")
@@ -41,23 +42,22 @@ class rdma_virtio_child_env extends rdma_env;
       if (!status.ok())
         `uvm_fatal("RDMA_VIRTIO", status.convert2string())
     end
-    super.build_phase(phase);
   endfunction
 endclass
 
-// 继承保留 virtio 原始 env/cfg 的所有公共字段；project_cfg 只是同一 cfg 的派生类型引用。
+// 继承保留 virtio 原始 env 的公共生命周期；project_cfg 与父类 cfg 是同一个 overlay 配置对象。
 class rdma_virtio_env extends project_env;
   `uvm_component_utils(rdma_virtio_env)
 
-  rdma_virtio_env_cfg project_cfg;
-  rdma_virtio_child_env rdma;
+  project_env_cfg project_cfg;
+  rdma_env rdma;
   bit busy;
   bit configured;
   bit init_attempted;
 
   // 功能：构造尚未配置/初始化的组合环境。
   // 输入/输出及副作用：name/parent 透传，状态位默认零；组件由 build 创建。
-  // 失败/边界：config_db 的 cfg 必须为 rdma_virtio_env_cfg，父类字段无需另设别名。
+  // 失败/边界：父类 cfg 必须是本 integration filelist 提供的 project_env_cfg；RDMA 关闭时不创建子环境。
   function new(string name, uvm_component parent);
     super.new(name, parent);
   endfunction
@@ -66,14 +66,17 @@ class rdma_virtio_env extends project_env;
   // 输入/输出及副作用：phase 透传；project_cfg 与继承 cfg 指向同一对象。
   // 失败/边界：cfg 类型不符 fatal；父类负责 Intel VIF、Host pool 和 VIO 配置检查。
   virtual function void build_phase(uvm_phase phase);
+    rdma_virtio_bind_plugin binder;
+
     super.build_phase(phase);
-    if (!$cast(project_cfg, cfg))
-      `uvm_fatal("RDMA_VIRTIO", "cfg must be rdma_virtio_env_cfg")
+    project_cfg = cfg;
     if (!project_cfg.rdma_enabled)
       return;
-    uvm_config_db#(rdma_virtio_env_cfg)::set(dpu_env, "rdma", "project_cfg", project_cfg);
+    binder = rdma_virtio_bind_plugin::type_id::create("rdma_bind");
+    binder.project_cfg = project_cfg;
+    project_cfg.rdma_cfg.plugins.push_back(binder);
     uvm_config_db#(rdma_env_cfg)::set(dpu_env, "rdma", "cfg", project_cfg.rdma_cfg);
-    rdma = rdma_virtio_child_env::type_id::create("rdma", dpu_env);
+    rdma = rdma_env::type_id::create("rdma", dpu_env);
   endfunction
 
   // 功能：复用 virtio 的真实 PCIe/协议连接，在同源 BAR map 上追加 RDMA 单 bank 目录。

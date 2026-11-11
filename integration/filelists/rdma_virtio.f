@@ -55,7 +55,7 @@
 +incdir+@PCIE_INTEL_ROOT@/src
 
 // virtio_work reference project dependencies, kept in the same order as its
-// filelists/project_integration.f. The original project_env_pkg is compiled unchanged.
+// filelists/project_integration.f. The final package uses this repository's project_env_cfg overlay and includes the external env implementation unchanged.
 +incdir+@VIRTIO_WORK_ROOT@/virtio_net_vip/src
 +incdir+@VIRTIO_WORK_ROOT@/virtio_net_vip/src/agent
 +incdir+@VIRTIO_WORK_ROOT@/virtio_net_vip/src/shared
@@ -90,8 +90,6 @@
 @VIRTIO_WORK_ROOT@/virtio_net_vip/src/virtio_net_pkg.sv
 @VIRTIO_WORK_ROOT@/integration/aip/virtio_aip_pkg.sv
 @VIRTIO_WORK_ROOT@/integration/dpu/virtio_dpu_pkg.sv
-@VIRTIO_WORK_ROOT@/integration/project/project_env_pkg.sv
-
 src/types/rdma_types_pkg.sv
 src/model/rdma_model_pkg.sv
 src/codec/rdma_codec_pkg.sv
@@ -103,6 +101,7 @@ src/adapters/net_packet/rdma_netpkt_pkg.sv
 src/tb/rdma_env_pkg.sv
 src/adapters/aip/rdma_aip_cfg_pkg.sv
 src/adapters/pcie_work/rdma_pcie_work_pkg.sv
+integration/virtio/rdma_project_env_pkg.sv
 integration/project/rdma_project_transport_pkg.sv
 integration/project/rdma_project_pkg.sv
 integration/virtio/rdma_virtio_pkg.sv
