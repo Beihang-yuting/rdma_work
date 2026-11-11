@@ -6,6 +6,8 @@ class rdma_virtio_env_cfg extends project_env_cfg;
   `uvm_object_utils(rdma_virtio_env_cfg)
 
   rdma_env_cfg rdma_cfg;
+  // 组合项目的 RDMA 业务总开关；默认关闭，避免 VIO-only 仿真解析和配置 RDMA。
+  bit rdma_enabled;
   dpu_function_key_t rdma_functions[$];
   protected bit rdma_params_loaded;
 
@@ -19,17 +21,34 @@ class rdma_virtio_env_cfg extends project_env_cfg;
     rdma_cfg.vseq_type = "rdma_traffic_vseq";
   endfunction
 
-  // 功能：加载父类参数，并给选中的权威 Function 声明 RDMA service，随后加载 RDMA 场景。
-  // 输入/输出及副作用：rdma_functions 为空时选择全部 DPU Function；只改冻结前的 authoring 输入。
-  // 失败/边界：重复调用幂等；空目录、重复/不存在的 Function 或 RDMA 参数错误 fatal；不支持模型模式。
+  // 功能：加载父类参数，并在 RDMA 开启时给选中的权威 Function 声明 service，随后加载 RDMA 场景。
+  // 输入/输出及副作用：读取 rdma.enabled；显式 Function/grant 选择会打开 RDMA，空选择在已打开时覆盖全部 DPU Function。
+  // 失败/边界：重复调用幂等；关闭时不读取 RDMA 参数、不改 DPU service；开启后空目录、重复/不存在 Function 或参数错误 fatal。
   virtual function void load_params();
     bit seen[string];
+    bit enabled;
     rdma_status status;
     string vseq;
 
     if (rdma_params_loaded)
       return;
     super.load_params();
+`ifdef AIP_CMDLINE_SV
+    enabled = rdma_enabled;
+    `aip_int("rdma", bit, enabled, rdma_enabled)
+    rdma_enabled = enabled;
+`endif
+    if (!rdma_enabled && (rdma_functions.size() != 0 || rdma_cfg.grants.size() != 0))
+      rdma_enabled = 1;
+    if (!rdma_enabled) begin
+      rdma_params_loaded = 1;
+      return;
+    end
+    if (rdma_functions.size() == 0 && rdma_cfg.grants.size() != 0) begin
+      foreach (rdma_cfg.grants[i])
+        if (rdma_cfg.grants[i] != null)
+          rdma_functions.push_back(rdma_cfg.grants[i].key);
+    end
     if (rdma_functions.size() == 0) begin
       foreach (dpu_cfg.device_cfg.functions[i])
         rdma_functions.push_back(dpu_cfg.device_cfg.functions[i].key);

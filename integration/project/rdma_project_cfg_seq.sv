@@ -9,6 +9,9 @@ class rdma_project_cfg_seq extends dpu_cfg_seq;
 
   // 明确列出本次完整单 bank RDMA 目录；空集合不能退化成配置全部 Function。
   dpu_function_key_t	rdma_functions[$];
+  // 外部平台发布的固定 RDMA grant；空集合保留 Notify/RNET 结构回归兼容，真实初始化会拒绝缺授权。
+  rdma_dpu_grant	rdma_grants[$];
+  rdma_hw_plan	hw_plan;
   // 只记录已经完成的类别，不代表 RDMA shared grant 或设备初始化就绪。
   string	configured_tables;
 
@@ -28,11 +31,23 @@ class rdma_project_cfg_seq extends dpu_cfg_seq;
     output string		why
   );
 
-  // 功能：对已有权威身份值和 Notify 地址作位宽检查，构造硬件 8B 字段，不分配身份。
-  // 输入/输出及副作用：global_id/host/address 只读，entry 成功为精确拼接，失败清零，why 返回窄字段原因。
+  // 功能：按可选 RDMA grant 生成 Notify/RNET catalog，grant 非空时使用其 rdma_vf_id。
+  // 输入/输出及副作用：grants 与 keys 按 Function key 匹配；controls 成功返回完整值，不写快照。
+  // 失败/边界：grant 缺失、重复、未授权或 ID 与快照不一致时拒绝；空 grants 保持 global ID 兼容路径。
+  extern static function bit make_catalog_for_grants(
+    input dpu_device_snapshot	device,
+    input dpu_bar_map		map,
+    input dpu_function_key_t	keys[$],
+    input rdma_dpu_grant	grants[$],
+    output dpu_control_cfg_t	controls[$],
+    output string		why
+  );
+
+  // 功能：对 RDMA VF ID、Host 和 Notify 地址作位宽检查，构造硬件 8B 字段，不分配身份。
+  // 输入/输出及副作用：rdma_vf_id/host/address 只读，entry 成功为精确拼接，失败清零，why 返回窄字段原因。
   // 失败/边界：ID>=256、Host>=8、X/Z 地址、地址高三位非零或非 8KB 对齐拒绝，绝不先截位。
   extern static function bit encode_notify(
-    input int unsigned			global_id,
+    input int unsigned			rdma_vf_id,
     input int unsigned			host,
     input logic [63:0]			address,
     output dpu_rdma_notify_entry_t	entry,
@@ -69,6 +84,11 @@ class rdma_project_cfg_seq extends dpu_cfg_seq;
     output string		why
   );
 
+  // 功能：把冻结 RDMA hardware plan 的值写入管理 BAR，复用父类 DWORD 写 helper。
+  // 输入/输出及副作用：逐项发送 plan.write；ok/why 返回首个失败，不修改 plan 或 grant。
+  // 失败/边界：plan 为空/未验证、目标跨 BAR/4KB、PCIe 无 RC 或任一写失败立即停止，后续 Notify/RNET 不执行。
+  extern protected task configure_hw_plan(output bit ok, output string why);
+
   // 功能：按 AF、BDF、有效 MSI-X/无效尾项/使能、完整读回、Notify、RNET 顺序配置，成功才发布 success。
   // 输入/输出及副作用：借用 cfg/RC，逐步更新 error_msg；正常失败保持 success=0，post_start 保留父类 fatal。
   // 失败/边界：完整预检先于所有事务；任一写/读回失败停止后续类别，不 probe、不 initialize、不声称 posted write 可回滚。
@@ -80,13 +100,14 @@ endclass
 // 失败/边界：构造不访问 DUT；空目录将在首笔 AF 事务前拒绝。
 function rdma_project_cfg_seq::new(string	name = "rdma_project_cfg_seq");
   super.new(name);
+  hw_plan = null;
 endfunction
 
-// 功能：对已有权威身份值和 Notify 地址作位宽检查，构造硬件 8B 字段，不分配身份。
-// 输入/输出及副作用：global_id/host/address 只读，entry 成功为精确拼接，失败清零，why 返回窄字段原因。
+// 功能：对 RDMA VF ID、Host 和 Notify 地址作位宽检查，构造硬件 8B 字段，不分配身份。
+// 输入/输出及副作用：rdma_vf_id/host/address 只读，entry 成功为精确拼接，失败清零，why 返回窄字段原因。
 // 失败/边界：ID>=256、Host>=8、X/Z 地址、地址高三位非零或非 8KB 对齐拒绝，绝不先截位。
 function bit rdma_project_cfg_seq::encode_notify(
-  input int unsigned			global_id,
+  input int unsigned			rdma_vf_id,
   input int unsigned			host,
   input logic [63:0]			address,
   output dpu_rdma_notify_entry_t	entry,
@@ -94,17 +115,17 @@ function bit rdma_project_cfg_seq::encode_notify(
 );
   entry = '0;
   why   = "Notify ID/Host/address cannot be encoded without truncation";
-  if (global_id >= 256 || host >= 8 || $isunknown(address) ||
+  if (rdma_vf_id >= 256 || host >= 8 || $isunknown(address) ||
       address[63:61] != 0 || address[12:0] != 0)
     return 0;
-  entry = {5'b0, global_id[7:0], host[2:0], address[60:13]};
+  entry = {5'b0, rdma_vf_id[7:0], host[2:0], address[60:13]};
   why   = "";
   return 1;
 endfunction
 
-// 功能：从冻结身份和真实 BAR 纯生成按 Host/Notify 地址排序的单 bank Notify 与 RNET 控制项。
-// 输入/输出及副作用：device/map/keys 只读；controls 成功返回完整 catalog，失败保持空，why 指出原因。
-// 失败/边界：拒绝异源/未冻结对象、空/重复/非法 Function kind/无 RDMA service 身份、ID>=256、Host>=8、地址溢出/不可编码/重复。
+// 功能：生成不带额外授权的 RDMA catalog，保持已有 global Function ID 调用兼容。
+// 输入/输出及副作用：device/map/keys 只读；controls/why 返回同源 Notify/RNET 目录，不修改任何快照。
+// 失败/边界：参数不完整、快照未冻结或 Function 目录非法时返回假，空 grant 不代表完成 driver 初始化。
 function bit rdma_project_cfg_seq::make_catalog(
   input dpu_device_snapshot	device,
   input dpu_bar_map		map,
@@ -112,16 +133,37 @@ function bit rdma_project_cfg_seq::make_catalog(
   output dpu_control_cfg_t	controls[$],
   output string			why
 );
+  rdma_dpu_grant grants[$];
+
+  return make_catalog_for_grants(device, map, keys, grants, controls, why);
+endfunction
+
+// 功能：按可选 grant 从冻结身份和真实 BAR 生成单 bank Notify 与 RNET 控制项。
+// 输入/输出及副作用：device/map/keys/grants 只读；controls 成功返回完整 catalog，不回写快照。
+// 失败/边界：拒绝异源/未冻结对象、空/重复/非法 Function、无 RDMA service、ID/Host 超限、grant 不匹配、地址不可编码或查找键重复。
+function bit rdma_project_cfg_seq::make_catalog_for_grants(
+  input dpu_device_snapshot	device,
+  input dpu_bar_map		map,
+  input dpu_function_key_t	keys[$],
+  input rdma_dpu_grant	grants[$],
+  output dpu_control_cfg_t	controls[$],
+  output string			why
+);
   dpu_service_key_t	services[$];
   dpu_control_cfg_t	notify[$];
   dpu_control_cfg_t	rnet[$];
   bit			seen_id[int unsigned];
+  bit			seen_rdmavf[int unsigned];
   bit			seen_key[string];
 
   controls.delete();
   why = "catalog requires frozen same-source device/map and nonempty RDMA Function list";
   if (device == null || map == null || keys.size() == 0)
     return 0;
+  if (grants.size() != 0 && grants.size() != keys.size()) begin
+    why = "RDMA grant count must match the selected Function catalog";
+    return 0;
+  end
   if (!device.is_frozen() || !map.is_frozen() || !map.references_device_snapshot(device))
     return 0;
   device.list_services(DPU_SERVICE_RDMA, services);
@@ -132,6 +174,8 @@ function bit rdma_project_cfg_seq::make_catalog(
     dpu_rdma_notify_entry_t	entry;
     dpu_qsch_rnet_entry_t	route;
     int unsigned		global_id;
+    int unsigned		rdma_id;
+    int			grant_index;
     bit [63:0]			address;
     bit				service_found;
     string			name;
@@ -158,11 +202,40 @@ function bit rdma_project_cfg_seq::make_catalog(
       return 0;
     end
     seen_id[global_id] = 1;
+    rdma_id = global_id;
+    grant_index = -1;
+    foreach (grants[g]) begin
+      if (grants[g] != null && dpu_same_function_key(grants[g].key, keys[i])) begin
+        if (grant_index >= 0) begin
+          why = {"duplicate RDMA grant: ", name};
+          return 0;
+        end
+        grant_index = g;
+      end
+    end
+    if (grants.size() != 0) begin
+      if (grant_index < 0) begin
+        why = {"RDMA grant missing: ", name};
+        return 0;
+      end
+      if (!grants[grant_index].validate(why))
+        return 0;
+      if (grants[grant_index].global_id != global_id) begin
+        why = {"RDMA grant global Function ID mismatch: ", name};
+        return 0;
+      end
+      rdma_id = grants[grant_index].rdma_vf_id;
+    end
+    if (seen_rdmavf.exists(rdma_id)) begin
+      why = {"RDMA VF ID must be unique: ", name};
+      return 0;
+    end
+    seen_rdmavf[rdma_id] = 1;
     if (!device.get_bar(keys[i], DPU_BAR_DEVICE_MEMORY, lease, why) ||
         !map.resolve_function(keys[i], lease.even_bar_id, target, why) ||
         !map.check_range(target, 64'h2000, 8, address, why))
       return 0;
-    if (!encode_notify(global_id, keys[i].host_id, address, entry, why)) begin
+    if (!encode_notify(rdma_id, keys[i].host_id, address, entry, why)) begin
       why = {name, ": ", why};
       return 0;
     end
@@ -179,7 +252,7 @@ function bit rdma_project_cfg_seq::make_catalog(
     route.host_id        = keys[i].host_id[2:0];
     route.enable         = 1;
     item.ctx.kind        = DPU_TABLE_RNET;
-    item.ctx.table_index = global_id;
+    item.ctx.table_index = rdma_id;
     item.value           = 128'(route);
     item.writable_mask   = 128'hf;
     rnet.push_back(item);
@@ -428,6 +501,7 @@ function bit rdma_project_cfg_seq::preflight(
   };
   dpu_table_item_t		batch[$];
   dpu_table_item_t		all_records[$];
+  rdma_status			plan_status;
   bit [63:0]			address;
   bit				seen_msix[string];
   int unsigned			route_controls;
@@ -441,8 +515,22 @@ function bit rdma_project_cfg_seq::preflight(
   if (!cfg.resource_snapshot.is_frozen() ||
       !cfg.resource_snapshot.references_device_snapshot(cfg.device_snapshot))
     return 0;
-  if (!make_catalog(cfg.device_snapshot, cfg.bar_map, rdma_functions, expected, why))
+  if (rdma_grants.size() == 0) begin
+    if (!make_catalog(cfg.device_snapshot, cfg.bar_map, rdma_functions, expected, why))
+      return 0;
+  end else if (!make_catalog_for_grants(cfg.device_snapshot, cfg.bar_map, rdma_functions,
+                                        rdma_grants, expected, why))
     return 0;
+  if (rdma_grants.size() != 0) begin
+    if (hw_plan == null)
+      hw_plan = rdma_hw_plan::type_id::create("rdma_hw_plan");
+    plan_status = hw_plan.build(cfg.device_snapshot, cfg.resource_snapshot, cfg.bar_map,
+                                cfg, rdma_grants);
+    if (!plan_status.ok()) begin
+      why = plan_status.convert2string();
+      return 0;
+    end
+  end
   route_controls = 0;
   foreach (cfg.frozen_controls[c]) begin
     if (cfg.frozen_controls[c].ctx.kind inside {DPU_TABLE_RDMA_NOTIFY, DPU_TABLE_RNET})
@@ -579,6 +667,11 @@ task rdma_project_cfg_seq::body();
       if (!completed_step("verify_msix_tail", ok)) return;
     end
   end
+  if (rdma_grants.size() != 0) begin
+    configure_hw_plan(ok, error_msg);
+    if (!completed_step("configure_rdma_hw_plan", ok)) return;
+    configured_tables = {configured_tables, ",RDMA_HW_PLAN"};
+  end
   configure_rdma_notify(rdma_scope, ok, error_msg);
   if (!completed_step("configure_rdma_notify", ok)) return;
   configured_tables = {configured_tables, ",RDMA_NOTIFY"};
@@ -587,4 +680,31 @@ task rdma_project_cfg_seq::body();
   configured_tables = {configured_tables, ",RNET"};
   success           = 1;
   error_msg         = "";
+endtask
+
+// 功能：把冻结 RDMA hardware plan 的值写入管理 BAR，复用父类 DWORD 写 helper。
+// 输入/输出及副作用：逐项发送 plan.write；ok/why 返回首个失败，不修改 plan 或 grant。
+// 失败/边界：plan 为空/未验证、目标跨 BAR/4KB、PCIe 无 RC 或任一写失败立即停止，后续 Notify/RNET 不执行。
+task rdma_project_cfg_seq::configure_hw_plan(output bit ok, output string why);
+  rdma_hw_reg_write plan_writes[$];
+  rdma_status plan_status;
+
+  ok = 0;
+  why = "RDMA hardware plan is not available";
+  if (hw_plan == null)
+    return;
+  plan_status = hw_plan.validate();
+  if (!plan_status.ok()) begin
+    why = plan_status.convert2string();
+    return;
+  end
+  hw_plan.list_writes(plan_writes);
+  foreach (plan_writes[i]) begin
+    write_table_dwords(plan_writes[i].target, plan_writes[i].offset, 4,
+                       128'(plan_writes[i].value), ok, why);
+    if (!ok)
+      return;
+  end
+  ok = 1;
+  why = "";
 endtask

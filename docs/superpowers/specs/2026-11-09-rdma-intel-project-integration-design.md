@@ -25,7 +25,7 @@ VIO 按 Host 拆分 env 是因为每个 Host 的 ring、IOMMU、worker 和 Host 
 | PCIe RC、tag、Completion、Intel VIF | PCIe/Intel与平台 | 非拥有引用，遵守原事务生命周期 |
 | 网络endpoint、reset/readiness | 平台 | 显式绑定；不调用本地NIC/FLR冒充真实硬件 |
 
-`rdma_vf_id = global_function_id` 且必须小于256；Notify、RNET、QPC/PD/EQ使用同一值，不截位或另建ID池。Notify行号由地址排序产生；Intel VF index、VIO Function内pair index/global qpair ID都不是global Function ID。未来若必须压紧RDMA编号，只能由DPU扩展显式映射契约。
+`global_function_id` 与 `rdma_vf_id` 均必须小于256；简单平台可以让两者相等，但 Notify、RNET、QPC/PD/EQ 使用 grant 发布的 RDMA VF ID，HID_MAP/RPE 仍保留 global Function ID 的权威映射。Notify行号由地址排序产生；Intel VF index、VIO Function内pair index/global qpair ID 都不是这两个 ID。两者不允许由 RDMA 侧自行推导或截位。
 
 外部 `rdma_env_cfg.external_configuration` 绑定平台 `external_system`；系统先一次绑定device snapshot和公共pool，再绑定同源resources及显式hw/driver cfg。2026-11-10起移除私有Host工厂与PCIe重复manager表，平台按冻结GPA创建pool成员，RDMA只校验并借用；DPU通过`host_mem_pool_ref`发布同一pool。外部节点不创建rdma_dev/router/interrupt模型。初始化一旦尝试就锁定绑定，失败也不能替换快照/BAR/pool/manager；新拓扑需要新的环境生命周期。独立模型/PEER的authoring与模型能力保留。
 

@@ -75,6 +75,7 @@ class rdma_drv_qp_attr extends uvm_object;
   localparam int unsigned M_MIN_RNR = 1 << 15;
   localparam int unsigned M_SQ_PSN = 1 << 16;
   localparam int unsigned M_DEST_QPN = 1 << 20;
+  localparam int unsigned M_ROUTE = 1 << 21;
 
   int unsigned mask;
   rdma_drv_qp_state_e state;
@@ -91,6 +92,12 @@ class rdma_drv_qp_attr extends uvm_object;
   bit [23:0] dest_qpn;
   bit [47:0] dmac;
   byte unsigned dest_ip[16];
+  bit source_addr_valid;
+  int unsigned source_addr_idx;
+  bit route_valid;
+  int unsigned dst_port;
+  int unsigned dst_vport_id;
+  int unsigned fwd;
 
   // 功能：构造 mask=0 的 QP 修改属性，并把未启用的 path_mtu 预置为 4096B。
   // 输入/输出及副作用：name 为 UVM 对象名；其余值字段保持 SystemVerilog 的零初值，返回对象不拥有
@@ -471,6 +478,13 @@ class rdma_drv_qp extends uvm_object;
     qpc = rdma_be::zeros(RDMA_QPC_BYTES);
     `RDMA_DRV_SET(qpc, RDMA_QPC_HOST_ID, dev.cfg.host_id)
     `RDMA_DRV_SET(qpc, RDMA_QPC_VF_ID, dev.cfg.vf_id)
+    if (dev.cfg.route_valid) begin
+      `RDMA_DRV_SET(qpc, RDMA_QPC_FWD, dev.cfg.fwd)
+      `RDMA_DRV_SET(qpc, RDMA_QPC_DST_PORT, dev.cfg.dst_port)
+      `RDMA_DRV_SET(qpc, RDMA_QPC_DST_VPORT_ID, dev.cfg.dst_vport_id)
+    end
+    if (dev.cfg.source_addr_valid)
+      `RDMA_DRV_SET(qpc, RDMA_QPC_SRC_ADDR_IDX, dev.cfg.source_addr_idx)
     `RDMA_DRV_SET(qpc, RDMA_QPC_ICOS, 3)
     `RDMA_DRV_SET(qpc, RDMA_QPC_QPN, qpn)
     `RDMA_DRV_SET(qpc, RDMA_QPC_PKEY, 16'hffff)
@@ -730,6 +744,15 @@ class rdma_drv_qp extends uvm_object;
     end
     if (a.mask & rdma_drv_qp_attr::M_MAX_RD_ATOMIC) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_RC_ORQ_SIZE, $clog2(a.max_rd_atomic))
+    end
+    if (a.mask & rdma_drv_qp_attr::M_ROUTE) begin
+      if (a.route_valid) begin
+        `RDMA_DRV_SET(qpc, RDMA_QPC_FWD, a.fwd)
+        `RDMA_DRV_SET(qpc, RDMA_QPC_DST_PORT, a.dst_port)
+        `RDMA_DRV_SET(qpc, RDMA_QPC_DST_VPORT_ID, a.dst_vport_id)
+      end
+      if (a.source_addr_valid)
+        `RDMA_DRV_SET(qpc, RDMA_QPC_SRC_ADDR_IDX, a.source_addr_idx)
     end
     if (a.mask & rdma_drv_qp_attr::M_AV) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_DMAC, a.dmac)

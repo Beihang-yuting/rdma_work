@@ -6,9 +6,13 @@ package rdma_project_pkg;
   timeunit 1ns;
   timeprecision 1ps;
   import uvm_pkg::*;
+  import rdma_types_pkg::*;
   import dpu_resource_pkg::*;
   import dpu_pcie_pkg::*;
   import pcie_tl_pkg::*;
+  import host_mem_pkg::*;
+  import rdma_dpu_adapter_pkg::*;
   `include "uvm_macros.svh"
+  `include "rdma_hw_plan.sv"
   `include "rdma_project_cfg_seq.sv"
 endpackage

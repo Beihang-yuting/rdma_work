@@ -62,6 +62,8 @@ class rdma_env_cfg extends uvm_object;
   // 外部系统由平台拥有：已投影快照、绑定 Host manager/hw；环境只借用，不重复声明拓扑。
   bit	external_configuration;
   rdma_dpu_system	external_system;
+  // 平台为每个 RDMA Function 发布的固定资源/路由授权；不从 VIO lease 推导，也不随 load_params 改变。
+  rdma_dpu_grant	grants[$];
   // 拓扑与平台。
   rdma_env_func_t	funcs[$];
   // 插件提供的远端 Function 数（如 rxe），下标排在 dpu Function 之后。
@@ -170,8 +172,9 @@ endclass
 function string rdma_env_cfg::describe();
     string	s;
 
-    s = $sformatf("RDMA effective configuration\n  mode=%s link=%s funcs=%0d remote_funcs=%0d\n",
-                  mode.name(), link_type, funcs.size(), remote_funcs);
+    s = $sformatf("RDMA effective configuration\n  mode=%s link=%s funcs=%0d grants=%0d\n",
+                  mode.name(), link_type, funcs.size(), grants.size());
+    s = {s, $sformatf("  remote_funcs=%0d\n", remote_funcs)};
     foreach (funcs[i])
       s = {s, $sformatf("  f%0d host=%0d pf=%0d kind=%s vf=%0d role=%s\n", i, funcs[i].host,
                         funcs[i].pf, funcs[i].kind.name(), funcs[i].vf, funcs[i].role.name())};
@@ -193,6 +196,7 @@ function rdma_env_cfg::new(string	name = "rdma_env_cfg");
   super.new(name);
   external_configuration = 0;
   external_system = null;
+  grants.delete();
   mode = RDMA_ENV_MODE_PEER;
   link_type = "rdma_link";
   flow_plan = null;
@@ -264,6 +268,7 @@ function void rdma_env_cfg::inherit_identity(rdma_env_cfg	active);
   cov_enable = active.cov_enable;
   external_configuration = active.external_configuration;
   external_system = active.external_system;
+  grants = active.grants;
   funcs = active.funcs;
   remote_funcs = active.remote_funcs;
   plugins = active.plugins;
@@ -294,6 +299,14 @@ function rdma_status rdma_env_cfg::validate_runtime_candidate(rdma_env_cfg	candi
       candidate.resolved_config != resolved_config || candidate.dut_endpoint != dut_endpoint ||
       candidate.dut_link_snapshot != dut_link_snapshot || candidate.dut_port != dut_port || candidate.dut_mac != dut_mac)
     return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA candidate changed fixed topology/platform identity");
+  if (candidate.grants.size() != grants.size())
+    return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA candidate changed fixed Function grants");
+  foreach (grants[i]) begin
+    if (grants[i] == null || candidate.grants[i] == null ||
+        !grants[i].same_as(candidate.grants[i]))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+        "RDMA candidate changed fixed Function grants");
+  end
   if (candidate.poll_interval == 0 || candidate.response_timeout == 0)
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "rdma.env.poll_ns/response_timeout_us must be positive");
   if (!(candidate.mode inside {RDMA_ENV_MODE_PEER, RDMA_ENV_MODE_RXE, RDMA_ENV_MODE_DUT}))

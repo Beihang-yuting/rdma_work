@@ -58,7 +58,7 @@ run_case() {
 }
 common=(+vio.pairs=1 +vio.queue_type=VQ_PACKED +vio.queue_size=256 +vio.rx_buf_size=2048
     +vio.completion_mode=VIRTIO_COMPLETION_POLLING +vio.notify_bar=0 +vio.notify_base=0
-    +vio.notify_stride=4 +vio.notify_encoding=VIO_NOTIFY_DPU32)
+    +vio.notify_stride=4 +vio.notify_encoding=VIO_NOTIFY_DPU32 +rdma.enabled=1)
 run_case two_pf commands.tcl RDMA_VIRTIO_COMMANDS_PASS required "${common[@]}" \
     +dpu.hosts=1 +dpu.pfs_per_host=2 +rdma.traffic.count=10
 run_case multi_host_pf_vf commands.tcl RDMA_VIRTIO_COMMANDS_PASS required "${common[@]}" \
@@ -67,3 +67,8 @@ run_case save save.tcl RDMA_VIRTIO_SAVE_PASS optional "${common[@]}" \
     +dpu.hosts=2 +dpu.pfs_per_host=2 +rdma.traffic.count=10 +vio.wait.poll_ns=10
 run_case restore restore.tcl RDMA_VIRTIO_RESTORE_PASS required "${common[@]}" \
     +dpu.hosts=2 +dpu.pfs_per_host=2 +rdma.traffic.count=20 +vio.wait.poll_ns=33
+run_case vio_only vio_only_commands.tcl RDMA_VIRTIO_VIO_ONLY_PASS required \
+    +vio.pairs=1 +vio.queue_type=VQ_PACKED +vio.queue_size=256 +vio.rx_buf_size=2048 \
+    +vio.completion_mode=VIRTIO_COMPLETION_POLLING +vio.notify_bar=0 +vio.notify_base=0 \
+    +vio.notify_stride=4 +vio.notify_encoding=VIO_NOTIFY_DPU32 +rdma.enabled=0 \
+    +dpu.hosts=2 +dpu.pfs_per_host=2

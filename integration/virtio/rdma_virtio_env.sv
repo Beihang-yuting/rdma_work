@@ -36,6 +36,11 @@ class rdma_virtio_child_env extends rdma_env;
     status = project_cfg.rdma_cfg.external_system.bind_resources(dpu.get_resource_snapshot());
     if (!status.ok())
       `uvm_fatal("RDMA_VIRTIO", status.convert2string())
+    if (project_cfg.rdma_cfg.grants.size() != 0) begin
+      status = project_cfg.rdma_cfg.external_system.bind_grants(project_cfg.rdma_cfg.grants);
+      if (!status.ok())
+        `uvm_fatal("RDMA_VIRTIO", status.convert2string())
+    end
     super.build_phase(phase);
   endfunction
 endclass
@@ -64,6 +69,8 @@ class rdma_virtio_env extends project_env;
     super.build_phase(phase);
     if (!$cast(project_cfg, cfg))
       `uvm_fatal("RDMA_VIRTIO", "cfg must be rdma_virtio_env_cfg")
+    if (!project_cfg.rdma_enabled)
+      return;
     uvm_config_db#(rdma_virtio_env_cfg)::set(dpu_env, "rdma", "project_cfg", project_cfg);
     uvm_config_db#(rdma_env_cfg)::set(dpu_env, "rdma", "cfg", project_cfg.rdma_cfg);
     rdma = rdma_virtio_child_env::type_id::create("rdma", dpu_env);
@@ -77,12 +84,14 @@ class rdma_virtio_env extends project_env;
     string why;
 
     super.connect_phase(phase);
+    if (!project_cfg.rdma_enabled)
+      return;
     foreach (cfg.dpu_cfg.platform_controls[i])
       if (cfg.dpu_cfg.platform_controls[i].ctx.kind inside {DPU_TABLE_RDMA_NOTIFY, DPU_TABLE_RNET})
         `uvm_fatal("RDMA_VIRTIO",
           "combined env generates the full RDMA catalog; duplicate input is not allowed")
-    if (!rdma_project_cfg_seq::make_catalog(dpu_env.get_snapshot(), cfg.dpu_cfg.bar_map,
-        project_cfg.rdma_functions, controls, why))
+    if (!rdma_project_cfg_seq::make_catalog_for_grants(dpu_env.get_snapshot(), cfg.dpu_cfg.bar_map,
+        project_cfg.rdma_functions, project_cfg.rdma_cfg.grants, controls, why))
       `uvm_fatal("RDMA_VIRTIO", why)
     foreach (controls[i])
       cfg.dpu_cfg.platform_controls.push_back(controls[i]);
@@ -102,7 +111,17 @@ class rdma_virtio_env extends project_env;
 
     ok = 0;
     why = "load_params requires idle project before RDMA initialization";
-    if (busy || init_attempted || rdma == null)
+    if (busy || init_attempted)
+      return;
+    if (!project_cfg.rdma_enabled) begin
+      busy = 1;
+      super.load_params(ok, why);
+      if (ok)
+        configured = 0;
+      busy = 0;
+      return;
+    end
+    if (rdma == null)
       return;
     status = rdma_aip_cfg_loader::make_runtime_candidate(project_cfg.rdma_cfg, candidate);
     if (status.ok())
@@ -143,7 +162,7 @@ class rdma_virtio_env extends project_env;
   // 输入/输出及副作用：ok/why 返回 seq 结果；实际 seq 登记到 AIP 取消 registry。
   // 失败/边界：busy、初始化尝试后、活动 VIO 代或缺管理 RC 拒绝；硬件失败/取消不伪装回滚。
   task configure(output bit ok, output string why);
-    rdma_virtio_cfg_seq seq;
+    dpu_cfg_seq seq;
     dpu_pcie_bar_map map;
     dpu_bar_target_t target;
     uvm_sequencer #(pcie_tl_tlp) rc;
@@ -156,8 +175,17 @@ class rdma_virtio_env extends project_env;
       return;
     busy = 1;
     configured = 0;
-    seq = rdma_virtio_cfg_seq::type_id::create("dut_config");
-    seq.rdma_functions = project_cfg.rdma_functions;
+    if (project_cfg.rdma_enabled) begin
+      rdma_virtio_cfg_seq rdma_seq;
+
+      rdma_seq = rdma_virtio_cfg_seq::type_id::create("dut_config");
+      rdma_seq.rdma_enabled = 1;
+      rdma_seq.rdma_functions = project_cfg.rdma_functions;
+      rdma_seq.rdma_grants = project_cfg.rdma_cfg.grants;
+      seq = rdma_seq;
+    end else begin
+      seq = vio_dpu_cfg_seq::type_id::create("dut_config");
+    end
     aip_cmd_seq_registry::register("dut_config", seq);
     seq.start(rc);
     aip_cmd_seq_registry::unregister("dut_config");
@@ -171,7 +199,7 @@ class rdma_virtio_env extends project_env;
   // 输入/输出及副作用：status 为核心 initialize 结果，开始尝试即关闭参数重载窗口。
   // 失败/边界：未配置、busy 或重复尝试拒绝；缺真实硬件/grant 仍明确失败，不把 VIO grant 当 RDMA grant。
   task initialize(output rdma_status status);
-    if (!configured || busy || init_attempted) begin
+    if (!project_cfg.rdma_enabled || rdma == null || !configured || busy || init_attempted) begin
       status = rdma_status::make(RDMA_SC_INVALID_STATE,
         "rdma_init requires dut_config and no prior initialization attempt");
       return;
@@ -193,7 +221,8 @@ class rdma_virtio_env extends project_env;
 
     ok = 0;
     why = "rdma_run requires ready RDMA, two valid distinct global IDs and qps>0";
-    if (busy || !rdma.is_ready() || first == second || qps == 0)
+    if (!project_cfg.rdma_enabled || rdma == null || busy || !rdma.is_ready() ||
+        first == second || qps == 0)
       return;
     left = rdma.find_function_index(first);
     right = rdma.find_function_index(second);

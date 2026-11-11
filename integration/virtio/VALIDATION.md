@@ -1,6 +1,6 @@
 # 组合环境验证记录
 
-验证日期：2026-11-10。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是原始 virtio `project_env_pkg` 加本目录派生类型，没有替换外部宏或修改外部仓库。
+验证日期：2026-11-11。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是原始 virtio `project_env_pkg` 加本目录派生类型，没有替换外部宏或修改外部仓库。
 
 ## 输入与产物
 
@@ -23,8 +23,13 @@
 | `multi_host_pf_vf.log` | 两 Host、每 Host 两 PF、每 PF 一个 VF；交换 Host→RC slot，逐节点检查正确 Host manager | `RDMA_VIRTIO_COMMANDS_PASS` |
 | `save.log` | 两 Host、每 Host 两 PF；保存 count=10、poll=10 的活动配置及尚未应用的 count=17、poll=27 override | `RDMA_VIRTIO_SAVE_PASS` |
 | `restore.log` | 同 binary 新进程 count=20、poll=33；restore 后一次重载先取得快照 override，clear 后再取得新 CLI | `RDMA_VIRTIO_RESTORE_PASS` |
+| `vio_only.log` | `+rdma.enabled=0`；两 Host/双 PF 只建立 VIO，RDMA child、service、Function 参数和 Notify/RNET 均未创建 | `RDMA_VIRTIO_VIO_ONLY_PASS` |
 
 命令矩阵同时验证：非法 RDMA count 不提交 DPU/VIO；非法 VIO 固定几何不提交 DPU/RDMA；成功重载原地保留 cfg/scenario、snapshot、pool 和命令句柄；`vio_release` 继续使用原 virtio 对象；`load_params wait=0` 可通过 AIP 原生后台路径完成；反序 `rdma_init/rdma_run` 被拒绝且没有初始化副作用。
+
+组合配置现在由 `rdma_enabled` 门控。关闭时 `load_params` 只调用父类 VIO/DPU 重载，`dut_config` 直接使用 `vio_dpu_cfg_seq`；不会创建 RDMA 子环境、添加 RDMA service、生成 hardware plan 或发送 Notify/RNET，节省仿真时间。显式 `rdma_functions` 或 grant 会在构建前打开 RDMA，混合场景仍使用 `rdma_virtio_cfg_seq`。
+
+本次门控复核在 53 的 `/tmp/rdma-codex.UrQZDM/output/virtio_gated3` 完成：`two_pf`、`multi_host_pf_vf`、`save`、`restore` 和新增 `vio_only` 均通过，`vio_only` 返回 `RDMA_VIRTIO_VIO_ONLY_PASS`；Task6 返回 `PROJECT_TASK6_PASS`，Intel 类型回归返回 `PROJECT_INTEL_TYPES_PASS`。
 
 原 [run_commands.sh](../project/tests/run_commands.sh) 使用原 Task6 依赖快照 `/tmp/rdma-task6-current-deps/deps` 重跑，返回 `PROJECT_TASK6_PASS`。命令、prepare/probe 拒绝、跨进程 restore、无新 CLI 恢复和 namespace 检查均通过；重复注册与配置 fatal 为独立预期负例。未把负例的诊断混入正常通过计数。
 
@@ -34,4 +39,4 @@
 
 这里的双 PF/多 Host 是组合环境与共享资源验证，没有创建真实 RDMA QP。既有独立 RDMA 模型流量/命令回归另行通过。组合配置 sequence 已编译，真实 `dut_config` 写入、VIO/RDMA 混合收发、Intel credit/reset 和平台 DMA 收尾仍须接入 DUT 后验证。
 
-公共 DPU 尚无 RDMA QP/SD/CEQ/AEQ grant 契约；本例不伪造 grant，不把结构通过等同于真实 RDMA 初始化通过，也没有新增 RDMA 资源权威。
+本例不伪造 RDMA grant；平台仍需发布每个 Function 的 QP/SD/CEQ/AEQ 与路由授权，结构通过不等同于真实 RDMA 初始化通过，也没有新增 RDMA 资源权威。

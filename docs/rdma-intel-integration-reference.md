@@ -1,6 +1,6 @@
 # RDMA Intel 项目接入参考
 
-本文对应实际实现；入口与验证命令见 [项目 README](../integration/project/README.md)，版本/结果见 [验证记录](../integration/project/VALIDATION.md)，设计约束见 [设计](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。当前为软件集成和受控 fixture，尚无完整真实 DUT 验收。公共 DPU 的 RDMA QP/SD/CEQ/AEQ grant 缺口必须独立解决。
+本文对应实际实现；入口与验证命令见 [项目 README](../integration/project/README.md)，版本/结果见 [验证记录](../integration/project/VALIDATION.md)，设计约束见 [设计](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。当前为软件集成和受控 fixture，尚无完整真实 DUT 验收。平台必须为每个 RDMA Function 显式发布 QP/SD/CEQ/AEQ 与路由 grant。
 
 ## 配置与类型组合
 
@@ -22,9 +22,9 @@
 
 ## 权威身份、共享内存与真实传输
 
-平台在 DPU authoring 中声明 Host/PF/VF、服务和资源请求，经一次 resolver 发布同源 device/resource snapshot、BAR map。RDMA 外部路径选择 `external_configuration`，绑定已有 `external_system`，由其 `bind_resources()` 借用同源资源快照；`bind_snapshot` 创建只读节点投影，不再次 resolve，不创建设备模型。一个 `rdma_env` 统一管理所有选定 Function，`global_function_id < 256` 直接进入 RDMA Function 字段；Notify 行号、Intel VF index、VIO local/global qpair ID 都不是该 ID。
+平台在 DPU authoring 中声明 Host/PF/VF、服务和资源请求，经一次 resolver 发布同源 device/resource snapshot、BAR map。RDMA 外部路径选择 `external_configuration`，绑定已有 `external_system`，由其 `bind_resources()` 借用同源资源快照；`bind_snapshot` 创建只读节点投影，不再次 resolve，不创建设备模型。一个 `rdma_env` 统一管理所有选定 Function，grant 分别携带 `global_function_id` 和 `rdma_vf_id`，两者都必须满足硬件位宽；Notify 行号、Intel VF index、VIO local/global qpair ID 都不是 RDMA VF ID。
 
-平台统一持有 `host_mem_pkg::host_mem_pool`，通过 `dpu.host_mem_pool_ref` 发布真实 pool 句柄。`rdma_dpu_system::bind_snapshot(source, keys, pool)` 借用同一个 pool，先检查全部选中 Function 的 Host manager 已初始化、Host ID 正确且覆盖冻结 GPA，再一次发布节点；缺项直接拒绝，不创建私有 backing。`rdma_host_mems` 工厂及 PCIe 的重复 Host 映射已删除。
+平台统一持有 `host_mem_pkg::host_mem_pool`，通过 `dpu.host_mem_pool_ref` 发布真实 pool 句柄。`rdma_dpu_system::bind_snapshot(source, keys, pool)` 借用同一个 pool，先检查全部选中 Function 的 Host manager 已初始化、Host ID 正确且覆盖冻结 GPA，再一次发布节点；缺项直接拒绝，不创建私有 backing。RDMA Function 视图只在公共 manager 上保留自己的分配账本，PCIe 继续直接使用同一 pool。
 
 平台按冻结快照的 `list_hosts()`/`lookup_host()` 建立 pool；对尚不存在的 Host 调用 `create_host(host_id, gpa_base, gpa_limit - 1, MODE_BUDDY, 16)`，其中 DPU 的 `gpa_limit` 为开区间终点，pool 的末地址为闭区间。已由 Virtio/project 建立的 pool 直接复用，不重复初始化 manager。以下片段放在平台装配阶段，`keys`、`host_id`、`rc_slot` 均来自现有映射：
 
@@ -58,7 +58,7 @@ DPU map 必须包含所有 Function 的显式 Intel policy 和实际 sequencer�
 
 非空 CONTROL/FUNCTION catalog 会涉及当前未实现的公共 hooks，因此预检在 AF/MMIO 前拒绝；table-only 策略按既有显式契约设置。公共 sequence 保留 success/error_msg 和继承的 fatal post_start；已经发出的 posted write 不承诺回滚。公共 scope 用非空 Function 列表与明确类别选择，另行核对 RDMA service，不能把 RDMA service 塞入只支持 VIO 的 service 校验。
 
-表配置成功只说明路由前提成立。DPU 目前没有 RDMA QP/SD/CEQ/AEQ grant，resource snapshot/manager 还要求 VIO qpair capacity/profile；RDMA 外部初始化在 MMIO/CMQ 前明确拒绝。模型测试合法发布的 VIO 资源/消息只能验证同源及公共表，不能冒充 RDMA grant；测试不编译 VIO 包，也不实现混合运行。`first_qp` 目前只是 bitmap 轮转起点，手填范围不能形成全局租约隔离。
+表配置成功只说明路由前提成立。外部 RDMA 初始化还要验证同源 resource snapshot、公共 Host pool、每个 Function 的显式 grant，以及 grant 投影出的驱动配置；缺任一项都会在 MMIO/CMQ 前拒绝。模型测试合法发布的 VIO 资源/消息只能验证同源及公共表，不能冒充 RDMA grant；测试不编译 VIO 包，也不实现混合运行。`first_qp` 目前只是 bitmap 轮转起点，手填范围不能形成全局租约隔离。
 
 ## 独立启动与已有 project 接入
 
@@ -133,7 +133,7 @@ if {[aip_check_status] != 0} { error [aip_read_result] }
 - `af_mng.c:1338`，`dpu_af_alloc_rdma_vf_id()`：从 256 项 RDMA bitmap 分配 ID，不取 global Function ID。
 - `af_mng.c:1358` 的注释及 `:1363` 的 `dpu_af_configure_rdma_vf()`：名称中的 VF 实际指 PCI Function；依次配置 Notify、RDMA QSCH/RNET 以及相关 MSI-X。
 
-独立 bitmap 是该驱动的分配策略，不要求本项目另建 ID 池。当前 RDMA 配置统一取 DPU 的 global Function ID，验证 8 位范围后用于 RDMA 硬件字段；只有平台要求不同编号时再扩展映射。
+独立 bitmap 是该驱动的分配策略，不要求本项目另建 ID 池。`global_function_id` 由 dpu_common 冻结快照提供，`rdma_vf_id` 由平台针对 RDMA Function 发布的 grant 提供。HID_MAP/RPE 使用 global ID；Notify、RNET、QPC、PD、EQ 等 RDMA 资源使用 grant 中的 RDMA VF ID。简单平台可以让两者数值相等，但 RDMA 不强制二者相等。
 
 生成当前表项时，先验证实际 Notify 窗口的 8KiB 对齐、地址可编码范围、Host 和 RDMA ID 位宽，再组装：
 
@@ -160,4 +160,4 @@ sort_key    = entry[50:0]
 
 ## 边界与后续范围
 
-RDMA/VIO 共用同一 DPU 权威快照、Host pool 和 PCIe 路由；VIO 可以按 Host 拆分 env，RDMA 保持一个 env 并以 flow group 绑定任意 Function 对，实际 ring/QP/CQ/MR 仍由各业务管理。当前已支持每条边的多个对称 QP；不同 QP 的独立 SQ/RQ/CQ 深度和 CQ 共享、吞吐优化、完整表达式引擎迁移仍另行处理。真实 DUT 接线、网络端点和硬件验收由平台负责，公共 grant 缺口不能以接线或 fixture 替代。
+RDMA/VIO 共用同一 DPU 权威快照、Host pool 和 PCIe 路由；VIO 可以按 Host 拆分 env，RDMA 保持一个 env 并以 flow group 绑定任意 Function 对，实际 ring/QP/CQ/MR 仍由各业务管理。当前已支持每条边的多个对称 QP；不同 QP 的独立 SQ/RQ/CQ 深度和 CQ 共享、吞吐优化、完整表达式引擎迁移仍另行处理。真实 DUT 接线、网络端点和 grant 内容的最终验收由平台负责。

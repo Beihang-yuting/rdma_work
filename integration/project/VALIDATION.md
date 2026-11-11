@@ -87,4 +87,4 @@ Task7范围独立复审为SPEC PASS / QUALITY Approved，执行门禁已通过�
 
 ## 明确未验收的能力
 
-未完成真实DUT引脚/网络接入；没有解决DPU RDMA QP/SD/CEQ/AEQ grant或纯RDMA资源snapshot的VIO前提；没有运行VIO混合业务或live RXE。合法VIO资源fixture不是RDMA授权；公共表完成不是driver ready。平台须提供真实reset/readiness、一次性绑定及DMA静止后的安全释放。
+未完成真实DUT引脚/网络接入；验证 fixture 不伪造 RDMA QP/SD/CEQ/AEQ grant，也没有运行VIO混合业务或live RXE。合法VIO资源 fixture 不是 RDMA 授权；公共表完成不是 driver ready。平台须提供同源资源 snapshot、每个 Function 的 grant、真实 reset/readiness、一次性绑定及 DMA 静止后的安全释放。

@@ -158,12 +158,18 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
     else if (state == RDMA_DRV_QPS_RTR && !qp.ud() && qp.qp.cur_state == RDMA_DRV_QPS_INIT) begin
       attr.mask |= rdma_drv_qp_attr::M_DEST_QPN | rdma_drv_qp_attr::M_RQ_PSN |
                    rdma_drv_qp_attr::M_PATH_MTU | rdma_drv_qp_attr::M_AV |
-                   rdma_drv_qp_attr::M_MIN_RNR;
+                   rdma_drv_qp_attr::M_MIN_RNR | rdma_drv_qp_attr::M_ROUTE;
       attr.dest_qpn = peer.id;
       attr.rq_psn = peer.psn;
       attr.path_mtu = qp.mtu;
       attr.dmac = peer.owner.mac;
       attr.min_rnr = qp.min_rnr;
+      attr.source_addr_valid = qp.owner.drv().cfg.source_addr_valid;
+      attr.source_addr_idx = qp.owner.drv().cfg.source_addr_idx;
+      attr.route_valid = qp.owner.drv().cfg.route_valid;
+      attr.dst_port = qp.owner.drv().cfg.dst_port;
+      attr.dst_vport_id = qp.owner.drv().cfg.dst_vport_id;
+      attr.fwd = qp.owner.drv().cfg.fwd;
     end
     else if (state == RDMA_DRV_QPS_RTS && qp.qp.cur_state == RDMA_DRV_QPS_RTR) begin
       attr.mask |= rdma_drv_qp_attr::M_SQ_PSN | rdma_drv_qp_attr::M_TIMEOUT |

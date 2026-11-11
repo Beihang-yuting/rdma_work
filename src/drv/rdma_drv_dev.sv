@@ -24,6 +24,17 @@ class rdma_drv_config extends uvm_object;
   int unsigned first_ceqn;
   int unsigned ceq_cnt;
   int unsigned eq_entries;
+  // GRM 路由与中断归属：QP/EQ 创建时原样下发，避免驱动侧重新推导 topology。
+  bit source_addr_valid;
+  int unsigned source_addr_idx;
+  bit sd_iova_valid;
+  bit [63:0] sd_iova;
+  bit route_valid;
+  int unsigned dst_port;
+  int unsigned dst_vport_id;
+  int unsigned fwd;
+  int unsigned ceq_msix_base;
+  int unsigned aeq_msix_idx;
   // debugfs rc_to_urc（rdma_main.h:192）：置位后内核新建的 RC QP 实为 URC。
   bit rc_to_urc;
 
@@ -45,6 +56,16 @@ class rdma_drv_config extends uvm_object;
     first_ceqn = 0;
     ceq_cnt = 1;
     eq_entries = 256;
+    source_addr_valid = 0;
+    source_addr_idx = 0;
+    sd_iova_valid = 0;
+    sd_iova = '0;
+    route_valid = 0;
+    dst_port = 0;
+    dst_vport_id = 0;
+    fwd = 0;
+    ceq_msix_base = 1;
+    aeq_msix_idx = 0;
     rc_to_urc = 1'b0;
   endfunction
 endclass
@@ -433,7 +454,7 @@ class rdma_drv_dev extends uvm_object;
     for (int unsigned i = 0; i < cfg.ceq_cnt && status.ok(); i++) begin
       eq = rdma_drv_eq::type_id::create($sformatf("ceq_%0d", i));
       eq.eqn = cfg.first_ceqn + i;
-      eq.msix_idx = i + 1;
+      eq.msix_idx = cfg.ceq_msix_base + i;
       create_eq(eq, status);
       if (status.ok())
         ceqs.push_back(eq);
@@ -443,7 +464,7 @@ class rdma_drv_dev extends uvm_object;
     eq = rdma_drv_eq::type_id::create("aeq");
     eq.is_aeq = 1'b1;
     eq.eqn = cfg.vf_id;
-    eq.msix_idx = 0;
+    eq.msix_idx = cfg.aeq_msix_idx;
     create_eq(eq, status);
     if (status.ok())
       aeq = eq;

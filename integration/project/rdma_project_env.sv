@@ -83,10 +83,23 @@ endfunction
 // 输入/输出及副作用：phase透传，向rdma发布同一cfg引用。
 // 失败/边界：缺任一组合配置或目录为空fatal，不创建替代身份。
 function void rdma_project_env::build_phase(uvm_phase	phase);
+  bit grants_match;
+
   super.build_phase(phase);
   if (!uvm_config_db#(rdma_project_env_cfg)::get(this, "", "project_cfg", cfg) ||
       cfg == null || cfg.dpu == null || cfg.rdma == null || cfg.pcie == null || cfg.functions.size() == 0)
     `uvm_fatal("RDMA_PROJECT", "published project_cfg and complete Function directory required")
+  if (cfg.grants.size() != 0 && cfg.rdma.grants.size() == 0)
+    cfg.rdma.grants = cfg.grants;
+  if (cfg.grants.size() != 0) begin
+    grants_match = cfg.grants.size() == cfg.rdma.grants.size();
+    if (grants_match)
+      foreach (cfg.grants[i])
+        grants_match &= cfg.grants[i] != null && cfg.rdma.grants[i] != null &&
+                        cfg.grants[i].same_as(cfg.rdma.grants[i]);
+    if (!grants_match)
+      `uvm_fatal("RDMA_PROJECT", "project and RDMA grant lists disagree")
+  end
   uvm_config_db#(rdma_env_cfg)::set(this, "rdma", "cfg", cfg.rdma);
   rdma = rdma_project_manual_env::type_id::create("rdma", this);
 endfunction
@@ -119,7 +132,8 @@ function void rdma_project_env::load_params(output bit	ok, output string	why);
     return;
   end
   if (!cfg.validate_dpu(dpu_next, why) ||
-      !rdma_project_cfg_seq::make_catalog(cfg.dpu.device_snapshot, cfg.dpu.bar_map, cfg.functions, catalog, why))
+      !rdma_project_cfg_seq::make_catalog_for_grants(cfg.dpu.device_snapshot, cfg.dpu.bar_map,
+        cfg.functions, cfg.rdma.grants, catalog, why))
     return;
   status = rdma.validate_runtime_candidate(rdma_next);
   if (!status.ok()) begin
@@ -156,6 +170,8 @@ task rdma_project_env::configure(output bit	ok, output string	why);
   end
   seq = rdma_project_cfg_seq::type_id::create("project_configuration");
   seq.rdma_functions = cfg.functions;
+  seq.rdma_grants = cfg.rdma.grants;
+  seq.hw_plan = cfg.hw_plan;
   aip_cmd_seq_registry::register("dut_config", seq);
   seq.start(rc);
   aip_cmd_seq_registry::unregister("dut_config");

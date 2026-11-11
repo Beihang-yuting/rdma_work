@@ -14,6 +14,7 @@ package rdma_project_runtime_pkg;
   import rdma_types_pkg::*;
   import rdma_env_pkg::*;
   import rdma_aip_cfg_pkg::*;
+  import rdma_dpu_adapter_pkg::*;
   import rdma_project_pkg::*;
   `include "uvm_macros.svh"
   `include "rdma_project_env_cfg.sv"

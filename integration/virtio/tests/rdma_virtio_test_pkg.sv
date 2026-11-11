@@ -117,30 +117,48 @@ package rdma_virtio_test_pkg;
     function void verify_structure();
       int unsigned functions;
       int unsigned vio_functions;
+      int unsigned rdma_services;
 
       functions = cfg.dpu_cfg.device_cfg.functions.size();
       vio_functions = 0;
-      require_true(project.rdma.get_parent() == project.dpu_env,
-        "RDMA outside DPU publication subtree");
-      require_true(project.rdma.sys.snapshot == saved_device &&
-        project.rdma.sys.resources == saved_resources,
-        "RDMA did not consume DPU snapshot handles");
       require_true(cfg.dpu_cfg.device_snapshot == saved_device &&
         cfg.dpu_cfg.resource_snapshot == saved_resources,
         "configuration publication replaced authoritative snapshots");
-      require_true(project.rdma.sys.mem_pool == saved_pool &&
-        cfg.dpu_cfg.host_mem_pool_ref == saved_pool,
+      require_true(cfg.dpu_cfg.host_mem_pool_ref == saved_pool,
         "RDMA/DPU have distinct Host pools");
-      require_true(project.rdma.cfg == saved_rdma_cfg && saved_rdma_cfg.scenario == saved_scenario,
+      require_true((!project.project_cfg.rdma_enabled && project.rdma == null) ||
+        (project.rdma != null && project.rdma.cfg == saved_rdma_cfg &&
+         saved_rdma_cfg.scenario == saved_scenario),
         "reload replaced RDMA config/scenario");
-      require_true(project.rdma.sys.nodes.size() == functions,
-        "RDMA did not include every selected PF/VF");
-      foreach (project.rdma.sys.nodes[i]) begin
-        require_true(project.rdma.sys.nodes[i].mem.mem ==
-          saved_pool.get_host(project.rdma.sys.nodes[i].func.key.host_id),
-          "RDMA Function has a private/wrong Host manager");
-        require_true(project.rdma.sys.nodes[i].drv == null,
-          "RDMA initialized without explicit command");
+      if (project.project_cfg.rdma_enabled) begin
+        require_true(project.rdma != null && project.rdma.get_parent() == project.dpu_env,
+          "RDMA outside DPU publication subtree");
+        require_true(project.rdma.sys.snapshot == saved_device &&
+          project.rdma.sys.resources == saved_resources,
+          "RDMA did not consume DPU snapshot handles");
+        require_true(project.rdma.sys.mem_pool == saved_pool,
+          "RDMA/DPU have distinct Host pools");
+        require_true(project.rdma.sys.nodes.size() == functions,
+          "RDMA did not include every selected PF/VF");
+        foreach (project.rdma.sys.nodes[i]) begin
+          require_true(project.rdma.sys.nodes[i].mem.mem ==
+            saved_pool.get_host(project.rdma.sys.nodes[i].func.key.host_id),
+            "RDMA Function has a private/wrong Host manager");
+          require_true(project.rdma.sys.nodes[i].drv == null,
+            "RDMA initialized without explicit command");
+        end
+      end else begin
+        foreach (cfg.dpu_cfg.device_cfg.functions[i])
+          foreach (cfg.dpu_cfg.device_cfg.functions[i].services[j])
+            if (cfg.dpu_cfg.device_cfg.functions[i].services[j].service_kind == DPU_SERVICE_RDMA)
+              rdma_services++;
+        require_true(project.rdma == null && project.project_cfg.rdma_functions.size() == 0 &&
+          project.project_cfg.rdma_cfg.funcs.size() == 0 && rdma_services == 0,
+          "disabled RDMA still created a child, service or Function configuration");
+        foreach (cfg.dpu_cfg.platform_controls[i])
+          require_true(!(cfg.dpu_cfg.platform_controls[i].ctx.kind inside {
+            DPU_TABLE_RDMA_NOTIFY, DPU_TABLE_RNET}),
+            "disabled RDMA published Notify/RNET controls");
       end
       foreach (project.vio_envs[h]) begin
         rdma_vio_probe vio;
@@ -160,8 +178,8 @@ package rdma_virtio_test_pkg;
       require_true(aip_cmd::get_handle("load_params") == saved_loader &&
         aip_cmd::get_handle("vio_release") == saved_release,
         "load/release command registry changed");
-      require_true(!project.rdma.is_ready() && project.rdma.res.funcs.size() == 0 &&
-        prepares == 0 &&
+      require_true((!project.project_cfg.rdma_enabled ||
+        (!project.rdma.is_ready() && project.rdma.res.funcs.size() == 0)) && prepares == 0 &&
         !project.configured && !project.busy && !project.init_attempted,
         "structure/reload caused initialization, configuration or resources");
     endfunction
@@ -188,9 +206,12 @@ package rdma_virtio_test_pkg;
     test.verify_structure();
     handle.status = 0;
     handle.result_out = $sformatf("count %0d print %0d poll %0d hosts %0d functions %0d",
-      test.project.project_cfg.rdma_cfg.scenario.traffic.count, test.cfg.dpu_cfg.print_bar_map,
+      test.project.project_cfg.rdma_enabled ?
+        test.project.project_cfg.rdma_cfg.scenario.traffic.count : 0,
+      test.cfg.dpu_cfg.print_bar_map,
       test.cfg.vio_cfg.wait_policy_cfg.default_poll_interval_ns,
-      test.project.vio_envs.num(), test.project.rdma.sys.nodes.size());
+      test.project.vio_envs.num(),
+      test.project.rdma == null ? 0 : test.project.rdma.sys.nodes.size());
   endtask
   `aip_cmd_task(compose_observe, compose_observe)
 endpackage

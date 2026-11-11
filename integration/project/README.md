@@ -4,7 +4,7 @@
 [组合环境示例 ../virtio](../virtio/README.md)；它直接继承原 virtio 类型并保留两类业务。
 本目录继续提供独立 RDMA 入口、公共配置 sequence 和已有回归 fixture。
 
-本目录提供冻结快照接入、Intel BAR/DMA 传输、单 bank 配置 sequence 和显式 Tcl 生命周期。软件/模型与 Intel wire fixture 的验证范围见 [验证记录](VALIDATION.md)，平台实际接线见 [接入参考](../../docs/rdma-intel-integration-reference.md)。**公共 DPU 的 RDMA QP/SD/CEQ/AEQ grant 契约仍缺失，当前不能宣称完整 Intel RDMA 初始化或真实 DUT 业务通过。**
+本目录提供冻结快照接入、Intel BAR/DMA 传输、单 bank 配置 sequence 和显式 Tcl 生命周期。软件/模型与 Intel wire fixture 的验证范围见 [验证记录](VALIDATION.md)，平台实际接线见 [接入参考](../../docs/rdma-intel-integration-reference.md)。平台需要为每个 RDMA Function 显式发布 QP/SD/CEQ/AEQ 与路由 grant；当前真实 DUT 接线和流量验收仍由用户完成。
 
 ## 编译边界
 
@@ -36,7 +36,7 @@ bash integration/project/tests/run_commands.sh
 
 ## 数据来源与平台生命周期
 
-`rdma_project_env_cfg` 直接借用 `dpu`、`rdma`、`pcie`，`functions` 是完整 RDMA Function 目录。DPU 唯一负责 Host/PF/VF、BDF、BAR 和 global Function ID；RDMA 不重新 resolve 外部拓扑。`rdma_vf_id = global_function_id < 256`，不是 Intel VF index，也不是 Notify 排序后的行号。
+`rdma_project_env_cfg` 直接借用 `dpu`、`rdma`、`pcie`，`functions` 是完整 RDMA Function 目录。DPU 唯一负责 Host/PF/VF、BDF、BAR 和 global Function ID；RDMA 不重新 resolve 外部拓扑。grant 同时保存 global Function ID 和 RDMA VF ID；简单平台可以让两者相等，但 RDMA 不强制这个映射，也不把 Intel VF index 或 Notify 排序行号当成 RDMA VF ID。
 
 平台只维护一个公共 `host_mem_pool`，按冻结 GPA 创建每 Host 的 manager，并通过 `dpu.host_mem_pool_ref` 发布。RDMA 用 `bind_snapshot(source, keys, pool)` 借用该 pool，PCIe 用 `pool.get_host(host_id)` 取得同一 manager；已有 Virtio pool 直接复用。缺 Host、未初始化、Host ID 或 GPA 覆盖不符时拒绝绑定，不建私有 fallback。各 Function 仅保留独立分配账本；完整 DMA 区间必须属于该 Function 的一次存活分配。不同 Host 的 GPA 可重叠，backing 各自独立。
 
@@ -54,7 +54,7 @@ rdma_init → rdma_run f0=<实际global ID> f1=<实际global ID>
 end_test → 平台finish确认静止/撤销/清理
 ```
 
-非空 MSI-X 配置复用父类尾项任务：有效行写入后、使能前初始化全部未用行；启用读回时验证完整尾部。完整 bank 的容量、溢出、BAR、对齐、4KB边界及尾部与表/握手的冲突在 AF/MMIO 前预检；无消息路径不访问 MSI-X。配置成功仍不代表 RDMA grant 或 driver ready。
+非空 MSI-X 配置复用父类尾项任务：有效行写入后、使能前初始化全部未用行；启用读回时验证完整尾部。完整 bank 的容量、溢出、BAR、对齐、4KB边界及尾部与表/握手的冲突在 AF/MMIO 前预检；无消息路径不访问 MSI-X。配置成功只表示公共表和显式 hardware plan 已写入；driver ready 仍由 `rdma_init` 和平台 grant 校验决定。
 
 ## 参数与显式命令
 
@@ -82,6 +82,6 @@ simv +rdma.qp.type=RC +rdma.traffic.op=write +rdma.traffic.count=100
 
 ## 尚未具备的外部能力
 
-DPU 当前可声明 RDMA service/统一身份，但 resource snapshot/manager 仍有 VIO qpair capacity/profile 前提，且没有 RDMA QP/SD/CEQ/AEQ grant。合法 VIO 资源 fixture 只证明公共表路由机制；不表示 grant 已解决，也没有编译 VIO 包或实现混合业务。
+DPU 当前可声明 RDMA service/统一身份。外部 RDMA 初始化要求同源 resource snapshot、公共 host_mem_pool 和每个 Function 的显式 RDMA grant；合法 VIO 资源 fixture 只证明公共表路由机制，不替代 RDMA grant，也不实现混合业务。
 
 场景 VLAN/IP/UDP 参数目前只在 netpkt 软件 codec 生效；DUT 或其他链路的非默认 pkt 在资源分配/发送前拒绝。一个 `rdma_env` 可承载多个 Host/PF/VF Function；`rdma_run f0=<id> f1=<id> qps=<n>` 运行任意一条业务边，`rdma_run group=<index>` 运行 `cfg.rdma.flow_groups` 中的边，多个 group 可顺序复用同一 env、snapshot、host_mem_pool 和 PCIe 路由。完整 DUT 还需要真实硬件、网络端点、reset/readiness、驱动资源授权和平台收尾验证；不同 QP 的独立深度/CQ 共享仍未提供。

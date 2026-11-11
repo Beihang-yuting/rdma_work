@@ -5,7 +5,7 @@
 ```text
 rdma_virtio_env_cfg extends project_env_cfg
   dpu_cfg / pcie_cfg / vio_cfg / vio_cfg_by_host / VIF / pool  ← 原 virtio 字段
-  rdma_cfg / rdma_functions                                 ← 本项目新增
+  rdma_cfg / rdma_enabled / rdma_functions                  ← 本项目新增
 
 rdma_virtio_env extends project_env
   pcie_env                 ← 原 virtio 创建，每 Host 一个 Intel RC
@@ -15,7 +15,7 @@ rdma_virtio_env extends project_env
     rdma                   ← 新增一个 RDMA env，包含所选 Host/PF/VF 的全部节点
 ```
 
-两个业务均在 DPU 子树构建，消费同一 `device_snapshot/resource_snapshot`。RDMA Function 的 `host_mem_manager` 与同 Host 的 VIO、PCIe 完全相同；不同 Host 使用独立 manager。`rdma_functions` 是 dpu_common 的完整 Function key 列表，空时选择全部 Function。global Function ID/BDF/BAR 仍由 DPU 唯一分配，RDMA 不重新 resolve。
+两个业务均在 DPU 子树构建，消费同一 `device_snapshot/resource_snapshot`。RDMA 默认关闭；只有 `rdma_enabled=1`，或显式提供 `rdma_functions`/RDMA grant 时才创建 RDMA 子环境和 service。RDMA 开启但未给出 Function 时才选择全部 DPU Function，VIO-only 场景不会因为 DPU 有 Function 就触发 RDMA 配置。RDMA Function 的 `host_mem_manager` 与同 Host 的 VIO、PCIe 完全相同；不同 Host 使用独立 manager。global Function ID/BDF/BAR 仍由 DPU 唯一分配，RDMA 不重新 resolve。
 
 | 文件 | 复用关系与职责 |
 | --- | --- |
@@ -35,7 +35,7 @@ rdma_virtio_env extends project_env
 2. `prepare_platform()`：仅由 Tcl `dut_config` 调用。等待真实 reset/readiness，并用 `project.rdma.sys` 给各 Function 绑定硬件上下文与明确的 RDMA 资源授权。失败按原 virtio 钩子契约报 fatal。
 3. `finish_platform()`：Tcl 结束后检查数据、完成和资源，确认 DUT 不再 DMA，再撤销平台借出的句柄。
 
-需要在加载参数前自定义默认值/Function 选择时，先创建 `rdma_virtio_env_cfg`，通过 `uvm_config_db#(project_env_cfg)` 的 `project_cfg` 键提供给 test。父类的 `cfg/env` 字段与新增 `project/project_cfg` 引用指向同一对象，没有兼容字段同步或配置复制。
+需要在加载参数前自定义默认值/Function 选择时，先创建 `rdma_virtio_env_cfg`，通过 `uvm_config_db#(project_env_cfg)` 的 `project_cfg` 键提供给 test，并设置 `rdma_enabled=1`。也可以使用 `+rdma.enabled=1`；显式 Function/grant 会自动打开 RDMA。父类的 `cfg/env` 字段与新增 `project/project_cfg` 引用指向同一对象，没有兼容字段同步或配置复制。
 
 普通业务参数继续使用 `+rdma.qp.*`、`+rdma.mem.*`、`+rdma.pkt.*`、`+rdma.traffic.*`；VIO/DPU 参数完全沿用 virtio 项目。VIO 默认 pairs=0，需要业务时按 virtio 的契约提供 Packed/Custom 队列几何、Notify 和完成模式。真实表布局、Function 策略与 MSI-X 消息由平台提供；本示例不会猜测硬件偏移或 requester 编码。
 
@@ -60,7 +60,7 @@ rdma_run f0=0 f1=1 qps=2
 
 可直接使用 [rdma_start.tcl](rdma_start.tcl)：先设置 `::rdma_f0/::rdma_f1`，再 source。该脚本逐项检查 AIP 返回状态，不会在配置或初始化失败后继续发包。
 
-`dut_config` 只运行一条 `rdma_virtio_cfg_seq`：先 RDMA 完整目录预检，随后由原 virtio 父序列执行 AF/BDF/MSI-X 等公共表；在准备 VIO ring 前加入 RDMA Notify/RNET，然后继续原 VIO Notify/QSCH/队列配置与确认。公共表只配置一次。配置成功不表示 RDMA driver 已初始化。
+`dut_config` 在 RDMA 开启时运行一条 `rdma_virtio_cfg_seq`：先 RDMA 完整目录预检，随后由原 virtio 父序列执行 AF/BDF/MSI-X 等公共表；在准备 VIO ring 前加入 RDMA Notify/RNET，然后继续原 VIO Notify/QSCH/队列配置与确认。RDMA 关闭时直接运行原 `vio_dpu_cfg_seq`，因此不会生成 RDMA catalog、hardware plan、Notify/RNET 或 RDMA 写表。公共表只配置一次。配置成功不表示 RDMA driver 已初始化。
 
 `load_params` 只有一个有效注册对象。当前 virtio 的环境重载 task 不是 virtual，因此 test 在 EOE 核对原 loader 身份后，通过 AIP 的公开 `unregister` 接口替换这一个入口；`vio_release` 和 VIO 业务命令保持原对象/实现。没有改写 AIP 宏，也不注册第二个加载范围。
 
@@ -78,4 +78,4 @@ bash integration/virtio/tests/run.sh
 
 结果、实际依赖与日志位置见 [VALIDATION.md](VALIDATION.md)。结构回归创建真实组合组件，验证多 Host/PF/VF 的快照/pool/PCIe 句柄、原 VIO 命令、事务拒绝和跨进程 restore。top 只提供空闲接口，没有 DUT 或 Completion responder，不能据此宣称真实配置写入或混合业务收发通过。
 
-RDMA 保持单 bank，字段约束仍为 Host ID < 8、global Function ID < 256。公共 DPU 当前没有 RDMA QP/SD/CEQ/AEQ grant 契约；真实 RDMA 初始化仍需平台接入并测试。组合层不会把 VIO 队列授权冒充 RDMA 授权。
+RDMA 保持单 bank，字段约束仍为 Host ID < 8、global Function ID 与 RDMA VF ID < 256。真实初始化由平台为每个 Function 发布 RDMA grant；组合层不会把 VIO 队列授权冒充 RDMA 授权，也不会强制两个 ID 相等。

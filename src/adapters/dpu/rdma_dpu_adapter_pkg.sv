@@ -32,6 +32,120 @@ package rdma_dpu_adapter_pkg;
   localparam bit [63:0] RDMA_DPU_MAILBOX_STATUS_OFFSET  = 64'h0010;
   localparam bit [63:0] RDMA_DPU_MAILBOX_ACK_OFFSET     = 64'h0018;
 
+  // 平台给每个 RDMA Function 的显式资源和路由授权。dpu_common 只负责身份、BDF、BAR 与
+  // topology；本契约不把 VIO qpair lease 转换成 RDMA 资源，也不拥有平台实际 backing。
+  class rdma_dpu_grant extends uvm_object;
+    `uvm_object_utils(rdma_dpu_grant)
+
+    dpu_function_key_t key;
+    int unsigned global_id;
+    int unsigned rdma_vf_id;
+    int unsigned host_id;
+    int unsigned qp_count;
+    int unsigned cq_count;
+    int unsigned mr_count;
+    int unsigned pd_count;
+    int unsigned srq_count;
+    int unsigned sd_count;
+    int unsigned first_qp;
+    int unsigned first_sd;
+    int unsigned first_ceqn;
+    int unsigned ceq_count;
+    int unsigned aeq_msix_idx;
+    int unsigned ceq_msix_base;
+    bit source_addr_valid;
+    int unsigned source_addr_idx;
+    bit sd_iova_valid;
+    bit [63:0] sd_iova;
+    bit route_valid;
+    int unsigned dst_port;
+    int unsigned dst_vport_id;
+    int unsigned fwd;
+    int unsigned net_id;
+    int unsigned group_id;
+    int unsigned dport;
+    int unsigned vnet;
+    int unsigned lvl2_id;
+
+    // 功能：构造未授权的 RDMA grant，所有资源额度、向量和路由字段从零开始并保持无效标志。
+    // 输入/输出及副作用：name 仅作为 UVM 对象名；不读取 snapshot、不分配资源、不取得平台句柄。
+    // 失败/边界：未经过 validate 的对象不能交给 bind_grants；零额度、无 route 或无 source index 会被拒绝。
+    function new(string name = "rdma_dpu_grant");
+      super.new(name);
+      key = '{host_id: 0, pf_id: 0, kind: DPU_FUNCTION_PF, vf_id: 0};
+      global_id = 0;
+      rdma_vf_id = 0;
+      host_id = 0;
+      qp_count = 0;
+      cq_count = 0;
+      mr_count = 0;
+      pd_count = 0;
+      srq_count = 0;
+      sd_count = 0;
+      first_qp = 0;
+      first_sd = 0;
+      first_ceqn = 0;
+      ceq_count = 0;
+      aeq_msix_idx = 0;
+      ceq_msix_base = 0;
+      source_addr_valid = 0;
+      source_addr_idx = 0;
+      sd_iova_valid = 0;
+      sd_iova = '0;
+      route_valid = 0;
+      dst_port = 0;
+      dst_vport_id = 0;
+      fwd = 0;
+      net_id = 0;
+      group_id = 0;
+      dport = 0;
+      vnet = 0;
+      lvl2_id = 0;
+    endfunction
+
+    // 功能：检查 grant 是否包含一份可用于单 Function 初始化的完整授权。
+    // 输入/输出及副作用：只读当前字段，why 返回首个拒绝原因；不修改 grant 或外部资源。
+    // 失败/边界：身份/8bit RDMA ID、资源额度、EQ vector、source index、SD IOVA 对齐和 QSCH 字段越界均拒绝。
+    function bit validate(output string why);
+      why = "";
+      if (host_id != key.host_id || host_id >= 8 || global_id >= 256 || rdma_vf_id >= 256)
+        why = "RDMA grant identity is inconsistent or exceeds hardware fields";
+      else if (qp_count == 0 || cq_count == 0 || mr_count == 0 || pd_count == 0 || sd_count == 0)
+        why = "RDMA grant resource capacities must be nonzero";
+      else if (ceq_count == 0 || aeq_msix_idx >= 256 || ceq_msix_base >= 256 ||
+               ceq_msix_base + ceq_count > 256)
+        why = "RDMA grant EQ/MSI-X range is invalid";
+      else if (!source_addr_valid || source_addr_idx >= 1024)
+        why = "RDMA grant requires a valid source_addr_idx";
+      else if (!sd_iova_valid || sd_iova == 0 || sd_iova[11:0] != 0)
+        why = "RDMA grant requires an aligned runtime SD IOVA";
+      else if (!route_valid || dst_port >= 16 || dst_vport_id >= 2048 || fwd >= 4 ||
+               net_id >= 1024 || group_id >= 1024 || dport >= 16 || vnet >= 1024 || lvl2_id >= 16)
+        why = "RDMA grant QSCH/QP route is incomplete or out of range";
+      return why == "";
+    endfunction
+
+    // 功能：比较两份 grant 的身份、资源、向量和路由授权是否完全一致，支持重复绑定幂等检查。
+    // 输入/输出及副作用：rhs 只读；返回值表示值语义相等，不改变任一 grant 或系统状态。
+    // 失败/边界：null rhs、任一字段不同或未授权字段不同都返回假，不用对象句柄相等替代内容校验。
+    function bit same_as(rdma_dpu_grant rhs);
+      if (rhs == null)
+        return 0;
+      return key == rhs.key && global_id == rhs.global_id && rdma_vf_id == rhs.rdma_vf_id &&
+             host_id == rhs.host_id && qp_count == rhs.qp_count && cq_count == rhs.cq_count &&
+             mr_count == rhs.mr_count && pd_count == rhs.pd_count && srq_count == rhs.srq_count &&
+             sd_count == rhs.sd_count && first_qp == rhs.first_qp && first_sd == rhs.first_sd &&
+             first_ceqn == rhs.first_ceqn && ceq_count == rhs.ceq_count &&
+             aeq_msix_idx == rhs.aeq_msix_idx && ceq_msix_base == rhs.ceq_msix_base &&
+             source_addr_valid == rhs.source_addr_valid && source_addr_idx == rhs.source_addr_idx &&
+             sd_iova_valid == rhs.sd_iova_valid && sd_iova == rhs.sd_iova &&
+             route_valid == rhs.route_valid && dst_port == rhs.dst_port &&
+             dst_vport_id == rhs.dst_vport_id && fwd == rhs.fwd && net_id == rhs.net_id &&
+             group_id == rhs.group_id && dport == rhs.dport && vnet == rhs.vnet &&
+             lvl2_id == rhs.lvl2_id;
+    endfunction
+  endclass
+
   // dpu_device_snapshot 当前不导出 mailbox 的 Function-local→global MSI-X 切片。适配器因此只
   // 建模现有 MAILBOX 寄存器实际触发的 local vector 0，不从 DUT 全局 vector 池推导每 Function 容量。
   localparam int unsigned RDMA_DPU_MODELED_MAILBOX_VECTOR_COUNT = 1;
@@ -1125,6 +1239,8 @@ package rdma_dpu_adapter_pkg;
     // 公共 pool 是唯一 Host 映射；build/bind_snapshot 发布后仅供消费者借用，不得直接替换。
     host_mem_pool		mem_pool;
     rdma_dpu_node		nodes[$];
+    // 外部平台为每个 Function 发布的资源/路由授权；系统只保存值对象引用，不拥有平台资源。
+    rdma_dpu_grant	grants[$];
 
     // 功能：构造可追加 Host/Function 的空系统，仅创建本系统拥有的 cfg。
     // 输入/输出及副作用：name 派生 cfg 名称；snapshot/router/mem_pool 为 null，nodes 为空，不创建 Host backing。
@@ -1156,6 +1272,17 @@ package rdma_dpu_adapter_pkg;
     // 失败/边界：非外部系统、未冻结/异源 value、已绑定不同资源或初始化开始均拒绝；同句柄重复绑定在启动前幂等。
     extern function rdma_status bind_resources(dpu_resource_snapshot	value);
 
+    // 功能：按 nodes 顺序绑定平台核发的 RDMA 资源与路由授权，并投影为驱动配置。
+    // 输入/输出及副作用：values 为每个 Function 的非拥有 grant；成功更新 grants 和 nodes[i].drv_cfg，不发 MMIO。
+    // 失败/边界：仅外部、未锁定且数量/身份/字段校验全部通过时接受；已有不同授权或 grant 未完整配置均拒绝。
+    extern function rdma_status bind_grants(rdma_dpu_grant	values[$]);
+
+    // 功能：比较驱动配置中由 grant 定义的身份、容量、索引、向量和路由字段。
+    // 输入/输出及副作用：只读 cfg_arg/grant_arg，返回值表示值语义一致，不修改对象或系统状态。
+    // 失败/边界：任一对象为空、任一授权字段不同均返回假；max_pbl、eq_entries、rc_to_urc 等独立调试字段不参与比较。
+    extern static function bit config_matches_grant(rdma_drv_config	cfg_arg,
+                                                     rdma_dpu_grant	grant_arg);
+
     // 功能：为外部节点借用平台已绑定的硬件上下文和显式驱动配置，保持 Host 视图唯一。
     // 输入/输出及副作用：i 选择节点，hw/cfg_arg 归调用方所有；成功保存 hw/bar/drv_cfg，不 probe。
     // 失败/边界：非外部、越界、空配置/端口、Host 视图不一致、替换已绑定上下文或启动后修改均拒绝。
@@ -1163,7 +1290,7 @@ package rdma_dpu_adapter_pkg;
 
     // 功能：在任何 probe/MMIO 前检查整个系统的初始化契约，纯查询不替换节点或驱动。
     // 输入/输出及副作用：返回首个缺失依赖的 status；模型只检查完整装配，外部进一步检查配置与资源来源。
-    // 失败/边界：空系统、缺失硬件/内存、视图与 pool 不一致、外部缺显式配置或同源资源均 INVALID_STATE；当前外部缺 RDMA shared grant 仍拒绝。
+    // 失败/边界：空系统、缺失硬件/内存、视图与 pool 不一致、外部缺显式配置/grant/同源资源均 INVALID_STATE。
     extern function rdma_status validate_initialization();
 
     // 功能：关闭外部装配入口，防止初始化请求与后续配置替换交错。
@@ -1187,10 +1314,9 @@ package rdma_dpu_adapter_pkg;
     // 失败/边界：空节点集合或外部节点无 dev 时跳过；模型重复调用仍会启动重复进程，调用方必须避免。
     extern task start();
 
-    // 功能：probe 第 i 个节点的驱动：driver cfg（为 null 时用默认）的 host_id 与 vf_id（global
-    //   Function ID）取自快照。
-    // 输入/输出及副作用：替换节点驱动。
-    // 失败/边界：i 越界 INVALID_ARGUMENT；全系统预检失败或已有驱动 INVALID_STATE；probe 失败保留失败驱动并返回 status。
+    // 功能：probe 第 i 个节点的驱动；模型使用快照 global Function ID，外部模式使用已绑定 grant 的 RDMA VF ID。
+    // 输入/输出及副作用：创建节点驱动并调用 probe，驱动配置由调用方或节点绑定对象提供。
+    // 失败/边界：i 越界、全系统预检失败、已有驱动或外部配置与 grant 不一致时拒绝；probe 失败保留失败驱动并返回 status。
     extern task probe(int unsigned	i, output rdma_status	status, input rdma_drv_config	drv_cfg = null);
 
     // 功能：快照中 key 对应的节点下标。
@@ -1240,6 +1366,7 @@ package rdma_dpu_adapter_pkg;
     binding_locked = 0;
     external_configuration = 0;
     mem_pool = null;
+    grants.delete();
   endfunction
 
   // 功能：声明 Host（见 rdma_dpu_topology::add_host）。
@@ -1342,6 +1469,102 @@ package rdma_dpu_adapter_pkg;
     return rdma_status::success();
   endfunction
 
+  // 功能：比较驱动配置中由 grant 定义的身份、容量、索引、向量和路由字段。
+  // 输入/输出及副作用：只读 cfg_arg/grant_arg，返回值表示值语义一致，不修改对象或系统状态。
+  // 失败/边界：任一对象为空、任一授权字段不同均返回假；max_pbl、eq_entries、rc_to_urc 等独立调试字段不参与比较。
+  function bit rdma_dpu_system::config_matches_grant(rdma_drv_config	cfg_arg,
+                                                       rdma_dpu_grant	grant_arg);
+    if (cfg_arg == null || grant_arg == null)
+      return 0;
+    return cfg_arg.host_id == grant_arg.host_id &&
+           cfg_arg.vf_id == grant_arg.rdma_vf_id &&
+           cfg_arg.max_qp == grant_arg.qp_count && cfg_arg.max_cq == grant_arg.cq_count &&
+           cfg_arg.max_mr == grant_arg.mr_count && cfg_arg.max_pd == grant_arg.pd_count &&
+           cfg_arg.max_srq == grant_arg.srq_count && cfg_arg.first_qp == grant_arg.first_qp &&
+           cfg_arg.first_sd == grant_arg.first_sd &&
+           cfg_arg.first_ceqn == grant_arg.first_ceqn &&
+           cfg_arg.ceq_cnt == grant_arg.ceq_count &&
+           cfg_arg.aeq_msix_idx == grant_arg.aeq_msix_idx &&
+           cfg_arg.ceq_msix_base == grant_arg.ceq_msix_base &&
+           cfg_arg.source_addr_valid == grant_arg.source_addr_valid &&
+           cfg_arg.source_addr_idx == grant_arg.source_addr_idx &&
+           cfg_arg.sd_iova_valid == grant_arg.sd_iova_valid &&
+           cfg_arg.sd_iova == grant_arg.sd_iova &&
+           cfg_arg.route_valid == grant_arg.route_valid &&
+           cfg_arg.dst_port == grant_arg.dst_port &&
+           cfg_arg.dst_vport_id == grant_arg.dst_vport_id && cfg_arg.fwd == grant_arg.fwd;
+  endfunction
+
+  // 功能：按 nodes 顺序绑定平台核发的 RDMA 资源与路由授权，并投影为驱动配置。
+  // 输入/输出及副作用：values 为每个 Function 的非拥有 grant；成功更新 grants 和 nodes[i].drv_cfg，不发 MMIO。
+  // 失败/边界：仅外部、未锁定且数量/身份/字段校验全部通过时接受；已有不同授权或 grant 未完整配置均拒绝。
+  function rdma_status rdma_dpu_system::bind_grants(rdma_dpu_grant	values[$]);
+    rdma_drv_config	candidate;
+    string		why;
+    bit		seen_global[int unsigned];
+    bit		seen_vf[int unsigned];
+
+    if (binding_locked || !external_configuration || snapshot == null)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA grant binding is closed");
+    if (values.size() != nodes.size())
+      return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+        "RDMA grant count differs from Function projection");
+    foreach (values[i]) begin
+      if (values[i] == null || !values[i].validate(why))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, {"invalid RDMA grant: ", why});
+      if (!dpu_same_function_key(values[i].key, nodes[i].func.key) ||
+          values[i].host_id != nodes[i].func.key.host_id ||
+          values[i].global_id != nodes[i].func.global_id ||
+          seen_global.exists(values[i].global_id) || seen_vf.exists(values[i].rdma_vf_id))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+          "RDMA grant identity differs from frozen Function");
+      seen_global[values[i].global_id] = 1;
+      seen_vf[values[i].rdma_vf_id] = 1;
+    end
+    if (grants.size() != 0) begin
+      if (grants.size() != values.size())
+        return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA grants are already bound");
+      foreach (grants[i])
+        if (!grants[i].same_as(values[i]))
+          return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA grants are already bound");
+      return rdma_status::success();
+    end
+    foreach (values[i]) begin
+      if (nodes[i].drv_cfg != null && !config_matches_grant(nodes[i].drv_cfg, values[i]))
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+          "explicit driver configuration conflicts with RDMA grant");
+    end
+    foreach (values[i]) begin
+      candidate = nodes[i].drv_cfg;
+      if (candidate == null)
+        candidate = rdma_drv_config::type_id::create({nodes[i].get_name(), "_grant_cfg"});
+      candidate.host_id = values[i].host_id;
+      candidate.vf_id = values[i].rdma_vf_id;
+      candidate.max_qp = values[i].qp_count;
+      candidate.max_cq = values[i].cq_count;
+      candidate.max_mr = values[i].mr_count;
+      candidate.max_pd = values[i].pd_count;
+      candidate.max_srq = values[i].srq_count;
+      candidate.first_qp = values[i].first_qp;
+      candidate.first_sd = values[i].first_sd;
+      candidate.first_ceqn = values[i].first_ceqn;
+      candidate.ceq_cnt = values[i].ceq_count;
+      candidate.aeq_msix_idx = values[i].aeq_msix_idx;
+      candidate.ceq_msix_base = values[i].ceq_msix_base;
+      candidate.source_addr_valid = values[i].source_addr_valid;
+      candidate.source_addr_idx = values[i].source_addr_idx;
+      candidate.sd_iova_valid = values[i].sd_iova_valid;
+      candidate.sd_iova = values[i].sd_iova;
+      candidate.route_valid = values[i].route_valid;
+      candidate.dst_port = values[i].dst_port;
+      candidate.dst_vport_id = values[i].dst_vport_id;
+      candidate.fwd = values[i].fwd;
+      nodes[i].drv_cfg = candidate;
+    end
+    grants = values;
+    return rdma_status::success();
+  endfunction
+
   // 功能：为外部节点借用平台已绑定的硬件上下文和显式驱动配置，保持 Host 视图唯一。
   // 输入/输出及副作用：i 选择节点，hw/cfg_arg 归调用方所有；成功保存 hw/bar/drv_cfg，不 probe。
   // 失败/边界：非外部、越界、空配置/端口、Host 视图不一致、替换已绑定上下文或启动后修改均拒绝。
@@ -1355,6 +1578,11 @@ package rdma_dpu_adapter_pkg;
     if (nodes[i].drv != null ||
         (nodes[i].hw != null && (nodes[i].hw != hw || nodes[i].drv_cfg != cfg_arg)))
       return rdma_status::make(RDMA_SC_INVALID_STATE, "external node binding is already in use");
+    if (grants.size() == nodes.size()) begin
+      if (!config_matches_grant(cfg_arg, grants[i]))
+      return rdma_status::make(RDMA_SC_INVALID_STATE,
+        "explicit driver configuration conflicts with RDMA grant");
+    end
     nodes[i].hw = hw;
     nodes[i].bar = hw.bar;
     nodes[i].drv_cfg = cfg_arg;
@@ -1363,8 +1591,10 @@ package rdma_dpu_adapter_pkg;
 
   // 功能：在任何 probe/MMIO 前检查整个系统的初始化契约，纯查询不替换节点或驱动。
   // 输入/输出及副作用：返回首个缺失依赖的 status；模型只检查完整装配，外部进一步检查配置与资源来源。
-  // 失败/边界：空系统、缺失硬件/内存、视图与 pool 不一致、外部缺显式配置或同源资源均 INVALID_STATE；当前外部缺 RDMA shared grant 仍拒绝。
+  // 失败/边界：空系统、缺失硬件/内存、视图与 pool 不一致、外部缺显式配置/grant/同源资源均 INVALID_STATE。
   function rdma_status rdma_dpu_system::validate_initialization();
+    string why;
+
     if (snapshot == null || nodes.size() == 0 || mem_pool == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "system has no bound Function snapshot or Host pool");
     foreach (nodes[i]) begin
@@ -1375,14 +1605,21 @@ package rdma_dpu_adapter_pkg;
         return rdma_status::make(RDMA_SC_INVALID_STATE, "node hardware binding is incomplete");
       if (external_configuration && nodes[i].drv_cfg == null)
         return rdma_status::make(RDMA_SC_INVALID_STATE, "external driver configuration is required");
+      if (external_configuration && grants.size() != nodes.size())
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+          "external RDMA grant count does not cover every Function");
+      if (external_configuration &&
+          (grants[i] == null || !config_matches_grant(nodes[i].drv_cfg, grants[i])))
+        return rdma_status::make(RDMA_SC_INVALID_STATE,
+          "external RDMA grant is missing or replaced");
     end
     if (external_configuration) begin
       if (resources == null || !resources.references_device_snapshot(snapshot))
         return rdma_status::make(RDMA_SC_INVALID_STATE, "same-source frozen resource snapshot is required");
-      // 现有 dpu_common 只导出 VIO qpair，不提供 RDMA QP/SD/CEQ 的共享分配证明。
-      // 禁止把显式整数配置、VIO lease 或模型默认范围升级为共享资源授权。
-      return rdma_status::make(RDMA_SC_INVALID_STATE,
-        "dpu_common lacks RDMA shared QP/SD/CEQ grants; external initialization is unsupported");
+      foreach (grants[i]) begin
+        if (!grants[i].validate(why))
+          return rdma_status::make(RDMA_SC_INVALID_STATE, {"invalid external RDMA grant: ", why});
+      end
     end
     return rdma_status::success();
   endfunction
@@ -1483,10 +1720,9 @@ package rdma_dpu_adapter_pkg;
     end
   endtask
 
-  // 功能：probe 第 i 个节点的驱动：driver cfg（为 null 时用默认）的 host_id 与 vf_id（global
-  //   Function ID）取自快照。
-  // 输入/输出及副作用：替换节点驱动。
-  // 失败/边界：i 越界 INVALID_ARGUMENT；全系统预检失败或已有驱动 INVALID_STATE；probe 失败保留失败驱动并返回 status。
+  // 功能：probe 第 i 个节点的驱动；模型配置使用快照 global Function ID，外部配置保留已绑定 grant 的 RDMA VF ID。
+  // 输入/输出及副作用：为节点创建驱动并调用 probe；驱动配置由调用方或节点绑定对象提供。
+  // 失败/边界：i 越界、全系统预检失败、已有驱动或外部配置与 grant 不一致时拒绝；probe 失败保留失败驱动并返回 status。
   task rdma_dpu_system::probe(int unsigned	i, output rdma_status	status, input rdma_drv_config	drv_cfg = null);
     if (i >= nodes.size()) begin
       status = rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "no such dpu node");
@@ -1501,9 +1737,19 @@ package rdma_dpu_adapter_pkg;
       return;
     end
     if (drv_cfg == null)
+      drv_cfg = nodes[i].drv_cfg;
+    if (drv_cfg == null)
       drv_cfg = rdma_drv_config::type_id::create({nodes[i].get_name(), "_drv_cfg"});
-    drv_cfg.host_id = nodes[i].func.key.host_id;
-    drv_cfg.vf_id = nodes[i].func.global_id;
+    if (external_configuration && drv_cfg != nodes[i].drv_cfg &&
+        !config_matches_grant(drv_cfg, grants[i])) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+        "explicit probe configuration conflicts with RDMA grant");
+      return;
+    end
+    if (!external_configuration) begin
+      drv_cfg.host_id = nodes[i].func.key.host_id;
+      drv_cfg.vf_id = nodes[i].func.global_id;
+    end
     nodes[i].drv = rdma_drv_dev::type_id::create({nodes[i].get_name(), "_drv"});
     nodes[i].drv.probe(drv_cfg, nodes[i].hw, status);
   endtask

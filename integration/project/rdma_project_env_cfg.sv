@@ -8,6 +8,9 @@ class rdma_project_env_cfg extends uvm_object;
   rdma_env_cfg	rdma;
   pcie_tl_env_config	pcie;
   dpu_function_key_t	functions[$];
+  // 每个 RDMA Function 的平台资源/路由授权，和 functions 保持同一快照顺序。
+  rdma_dpu_grant	grants[$];
+  rdma_hw_plan	hw_plan;
 
   // 功能：构造尚未绑定平台三种配置的组合对象。
   // 输入/输出及副作用：name传给UVM；所有配置句柄初始为空。
@@ -25,6 +28,8 @@ endclass
 // 失败/边界：build前必须补齐配置与完整RDMA目录，构造不创建资源。
 function rdma_project_env_cfg::new(string	name = "rdma_project_env_cfg");
   super.new(name);
+  grants.delete();
+  hw_plan = rdma_hw_plan::type_id::create("hw_plan");
 endfunction
 
 // 功能：拒绝无消费者的DPU运行期变化，只允许print_bar_map和verify_readback。
