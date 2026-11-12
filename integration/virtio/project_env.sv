@@ -51,6 +51,62 @@ class rdma_virtio_bind_plugin extends rdma_env_plugin;
   endfunction
 endclass
 
+// Intel RC 的 RDMA BAR 适配层：只借用 dpu_common 的冻结目标和 pcie_tl_vip 的 RC sequencer，
+// 不创建 RDMA 专用 PCIe transport，也不拥有 BAR、RC 或 Host memory。每次写入都重新校验
+// target 的 snapshot/generation，避免 restore/rebuild 后沿用旧 Function 路由。
+class rdma_intel_pcie_bar extends rdma_drv_bar;
+  `uvm_object_utils(rdma_intel_pcie_bar)
+
+  dpu_pcie_bar_map             map;
+  dpu_bar_target_t             target;
+  uvm_sequencer #(pcie_tl_tlp) sequencer;
+
+  // 功能：构造未绑定的 Intel RC BAR 适配器。
+  // 输入/输出及副作用：name 传给 UVM；map、target 和 sequencer 保持空状态，不创建 PCIe 组件。
+  // 失败/边界：绑定完成前 write64 返回 INVALID_STATE；适配器不拥有外部 map 或 sequencer。
+  function new(string name = "rdma_intel_pcie_bar");
+    super.new(name);
+    map       = null;
+    sequencer = null;
+  endfunction
+
+  // 功能：把 RDMA 驱动的 BAR0 8B 写转换为 pcie_tl_reg_seq，并通过目标 Host 的 Intel RC 发送。
+  // 输入/输出及副作用：offset/value 为驱动寄存器访问；status 返回 PCIe posted write 的结果。
+  // 失败/边界：空绑定、过期/越界 BAR、非法 PCIe 请求或 RC 发送错误均不发出后续事务并返回失败。
+  virtual task write64(bit [63:0] offset, bit [63:0] value, output rdma_status status);
+    pcie_tl_reg_seq request;
+    bit [63:0]      address;
+    string          why;
+
+    if (map == null || sequencer == null) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE,
+                                 "Intel RDMA BAR has no RC binding");
+      return;
+    end
+    if (!map.check_range(target, offset, 8, address, why)) begin
+      status = rdma_status::make(RDMA_SC_INVALID_STATE, why);
+      return;
+    end
+
+    request          = pcie_tl_reg_seq::type_id::create({get_name(), "_write"});
+    request.is_write = 1;
+    request.addr     = address;
+    request.len      = 8;
+    request.mask     = 0;
+    request.wdata    = value;
+    request.start(sequencer);
+
+    case (request.status)
+      PCIE_RW_OK:
+        status = rdma_status::success();
+      PCIE_RW_TIMEOUT:
+        status = rdma_status::make(RDMA_SC_TIMEOUT, request.error_msg);
+      default:
+        status = rdma_status::make(RDMA_SC_PCIE_COMPLETION, request.error_msg);
+    endcase
+  endtask
+endclass
+
 class project_env extends uvm_env;
 	`uvm_component_utils(project_env)
 
@@ -60,6 +116,9 @@ class project_env extends uvm_env;
 	virtio_net_env	vio_envs[int unsigned];
 	host_mem_pool	shared_pool;
 	rdma_env		rdma;
+	// project_env 保持每个 Function 的非拥有硬件绑定，覆盖 RDMA driver 的使用生命周期。
+	rdma_drv_bar	rdma_bars[int unsigned];
+	rdma_drv_hw	rdma_hws[int unsigned];
 
 	local bit	tx_observation_bound[int unsigned];
 
@@ -103,6 +162,12 @@ class project_env extends uvm_env;
 	// 输入/输出及副作用：只更新 cfg.dpu_cfg 的控制目录和已发布值，不发送 PCIe 事务或启动 driver。
 	// 失败/边界：RDMA 未开启时为空操作；快照/map/grant 不完整、重复目录或发布失败时 fatal。
 	extern protected function void bind_rdma_catalog();
+
+	// 功能：按每个 RDMA Function 的冻结 BAR 和 Host RC 创建 Intel BAR adapter/driver hardware，
+	//   并把它们绑定到 rdma_dpu_system；不启动 probe、初始化或流量 sequence。
+	// 输入/输出及副作用：更新 rdma_bars/rdma_hws 和外部系统节点的硬件句柄；只借用 map、RC、Host memory。
+	// 失败/边界：RDMA 未启用为空操作；缺 map、节点、BAR、RC 或任一绑定失败立即 fatal，禁止留下半绑定系统。
+	extern protected function void bind_rdma_hardware();
 
 	// 运行期入口：重读当前AIP参数，只在首次prepare前或已release后更新同一个cfg。
 // 功能：按 virtio_work 契约重载 DPU/VIO 参数，并在 RDMA 开启时原子提交 RDMA 候选。
@@ -637,6 +702,66 @@ function void project_env::connect_phase(uvm_phase	phase);
 											vio_envs[h]);
 	end
 	bind_rdma_catalog();
+	bind_rdma_hardware();
+endfunction
+
+// 功能：按 RDMA 节点顺序把 dpu_common BAR0 目标和 Intel RC sequencer 投影给 RDMA driver。
+// 输入/输出及副作用：为每个节点创建一个 rdma_intel_pcie_bar 与 rdma_drv_hw，并调用
+//   rdma_dpu_system::bind_external_hw；不发送 TLP、不分配 Host memory、不启动驱动。
+// 失败/边界：只接受已冻结同源 dpu_pcie_bar_map；节点顺序、BAR0、Host RC 或外部 driver cfg 缺失时 fatal，
+//   任一失败都停止绑定，避免后续 rdma_init 看到部分可用硬件。
+function void project_env::bind_rdma_hardware();
+	dpu_pcie_bar_map				map;
+	rdma_intel_pcie_bar			bar;
+	dpu_bar_target_t				target;
+	uvm_sequencer #(pcie_tl_tlp)	sequencer;
+	rdma_drv_hw					hw;
+	rdma_status					status;
+	string						why;
+
+	if (!cfg.rdma_enabled)
+		return;
+	if (rdma == null || rdma.sys == null || cfg.dpu_cfg.bar_map == null) begin
+		`uvm_fatal("RDMA_VIRTIO", "RDMA hardware binding requires an initialized system and BAR map")
+	end
+	if (!$cast(map, cfg.dpu_cfg.bar_map) || map == null || !map.is_frozen()) begin
+		`uvm_fatal("RDMA_VIRTIO", "RDMA hardware binding requires a frozen Intel BAR map")
+	end
+	if (rdma.sys.nodes.size() == 0 || rdma.sys.nodes.size() != cfg.rdma_functions.size()) begin
+		`uvm_fatal("RDMA_VIRTIO", "RDMA node order does not match the configured Function selection")
+	end
+
+	rdma_bars.delete();
+	rdma_hws.delete();
+	foreach (rdma.sys.nodes[i]) begin
+		if (rdma.sys.nodes[i] == null || rdma.sys.nodes[i].func == null ||
+			rdma.sys.nodes[i].mem == null || rdma.sys.nodes[i].drv_cfg == null) begin
+			`uvm_fatal("RDMA_VIRTIO", $sformatf("RDMA node %0d is incomplete before hardware binding", i))
+		end
+		if (!map.resolve_function(rdma.sys.nodes[i].func.key,
+						  rdma.sys.nodes[i].func.bar0.even_bar_id, target, why)) begin
+			`uvm_fatal("RDMA_VIRTIO", why)
+		end
+		if (!map.get_sequencer(target, sequencer, why)) begin
+			`uvm_fatal("RDMA_VIRTIO", why)
+		end
+
+		bar = rdma_intel_pcie_bar::type_id::create($sformatf("rdma_bar_f%0d", i));
+		bar.map       = map;
+		bar.target    = target;
+		bar.sequencer = sequencer;
+
+		hw = rdma_drv_hw::type_id::create($sformatf("rdma_hw_f%0d", i));
+		status = hw.bind_hw(bar, rdma.sys.nodes[i].mem);
+		if (!status.ok())
+			`uvm_fatal("RDMA_VIRTIO", status.convert2string())
+		status = rdma.sys.bind_external_hw(i, hw, rdma.sys.nodes[i].drv_cfg);
+		if (!status.ok())
+			`uvm_fatal("RDMA_VIRTIO", status.convert2string())
+
+		rdma_bars[i] = bar;
+		rdma_hws[i]  = hw;
+	end
 endfunction
 
 // 功能：把已冻结 RDMA Function 目录转换为 Notify/RNET 控制项并重新发布同源 DPU 配置。
