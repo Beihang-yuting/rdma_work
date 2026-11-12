@@ -35,6 +35,18 @@
 在 virtio_work 的 `project_env/project_env_cfg` 上组合 VIO 与 RDMA，使用
 [integration/virtio](integration/virtio/README.md)，共享同一 DPU 快照、Intel PCIe 和 Host 内存池。
 
+如果只集成 RDMA 基础环境，直接使用 [src/rdma.f](src/rdma.f)：从仓库根目录将清单中的
+`@AIP_CORE_ROOT@`、`@DPU_COMMON_ROOT@`、`@HOST_MEM_ROOT@`、`@NET_PACKET_ROOT@` 和
+`@PCIE_WORK_ROOT@` 展开为实际 checkout，再把自己的 test/top 追加到 VCS 命令。例如：
+
+```bash
+vcs -full64 -sverilog -ntb_opts uvm-1.2 -f src/rdma.f my_test.sv -top my_test
+```
+
+编译完成后只需 `import rdma_pkg::*;` 即可使用 RDMA 类型、模型、驱动、设备、UVM env 以及各适配器；
+dpu_common、host_mem、net_packet 和 pcie_work 的原生类型仍保留在各自 package 中。该入口不包含
+`integration/`、Intel wrapper、Tcl、运行时 sequence 或 RXE/DPI 路径。
+
 ## 外部依赖
 
 CMQ/codec 基线来自 `/home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz`，
