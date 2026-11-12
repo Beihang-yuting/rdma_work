@@ -2,6 +2,26 @@
 
 验证日期：2026-11-12。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 在本地直接组合 RDMA，`project_base_test` 与配置 sequence 继续来自 virtio_work 且外部 checkout 未修改。
 
+## 自动 grant 定向验证（当前修改）
+
+2026-11-12 在 `ubuntu@10.11.10.53` 的登录 bash 中执行 `RDMA_GRANT_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh`，VCS 编译通过；编译日志只有 `LCA_FEATURES_ENABLED` 使用提示。此次没有执行全量回归。
+
+隔离源码/依赖位于 `/tmp/rdma-grants.UFTBig/{rdma_work,deps}`，依赖使用本地当前源码；AIP 使用 `/tmp/rdma-virtio-current-deps/aip_core_set_param_expr`。产物和日志位于 `/tmp/rdma-grants.UFTBig/run`。
+
+| 日志 | 覆盖 | 结果 |
+| --- | --- | --- |
+| `rdma_only_two_pf.log` | VIO 关闭，同 Host 两 PF；参数设置 QP 容量 96；自动分配总计 8 SD、2 CEQ，Intel BAR/hw 绑定完成，无隐式 probe/DMA | `RDMA_GRANTS_PASS` |
+| `rdma_vio_two_host.log` | 两 Host 的 RDMA/VIO 共用冻结快照和 pool；RDMA 向量避开公共前缀；`load_params` 后 AEQ local vector 保持 15，message data 从 15 更新为 1015 | `RDMA_GRANTS_PASS` |
+| `rdma_disabled.log` | RDMA 关闭，不创建 RDMA service/env/grant/catalog，VIO 重载仍有效 | `RDMA_VIRTIO_VIO_ONLY_PASS` |
+
+三个正常结束进程的 UVM WARNING/ERROR/FATAL 均为 `0/0/0`。测试还检查 grant 身份、HMC 容量、SD/CEQ/vector 不重叠、已有 grant 不被覆盖，并注入 SD 重叠验证 `bind_grants` 拒绝后原绑定仍有效。
+
+这些是实际组合环境的构建/连接/重载验证；没有真实 DUT，也未执行正常 `rdma_init`、创建真实 QP 或验证 TX/ACK。ETH 环回尚未实现。真实 Intel 外部驱动模式已不再强制依赖模型包注入 `dut_endpoint`。
+
+本地 `git diff --check`、`bash -n` 和 `tools/check_changed_sv_style.py --base HEAD` 通过；风格检查仅报告较长代码行的 soft-limit 提示。
+
+以下保留自动 grant 引入前的历史回归记录，不能视作本次全量复跑结果。
+
 ## 输入与产物
 
 - RDMA 工作树：`/tmp/rdma-virtio-compose`。
@@ -39,4 +59,4 @@
 
 这里的双 PF/多 Host 是组合环境与共享资源验证，没有创建真实 RDMA QP。既有独立 RDMA 模型流量/命令回归另行通过。组合配置 sequence 已编译，真实 `dut_config` 写入、VIO/RDMA 混合收发、Intel credit/reset 和平台 DMA 收尾仍须接入 DUT 后验证。
 
-本例不伪造 RDMA grant；平台仍需发布每个 Function 的 QP/SD/CEQ/AEQ 与路由授权，结构通过不等同于真实 RDMA 初始化通过，也没有新增 RDMA 资源权威。
+历史版本要求平台显式发布 grant；当前组合配置已自动生成，见本页首节。DPU 仍是 Function/BAR 等公共身份的唯一权威，结构通过不等同于真实 RDMA 初始化通过。

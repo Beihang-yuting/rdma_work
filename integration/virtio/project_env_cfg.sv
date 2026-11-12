@@ -5,7 +5,7 @@
 // 该文件只由 rdma_virtio.f 使用，原 virtio_work project_env_cfg 和 project_env_pkg 不被修改。
 class project_env_cfg extends uvm_object;
 	`uvm_object_utils(project_env_cfg)
-	// 三类子配置由本对象创建；每个 Host 的 VIO 配置在加载参数后独立生成。
+	// 四类子配置由本对象创建；每个 Host 的 VIO 配置在加载参数后独立生成。
 	dpu_env_cfg				dpu_cfg;
 	virtio_net_env_config	vio_cfg;
 	virtio_net_env_config	vio_cfg_by_host[int unsigned];
@@ -16,6 +16,7 @@ class project_env_cfg extends uvm_object;
 	bit				rdma_enabled;
 	dpu_function_key_t		rdma_functions[$];
 	protected bit			rdma_params_loaded;
+	protected bit			rdma_grants_generated;
 
 	// 值是 RC agent 下标；EP 由真实 DUT 提供。缺省 h→h，PF/VF 共用 Host 的 slot。
 	int unsigned	tl_slot_by_host[int unsigned];
@@ -55,9 +56,24 @@ class project_env_cfg extends uvm_object;
 	// 失败/边界：关闭时保持空 RDMA 视图；显式 Function、grant、重复或不存在 Function 会拒绝。
 	extern function void load_rdma_params();
 
-	// 功能：构造 DPU/VIO/PCIe 运行期候选，保留当前对象身份和共享句柄。
+	// 功能：在 DPU 快照冻结后，为未显式提供 grant 的 RDMA Functions 一次生成容量、编号和出口配置。
+	// 输入/输出及副作用：sys 提供同源 snapshot/resources；成功发布 rdma_cfg.grants 和可选 MSI-X 消息，不分配 DMA。
+	// 失败/边界：关闭或已有 grants 时幂等；缺快照/路由、容量耗尽或参数越界返回假，失败不发布部分结果。
+	extern function bit make_rdma_grants(rdma_dpu_system	sys, output string	why);
+
+	// 功能：导出当前 DPU 向量前缀后的首个空闲编号，以及每 Function 已占用的 local vector 尾部。
+	// 输入/输出及副作用：只读 sys 的冻结资源和 dpu_cfg.messages；next_vector/local_end 为输出，不修改公共分配。
+	// 失败/边界：缺 AF/caps 或绑定不符合当前 DPU 的连续 LAN/mailbox/AF 布局时拒绝，避免占用未导出的保留向量。
+	extern protected function bit rdma_vector_start(
+		rdma_dpu_system	sys,
+		output int unsigned	next_vector,
+		output int unsigned	local_end[string],
+		output string		why
+	);
+
+	// 功能：构造 DPU/VIO/PCIe 运行期候选并刷新自动 RDMA 中断消息，保留当前身份和共享句柄。
 	// 输入/输出及副作用：candidate 输出纯参数对象，why 输出首个校验失败；不分配 BAR/ring 或发送配置。
-	// 失败/边界：任一子配置候选、VIO service 或 MSI-X scope 不可重载时返回假且不修改活动值。
+	// 失败/边界：任一子配置候选、VIO service、RDMA 消息模板或 MSI-X scope 不可重载时返回假且不修改活动值。
 	extern function bit make_runtime_candidate(
 		output project_env_cfg	candidate,
 		output string			why
@@ -80,6 +96,7 @@ function project_env_cfg::new(string	name);
 	pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
 	rdma_cfg = rdma_env_cfg::type_id::create("rdma_cfg");
 	rdma_cfg.external_configuration = 1;
+	rdma_cfg.mode = RDMA_ENV_MODE_DUT;
 	rdma_cfg.vseq_type = "rdma_traffic_vseq";
 	rdma_enabled = 0;
 
@@ -332,17 +349,247 @@ function void project_env_cfg::load_rdma_params();
 	rdma_params_loaded = 1;
 endfunction
 
-// 功能：构造 DPU/VIO/PCIe 运行期候选，保留当前对象身份和共享句柄。
+// 功能：导出当前 DPU 向量前缀后的首个空闲编号，以及每 Function 已占用的 local vector 尾部。
+// 输入/输出及副作用：只读 sys 的冻结资源和 dpu_cfg.messages；next_vector/local_end 为输出，不修改公共分配。
+// 失败/边界：缺 AF/caps 或绑定不符合当前 DPU 的连续 LAN/mailbox/AF 布局时拒绝，避免占用未导出的保留向量。
+function bit project_env_cfg::rdma_vector_start(
+	rdma_dpu_system	sys,
+	output int unsigned	next_vector,
+	output int unsigned	local_end[string],
+	output string		why
+);
+	dpu_function_key_t		keys[$];
+	dpu_function_key_t		af;
+	dpu_bar_pair_lease_t		bar0;
+	dpu_dut_caps			caps;
+	dpu_vio_qpair_binding_t		pairs[$];
+	dpu_af_extra_queue_binding_t	extras[$];
+
+	next_vector = 0;
+	local_end.delete();
+	caps = sys.snapshot.snapshot_dut_caps();
+	if (caps == null || !sys.snapshot.get_expected_af(af, bar0, why)) return 0;
+	sys.snapshot.list_functions(keys);
+	sys.resources.list_vio_bindings(pairs);
+	sys.resources.list_af_extra_queue_bindings(extras);
+
+	// dpu_common 当前只导出 LAN/AF bindings，未导出 RDMA lease；此处显式适配其连续前缀契约。
+	// mailbox 虽不在 bindings 中仍占空间。后续 DPU 改变布局时先失败，不按 VIO ordinal 猜 RDMA 向量。
+	foreach (keys[i]) begin
+		string		name;
+		int unsigned	lan_end;
+
+		name = dpu_function_key_name(keys[i]);
+		lan_end = 0;
+		foreach (pairs[p]) begin
+			if (!dpu_same_function_key(pairs[p].service_key.function_key, keys[i])) continue;
+			if (pairs[p].global_msix_vector_id != next_vector + pairs[p].local_msix_vector_id) begin
+				why = "DPU MSI-X layout changed; RDMA prefix adapter needs updating";
+				return 0;
+			end
+			if (pairs[p].local_msix_vector_id >= lan_end) lan_end = pairs[p].local_msix_vector_id + 1;
+		end
+		foreach (extras[e]) begin
+			if (!dpu_same_function_key(extras[e].af_function_key, keys[i])) continue;
+			if (extras[e].global_msix_vector_id != next_vector + extras[e].local_msix_vector_id) begin
+				why = "DPU AF MSI-X layout changed; RDMA prefix adapter needs updating";
+				return 0;
+			end
+		end
+		local_end[name] = lan_end;
+		if (lan_end != 0 || dpu_same_function_key(keys[i], af))
+			local_end[name] += caps.mailbox_msix_vectors;
+		if (dpu_same_function_key(keys[i], af)) local_end[name] += caps.af_extra_msix_vectors;
+		next_vector += local_end[name];
+	end
+	foreach (dpu_cfg.messages[i]) begin
+		string	name;
+
+		name = dpu_function_key_name(dpu_cfg.messages[i].owner);
+		if (dpu_cfg.messages[i].global_vector >= next_vector)
+			next_vector = dpu_cfg.messages[i].global_vector + 1;
+		if (dpu_cfg.messages[i].local_vector >= local_end[name])
+			local_end[name] = dpu_cfg.messages[i].local_vector + 1;
+	end
+	why = "";
+	return 1;
+endfunction
+
+// 功能：在 DPU 快照冻结后，为未显式提供 grant 的 RDMA Functions 一次生成容量、编号和出口配置。
+// 输入/输出及副作用：sys 提供同源 snapshot/resources；成功发布 rdma_cfg.grants 和可选 MSI-X 消息，不分配 DMA。
+// 失败/边界：关闭或已有 grants 时幂等；缺快照/路由、容量耗尽或参数越界返回假，失败不发布部分结果。
+function bit project_env_cfg::make_rdma_grants(rdma_dpu_system	sys, output string	why);
+	rdma_dpu_grant		pending[$];
+	dpu_msix_message_t	messages[$];
+	dpu_dut_caps		caps;
+	int unsigned		local_end[string];
+	int unsigned		next_vector;
+	int unsigned		next_sd;
+	int unsigned		next_ceq;
+
+	why = "";
+	if (!rdma_enabled || rdma_cfg.grants.size() != 0) return 1;
+	if (sys == null || sys.snapshot == null || sys.resources == null ||
+		!sys.snapshot.is_frozen() || !sys.resources.is_frozen() ||
+		!sys.resources.references_device_snapshot(sys.snapshot) || sys.nodes.size() == 0) begin
+		why = "automatic RDMA grants require same-source frozen DPU views";
+		return 0;
+	end
+	if (!rdma_vector_start(sys, next_vector, local_end, why)) return 0;
+	caps = sys.snapshot.snapshot_dut_caps();
+	next_sd = 0;
+	next_ceq = 0;
+
+	foreach (sys.nodes[i]) begin
+		rdma_dpu_grant	g;
+		rdma_drv_config	c;
+		string		name;
+		string		path;
+		string		paths[$];
+		int unsigned	port;
+
+		g = rdma_dpu_grant::type_id::create($sformatf("rdma_grant_%0d", i));
+		c = rdma_drv_config::type_id::create("capacity_defaults");
+		g.key = sys.nodes[i].func.key;
+		g.host_id = g.key.host_id;
+		g.global_id = sys.nodes[i].func.global_id;
+		g.rdma_vf_id = g.global_id;
+		name = dpu_function_key_name(g.key);
+		path = $sformatf("rdma.h%0d.pf%0d", g.host_id, g.key.pf_id);
+		if (g.key.kind == DPU_FUNCTION_VF) path = {path, $sformatf(".vf%0d", g.key.vf_id)};
+		paths = '{"rdma.resource", $sformatf("rdma.h%0d.resource", g.host_id), {path, ".resource"}};
+		port = 0;
+`ifdef AIP_CMDLINE_SV
+		foreach (paths[p]) begin
+			int unsigned	qp_count;
+			int unsigned	cq_count;
+			int unsigned	mr_count;
+			int unsigned	pbl_count;
+			int unsigned	pd_count;
+			int unsigned	srq_count;
+			int unsigned	ceq_count;
+			int unsigned	eth_port;
+
+			`DPU_AIP_UINT(paths[p], int unsigned, qp_count, c.max_qp)
+			`DPU_AIP_UINT(paths[p], int unsigned, cq_count, c.max_cq)
+			`DPU_AIP_UINT(paths[p], int unsigned, mr_count, c.max_mr)
+			`DPU_AIP_UINT(paths[p], int unsigned, pbl_count, c.max_pbl)
+			`DPU_AIP_UINT(paths[p], int unsigned, pd_count, c.max_pd)
+			`DPU_AIP_UINT(paths[p], int unsigned, srq_count, c.max_srq)
+			`DPU_AIP_UINT(paths[p], int unsigned, ceq_count, c.ceq_cnt)
+			`DPU_AIP_UINT(paths[p], int unsigned, eth_port, port)
+			c.max_qp = qp_count;
+			c.max_cq = cq_count;
+			c.max_mr = mr_count;
+			c.max_pbl = pbl_count;
+			c.max_pd = pd_count;
+			c.max_srq = srq_count;
+			c.ceq_cnt = ceq_count;
+			port = eth_port;
+		end
+`endif
+		if (!dpu_cfg.function_policies.exists(name) || port >= dpu_cfg.qsch_eth_ports || port >= 8) begin
+			why = {name, ": missing Intel Function route or invalid rdma.resource.eth_port"};
+			return 0;
+		end
+		g.qp_count = c.max_qp;
+		g.cq_count = c.max_cq;
+		g.mr_count = c.max_mr;
+		g.pbl_count = c.max_pbl;
+		g.pd_count = c.max_pd;
+		g.srq_count = c.max_srq;
+		g.sd_count = c.hmc_sd_count();
+		g.first_sd = next_sd;
+		g.first_ceqn = next_ceq;
+		g.ceq_count = c.ceq_cnt;
+		g.aeq_msix_idx = next_vector;
+		g.ceq_msix_base = next_vector + 1;
+		g.source_addr_valid = 1;
+		g.source_addr_idx = i;
+		g.route_valid = 1;
+		g.dst_port = 15; // 驱动 NODE_MODE；真实出口由 RDMA_NET_MAP/G2P 的 dport 给出。
+		g.dst_vport_id = dpu_cfg.function_policies[name].vport;
+		g.fwd = 1; // 驱动 DPU_FWD_NORMAL。
+		g.net_id = g.rdma_vf_id;
+		g.vnet = g.net_id;
+		g.dport = port;
+		g.lvl2_id = g.host_id;
+		g.group_id = g.host_id * 16 + port; // 与 DPU AUTO 的相同 Host/出口共用同值 G2P。
+		if (!g.validate(why)) begin
+			why = {name, ": ", why};
+			return 0;
+		end
+		if (next_vector + 1 + g.ceq_count > caps.global_msix_vector_count ||
+			local_end[name] + 1 + g.ceq_count > 64) begin
+			why = {name, ": RDMA EQ vectors exceed DPU global/local MSI-X capacity"};
+			return 0;
+		end
+
+		// 地址/data 只能来自平台既有 DPU 模板。未配置模板时保持 polling，不编造中断目标。
+		for (int unsigned	v = 0; v <= g.ceq_count; v++) begin
+			dpu_msix_message_t	message;
+			int unsigned		local_vector;
+
+			local_vector = local_end[name] + v;
+			if (!dpu_cfg.message_templates.exists(name) ||
+				!dpu_cfg.message_templates[name].exists(local_vector)) continue;
+			message = dpu_cfg.message_templates[name][local_vector];
+			message.global_vector = next_vector + v;
+			messages.push_back(message);
+		end
+		pending.push_back(g);
+		next_sd += g.sd_count;
+		next_ceq += g.ceq_count;
+		next_vector += 1 + g.ceq_count;
+	end
+	rdma_cfg.grants = pending;
+	rdma_grants_generated = 1;
+	foreach (messages[i]) dpu_cfg.messages.push_back(messages[i]);
+	`uvm_info("PROJECT_RDMA_GRANTS", $sformatf("functions=%0d SD=%0d CEQ=%0d; DMA allocated by rdma_init",
+		pending.size(), next_sd, next_ceq), UVM_LOW)
+	return 1;
+endfunction
+
+// 功能：构造 DPU/VIO/PCIe 运行期候选并刷新自动 RDMA 中断消息，保留当前身份和共享句柄。
 // 输入/输出及副作用：candidate 输出纯参数对象，why 输出首个校验失败；不分配 BAR/ring 或发送配置。
-// 失败/边界：任一子配置候选、VIO service 或 MSI-X scope 不可重载时返回假且不修改活动值。
+// 失败/边界：任一子配置候选、VIO service、RDMA 消息模板或 MSI-X scope 不可重载时返回假且不修改活动值。
 function bit project_env_cfg::make_runtime_candidate(
 	output project_env_cfg	candidate,
 	output string			why
 );
 	dpu_cfg_scope	msix_scope;
+	bit		messages_changed;
 
 	candidate = new("runtime_candidate");
 	if (!dpu_cfg.make_runtime_candidate(candidate.dpu_cfg, why)) return 0;
+	// grant 的编号在 restore 后保持不变；自动消息的 address/data/mask 仍从重新加载的 DPU 模板取得。
+	// 只刷新本集成自动发布的 RDMA 向量，不覆盖用户显式 grant 或 VIO/AF 消息。
+	if (rdma_grants_generated) begin
+		foreach (candidate.dpu_cfg.messages[m]) begin
+			foreach (rdma_cfg.grants[g]) begin
+				dpu_msix_message_t	message;
+				string			name;
+
+				message = candidate.dpu_cfg.messages[m];
+				if (message.owner != rdma_cfg.grants[g].key ||
+					!(message.global_vector == rdma_cfg.grants[g].aeq_msix_idx ||
+					  (message.global_vector >= rdma_cfg.grants[g].ceq_msix_base &&
+					   message.global_vector < rdma_cfg.grants[g].ceq_msix_base + rdma_cfg.grants[g].ceq_count)))
+					continue;
+				name = dpu_function_key_name(message.owner);
+				if (!candidate.dpu_cfg.message_templates.exists(name) ||
+					!candidate.dpu_cfg.message_templates[name].exists(message.local_vector)) begin
+					why = {name, ": reload removed an RDMA MSI-X message template"};
+					return 0;
+				end
+				candidate.dpu_cfg.messages[m] = candidate.dpu_cfg.message_templates[name][message.local_vector];
+				candidate.dpu_cfg.messages[m].global_vector = message.global_vector;
+				messages_changed = 1;
+			end
+		end
+	end
+	if (messages_changed && !candidate.dpu_cfg.publish(
+		dpu_cfg.device_snapshot, dpu_cfg.resource_snapshot, dpu_cfg.bar_map, why)) return 0;
 	if (!vio_cfg.make_runtime_candidate(null, "vio", candidate.vio_cfg, why)) return 0;
 	foreach (vio_cfg_by_host[h]) begin
 		if (!vio_cfg_by_host[h].make_runtime_candidate(

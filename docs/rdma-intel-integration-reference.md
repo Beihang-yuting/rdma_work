@@ -1,6 +1,6 @@
 # RDMA Intel 项目接入参考
 
-本文对应实际实现；入口与验证命令见 [项目 README](../integration/project/README.md)，版本/结果见 [验证记录](../integration/project/VALIDATION.md)，设计约束见 [设计](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。当前为软件集成和受控 fixture，尚无完整真实 DUT 验收。平台必须为每个 RDMA Function 显式发布 QP/SD/CEQ/AEQ 与路由 grant。
+本文对应实际实现；入口与验证命令见 [项目 README](../integration/project/README.md)，版本/结果见 [验证记录](../integration/project/VALIDATION.md)，设计约束见 [设计](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。当前为软件集成和受控 fixture，尚无完整真实 DUT 验收。使用 `integration/virtio/project_env_cfg` 时，QP/SD/CEQ/AEQ 与路由 grant 已按 DPU 快照和 `rdma.resource.*` 自动生成；独立底层适配器仍接收显式 grant。参见 [自动 grant 参数](../integration/virtio/README.md#自动-grant-与启动参数)。
 
 ## 配置与类型组合
 

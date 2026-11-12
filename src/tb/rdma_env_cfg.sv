@@ -131,7 +131,7 @@ class rdma_env_cfg extends uvm_object;
 
   // 功能：校验模式、拓扑和唯一场景，成功后冻结构建配置。
   // 输入/输出及副作用：校验场景并置 finalized，返回首个错误状态或成功。
-  // 失败/边界：模型拓扑为空、外部系统缺失/非外部/无节点、外部同时声明 funcs、存在 DUT 角色、mode 与链路/远端
+  // 失败/边界：模型拓扑为空、外部系统缺失/非外部/无节点、外部同时声明 funcs、存在 DUT 角色、模型 mode 与链路/远端
   //   Function 不一致、流量组端点/数量非法或任一场景非法均返回错误；重复调用幂等。
   extern function rdma_status finalize();
 
@@ -218,7 +218,7 @@ endfunction
 
 // 功能：校验模式、拓扑和唯一场景，成功后冻结构建配置。
 // 输入/输出及副作用：校验场景并置 finalized，返回首个错误状态或成功。
-// 失败/边界：模型拓扑为空、外部系统缺失/非外部/无节点、外部同时声明 funcs、存在 DUT 角色、mode 与链路/远端
+// 失败/边界：模型拓扑为空、外部系统缺失/非外部/无节点、外部同时声明 funcs、存在 DUT 角色、模型 mode 与链路/远端
 //   Function 不一致、任一场景非法均返回错误；重复调用幂等。
 function rdma_status rdma_env_cfg::finalize();
   rdma_status	status;
@@ -236,7 +236,8 @@ function rdma_status rdma_env_cfg::finalize();
     if (funcs[i].role == RDMA_FUNC_ROLE_DUT)
       return rdma_status::make(RDMA_SC_UNSUPPORTED_OPCODE,
                                $sformatf("f%0d role DUT: DUT bridge/RM not implemented yet", i));
-  if (mode == RDMA_ENV_MODE_DUT && link_type != "rdma_dut_link")
+  // 外部驱动通过 Intel PCIe 操作真实 DUT，不依赖模型包注入 endpoint；仅模型侧 DUT link 有此要求。
+  if (mode == RDMA_ENV_MODE_DUT && !external_configuration && link_type != "rdma_dut_link")
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
                              "mode DUT requires link_type rdma_dut_link");
   if (mode == RDMA_ENV_MODE_RXE && remote_funcs == 0)

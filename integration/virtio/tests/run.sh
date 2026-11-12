@@ -59,6 +59,19 @@ run_case() {
 common=(+vio.pairs=1 +vio.queue_type=VQ_PACKED +vio.queue_size=256 +vio.rx_buf_size=2048
     +vio.completion_mode=VIRTIO_COMPLETION_POLLING +vio.notify_bar=0 +vio.notify_base=0
     +vio.notify_stride=4 +vio.notify_encoding=VIO_NOTIFY_DPU32 +rdma.enabled=1)
+# grant 定向验证只运行结构/参数场景；无 DUT，不把未收到 ACK 的流量伪装成通过。
+if [[ ${RDMA_GRANT_SMOKE_ONLY:-0} == 1 ]]; then
+    run_case rdma_only_two_pf grants.tcl RDMA_GRANTS_PASS required \
+        +rdma.enabled=1 +vio.pairs=0 +dpu.hosts=1 +dpu.pfs_per_host=2 \
+        +dpu.h0.pf1.requester=1 +dpu.h0.pf1.intel_pf=1 +dpu.h0.pf1.intel_vf=-1 \
+        +dpu.h0.pf1.vport=1 +rdma.resource.qp_count=96 +grant_expect_qp=96
+    run_case rdma_vio_two_host grants.tcl RDMA_GRANTS_PASS required "${common[@]}" \
+        +dpu.hosts=2 +dpu.pfs_per_host=1 +dpu.msix.msg_addr_base=4276092928 \
+        +dpu.msix.msg_data_base=0 +dpu.msix.msg_data_stride=1 +dpu.msix.table_only_enable=1
+    run_case rdma_disabled vio_only_commands.tcl RDMA_VIRTIO_VIO_ONLY_PASS required \
+        "${common[@]:0:9}" +rdma.enabled=0 +dpu.hosts=1 +dpu.pfs_per_host=1
+    exit 0
+fi
 run_case two_pf commands.tcl RDMA_VIRTIO_COMMANDS_PASS required "${common[@]}" \
     +dpu.hosts=1 +dpu.pfs_per_host=2 +rdma.traffic.count=10
 run_case multi_host_pf_vf commands.tcl RDMA_VIRTIO_COMMANDS_PASS required "${common[@]}" \

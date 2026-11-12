@@ -32,13 +32,40 @@ project_env                               ← 本地直接组合环境，不再�
 
 平台 test 继承 `rdma_virtio_test`，继续实现 virtio 已有的接口：
 
-1. `bind_platform_handles()`：在 cfg 加载后、env build 前注入 Intel VIF、可选已有 pool/IOMMU 和网络 endpoint。`cfg` 本身就是 integration 的 `project_env_cfg`，直接使用 `cfg.rdma_cfg` 及原有 `cfg.intel_rc_vifs` 等字段。
-2. `prepare_platform()`：仅由 Tcl `dut_config` 调用。等待真实 reset/readiness，并用 `project.rdma.sys` 给各 Function 绑定硬件上下文与明确的 RDMA 资源授权。失败按原 virtio 钩子契约报 fatal。
+1. `bind_platform_handles()`：在 cfg 加载后、env build 前注入 Intel VIF、可选已有 pool/IOMMU。仅使用模型向 DUT 注包时才需要网络 endpoint。`cfg` 本身就是 integration 的 `project_env_cfg`，直接使用 `cfg.rdma_cfg` 及原有 `cfg.intel_rc_vifs` 等字段。
+2. `prepare_platform()`：仅由 Tcl `dut_config` 调用。等待真实 reset/readiness；grant 已在 build 阶段生成，Intel BAR/hw 已在 connect 阶段绑定，不在这里重复创建。失败按原 virtio 钩子契约报 fatal。
 3. `finish_platform()`：Tcl 结束后检查数据、完成和资源，确认 DUT 不再 DMA，再撤销平台借出的句柄。
 
 需要在加载参数前自定义默认值/Function 选择时，直接创建 `project_env_cfg`，通过 `uvm_config_db#(project_env_cfg)` 的 `project_cfg` 键提供给 test，并设置 `rdma_enabled=1`。也可以使用 `+rdma.enabled=1`；显式 Function/grant 会自动打开 RDMA。父类 `cfg` 与组合 env 的 `project_cfg` 指向同一对象，没有兼容字段同步或配置复制。
 
 普通业务参数继续使用 `+rdma.qp.*`、`+rdma.mem.*`、`+rdma.pkt.*`、`+rdma.traffic.*`；VIO/DPU 参数完全沿用 virtio 项目。VIO 默认 pairs=0，需要业务时按 virtio 的契约提供 Packed/Custom 队列几何、Notify 和完成模式。真实表布局、Function 策略与 MSI-X 消息由平台提供；本示例不会猜测硬件偏移或 requester 编码。
+
+### 自动 grant 与启动参数
+
+普通用例不必在 tc_base 填 `rdma_functions` 或 `grants`。启动参数例如：
+
+```bash
++rdma.enabled=1 +vio.pairs=0 +dpu.hosts=1 +dpu.pfs_per_host=1
+```
+
+RDMA 开启后默认选择全部 DPU Function；多 Host/PF/VF 仍由 `dpu.*` 声明，Intel requester/PFVF/VIF 接线沿用平台实际配置。`rdma_run` 的双端场景需要两个不同的有效 Function ID，单 Function 配置只能先做配置/初始化。
+
+下列参数在 **build 阶段**采样；通用路径为 `rdma.resource.*`，可由 `rdma.hH.resource.*`、`rdma.hH.pfP[.vfV].resource.*` 逐层覆盖：
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `qp_count` | 64 | QP 容量，包含保留的 QPN 0/1 |
+| `cq_count` / `mr_count` | 64 | 每 Function 的 CQ/MR 容量 |
+| `pbl_count` | 1024 | PBL 容量 |
+| `pd_count` / `srq_count` | 16 | 每 Function 的 PD/SRQ 容量 |
+| `ceq_count` | 1 | 每 Function 的 CEQ 数量 |
+| `eth_port` | 0 | 真实 QSCH Ethernet 出口，默认 ETH0 |
+
+例如 `+rdma.resource.qp_count=128 +rdma.h0.pf1.resource.ceq_count=2`。SD 数量按驱动 HMC 布局自动计算，SD/CEQ/vector 不重叠；实际 SD 页表及 IOVA 在显式 `rdma_init` 时通过共享 host_mem 分配，不再填写 `sd_iova`。
+
+这些容量和编号随环境构建固定；restore 后的 `load_params` 继续重载已有的 QP 行为、报文、流量参数，不重新分配 grant。MSI-X 地址/data 使用已有 `dpu.*.msix` 模板；未提供模板时不生成中断消息，基础场景使用轮询。已生成消息在重载时保留向量编号并更新模板值。
+
+真实 Intel PCIe 驱动模式使用 `external_configuration=1`，不要求 `dut_endpoint`。显式选择 `rdma_dut_link` 才要求该接口。ETH 环回暂未接入；DUT TX ready 仍必须由 MAC 侧驱动。没有 TX→RX 回包路径可以观察首批 TX，RC 的 ACK、接收及完成检查不能因此认为通过。
 
 RDMA Notify/RNET catalog 使用父环境的实际 BAR map 生成，再调用 DPU 的同源 `publish()` 补齐配置值。这里不会改写冻结拓扑或重新分配资源；因为父 `publish_dpu_configuration()` 不是虚函数，适配留在本仓库。平台不要再手工添加第二份 RDMA catalog。
 
@@ -53,7 +80,7 @@ load_params
 dut_config
 # 使用 VIO 时，沿用 virtio 的 vio.target 和业务命令。
 vio_start
-# RDMA 需要平台已具备真实硬件及 RDMA grant。
+# RDMA grant 已由 project_env_cfg 自动补齐；真实硬件须已 ready。
 rdma_init
 rdma_run f0=0 f1=1 qps=2
 # 0/1 只是例子，必须替换为该快照中的实际 global Function ID。
@@ -76,9 +103,9 @@ Restore 使用同一 binary；在未配置、未初始化时保存。恢复后�
 在 `ubuntu@10.11.10.53` 登录 bash 中设置上述七个依赖根和 `RDMA_ROOT`，运行：
 
 ```bash
-bash integration/virtio/tests/run.sh
+RDMA_GRANT_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
 ```
 
 结果、实际依赖与日志位置见 [VALIDATION.md](VALIDATION.md)。结构回归创建真实组合组件，验证多 Host/PF/VF 的快照/pool/PCIe 句柄、原 VIO 命令、事务拒绝和跨进程 restore。top 只提供空闲接口，没有 DUT 或 Completion responder，不能据此宣称真实配置写入或混合业务收发通过。
 
-RDMA 保持单 bank，字段约束仍为 Host ID < 8、global Function ID 与 RDMA VF ID < 256。真实初始化由平台为每个 Function 发布 RDMA grant；组合层不会把 VIO 队列授权冒充 RDMA 授权，也不会强制两个 ID 相等。
+RDMA 保持单 bank，字段约束仍为 Host ID < 8、global Function ID 与 RDMA VF ID < 256。未手工提供 grant 时，组合配置自动生成，默认 RDMA VF ID 等于冻结 global Function ID；显式 grant 仍允许两者不同。SD/CEQ/source 属于 RDMA 独立资源；MSI-X 从 DPU 已占用的 LAN/mailbox/AF 前缀之后分配，不改写 VIO 分配。当前 DPU 未导出通用 RDMA allocator，组合配置显式适配并校验这一前缀契约。

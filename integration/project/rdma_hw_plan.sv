@@ -3,7 +3,7 @@
 //   HID_MAP、RPE_VFT、QSCH、WBE、EAT 写项；Notify/RNET 由公共 catalog sequence 唯一写入。
 // 依赖：dpu_resource_pkg、host_mem_pkg、rdma_dpu_adapter_pkg；实际 PCIe 写入仍由 dpu_cfg_seq 完成。
 // 所有权与生命周期：plan 只借用冻结对象和 grant；write 项为值/非拥有目标快照，restore 后必须重新 build。
-// 设计边界：SD/HMC 的页表由 rdma_drv_dev 通过 CMQ 管理，plan 只校验并携带 grant.sd_iova，不伪造未知 MMIO 偏移。
+// 设计边界：SD/HMC 的页表由 rdma_drv_dev 通过 CMQ 管理，grant 只授权 SD 编号范围，真实 IOVA 在 probe 时从共享 Host pool 分配。
 // 功能：返回一个字段完整的空 BAR target，供构造函数先建立可校验的零值目标。
 // 输入/输出及副作用：无输入；返回值不拥有 snapshot 或 BAR lease，不访问 PCIe、不分配资源。
 // 失败/边界：返回值只能作为未绑定占位；resolve/build 成功前不能发送其上的写项。
@@ -256,7 +256,8 @@ class rdma_hw_plan extends uvm_object;
       add_write(target, grants_arg[i].key,
                 DSCH_QSCH_RDMA_N2G_BASE + grants_arg[i].net_id * 4,
                 value, "QSCH_N2G");
-      value = 32'h8000_0000 | (grants_arg[i].dst_port << 16) | grants_arg[i].lvl2_id;
+      // G2P 使用物理调度出口 dport；QPC 的 dst_port=15 表示 NODE_MODE，不能写成 G2P 出口。
+      value = 32'h8000_0000 | (grants_arg[i].dport << 16) | grants_arg[i].lvl2_id;
       add_write(target, grants_arg[i].key,
                 DSCH_QSCH_BASE + 64'h14000 + grants_arg[i].group_id * 4, value, "QSCH_G2P");
       value = 32'h8000_0000 | grants_arg[i].net_id;

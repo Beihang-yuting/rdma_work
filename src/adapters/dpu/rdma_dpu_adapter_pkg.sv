@@ -44,6 +44,7 @@ package rdma_dpu_adapter_pkg;
     int unsigned qp_count;
     int unsigned cq_count;
     int unsigned mr_count;
+    int unsigned	pbl_count;
     int unsigned pd_count;
     int unsigned srq_count;
     int unsigned sd_count;
@@ -55,8 +56,6 @@ package rdma_dpu_adapter_pkg;
     int unsigned ceq_msix_base;
     bit source_addr_valid;
     int unsigned source_addr_idx;
-    bit sd_iova_valid;
-    bit [63:0] sd_iova;
     bit route_valid;
     int unsigned dst_port;
     int unsigned dst_vport_id;
@@ -67,7 +66,7 @@ package rdma_dpu_adapter_pkg;
     int unsigned vnet;
     int unsigned lvl2_id;
 
-    // 功能：构造未授权的 RDMA grant，所有资源额度、向量和路由字段从零开始并保持无效标志。
+    // 功能：构造未授权的 RDMA grant；PBL 默认 1024，其余额度、向量和路由从零开始并保持无效标志。
     // 输入/输出及副作用：name 仅作为 UVM 对象名；不读取 snapshot、不分配资源、不取得平台句柄。
     // 失败/边界：未经过 validate 的对象不能交给 bind_grants；零额度、无 route 或无 source index 会被拒绝。
     function new(string name = "rdma_dpu_grant");
@@ -79,6 +78,7 @@ package rdma_dpu_adapter_pkg;
       qp_count = 0;
       cq_count = 0;
       mr_count = 0;
+      pbl_count = 1024;
       pd_count = 0;
       srq_count = 0;
       sd_count = 0;
@@ -90,8 +90,6 @@ package rdma_dpu_adapter_pkg;
       ceq_msix_base = 0;
       source_addr_valid = 0;
       source_addr_idx = 0;
-      sd_iova_valid = 0;
-      sd_iova = '0;
       route_valid = 0;
       dst_port = 0;
       dst_vport_id = 0;
@@ -105,20 +103,22 @@ package rdma_dpu_adapter_pkg;
 
     // 功能：检查 grant 是否包含一份可用于单 Function 初始化的完整授权。
     // 输入/输出及副作用：只读当前字段，why 返回首个拒绝原因；不修改 grant 或外部资源。
-    // 失败/边界：身份/8bit RDMA ID、资源额度、EQ vector、source index、SD IOVA 对齐和 QSCH 字段越界均拒绝。
+    // 失败/边界：身份/8bit RDMA ID、资源额度、SD/CEQ 范围、EQ vector、source index 和 QSCH 字段越界均拒绝；HMC IOVA 由驱动分配。
     function bit validate(output string why);
       why = "";
       if (host_id != key.host_id || host_id >= 8 || global_id >= 256 || rdma_vf_id >= 256)
         why = "RDMA grant identity is inconsistent or exceeds hardware fields";
-      else if (qp_count == 0 || cq_count == 0 || mr_count == 0 || pd_count == 0 || sd_count == 0)
-        why = "RDMA grant resource capacities must be nonzero";
-      else if (ceq_count == 0 || aeq_msix_idx >= 256 || ceq_msix_base >= 256 ||
-               ceq_msix_base + ceq_count > 256)
+      else if (qp_count < 3 || cq_count == 0 || mr_count == 0 || pbl_count == 0 || pd_count == 0 || sd_count == 0)
+        why = "RDMA grant requires QP0/1 plus a user QP, and nonzero CQ/MR/PBL/PD/SD capacities";
+      else if (first_sd >= 4096 || sd_count > 4096 - first_sd || first_qp >= qp_count)
+        why = "RDMA grant SD range or QP cursor is invalid";
+      else if (ceq_count == 0 || first_ceqn >= 4096 || ceq_count > 4096 - first_ceqn ||
+               aeq_msix_idx >= 8192 || ceq_msix_base >= 8192 ||
+               ceq_count > 8192 - ceq_msix_base ||
+               (aeq_msix_idx >= ceq_msix_base && aeq_msix_idx < ceq_msix_base + ceq_count))
         why = "RDMA grant EQ/MSI-X range is invalid";
       else if (!source_addr_valid || source_addr_idx >= 1024)
         why = "RDMA grant requires a valid source_addr_idx";
-      else if (!sd_iova_valid || sd_iova == 0 || sd_iova[11:0] != 0)
-        why = "RDMA grant requires an aligned runtime SD IOVA";
       else if (!route_valid || dst_port >= 16 || dst_vport_id >= 2048 || fwd >= 4 ||
                net_id >= 1024 || group_id >= 1024 || dport >= 16 || vnet >= 1024 || lvl2_id >= 16)
         why = "RDMA grant QSCH/QP route is incomplete or out of range";
@@ -133,12 +133,11 @@ package rdma_dpu_adapter_pkg;
         return 0;
       return key == rhs.key && global_id == rhs.global_id && rdma_vf_id == rhs.rdma_vf_id &&
              host_id == rhs.host_id && qp_count == rhs.qp_count && cq_count == rhs.cq_count &&
-             mr_count == rhs.mr_count && pd_count == rhs.pd_count && srq_count == rhs.srq_count &&
+             mr_count == rhs.mr_count && pbl_count == rhs.pbl_count && pd_count == rhs.pd_count && srq_count == rhs.srq_count &&
              sd_count == rhs.sd_count && first_qp == rhs.first_qp && first_sd == rhs.first_sd &&
              first_ceqn == rhs.first_ceqn && ceq_count == rhs.ceq_count &&
              aeq_msix_idx == rhs.aeq_msix_idx && ceq_msix_base == rhs.ceq_msix_base &&
              source_addr_valid == rhs.source_addr_valid && source_addr_idx == rhs.source_addr_idx &&
-             sd_iova_valid == rhs.sd_iova_valid && sd_iova == rhs.sd_iova &&
              route_valid == rhs.route_valid && dst_port == rhs.dst_port &&
              dst_vport_id == rhs.dst_vport_id && fwd == rhs.fwd && net_id == rhs.net_id &&
              group_id == rhs.group_id && dport == rhs.dport && vnet == rhs.vnet &&
@@ -1274,12 +1273,12 @@ package rdma_dpu_adapter_pkg;
 
     // 功能：按 nodes 顺序绑定平台核发的 RDMA 资源与路由授权，并投影为驱动配置。
     // 输入/输出及副作用：values 为每个 Function 的非拥有 grant；成功更新 grants 和 nodes[i].drv_cfg，不发 MMIO。
-    // 失败/边界：仅外部、未锁定且数量/身份/字段校验全部通过时接受；已有不同授权或 grant 未完整配置均拒绝。
+    // 失败/边界：仅外部、未锁定且数量/身份/字段校验全部通过时接受；SD 不足、跨 Function SD/CEQ/vector/source 冲突或已有不同授权均拒绝。
     extern function rdma_status bind_grants(rdma_dpu_grant	values[$]);
 
     // 功能：比较驱动配置中由 grant 定义的身份、容量、索引、向量和路由字段。
     // 输入/输出及副作用：只读 cfg_arg/grant_arg，返回值表示值语义一致，不修改对象或系统状态。
-    // 失败/边界：任一对象为空、任一授权字段不同均返回假；max_pbl、eq_entries、rc_to_urc 等独立调试字段不参与比较。
+    // 失败/边界：任一对象为空、任一授权字段不同均返回假；eq_entries、rc_to_urc 等独立调试字段不参与比较。
     extern static function bit config_matches_grant(rdma_drv_config	cfg_arg,
                                                      rdma_dpu_grant	grant_arg);
 
@@ -1471,7 +1470,7 @@ package rdma_dpu_adapter_pkg;
 
   // 功能：比较驱动配置中由 grant 定义的身份、容量、索引、向量和路由字段。
   // 输入/输出及副作用：只读 cfg_arg/grant_arg，返回值表示值语义一致，不修改对象或系统状态。
-  // 失败/边界：任一对象为空、任一授权字段不同均返回假；max_pbl、eq_entries、rc_to_urc 等独立调试字段不参与比较。
+  // 失败/边界：任一对象为空、任一授权字段不同均返回假；eq_entries、rc_to_urc 等独立调试字段不参与比较。
   function bit rdma_dpu_system::config_matches_grant(rdma_drv_config	cfg_arg,
                                                        rdma_dpu_grant	grant_arg);
     if (cfg_arg == null || grant_arg == null)
@@ -1479,7 +1478,8 @@ package rdma_dpu_adapter_pkg;
     return cfg_arg.host_id == grant_arg.host_id &&
            cfg_arg.vf_id == grant_arg.rdma_vf_id &&
            cfg_arg.max_qp == grant_arg.qp_count && cfg_arg.max_cq == grant_arg.cq_count &&
-           cfg_arg.max_mr == grant_arg.mr_count && cfg_arg.max_pd == grant_arg.pd_count &&
+           cfg_arg.max_mr == grant_arg.mr_count &&
+           cfg_arg.max_pbl == grant_arg.pbl_count && cfg_arg.max_pd == grant_arg.pd_count &&
            cfg_arg.max_srq == grant_arg.srq_count && cfg_arg.first_qp == grant_arg.first_qp &&
            cfg_arg.first_sd == grant_arg.first_sd &&
            cfg_arg.first_ceqn == grant_arg.first_ceqn &&
@@ -1488,8 +1488,6 @@ package rdma_dpu_adapter_pkg;
            cfg_arg.ceq_msix_base == grant_arg.ceq_msix_base &&
            cfg_arg.source_addr_valid == grant_arg.source_addr_valid &&
            cfg_arg.source_addr_idx == grant_arg.source_addr_idx &&
-           cfg_arg.sd_iova_valid == grant_arg.sd_iova_valid &&
-           cfg_arg.sd_iova == grant_arg.sd_iova &&
            cfg_arg.route_valid == grant_arg.route_valid &&
            cfg_arg.dst_port == grant_arg.dst_port &&
            cfg_arg.dst_vport_id == grant_arg.dst_vport_id && cfg_arg.fwd == grant_arg.fwd;
@@ -1497,12 +1495,16 @@ package rdma_dpu_adapter_pkg;
 
   // 功能：按 nodes 顺序绑定平台核发的 RDMA 资源与路由授权，并投影为驱动配置。
   // 输入/输出及副作用：values 为每个 Function 的非拥有 grant；成功更新 grants 和 nodes[i].drv_cfg，不发 MMIO。
-  // 失败/边界：仅外部、未锁定且数量/身份/字段校验全部通过时接受；已有不同授权或 grant 未完整配置均拒绝。
+  // 失败/边界：仅外部、未锁定且数量/身份/字段校验全部通过时接受；SD 不足、跨 Function SD/CEQ/vector/source 冲突或已有不同授权均拒绝。
   function rdma_status rdma_dpu_system::bind_grants(rdma_dpu_grant	values[$]);
     rdma_drv_config	candidate;
     string		why;
     bit		seen_global[int unsigned];
     bit		seen_vf[int unsigned];
+    bit		used_sd[int unsigned];
+    bit		used_ceq[int unsigned];
+    bit		used_vector[int unsigned];
+    bit		used_source[int unsigned];
 
     if (binding_locked || !external_configuration || snapshot == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA grant binding is closed");
@@ -1520,6 +1522,33 @@ package rdma_dpu_adapter_pkg;
           "RDMA grant identity differs from frozen Function");
       seen_global[values[i].global_id] = 1;
       seen_vf[values[i].rdma_vf_id] = 1;
+
+      candidate = rdma_drv_config::type_id::create("grant_capacity_check");
+      candidate.max_qp = values[i].qp_count;
+      candidate.max_cq = values[i].cq_count;
+      candidate.max_mr = values[i].mr_count;
+      candidate.max_pbl = values[i].pbl_count;
+      if (values[i].sd_count < candidate.hmc_sd_count())
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "RDMA grant SD capacity is smaller than HMC layout");
+      for (int unsigned	s = values[i].first_sd; s < values[i].first_sd + values[i].sd_count; s++) begin
+        if (used_sd.exists(s))
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "overlapping RDMA SD grants");
+        used_sd[s] = 1;
+      end
+      for (int unsigned	q = values[i].first_ceqn; q < values[i].first_ceqn + values[i].ceq_count; q++) begin
+        if (used_ceq.exists(q))
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "overlapping RDMA CEQ grants");
+        used_ceq[q] = 1;
+      end
+      if (used_vector.exists(values[i].aeq_msix_idx) || used_source.exists(values[i].source_addr_idx))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "overlapping RDMA AEQ/source grants");
+      used_vector[values[i].aeq_msix_idx] = 1;
+      used_source[values[i].source_addr_idx] = 1;
+      for (int unsigned	v = values[i].ceq_msix_base; v < values[i].ceq_msix_base + values[i].ceq_count; v++) begin
+        if (used_vector.exists(v))
+          return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "overlapping RDMA CEQ MSI-X grants");
+        used_vector[v] = 1;
+      end
     end
     if (grants.size() != 0) begin
       if (grants.size() != values.size())
@@ -1543,6 +1572,7 @@ package rdma_dpu_adapter_pkg;
       candidate.max_qp = values[i].qp_count;
       candidate.max_cq = values[i].cq_count;
       candidate.max_mr = values[i].mr_count;
+      candidate.max_pbl = values[i].pbl_count;
       candidate.max_pd = values[i].pd_count;
       candidate.max_srq = values[i].srq_count;
       candidate.first_qp = values[i].first_qp;
@@ -1553,8 +1583,6 @@ package rdma_dpu_adapter_pkg;
       candidate.ceq_msix_base = values[i].ceq_msix_base;
       candidate.source_addr_valid = values[i].source_addr_valid;
       candidate.source_addr_idx = values[i].source_addr_idx;
-      candidate.sd_iova_valid = values[i].sd_iova_valid;
-      candidate.sd_iova = values[i].sd_iova;
       candidate.route_valid = values[i].route_valid;
       candidate.dst_port = values[i].dst_port;
       candidate.dst_vport_id = values[i].dst_vport_id;

@@ -23,12 +23,13 @@ class rdma_virtio_bind_plugin extends rdma_env_plugin;
     super.new(name);
   endfunction
 
-  // 功能：在基础 rdma_env finalize 前绑定 DPU 快照、资源快照、共享 Host pool 和可选 grant。
-  // 输入/输出及副作用：更新 project_cfg.rdma_cfg.external_system；所有外部对象保持非拥有引用。
+  // 功能：在基础 rdma_env finalize 前绑定 DPU 快照、资源快照、共享 Host pool，并补齐或使用显式 grant。
+  // 输入/输出及副作用：更新 project_cfg.rdma_cfg.external_system/grants；所有外部对象保持非拥有引用，不分配 DMA。
   // 失败/边界：父级不是 dpu_device_env、重复投影、异源快照或 grant 不匹配时 fatal；不执行 probe/初始化。
   virtual function void pre_build(rdma_env env);
     dpu_device_env dpu;
     rdma_status status;
+    string	why;
 
     if (project_cfg == null || env == null || !$cast(dpu, env.get_parent()))
       `uvm_fatal("RDMA_VIRTIO", "RDMA plugin requires a dpu_device_env parent and project_cfg")
@@ -43,11 +44,11 @@ class rdma_virtio_bind_plugin extends rdma_env_plugin;
     status = project_cfg.rdma_cfg.external_system.bind_resources(dpu.get_resource_snapshot());
     if (!status.ok())
       `uvm_fatal("RDMA_VIRTIO", status.convert2string())
-    if (project_cfg.rdma_cfg.grants.size() != 0) begin
-      status = project_cfg.rdma_cfg.external_system.bind_grants(project_cfg.rdma_cfg.grants);
-      if (!status.ok())
-        `uvm_fatal("RDMA_VIRTIO", status.convert2string())
-    end
+    if (!project_cfg.make_rdma_grants(project_cfg.rdma_cfg.external_system, why))
+      `uvm_fatal("RDMA_VIRTIO", why)
+    status = project_cfg.rdma_cfg.external_system.bind_grants(project_cfg.rdma_cfg.grants);
+    if (!status.ok())
+      `uvm_fatal("RDMA_VIRTIO", status.convert2string())
   endfunction
 endclass
 

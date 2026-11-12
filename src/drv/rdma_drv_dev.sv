@@ -27,8 +27,6 @@ class rdma_drv_config extends uvm_object;
   // GRM 路由与中断归属：QP/EQ 创建时原样下发，避免驱动侧重新推导 topology。
   bit source_addr_valid;
   int unsigned source_addr_idx;
-  bit sd_iova_valid;
-  bit [63:0] sd_iova;
   bit route_valid;
   int unsigned dst_port;
   int unsigned dst_vport_id;
@@ -58,8 +56,6 @@ class rdma_drv_config extends uvm_object;
     eq_entries = 256;
     source_addr_valid = 0;
     source_addr_idx = 0;
-    sd_iova_valid = 0;
-    sd_iova = '0;
     route_valid = 0;
     dst_port = 0;
     dst_vport_id = 0;
@@ -68,7 +64,25 @@ class rdma_drv_config extends uvm_object;
     aeq_msix_idx = 0;
     rc_to_urc = 1'b0;
   endfunction
+
+  // 功能：按 hmc_setup 的 QPC/CQC/MRT/PBL 四段布局计算所需 SD 数量。
+  // 输入/输出及副作用：只读 max_qp/max_cq/max_mr/max_pbl，各段向上取整到 2MiB；不分配 DMA 页。
+  // 失败/边界：零容量段贡献零；使用 64 位乘法避免大容量溢出，硬件 SD 上限由 grant 校验。
+  extern function int unsigned hmc_sd_count();
 endclass
+
+// 功能：按 hmc_setup 的 QPC/CQC/MRT/PBL 四段布局计算所需 SD 数量。
+// 输入/输出及副作用：只读 max_qp/max_cq/max_mr/max_pbl，各段向上取整到 2MiB；不分配 DMA 页。
+// 失败/边界：零容量段贡献零；使用 64 位乘法避免大容量溢出，硬件 SD 上限由 grant 校验。
+function int unsigned rdma_drv_config::hmc_sd_count();
+  longint unsigned	sd_bytes;
+
+  sd_bytes = RDMA_HMC_PAGE_BYTES * RDMA_HMC_PD_PER_SD;
+  return (longint'(max_qp) * RDMA_QPC_BYTES + sd_bytes - 1) / sd_bytes +
+         (longint'(max_cq) * RDMA_CQC_BYTES + sd_bytes - 1) / sd_bytes +
+         (longint'(max_mr) * 64 + sd_bytes - 1) / sd_bytes +
+         (longint'(max_pbl) * 8 + sd_bytes - 1) / sd_bytes;
+endfunction
 
 // 一类 HMC 对象（hmc.h xtrdma_hmc_obj_info + sd_rsrc）。
 class rdma_drv_hmc_obj extends uvm_object;
