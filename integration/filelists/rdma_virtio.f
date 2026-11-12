@@ -98,5 +98,6 @@ src/adapters/net_packet/rdma_netpkt_pkg.sv
 src/tb/rdma_env_pkg.sv
 src/adapters/aip/rdma_aip_cfg_pkg.sv
 integration/project/rdma_project_pkg.sv
+integration/project/rdma_aip_pkg.sv
 integration/virtio/rdma_project_env_pkg.sv
 integration/virtio/rdma_virtio_pkg.sv

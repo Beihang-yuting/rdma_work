@@ -20,6 +20,7 @@ package rdma_virtio_pkg;
   import rdma_aip_cfg_pkg::*;
   import rdma_dpu_adapter_pkg::*;
   import rdma_project_pkg::*;
+  import rdma_aip_pkg::*;
   `include "uvm_macros.svh"
 
   `include "rdma_virtio_cfg_seq.sv"

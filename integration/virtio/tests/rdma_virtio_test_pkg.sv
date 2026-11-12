@@ -233,7 +233,8 @@ package rdma_virtio_test_pkg;
         "load/release command registry changed");
       require_true((!project.cfg.rdma_enabled ||
         (!project.rdma.is_ready() && project.rdma.res.funcs.size() == 0)) && prepares == 0 &&
-        !configured && !busy && !init_attempted,
+        !configured && !busy &&
+        !rdma_aip_registry::initialization_started(project.rdma),
         "structure/reload caused initialization, configuration or resources");
     endfunction
 

@@ -6,6 +6,7 @@ package rdma_project_pkg;
   timeunit 1ns;
   timeprecision 1ps;
   import uvm_pkg::*;
+  import aip_core_pkg::*;
   import rdma_types_pkg::*;
   import dpu_resource_pkg::*;
   import dpu_pcie_pkg::*;

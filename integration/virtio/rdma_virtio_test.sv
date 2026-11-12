@@ -1,11 +1,12 @@
-// 目录/层次：integration/virtio；组合项目的 Tcl 命令与 sequence 调度入口。
-// 职责：复用 virtio_work 的 cfg/build/connect 和平台 hook，只在命令层选择 RDMA-only 或 RDMA+VIO sequence。
+// 目录/层次：integration/virtio；组合项目的 Tcl 配置命令与平台 hook 入口。
+// 职责：复用 virtio_work 的 cfg/build/connect 和平台 hook；VIO 由 project_env 绑定，RDMA init/run/stop
+//   由本组合 test 在连接完成后交给 rdma_aip_pkg 注册，本文件保留平台 prepare、dut_config 与统一 load_params。
 // 依赖：project_base_test、project_env、rdma_project_pkg、rdma_virtio_cfg_seq；平台实现三个既有 hook。
 // 所有权/生命周期：test 借用 project_env 及其子组件；sequence 由命令临时拥有，env 不启动任何运行期 sequence。
 typedef class rdma_virtio_test;
 
-// 父类 load_params 不是 virtual，因此用 AIP 公开 unregister API 接管同名入口；其余命令均由本类显式注册。
-// 命令只解析参数、准备平台和启动 sequence，不把配置/初始化/流量实现塞回 project_env。
+// 父类 load_params 不是 virtual，因此用 AIP 公开 unregister API 接管同名入口；RDMA 业务命令不在本类重复注册。
+// 本类命令只解析参数、准备平台和启动配置 sequence，不把 RDMA 初始化/流量实现塞回 test。
 class rdma_virtio_command extends aip_cmd_user_task;
   rdma_virtio_test owner_test;
 
@@ -35,7 +36,6 @@ virtual class rdma_virtio_test extends project_base_test;
   bit commands_registered;
   bit busy;
   bit configured;
-  bit init_attempted;
 
   // 功能：构造可由真实平台继承的 Tcl 驱动 test 外壳。
   // 输入/输出及副作用：name/parent 透传；运行期状态从空闲、未配置、未初始化开始。
@@ -58,11 +58,11 @@ virtual class rdma_virtio_test extends project_base_test;
   endfunction
 
   // 功能：检查是否仍处于可以启动 dut_config 的空闲窗口。
-  // 输入/输出及副作用：只读 busy/init_attempted 和各 Host VIO setup，why 返回首个拒绝原因。
+  // 输入/输出及副作用：只读 busy、RDMA AIP 初始化状态和各 Host VIO setup，why 返回首个拒绝原因。
   // 失败/边界：已有配置 sequence、RDMA 初始化尝试或活动 VIO ring 时拒绝，不自动释放或重置。
   function bit can_configure(output string why);
     why = "dut_config requires an idle pre-initialization project";
-    if (busy || init_attempted)
+    if (busy || rdma_aip_registry::initialization_started(project.rdma))
       return 0;
     foreach (project.vio_envs[h]) begin
       if (project.vio_envs[h].get_external_setup() != null) begin
@@ -98,13 +98,15 @@ virtual class rdma_virtio_test extends project_base_test;
     return map.resolve_name("h0.pf0.bar0", target, why) && map.get_sequencer(target, rc, why);
   endfunction
 
-  // 功能：在全部连接完成后登记 VIO 业务并替换原 load_params 命令，增加 RDMA 三个 Tcl 入口。
-  // 输入/输出及副作用：命令对象常驻本 test；VIO 既有命令、唯一 loader 和取消 registry 保持 AIP 原契约。
-  // 失败/边界：原 loader 缺失、命令重名或重复 EOE 立即 fatal，不注册第二个参数加载范围。
+  // 功能：在全部连接完成后登记 VIO/RDMA package 命令，并替换原 load_params 命令。
+  // 输入/输出及副作用：VIO 绑定由 project_env 复用 virtio_work 入口；RDMA 由本 test 把已连接 env
+  //   交给 rdma_aip_pkg；本 test 另外注册 dut_config 和统一 loader，保留 AIP 唯一参数加载入口。
+  // 失败/边界：原 loader 缺失、RDMA env 为空、命令重名或重复 EOE 立即 fatal，不注册第二个加载范围。
   virtual function void end_of_elaboration_phase(uvm_phase phase);
     project_env_pkg::__aip_cmd_load_params inherited_loader;
     rdma_virtio_command command;
-    string names[$] = '{"dut_config", "rdma_init", "rdma_run"};
+    string why;
+    string names[$] = '{"dut_config"};
 
     super.end_of_elaboration_phase(phase);
     if (commands_registered || !$cast(inherited_loader, aip_cmd::get_handle("load_params")))
@@ -114,6 +116,9 @@ virtual class rdma_virtio_test extends project_base_test;
         `uvm_fatal("RDMA_VIRTIO_TEST", {"project command already exists: ", names[i]})
 
     project.register_aip_commands();
+    if (cfg.rdma_enabled &&
+        !rdma_aip_registry::bind_and_register(project.rdma, why))
+      `uvm_fatal("RDMA_AIP", why)
     aip_cmd::unregister("load_params");
     names.push_back("load_params");
     foreach (names[i])
@@ -147,25 +152,17 @@ task rdma_virtio_command::cmd_exec();
   end_macro_result_scope(owns_scope);
 endtask
 
-// 功能：解析命令参数并启动对应 sequence；RDMA-only 配置使用 rdma_project_cfg_seq，混合场景使用 rdma_virtio_cfg_seq。
-// 输入/输出及副作用：可能调用平台 prepare、发送配置事务、probe driver 或创建业务资源；结果写回 ok/why。
-// 失败/边界：命令不自动串联缺失步骤；初始化失败锁定当前 epoch，流量失败不回滚已建 QP/CQ/MR。
+// 功能：准备平台并启动配置或参数重载 sequence；RDMA init/run/stop 由 rdma_aip_pkg 独立处理。
+// 输入/输出及副作用：可能调用平台 prepare、发送 DPU/VIO/RDMA 表事务；结果写回 ok/why。
+// 失败/边界：命令不自动串联缺失步骤；配置失败不标记 RDMA 可初始化，参数重载失败保持原配置。
 task rdma_virtio_command::execute(output bit ok, output string why);
   uvm_sequencer #(pcie_tl_tlp) rc;
-  string group_arg;
-  string first_arg;
-  string second_arg;
-  string qps_arg;
-  longint unsigned first;
-  longint unsigned second;
-  longint unsigned qps;
-  longint unsigned group_index;
 
   ok = 0;
   why = "project unavailable or busy";
   if (owner_test == null || owner_test.project == null || owner_test.busy)
     return;
-  if (cmd_name != "rdma_run" && args_in != "") begin
+  if (cmd_name != "dut_config" && args_in != "") begin
     why = {cmd_name, " takes no arguments"};
     return;
   end
@@ -173,8 +170,10 @@ task rdma_virtio_command::execute(output bit ok, output string why);
   case (cmd_name)
     "load_params": begin
       owner_test.project.load_params(ok, why);
-      if (ok)
+      if (ok) begin
         owner_test.configured = 0;
+        void'(rdma_aip_registry::mark_configured(owner_test.project.rdma, 0));
+      end
     end
     "dut_config": begin
       dpu_cfg_seq config_seq;
@@ -185,6 +184,7 @@ task rdma_virtio_command::execute(output bit ok, output string why);
         return;
       owner_test.busy = 1;
       owner_test.configured = 0;
+      void'(rdma_aip_registry::mark_configured(owner_test.project.rdma, 0));
       owner_test.prepare_platform();
       if (owner_test.cfg.rdma_enabled) begin
         if (owner_test.has_vio_functions()) begin
@@ -210,72 +210,13 @@ task rdma_virtio_command::execute(output bit ok, output string why);
       config_seq.start(rc);
       aip_cmd_seq_registry::unregister("dut_config");
       owner_test.configured = config_seq.success;
+      void'(rdma_aip_registry::mark_configured(owner_test.project.rdma, config_seq.success));
       ok = config_seq.success;
       why = config_seq.error_msg;
       owner_test.busy = 0;
     end
-    "rdma_init": begin
-      rdma_init_seq init_seq;
-
-      if (!owner_test.cfg.rdma_enabled || owner_test.project.rdma == null ||
-          !owner_test.configured || owner_test.init_attempted) begin
-        why = "rdma_init requires successful dut_config and no previous initialization attempt";
-        return;
-      end
-      owner_test.busy = 1;
-      owner_test.init_attempted = 1;
-      init_seq = rdma_init_seq::type_id::create("rdma_init");
-      init_seq.env = owner_test.project.rdma;
-      aip_cmd_seq_registry::register("rdma_init", init_seq);
-      init_seq.start(null);
-      aip_cmd_seq_registry::unregister("rdma_init");
-      ok = init_seq.success;
-      why = init_seq.error_msg;
-      owner_test.busy = 0;
-    end
-    "rdma_run": begin
-      rdma_run_seq run_seq;
-
-      group_arg = aip_cmd::get_arg(args_in, "group");
-      first_arg = aip_cmd::get_arg(args_in, "f0");
-      second_arg = aip_cmd::get_arg(args_in, "f1");
-      qps_arg = aip_cmd::get_arg(args_in, "qps");
-      if (group_arg != "") begin
-        group_index = aip_cmd::parse_int64_arg(group_arg, '1);
-        if (first_arg != "" || second_arg != "" || qps_arg != "" ||
-            group_index >= owner_test.cfg.rdma_cfg.flow_groups.size()) begin
-          why = "group must name an existing RDMA flow group without f0/f1/qps";
-          return;
-        end
-        first = owner_test.cfg.rdma_cfg.flow_groups[group_index].f0_global_id;
-        second = owner_test.cfg.rdma_cfg.flow_groups[group_index].f1_global_id;
-        qps = owner_test.cfg.rdma_cfg.flow_groups[group_index].qp_count;
-      end else begin
-        first = aip_cmd::parse_int64_arg(first_arg, '1);
-        second = aip_cmd::parse_int64_arg(second_arg, '1);
-        qps = qps_arg == "" ? 1 : aip_cmd::parse_int64_arg(qps_arg, '1);
-      end
-      if (!owner_test.cfg.rdma_enabled || owner_test.project.rdma == null ||
-          !owner_test.init_attempted || first >= 256 || second >= 256 || qps == 0 ||
-          qps > 32'hffff_ffff) begin
-        why = "rdma_run requires rdma_init and valid global IDs in [0:255] with positive qps";
-        return;
-      end
-      owner_test.busy = 1;
-      run_seq = rdma_run_seq::type_id::create("rdma_run");
-      run_seq.env = owner_test.project.rdma;
-      run_seq.f0 = int'(first);
-      run_seq.f1 = int'(second);
-      run_seq.qp_count = int'(qps);
-      aip_cmd_seq_registry::register("rdma_run", run_seq);
-      run_seq.start(null);
-      aip_cmd_seq_registry::unregister("rdma_run");
-      ok = run_seq.success;
-      why = run_seq.error_msg;
-      owner_test.busy = 0;
-    end
     default: begin
-      why = "unknown project command";
+      why = {"unknown project command: ", cmd_name};
     end
   endcase
 endtask

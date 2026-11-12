@@ -55,4 +55,5 @@ src/adapters/aip/rdma_aip_cfg_pkg.sv
 @DPU_COMMON_ROOT@/integration/pcie/dpu_pcie_pkg.sv
 +incdir+integration/project
 integration/project/rdma_project_pkg.sv
+integration/project/rdma_aip_pkg.sv
 integration/project/rdma_project_runtime_pkg.sv

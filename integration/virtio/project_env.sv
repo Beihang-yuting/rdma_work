@@ -6,7 +6,7 @@
 //   配置和业务启动由 sequence/Tcl 负责，外部 virtio_work checkout 不被修改。
 typedef class project_env;
 
-// 运行期命令共用项目 env；由 AIP 宏生成适配，无独立命令类。
+// 运行期参数命令共用项目 env；VIO 业务由 virtio_aip_pkg 管理，RDMA 业务由 rdma_aip_pkg 管理。
 project_env	project_runtime_env;
 
 // RDMA env 的 pre_build 绑定必须发生在 dpu_device_env 子树开始 build 前；插件只保存 project_cfg
@@ -787,11 +787,11 @@ function void project_env::bind_rdma_catalog();
 		`uvm_fatal("RDMA_VIRTIO", why)
 endfunction
 
-// 每个仿真调用一次：按完整 service 身份登记各 Host，再注册已有 Tcl 命令。
-// 空 Host 可跳过；全局未启用 VIO 时不注册业务命令，重复注册仍报接入错误。
-// 功能：把各 Host 的 VIO env 绑定到 virtio AIP registry 并注册既有业务命令。
-// 输入/输出及副作用：无显式输出；只写 AIP registry，RDMA 命令由 rdma_virtio_test 单独注册。
-// 失败/边界：空 VIO 服务时保持空操作；重复绑定或命令冲突由 registry 返回失败并 fatal。
+// 每个仿真调用一次：按完整 service 身份登记各 Host 的 VIO env；RDMA 注册由 test 在 env 完成连接后执行。
+// 空 Host 可跳过；VIO 关闭时不注册 VIO 业务命令，重复注册仍报接入错误。
+// 功能：把各 Host 的 VIO env 绑定到 virtio AIP registry，并注册既有 VIO 业务命令。
+// 输入/输出及副作用：无显式输出；VIO 命令对象和状态由 virtio AIP package 持有，project_env 不实现命令。
+// 失败/边界：空 VIO 服务保持空操作；重复绑定、异源环境或命令冲突由 registry 返回失败并 fatal。
 function void project_env::register_aip_commands();
 	int unsigned	active_hosts;
 	string			why;
@@ -810,13 +810,10 @@ function void project_env::register_aip_commands();
 		active_hosts++;
 	end
 
-	if (active_hosts == 0) begin
-		return;
-	end
-
-	if (!virtio_aip_registry::register_business_commands(why)) begin
+	if (active_hosts != 0 && !virtio_aip_registry::register_business_commands(why)) begin
 		`uvm_fatal("PROJECT_ENV", why)
 	end
+
 endfunction
 
 // 建立一份 PCIe BAR 扩展并交给公共 cfg；driver 与配置 seq 复用同一个对象。

@@ -1,7 +1,9 @@
 // 目录/层次：integration/project；RDMA 运行期 sequence 入口。
 // 职责：把基础 rdma_env 的初始化和业务流量封装成可由任意项目 Tcl 命令启动的 sequence；不创建 env、
-//   不解析 dpu_common 身份，也不拥有 snapshot、Host memory 或 driver 资源。
-// 依赖：rdma_env_pkg 提供 rdma_env/rdma_vsequencer，rdma_traffic_vseq 提供业务资源和报文流程。
+//   不解析 dpu_common 身份，也不拥有 snapshot、Host memory 或 driver 资源；stop sequence 只取消
+//   AIP 登记的业务 sequence，不假设已经发出的 PCIe/DMA 事务可以回滚。
+// 依赖：rdma_env_pkg 提供 rdma_env/rdma_vsequencer，rdma_traffic_vseq 提供业务资源和报文流程，
+//   aip_core_pkg 提供 sequence 取消登记。
 // 所有权/生命周期：sequence 只借用 env；调用方拥有 sequence 句柄并在同一 reset epoch 内启动一次。
 
 // 功能：显式执行 RDMA 环境的 probe、资源登记和 ready 发布。
@@ -90,5 +92,44 @@ class rdma_run_seq extends uvm_sequence;
     traffic.start(env.vseqr);
     success = env.sb.errors == 0 && env.sb.idle();
     error_msg = success ? "traffic completed" : "RDMA scoreboard did not drain cleanly";
+  endtask
+endclass
+
+// 功能：停止当前 AIP 登记的 RDMA 流量 sequence，并返回取消结果。
+// 输入/输出及副作用：target_cmd 指向 rdma_run 的 sequence 登记名；body 只取消尚未结束的业务 sequence，
+//   不销毁已创建的 PD/CQ/QP/MR，也不重置 driver 或复位 DUT。
+// 失败/边界：没有活动 rdma_run 时幂等成功；AIP registry 不可用或取消数异常时返回失败，已提交到
+//   driver 的事务仍由平台 quiesce/reset 流程负责收尾。
+class rdma_stop_seq extends uvm_sequence;
+  `uvm_object_utils(rdma_stop_seq)
+
+  string target_cmd;
+  int killed;
+  bit success;
+  string error_msg;
+
+  // 功能：构造默认停止 rdma_run 的 sequence。
+  // 输入/输出及副作用：name 传给 UVM；target_cmd 固定为 AIP 业务登记名，不访问环境资源。
+  // 失败/边界：构造阶段不取消任何 sequence；调用方必须在 AIP 命令 worker 中启动。
+  function new(string name = "rdma_stop_seq");
+    super.new(name);
+    target_cmd = "rdma_run";
+    killed = 0;
+    success = 0;
+    error_msg = "RDMA stop sequence has not run";
+  endfunction
+
+  // 功能：通过 AIP sequence registry 取消当前 rdma_run，并报告是否存在待停止业务。
+  // 输入/输出及副作用：更新 killed/success/error_msg；不会改写 RDMA env 的 ready 或资源库状态。
+  // 失败/边界：kill_one 返回零表示已空闲，按幂等停止成功；非默认 target_cmd 或 registry 异常拒绝。
+  virtual task body();
+    if (target_cmd != "rdma_run") begin
+      error_msg = "rdma_stop_seq only accepts the rdma_run registry name";
+      return;
+    end
+    killed = aip_cmd_seq_registry::kill_one(target_cmd);
+    success = 1'b1;
+    error_msg = killed == 0 ? "RDMA traffic was already idle" :
+      $sformatf("RDMA traffic stop requested; cancelled=%0d", killed);
   endtask
 endclass
