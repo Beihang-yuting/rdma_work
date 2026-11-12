@@ -76,7 +76,7 @@ package rdma_project_command_test_pkg;
     handle = aip_cmd::get_handle("project_inject");
     handle.status = 1;
     handle.result_out = "invalid model injection lifecycle or mode";
-    if (!$cast(model, project_context) || model.project.busy || model.project.init_attempted)
+    if (!$cast(model, project_context) || model.busy || model.init_attempted)
       return;
     mode = aip_cmd::get_arg(handle.args_in, "mode");
     case (mode)

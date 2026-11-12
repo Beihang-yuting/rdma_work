@@ -97,7 +97,7 @@ package rdma_virtio_test_pkg;
       saved_device = project.dpu_env.get_snapshot();
       saved_resources = project.dpu_env.get_resource_snapshot();
       saved_pool = project.shared_pool;
-      saved_rdma_cfg = project.project_cfg.rdma_cfg;
+      saved_rdma_cfg = project.cfg.rdma_cfg;
       saved_scenario = saved_rdma_cfg.scenario;
       saved_loader = aip_cmd::get_handle("load_params");
       verify_structure();
@@ -126,11 +126,11 @@ package rdma_virtio_test_pkg;
         "configuration publication replaced authoritative snapshots");
       require_true(cfg.dpu_cfg.host_mem_pool_ref == saved_pool,
         "RDMA/DPU have distinct Host pools");
-      require_true((!project.project_cfg.rdma_enabled && project.rdma == null) ||
+      require_true((!project.cfg.rdma_enabled && project.rdma == null) ||
         (project.rdma != null && project.rdma.cfg == saved_rdma_cfg &&
          saved_rdma_cfg.scenario == saved_scenario),
         "reload replaced RDMA config/scenario");
-      if (project.project_cfg.rdma_enabled) begin
+      if (project.cfg.rdma_enabled) begin
         require_true(project.rdma != null && project.rdma.get_parent() == project.dpu_env,
           "RDMA outside DPU publication subtree");
         require_true(project.rdma.sys.snapshot == saved_device &&
@@ -152,8 +152,8 @@ package rdma_virtio_test_pkg;
           foreach (cfg.dpu_cfg.device_cfg.functions[i].services[j])
             if (cfg.dpu_cfg.device_cfg.functions[i].services[j].service_kind == DPU_SERVICE_RDMA)
               rdma_services++;
-        require_true(project.rdma == null && project.project_cfg.rdma_functions.size() == 0 &&
-          project.project_cfg.rdma_cfg.funcs.size() == 0 && rdma_services == 0,
+        require_true(project.rdma == null && project.cfg.rdma_functions.size() == 0 &&
+          project.cfg.rdma_cfg.funcs.size() == 0 && rdma_services == 0,
           "disabled RDMA still created a child, service or Function configuration");
         foreach (cfg.dpu_cfg.platform_controls[i])
           require_true(!(cfg.dpu_cfg.platform_controls[i].ctx.kind inside {
@@ -178,9 +178,9 @@ package rdma_virtio_test_pkg;
       require_true(aip_cmd::get_handle("load_params") == saved_loader &&
         aip_cmd::get_handle("vio_release") == saved_release,
         "load/release command registry changed");
-      require_true((!project.project_cfg.rdma_enabled ||
+      require_true((!project.cfg.rdma_enabled ||
         (!project.rdma.is_ready() && project.rdma.res.funcs.size() == 0)) && prepares == 0 &&
-        !project.configured && !project.busy && !project.init_attempted,
+        !configured && !busy && !init_attempted,
         "structure/reload caused initialization, configuration or resources");
     endfunction
 
@@ -206,8 +206,8 @@ package rdma_virtio_test_pkg;
     test.verify_structure();
     handle.status = 0;
     handle.result_out = $sformatf("count %0d print %0d poll %0d hosts %0d functions %0d",
-      test.project.project_cfg.rdma_enabled ?
-        test.project.project_cfg.rdma_cfg.scenario.traffic.count : 0,
+      test.project.cfg.rdma_enabled ?
+        test.project.cfg.rdma_cfg.scenario.traffic.count : 0,
       test.cfg.dpu_cfg.print_bar_map,
       test.cfg.vio_cfg.wait_policy_cfg.default_poll_interval_ns,
       test.project.vio_envs.num(),

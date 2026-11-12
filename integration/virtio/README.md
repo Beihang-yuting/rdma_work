@@ -1,13 +1,13 @@
 # 在 virtio project_env 上加入 RDMA
 
-本目录用本仓库的 `project_env_cfg` overlay 组成 `project_env_pkg`，再包含 `virtio_work` 原有的 `project_env`、配置 sequence 和 `project_base_test`。外部 checkout 不改动，原 VirtIO filelist 也不受影响；独立 RDMA 示例仍在 [../project](../project/README.md)。
+本目录用本仓库的 `project_env_cfg` 和 `project_env` 组成 `project_env_pkg`，复用 `virtio_work` 的配置 sequence、`project_base_test` 和连接契约。外部 checkout 不改动，原 VirtIO filelist 也不受影响；独立 RDMA 示例仍在 [../project](../project/README.md)。
 
 ```text
 project_env_cfg                         ← integration overlay，直接持有全部配置
   dpu_cfg / pcie_cfg / vio_cfg / VIF / pool
   rdma_cfg / rdma_enabled / rdma_functions
 
-rdma_virtio_env extends project_env       ← 只接入组合生命周期
+project_env                               ← 本地直接组合环境，不再派生 rdma_virtio_env
   pcie_env                                 ← 原 virtio，每 Host 一个 Intel RC
   shared_pool                              ← 全项目唯一 host_mem_pool
   dpu_env                                  ← 原 dpu_device_env，只解析一次身份/资源
@@ -20,8 +20,8 @@ rdma_virtio_env extends project_env       ← 只接入组合生命周期
 | 文件 | 复用关系与职责 |
 | --- | --- |
 | [project_env_cfg.sv](project_env_cfg.sv) | integration-only `project_env_cfg` overlay；直接创建 `rdma_cfg` 并门控 RDMA 参数 |
-| [rdma_project_env_pkg.sv](rdma_project_env_pkg.sv) | 使用 overlay，继续包含外部 `project_env`/`project_base_test`，不修改 virtio_work |
-| [rdma_virtio_env.sv](rdma_virtio_env.sv) | 继承 `project_env`；追加一个 RDMA 子环境及显式生命周期 |
+| [rdma_project_env_pkg.sv](rdma_project_env_pkg.sv) | 使用本地 overlay，包含本地 `project_env` 和外部 `project_base_test`，不修改 virtio_work |
+| [project_env.sv](project_env.sv) | 直接创建 DPU、PCIe、VIO、共享 pool 和可选 RDMA 子环境；只负责 build/connect/load_params |
 | [rdma_virtio_cfg_seq.sv](rdma_virtio_cfg_seq.sv) | 继承 `vio_dpu_cfg_seq`；复用 RDMA 预检和 Notify/RNET 写表 |
 | [rdma_virtio_test.sv](rdma_virtio_test.sv) | 继承 `project_base_test` 的三个平台钩子；run 阶段只运行 AIP bridge |
 | [../filelists/rdma_virtio.f](../filelists/rdma_virtio.f) | 独立组合 filelist，不加入旧 `sim/filelists` |
@@ -61,7 +61,9 @@ rdma_run f0=0 f1=1 qps=2
 
 可直接使用 [rdma_start.tcl](rdma_start.tcl)：先设置 `::rdma_f0/::rdma_f1`，再 source。该脚本逐项检查 AIP 返回状态，不会在配置或初始化失败后继续发包。
 
-`dut_config` 在 RDMA 开启时运行一条 `rdma_virtio_cfg_seq`：先 RDMA 完整目录预检，随后由原 virtio 父序列执行 AF/BDF/MSI-X 等公共表；在准备 VIO ring 前加入 RDMA Notify/RNET，然后继续原 VIO Notify/QSCH/队列配置与确认。RDMA 关闭时直接运行原 `vio_dpu_cfg_seq`，因此不会生成 RDMA catalog、hardware plan、Notify/RNET 或 RDMA 写表。公共表只配置一次。配置成功不表示 RDMA driver 已初始化。
+`dut_config` 在 RDMA 开启且存在 VIO Function 时运行一条 `rdma_virtio_cfg_seq`：先 RDMA 完整目录预检，随后由原 virtio 父序列执行 AF/BDF/MSI-X 等公共表；在准备 VIO ring 前加入 RDMA Notify/RNET，然后继续原 VIO Notify/QSCH/队列配置与确认。RDMA 开启但没有 VIO Function 时，命令直接运行独立的 `rdma_project_cfg_seq`；RDMA 关闭时直接运行原 `vio_dpu_cfg_seq`，因此不会生成 RDMA catalog、hardware plan、Notify/RNET 或 RDMA 写表。公共表只配置一次。配置成功不表示 RDMA driver 已初始化。
+
+组合命令仍只由 Tcl 显式启动：`rdma_init` 创建 `rdma_init_seq`，`rdma_run` 创建 `rdma_run_seq`；`project_env` 不保存启动状态，也不在 phase 中自动创建或启动业务 sequence。独立 RDMA-only 案例使用相同的三个 sequence，见 [../project/tests/run_commands.sh](../project/tests/run_commands.sh)。
 
 `load_params` 只有一个有效注册对象。当前 virtio 的环境重载 task 不是 virtual，因此 test 在 EOE 核对原 loader 身份后，通过 AIP 的公开 `unregister` 接口替换这一个入口；`vio_release` 和 VIO 业务命令保持原对象/实现。没有改写 AIP 宏，也不注册第二个加载范围。
 

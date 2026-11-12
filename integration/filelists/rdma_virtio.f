@@ -101,7 +101,7 @@ src/adapters/net_packet/rdma_netpkt_pkg.sv
 src/tb/rdma_env_pkg.sv
 src/adapters/aip/rdma_aip_cfg_pkg.sv
 src/adapters/pcie_work/rdma_pcie_work_pkg.sv
+integration/project/rdma_project_pkg.sv
 integration/virtio/rdma_project_env_pkg.sv
 integration/project/rdma_project_transport_pkg.sv
-integration/project/rdma_project_pkg.sv
 integration/virtio/rdma_virtio_pkg.sv

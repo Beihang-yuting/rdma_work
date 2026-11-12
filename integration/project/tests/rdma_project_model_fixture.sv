@@ -1,7 +1,7 @@
 // 目录/层次：integration/project/tests；命令/恢复专用模型夹具。
 // 职责：从唯一正常解析快照装配模型节点，验证真实命令桥而不声称DUT/grant有效。
 // 依赖：现有模型API及配置寄存器fixture；无VIO package，无外部模式翻转。
-// 所有权/生命周期：test拥有DPU配置、公共pool、模型系统和RC，子env只借用；模型从构造即显式启动。
+// 所有权/生命周期：test拥有DPU配置、公共pool、模型系统和RC，子env只借用；模型由 Tcl 命令显式启动。
 `uvm_analysis_imp_decl(_project_posted)
 `uvm_analysis_imp_decl(_project_cqe)
 
@@ -145,7 +145,7 @@ function void rdma_project_model_env::build_system();
 endfunction
 
 // 功能：保持模型夹具的显式命令生命周期，避免基础 rdma_env 自动调用 initialize。
-// 输入/输出及副作用：phase 不推进状态；Tcl 命令仍通过 project_env 显式驱动初始化。
+// 输入/输出及副作用：phase 不推进状态；Tcl 命令通过独立 runtime sequence 显式驱动初始化。
 // 失败/边界：仅该 fixture 禁止自动启动，基础 RDMA env 和外部平台契约不受影响。
 task rdma_project_model_env::run_phase(uvm_phase phase);
 endtask
@@ -441,9 +441,9 @@ function string rdma_project_model_test::observation();
     "write_posts %0d write_completions %0d pending_writes %0d sb_errors %0d sb_idle %0d ",
     "loads %0d dpu_reads %0d rdma_reads %0d registry_stable %0d preparing %0d busy %0d prints %0d"},
     original_scenario.traffic.count, project_cfg.dpu.print_bar_map, project_cfg.dpu.verify_readback,
-    project.configured, project.rdma.is_ready(), probes, model_system.router.routed,
+    configured, project.rdma.is_ready(), probes, model_system.router.routed,
     rdma_config_reg_fixture::accesses.size(), project.rdma.sb.checked, project.rdma.res.funcs.size(),
     rdma_project_draw_spy::draws, identity, write_posts, write_completions, pending_writes.num(),
     project.rdma.sb.errors, project.rdma.sb.idle(), project.loads, project.dpu_candidates, project.rdma_candidates,
-    aip_cmd::get_all_cmd_names() == original_commands, preparing, project.busy, project.prints);
+    aip_cmd::get_all_cmd_names() == original_commands, preparing, busy, prints);
 endfunction

@@ -7,7 +7,12 @@ class rdma_project_test extends uvm_test;
   rdma_project_env	project;
   rdma_project_env_cfg	project_cfg;
   uvm_sequencer #(pcie_tl_tlp)	project_rc;
+  // 命令生命周期由 test 持有，避免环境在 build/connect 之外承担 sequence 调度状态。
   bit	preparing;
+  bit	busy;
+  bit	configured;
+  bit	init_attempted;
+  int unsigned	prints;
 
   // 功能：构造尚未组装的平台测试入口。
   // 输入/输出及副作用：name/parent交给UVM，平台引用为空。

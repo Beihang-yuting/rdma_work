@@ -1,6 +1,6 @@
 # 组合环境验证记录
 
-验证日期：2026-11-11。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 在本地直接包含 RDMA 配置，`project_env`/`project_base_test` 仍来自外部且未修改。
+验证日期：2026-11-12。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 在本地直接组合 RDMA，`project_base_test` 与配置 sequence 继续来自 virtio_work 且外部 checkout 未修改。
 
 ## 输入与产物
 

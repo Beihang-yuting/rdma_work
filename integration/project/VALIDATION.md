@@ -1,6 +1,6 @@
 # 集成验证与依赖记录
 
-日期：2026-11-09；本记录区分历史已通过结果、当前发布门禁和外部能力缺口。所有 VCS 编译/运行由指定验证者在 `ubuntu@10.11.10.53` 登录 bash 环境执行；源码实现者没有在本机运行仿真。
+日期：2026-11-12；本记录区分历史已通过结果、当前发布门禁和外部能力缺口。所有 VCS 编译/运行均在 `ubuntu@10.11.10.53` 的登录 bash 环境执行。
 
 ## 可复现的依赖状态
 
@@ -84,6 +84,10 @@ Task7范围独立复审为SPEC PASS / QUALITY Approved，执行门禁已通过�
 任务静态检查 `--base f3544de` 返回0、17条软行宽提示；全分支 `--base 08d2f71` 返回0、220条软提示、0硬错误；whitespace通过。旧 `sim/filelists`、集成清单/runner及参数候选策略文件保持不变；4份接口文档的围栏和33个活动相对链接通过。本轮不重跑无关参数/namespace/负例矩阵，不扩大真实 DUT 或 RDMA grant 的结论。
 
 原始证据为 `output/validation/mem_pool_20261110/final_report.md`、`evidence_final.sha256` 及各门禁子目录；AIP restore 日志 SHA-256 为 `2d7d13f9080e4231be17f57cc024649301eb557d7f9c0696339f4fd525d3f85c`。本轮单独归档至 `output/rdma-host-mem-pool-2026-11-10/`，不覆盖上述11月9日交付证据；实际转交以新归档中的 `INDEX.md` 为准。
+
+## 2026-11-12：RDMA-only sequence 验证
+
+本轮把独立环境的配置、初始化和流量启动从 `rdma_project_env` 移到 Tcl 命令创建的 `rdma_project_cfg_seq`、`rdma_init_seq` 和 `rdma_run_seq`；环境只保留 build/connect/load_params。53 上使用 `/tmp/rdma-codex-standalone-seq` 重新编译 commands/namespace 两个 top，完整 `run_commands.sh` 返回 `PROJECT_TASK6_PASS`，包含命令矩阵、prepare/probe 故障、save/restore 和 namespace 检查，正常场景 UVM W/E/F 为 `0/0/0`。组合路径随后在 `/tmp/rdma-codex-virtio-seq` 编译并通过 `two_pf`、`multi_host_pf_vf`、`save`、`restore` 和 `vio_only` 五个场景。
 
 ## 明确未验收的能力
 

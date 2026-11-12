@@ -1,8 +1,8 @@
 # RDMA 独立集成入口
 
 需要在 **virtio_work 的 project_env/project_env_cfg 上加入 RDMA** 时，使用
-[组合环境示例 ../virtio](../virtio/README.md)；它直接继承原 virtio 类型并保留两类业务。
-本目录继续提供独立 RDMA 入口、公共配置 sequence 和已有回归 fixture。
+[组合环境示例 ../virtio](../virtio/README.md)；本仓库直接提供同名 `project_env/project_env_cfg`，保留两类业务。
+本目录继续提供独立 RDMA 环境、公共配置/runtime sequence 和已有回归 fixture。
 
 本目录提供冻结快照接入、Intel BAR/DMA 传输、单 bank 配置 sequence 和显式 Tcl 生命周期。软件/模型与 Intel wire fixture 的验证范围见 [验证记录](VALIDATION.md)，平台实际接线见 [接入参考](../../docs/rdma-intel-integration-reference.md)。平台需要为每个 RDMA Function 显式发布 QP/SD/CEQ/AEQ 与路由 grant；当前真实 DUT 接线和流量验收仍由用户完成。
 
@@ -49,8 +49,8 @@ Intel RC 与 BAR 共用同源 `dpu_pcie_bar_map`，以 ingress Host + Requester 
 ```text
 平台authoring/一次resolve → 冻结device/resource快照 → 发布共享map/host_mem_pool
 build/connect → 唯一注册命令 → run_phase仅运行AIP bridge
-load_params → dut_config(prepare + 公共表/Notify/QSCH/RNET)
-rdma_init → rdma_run f0=<实际global ID> f1=<实际global ID>
+load_params → dut_config(prepare + rdma_project_cfg_seq 公共表/Notify/QSCH/RNET)
+rdma_init → rdma_init_seq → rdma_run → rdma_run_seq f0=<实际global ID> f1=<实际global ID>
 end_test → 平台finish确认静止/撤销/清理
 ```
 
@@ -63,9 +63,9 @@ end_test → 平台finish确认静止/撤销/清理
 | 命令 | 实际职责 |
 | --- | --- |
 | `load_params` | 唯一项目事务：DPU/RDMA 各读一次候选，全部验证后原地提交；不写表、不初始化、不抽 WR |
-| `dut_config` | 调用平台 prepare，再显式运行配置 sequence；不 probe，不分配业务资源 |
-| `rdma_init` | 完整配置成功后首次初始化 driver 与设备级资源；失败尝试也关闭重载窗口 |
-| `rdma_run f0=1 f1=2` | 显式选择两个真实 global ID，运行场景；1/2仅为模型 fixture 的VF ID |
+| `dut_config` | 调用平台 prepare，再显式运行 `rdma_project_cfg_seq`；不 probe，不分配业务资源 |
+| `rdma_init` | 创建并启动 `rdma_init_seq`，完成配置后的 driver probe 与设备级资源登记；失败尝试也关闭重载窗口 |
+| `rdma_run f0=1 f1=2` | 创建并启动 `rdma_run_seq`，显式选择两个真实 global ID 运行场景；1/2仅为模型 fixture 的 VF ID |
 | `reg_acc` | 复用 `dpu_bar_reg_seq` 和当前管理 RC，保持公共 DWORD 契约 |
 
 完整 override > leaf override > 完整 plusarg > leaf plusarg > 默认值。`set_param` 只改 AIP 表；显式 `load_params` 才应用。当前 DPU 可重载范围仅 `print_bar_map`、`verify_readback`；PCIe 和冻结身份保持构建值。RDMA 固定 mode/link/vseq/checker/cov 的缺省沿用已建值，显式改变拒绝；可重载场景/时间字段使用新默认值，不拿 checkpoint 旧 CLI 值当默认。
