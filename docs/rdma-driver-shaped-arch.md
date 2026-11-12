@@ -21,7 +21,7 @@
 | 接口 | 主机侧（驱动模型） | 设备侧（NIC 模型） |
 | --- | --- | --- |
 | CMQ | `rdma_cmq_engine`（已完成）在主机内存环写 SQE、敲 CMQ doorbell、轮询 CQE | 读 CMQ SQE、解码、更新 context 存储、写 CQE |
-| MMIO doorbell | `rdma_pcie_api.mmio_write` | doorbell 解码 → SQ/RQ/SRQ PI、CQ arm、EQ CI |
+| MMIO doorbell | `rdma_drv_bar.write64` | doorbell 解码 → SQ/RQ/SRQ PI、CQ arm、EQ CI |
 | DMA | `rdma_host_mem`（外部 host_mem 的 Function 视图）读写 WQE/CQE/EQE/数据/shadow | 同一 host_mem，按 context 中的地址访问 |
 
 层次（一个模块对应驱动一个源文件）：
@@ -39,7 +39,7 @@ L2 drv          主机侧驱动模型（新）：
 L3 dev          设备侧 NIC 模型（由现 src/tb/rdma_nic_model 演化）：
                   CMQ 消费者 + context 存储（QPC/CQC/MRT/SRFQC/CEQC/AEQC，按 Function 隔离）
                   doorbell 接收；SQ 处理/RX/ACK；按 CQC 写 CQE、按 EQC 写 CEQE/AEQE
-L4 adapters     src/adapters/<组件>：直接使用外部 host_mem、net_packet、dpu_common、pcie_work、rxe
+L4 adapters     src/adapters/<组件>：直接使用外部 host_mem、net_packet、dpu_common、rxe；PCIe TL 只由项目 integration 接入
 L5 tb           verb agent / wire / scoreboard（不变，driver 换成 L2）；多 Function env
 ```
 
@@ -73,5 +73,5 @@ A–D 只新增代码，旧回归保持全绿；E 一次性删除，验收为迁
 
 ## 4. 保留
 
-CMQ 引擎与驱动 golden 门禁、全部 codec 与其 golden/字段门禁、host_mem/net_packet/pcie_work 适配器、
+CMQ 引擎与驱动 golden 门禁、全部 codec 与其 golden/字段门禁、host_mem/net_packet/dpu_common 适配器、
 tb 的 sequence/wire/scoreboard。

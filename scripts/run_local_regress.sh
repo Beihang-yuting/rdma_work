@@ -4,7 +4,7 @@
 #   simv，可带 plusargs 与种子，用 check_uvm_summary.sh 判定，最后打印汇总。适用于本地虚拟机等
 #   已配置好 VCS 与 *_ROOT 环境变量的机器；53 主机仍可使用 run_vcs53.sh。
 # 清单格式（# 起注释）：<suite> <test> [tag ...] [+plusarg ...]
-#   suite 为 core/env/pcie_work；以 + 或 - 开头的字段原样传给 simv，其余字段视为标签忽略，因此
+#   suite 为 core/env；以 + 或 - 开头的字段原样传给 simv，其余字段视为标签忽略，因此
 #   sim/regression.list 也可直接使用。未给 +ntb_random_seed 时使用 RDMA_SEED 或随机种子并打印。
 # 依赖：sim/Makefile 的 build_<suite> 目标、scripts/check_uvm_summary.sh、VCS 与 *_ROOT 环境变量。
 # 所有权：只写 sim/build/<suite>/ 下的编译产物与日志，不改源码。
@@ -30,7 +30,7 @@ build_suite() {
   local log="$SIM_DIR/build/$suite/build.log"
 
   case "$suite" in
-    core|env|pcie_work) ;;
+    core|env) ;;
     *) echo "unsupported suite: $suite" >&2; return 2 ;;
   esac
   mkdir -p "$SIM_DIR/build/$suite"

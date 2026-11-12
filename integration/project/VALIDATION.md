@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | dpu_common | `29c57d02d91ee8ba5f8b2c19007fa801a355d50d` | 15条；当前公共配置/sequence迁移，移除旧plan/executor接口，含package引用的新dpu_names.sv；完整WIP参与staging |
 | host_mem | `bdad0ec66a899e5759cf172117719570a3bc0b30` | clean |
-| pcie_work | `b63ca848d4e6d92b336a35a2e04837130c111a02` | 12条；旧executor移除与package清理；本轮依赖准备未改变RC/scoreboard语义 |
+| pcie_work（仅提供外部 pcie_tl_vip） | `b63ca848d4e6d92b336a35a2e04837130c111a02` | 12条；RDMA 只消费 `pcie_tl_vip` 原生类型，不编译 pcie_work 其他层 |
 | aip_core_set_param_expr | `a0367231fd9568f68547123b7173d49b586b84f6` | clean；使用匹配预建dist loader/.so |
 | net_packet | `b212855eb7bc8b0aba5c06b224757c880c6b28e0` | clean |
 | pcie_intel | `77d2c6aeefff33732cfd6237c9e5f9919088f48d` | clean；完整Intel类型入口依赖 |
@@ -23,11 +23,11 @@ Task6 依赖 staging：`/tmp/rdma-task6-current-deps/deps`。状态清单来源 
 | 范围 | 实际结论 | 原始记录 |
 | --- | --- | --- |
 | Task1/2 Host memory、外部快照 | 共享manager/Function账本、ID255/256、同源拒绝、无隐式MMIO、外部缺grant拒绝与模型显式初始化已验证；外部快照在Task5再次通过 | `.superpowers/sdd/2026-11-09-rdma-intel-project-integration/task-1-report.md`、`task-2-report.md`；`output/validation/task5/external*` |
-| Task3 Intel transport/PCIe回归 | 双Host实际wrapper、literal8字节、DMA/Completion分片/隔离/reset epoch，以及normal/fault PCIe通过；不含真实DUT | `output/validation/task3/final2_transport_{compile,run}.log`、`final2_rdma_env_pcie{,_fault}_test.log` |
+| Task3 Intel transport/PCIe回归（历史） | 旧自建 transport fixture 的双Host MMIO/DMA 与隔离检查；该 fixture 和 RDMA 自有 PCIe suite 已移除，历史日志只作背景证据 | 归档的 `output/validation/task3` 日志，不属于当前入口 |
 | Task4公共表（历史快照） |33-case PROJECT_CONFIG_PASS，W/E/F=0/0/0；完整预检、单bank和写序；仅routing/table readiness | `output/validation/task4` 与 `task-4-report.md` |
 | Task5场景迁移 |13参数行通过；cfg/draw/single/mix/CAS、errors/SRQ/lifecycle/multifunc通过；10负例按预期非零；external snapshot通过、RXE仅编译通过 | `output/validation/task5` 与 `task-5-report.md`；源码manifest SHA-256 `80a1b3ad98f009ca4a467d9132eea193ca5c1fc590dba92ab73fa4fa6d0deb1b` |
 | Task6模型/Tcl（commit3e08149） |完整门禁通过：commands/prepare failure/partial probe failure/save/restore/absent32/namespace及预期duplicate/config-fatal；同binary恢复10→override17→新CLI20并实际20 WRITE posts/completions；fresh basic/external snapshot均0/0/0。首个save超时不计通过，第二次成功save用于restore | `output/validation/task6/evidence_final.sha256` 与 `task-6-report.md` 独立最终验证节；源码manifest SHA-256 `c6341f742da148892dca2652dd97fb21269c852246840db9c877ab857c9f84f2` |
-| Task7完整类型发布 |独立门禁通过：53上完整Intel类型编译/链接及既有双Host wire fixture运行成功，真实PROJECT_TRANSPORT_PASS与PROJECT_INTEL_TYPES_PASS，W/E/F=0/0/0；静态及文档检查通过。不代表真实RDMA DUT业务验收 | `output/validation/task7_intel/evidence.sha256`、`output/validation/task7/evidence_final.sha256` 与 `task-7-report.md` 独立最终验证节 |
+| Task7完整类型发布（历史） | 旧自建 Intel wire fixture 的类型编译/链接结果；fixture 已移除，不代表当前 RDMA DUT 业务验收 | 归档的 `output/validation/task7*` 与 `task-7-report.md` |
 
 Task6最终任务静态退出0，仅32条软行宽；whitespace通过，旧sim/filelists与config.f不变。匹配AIP `.so` SHA-256为 `1eb87d3589b349c3c06efedb45e968d3a7eb3933427e65c3296231cfbbb407a7`；restore日志 SHA-256为 `251f9e6ebfaac833c340e27772bc490840917f4100549a3bd81e02bc04aaa58a`。最终恢复矩阵沿用同一binary执行精确runner-equivalent命令，未替换binary。
 
@@ -37,7 +37,7 @@ Task3历史静态结论已更正：不可变范围 `08d2f71..cbe7c69` 检查退�
 
 ## 发布验证命令
 
-完整Intel入口使用 [run_intel.sh](tests/run_intel.sh)；模型/Tcl使用 [run_commands.sh](tests/run_commands.sh)，设置方法见 [README](README.md)。Intel成功必须同时有实际 `PROJECT_TRANSPORT_PASS` 输出、进程成功与W/E/F=0/0/0，runner最后才打印 `PROJECT_INTEL_TYPES_PASS`。未运行不能以脚本存在判定通过。
+当前仓库只保留模型/Tcl入口 [run_commands.sh](tests/run_commands.sh)，设置方法见 [README](README.md)。真实 Intel/DUT 验证由调用方复用 virtio_work 的 project env、`pcie_tl_vip` RC bridge 和 `dpu_common` BAR map；本目录不再提供自建 transport runner 或 PCIe regression。
 
 验证者在最终工作树运行真实diff范围检查，normal模式包含staged/untracked源文件，不用 `--all` 代替任务门禁：
 
@@ -47,11 +47,11 @@ git diff --check 08d2f71
 git diff origin/feature/rdma-param-v1 -- sim/filelists
 ```
 
-独立验证确认：`git diff --check 08d2f71`、`bash -n integration/project/tests/run_intel.sh` 均返回0；7个变更Markdown的围栏闭合，围栏外41个相对链接全部有效。完整类型26项加fixture4项共30项无重复，类型入口不含wrapper/test/top/注册。相对Task6基线 `3e08149`，旧 `sim/filelists` 及config/runtime/commands/namespace/transport清单字节不变。
+独立验证确认：历史 Task7 的静态结果保留在归档中；当前变更应以 `git diff --check`、filelist 依赖闭包和 `run_commands.sh` 为准。自建 transport 清单、wrapper、test/top 和 runner 已从工作树删除。
 
 本次通过验证的是**状态更新前的20文件快照**，其 `source_final.sha256` 清单SHA-256为 `4aa1da36b7f12108d9e6bfa80c17d9a1e140bd726f766870bc67f4a7e6c5435a`；不是本次验收文字更新后的文档哈希。远端 `/tmp/rdma-task7-final/rdma` 逐项校验通过；冻结七行依赖清单SHA-256为 `1603c54aedd0aecfe9559e7c16c7a707890c9675839685c78d6722c73c667b3e`。
 
-53上 `bash integration/project/tests/run_intel.sh` 返回0，VCS W-2024.09-SP1报告 `All of 34 modules done`，实际双Host Intel MMIO/DMA、literal bytes、隔离和epoch检查通过。`build.log` SHA-256为 `f92b38903124cd3a505d1992aa109ae891cff2903270b3878813e7ef5cd843b1`；`run.log` SHA-256为 `ed93d5a421b760f487db76b12f55cd3b593752af5653c3366b1c808cc5513ded`。
+历史 Task7 曾在 53 上验证双 Host Intel wire fixture；该 fixture 属于已删除的项目自建 transport，不代表当前工作树提供 Intel DUT 验收入口。当前真实接线须由平台项目复用 virtio_work 的实现。
 
 Task7范围独立复审为SPEC PASS / QUALITY Approved，执行门禁已通过。随后全分支最终审查发现唯一I1：非空MSI-X遗漏无效尾项。修复提交 `f3e03b1` 已完成独立验证及专项复审，结论为Approved / I1 ADDRESSED，0新增Critical/Important/Minor；批准范围的实现、验证与最终技术复审门禁已关闭。原始 `final-review.md` 的发现及 `final-rereview.md` 的关闭结论均保留。
 
@@ -75,8 +75,8 @@ Task7范围独立复审为SPEC PASS / QUALITY Approved，执行门禁已通过�
 | --- | --- |
 | 公共 pool 聚焦测试 | 两个 Host 使用相同 GPA，数据和释放互不影响；同 Host 共享 backing，跨 Function 读写/释放拒绝，清理后无泄漏 |
 | 默认模型、外部快照、设备 CMQ | 全部通过；外部 pool 缺失、Host/GPA 错配与重绑定被拒绝，失败不部分发布 |
-| 普通 PCIe | fresh build 与 `rdma_env_pcie_test` 通过，消费同一 pool manager |
-| 完整 Intel 入口 | fresh 编译/链接与双 Host MMIO/DMA fixture 通过，实际 `PROJECT_TRANSPORT_PASS` 和 `PROJECT_INTEL_TYPES_PASS` |
+| 普通 PCIe | RDMA 自建 `rdma_env_pcie_test` 已删除；平台项目负责复用 `pcie_tl_vip` 和公共 Host pool |
+| 完整 Intel 入口 | 当前未在本目录提供；应在 virtio_work 的 project env 中接入真实 wrapper/RC bridge |
 | 实际 AIP save/restore | 新编译的同一 binary 跨进程保存/恢复通过；`identity=1` 覆盖 pool/manager，重载后 count=20、WRITE posts/completions均20、pending=0、scoreboard errors=0、idle=1 |
 
 上述运行全部 W/E/F=0/0/0。首次 env 编排使用了错误的预期输出目录，编译成功但未运行仿真；保留 `env_external/attempt1`，修正路径后的 `attempt2` 通过，源码未改变。

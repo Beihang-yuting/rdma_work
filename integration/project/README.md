@@ -4,16 +4,15 @@
 [组合环境示例 ../virtio](../virtio/README.md)；本仓库直接提供同名 `project_env/project_env_cfg`，保留两类业务。
 本目录继续提供独立 RDMA 环境、公共配置/runtime sequence 和已有回归 fixture。
 
-本目录提供冻结快照接入、Intel BAR/DMA 传输、单 bank 配置 sequence 和显式 Tcl 生命周期。软件/模型与 Intel wire fixture 的验证范围见 [验证记录](VALIDATION.md)，平台实际接线见 [接入参考](../../docs/rdma-intel-integration-reference.md)。平台需要为每个 RDMA Function 显式发布 QP/SD/CEQ/AEQ 与路由 grant；当前真实 DUT 接线和流量验收仍由用户完成。
+本目录提供冻结快照接入、单 bank 配置 sequence 和显式 Tcl 生命周期。软件/模型验证范围见 [验证记录](VALIDATION.md)，平台实际接线见 [接入参考](../../docs/rdma-intel-integration-reference.md)。平台需要为每个 RDMA Function 显式发布 QP/SD/CEQ/AEQ 与路由 grant；Intel BAR/DMA bridge 由调用方的 project env（参考 virtio_work）提供。
 
 ## 编译边界
 
 | 入口 | 内容 | 不包含 |
 | --- | --- | --- |
-| [rdma_project.f](../filelists/rdma_project.f) | AIP、Host memory、DPU、PCIe、Intel、RDMA 核心/适配器、DPU PCIe、transport/config/runtime 类型 | wrapper 实例、test/top、命令注册 |
+| [rdma_project.f](../filelists/rdma_project.f) | AIP、Host memory、DPU、pcie_tl_vip、Intel、RDMA 核心/适配器、DPU PCIe、config/runtime 类型 | wrapper 实例、Intel bridge、test/top、命令注册 |
 | [rdma_project_runtime.f](../filelists/rdma_project_runtime.f) | 模型/Tcl 所需核心和 config/runtime 类型 | Intel、test/top、命令注册 |
 | [tests/config.f](tests/config.f) | 独立公共表 sequence fixture | RDMA model/driver、AIP、Intel、VIO |
-| [tests/project_intel.f](tests/project_intel.f) | 在完整类型入口之后加入 Intel wrapper 和既有双 Host wire fixture | 重复依赖、Tcl 注册、真实 DUT |
 | [tests/commands.f](tests/commands.f)、[tests/namespace.f](tests/namespace.f) | 各自完整的模型/Tcl 最终编译单元 | Intel、VIO |
 
 从仓库根展开 `@*_ROOT@` 为实际依赖绝对路径。完整入口和 runtime 入口二选一，不同时编译；commands/namespace 已各自包含依赖，也不要再叠加类型清单。`rdma_project_pkg` 只含配置 sequence；`rdma_project_runtime_pkg` 才含 `rdma_project_env_cfg`/`rdma_project_env`。旧 `sim/filelists` 保持独立。
@@ -26,8 +25,6 @@
 
 ```bash
 cd "$RDMA_ROOT"
-# 完整类型入口 + 既有Intel wire fixture；编译/运行日志留在RDMA_INTEL_RUN。
-bash integration/project/tests/run_intel.sh
 # 单独的模型/Tcl矩阵；要求同一AIP checkout预建匹配的dist loader/.so。
 bash integration/project/tests/run_commands.sh
 ```
@@ -36,7 +33,7 @@ bash integration/project/tests/run_commands.sh
 
 ## 数据来源与平台生命周期
 
-`rdma_project_env_cfg` 直接借用 `dpu`、`rdma`、`pcie`，`functions` 是完整 RDMA Function 目录。DPU 唯一负责 Host/PF/VF、BDF、BAR 和 global Function ID；RDMA 不重新 resolve 外部拓扑。grant 同时保存 global Function ID 和 RDMA VF ID；简单平台可以让两者相等，但 RDMA 不强制这个映射，也不把 Intel VF index 或 Notify 排序行号当成 RDMA VF ID。
+`rdma_project_env_cfg` 直接借用 `dpu`、`rdma`，`functions` 是完整 RDMA Function 目录；PCIe 环境和 RC 由平台 project env 持有。DPU 唯一负责 Host/PF/VF、BDF、BAR 和 global Function ID；RDMA 不重新 resolve 外部拓扑。grant 同时保存 global Function ID 和 RDMA VF ID；简单平台可以让两者相等，但 RDMA 不强制这个映射，也不把 Intel VF index 或 Notify 排序行号当成 RDMA VF ID。
 
 平台只维护一个公共 `host_mem_pool`，按冻结 GPA 创建每 Host 的 manager，并通过 `dpu.host_mem_pool_ref` 发布。RDMA 用 `bind_snapshot(source, keys, pool)` 借用该 pool，PCIe 用 `pool.get_host(host_id)` 取得同一 manager；已有 Virtio pool 直接复用。缺 Host、未初始化、Host ID 或 GPA 覆盖不符时拒绝绑定，不建私有 fallback。各 Function 仅保留独立分配账本；完整 DMA 区间必须属于该 Function 的一次存活分配。不同 Host 的 GPA 可重叠，backing 各自独立。
 

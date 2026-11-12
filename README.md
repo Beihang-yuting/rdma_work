@@ -3,7 +3,7 @@
 本仓库按 XTR RDMA 0.1.34 内核驱动的形状建模主机侧驱动（`src/drv`）与设备侧（`src/dev`），二者只经
 真实硬件边界交互：CMQ 环、MMIO doorbell（BAR+0x2000 窗口）与按 IOVA 的 DMA。UVM 验证环境
 （`src/tb`）在其上运行 seq → 驱动 → 设备 → 报文 → 内存的端到端数据检查。外部组件（dpu_common、host_mem、
-`net_packet`、pcie_work）直接引用，不复制源码，由使用者经 `*_ROOT` 指定；对接代码在 `src/adapters/<组件>`。
+`net_packet`）直接引用，不复制源码，由使用者经 `*_ROOT` 指定；对接代码在 `src/adapters/<组件>`。
 
 ## 目录与边界
 
@@ -21,8 +21,6 @@
   - `dpu`：dpu_common 拓扑 → 每个 Function 的设备、内存、BAR、驱动；Function key、BDF、global ID、BAR、
     parent 与 caps 按值冻结并在 attach 时对快照复核；MAILBOX/MSI-X local vector 0、mask/pending 与投递结果
     按 Function 隔离；
-  - `pcie_work`：BAR 写与设备 DMA 经 PCIe TLP（pcie_work suite），启用 FC、事务记分板与覆盖率，并检查
-    Completion timeout/UR/CA；
   - `rxe`：经 TAP 与 Linux Soft-RoCE 互打（rxe suite）。
 - `tests/unit`：模型与驱动单元测试、codec 测试；`tests/integration`：rxe 互打测试；`tests/rdma_env_test_pkg.sv`：
   env 测试。
@@ -36,15 +34,16 @@
 [integration/virtio](integration/virtio/README.md)，共享同一 DPU 快照、Intel PCIe 和 Host 内存池。
 
 如果只集成 RDMA 基础环境，直接使用 [src/rdma.f](src/rdma.f)：从仓库根目录将清单中的
-`@AIP_CORE_ROOT@`、`@DPU_COMMON_ROOT@`、`@HOST_MEM_ROOT@`、`@NET_PACKET_ROOT@` 和
-`@PCIE_WORK_ROOT@` 展开为实际 checkout，再把自己的 test/top 追加到 VCS 命令。例如：
+`@AIP_CORE_ROOT@`、`@DPU_COMMON_ROOT@`、`@HOST_MEM_ROOT@` 和 `@NET_PACKET_ROOT@` 展开为实际
+checkout，再把自己的 test/top 追加到 VCS 命令。例如：
 
 ```bash
 vcs -full64 -sverilog -ntb_opts uvm-1.2 -f src/rdma.f my_test.sv -top my_test
 ```
 
 编译完成后只需 `import rdma_pkg::*;` 即可使用 RDMA 类型、模型、驱动、设备、UVM env 以及各适配器；
-dpu_common、host_mem、net_packet 和 pcie_work 的原生类型仍保留在各自 package 中。该入口不包含
+dpu_common、host_mem 和 net_packet 的原生类型仍保留在各自 package 中。项目 integration filelist 单独引入
+pcie_tl_vip 原生类型；该入口不包含
 `integration/`、Intel wrapper、Tcl、运行时 sequence 或 RXE/DPI 路径。
 
 ## 外部依赖
@@ -59,7 +58,6 @@ CMQ/codec 基线来自 `/home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.ta
 | dpu_common | `DPU_COMMON_ROOT` | 全部 suite |
 | host_mem | `HOST_MEM_ROOT` | 全部 suite |
 | net_packet | `NET_PACKET_ROOT` | 全部 suite |
-| pcie_work | `PCIE_WORK_ROOT` | pcie_work suite |
 | aip_core（update 分支） | `AIP_CORE_ROOT` | 全部 suite：`+rdma.env.*` / `+rdma.{qp,mem,pkt,traffic}.*` 命令行参数 |
 
 外部源码不会同步进本仓库，也不应把访问令牌写入 remote URL、脚本或配置文件。
@@ -106,7 +104,6 @@ scripts/run_vcs53.sh rdma_defs rdma_cmq_driver_contract_test
 scripts/run_vcs53.sh core regression
 scripts/run_vcs53.sh cmq_gate regression
 scripts/run_vcs53.sh env regression        # 结束时打印合并覆盖率 RDMA_COV merged=
-PCIE_WORK_ROOT=... scripts/run_vcs53.sh pcie_work regression
 scripts/run_vcs53.sh rxe regression        # 需先在 53 上 tools/rxe/rxe_tap_setup.sh up
 ```
 
@@ -134,12 +131,9 @@ scripts/run_queue_lifecycle_regression53.sh
   数量不是每 Function 的本地容量。ACK offset 读取当前 64 位 publication token，软件必须精确回写；错误、
   重复、旧发布或跨 FLR/recover 的 token 返回 `RDMA_SC_STALE_GENERATION`。该机制只是适配器内的寄存器与
   事件队列，并非真实 PCIe MSI-X MemWr，CEQ/AEQ 也尚未全部自动接入。
-- PCIe 适配器按 Host+BDF 保留 authority，启用 pcie_work 的 FC、事务记分板和覆盖率；设备 MemRd 的
-  timeout 映射为可重试 `RDMA_SC_TIMEOUT`，UR/CA 映射为保留原始 Completion 状态的
-  `RDMA_SC_PCIE_COMPLETION`。timeout tag 在本次仿真剩余生命周期内 quarantine，防止迟到 Completion
-  与复用 tag 发生 ABA 混淆。正式依赖 `1a80801e` 与候选 `9aedf898` 的 basic/fault 均为 W/E/F=`0/0/0`；
-  历史 `4b7b8d70` 只证明编译兼容，不能作为动态通过证据。只有 pcie_work suite 的 DMA 走 PCIe，其余 suite
-  使用后门 DMA。
+- PCIe TL 只作为平台接入的原生事务类型；Host、Function、BDF、BAR 和路由 authority 由 dpu_common
+  快照提供，Intel wrapper/RC bridge 由项目环境拥有。RDMA 基础 env 默认使用后门 DMA，不创建额外
+  PCIe system、RC/EP driver、DMA driver 或 fault 注入器。
 
 ## completion 分支验证快照（2026-10-08）
 
@@ -151,7 +145,6 @@ scripts/run_queue_lifecycle_regression53.sh
 | `rdma_defs/rdma_cmq_driver_contract_test` | 通过 |
 | core / cmq_gate / env | 15/15、5/5、9/9，均 exit 0，逐项 W/E/F=`0/0/0` |
 | env 合并覆盖率 | `RDMA_COV merged=97.46` |
-| pcie_work 正式依赖 `1a80801e` | basic/fault 均 exit 0，W/E/F=`0/0/0` |
 | RXE | 3/3 pristine，全部 exit 0，逐项 W/E/F=`0/0/0`；`rdma_env_rxe_test` coverage total=67.4 |
 
 ## CMQ 门禁

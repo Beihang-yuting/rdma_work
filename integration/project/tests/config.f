@@ -21,8 +21,6 @@
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/topology/pcie_topology_pkg.sv
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/pcie_tl_pkg.sv
-+incdir+@PCIE_WORK_ROOT@/pcie_dpu_integration/src
-@PCIE_WORK_ROOT@/pcie_dpu_integration/src/pcie_dpu_integration_pkg.sv
 
 +incdir+@DPU_COMMON_ROOT@/integration/pcie
 @DPU_COMMON_ROOT@/integration/pcie/dpu_pcie_pkg.sv

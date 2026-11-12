@@ -3,7 +3,7 @@
 // 职责：验证冻结 Function 快照控制的 MAILBOX/MSI-X 最小完整路径：单 mailbox vector 权限、
 //   寄存器编程、masked pending、token ACK 的同 epoch/跨 FLR 防 ABA、投影按值冻结、伪造 attach 拒绝、
 //   显式设备中断、失败恢复、跨 Host domain 拒绝、Function 隔离与 recover 双 epoch 推进。
-// 依赖：rdma_dpu_adapter_pkg、dpu_resource_pkg、rdma_types_pkg；不依赖 pcie_work 或外部 DUT。
+// 依赖：rdma_dpu_adapter_pkg、dpu_resource_pkg、rdma_types_pkg；不依赖 PCIe transport 或外部 DUT。
 // 所有权：测试拥有 rdma_dpu_system；节点拥有各自中断控制器与事件队列，快照/BAR 身份由 dpu_common
 //   生成并冻结。
 // 生命周期：run_phase 内建立三 Function 拓扑并执行同步 MMIO；结束后不保留外部资源或后台进程。

@@ -1,10 +1,10 @@
 # 目录：sim/Makefile，仿真构建层入口。
-# 职责：定义 core、env、pcie_work 与 rxe 的编译、预检和 UVM 运行流程。所有 suite 编译同一份 RDMA 源码
-#   （filelists/rdma.f + tests.f，含外部 host_mem 与 net_packet）；pcie_work、rxe 另加各自的 filelist。
+# 职责：定义 core、env 与 rxe 的编译、预检和 UVM 运行流程。所有 suite 编译同一份 RDMA 源码
+#   （filelists/rdma.f + tests.f，含外部 host_mem 与 net_packet）；rxe 另加自己的 filelist。
 # 依赖与所有权：依赖 VCS、仓库 filelist 及外部只读源码树；本文件仅管理 build 输出目录，不拥有外部依赖生命周期。
 
 BUILD ?= build/core
-# 外部组件（dpu_common、host_mem、net_packet、pcie_work、aip_core）由使用者经 *_ROOT 指定，直接引用、不锁版本。
+# 外部组件（dpu_common、host_mem、net_packet、aip_core）由使用者经 *_ROOT 指定，直接引用、不锁版本。
 # 驱动归档路径默认沿用 53 主机位置，其它机器可经环境变量或命令行 RDMA_ARCHIVE=... 覆盖。
 RDMA_ARCHIVE ?= /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
 TEST ?= rdma_smoke_test
@@ -23,14 +23,14 @@ DPU_COMMON_SRC = +incdir+$(DPU_COMMON_ROOT)/src $(DPU_COMMON_ROOT)/src/dpu_resou
 # aip_core（命令行参数解析）：filelist 中 aip_core_pkg.sv 必须是本编译单元首个 AIP 文件。
 
 # 功能：在 build 目录 $(1) 生成外部组件路径展开后的 filelist（VCS 不替换 filelist 中的 Make 变量），并
-#   编译 tb_top 为 $(1)/simv；$(2) 为附加的 suite filelist（rxe、pcie_work）与选项。
+#   编译 tb_top 为 $(1)/simv；$(2) 为附加的 rxe filelist 与选项。
 # 输入输出及副作用：写 $(1) 下的 *.f 与 simv。
 # 失败边界：编译失败返回非零。
 define RDMA_COMPILE
 	mkdir -p $(1); \
-	for list in rdma tests pcie_work rxe; do \
+	for list in rdma tests rxe; do \
 		sed -e 's|@HOST_MEM_ROOT@|$(HOST_MEM_ROOT)|g' -e 's|@NET_PACKET_ROOT@|$(NET_PACKET_ROOT)|g' \
-		    -e 's|@PCIE_WORK_ROOT@|$(PCIE_WORK_ROOT)|g' -e 's|@AIP_CORE_ROOT@|$(AIP_CORE_ROOT)|g' \
+		    -e 's|@AIP_CORE_ROOT@|$(AIP_CORE_ROOT)|g' \
 		    filelists/$$list.f > $(1)/$$list.f; \
 	done; \
 	$(VCS) $(VCS_FLAGS) $(VCS_EXTRA_FLAGS) $(DPU_COMMON_SRC) -f $(1)/rdma.f $(2) -f $(1)/tests.f \
@@ -48,7 +48,7 @@ define RUN_CORE_LOGICAL_TEST
 		"../scripts/check_uvm_summary.sh"
 endef
 
-.PHONY: dpu_common_preflight aip_core_preflight build_core build_env build_pcie_work core cmq_gate sv_style host_mem_preflight rdma_defs env net_packet_preflight pcie_work pcie_work_preflight rxe regression
+.PHONY: dpu_common_preflight aip_core_preflight build_core build_env core cmq_gate sv_style host_mem_preflight rdma_defs env net_packet_preflight rxe regression
 
 dpu_common_preflight:
 	@if [[ -z "$(DPU_COMMON_ROOT)" || ! -r "$(DPU_COMMON_ROOT)/src/dpu_resource_pkg.sv" ]]; then \
@@ -68,11 +68,6 @@ build_env: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core
 	set -euo pipefail; \
 	$(call RDMA_COMPILE,build/env,)
 
-build_pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_work_preflight \
-	aip_core_preflight
-	set -euo pipefail; \
-	$(call RDMA_COMPILE,build/pcie_work,+define+RDMA_PCIE_WORK_TEST -f build/pcie_work/pcie_work.f)
-
 # 变更 SV 的注释/单语句门禁与 Git 空白检查共用明确的基线提交，避免隐式读取工作树历史。
 sv_style:
 	python3 ../tools/check_changed_sv_style.py --base "$${STYLE_BASE:?STYLE_BASE is required}"
@@ -90,7 +85,7 @@ regression:
 		      "$$suite" == axis_vip || "$$test" == *axis* ]]; then \
 			echo "invalid regression manifest row" >&2; exit 2; \
 		fi; \
-		if [[ ! "$$suite" =~ ^(core|env|pcie_work|rdma_defs)$$ || \
+		if [[ ! "$$suite" =~ ^(core|env|rdma_defs)$$ || \
 		      ! "$$test" =~ ^[A-Za-z_][A-Za-z0-9_]*$$ ]]; then \
 			echo "invalid suite/test in regression manifest: $$suite $$test" >&2; exit 2; \
 		fi; \
@@ -227,24 +222,6 @@ env: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core_prefl
 	: "各测试的功能覆盖率经 urg 合并，打印合并后的总分（RDMA_COV merged）"; \
 	urg -dir build/env/simv.vdb -format text -report build/env/cov > build/env/urg.log 2>&1; \
 	echo "RDMA_COV merged=$$(awk '/Total Groups Coverage Summary/ {getline; getline; print $$1; exit}' build/env/cov/groups.txt)"
-
-pcie_work_preflight:
-	@if [[ -z "$(PCIE_WORK_ROOT)" || ! -r "$(PCIE_WORK_ROOT)/pcie_tl_vip/src/pcie_tl_pkg.sv" ]]; then \
-		echo "PCIE_WORK_ROOT must point at a pcie_work checkout" >&2; exit 2; fi
-
-# PCIe suite 同时覆盖正常事务守恒，以及 timeout/UR/CA 经真实 CMQ 路径传播到驱动的负向场景。
-PCIE_WORK_TESTS := rdma_env_pcie_test rdma_env_pcie_fault_test
-
-pcie_work: dpu_common_preflight host_mem_preflight net_packet_preflight pcie_work_preflight \
-	aip_core_preflight
-	set -euo pipefail; \
-	$(call RDMA_COMPILE,build/pcie_work,+define+RDMA_PCIE_WORK_TEST -f build/pcie_work/pcie_work.f); \
-	tests="$(TEST)"; \
-	if [[ "$$tests" == regression ]]; then tests="$(PCIE_WORK_TESTS)"; fi; \
-	for test_name in $$tests; do \
-		build/pcie_work/simv +UVM_TESTNAME=$$test_name | tee build/pcie_work/$$test_name.log; \
-		../scripts/check_uvm_summary.sh build/pcie_work/$$test_name.log; \
-	done
 
 # Soft-RoCE 互打：需先在本机运行 tools/rxe/rxe_tap_setup.sh up（TAP 网卡 + rxe 设备，需 sudo）。
 RXE_TAP ?= rtap0

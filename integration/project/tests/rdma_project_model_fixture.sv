@@ -76,7 +76,6 @@ class rdma_project_model_test extends rdma_project_test;
   string	original_commands;
   bit	prepared;
   bit	fail_prepare;
-  pcie_tl_env_config	original_pcie;
   dpu_env_cfg	original_dpu;
   host_mem_pool	original_pool;
   host_mem_api	original_manager;
@@ -271,7 +270,6 @@ function void rdma_project_model_test::build_phase(uvm_phase	phase);
   if (!dpu.publish(snapshot, resources, map, why))
     `uvm_fatal("PROJECT_MODEL", why)
   project_cfg.dpu = dpu;
-  project_cfg.pcie = new("fixture_pcie_cfg");
   project_cfg.rdma = rdma_env_cfg::type_id::create("rdma_cfg");
   project_cfg.rdma.add_func(0, 0, DPU_FUNCTION_VF, 0);
   project_cfg.rdma.add_func(0, 0, DPU_FUNCTION_VF, 1);
@@ -284,7 +282,6 @@ function void rdma_project_model_test::build_phase(uvm_phase	phase);
   original_resources = resources;
   original_map = map;
   original_commands = aip_cmd::get_all_cmd_names();
-  original_pcie = project_cfg.pcie;
   original_dpu = dpu;
   assemble_model();
   uvm_config_db#(rdma_dpu_system)::set(this, "project.rdma", "model_system", model_system);
@@ -430,7 +427,7 @@ function string rdma_project_model_test::observation();
   probes = 0;
   foreach (model_system.nodes[i])
     if (model_system.nodes[i].drv != null) probes++;
-  identity = project.cfg.dpu == original_dpu && project.cfg.pcie == original_pcie &&
+  identity = project.cfg.dpu == original_dpu &&
     project_cfg.dpu.host_mem_pool_ref == original_pool && model_system.mem_pool == original_pool &&
     original_pool.get_host(0) == original_manager &&
     project.rc == fixture_rc && project.cfg.rdma == original_cfg && project.cfg.rdma.scenario == original_scenario &&

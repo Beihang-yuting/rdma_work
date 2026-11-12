@@ -33,8 +33,6 @@
 +incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/seq/constraints
 +incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/seq/scenario
 +incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/seq/virtual
-+incdir+@PCIE_WORK_ROOT@/pcie_dpu_integration/src
-+incdir+src/adapters/pcie_work
 +incdir+@DPU_COMMON_ROOT@/integration/pcie
 +incdir+integration/project
 +incdir+@PCIE_INTEL_ROOT@/src
@@ -47,7 +45,6 @@
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/topology/pcie_topology_pkg.sv
 @PCIE_WORK_ROOT@/pcie_tl_vip/src/pcie_tl_pkg.sv
-@PCIE_WORK_ROOT@/pcie_dpu_integration/src/pcie_dpu_integration_pkg.sv
 @PCIE_INTEL_ROOT@/src/interface/intel_pcie_if.sv
 @PCIE_INTEL_ROOT@/src/adapter/intel_pcie_adapter_pkg.sv
 src/types/rdma_types_pkg.sv
@@ -60,8 +57,6 @@ src/adapters/dpu/rdma_dpu_adapter_pkg.sv
 src/adapters/net_packet/rdma_netpkt_pkg.sv
 src/tb/rdma_env_pkg.sv
 src/adapters/aip/rdma_aip_cfg_pkg.sv
-src/adapters/pcie_work/rdma_pcie_work_pkg.sv
 @DPU_COMMON_ROOT@/integration/pcie/dpu_pcie_pkg.sv
-integration/project/rdma_project_transport_pkg.sv
 integration/project/rdma_project_pkg.sv
 integration/project/rdma_project_runtime_pkg.sv

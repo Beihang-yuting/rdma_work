@@ -4,11 +4,10 @@
 
 ## 配置与类型组合
 
-`rdma_project_env_cfg` 直接保存 `dpu_env_cfg dpu`、`rdma_env_cfg rdma`、`pcie_tl_env_config pcie` 和 `functions[$]`。平台提供并拥有这三份既有配置，参考 project 只借用。用户也可在自己的 cfg 直接组合相同类型，不要求继承参考类或增加公共包装对象。
+`rdma_project_env_cfg` 直接保存 `dpu_env_cfg dpu`、`rdma_env_cfg rdma` 和 `functions[$]`。PCIe 环境及 RC sequencer 由平台 project env 持有，RDMA 只借用通过 BAR map 发布的管理 RC；参考 project 不复制一份 PCIe 配置。用户也可在自己的 cfg 直接组合相同类型，不要求继承参考类或增加公共包装对象。
 
 | 文件 | 实际职责 |
 | --- | --- |
-| `integration/project/rdma_project_transport_pkg.sv` | Intel RC 的 Host/Requester/Function authority 与 BAR 绑定；复用 PCIe responder |
 | `integration/project/rdma_project_cfg_seq.sv` | `rdma_project_cfg_seq extends dpu_cfg_seq`，单 bank 公共表编排 |
 | `integration/project/rdma_project_pkg.sv` | 仅配置 sequence 的包入口 |
 | `integration/project/rdma_project_runtime_pkg.sv` | include `rdma_project_env_cfg.sv` 与 `rdma_project_env.sv`，无注册副作用 |
@@ -16,9 +15,9 @@
 | `integration/project/rdma_project_commands.sv` | 最终编译单元显式 include 的唯一命令注册 |
 | `integration/filelists/rdma_project.f` | 完整可复用类型入口，无 wrapper/test/top/注册 |
 
-完整类型编译顺序为 AIP → Host memory → DPU resource → PCIe interface/shared/topology/TL/integration → Intel interface/adapter → RDMA 核心/适配器/env/AIP/PCIe → DPU PCIe → project transport/config/runtime。普通 `.sv` 被 package include 后不能单独再编译。`rdma_pcie_work_pkg` 依赖 `pcie_dpu_integration_pkg`；真正使用 `dpu_pcie_pkg` 的 Task3 transport 放在后面。AIP 使用 expression-capable checkout，不同时编译旧 aip_core 包；net_packet 沿用 RDMA adapter 的 include 方式。
+完整项目类型编译顺序为 AIP → Host memory → DPU resource → PCIe TL/interface → Intel interface/adapter → RDMA 核心/适配器/env/AIP → DPU PCIe → project config/runtime。普通 `.sv` 被 package include 后不能单独再编译。RDMA 基础包不编译 PCIe transport；项目 integration filelist 只引入 `pcie_tl_vip` 原生类型，不编译 `pcie_dpu_integration_pkg` 或 RDMA 自有 PCIe system/driver。AIP 使用 expression-capable checkout，不同时编译旧 aip_core 包；net_packet 沿用 RDMA adapter 的 include 方式。
 
-[完整 Intel fixture](../integration/project/tests/project_intel.f) 只追加 wrapper、control interface、既有 test 与 top。[run_intel.sh](../integration/project/tests/run_intel.sh) 展开两份清单并显式选择 `rdma_project_transport_top`。模型/Tcl 使用独立 runtime 边界；config-only 测试不因此引入 RDMA/AIP/Intel。旧生产 filelist 不变。
+真实 Intel fixture 不属于基础 RDMA 包；后续项目应在自己的 project env 中复用 virtio_work 的 Intel RC bridge、wrapper 和 `dpu_common` BAR map。模型/Tcl 使用独立 runtime 边界；config-only 测试不因此引入 RDMA/AIP/Intel。
 
 ## 权威身份、共享内存与真实传输
 
@@ -44,11 +43,11 @@ if (!pcie_cfg.bind_host_memory(rc_slot, host_id, pool.get_host(host_id), why))
 
 同 Host 的 RDMA/PCIe 消费同一 manager，不同 Host 可以使用数值相同的 GPA，backing 仍然隔离。`rdma_host_mem` 仅保留各 Function 的分配账本和 DMA 范围检查；完整区间必须属于本 Function 的一次存活分配。独立模型的 `build()` 同样使用公共 pool，范围来自模型 authoring 冻结后的 GPA。pool 和 manager 必须覆盖所有借用者及未释放分配；发布后不能替换，`load_params` 与 AIP restore 保持其身份。
 
-每 Host 一个 Intel 端口/RC slot，同 Host PF/VF 共用；Host ID 不必等于 slot。平台创建 `pcie_tl_env` 前调用 `intel_pcie_configure_env()`，给 RC 设置 `rdma_project_rc_driver` 实例 override；真实 DUT 路径开启 RC，关闭模型 EP/ep_auto_response，wrapper 使用 HARD_IP。`rdma_project_pcie_bar` 复用已有大端8字节 write64；公共表仍按现有 DWORD 顺序写。
+每 Host 一个 Intel 端口/RC slot，同 Host PF/VF 共用；Host ID 不必等于 slot。平台创建 `pcie_tl_env` 前调用 virtio_work 项目环境已有的 Intel 配置流程；真实 DUT 路径开启 RC，关闭模型 EP/ep_auto_response，wrapper 使用 HARD_IP。RDMA 只把公共 BAR/Function 选择交给该 bridge，公共表仍按现有 DWORD 顺序写。
 
 DPU map 必须包含所有 Function 的显式 Intel policy 和实际 sequencer。支持每 Host segment0、PF0..7、VF0..2047，PF 的 vf_index=-1；BDF、Requester ID 和 Intel PF/VF sideband 分别消费真实映射。不存在的 Host/Function、缺 policy、跨 BAR/溢出、未知 Requester 或旧 epoch 都拒绝，不回退 RC0。Function 数量由 dpu_common 能力、Host/Function 表和 Notify bank 容量约束，RDMA 代码不固定为两端。
 
-当前 transport 为保证授权检查至 enqueue 无等待，要求 infinite credit、关闭 shaper/link delay，并验证实际 driver/Intel 状态。`prepare_platform` 完成初始 reset/readiness 后调用 RC `bind_transport(...)`，再调用 BAR `bind_project(...)`；connect 可先发布尚未绑定的 BAR。绑定一次性捕获非零 generation/reset epoch，FLR 前 `revoke_function(key)`，链路 teardown 前 `revoke()`；物理复位后旧绑定永久失效，无 rearm。平台须确认 DMA 静止后释放业务分配。
+平台负责在 `prepare_platform` 完成初始 reset/readiness 后绑定 RC bridge 和 BAR map；RDMA 不保存第二份 route、epoch 或 Host responder。FLR/link teardown 的撤销和复位代次由项目环境及 `dpu_common` contract 管理，平台须确认 DMA 静止后释放业务分配。
 
 ## 公共表、驱动与 grant 的边界
 

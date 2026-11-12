@@ -1,7 +1,7 @@
 // 目录：设备层 src/dev/rdma_dev_dma.sv。
 // 职责：设备 DMA 端口：设备（CMQ 与数据面 NIC）对主机内存的全部读写都经由本端口的 task。默认实现
-//   为后门：直接读写本 Function 的 rdma_host_mem（零仿真时间）；PCIe 集成以 factory 覆盖为
-//   经 pcie_work EP 发 MemRd/MemWr 的实现。
+//   为后门：直接读写本 Function 的 rdma_host_mem（零仿真时间）；真实 PCIe 集成由平台在外部
+//   传输层提供 DMA adapter，不改变基础端口的所有权。
 // 依赖：rdma_host_mem。
 // 所有权与生命周期：host_mem 只借用；由 rdma_dev_cmq.configure 创建，设备内 CMQ 与 NIC 共用。
 class rdma_dev_dma extends uvm_object;

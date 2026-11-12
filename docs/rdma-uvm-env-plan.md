@@ -15,7 +15,7 @@ rdma_base_test ── rdma_env_cfg + vseq
     ├ ctrl       rdma_ctrl_agent：控制面（资源生命周期、QP 连接/状态迁移、FLR/恢复），全部 Function 共用一个
     ├ verb[f]    rdma_verb_agent：数据面（post_send/recv、SRQ recv、poll CQ/EQ）
     ├ link       rdma_link（本身即 loopback）及子类 rdma_link_netpkt | rxe，factory 按名字创建；tx/rx analysis、故障注入
-    ├ plugins    rdma_env_plugin：传输相关扩展（pcie_work 承载 MMIO/DMA、rxe 远端 Function）
+    ├ plugins    rdma_env_plugin：传输相关扩展（rxe 远端 Function；真实 PCIe 由项目 env 提供）
     ├ sb         rdma_scoreboard = rdma_mem_model（期望内存）+ rdma_expect（每 QP 期望完成）
     ├ checker    rdma_proto_checker + rdma_proto_rule 子类（每组 IBTA 规则一个类）
     ├ cov        rdma_coverage（每个覆盖面一个 covergroup）
@@ -71,10 +71,9 @@ rdma_res_db ── funcs[uid] : rdma_res_func（每个 Function 一个；rxe 远
 - **rdma_link**：基类提供 `port(func)`、`tx_ap/rx_ap`、`drop/corrupt/delay(dir, nth)`；loopback 与 netpkt 在
   tb 包内，rxe 在 rxe 包内（工厂按名字创建，tb 不依赖 rxe 包）。
 - **rdma_env_plugin**：钩子 `pre_build(env)`、`build(env)`、`start(env)`、`report(env)`。
-  - `rdma_pcie_plugin`（tests/rdma_env_test_pkg，RC 应答用各 Host 的 host_mem manager）：安装 BAR/DMA 覆盖、
-    按快照建 PCIe 系统并保留 MMIO ingress 的 Host authority；启用 FC、事务记分板与功能覆盖率，结束时检查
-    MMIO/DMA TLP 计数、每个 Host+BDF 都发过 DMA 及跨 Host MMIO 不被误路由。fault test 另注入 timeout/UR/CA，
-    检查精确 request 退休与 timeout tag quarantine。
+  - 真实 PCIe 不再由 `rdma_env_plugin` 承担。项目 env 复用 `pcie_tl_vip` 原生事务、virtio_work 的 Intel
+    RC bridge、dpu_common 快照和公共 Host pool；RDMA 基础 env 不安装 factory override，也不创建 RC/EP/DMA
+    driver 或 fault 注入器。
   - `rdma_rxe_plugin`（src/adapters/rxe/rdma_rxe_env.sv）：远端 Function（`cfg.remote_funcs`，下标在 dpu
     Function 之后）由 rxe_peer 进程承载；覆盖 ctrl/verb driver 与 monitor，远端资源/投递/完成经对端命令，
     缓冲为 `rdma_rxe_buf`（rbuf/wbuf 分块）；链路 `rdma_link_rxe`（TAP）。对端限制：单 PD/CQ/MR/SRQ、单 SGE、
@@ -125,13 +124,13 @@ INCREMENT/PATTERN，`pkt_len` = 长度，`do_pack()` 后 `raw_data` 即负载。
 | --- | --- | --- |
 | core / cmq_gate / rdma_defs | 模型与驱动单元测试、net_packet 帧编解码测试 | dpu_common、host_mem、net_packet |
 | env | env 全部场景（loopback/netpkt 链路） | dpu_common、host_mem、net_packet |
-| pcie_work | rdma_env_pcie_test（PF/VF ↔ 另一 Host 的 basic_traffic）+ rdma_env_pcie_fault_test（timeout/UR/CA）+ PCIe 插件 | 上述 + pcie_work |
+| PCIe 项目接入 | 由调用方的 project env 复用 `pcie_tl_vip`/Intel RC bridge；RDMA 基础 env 不提供独立 PCIe suite | 上述 + pcie_tl_vip；真实 Intel wrapper 由平台提供 |
 | rxe | rdma_env_rxe_test（basic_traffic ↔ Soft-RoCE）+ 原 rxe 互打测试（需 TAP，手动） | 上述 + DPI、rdma_rxe |
 
 原 host_mem、net_packet、e2e 三个 suite 并入 env。外部组件直接引用（不锁版本、不做抽象层）：所有 suite
 编译同一份 RDMA 源码（`sim/filelists/rdma.f` + `tests.f`），主机内存恒为外部 host_mem（每个 Host 一个
-manager，每个 Function 按记账隔离 DMA），帧编解码为 `rdma_netpkt_codec`；pcie_work、rxe 只追加各自的
-filelist。只有 pcie_work suite 通过 PCIe TLP 执行设备 DMA，其余 suite 使用后门 DMA；对接代码集中在
+manager，每个 Function 按记账隔离 DMA），帧编解码为 `rdma_netpkt_codec`；rxe 只追加自己的
+filelist。基础 suite 使用后门 DMA；真实 PCIe TLP 由项目 env 接入；对接代码集中在
 `src/adapters/<组件>`。
 
 env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并全部测试的 covergroup 并打印
@@ -148,7 +147,7 @@ env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并�
   保留（其余检查点是驱动/设备内部行为：inline、CQ arm/resize/cq_clean、CEQ cleanup、SRFQ、SRQ limit AEQE、URC frag、
   SQD doorbell AE、RNR/重试耗尽、QP 编号复用策略，env 层不可表达） |
 | multifunc | 复位范围与隔离由 multifunc vseq 覆盖；保留（BAR 解码拒绝、CMQ 卡死超时、外部 IOVA 访问错为驱动/平台内部） |
-| pcie_rdma | 已删除：rdma_env_pcie_test + PCIe 插件覆盖其全部检查 |
+| pcie_rdma | 已删除：旧 `rdma_env_pcie_test`、fault test、插件和 RDMA 自有 PCIe transport |
 | rxe_test、rxe_fault_test | env rxe 测试覆盖 basic/errors/srq/reliability；保留（rxe 作请求方的 READ/ATOMIC、rxe 侧 RNR、
   rxe 请求方丢包等以对端视角断言的检查点未全部迁移；suite 手动运行、代价低） |
 
@@ -159,7 +158,7 @@ env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并�
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | S1 ✅ | 配置、资源层、数据生成、ctrl/verb agent、loopback/netpkt 链路、scoreboard 拆分、env、base vseq、basic_traffic/high_traffic；env suite | 替代 tb_flow/host_mem/e2e/high_traffic，全量通过 |
-| S2 ✅ | 链路故障注入；pcie 插件；rxe 链路 + 远端 Function 插件 | basic_traffic 在 4 种传输下通过 |
+| S2 ✅ | 链路故障注入；rxe 链路 + 远端 Function 插件；PCIe 责任移交项目 env | basic_traffic 与平台接入边界明确 |
 | S3 ✅ | 协议检查规则类；scoreboard 错误/flush/SRQ/UD/FLR 预测 | 每条规则有变异检查（见第 9 节） |
 | S4 ✅ | errors/reliability/srq/qp_lifecycle/multifunc vseq（UD 场景并入 basic/errors）；删已完全覆盖的旧测试 | 全量通过 |
 | S5 ✅ | 覆盖率、random vseq、覆盖率报告进入回归汇总 | 覆盖率基线（回归汇总的 RDMA_COV 行） |
@@ -226,7 +225,7 @@ env 回归每个测试以 `-cm_name <测试名>` 运行，结束后 urg 合并�
 | `rdma_defs/rdma_cmq_driver_contract_test` | 通过 |
 | core / cmq_gate / env | 15/15、5/5、9/9，均 exit 0，逐项 W/E/F=`0/0/0` |
 | env 合并覆盖率 | `RDMA_COV merged=97.46` |
-| pcie_work 正式依赖 `1a80801e` | basic/fault 均 exit 0，W/E/F=`0/0/0` |
+| 旧 pcie_work 依赖（历史） | basic/fault 曾通过；自建 PCIe suite 已删除，当前不作为 RDMA 基础 env 的验证入口 |
 | RXE | 3/3 pristine，均 exit 0，逐项 W/E/F=`0/0/0`；`rdma_env_rxe_test` coverage total=67.4 |
 
 RXE 的 67.4 是单场景 total；env 的最终覆盖率口径仍以 9 项回归合并值 97.46 为准。

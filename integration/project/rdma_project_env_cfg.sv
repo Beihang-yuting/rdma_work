@@ -1,15 +1,12 @@
 // 目录/层次：integration/project；项目组合配置。
-// 职责：直接组合DPU/RDMA/PCIe既有配置，约束运行期唯一可消费DPU策略。
+// 职责：直接组合DPU和RDMA既有配置，约束运行期唯一可消费DPU策略。
 // 依赖：所属runtime package导入类型；不加载参数、不解析拓扑。
-// 所有权/生命周期：平台提供并持有三个配置；项目仅借用，整个运行期保持句柄。
+// 所有权/生命周期：平台提供并持有 DPU/RDMA 配置；项目仅借用，整个运行期保持句柄。
 class rdma_project_env_cfg extends uvm_object;
   `uvm_object_utils(rdma_project_env_cfg)
   dpu_env_cfg	dpu;
   rdma_env_cfg	rdma;
-  pcie_tl_env_config	pcie;
   dpu_function_key_t	functions[$];
-  // 每个 RDMA Function 的平台资源/路由授权，和 functions 保持同一快照顺序。
-  rdma_dpu_grant	grants[$];
   rdma_hw_plan	hw_plan;
 
   // 功能：构造尚未绑定平台三种配置的组合对象。
@@ -28,7 +25,6 @@ endclass
 // 失败/边界：build前必须补齐配置与完整RDMA目录，构造不创建资源。
 function rdma_project_env_cfg::new(string	name = "rdma_project_env_cfg");
   super.new(name);
-  grants.delete();
   hw_plan = rdma_hw_plan::type_id::create("hw_plan");
 endfunction
 

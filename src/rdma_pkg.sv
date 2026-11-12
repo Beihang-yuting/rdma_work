@@ -19,7 +19,6 @@ package rdma_pkg;
   import rdma_netpkt_pkg::*;
   import rdma_env_pkg::*;
   import rdma_aip_cfg_pkg::*;
-  import rdma_pcie_work_pkg::*;
 
   // VCS 对 export package::* 的可见性处理不完整，按包显式导出公开符号。
   // 每个声明仍归原始 package 所有；facade 只提供直接 import rdma_pkg::* 的入口。
@@ -264,12 +263,4 @@ package rdma_pkg;
   export rdma_env_pkg::rdma_random_vseq, rdma_env_pkg::rdma_traffic_pair, rdma_env_pkg::rdma_traffic_vseq;
   // rdma_aip_cfg_pkg
   export rdma_aip_cfg_pkg::rdma_aip_value_spec, rdma_aip_cfg_pkg::rdma_aip_cfg_loader;
-  // rdma_pcie_work_pkg
-  export rdma_pcie_work_pkg::rdma_pcie_system, rdma_pcie_work_pkg::rdma_pcie_fault_e;
-  export rdma_pcie_work_pkg::RDMA_PCIE_FAULT_NONE, rdma_pcie_work_pkg::RDMA_PCIE_FAULT_TIMEOUT;
-  export rdma_pcie_work_pkg::RDMA_PCIE_FAULT_UR, rdma_pcie_work_pkg::RDMA_PCIE_FAULT_CA;
-  export rdma_pcie_work_pkg::rdma_pcie_issued_fault_t, rdma_pcie_work_pkg::rdma_pcie_mmio_ingress_t;
-  export rdma_pcie_work_pkg::rdma_pcie_dma_seq, rdma_pcie_work_pkg::rdma_pcie_rc_driver;
-  export rdma_pcie_work_pkg::rdma_pcie_dma, rdma_pcie_work_pkg::rdma_pcie_ep_driver;
-  export rdma_pcie_work_pkg::rdma_pcie_bar;
 endpackage : rdma_pkg

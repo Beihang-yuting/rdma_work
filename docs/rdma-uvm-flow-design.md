@@ -40,23 +40,10 @@ Host/Function 请求会被拒绝。该机制是适配器事件队列，不会产
 CEQ/AEQ 连接到中断入口。e2e 的 net_packet Function identity 同样由快照生成。
 全部单元测试（`tests/support/rdma_dpu_test_system.sv`）、tb 与 multifunc 都经 `rdma_dpu_system`。
 
-设备对主机内存的访问全部经 `rdma_dev_dma`（task）。默认后门直接读写 host_mem；pcie_work suite
-（`src/adapters/pcie_work/rdma_pcie_work_pkg.sv`）以 factory 覆盖为 PCIe 路径：
-
-```
-dpu_common 快照 ── pcie_topology（每 Host：RC<h> ── EP<h>）── pcie_dpu_cfg_adapter ── pcie_tl_env（TLM）
-驱动 BAR 写  → RC<h> MemWr（BAR0 + 偏移）→ EP<h> → 队列 → 快照解码 → rdma_dev.write_register
-设备 DMA     → EP<h> MemRd/MemWr（requester = Function BDF，≤512/256B，不跨 4KB）→ RC<h> → Host<h> host_mem
-```
-
-RC 的统一内存是绑定到该 Root 的 Host host_mem manager；没有 IOMMU，驱动分配用恒等 IOVA adapter。
-MMIO ingress 保留发起 Host authority，只在该 Host 的 PCIe domain 内解码；requester 统计与故障注入键均为
-Host+BDF，以允许不同 Host 使用相同 BDF。适配层启用 FC、事务记分板与功能覆盖率，并把 MemRd 的 timeout、
-UR、CA 转换成设备可见的结构化状态：timeout 为可重试 `RDMA_SC_TIMEOUT`，UR/CA 为带原始 Completion code
-的 `RDMA_SC_PCIE_COMPLETION`，失败读不返回部分数据。timeout 后原请求按精确 handle 退休，tag 在本次
-仿真剩余生命周期内 quarantine，迟到 Completion 不得命中新请求。正式依赖 `1a80801e` 与候选
-`9aedf898` 的 basic/fault 均为 W/E/F=`0/0/0`；历史 `4b7b8d70` 只证明编译兼容。只有 pcie_work suite
-的 DMA 走上述 PCIe 路径，其余 suite 使用后门 DMA。
+设备对主机内存的访问全部经 `rdma_dev_dma`（task）。默认后门直接读写 host_mem；基础 RDMA 包不再
+安装自有 PCIe factory、RC/EP driver、DMA driver 或 TLM system。需要真实 PCIe 时，项目环境直接复用
+`pcie_tl_vip` 的原生事务和 `dpu_common` 的冻结 snapshot/BAR map，Intel wrapper 与 RC bridge 由项目
+（例如 virtio_work 的 project env）拥有，RDMA 只提供资源和 Function 视图。
 
 ## 2. 关键约定
 
@@ -110,10 +97,8 @@ UR、CA 转换成设备可见的结构化状态：timeout 为可重试 `RDMA_SC_
 - Soft-RoCE 互打：`rdma_rxe_test`（rxe suite，需 `tools/rxe/rxe_tap_setup.sh up`）：仿真设备经 TAP 与真实
   rdma_rxe 双向 SEND/WRITE/READ/ATOMIC（含立即数、多包），net_packet 帧带真实 ICRC/pad/AckReq。
   `rdma_rxe_fault_test`：UD、SRQ、RNR（含耗尽）、链路注入丢包（中间包、ACK、READ 响应）与错误 rkey/超长 SEND。
-- PCIe：`rdma_env_pcie_test`（pcie_work suite）：Host0 PF0/VF1 与 Host1 PF0 经 PCIe 完成 probe 与
-  SEND/WRITE，检查 MMIO TLP 解码数、DMA TLP 发出/送达数、各 Function 的 Host+BDF authority、FC、
-  scoreboard 与 coverage；`rdma_env_pcie_fault_test` 对直接设备 MemRd 注入 timeout/UR/CA，并把 UR
-  注入真实 CMQ SQE fetch，检查结构化错误、失败读数据清空、tag 唯一性与 timeout quarantine。
+- PCIe：基础环境不再提供独立 PCIe 回归或自有 RC/EP driver；真实 Intel/DUT 验证由项目环境复用
+  `pcie_tl_vip` 和 virtio_work 的 RC bridge 完成，RDMA 只消费 dpu_common snapshot 与 Host pool。
 - 中断：`rdma_dpu_interrupt_test` 检查 MAILBOX 发布/ack、MSI-X mask/pending/解 mask 投递、pending 合并、
   精确 publication token、旧/重复/跨复位 ACK 拒绝、local vector 0、冻结身份变异隔离、direct interrupt、
   Function/PF FLR 范围、跨 Host 隔离与 stale epoch 拒绝。
@@ -128,7 +113,6 @@ UR、CA 转换成设备可见的结构化状态：timeout 为可重试 `RDMA_SC_
 | `rdma_defs/rdma_cmq_driver_contract_test` | 通过 |
 | core / cmq_gate / env | 15/15、5/5、9/9，均 exit 0，逐项 W/E/F=`0/0/0` |
 | env 合并覆盖率 | `RDMA_COV merged=97.46` |
-| pcie_work 正式依赖 `1a80801e` | basic/fault 均 exit 0，W/E/F=`0/0/0` |
 | RXE | `rdma_rxe_test`、`rdma_rxe_fault_test`、`rdma_env_rxe_test` 3/3 pristine，均 exit 0，逐项 W/E/F=`0/0/0`；env RXE coverage total=67.4 |
 
 RXE 的 67.4 是单场景 total，不替代 env 九项回归的合并覆盖率 97.46。

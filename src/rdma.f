@@ -1,7 +1,7 @@
 // 目录：基础环境编译入口 src/rdma.f。
 // 文件职责：按依赖顺序编译 RDMA 基础环境及其公共适配器，最后编译
 //   src/rdma_pkg.sv 统一入口。
-// 主要依赖：AIP core、dpu_common、host_mem、net_packet、pcie_work；调用方先将 @*_ROOT@ 替换为
+// 主要依赖：AIP core、dpu_common、host_mem 和 net_packet；调用方先将 @*_ROOT@ 替换为
 //   实际路径。
 // 所有权与生命周期：filelist 只描述编译输入，不创建运行期对象，也不启动 sequence、Tcl 命令、
 //   test 或 top。
@@ -13,7 +13,7 @@
 +define+UVM
 +define+RDMA_NETPKT_USE_NET_PACKET_PKG
 
-// 外部 pcie_work package 含有局部 `timescale；统一编译时间单位，调用方无需再补该选项。
+// 统一编译时间单位，调用方无需再补该选项。
 -timescale=1ns/1ps
 
 // AIP 必须先于 dpu_common、net_packet 和 RDMA 参数适配器编译。
@@ -52,27 +52,6 @@
 +incdir+@NET_PACKET_ROOT@/src/uvm_wrapper
 @NET_PACKET_ROOT@/src/net_packet_pkg.sv
 
-// pcie_work 只提供通用 PCIe TL/topology 与 DPU 适配 contract；平台 wrapper 由调用方自行接入。
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/types
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/shared
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/agent
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/env
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/adapter
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/topology
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/switch
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/seq/base
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/seq/constraints
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/seq/scenario
-+incdir+@PCIE_WORK_ROOT@/pcie_tl_vip/src/seq/virtual
-+incdir+@PCIE_WORK_ROOT@/pcie_dpu_integration/src
-@PCIE_WORK_ROOT@/pcie_tl_vip/src/pcie_tl_if.sv
-@PCIE_WORK_ROOT@/pcie_tl_vip/src/shared/pcie_tl_bdf_utils_pkg.sv
-@PCIE_WORK_ROOT@/pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv
-@PCIE_WORK_ROOT@/pcie_tl_vip/src/topology/pcie_topology_pkg.sv
-@PCIE_WORK_ROOT@/pcie_tl_vip/src/pcie_tl_pkg.sv
-@PCIE_WORK_ROOT@/pcie_dpu_integration/src/pcie_dpu_integration_pkg.sv
-
 // RDMA 基础 package 必须按依赖由底向上编译。
 +incdir+src/types
 +incdir+src/model
@@ -84,7 +63,6 @@
 +incdir+src/adapters/dpu
 +incdir+src/adapters/net_packet
 +incdir+src/adapters/aip
-+incdir+src/adapters/pcie_work
 src/types/rdma_types_pkg.sv
 src/model/rdma_model_pkg.sv
 src/codec/rdma_codec_pkg.sv
@@ -95,7 +73,6 @@ src/adapters/dpu/rdma_dpu_adapter_pkg.sv
 src/adapters/net_packet/rdma_netpkt_pkg.sv
 src/tb/rdma_env_pkg.sv
 src/adapters/aip/rdma_aip_cfg_pkg.sv
-src/adapters/pcie_work/rdma_pcie_work_pkg.sv
 
 // facade 必须最后编译，确保所有被 export 的 package 已经存在。
 src/rdma_pkg.sv

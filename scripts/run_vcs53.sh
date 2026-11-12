@@ -51,7 +51,7 @@ suite=$1
 test_name=$2
 
 case "$suite" in
-  core|cmq_gate|env|pcie_work|rxe|axis_vip|rdma_defs) ;;
+  core|cmq_gate|env|rxe|axis_vip|rdma_defs) ;;
   *)
     echo "Unsupported suite: $suite" >&2
     usage
@@ -90,7 +90,7 @@ trap cleanup EXIT
 sync_repo "$repo_root" "$REMOTE_HOST:$remote_dir"
 
 remote_env=()
-for var_name in HOST_MEM_ROOT DPU_COMMON_ROOT PCIE_WORK_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT \
+for var_name in HOST_MEM_ROOT DPU_COMMON_ROOT NET_PACKET_ROOT AXIS_VIP_ROOT \
                 AIP_CORE_ROOT VCS_EXTRA_FLAGS RDMA_ARCHIVE; do
   if [[ -v "$var_name" ]]; then
     printf -v quoted_value '%q' "${!var_name}"

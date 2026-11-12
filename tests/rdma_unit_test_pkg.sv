@@ -17,10 +17,6 @@ package rdma_unit_test_pkg;
   import rdma_dpu_adapter_pkg::*;
   import rdma_netpkt_pkg::*;
   import rdma_env_pkg::*;
-`ifdef RDMA_PCIE_WORK_TEST
-  import pcie_tl_pkg::*;
-  import rdma_pcie_work_pkg::*;
-`endif
 `ifdef RDMA_RXE_TEST
   import rdma_rxe_pkg::*;
 `endif
