@@ -58,7 +58,9 @@ class rdma_scoreboard extends uvm_scoreboard;
       mem.track(item.rmr.mem);
     if (item.data.size() != 0)
       mem.write(item.lmr.mem, loff(item), item.data);
-    exp.post(item);
+    // TX-only RC 只验证首个提交，不等待远端 ACK；没有本地完成事件时不留下伪造的 scoreboard 期望。
+    if (!(item.tx_only && !item.qp.ud()))
+      exp.post(item);
     predicted_ap.write(item);
   endfunction
 

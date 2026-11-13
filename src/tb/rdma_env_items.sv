@@ -44,6 +44,11 @@ class rdma_ctrl_item extends uvm_sequence_item;
   // CONNECT（qp ↔ peer 双向推到 RTS）/ MODIFY_QP（qp 迁到 state）。
   rdma_res_qp	qp;
   rdma_res_qp	peer;
+  // TX-only QP 迁移目的；仅在 tx_only=1 时由控制面读取，不替代冻结 Function 身份。
+  bit	 tx_only;
+  bit [23:0]	tx_dest_qpn;
+  bit [23:0]	tx_dest_psn;
+  bit [47:0]	tx_dest_dmac;
   rdma_drv_qp_state_e	state;
   // DESTROY 对象；FLR/RECOVER 范围（Function 下标）。
   rdma_res	target;
@@ -113,6 +118,11 @@ class rdma_verb_item extends uvm_sequence_item;
   bit	signaled;
   // UD 目的 Q_Key（0 取对端 QP 的 Q_Key；故意不符时接收端应丢弃）。
   bit [31:0]	ud_qkey;
+  // TX-only UD 目的：当 tx_only=1 时不依赖本地 peer QP，直接使用平台提供的目的字段。
+  bit	 tx_only;
+  bit [23:0]	tx_dest_qpn;
+  bit [31:0]	tx_dest_qkey;
+  bit [47:0]	tx_dmac;
   payload_mode_e	data_mode;
   byte unsigned	data_fixed;
   byte unsigned	data_pattern[$];
@@ -128,7 +138,7 @@ class rdma_verb_item extends uvm_sequence_item;
 
   // 功能：构造默认 signaled、单 SGE、随机数据模式的 SEND verb item。
   // 输入/输出及副作用：name 为 UVM 名；QP/MR/SRQ 为非拥有空引用，长度/偏移/数据与 wr_id 输出为空或零。
-  // 失败/边界：投递前 sequence 必须提供 QP、本地 MR 及与操作匹配的远端资源；构造不做范围或权限校验。
+  // 失败/边界：投递前 sequence 必须提供 QP、本地 MR 及与操作匹配的远端资源；TX-only 还必须提供目的字段，构造不做范围校验。
   extern function new(string	name = "rdma_verb_item");
 
   // 功能：判断当前 verb 是否需要 driver 从本地 SGE 取得源数据，即 SEND/WRITE 及其立即数变体。
@@ -171,6 +181,10 @@ function rdma_verb_item::new(string	name = "rdma_verb_item");
     sge_count = 1;
     signaled = 1'b1;
     data_mode = PAYLOAD_RANDOM;
+    tx_only = 1'b0;
+    tx_dest_qpn = 0;
+    tx_dest_qkey = 0;
+    tx_dmac = '0;
 endfunction
 
 // monitor 观测到的一条完成（func 为所属 Function 下标）。

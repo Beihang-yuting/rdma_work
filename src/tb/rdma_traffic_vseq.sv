@@ -47,6 +47,10 @@ class rdma_traffic_vseq extends rdma_base_vseq;
   int unsigned	f0 = 0;
   int unsigned	f1 = 1;
   int unsigned	qp_count = 1;
+  bit	 tx_only;
+  int unsigned	tx_dest_qpn;
+  bit [31:0]	tx_dest_qkey;
+  bit [47:0]	tx_dmac;
   rdma_flow_group_t	flow_groups[$];
   time	drain = 5ms;
 
@@ -58,12 +62,12 @@ class rdma_traffic_vseq extends rdma_base_vseq;
 
   // 功能：校验统一场景后按显式 flow_groups 或 cfg.flow_groups 逐条建资源、投递流量并等待排空；无组时保留 f0/f1 兼容路径。
   // 输入/输出及副作用：每个 flow group 追加资源库对象并投递其消息；不修改 dpu_common 快照或配置目录。
-  // 失败/边界：ID 不存在、端点相同、QP 数为零、场景无效或远端 URC 在创建资源前 fatal。
+  // 失败/边界：ID 不存在、端点相同、QP 数为零、场景无效或远端 URC 在创建资源前 fatal；TX-only 只接受单一发送端和有效目的。
   extern task body();
 
-  // 功能：为一条业务边在 f0/f1 两端各建 PD、共享缓冲/MR，并按 requested_qps 建立独立 CQ/QP 后逐对推到 RTS。
-  // 输入/输出及副作用：b 为已 finalize 的场景，requested_qps 为对称 QP 数，p 输出资源组；控制面创建结果登记到 res。
-  // 失败/边界：requested_qps=0、场景未 finalize 或控制面失败时 fatal；资源已创建后失败不伪装成可重试事务。
+  // 功能：为双端或 TX-only 业务建立 PD、缓冲/MR、CQ/QP；TX-only 只创建发送端并把 UD QP 推到 RTS。
+  // 输入/输出及副作用：b 为已 finalize 的场景，requested_qps 为 QP 数，p 输出资源组；控制面创建结果登记到 res。
+  // 失败/边界：requested_qps=0、场景未 finalize、TX-only 目的缺失或控制面失败时 fatal；资源已创建后失败不伪装成可重试事务。
   extern task setup_scenario(rdma_scenario_cfg	b, output rdma_traffic_pair	p,
                              input int unsigned requested_qps = 1);
 
@@ -71,7 +75,7 @@ class rdma_traffic_vseq extends rdma_base_vseq;
   //   回收与结算，且投递时源数据就写入本地槽，因此按方向分别计数连续 unsigned：达到 min(QP 深度/2,
   //   槽数-1) 时强制 signaled（其完成意味着之前的 WR 全部完成），保证一个槽被再次写入前旧 WR 已执行；
   //   全部消息之后，对每个 QP/方向仍有未结算 unsigned 的队列各补一条 signaled 消息。
-  // 输入/输出及副作用：p 为场景资源组；投递消息（及所需的对端 RECV）。
+  // 输入/输出及副作用：p 为场景资源组；双端投递消息及所需 RECV，TX-only 只投递发送 WR。
   // 失败/边界：分布表达式非法时 uvm_fatal（见 rdma_scenario_cfg::draw）；补发消息不计入 traffic.count。
   extern task traffic(rdma_traffic_pair	p);
 
@@ -80,7 +84,7 @@ class rdma_traffic_vseq extends rdma_base_vseq;
   //   Function 单 SGE），随机数据模式/立即数/原子操作数，消耗 RQE 的 verb 先在对端投递一个整槽 RECV。
   // 输入/输出及副作用：p 为资源组、i 为消息序号；quiet 按方向/QP 保存连续 unsigned 计数，
   //   qp_override>=0 用于尾部补发时指定 QP。
-  // 失败/边界：长度与 SGE 抽样越界立即 fatal，禁止裁剪或重复求值；某方向连续 unsigned 达到 min(QP 深度/2, 槽数-1) 时本条
+  // 失败/边界：长度与 SGE 抽样越界立即 fatal，禁止裁剪或重复求值；TX-only 目的字段缺失或某方向连续 unsigned 达到 min(QP 深度/2, 槽数-1) 时本条
   //   强制 signaled。
   extern task one(rdma_traffic_pair	p, int unsigned	i, int	dir_override,
                   ref int unsigned	quiet[2][$], input int	qp_override = -1);
@@ -116,6 +120,21 @@ task rdma_traffic_vseq::body();
     status = env.cfg.scenario.validate();
     if (!status.ok())
       `uvm_fatal("RDMA_SCENARIO", status.convert2string())
+    if (tx_only) begin
+      if (flow_groups.size() != 0 || tx_dest_qpn == 0 || tx_dmac == '0 ||
+          (env.cfg.scenario.qp.kind == RDMA_SCENARIO_UD && tx_dest_qkey == 0))
+        `uvm_fatal("RDMA_SCENARIO",
+                   "TX-only requires no flow groups and complete destination fields")
+      if (env.cfg.scenario.qp.kind == RDMA_SCENARIO_RC &&
+          (qp_count != 1 || env.cfg.scenario.traffic.count != 1))
+        `uvm_fatal("RDMA_SCENARIO", "TX-only RC permits one QP and one first SEND only")
+      if (f0 >= env.res.funcs.size() || env.res.funcs[f0].remote)
+        `uvm_fatal("RDMA_SCENARIO", "TX-only sender Function is missing or remote")
+      setup_scenario(env.cfg.scenario, p, qp_count);
+      traffic(p);
+      env.wait_idle(drain);
+      return;
+    end
     // 配置中的 flow_groups 是项目级拓扑声明；序列字段仍保留给旧用例和平台临时覆盖。
     if (flow_groups.size() == 0 && env.cfg.flow_groups.size() != 0)
       flow_groups = env.cfg.flow_groups;
@@ -169,6 +188,46 @@ task rdma_traffic_vseq::setup_scenario(rdma_scenario_cfg	b, output rdma_traffic_
     p.qp_count = requested_qps;
     rights = rdma_drv_mr::rights_of(1'b1, b.mem.mr_remote_read, b.mem.mr_remote_write,
                                     b.mem.mr_remote_atomic);
+    if (tx_only) begin
+      f[0] = f0;
+      alloc_pd(f[0], p.pd[0]);
+      alloc_buf(f[0], b.mem.buf_bytes, p.mem[0]);
+      reg_mr(p.pd[0], p.mem[0], p.mr[0], rights, b.mem.mr_offset);
+      for (int unsigned q = 0; q < requested_qps; q++) begin
+        rdma_res_cq cq;
+        rdma_res_qp qp;
+        rdma_drv_qp_state_e states[3] = '{RDMA_DRV_QPS_INIT, RDMA_DRV_QPS_RTR, RDMA_DRV_QPS_RTS};
+
+        create_cq(f[0], b.qp.depth, cq);
+        it = new_ctrl(RDMA_CTRL_CREATE_QP, f[0]);
+        it.pd = p.pd[0];
+        it.qp_type = b.qp_type();
+        it.urc = 1'b0;
+        it.send_cq = cq;
+        it.recv_cq = cq;
+        it.size = b.qp.depth;
+        it.max_sge = b.qp.max_sge;
+        ctrl(it);
+        void'($cast(qp, it.res));
+        p.cq_list[0].push_back(cq);
+        p.qp_list[0].push_back(qp);
+        for (int unsigned s = 0; s < 3; s++) begin
+          rdma_ctrl_item mod;
+
+          mod = new_ctrl(RDMA_CTRL_MODIFY_QP, f[0]);
+          mod.qp = qp;
+          mod.state = states[s];
+          mod.tx_only = 1'b1;
+          mod.tx_dest_qpn = tx_dest_qpn;
+          mod.tx_dest_psn = b.qp.psn;
+          mod.tx_dest_dmac = tx_dmac;
+          ctrl(mod);
+        end
+      end
+      p.cq[0] = p.cq_list[0][0];
+      p.qp[0] = p.qp_list[0][0];
+      return;
+    end
     foreach (f[n]) begin
       alloc_pd(f[n], p.pd[n]);
       alloc_buf(f[n], b.mem.buf_bytes, p.mem[n]);
@@ -250,7 +309,7 @@ task rdma_traffic_vseq::one(rdma_traffic_pair	p, int unsigned	i, int	dir_overrid
     op = b.pick_op();
     qp_slot = qp_override >= 0 ? qp_override : i % p.qp_count;
     active_qp[0] = p.qp_list[0][qp_slot];
-    active_qp[1] = p.qp_list[1][qp_slot];
+    active_qp[1] = tx_only ? null : p.qp_list[1][qp_slot];
     slot = (i % b.mem.slots) * b.mem.slot_bytes;
     base = b.mem.slots * b.mem.slot_bytes;
     remote_side = env.res.funcs[n == 0 ? f0 : f1].remote;
@@ -274,8 +333,16 @@ task rdma_traffic_vseq::one(rdma_traffic_pair	p, int unsigned	i, int	dir_overrid
     it.signaled = dir_override >= 0 || quiet[n][qp_slot] + 1 >= unsigned_limit(b) ||
                   $urandom_range(99, 0) < b.traffic.signaled_pct;
     quiet[n][qp_slot] = it.signaled ? 0 : quiet[n][qp_slot] + 1;
-    if (it.consumes_rqe())
+    if (!tx_only && it.consumes_rqe())
       post(verb(RDMA_VERB_RECV, active_qp[1 - n], p.mr[1 - n], base + slot, b.mem.slot_bytes));
+    if (tx_only) begin
+      if (!(op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM}))
+        `uvm_fatal("RDMA_SCENARIO", "TX-only supports SEND and SEND_IMM only")
+      it.tx_only = 1'b1;
+      it.tx_dest_qpn = tx_dest_qpn;
+      it.tx_dest_qkey = tx_dest_qkey;
+      it.tx_dmac = tx_dmac;
+    end
     post(it);
 endtask
 

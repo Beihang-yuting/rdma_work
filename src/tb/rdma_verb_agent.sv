@@ -40,7 +40,8 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
     forever begin
       seq_item_port.get_next_item(item);
       drive(item, posted);
-      if (posted && item.signaled && item.op != RDMA_VERB_RECV)
+      if (posted && item.signaled && item.op != RDMA_VERB_RECV &&
+          !(item.tx_only && !item.qp.ud()))
         monitor.wait_completion(item.wr_id, 4 * env.cfg.response_timeout);
       seq_item_port.item_done();
     end
@@ -106,7 +107,7 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
       rdma_drv_wr::post_recv(env.res.funcs[func].drv(), item.qp.qp, wr, status);
   endtask
 
-  // 功能：投递 SQ 请求：远端地址/rkey（非 SEND）、atomic 操作数、UD 目的（对端 QPN、Q_Key、MAC）。
+  // 功能：投递 SQ 请求：远端地址/rkey（非 SEND）、atomic 操作数、UD 目的（peer 或 TX-only 目的字段）。
   // 输入/输出及副作用：写 SQ/SGB 并按需敲 doorbell。
   // 失败/边界：驱动错误经 status 输出。
   protected virtual task post_send(rdma_verb_item item, rdma_drv_sge sges[$],
@@ -126,9 +127,16 @@ class rdma_verb_driver extends uvm_driver #(rdma_verb_item);
     wr.compare_add = item.op == RDMA_VERB_FETCH_ADD ? item.swap_add_value : item.compare_value;
     wr.swap = item.swap_add_value;
     if (item.qp.ud()) begin
-      wr.dest_qpn = item.qp.peer.id;
-      wr.qkey = item.ud_qkey != 0 ? item.ud_qkey : item.qp.peer.qkey;
-      wr.dmac = item.qp.peer.owner.mac;
+      if (item.tx_only) begin
+        wr.dest_qpn = item.tx_dest_qpn;
+        wr.qkey = item.ud_qkey != 0 ? item.ud_qkey : item.tx_dest_qkey;
+        wr.dmac = item.tx_dmac;
+      end
+      else begin
+        wr.dest_qpn = item.qp.peer.id;
+        wr.qkey = item.ud_qkey != 0 ? item.ud_qkey : item.qp.peer.qkey;
+        wr.dmac = item.qp.peer.owner.mac;
+      end
     end
     rdma_drv_wr::post_send(env.res.funcs[func].drv(), item.qp.qp, wr, status);
   endtask
