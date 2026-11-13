@@ -32,6 +32,7 @@ typedef struct {
   int unsigned	mtu;
   int unsigned	max_sge;
   int unsigned	psn;
+  int unsigned	dest_qpn;
   bit [31:0]	qkey;
   int	timeout;
   int	retry;
@@ -50,16 +51,20 @@ typedef struct {
   bit	mr_remote_atomic;
 } rdma_scenario_mem_t;
 
-// 场景报文属性：随 QP 绑定，帧编码链路（仅 netpkt）编码该 QP 发出的报文时使用；0 表示沿用链路默认；当前 DUT 无对应场景接口，非默认值拒绝。
+// 场景报文属性：随 QP 绑定，帧编码链路或 DUT TX 参数下发使用；
+//   0 表示沿用链路默认。
 typedef struct {
   bit	vlan_en;
   int unsigned	vlan_id;
+  bit [47:0]	src_mac;
+  bit [47:0]	dst_mac;
   bit [31:0]	src_ip;
   bit [31:0]	dst_ip;
   int unsigned	udp_sport;
 } rdma_scenario_pkt_t;
 
-// 场景流量分布：消息数、各 verb 权重、长度/SGE 表达式、数据模式候选、signaled 比例与方向。
+// 场景流量分布：消息数、各 verb 权重、长度/SGE 与 payload/IMM 原始表达式、
+//   数据模式候选、signaled 比例与方向。
 typedef struct {
   string	op;
   int unsigned	count;
@@ -73,6 +78,9 @@ typedef struct {
   string	len;
   string	sge;
   string	data_mode;
+  string	data_fixed;
+  string	data_pattern;
+  string	imm;
   int unsigned	signaled_pct;
   int unsigned	dir;
 } rdma_scenario_traffic_t;

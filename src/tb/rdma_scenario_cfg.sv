@@ -233,9 +233,9 @@ class rdma_scenario_cfg extends uvm_object;
 // 失败/边界：仅 URC 返回 1。
   extern function bit urc();
 
-// 功能：判断报文参数是否全部继承链路默认。
-// 输入/输出及副作用：比较五个 pkt 字段，无副作用。
-// 失败/边界：vlan_id 非零即视为 override，即使 vlan_en=0。
+  // 功能：判断报文参数是否全部继承链路默认。
+  // 输入/输出及副作用：比较 VLAN、MAC、IP 和 UDP 源端口字段，无副作用。
+  // 失败/边界：任一 MAC/IP/UDP/VLAN 字段非零即视为 override，即使 vlan_en=0。
   extern function bit packet_defaults();
 
 // 功能：确定性校验 QP、操作、MR、槽布局及数据模式，不抽取任何 WR 表达式。
@@ -273,7 +273,7 @@ class rdma_scenario_cfg extends uvm_object;
 // 失败/边界：ev 缺失、表达式失败、lo>hi 或抽样越界 fatal；绝不裁剪或重复采样。
   extern function int unsigned draw(string	what, string	spec, int unsigned	lo, int unsigned	hi, rdma_value_spec	ev);
 
-// 功能：从已验证候选选择当前 WR 的负载模式。
+  // 功能：从已验证候选选择当前 WR 的负载模式。
 // 输入/输出及副作用：读取 traffic.data_mode 并消耗一个随机选择值。
 // 失败/边界：未知模式 fatal；空候选在 validate 拒绝。
   extern function payload_mode_e pick_data_mode();
@@ -290,9 +290,9 @@ endclass
 // 失败/边界：默认长度保留 [1:4096]；QP max_sge=4，显式多 SGE 表达式由 WR 边界检查。
 function rdma_scenario_cfg::new(string	name = "rdma_scenario_cfg");
   super.new(name);
-  qp = '{RDMA_SCENARIO_RC, 256, 1024, 4, 0, 32'h8001_0000, 14, 7, 7, 1};
+  qp = '{RDMA_SCENARIO_RC, 256, 1024, 4, 0, 0, 32'h8001_0000, 14, 7, 7, 1};
   mem = '{'h20000, 'h1000, 8, 0, 1, 1, 1};
-  pkt = '{0, 0, 0, 0, 0};
+  pkt = '{0, 0, 0, 0, 0, 0, 0};
   traffic.op = "send";
   traffic.count = 32;
   traffic.w_send = 1;
@@ -305,6 +305,9 @@ function rdma_scenario_cfg::new(string	name = "rdma_scenario_cfg");
   traffic.len = "[1:4096]";
   traffic.sge = "1";
   traffic.data_mode = "RANDOM,FIXED,INCREMENT,PATTERN";
+  traffic.data_fixed = "0";
+  traffic.data_pattern = "{0}";
+  traffic.imm = "";
   traffic.signaled_pct = 100;
   traffic.dir = 2;
   finalized = 0;
@@ -372,10 +375,11 @@ function bit rdma_scenario_cfg::urc();
 endfunction
 
 // 功能：判断报文参数是否全部继承链路默认。
-// 输入/输出及副作用：比较五个 pkt 字段，无副作用。
-// 失败/边界：vlan_id 非零即视为 override，即使 vlan_en=0。
+// 输入/输出及副作用：比较 VLAN、MAC、IP 和 UDP 源端口字段，无副作用。
+// 失败/边界：任一 MAC/IP/UDP/VLAN 字段非零即视为 override，即使 vlan_en=0。
 function bit rdma_scenario_cfg::packet_defaults();
-  return !pkt.vlan_en && pkt.vlan_id == 0 && pkt.src_ip == 0 && pkt.dst_ip == 0 && pkt.udp_sport == 0;
+  return !pkt.vlan_en && pkt.vlan_id == 0 && pkt.src_mac == 0 && pkt.dst_mac == 0 &&
+    pkt.src_ip == 0 && pkt.dst_ip == 0 && pkt.udp_sport == 0;
 endfunction
 
 // 功能：确定性校验 QP、操作、MR、槽布局及数据模式，不抽取任何 WR 表达式。
@@ -392,6 +396,8 @@ function rdma_status rdma_scenario_cfg::validate();
   bit	has_literal_sge;
   bit	number_overflow;
   string	parts[$];
+  string	pattern_spec;
+  string	pattern_body;
   ops = '{RDMA_VERB_SEND, RDMA_VERB_SEND_IMM, RDMA_VERB_WRITE, RDMA_VERB_WRITE_IMM,
     RDMA_VERB_READ, RDMA_VERB_CMP_SWAP, RDMA_VERB_FETCH_ADD};
   if (!(qp.kind inside {RDMA_SCENARIO_RC, RDMA_SCENARIO_UD, RDMA_SCENARIO_URC}))
@@ -400,7 +406,7 @@ function rdma_status rdma_scenario_cfg::validate();
     return fail("rdma.qp.depth must be 1..32768 and max_sge 1..4");
   if (!(qp.mtu inside {256, 512, 1024, 2048, 4096}))
     return fail("rdma.qp.mtu must be 256/512/1024/2048/4096");
-  if (qp.psn > 24'hffffff || qp.timeout < 0 || qp.timeout > 31 ||
+  if (qp.psn > 24'hffffff || qp.dest_qpn > 24'hffffff || qp.timeout < 0 || qp.timeout > 31 ||
       qp.retry < 0 || qp.retry > 7 || qp.rnr_retry < 0 || qp.rnr_retry > 7 ||
       qp.min_rnr < 0 || qp.min_rnr > 31)
     return fail("rdma.qp PSN/timeout/retry/rnr_retry/min_rnr exceeds hardware encoding");
@@ -412,6 +418,24 @@ function rdma_status rdma_scenario_cfg::validate();
     return fail("rdma.mem.slot_bytes must exceed UD GRH size 40");
   if (pkt.vlan_id > 4095 || pkt.udp_sport > 65535)
     return fail("rdma.pkt.vlan_id must be 0..4095 and udp_sport 0..65535");
+  if (rdma_value_spec::strip(traffic.data_fixed) != "" &&
+      rdma_value_spec::parse_number(traffic.data_fixed, literal_len, number_overflow) &&
+      literal_len > 8'hff)
+    return fail("rdma.traffic.data_fixed literal must be 0..255");
+  if (rdma_value_spec::strip(traffic.imm) != "" &&
+      rdma_value_spec::parse_number(traffic.imm, literal_len, number_overflow) &&
+      literal_len > 32'hffff_ffff)
+    return fail("rdma.traffic.imm literal must be 0..0xffffffff");
+  pattern_spec = rdma_value_spec::strip(traffic.data_pattern);
+  if (pattern_spec != "" && pattern_spec.len() >= 2 && pattern_spec[0] == "{" &&
+      pattern_spec[pattern_spec.len() - 1] == "}") begin
+    pattern_body = pattern_spec.substr(1, pattern_spec.len() - 2);
+    rdma_value_spec::split_top(pattern_body, parts);
+    foreach (parts[i])
+      if (rdma_value_spec::parse_number(parts[i], literal_len, number_overflow) &&
+          literal_len > 8'hff)
+        return fail("rdma.traffic.data_pattern elements must be 0..255");
+  end
   if (traffic.signaled_pct > 100 || traffic.dir > 2 || traffic.count == 0)
     return fail("rdma.traffic requires count>0, signaled_pct 0..100, dir 0..2");
   if (rdma_value_spec::strip(traffic.len) == "" || rdma_value_spec::strip(traffic.sge) == "")
@@ -556,6 +580,11 @@ endfunction
 // 输入/输出及副作用：按值格式化传输类型、队列、操作和表达式，不求值。
 // 失败/边界：未 finalize 也可诊断当前输入。
 function string rdma_scenario_cfg::describe();
-  return $sformatf("rdma.qp.type=%s depth=%0d mtu=%0d max_sge=%0d; rdma.traffic.op=%s count=%0d len=%s sge=%s",
-    qp.kind.name(), qp.depth, qp.mtu, qp.max_sge, traffic.op, traffic.count, traffic.len, traffic.sge);
+  // 摘要保留原始表达式，便于诊断参数来源而不提前抽样。
+  return $sformatf({"rdma.qp.type=%s depth=%0d mtu=%0d max_sge=%0d dest_qpn=%0d; ",
+    "rdma.pkt.smac=%012h dmac=%012h; rdma.traffic.op=%s count=%0d len=%s sge=%s ",
+    "data_fixed=%s data_pattern=%s imm=%s"},
+    qp.kind.name(), qp.depth, qp.mtu, qp.max_sge, qp.dest_qpn, pkt.src_mac, pkt.dst_mac,
+    traffic.op, traffic.count, traffic.len, traffic.sge, traffic.data_fixed,
+    traffic.data_pattern, traffic.imm);
 endfunction

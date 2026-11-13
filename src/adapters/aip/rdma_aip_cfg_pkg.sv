@@ -76,7 +76,8 @@ endfunction
   // 失败/边界：未知 mode 写入非法枚举供核心状态校验；语法错误由 AIP fatal。
     extern static function void load_env(rdma_env_cfg	cfg);
 
-  // 功能：读取队列深度、MTU、SGE、PSN、QKey 与重试编码，并把 type 文本映射为传输枚举。
+  // 功能：读取队列深度、MTU、SGE、PSN、目的 QPN、QKey 与重试编码，
+  //   并把 type 文本映射为传输枚举。
   // 输入/输出及副作用：b 接收 AIP 宏结果；默认值取未发布候选当前字段。
   // 失败/边界：标量范围由核心 validate 返回错误；AIP 数字语法或类型转换错误仍 fatal。
     extern static function void load_qp(rdma_scenario_cfg	b);
@@ -86,13 +87,15 @@ endfunction
   // 失败/边界：标量范围由核心 validate 返回错误；AIP 数字语法或类型转换错误仍 fatal。
     extern static function void load_mem(rdma_scenario_cfg	b);
 
-  // 功能：读取操作选择、七种权重、消息数/方向/signaled 比例，并保留长度/SGE/模式表达式原文。
+  // 功能：读取操作选择、七种权重、消息数/方向/signaled 比例，
+  //   并保留长度/SGE/负载及 IMM 表达式原文。
   // 输入/输出及副作用：b 接收 AIP 宏结果；默认值取未发布候选当前字段。
   // 失败/边界：标量范围由核心 validate 返回错误；AIP 数字语法或类型转换错误仍 fatal。
     extern static function void load_traffic(rdma_scenario_cfg	b);
 
-  // 功能：读取报文属性，保留 VLAN/UDP 全宽供范围校验。
-  // 输入/输出及副作用：b 接收五个 pkt 字段；IPv4 支持既有点分或 AIP 数字语法。
+  // 功能：读取报文属性，保留 VLAN/UDP 全宽供范围校验并加载源/目的 MAC。
+  // 输入/输出及副作用：b 接收 VLAN、MAC、IPv4 和 UDP 字段；
+  //   IPv4 支持既有点分或 AIP 数字语法。
   // 失败/边界：点分语义错误返回状态；数值语法错误继承 AIP fatal。
     extern static function rdma_status load_pkt(rdma_scenario_cfg	b);
 
@@ -187,6 +190,7 @@ endfunction
     int unsigned	mtu;
     int unsigned	max_sge;
     int unsigned	psn;
+    int unsigned	dest_qpn;
     bit [31:0]	qkey;
     int	timeout;
     int	retry;
@@ -198,6 +202,7 @@ endfunction
     mtu = b.qp.mtu;
     max_sge = b.qp.max_sge;
     psn = b.qp.psn;
+    dest_qpn = b.qp.dest_qpn;
     qkey = b.qp.qkey;
     timeout = b.qp.timeout;
     retry = b.qp.retry;
@@ -207,6 +212,7 @@ endfunction
     `aip_int("rdma.qp", int	unsigned, mtu, mtu)
     `aip_int("rdma.qp", int	unsigned, max_sge, max_sge)
     `aip_int("rdma.qp", int	unsigned, psn, psn)
+    `aip_int("rdma.qp", int	unsigned, dest_qpn, dest_qpn)
     `aip_int("rdma.qp", bit [31:0], qkey, qkey)
     `aip_int("rdma.qp", int, timeout, timeout)
     `aip_int("rdma.qp", int, retry, retry)
@@ -216,6 +222,7 @@ endfunction
     b.qp.mtu = mtu;
     b.qp.max_sge = max_sge;
     b.qp.psn = psn;
+    b.qp.dest_qpn = dest_qpn;
     b.qp.qkey = qkey;
     b.qp.timeout = timeout;
     b.qp.retry = retry;
@@ -326,6 +333,9 @@ endfunction
     b.traffic.len = raw_or("rdma.traffic", "len", b.traffic.len);
     b.traffic.sge = raw_or("rdma.traffic", "sge", b.traffic.sge);
     b.traffic.data_mode = raw_or("rdma.traffic", "data_mode", b.traffic.data_mode);
+    b.traffic.data_fixed = raw_or("rdma.traffic", "data_fixed", b.traffic.data_fixed);
+    b.traffic.data_pattern = raw_or("rdma.traffic", "data_pattern", b.traffic.data_pattern);
+    b.traffic.imm = raw_or("rdma.traffic", "imm", b.traffic.imm);
 
   endfunction
 
@@ -336,15 +346,23 @@ endfunction
     bit	vlan_en;
     int unsigned	vlan_id;
     int unsigned	udp_sport;
+    bit [47:0]	src_mac;
+    bit [47:0]	dst_mac;
     rdma_status	status;
     vlan_en = b.pkt.vlan_en;
     vlan_id = b.pkt.vlan_id;
     udp_sport = b.pkt.udp_sport;
+    src_mac = b.pkt.src_mac;
+    dst_mac = b.pkt.dst_mac;
     `aip_int("rdma.pkt", bit, vlan_en, vlan_en)
     `aip_int("rdma.pkt", int	unsigned, vlan_id, vlan_id)
+    `aip_int("rdma.pkt", bit [47:0], src_mac, src_mac)
+    `aip_int("rdma.pkt", bit [47:0], dst_mac, dst_mac)
     `aip_int("rdma.pkt", int	unsigned, udp_sport, udp_sport)
     b.pkt.vlan_en = vlan_en;
     b.pkt.vlan_id = vlan_id;
+    b.pkt.src_mac = src_mac;
+    b.pkt.dst_mac = dst_mac;
     b.pkt.udp_sport = udp_sport;
     status = ip_param("src_ip", b.pkt.src_ip);
     if (!status.ok())
