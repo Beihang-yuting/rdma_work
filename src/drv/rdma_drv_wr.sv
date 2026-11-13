@@ -367,18 +367,34 @@ class rdma_drv_wr extends uvm_object;
     end
   endfunction
 
-  // 功能：按 xtrdma_set_ud_wqe 填写 UD 目的 IP、QPN/Q_Key、PD、DMAC、SGE 数和负载长度等字段。
-  // 输入/输出及副作用：原位修改 wqe，读取 qp.pd、wr、sge_num 与 payload；SEND_IMM 时同时写立即数。
-  // 失败/边界：要求 wqe 容纳固定 16B 目的 IP 且 qp.pd 非空；不拒绝非 SEND_IMM opcode 或无效目的参数。
+  // 功能：按 xtrdma_set_ud_wqe 填写 UD 目的 IP、QPN/Q_Key、PD、DMAC、源地址索引、VLAN、SGE
+  //   数和负载长度等字段；目的 IP、源地址索引与 VLAN 默认从已经完成 RTR 的 QPC 地址向量读取。
+  // 输入/输出及副作用：原位修改 wqe，读取 qp.qpc、qp.pd、wr、sge_num 与 payload；SEND_IMM 时同时写立即数。
+  // 失败/边界：要求 wqe 容纳固定 16B 目的 IP 且 qp.pd 非空；wr.dest_ip 非零时覆盖 QPC 地址，未连接 QP
+  //   可能产生全零地址向量，调用方仍须保证目的参数有效。
   static function void fill_ud(inout rdma_bytes_t wqe, input rdma_drv_qp qp,
                                input rdma_drv_send_wr wr, input int unsigned sge_num,
                                input longint unsigned payload);
+    bit has_dest_ip;
+
+    has_dest_ip = 1'b0;
     foreach (wr.dest_ip[i])
-      wqe[48 + i] = wr.dest_ip[i];
+      has_dest_ip |= wr.dest_ip[i] != 0;
+    foreach (wr.dest_ip[i])
+      wqe[48 + i] = has_dest_ip ? wr.dest_ip[i] : qp.qpc[80 + i];
     `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_HOPLIMIT, 255)
     `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_DST_QPN, wr.dest_qpn)
     `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_DST_Q_KEY, wr.qkey)
     `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_PD_IDX, qp.pd.pd_id)
+    `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_SRC_ADDR_IDX,
+                  rdma_be::field(qp.qpc, RDMA_QPC_SRC_ADDR_IDX_WORD_BYTE_OFFSET,
+                                 RDMA_QPC_SRC_ADDR_IDX_LSB, RDMA_QPC_SRC_ADDR_IDX_WIDTH))
+    `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_VLAN,
+                  rdma_be::field(qp.qpc, RDMA_QPC_VLAN_WORD_BYTE_OFFSET,
+                                 RDMA_QPC_VLAN_LSB, RDMA_QPC_VLAN_WIDTH))
+    `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_VLAN_ID,
+                  rdma_be::field(qp.qpc, RDMA_QPC_VLAN_ID_WORD_BYTE_OFFSET,
+                                 RDMA_QPC_VLAN_ID_LSB, RDMA_QPC_VLAN_ID_WIDTH))
     `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_SGE_NUM, sge_num)
     `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_DMAC, wr.dmac)
     `RDMA_DRV_SET(wqe, RDMA_SQ_WQE_UD_TOTAL_PAYLOAD_LEN, payload)

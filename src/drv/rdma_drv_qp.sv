@@ -92,6 +92,11 @@ class rdma_drv_qp_attr extends uvm_object;
   bit [23:0] dest_qpn;
   bit [47:0] dmac;
   byte unsigned dest_ip[16];
+  bit vlan_valid;
+  bit vlan_en;
+  int unsigned vlan_id;
+  bit udp_sport_valid;
+  int unsigned udp_sport;
   bit source_addr_valid;
   int unsigned source_addr_idx;
   bit route_valid;
@@ -695,7 +700,8 @@ class rdma_drv_qp extends uvm_object;
     endcase
   endfunction
 
-  // 功能：xtrdma_update_qp_context：按 mask 把属性写入 QPC 镜像（PSN 写入全部镜像字段）。
+  // 功能：xtrdma_update_qp_context：按 mask 把属性写入 QPC 镜像（PSN 写入全部镜像字段），并在
+  //   地址向量更新时同步已物化的 VLAN 与 UDP 源端口。
   // 输入/输出及副作用：读取 a 中由 mask 选中的状态、寻址、重试及 PSN 字段并原地修改 qpc；next
   //   决定写入的硬件状态编码，未置位字段保持原值。
   // 失败/边界：本函数假定 modify_qp 已验证状态迁移与属性范围；未知或未置位的 mask 位被忽略，
@@ -758,6 +764,12 @@ class rdma_drv_qp extends uvm_object;
       `RDMA_DRV_SET(qpc, RDMA_QPC_DMAC, a.dmac)
       foreach (a.dest_ip[i])
         qpc[80 + i] = a.dest_ip[i];
+      if (a.vlan_valid) begin
+        `RDMA_DRV_SET(qpc, RDMA_QPC_VLAN, a.vlan_en)
+        `RDMA_DRV_SET(qpc, RDMA_QPC_VLAN_ID, a.vlan_en ? a.vlan_id : 0)
+      end
+      if (a.udp_sport_valid)
+        `RDMA_DRV_SET(qpc, RDMA_QPC_CUR_UDP_SPORT, a.udp_sport)
     end
     if (a.mask & rdma_drv_qp_attr::M_STATE) begin
       `RDMA_DRV_SET(qpc, RDMA_QPC_QP_ST, qpc_state(next))

@@ -136,8 +136,8 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
   endtask
 
   // 功能：把 qp 迁到 state，属性取该 QP 资源记录的链路参数：→INIT（UD Q_Key / RC 远端权限）、
-  //   INIT→RTR（RC：对端 QPN、RQ PSN = 对端起始 PSN、MTU、目的 MAC、min_rnr）、RTR→RTS（SQ PSN = 本端
-  //   起始 PSN、timeout、重试次数）；其它迁移（SQD、ERR、RESET、SQD→RTS 等）只给状态。
+  //   INIT→RTR（对端 QPN、RQ PSN = 对端起始 PSN、MTU、目的 MAC、VLAN/IP/UDP 源端口及路由）、
+  //   RTR→RTS（SQ PSN = 本端起始 PSN、timeout、重试次数）；其它迁移（SQD、ERR、RESET、SQD→RTS 等）只给状态。
   // 输入/输出及副作用：驱动 modify；广播 CHANGED（ERR 时资源状态置 ERROR）。
   // 失败/边界：驱动失败经 status 返回。
   protected virtual task modify(rdma_res_qp	qp, rdma_drv_qp_state_e	state, rdma_res_qp	peer,
@@ -155,14 +155,14 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       attr.mask |= rdma_drv_qp_attr::M_ACCESS;
       attr.access = RDMA_RIGHT_REMOTE_READ | RDMA_RIGHT_REMOTE_WRITE | RDMA_RIGHT_REMOTE_ATOMIC;
     end
-    else if (state == RDMA_DRV_QPS_RTR && !qp.ud() && qp.qp.cur_state == RDMA_DRV_QPS_INIT) begin
+    else if (state == RDMA_DRV_QPS_RTR && qp.qp.cur_state == RDMA_DRV_QPS_INIT) begin
       attr.mask |= rdma_drv_qp_attr::M_DEST_QPN | rdma_drv_qp_attr::M_RQ_PSN |
                    rdma_drv_qp_attr::M_PATH_MTU | rdma_drv_qp_attr::M_AV |
                    rdma_drv_qp_attr::M_MIN_RNR | rdma_drv_qp_attr::M_ROUTE;
-      attr.dest_qpn = peer.id;
-      attr.rq_psn = peer.psn;
+      attr.dest_qpn = item.tx_only ? item.tx_dest_qpn : peer.id;
+      attr.rq_psn = item.tx_only ? item.tx_dest_psn : peer.psn;
       attr.path_mtu = qp.mtu;
-      attr.dmac = peer.owner.mac;
+      attr.dmac = item.tx_only ? item.tx_dest_dmac : peer.owner.mac;
       attr.min_rnr = qp.min_rnr;
       attr.source_addr_valid = qp.owner.drv().cfg.source_addr_valid;
       attr.source_addr_idx = qp.owner.drv().cfg.source_addr_idx;
@@ -170,6 +170,19 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       attr.dst_port = qp.owner.drv().cfg.dst_port;
       attr.dst_vport_id = qp.owner.drv().cfg.dst_vport_id;
       attr.fwd = qp.owner.drv().cfg.fwd;
+      attr.vlan_valid = qp.pkt.vlan_en || qp.pkt.vlan_id != 0;
+      attr.vlan_en = qp.pkt.vlan_en;
+      attr.vlan_id = qp.pkt.vlan_id;
+      attr.udp_sport_valid = qp.pkt.udp_sport != 0;
+      attr.udp_sport = qp.pkt.udp_sport;
+      foreach (attr.dest_ip[i])
+        attr.dest_ip[i] = 0;
+      if (qp.pkt.dst_ip != 0) begin
+        attr.dest_ip[12] = qp.pkt.dst_ip[31:24];
+        attr.dest_ip[13] = qp.pkt.dst_ip[23:16];
+        attr.dest_ip[14] = qp.pkt.dst_ip[15:8];
+        attr.dest_ip[15] = qp.pkt.dst_ip[7:0];
+      end
     end
     else if (state == RDMA_DRV_QPS_RTS && qp.qp.cur_state == RDMA_DRV_QPS_RTR) begin
       attr.mask |= rdma_drv_qp_attr::M_SQ_PSN | rdma_drv_qp_attr::M_TIMEOUT |
