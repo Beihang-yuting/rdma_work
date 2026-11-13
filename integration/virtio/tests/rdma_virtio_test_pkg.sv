@@ -15,6 +15,7 @@ package rdma_virtio_test_pkg;
   import rdma_types_pkg::*;
   import rdma_env_pkg::*;
   import rdma_dpu_adapter_pkg::*;
+  import rdma_aip_pkg::*;
   import project_env_pkg::*;
   import rdma_virtio_pkg::*;
   `include "uvm_macros.svh"

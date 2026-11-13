@@ -88,20 +88,18 @@ package rdma_aip_pkg;
   endclass
 
   // 功能：绑定一个 rdma_env，并为其注册三个常驻 AIP 命令。
-  // 输入/输出及副作用：bound 输出 registry 持有的目标；成功后创建 rdma_init/rdma_run/rdma_stop 命令对象。
+  // 输入/输出及副作用：registry 拥有 target；成功后创建共享该 target 的 rdma_init/rdma_run/rdma_stop 命令对象。
   // 失败/边界：空 env、不同 env 重复绑定或已有同名命令均拒绝；同一 env 重复调用保持幂等。
   class rdma_aip_registry;
     static rdma_aip_target target;
 
-    // 功能：把已连接的 rdma_env 纳入唯一 AIP 命令上下文。
-    // 输入/输出及副作用：env 只保存借用引用；bound 返回常驻 target，不启动任何 sequence。
-    // 失败/边界：不同环境不能共用同一进程级命令名；已有命令冲突时不留下部分注册。
-    static function bit bind_and_register(rdma_env env, output rdma_aip_target bound,
-                                          output string why);
+    // 功能：把已连接的 rdma_env 纳入唯一 AIP 命令上下文，并注册三个常驻命令。
+    // 输入/输出及副作用：env 只保存借用引用；why 返回绑定或注册诊断，不启动任何 sequence。
+    // 失败/边界：空 env、不同环境重复绑定或命令重名均拒绝；同一 env 重复调用保持幂等。
+    static function bit bind_and_register(rdma_env env, output string why);
       string names[$] = '{"rdma_init", "rdma_run", "rdma_stop"};
       rdma_aip_command command;
 
-      bound = null;
       why = "";
       if (env == null) begin
         why = "RDMA AIP binding requires a non-null rdma_env";
@@ -112,7 +110,6 @@ package rdma_aip_pkg;
           why = "RDMA AIP commands are already bound to another rdma_env";
           return 0;
         end
-        bound = target;
         return 1;
       end
       foreach (names[i]) begin
@@ -124,17 +121,7 @@ package rdma_aip_pkg;
       target = new(env);
       foreach (names[i])
         command = new(names[i], names[i], target);
-      bound = target;
       return 1;
-    endfunction
-
-    // 功能：提供不需要暴露 target 句柄的环境注册入口。
-    // 输入/输出及副作用：env 绑定到本 package 的唯一 target，并注册三个常驻命令；why 返回诊断。
-    // 失败/边界：沿用带 bound 重载的空 env、异源 env 和命令重名拒绝条件；成功后 target 由 registry 持有。
-    static function bit bind_and_register(rdma_env env, output string why);
-      rdma_aip_target ignored;
-
-      return bind_and_register(env, ignored, why);
     endfunction
 
     // 功能：更新绑定 target 的配置完成状态。
