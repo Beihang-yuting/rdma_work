@@ -120,6 +120,35 @@ PF 路径为 `rdma.hN.pfP.resource`，VF 路径为 `rdma.hN.pfP.vfV.resource`；
 
 Tcl 命令层管理一次配置执行的上下文及结果；参数成功重载后清除旧配置完成状态，重载失败保留原状态。配置 sequence 本身不维护另一套 AIP busy/configured 状态。调用层依据实际环境检查 RDMA 初始化是否已开始、是否有活动配置命令；直接 SV 调用者也承担相同责任。平台负责 reset/readiness、活动业务停机和最终收尾。
 
+## 启动与发包参数
+
+整理后的两种启动方式共用实际能力：
+
+- Tcl：`dut_config` → `rdma_init` → `rdma_run`。
+- 直接 SV：`dut_cfg_seq` → 现有 `rdma_env.initialize()` task → `rdma_traffic_vseq`。
+
+调用层管理顺序和门禁：配置 sequence 成功表示表配置完成，`ready` 表示初始化成功，run 完成还须确认业务结果和 scoreboard 排空。
+删除纯转发类时保留实际初始化、业务执行、取消登记和结果检查，不新增总启动 sequence；取消不等于撤销 DMA 或释放资源。
+`set_param` 只修改参数来源，须显式 `load_params` 才应用；该重载只允许初始化从未开始的窗口，本轮不新增初始化后重载。
+
+复用已有参数入口，不另造发包配置层：
+
+| 常用路径 | 控制内容 |
+| --- | --- |
+| `rdma.qp.type/depth/mtu/max_sge` | QP 类型、队列深度、MTU、SGE 上限 |
+| `rdma.mem.buf_bytes/slot_bytes/slots/mr_offset` | 缓冲、槽和 MR；权限继续使用 `rdma.mem.mr_remote_*` |
+| `rdma.traffic.op/count/dir/signaled_pct` | 操作、每个 group 的消息数、方向及完成信号比例 |
+| `rdma.traffic.len/sge/data_mode` | 逐 WR 的长度、SGE 数及数据模式；混合操作沿用 `rdma.traffic.w_*` |
+
+`count` 不是每 QP 数量，也不包含为完成回收补发的消息；原子操作长度固定 8B，原子/远端路径沿用单 SGE 约束。
+`data_mode` 可选 RANDOM/FIXED/INCREMENT/PATTERN，但 FIXED 的具体值和 PATTERN 内容目前仍随机生成。
+MAC、UDP 目的端口、具体 payload、IMM 值及原子操作数尚无对应参数入口，不承诺任意报文字段均可设置。
+`rdma.pkt.*` 的非默认值在默认 external driver 路径会被拒绝；模型 netpkt 可使用这些属性，但不能替代真实 DUT 写表。
+外部路径须按真实 driver/平台能力预检，修改 `link_type` 不能视为已接通网络或已配置硬件报文属性。
+
+当前组合参考没有连接真实 ETH 对端/环回或网络观察口；配置 fixture 通过不是收发闭环验证。
+平台提供网络连接、DUT DMA/Completion 和必要观察，env 保持创建/连接职责；ETH 对端及观察组件的生命周期由平台管理。
+
 ## 多 QP 运行与生命周期
 
 运行入口显式选择 group 或端点时优先使用该选择，两者互斥；仅在没有显式选择时使用 cfg 的 flow groups。
