@@ -1,8 +1,34 @@
 # 组合环境验证记录
 
-验证日期：2026-11-12。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 在本地直接组合 RDMA，`project_base_test` 与配置 sequence 继续来自 virtio_work 且外部 checkout 未修改。
+最近验证日期：2026-11-13。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 直接组合 RDMA，复用 virtio_work 的基础 test/配置 sequence；本次同时修正 dpu_common 的 RDMA Notify PF 限制。
 
-## 自动 grant 定向验证（当前修改）
+## 独立配置 sequence 与 PF Notify 定向验证
+
+2026-11-13 执行 `RDMA_CFG_SEQ_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh`，编译及两个基础场景通过，没有执行全量回归。
+
+提交前复跑源码位于 `/tmp/rdma_cfg_seq_current.jChGES`，日志位于该目录的 `output/virtio_integration`。
+当前 `integration/` 和 `src/` 下的仿真源码及脚本与该隔离副本逐文件 SHA-256 一致；复制后仅更新使用说明与本验证记录。
+`dpu_common` 使用已发布的 `0e8a8eb`（PF Notify 修复），复制到该隔离目录的 `deps/dpu_common`，并核对全部文件内容一致；
+其余依赖使用 `/home/ubuntu/ryan/vio_release_auto_validation_20261110.4FOO8Z` 下对应源码，AIP 为其中的 `aip_core_set_param_expr`。未改写 53 上共享依赖 checkout。
+
+| 日志 | 覆盖 | 结果 |
+| --- | --- | --- |
+| `config_seq.log` | Host0 两个 PF、VIO 关闭；AIP 宏直接创建独立 seq，自行获取原项目 cfg/Function/grant；执行生产配置；核对两 PF Notify 的地址排序、Function ID 和高 DWORD 先写；参数重载为 count=23 后再次配置 | `RDMA_CFG_SEQ_PASS` |
+| `rdma_disabled.log` | RDMA 关闭时不创建其 service/env/grant/catalog，VIO 参数重载仍有效 | `RDMA_VIRTIO_VIO_ONLY_PASS` |
+
+两个场景最终 UVM WARNING/ERROR/FATAL 均为 `0/0/0`。配置用例另外精确捕获一次主动注入的异源 cfg fatal，验证未执行子流程且原配置状态保持；其他 fatal 不捕获。
+编译无错误；除 `LCA_FEATURES_ENABLED` 提示外，复用的旧 `rdma_project_config_test.sv` 有五条结构体默认值的 `ENUMASSIGN` 警告，此次未修改该 fixture。
+
+修改前，相同 PF 配置曾在 `public_records()` 被 VF-only 条件拒绝，原日志保留于
+`/home/ubuntu/workspace/rdma_cfg_seq.3BtFw9/output/virtio_integration/config_seq_pf_notify_rejected.log`。
+修复仅删除 `owner.kind != DPU_FUNCTION_VF`，保留原 Host、保留位和索引检查，不增加新校验或适配层。
+
+配置用例只在 `pcie_tl_reg_seq` 传输边界复用字节存储 fixture，实际执行 AF、BDF、RDMA hardware plan、Notify/RNET 的生产配置流程；没有真实 DUT，不代表 Intel 链路、`rdma_init`、QP 收发或 ETH 环回通过。
+`project_dut_config_seq` 的对象绑定和重载门禁此前也曾以入口探针单独通过；本次以实际配置流程替换了该模拟成功结果。
+
+本地 `git diff --check`、`bash -n integration/virtio/tests/run.sh` 和 `tools/check_changed_sv_style.py --base HEAD` 通过。
+
+## 自动 grant 定向验证（2026-11-12）
 
 2026-11-12 在 `ubuntu@10.11.10.53` 的登录 bash 中执行 `RDMA_GRANT_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh`，VCS 编译通过；编译日志只有 `LCA_FEATURES_ENABLED` 使用提示。此次没有执行全量回归。
 

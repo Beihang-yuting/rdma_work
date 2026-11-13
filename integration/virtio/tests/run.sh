@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 目录/层次：integration/virtio/tests；仅在 ubuntu@10.11.10.53 登录 bash 运行。
-# 职责：编译实际组合环境，验证多 Host/PF/VF、单次重载、失败不提交及跨进程 restore。
+# 职责：编译实际组合环境，验证直接注册配置 sequence、多 Host/PF/VF、重载及跨进程 restore。
 # 依赖：七个源码根、VCS/license 和匹配的 AIP dist；不修改依赖源码。
 # 所有权/生命周期：RDMA_VIRTIO_RUN 保存 binary/log/checkpoint；不删除其他回归产物。
 set -euo pipefail
@@ -24,7 +24,10 @@ text = Path('integration/filelists/rdma_virtio.f').read_text()
 for key in ['VIRTIO_WORK_ROOT', 'AIP_CORE_ROOT', 'DPU_COMMON_ROOT', 'HOST_MEM_ROOT',
             'NET_PACKET_ROOT', 'PCIE_WORK_ROOT', 'PCIE_INTEL_ROOT']:
     text = text.replace('@'+key+'@', os.environ[key])
-text += '\nintegration/virtio/tests/rdma_virtio_test_pkg.sv\nintegration/virtio/tests/rdma_virtio_top.sv\n'
+text += ('\nintegration/project/tests/rdma_project_config_test.sv\n'
+         '+incdir+integration/virtio/tests\n'
+         'integration/virtio/tests/rdma_virtio_test_pkg.sv\n'
+         'integration/virtio/tests/rdma_virtio_top.sv\n')
 (Path(os.environ['RDMA_VIRTIO_RUN'])/'expanded.f').write_text(text)
 PY
 vcs -full64 -sverilog -ntb_opts uvm -timescale=1ns/1ps -debug_access+r+w+f -lca \
@@ -59,6 +62,16 @@ run_case() {
 common=(+vio.pairs=1 +vio.queue_type=VQ_PACKED +vio.queue_size=256 +vio.rx_buf_size=2048
     +vio.completion_mode=VIRTIO_COMPLETION_POLLING +vio.notify_bar=0 +vio.notify_base=0
     +vio.notify_stride=4 +vio.notify_encoding=VIO_NOTIFY_DPU32 +rdma.enabled=1)
+# 配置入口定向验证自动绑定、重载与两 PF Notify 写入；复用寄存器传输 fixture，无真实 DUT。
+if [[ ${RDMA_CFG_SEQ_SMOKE_ONLY:-0} == 1 ]]; then
+    run_case config_seq config_seq.tcl RDMA_CFG_SEQ_PASS required \
+        +UVM_TESTNAME=project_cfg_seq_test +rdma.enabled=1 +vio.pairs=0 \
+        +dpu.hosts=1 +dpu.pfs_per_host=2 +dpu.h0.pf1.requester=1 \
+        +dpu.h0.pf1.intel_pf=1 +dpu.h0.pf1.intel_vf=-1 +dpu.h0.pf1.vport=1
+    run_case rdma_disabled vio_only_commands.tcl RDMA_VIRTIO_VIO_ONLY_PASS required \
+        "${common[@]:0:9}" +rdma.enabled=0 +dpu.hosts=1 +dpu.pfs_per_host=1
+    exit 0
+fi
 # grant 定向验证只运行结构/参数场景；无 DUT，不把未收到 ACK 的流量伪装成通过。
 if [[ ${RDMA_GRANT_SMOKE_ONLY:-0} == 1 ]]; then
     run_case rdma_only_two_pf grants.tcl RDMA_GRANTS_PASS required \

@@ -23,6 +23,7 @@ project_env                               ← 本地直接组合环境，不再�
 | [rdma_project_env_pkg.sv](rdma_project_env_pkg.sv) | 使用本地 overlay，包含本地 `project_env` 和外部 `project_base_test`，不修改 virtio_work |
 | [project_env.sv](project_env.sv) | 直接创建 DPU、PCIe、VIO、共享 pool 和可选 RDMA 子环境；只负责 build/connect/load_params |
 | [rdma_virtio_cfg_seq.sv](rdma_virtio_cfg_seq.sv) | 继承 `vio_dpu_cfg_seq`；复用 RDMA 预检和 Notify/RNET 写表 |
+| [project_dut_config_seq.sv](project_dut_config_seq.sv) | 继承 `dpu_cfg_seq`；自行获取完整项目 cfg，选择业务并发布 RDMA 配置完成状态 |
 | [rdma_virtio_test.sv](rdma_virtio_test.sv) | 继承 `project_base_test` 的三个平台钩子；run 阶段只运行 AIP bridge |
 | [../filelists/rdma_virtio.f](../filelists/rdma_virtio.f) | 独立组合 filelist，不加入旧 `sim/filelists` |
 
@@ -35,6 +36,44 @@ project_env                               ← 本地直接组合环境，不再�
 1. `bind_platform_handles()`：在 cfg 加载后、env build 前注入 Intel VIF、可选已有 pool/IOMMU。仅使用模型向 DUT 注包时才需要网络 endpoint。`cfg` 本身就是 integration 的 `project_env_cfg`，直接使用 `cfg.rdma_cfg` 及原有 `cfg.intel_rc_vifs` 等字段。
 2. `prepare_platform()`：仅由 Tcl `dut_config` 调用。等待真实 reset/readiness；grant 已在 build 阶段生成，Intel BAR/hw 已在 connect 阶段绑定，不在这里重复创建。失败按原 virtio 钩子契约报 fatal。
 3. `finish_platform()`：Tcl 结束后检查数据、完成和资源，确认 DUT 不再 DMA，再撤销平台借出的句柄。
+
+已有平台 test 接好了 `project_env/project_env_cfg` 时，可直接在自己的命令 package 注册独立配置 sequence：
+
+```systemverilog
+import rdma_virtio_pkg::*;
+`aip_cmd_user_seq(dut_config, project_dut_config_seq, virtual_sqr::pcie_rc_sqr)
+```
+
+用这行替换原 `dut_config` 注册，第三个参数沿用平台管理 RC；不与 `rdma_virtio_test` 的同名命令重复注册。
+`project_env.build_phase` 将原 cfg 通过 `project_cfg` 键发布到 `pcie_env.*`，sequence 在 `pre_start` 获取该句柄，
+并确认它的 `dpu_cfg` 与 RC 已发布对象一致。Function/grant 在 sequence 内部从完整 cfg 取得，TC 无需复制数组。
+若平台使用自有 env，只需在创建/连接处发布同一个 `project_env_cfg` 到相应 RC 作用域；不要重新创建配置对象。
+`project_env/project_env_cfg` 接入后，还需在平台已有的 `end_of_elaboration_phase` 或等价命令注册入口绑定 RDMA。
+下面的 `env` 是已经连接完成的 `project_env` 实例；若使用 `rdma_virtio_test`，该基类已经执行这一步：
+
+```systemverilog
+string why;
+
+if (cfg.rdma_enabled &&
+    !rdma_aip_pkg::rdma_aip_registry::bind_and_register(env.rdma, why))
+  `uvm_fatal("RDMA_AIP", why)
+```
+
+该调用保存已有环境句柄并注册 `rdma_init/rdma_run/rdma_stop`，不启动业务；三个同名命令无需再用宏注册。
+仅 import package、注册 `dut_config` 或调用 `load_params` 不会完成环境绑定。
+自有平台的 `load_params` 命令成功重载参数后，必须清除 RDMA 配置完成门禁，确保重新执行
+`dut_config` 后才能初始化。原 `project_env_pkg::project_load_params` 只重载环境参数，不清除该门禁；
+请在自己的 loader 中使用以下调用顺序。继承 `rdma_virtio_test` 时，其 loader 已处理这一步：
+
+```systemverilog
+env.load_params(ok, why);
+if (ok && cfg.rdma_enabled &&
+    !rdma_aip_pkg::rdma_aip_registry::mark_configured(env.rdma, 0))
+  `uvm_fatal("RDMA_AIP", "load_params requires the registered RDMA environment")
+```
+
+直接注册方式由平台在 Tcl 调用前完成 reset/readiness；配置 sequence 成功后自动更新 RDMA AIP
+门禁，随后可以执行 `rdma_init`。
 
 需要在加载参数前自定义默认值/Function 选择时，直接创建 `project_env_cfg`，通过 `uvm_config_db#(project_env_cfg)` 的 `project_cfg` 键提供给 test，并设置 `rdma_enabled=1`。也可以使用 `+rdma.enabled=1`；显式 Function/grant 会自动打开 RDMA。父类 `cfg` 与组合 env 的 `project_cfg` 指向同一对象，没有兼容字段同步或配置复制。
 
@@ -88,7 +127,7 @@ rdma_run f0=0 f1=1 qps=2
 
 可直接使用 [rdma_start.tcl](rdma_start.tcl)：先设置 `::rdma_f0/::rdma_f1`，再 source。该脚本逐项检查 AIP 返回状态，不会在配置或初始化失败后继续发包。
 
-`dut_config` 在 RDMA 开启且存在 VIO Function 时运行一条 `rdma_virtio_cfg_seq`：先 RDMA 完整目录预检，随后由原 virtio 父序列执行 AF/BDF/MSI-X 等公共表；在准备 VIO ring 前加入 RDMA Notify/RNET，然后继续原 VIO Notify/QSCH/队列配置与确认。RDMA 开启但没有 VIO Function 时，命令直接运行独立的 `rdma_project_cfg_seq`；RDMA 关闭时直接运行原 `vio_dpu_cfg_seq`，因此不会生成 RDMA catalog、hardware plan、Notify/RNET 或 RDMA 写表。公共表只配置一次。配置成功不表示 RDMA driver 已初始化。
+`dut_config` 统一启动 `project_dut_config_seq`。它获取已有项目 cfg，不重新加载参数或申请 grant：RDMA 开启且冻结资源中有 VIO 队列时调用 `rdma_virtio_cfg_seq`，在原 VIO 公共配置中加入 RDMA 表；只有 RDMA 时调用 `rdma_project_cfg_seq`；RDMA 关闭时调用原 `vio_dpu_cfg_seq`。关闭的业务不配置，公共表只配置一次。配置成功后发布 RDMA AIP 门禁，但不会自动初始化驱动或发包。
 
 组合命令仍只由 Tcl 显式启动：`rdma_init` 创建 `rdma_init_seq`，`rdma_run` 创建 `rdma_run_seq`；`project_env` 不保存启动状态，也不在 phase 中自动创建或启动业务 sequence。独立 RDMA-only 案例使用相同的三个 sequence，见 [../project/tests/run_commands.sh](../project/tests/run_commands.sh)。
 
@@ -109,3 +148,7 @@ RDMA_GRANT_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
 结果、实际依赖与日志位置见 [VALIDATION.md](VALIDATION.md)。结构回归创建真实组合组件，验证多 Host/PF/VF 的快照/pool/PCIe 句柄、原 VIO 命令、事务拒绝和跨进程 restore。top 只提供空闲接口，没有 DUT 或 Completion responder，不能据此宣称真实配置写入或混合业务收发通过。
 
 RDMA 保持单 bank，字段约束仍为 Host ID < 8、global Function ID 与 RDMA VF ID < 256。未手工提供 grant 时，组合配置自动生成，默认 RDMA VF ID 等于冻结 global Function ID；显式 grant 仍允许两者不同。SD/CEQ/source 属于 RDMA 独立资源；MSI-X 从 DPU 已占用的 LAN/mailbox/AF 前缀之后分配，不改写 VIO 分配。当前 DPU 未导出通用 RDMA allocator，组合配置显式适配并校验这一前缀契约。
+
+PF 配置需同步本次 `dpu_common.public_records()` 修复：删除 RDMA Notify 的 VF-only 限制，
+保留既有 Host、保留位和表索引检查。Notify 的 `vf_id` 是 RDMA Function ID，可对应 PF 或 VF；
+平台仍须显式提供 RDMA Notify/RNET 的实际表布局。

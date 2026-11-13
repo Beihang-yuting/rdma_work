@@ -149,7 +149,8 @@ class project_env extends uvm_env;
 
 	// 按 UVM 顺序建立 DPU、PCIe 和 VIO；缺 cfg 或绑定冲突立即报错。
 // 功能：创建 project_env 的 DPU、PCIe、各 Host VIO 以及启用时的 RDMA 子环境。
-// 输入/输出及副作用：phase 透传；读取 cfg、准备共享 pool/Intel binding，并把 RDMA cfg 发布到 dpu_env 子树。
+// 输入/输出及副作用：phase 透传；读取 cfg、准备共享 pool/Intel binding，把完整 project_cfg 和 dpu_cfg
+// 发布给 PCIe sequence，并把 RDMA cfg 发布到 dpu_env 子树；全部复用原对象句柄。
 // 失败/边界：缺 cfg、Host memory、PCIe binding 或平台 VIF 时 fatal；RDMA 关闭时不创建 RDMA 子环境。
 	extern virtual function void build_phase(uvm_phase	phase);
 
@@ -522,7 +523,8 @@ endfunction
 // create(..., dpu_env) 让 VIO 位于 DPU 子树；框架先 build DPU，再 build VIO。
 // PCIe 只需要 Host 内存和 TL cfg，可以与 DPU 同级，不依赖二者遍历先后顺序。
 // 功能：创建 project_env 的 DPU、PCIe、各 Host VIO 以及启用时的 RDMA 子环境。
-// 输入/输出及副作用：phase 透传；读取 cfg、准备共享 pool/Intel binding，并把 RDMA cfg 发布到 dpu_env 子树。
+// 输入/输出及副作用：phase 透传；读取 cfg、准备共享 pool/Intel binding，把完整 project_cfg 和 dpu_cfg
+// 发布给 PCIe sequence，并把 RDMA cfg 发布到 dpu_env 子树；全部复用原对象句柄。
 // 失败/边界：缺 cfg、Host memory、PCIe binding 或平台 VIF 时 fatal；RDMA 关闭时不创建 RDMA 子环境。
 function void project_env::build_phase(uvm_phase	phase);
 
@@ -533,6 +535,7 @@ function void project_env::build_phase(uvm_phase	phase);
 	end
 
 	cfg.load_params();
+	uvm_config_db#(project_env_cfg)::set(this, "pcie_env.*", "project_cfg", cfg);
 	uvm_config_db#(dpu_env_cfg)::set(this, "pcie_env.*", "dpu_cfg", cfg.dpu_cfg);
 	prepare_host_memory();
 	prepare_pcie_config();

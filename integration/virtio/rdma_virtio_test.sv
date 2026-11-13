@@ -1,7 +1,7 @@
 // 目录/层次：integration/virtio；组合项目的 Tcl 配置命令与平台 hook 入口。
 // 职责：复用 virtio_work 的 cfg/build/connect 和平台 hook；VIO 由 project_env 绑定，RDMA init/run/stop
 //   由本组合 test 在连接完成后交给 rdma_aip_pkg 注册，本文件保留平台 prepare、dut_config 与统一 load_params。
-// 依赖：project_base_test、project_env、rdma_project_pkg、rdma_virtio_cfg_seq；平台实现三个既有 hook。
+// 依赖：project_base_test、project_env、project_dut_config_seq；平台实现三个既有 hook。
 // 所有权/生命周期：test 借用 project_env 及其子组件；sequence 由命令临时拥有，env 不启动任何运行期 sequence。
 typedef class rdma_virtio_test;
 
@@ -23,9 +23,9 @@ class rdma_virtio_command extends aip_cmd_user_task;
   // 失败/边界：普通拒绝写非零状态，平台 fatal 保持原 UVM 终止契约。
   extern virtual task cmd_exec();
 
-  // 功能：校验命令上下文并分派参数重载、DUT 配置、RDMA 初始化或流量 sequence。
+  // 功能：校验命令上下文并分派参数重载或独立项目配置 sequence。
   // 输入/输出及副作用：ok/why 返回命令结果；仅 dut_config 调用 prepare_platform，其余命令不隐式补步骤。
-  // 失败/边界：空上下文、重入、反序生命周期、非法参数和未知 Function 均拒绝且不创建对应资源。
+  // 失败/边界：空上下文、重入、反序配置、重载带参或未知命令均拒绝；配置错误保留 sequence 的诊断。
   extern task execute(output bit ok, output string why);
 endclass
 
@@ -72,16 +72,6 @@ virtual class rdma_virtio_test extends project_base_test;
     end
     why = "";
     return 1;
-  endfunction
-
-  // 功能：判断组合环境是否存在实际 VIO Function，用于选择 RDMA-only 或合并配置 sequence。
-  // 输入/输出及副作用：只读各 Host 的 function_instances；返回值不改变配置或组件状态。
-  // 失败/边界：空 Host/VIO 返回假，RDMA-only sequence 仍可配置 RDMA 表。
-  function bit has_vio_functions();
-    foreach (project.vio_envs[h])
-      if (project.vio_envs[h].function_instances.size() != 0)
-        return 1;
-    return 0;
   endfunction
 
   // 功能：从冻结 BAR map 找到管理 RC sequencer，供配置 sequence 发送公共/RDMA 表事务。
@@ -153,7 +143,7 @@ task rdma_virtio_command::cmd_exec();
 endtask
 
 // 功能：准备平台并启动配置或参数重载 sequence；RDMA init/run/stop 由 rdma_aip_pkg 独立处理。
-// 输入/输出及副作用：可能调用平台 prepare、发送 DPU/VIO/RDMA 表事务；结果写回 ok/why。
+// 输入/输出及副作用：配置仅创建 project_dut_config_seq；由它获取 cfg、选择业务和发布 RDMA 完成状态。
 // 失败/边界：命令不自动串联缺失步骤；配置失败不标记 RDMA 可初始化，参数重载失败保持原配置。
 task rdma_virtio_command::execute(output bit ok, output string why);
   uvm_sequencer #(pcie_tl_tlp) rc;
@@ -176,7 +166,7 @@ task rdma_virtio_command::execute(output bit ok, output string why);
       end
     end
     "dut_config": begin
-      dpu_cfg_seq config_seq;
+      project_dut_config_seq config_seq;
 
       if (!owner_test.can_configure(why))
         return;
@@ -184,33 +174,12 @@ task rdma_virtio_command::execute(output bit ok, output string why);
         return;
       owner_test.busy = 1;
       owner_test.configured = 0;
-      void'(rdma_aip_registry::mark_configured(owner_test.project.rdma, 0));
       owner_test.prepare_platform();
-      if (owner_test.cfg.rdma_enabled) begin
-        if (owner_test.has_vio_functions()) begin
-          rdma_virtio_cfg_seq merged_seq;
-
-          merged_seq = rdma_virtio_cfg_seq::type_id::create("dut_config");
-          merged_seq.rdma_enabled = 1;
-          merged_seq.rdma_functions = owner_test.cfg.rdma_functions;
-          merged_seq.rdma_grants = owner_test.cfg.rdma_cfg.grants;
-          config_seq = merged_seq;
-        end else begin
-          rdma_project_cfg_seq rdma_seq;
-
-          rdma_seq = rdma_project_cfg_seq::type_id::create("dut_config");
-          rdma_seq.rdma_functions = owner_test.cfg.rdma_functions;
-          rdma_seq.rdma_grants = owner_test.cfg.rdma_cfg.grants;
-          config_seq = rdma_seq;
-        end
-      end else begin
-        config_seq = vio_dpu_cfg_seq::type_id::create("dut_config");
-      end
+      config_seq = project_dut_config_seq::type_id::create("dut_config");
       aip_cmd_seq_registry::register("dut_config", config_seq);
       config_seq.start(rc);
       aip_cmd_seq_registry::unregister("dut_config");
       owner_test.configured = config_seq.success;
-      void'(rdma_aip_registry::mark_configured(owner_test.project.rdma, config_seq.success));
       ok = config_seq.success;
       why = config_seq.error_msg;
       owner_test.busy = 0;

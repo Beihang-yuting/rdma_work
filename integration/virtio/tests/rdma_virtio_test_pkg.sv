@@ -1,7 +1,7 @@
 // 目录/层次：integration/virtio/tests；组合环境实际 build/connect 与 Tcl 重载回归。
-// 职责：检查多 Host/PF/VF 下的共享快照、内存、原始 VIO 组件以及无自动启动契约。
-// 依赖：生产组合 package 和空闲 Intel/协议 VIF；无 DUT 或 Completion responder，grant 由生产配置自动生成。
-// 所有权/生命周期：fixture 只拥有观测句柄；finish 核对无隐式配置，不伪造数据面完成。
+// 职责：检查多 Host/PF/VF 的共享资源、重载和无自动启动契约；专用用例验证直接注册配置 sequence。
+// 依赖：生产组合 package、空闲 Intel/协议 VIF；grant 由生产配置自动生成。
+// 所有权/生命周期：测试借用句柄；配置入口用例复用寄存器传输 fixture，不提供 DUT 或数据面 completion。
 package rdma_virtio_test_pkg;
   timeunit 1ns;
   timeprecision 1ps;
@@ -10,14 +10,18 @@ package rdma_virtio_test_pkg;
   import aip_core_pkg::*;
   import host_mem_pkg::*;
   import dpu_resource_pkg::*;
+  import dpu_pcie_pkg::*;
+  import pcie_tl_pkg::*;
   import virtio_net_pkg::*;
   import intel_pcie_adapter_pkg::*;
   import rdma_types_pkg::*;
   import rdma_env_pkg::*;
   import rdma_dpu_adapter_pkg::*;
   import rdma_aip_pkg::*;
+  import rdma_project_pkg::*;
   import project_env_pkg::*;
   import rdma_virtio_pkg::*;
+  import rdma_project_config_test_pkg::*;
   `include "uvm_macros.svh"
 
   // 空闲 top 的 PF 接线契约：各 Host 的 PF 使用 requester=intel_pf=pf_id；不替真实平台推断接线。
@@ -340,4 +344,5 @@ package rdma_virtio_test_pkg;
       test.project.rdma == null ? 0 : test.project.rdma.sys.nodes.size(), irq_local, irq_data);
   endtask
   `aip_cmd_task(compose_observe, compose_observe)
+  `include "project_cfg_seq_test.sv"
 endpackage
