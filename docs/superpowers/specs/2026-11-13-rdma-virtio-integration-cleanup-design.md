@@ -12,6 +12,7 @@
 - 对外只保留一个复合配置入口 `dut_cfg_seq`，替代冗长的 `project_dut_config_seq` 名称和中间分派包装。
 - RDMA、VIO 可按参数分别启用，也可一起启用；公共配置只有一个执行者。
 - Tcl 使用已有 AIP 参数和命令能力，配置与流量由用户显式触发。
+- 本轮真实 DUT 业务先验 TX 发包，不接环回；按现有 `rdma.qp.type` 选择 RC 或 UD，保留默认 RC，ACK/可靠传输完成和收发闭环留待后续。
 
 本轮不修改外部依赖仓库，不新增通用项目框架或另一套 PCIe transport。RDMA 核心模型和业务 sequence 仍保留各自测试能力；删除范围是多余的集成示例和转发层。
 
@@ -97,8 +98,8 @@ VIO 开启示例还需沿用平台已有队列格式、Notify 和完成模式参
 集合沿用 AIP 的“SV 初值 → 参数覆盖 → 最终一份 cfg”：未提供参数时保留 SV 配置，提供时按已有集合语义应用。
 参数仅由 cfg 解析一次，不增加 CLI/SV 双重声明拒绝或专用来源仲裁机制。
 RDMA 启用而 `rdma.functions` 显式为空时拒绝；没有 Function 选择时，沿用显式 grants 的 keys，否则选择已有 DPU Functions。
-flow group 的端点使用 global Function ID，必须属于实际选中的 RDMA Functions，且两端不同、`qp_count > 0`。
-`rdma.flow_groups.size=0` 表示没有默认流量组，此时 run 必须明确指定端点；不影响单独执行配置。
+双端 flow group 保留模型收发语义：端点使用选中 RDMA Functions 的 global ID，两端不同且 `qp_count > 0`。
+`rdma.flow_groups.size=0` 表示无默认双端流量组；TX 可显式指定一个本地发送 Function、多 QP 和目的信息，不要求第二个本地 Function。
 
 资源参数沿用 `rdma.resource` → `rdma.hN.resource` → 精确 Function 的覆盖顺序。
 PF 路径为 `rdma.hN.pfP.resource`，VF 路径为 `rdma.hN.pfP.vfV.resource`；PF 覆盖不自动继承给 VF。
@@ -127,40 +128,68 @@ Tcl 命令层管理一次配置执行的上下文及结果；参数成功重载�
 - Tcl：`dut_config` → `rdma_init` → `rdma_run`。
 - 直接 SV：`dut_cfg_seq` → 现有 `rdma_env.initialize()` task → `rdma_traffic_vseq`。
 
-调用层管理顺序和门禁：配置 sequence 成功表示表配置完成，`ready` 表示初始化成功，run 完成还须确认业务结果和 scoreboard 排空。
+真实 external DUT 本轮使用 `rdma_run f0=<global ID> qps=N` 进入 TX 路径，不要求 `f1`；模型保留双端 `f0/f1` 或 `group` 入口。
+
+调用层管理顺序和门禁：配置 sequence 成功表示表配置完成，`ready` 表示初始化成功，run 完成须满足所选业务的真实验收条件。
 删除纯转发类时保留实际初始化、业务执行、取消登记和结果检查，不新增总启动 sequence；取消不等于撤销 DMA 或释放资源。
 `set_param` 只修改参数来源，须显式 `load_params` 才应用；该重载只允许初始化从未开始的窗口，本轮不新增初始化后重载。
 
-复用已有参数入口，不另造发包配置层：
+复用已有参数入口并补齐真实 DUT 的字段下发，以下扩展均属于本轮拟实现内容：
 
 | 常用路径 | 控制内容 |
 | --- | --- |
-| `rdma.qp.type/depth/mtu/max_sge` | QP 类型、队列深度、MTU、SGE 上限 |
+| `rdma.qp.type/depth/mtu/max_sge` | QP 类型、队列深度、MTU、SGE 上限；新增 `rdma.qp.dest_qpn`，QKey 沿用 `rdma.qp.qkey` |
 | `rdma.mem.buf_bytes/slot_bytes/slots/mr_offset` | 缓冲、槽和 MR；权限继续使用 `rdma.mem.mr_remote_*` |
-| `rdma.traffic.op/count/dir/signaled_pct` | 操作、每个 group 的消息数、方向及完成信号比例 |
-| `rdma.traffic.len/sge/data_mode` | 逐 WR 的长度、SGE 数及数据模式；混合操作沿用 `rdma.traffic.w_*` |
+| `rdma.traffic.op/count/dir/signaled_pct` | 操作、每组 WR 消息数、方向及完成信号比例；TX 只向选定目的发送 |
+| `rdma.traffic.len/sge/data_mode` | 逐 WR 的长度、SGE 数和数据模式；新增 `data_fixed`、`data_pattern`、`imm` |
+| `rdma.pkt.src_ip/dst_ip/vlan_en/vlan_id/udp_sport` | 沿用现有字段并新增同组 `src_mac/dst_mac`，下发到实际源表与 QPC/WQE |
 
-`count` 不是每 QP 数量，也不包含为完成回收补发的消息；原子操作长度固定 8B，原子/远端路径沿用单 SGE 约束。
-`data_mode` 可选 RANDOM/FIXED/INCREMENT/PATTERN，但 FIXED 的具体值和 PATTERN 内容目前仍随机生成。
-MAC、UDP 目的端口、具体 payload、IMM 值及原子操作数尚无对应参数入口，不承诺任意报文字段均可设置。
-`rdma.pkt.*` 的非默认值在默认 external driver 路径会被拒绝；模型 netpkt 可使用这些属性，但不能替代真实 DUT 写表。
-外部路径须按真实 driver/平台能力预检，修改 `link_type` 不能视为已接通网络或已配置硬件报文属性。
+cfg 一次解析参数及保留原文表达式；源 MAC/IP 每 Function 采样一次，目的 MAC/IP、VLAN、UDP 源端口每 QP 采样一次，后续写表和检查复用结果。
+本轮新增网络字段覆盖：`rdma.pkt` → `rdma.hN.pkt` → `rdma.hN.pfP[.vfV].pkt`，PF 不自动覆盖 VF；逐 QP/WR 表达式不能在 load 时提前随机采样。
+源 QPN 由已有本地 QP 分配器分配一次；目的 QPN/QKey 在创建每个 QP 时物化一次，后续 WR 和检查复用，不随机替换本地资源编号。
+初始化在 driver CMQ 可用后、发布 ready 前，通过已有 `SRC_ADDR_UPDATE` 和 `rdma_drv_cmq::exec_fields` 写源 MAC/IP，索引取 grant.source_addr_idx。
+traffic 创建 QP 时通过现有 create/modify QPC 路径下发源索引及网络属性，RC 目的 QPN/MAC/IP 使用 modify QPC；UD 补齐 WQE 的索引、VLAN、DMAC、目的 QPN/QKey/IP，移除 driver 隐式二次随机。
+复用现有 CMQ field codec 和 QPC/WQE 字段定义；16B IP 字节布局核对真实 driver 契约，必需字段/位宽在下发前预检，不另造 MMIO 表或编解码器。
+模型 CMQ 当前对 `SRC_ADDR_UPDATE/QUERY` 默认返回 success 却不存表；本轮补最小存储/查询处理或对应 fixture，验证实际编码和回读，不能据默认成功宣称配置有效。
+目前默认 external 路径拒绝非默认 `rdma.pkt`；本轮需贯通上述受支持字段。模型 netpkt 编码不能替代 DUT 写表，改 `link_type` 不能视为接通。
+payload/IMM 按 WR 一次生成，实际 WQE/源内存与检查期望共用结果；FIXED 重复指定字节，`data_pattern` 使用 AIP 有序字节集合并循环，不能把内容逗号误作随机候选。
+常量必须可复现；范围、候选、权重按规定粒度通过 AIP/现有 value-spec 求值一次，非法结果报错，不裁剪或默默重抽；不新写解析器。
 
-当前组合参考没有连接真实 ETH 对端/环回或网络观察口；配置 fixture 通过不是收发闭环验证。
-平台提供网络连接、DUT DMA/Completion 和必要观察，env 保持创建/连接职责；ETH 对端及观察组件的生命周期由平台管理。
+## 本轮 TX 业务与完成条件
+
+在现有 `rdma_traffic_vseq` 内增加真实 DUT 的 TX 路径，保留原模型双端收发路径，不新增总启动 sequence。
+先验证 RC/UD 的 SEND、SEND_IMM 发包，read/atomic 和远端结果留待后续；只创建实际发送 Function 的 PD/MR/CQ/QP，按显式目的信息建立发送上下文。
+不投 RECV、不建立环回，也不制造接收端 Function；不依赖远端 ACK 或远端 scoreboard 完成。
+投递后等待实际 TX 的语义贯通 driver 的 CQE 等待、traffic 的补 signaled/`wait_idle()`、scoreboard 最终 leftovers 三处，不能只删除某个 wait。
+TX 期望按本轮观察结果结算，不等待 ACK、成功 CQE 或端到端 scoreboard 排空；UD 可记录本地 CQ，但不作为统一必过前提。
+本地投递、DMA、编码和 TX 观察超时等真实错误仍失败；不整体屏蔽报告，不把本轮未要求的可靠完成伪装成成功。
+
+一次 run 的 TX 验收通过要求 DUT TX 口实际输出预期完整帧且字段/payload 正确；该结果不表示可靠传输或业务完成。
+WR 投递、doorbell 或 PCIe posted write 仅表示提交，不能代替 TX 口观测；缺少 ACK 导致的 CQ 未完成不否定已经观测到的正确首发。
+核对出口、QP/目的字段、PSN、长度、报文头和 payload。`count` 统计 WR 消息，不是每 QP 数量或物理帧数。
+RC 按 QP/PSN 区分首发、分片与重传，重传不能计作新消息；UD 长度按 MTU/硬件能力预检，消息数与物理帧数分别记录。
+无 ACK 的 RC 首批用例每 QP 一条 SEND、长度不超过 MTU，总 count 按实际 WR 数配置；更大 count/跨 MTU 发送须按已验证窗口扩展。
+预检发送窗口、SQ 和缓冲容量，不复用未完成 WR 的资源、不静默截断 count，也不能将看到一帧当作任意配置都通过。
+
+平台提供真实 TX ready/backpressure、完整帧 monitor 和 DUT PCIe DMA/Completion，env 只创建/连接所需适配对象。
+可按实际接线复用 `eth_sgment` 的 `item_collected_port`，或 DUT TX 已接入其接收链路时复用 `eth_work` 的 `rx_ap`。
+两者不是默认已接通的组件；实际 TB 路径和接口仍待用户提供。本轮不接 RX、回包或环回，收包测试待平台 ETH 接口调通后再做。
+TX 观察及平台接口生命周期由平台管理；结束时确认不再 DMA，取消命令本身不代表资源可回收。
 
 ## 多 QP 运行与生命周期
 
-运行入口显式选择 group 或端点时优先使用该选择，两者互斥；仅在没有显式选择时使用 cfg 的 flow groups。
+运行入口显式选择 group 或端点时优先使用该选择，两者互斥；TX 的发送 Function/目的选择不能被 cfg 的双端 groups 覆盖。
+仅在没有显式选择且执行双端业务时使用 cfg 的 flow groups；TX 缺少发送端或必需目的信息时拒绝。
 不为组合流程保留只做同名转发的 sequence；实际流量创建与执行继续使用既有 traffic sequence。
 
-每次 run 在创建任何业务资源前，按本次选中的 groups 汇总各 Function 的需求：
+每次 run 在创建任何业务资源前，按本次选中的发送项或双端 groups 汇总各实际本地 Function 的需求：
 
 - QP、CQ 需求各为该 Function 参与的 groups 的 `qp_count` 之和。
 - PD、MR 需求各为该 Function 参与的 group 数。
 - PBL 和 Host memory 需求复用既有 driver 的布局/页数计算，按实际 buffer、MR 和队列参数求得。
 
-将需求与实际剩余资源比较，包含此前 run 的占用；不能只比较 grant 总额度。
+TX 按发送项计算 QP/CQ 及共享的 PD/MR，不为未建立的远端申请额度；双端模型仍按参与 group 数计算。
+将需求与实际剩余资源、发送窗口和未完成 WR 占用比较，包含此前 run 的占用；不能只比较 grant 总额度。
 已知不足时不创建本次业务资源，诊断指出 Function、资源、需求与剩余量。
 实际 DMA 分配仍可能失败，保留真实错误与已分配状态，不承诺回滚或用默认容量掩盖不足。
 默认 `rdma.resource.qp_count=64` 包含保留 QP0/1，最多只有 62 个用户 QP；DPU 支持的拓扑规模也不等于当前 MSI-X 容量能够承载的业务规模。
@@ -188,6 +217,7 @@ MAC、UDP 目的端口、具体 payload、IMM 值及原子操作数尚无对应�
 | 自动/显式授权与装配顺序 | 正常配置无缺 grant；显式 grants 乱序按 key 匹配；缺项在装配检查定位；RDMA finalize 前完成投影与授权绑定 |
 | 多 Host/PF/VF 与集合入口 | SV 初值与 CLI 覆盖得到唯一 cfg，启用时空选择拒绝；逐 Function 资源覆盖及显式授权冲突检查正确；共享 pool、BAR/RC 和授权同源，显式授权侵占公共向量或容量不足均拒绝 |
 | 多 QP、跨 group、重复 run | 显式 `rdma_run` group/端点选择不被 cfg 全部 groups 覆盖；按实际选择汇总剩余额度，覆盖恰好满足和不足；已知不足无本次业务资源创建，保留实际分配失败结果 |
+| 单 Function RC/UD TX 与网络参数 | 无 f1/RECV/环回；源表编码/回读和 QPC/WQE 字段有效；常量可复现、表达式按粒度一次取值；实际整帧及 payload/IMM 正确，不要求 ACK/CQ 成功；RC 窗口有限且重传不重复计数 |
 | 固定参数与生命周期 | 固定字段改配拒绝且不重新随机采样；合法重载原子提交、失败不提交；初始化后 reload 与 external recover 明确拒绝 |
 | RDMA-only/VIO-only/混合 | Tcl 和直接 SV 接入均可，后者不依赖示例 test/AIP registry；公共流程一次，关闭业务无业务配置事务；另验两者关闭仅执行公共配置 |
 
