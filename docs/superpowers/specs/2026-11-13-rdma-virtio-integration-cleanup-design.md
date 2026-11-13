@@ -19,7 +19,7 @@
 
 | 内容 | 整理后的职责 |
 | --- | --- |
-| `project_env_cfg` | 创建子配置、加载参数、保存同一份业务选择；不发送 MMIO |
+| `project_env_cfg` | 创建子配置、加载参数，唯一准备并发布业务选择和 RDMA grant；不发送 MMIO |
 | `project_env` | 创建/连接 RDMA，复用原 VirtIO 的 pool、DPU、RC 和 VIO；不实现 BAR 访问或启动业务 |
 | `dut_cfg_seq` | 借用项目 cfg 和已有 RC，预检后串行执行公共、RDMA、VIO 配置，返回配置结果 |
 | `src/adapters/pcie` | 实现 `rdma_drv_bar` 到已有 `pcie_tl_reg_seq` 的转换，使用已有 BAR map 和 RC |
@@ -30,6 +30,25 @@
 BAR adapter 命名为 `rdma_pcie_bar`，迁出 `project_env.sv`。`pcie_tl_reg_seq` 已支持 8B 访问；adapter 仅做接口转换、现有 map 的范围校验和状态转换，不重做拆包、BAR 分配、Host 路由或 Intel 发送逻辑。
 
 DPU 是 Host/Function/BDF/BAR/全局编号的唯一权威。env 安装必要的绑定逻辑，使 DPU 冻结快照之后、RDMA 子环境 finalize 之前完成投影和授权绑定；该时序不能整体推迟到 connect。
+
+## 授权来源与装配顺序
+
+合法配置不能因为示例装配遗漏，在配置或初始化时才报缺 grant。使用现有 cfg、grant 和 system 完成以下顺序：
+
+1. cfg 加载业务选择和每 Function 的资源需求，声明 DPU service；共享 Host pool 由已有环境准备。
+2. DPU 冻结 device/resource snapshot 后，由 cfg 唯一准备授权：已有显式 grant 先验证，否则按已采样需求生成。
+3. env 在 RDMA finalize 前，按完整 Function key 匹配投影与 grant，并将同一结果绑定到 system/driver cfg。
+4. connect 使用同源 BAR map、RC、Host memory 完成 hardware 和 catalog 连接，结束前检查完整装配；失败指出阶段、Function 和缺失字段。
+5. 配置与初始化入口继续检查来源、覆盖和容量，不在缺项时临时生成另一份 grant。
+
+显式 grant 允许乱序，不能要求它与 Function 数组按下标对应；缺项、重复或身份不符仍拒绝。
+显式 grant 保持只读授权边界，自动 `rdma.resource` 容量声明不改写它；对同一 Function 明确声明的容量与显式授权冲突时拒绝。
+自动与显式 grant 使用同一完整预检，覆盖 RDMA 内部 SD/CEQ/source/vector 冲突及 DPU 已占用的 VIO、AF、mailbox 全局向量和实际容量。
+向量检查沿用当前 DPU 冻结资源及已有前缀适配契约，不另设分配权威；属于同份 RDMA 授权的消息按身份匹配。
+
+cfg 拥有准备结果，system、driver、catalog 和 plan 只读借用其授权；发布后调用方不得修改或替换 grant。
+在现有绑定、配置和初始化边界检查 cfg/system 的 Function 覆盖、授权对应关系及 snapshot/resource/map 同源。
+不增加 grant 管理器、版本状态机或私有冻结记录，也不为调用方直接篡改公开字段建立新防护框架。
 
 ## dut_cfg_seq 输入与接入
 
@@ -62,7 +81,28 @@ VIO 沿用原有全局、Host、Function/service 参数覆盖规则；enabled、
 
 这些业务和资源声明在 build 时形成并冻结。运行期 `load_params` 继续只重载允许变化的参数，不能借此改变 Host/Function、业务拓扑、VIO 队列数量或 grant。切换上述环境组合需要重新构建环境；流量参数仍按原重载窗口处理。
 
+固定参数变更必须明确拒绝，不能返回成功却继续使用旧 grant。利用已有 AIP 参数来源/存在性与首次加载记录识别变更；不能为了检查而重新随机采样固定参数。允许重载的候选仍在完整预检后原子提交。
+
 VIO 开启示例还需沿用平台已有队列格式、Notify 和完成模式参数，表中仅展示选择业务的参数。
+
+### Function、flow group 与资源参数
+
+拟新增以下两个 AIP 集合入口，目前尚未实现；复用 `aip_struct_queue_apply`，不另写集合解析器：
+
+| 集合 | 元素与读取方式 |
+| --- | --- |
+| `rdma.functions` | `dpu_function_key_t`；复用已经注册的 schema |
+| `rdma.flow_groups` | `rdma_flow_group_t`；补充 `f0_global_id`、`f1_global_id`、`qp_count` 三字段 schema |
+
+集合沿用 AIP 的“SV 初值 → 参数覆盖 → 最终一份 cfg”：未提供参数时保留 SV 配置，提供时按已有集合语义应用。
+参数仅由 cfg 解析一次，不增加 CLI/SV 双重声明拒绝或专用来源仲裁机制。
+RDMA 启用而 `rdma.functions` 显式为空时拒绝；没有 Function 选择时，沿用显式 grants 的 keys，否则选择已有 DPU Functions。
+flow group 的端点使用 global Function ID，必须属于实际选中的 RDMA Functions，且两端不同、`qp_count > 0`。
+`rdma.flow_groups.size=0` 表示没有默认流量组，此时 run 必须明确指定端点；不影响单独执行配置。
+
+资源参数沿用 `rdma.resource` → `rdma.hN.resource` → 精确 Function 的覆盖顺序。
+PF 路径为 `rdma.hN.pfP.resource`，VF 路径为 `rdma.hN.pfP.vfV.resource`；PF 覆盖不自动继承给 VF。
+资源参数由 cfg 首次加载时采样一次，授权生成消费该结果，不在多个 sequence 中重复读取。
 
 ## 配置执行顺序
 
@@ -80,6 +120,26 @@ VIO 开启示例还需沿用平台已有队列格式、Notify 和完成模式参
 
 Tcl 命令层管理一次配置执行的上下文及结果；参数成功重载后清除旧配置完成状态，重载失败保留原状态。配置 sequence 本身不维护另一套 AIP busy/configured 状态。调用层依据实际环境检查 RDMA 初始化是否已开始、是否有活动配置命令；直接 SV 调用者也承担相同责任。平台负责 reset/readiness、活动业务停机和最终收尾。
 
+## 多 QP 运行与生命周期
+
+运行入口显式选择 group 或端点时优先使用该选择，两者互斥；仅在没有显式选择时使用 cfg 的 flow groups。
+不为组合流程保留只做同名转发的 sequence；实际流量创建与执行继续使用既有 traffic sequence。
+
+每次 run 在创建任何业务资源前，按本次选中的 groups 汇总各 Function 的需求：
+
+- QP、CQ 需求各为该 Function 参与的 groups 的 `qp_count` 之和。
+- PD、MR 需求各为该 Function 参与的 group 数。
+- PBL 和 Host memory 需求复用既有 driver 的布局/页数计算，按实际 buffer、MR 和队列参数求得。
+
+将需求与实际剩余资源比较，包含此前 run 的占用；不能只比较 grant 总额度。
+已知不足时不创建本次业务资源，诊断指出 Function、资源、需求与剩余量。
+实际 DMA 分配仍可能失败，保留真实错误与已分配状态，不承诺回滚或用默认容量掩盖不足。
+默认 `rdma.resource.qp_count=64` 包含保留 QP0/1，最多只有 62 个用户 QP；DPU 支持的拓扑规模也不等于当前 MSI-X 容量能够承载的业务规模。
+
+初始化一旦开始，当前 external 环境不可再次初始化或重载参数；失败也不解除该限制。
+当前真实 external reset/recover 没有平台契约，继续明确拒绝，不能复用模型 FLR 来宣称支持真实 DUT 恢复。
+拓扑与固定资源改配须重新构建环境；本轮不扩展复位恢复机制。
+
 ## 集成目录与去重
 
 仅保留 `integration/virtio` 这一套 RDMA+VirtIO 接入参考及对应 filelist、Tcl 示例和测试入口。用户已有 VirtIO env/cfg 吸收 RDMA 增量，不能要求用户整体替换环境或引入本仓库专用 test。
@@ -94,10 +154,15 @@ Tcl 命令层管理一次配置执行的上下文及结果；参数成功重载�
 
 ## 验收
 
-- 复合 sequence 可在没有示例 test 和 AIP registry 的测试中接收项目 cfg 并启动。
-- RDMA-only、VIO-only、混合、两者关闭四种组合按已冻结业务选择执行，公共配置一次，关闭业务无业务配置事务。
-- 原对象身份、每 Host 共享内存、冻结 BAR/Function 路由及 pre-build 绑定时序保持正确。
-- 保留 Notify 排序和 DWORD 写顺序、表范围/覆盖、MSI-X 尾项、异源拒绝、重载失败不提交等有效检查。
-- PCIe adapter 通过原 `pcie_tl_reg_seq` 发 8B 写，校验越界/过期目标和失败状态转换。
-- Tcl 参数入口、直接 SV 启动、初始化前重载及禁止改动固定拓扑的契约均有对应验证。
-- 执行静态检查；所有 VCS 编译/仿真在 `ubuntu@10.11.10.53` 登录 bash 中运行。配置 fixture 通过不能替代真实 DUT 初始化、DMA 或网络收发验证。
+| 场景 | 必须确认的结果 |
+| --- | --- |
+| 自动/显式授权与装配顺序 | 正常配置无缺 grant；显式 grants 乱序按 key 匹配；缺项在装配检查定位；RDMA finalize 前完成投影与授权绑定 |
+| 多 Host/PF/VF 与集合入口 | SV 初值与 CLI 覆盖得到唯一 cfg，启用时空选择拒绝；逐 Function 资源覆盖及显式授权冲突检查正确；共享 pool、BAR/RC 和授权同源，显式授权侵占公共向量或容量不足均拒绝 |
+| 多 QP、跨 group、重复 run | 显式 `rdma_run` group/端点选择不被 cfg 全部 groups 覆盖；按实际选择汇总剩余额度，覆盖恰好满足和不足；已知不足无本次业务资源创建，保留实际分配失败结果 |
+| 固定参数与生命周期 | 固定字段改配拒绝且不重新随机采样；合法重载原子提交、失败不提交；初始化后 reload 与 external recover 明确拒绝 |
+| RDMA-only/VIO-only/混合 | Tcl 和直接 SV 接入均可，后者不依赖示例 test/AIP registry；公共流程一次，关闭业务无业务配置事务；另验两者关闭仅执行公共配置 |
+
+保留 Notify 排序与 DWORD 写序、表范围/覆盖、MSI-X 尾项及异源拒绝检查。
+PCIe adapter 验证原 `pcie_tl_reg_seq` 的 8B 写、越界/过期目标和失败状态转换。
+执行静态检查；所有 VCS 编译/仿真在 `ubuntu@10.11.10.53` 登录 bash 中运行。
+配置 fixture 通过不能替代真实 DUT 初始化、DMA 或网络收发验证。
