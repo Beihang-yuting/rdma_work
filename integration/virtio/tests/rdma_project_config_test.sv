@@ -1,4 +1,4 @@
-// 目录/层次：integration/project/tests；公共配置 sequence 的独立表/传输契约回归。
+// 目录/层次：integration/virtio/tests；公共配置 sequence 的独立表/传输契约回归。
 // 职责：正常 DPU resolve/publish 建立两 Host/四 RDMA VF；独立字节 fixture 验证完整 MSI-X 尾项并注入失败。
 // 依赖：DPU/PCIe/project 包；不创建 RDMA driver、模型设备或真实 Intel 链路，不声称 init/grant 就绪。
 // 所有权：测试拥有 cfg/snapshot/map/RC；唯一 VIO 请求仅提供真实资源 lineage，MSI-X 用例消费其真实 vector。

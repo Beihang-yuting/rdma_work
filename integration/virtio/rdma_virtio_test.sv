@@ -1,7 +1,7 @@
 // 目录/层次：integration/virtio；组合项目的 Tcl 配置命令与平台 hook 入口。
 // 职责：复用 virtio_work 的 cfg/build/connect 和平台 hook；VIO 由 project_env 绑定，RDMA init/run/stop
 //   由本组合 test 在连接完成后交给 rdma_aip_pkg 注册，本文件保留平台 prepare、dut_config 与统一 load_params。
-// 依赖：project_base_test、project_env、project_dut_config_seq；平台实现三个既有 hook。
+// 依赖：project_base_test、project_env、dut_cfg_seq；平台实现三个既有 hook。
 // 所有权/生命周期：test 借用 project_env 及其子组件；sequence 由命令临时拥有，env 不启动任何运行期 sequence。
 typedef class rdma_virtio_test;
 
@@ -143,7 +143,7 @@ task rdma_virtio_command::cmd_exec();
 endtask
 
 // 功能：准备平台并启动配置或参数重载 sequence；RDMA init/run/stop 由 rdma_aip_pkg 独立处理。
-// 输入/输出及副作用：配置仅创建 project_dut_config_seq；由它获取 cfg、选择业务和发布 RDMA 完成状态。
+// 输入/输出及副作用：配置仅创建 dut_cfg_seq；由它获取 cfg、选择业务和发布 RDMA 完成状态。
 // 失败/边界：命令不自动串联缺失步骤；配置失败不标记 RDMA 可初始化，参数重载失败保持原配置。
 task rdma_virtio_command::execute(output bit ok, output string why);
   uvm_sequencer #(pcie_tl_tlp) rc;
@@ -166,7 +166,7 @@ task rdma_virtio_command::execute(output bit ok, output string why);
       end
     end
     "dut_config": begin
-      project_dut_config_seq config_seq;
+      dut_cfg_seq config_seq;
 
       if (!owner_test.can_configure(why))
         return;
@@ -175,7 +175,7 @@ task rdma_virtio_command::execute(output bit ok, output string why);
       owner_test.busy = 1;
       owner_test.configured = 0;
       owner_test.prepare_platform();
-      config_seq = project_dut_config_seq::type_id::create("dut_config");
+      config_seq = dut_cfg_seq::type_id::create("dut_cfg_seq");
       aip_cmd_seq_registry::register("dut_config", config_seq);
       config_seq.start(rc);
       aip_cmd_seq_registry::unregister("dut_config");

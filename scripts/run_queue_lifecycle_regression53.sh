@@ -24,6 +24,7 @@ readonly CORE_TESTS=(
   rdma_netpkt_codec_test
   rdma_flow_profiles_test
   rdma_dut_link_test
+  rdma_tx_contract_test
 )
 
 if [[ ${1-} == "--list" ]]; then

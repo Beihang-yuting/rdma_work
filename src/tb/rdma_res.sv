@@ -235,6 +235,11 @@ class rdma_res_qp extends rdma_res;
   int unsigned	min_rnr;
   // 该 QP 发出报文的属性（VLAN/IP/UDP 源端口），帧编码链路使用。
   rdma_scenario_pkt_t	pkt;
+  // TX-only 建链目的字段由控制项下发到资源，避免 modify() 依赖控制项局部变量。
+  bit	 tx_only;
+  bit [23:0]	 tx_dest_qpn;
+  bit [23:0]	 tx_dest_psn;
+  bit [47:0]	 tx_dest_dmac;
 
   // 功能：建立 ALIVE 的队列对资源描述，并固定资源种类为 RDMA_RES_QP；链路参数取 IB 常用默认
   //   （PSN 0、timeout 14、retry 7、rnr_retry 7、min_rnr 1），报文属性全部沿用链路默认。
@@ -263,6 +268,10 @@ function rdma_res_qp::new(string	name = "rdma_res_qp");
     rnr_retry = 7;
     min_rnr = 1;
     pkt = '{default: '0};
+    tx_only = 1'b0;
+    tx_dest_qpn = 0;
+    tx_dest_psn = 0;
+    tx_dest_dmac = 0;
 endfunction
 
 // 一类资源的池：设备内编号 → 对象。编号复用时新对象的 generation 加一。

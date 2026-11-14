@@ -1,19 +1,18 @@
 # RDMA Intel 项目接入参考
 
-本文对应实际实现；入口与验证命令见 [项目 README](../integration/project/README.md)，版本/结果见 [验证记录](../integration/project/VALIDATION.md)，设计约束见 [设计](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。当前为软件集成和受控 fixture，尚无完整真实 DUT 验收。使用 `integration/virtio/project_env_cfg` 时，QP/SD/CEQ/AEQ 与路由 grant 已按 DPU 快照和 `rdma.resource.*` 自动生成；独立底层适配器仍接收显式 grant。参见 [自动 grant 参数](../integration/virtio/README.md#自动-grant-与启动参数)。
+本文对应实际实现；入口与验证命令见 [Virtio 集成 README](../integration/virtio/README.md)，版本/结果见 [验证记录](../integration/virtio/VALIDATION.md)，设计约束见 [设计](superpowers/specs/2026-11-09-rdma-intel-project-integration-design.md)。当前为软件集成和受控 fixture，尚无完整真实 DUT 验收。使用 `integration/virtio/project_env_cfg` 时，QP/SD/CEQ/AEQ 与路由 grant 已按 DPU 快照和 `rdma.resource.*` 自动生成；独立底层适配器仍接收显式 grant。参见 [自动 grant 参数](../integration/virtio/README.md#自动-grant-与启动参数)。
 
 ## 配置与类型组合
 
-`rdma_project_env_cfg` 直接保存 `dpu_env_cfg dpu`、`rdma_env_cfg rdma` 和 `functions[$]`。PCIe 环境及 RC sequencer 由平台 project env 持有，RDMA 只借用通过 BAR map 发布的管理 RC；参考 project 不复制一份 PCIe 配置。用户也可在自己的 cfg 直接组合相同类型，不要求继承参考类或增加公共包装对象。
+`integration/virtio/project_env_cfg` 直接保存 `dpu_env_cfg dpu`、`rdma_env_cfg rdma` 和 `functions[$]`。PCIe 环境及 RC sequencer 由平台 project env 持有，RDMA 只借用通过 BAR map 发布的管理 RC；参考 project 不复制一份 PCIe 配置。用户也可在自己的 cfg 直接组合相同类型，不要求继承参考类或增加公共包装对象。
 
 | 文件 | 实际职责 |
 | --- | --- |
 | `integration/project/rdma_project_cfg_seq.sv` | `rdma_project_cfg_seq extends dpu_cfg_seq`，单 bank 公共表编排 |
 | `integration/project/rdma_project_pkg.sv` | 仅配置 sequence 的包入口 |
-| `integration/project/rdma_project_runtime_pkg.sv` | include `rdma_project_env_cfg.sv` 与 `rdma_project_env.sv`，无注册副作用 |
-| `integration/project/rdma_project_test.sv` | 最终 test package include 的平台 hooks 与 AIP bridge 基类 |
-| `integration/project/rdma_project_commands.sv` | 最终编译单元显式 include 的唯一命令注册 |
-| `integration/filelists/rdma_project.f` | 完整可复用类型入口，无 wrapper/test/top/注册 |
+| `integration/project/rdma_runtime_seq.sv` | 独立可复用的 RDMA 初始化/运行 sequence |
+| `integration/project/rdma_aip_pkg.sv` | 项目命令参数解析与 runtime sequence 编排类型 |
+| `integration/filelists/rdma_virtio.f` | Virtio/RDMA 组合类型入口；环境、Tcl 和 test 由 `integration/virtio` 持有 |
 
 完整项目类型编译顺序为 AIP → Host memory → DPU resource → PCIe TL/interface → Intel interface/adapter → RDMA 核心/适配器/env/AIP → DPU PCIe → project config/runtime。普通 `.sv` 被 package include 后不能单独再编译。RDMA 基础包不编译 PCIe transport；项目 integration filelist 只引入 `pcie_tl_vip` 原生类型，不编译 `pcie_dpu_integration_pkg` 或 RDMA 自有 PCIe system/driver。AIP 使用 expression-capable checkout，不同时编译旧 aip_core 包；net_packet 沿用 RDMA adapter 的 include 方式。
 
@@ -61,17 +60,16 @@ DPU map 必须包含所有 Function 的显式 Intel policy 和实际 sequencer�
 
 ## 独立启动与已有 project 接入
 
-独立最终 test package 按实际 [command test package](../integration/project/tests/rdma_project_command_test_pkg.sv) 的结构导入 runtime/config/AIP 类型，前置声明 `rdma_project_test`，声明非拥有 `project_context` 与 `project_rc_sqr`，然后依次 include test 基类、commands 和平台子类。当前注册为：
+组合环境的最终 test package 位于 [`integration/virtio/tests/rdma_virtio_test_pkg.sv`](../integration/virtio/tests/rdma_virtio_test_pkg.sv)，导入 runtime/config/AIP 类型并由平台环境持有非拥有的 PCIe/Host 句柄。公共 sequence 只保留类型与业务逻辑，不注册独立 test 或 Tcl 命令。当前注册为：
 
 ```systemverilog
-`aip_cmd_task(dut_config, project_dut_config)
-`aip_cmd_task(rdma_init, project_rdma_init)
-`aip_cmd_task(rdma_run, project_rdma_run)
-`aip_cmd_task(load_params, rdma_project_load_params)
+`aip_cmd_user_seq(dut_config, dut_cfg_seq, virtual_sqr::pcie_rc_sqr)
+`rdma_aip_registry::bind_and_register(env.rdma, why)
+`rdma_aip_registry::mark_configured(env.rdma, 0)
 `aip_cmd_reg(reg_acc, dpu_bar_reg_seq, project_rc_sqr, seq.error_msg, seq.check_read_data)
 ```
 
-`dut_config` 采用短 task 调用 prepare 再执行 sequence，不能直接用 user_seq 宏跳过平台就绪步骤。test 的 `run_phase()` 只运行 bridge 与 finish；默认 prepare 明确失败，真实平台提供完成/超时判定、一次绑定和安全收尾。driver/router 不读取全局命令上下文。
+组合入口对外只保留 `dut_cfg_seq`；真实平台在 `dut_config` 前完成平台就绪和 RC 绑定，再由 sequence 从 `project_env_cfg` 获取完整 Function/grant 快照。test 的 `run_phase()` 只运行 bridge 与 finish；默认 prepare 明确失败，真实平台提供完成/超时判定、一次绑定和安全收尾。driver/router 不读取全局命令上下文。
 
 已有 project 只导入无副作用的类型包，沿用自己的 test/registry。在其唯一 load_params 中先检查所有组件生命周期，再各自构造候选，完整验证后统一无时间推进提交；DPU 只读一次，RDMA 不读取 DPU/VIO 参数。可复用 `rdma_aip_cfg_loader::make_runtime_candidate`、`rdma_env::validate_runtime_candidate/apply_runtime_candidate`；不要顺序调用多个已自行提交的子 loader。配置使用 `rdma_project_cfg_seq`，初始化调用 `rdma_env::initialize`，业务复用 `rdma_traffic_vseq`。
 
@@ -112,7 +110,7 @@ if {[aip_check_status] != 0} { error [aip_read_result] }
 # 随后显式dut_config、rdma_init、带实际f0/f1或group索引的rdma_run。
 ```
 
-[rdma_restore.tcl](../integration/project/rdma_restore.tcl) 是模型验收脚本，使用测试专有 project_observe/common assertions；[run_commands.sh](../integration/project/tests/run_commands.sh) 负责独立进程保存/恢复及匹配AIP dist。不能把同进程set_param测试当跨进程恢复证据。完整结果和外部能力限制见验证记录。
+[`integration/virtio/tests/restore.tcl`](../integration/virtio/tests/restore.tcl) 和 [`integration/virtio/tests/run.sh`](../integration/virtio/tests/run.sh) 负责组合环境的恢复与参数验证。不能把同进程 `set_param` 测试当跨进程恢复证据。完整结果和外部能力限制见验证记录。
 
 ## 驱动字段来源与保留的硬件约定
 

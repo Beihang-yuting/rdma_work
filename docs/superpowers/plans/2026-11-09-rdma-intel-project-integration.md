@@ -2,7 +2,7 @@
 
 日期：2026-11-09。本记录包含已完成的实现、53验证与最终技术复审；工作区转交由控制方另行确认。原批准范围仍为RDMA优先、单bank、Tcl显式启动、统一场景、独立filelist。实现/复杂诊断/复审由Astra负责，VCS与日志验收由指定5.6验证者在53登录bash执行；同一源码只有一个活动实现者。
 
-**设计：** [共享配置与Intel集成](../specs/2026-11-09-rdma-intel-project-integration-design.md)。**使用：** [项目README](../../../integration/project/README.md)、[接入参考](../../rdma-intel-integration-reference.md)。**证据：** [验证与依赖记录](../../../integration/project/VALIDATION.md)。复选框只表示该项实际状态，不把源码存在等同验证通过。
+**设计：** [共享配置与Intel集成](../specs/2026-11-09-rdma-intel-project-integration-design.md)。**使用：** [Virtio 集成 README](../../../integration/virtio/README.md)、[接入参考](../../rdma-intel-integration-reference.md)。**证据：** [Virtio 验证记录](../../../integration/virtio/VALIDATION.md)。复选框只表示该项实际状态，不把源码存在等同验证通过。
 
 ## 全局约束
 
@@ -23,7 +23,7 @@
 - [x] Function各自分配账本覆盖完整区间检查；保留独立模型fallback工厂。
 - [x] 独立rdma_shared_memory_test验证共享backing与跨Function读写/释放隔离。
 
-产物：`src/adapters/host_mem/rdma_host_mem_pkg.sv` 与 `integration/project/tests/rdma_shared_memory_test.sv`。历史详细执行记录保留于任务ledger/reports，最终Task7修正精确注释标签。
+产物：`src/adapters/host_mem/rdma_host_mem_pkg.sv` 与已迁移到 Virtio fixture 的共享内存测试。历史详细执行记录保留于任务ledger/reports，最终Task7修正精确注释标签。
 
 ## Task2：外部快照与显式初始化（已完成）
 
@@ -68,22 +68,22 @@
 
 ## Task6：项目事务和Tcl（已完成，commit3e08149）
 
-- [x] `rdma_project_env_cfg`直接借用dpu/rdma/pcie/functions，`rdma_project_env`创建手动启动子环境。
+- [x] `integration/virtio/project_env_cfg.sv` 直接借用 dpu/rdma/pcie/functions，`project_env.sv` 创建手动启动子环境。
 - [x] load_params检查生命周期，DPU/RDMA各候选一次，全验证后原地apply；DPU只允许print_bar_map/verify_readback，PCIe固定。
 - [x] 独立最终test声明context/sequencer后include test/commands；runtime package无注册副作用。
 - [x] dut_config task先prepare再configure；rdma_init只允许完整配置后首次调用；rdma_run要求显式不同实际global IDs f0/f1。
 - [x] 模型fixture通过已有protected build_system的virtual分派使用同源快照；默认实现体不变，无生产grant绕过。
-- [x] 独立commands/namespace manifests与run_commands.sh，真实Tcl/DPI、同binary跨进程restore；匹配AIP dist由验证者预建。
+- [x] Virtio commands/namespace manifests 与 `integration/virtio/tests/run.sh` 覆盖真实 Tcl/DPI、同 binary 的 restore；匹配 AIP dist 由验证者预建。
 - [x] 当前已确认commands/prepare failure/partial probe failure为0/0/0；save成功后的restore验证10→override17→CLI20并真实20 WRITE完成。
 - [x] absent32、namespace、duplicate/config-fatal预期负例及完整矩阵通过；fresh basic/external snapshot均0/0/0。第一次save超时不计通过，第二次成功save产生同binary恢复所用快照。
 
 运行由验证者按README设置实际roots后执行：
 
 ```bash
-bash integration/project/tests/run_commands.sh
+bash integration/virtio/tests/run.sh
 ```
 
-rdma_restore.tcl带测试专有project_observe断言，是模型验收脚本；通用平台只复用恢复/source/load顺序，不直接依赖测试命令。
+`integration/virtio/tests/restore.tcl` 带测试专有观测断言，是模型验收脚本；通用平台只复用恢复/source/load顺序，不直接依赖测试命令。
 
 ## Task7：发布完整入口（实现、验证与最终技术复审完成）
 
@@ -98,7 +98,7 @@ rdma_restore.tcl带测试专有project_observe断言，是模型验收脚本；�
 - [x] 全分支上下文及最终技术复审完成；唯一I1已修复并经专项复审Approved/ADDRESSED，0新增发现。实现/验证/技术复审门禁关闭；实际工作区转交由控制方交付记录确认。
 
 ```bash
-bash integration/project/tests/run_intel.sh
+bash integration/virtio/tests/run.sh
 python3 tools/check_changed_sv_style.py --base 08d2f71
 git diff --check 08d2f71
 git diff origin/feature/rdma-param-v1 -- sim/filelists

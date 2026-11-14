@@ -35,6 +35,24 @@ class rdma_dev_object extends uvm_object;
   endfunction
 endclass
 
+// Function 源地址表项：保存 CMQ 下发的 MAC/IPv6 字节，供模型读回和后续网卡路径观察。
+class rdma_dev_source_addr extends uvm_object;
+  `uvm_object_utils(rdma_dev_source_addr)
+
+  bit [47:0] mac;
+  byte unsigned ip[16];
+
+  // 功能：构造清零的源地址表项。
+  // 输入/输出及副作用：name 为 UVM 名；mac/ip 初始化为零，不取得外部资源所有权。
+  // 失败/边界：仅可由 CMQ 源地址更新路径填充；未更新项的零值不能冒充平台默认地址。
+  function new(string name = "rdma_dev_source_addr");
+    super.new(name);
+    mac = '0;
+    foreach (ip[i])
+      ip[i] = 0;
+  endfunction
+endclass
+
 class rdma_dev_cmq extends uvm_object;
   `rdma_object_utils(rdma_dev_cmq)
 
@@ -65,6 +83,7 @@ class rdma_dev_cmq extends uvm_object;
   // HMC：IFA_UPDATE 的每类对象 data 字（FVM_SOA 等），SD_UPDATE 的 SD 号 → PD 表（或页）地址。
   protected bit [63:0] ifa_data[4];
   protected bit [63:0] sd_pa[int unsigned];
+  protected rdma_dev_source_addr source_addrs[int unsigned];
   // 观测：按序执行过的 opcode 与对应 ecode。
   bit [7:0] executed_opcodes[$];
   bit [7:0] executed_ecodes[$];
@@ -104,6 +123,7 @@ class rdma_dev_cmq extends uvm_object;
     foreach (ifa_data[t])
       ifa_data[t] = '0;
     sd_pa.delete();
+    source_addrs.delete();
     executed_opcodes.delete();
     executed_ecodes.delete();
   endfunction
@@ -300,10 +320,43 @@ class rdma_dev_cmq extends uvm_object;
       RDMA_OP_IFA_UPDATE: begin
         ifa_data[(rdma_be::qword(sqe, 0) >> 60) & 2'b11] = rdma_be::qword(sqe, 8);
       end
+      RDMA_OP_SRC_ADDR_UPDATE, RDMA_OP_SRC_ADDR_QUERY: begin
+        execute_source_addr(opcode, sqe, cqe, ecode, status);
+      end
       default: begin
         // OCC/TQ flush、IFA/GID/MAC 等表项：设备侧无可观测状态，按成功完成。
       end
     endcase
+  endtask
+
+  // 功能：执行源地址表更新/查询，保存 CMQ field codec 编码的 12-bit index、MAC 和 16B IP。
+  // 输入/输出及副作用：sqe 为请求镜像，cqe 在 QUERY 时回填地址字段；更新 source_addrs 表，不访问外部资源。
+  // 失败/边界：UPDATE 始终替换指定 index；QUERY 缺少表项返回命令错误码且不生成伪造地址。
+  protected task execute_source_addr(byte unsigned opcode, byte unsigned sqe[],
+                                     inout byte unsigned cqe[], output bit [7:0] ecode,
+                                     output rdma_status status);
+    int unsigned index;
+    rdma_dev_source_addr entry;
+
+    index = rdma_be::field(sqe, 8, 52, 12);
+    if (opcode == RDMA_OP_SRC_ADDR_UPDATE) begin
+      entry = rdma_dev_source_addr::type_id::create($sformatf("source_addr_%0d", index));
+      entry.mac = rdma_be::field(sqe, 8, 0, 48);
+      foreach (entry.ip[i])
+        entry.ip[i] = sqe[16 + i];
+      source_addrs[index] = entry;
+      return;
+    end
+    if (!source_addrs.exists(index)) begin
+      ecode = 8'h01;
+      status = rdma_status::success();
+      return;
+    end
+    entry = source_addrs[index];
+    foreach (entry.ip[i])
+      cqe[16 + i] = entry.ip[i];
+    for (int unsigned i = 0; i < 6; i++)
+      cqe[8 + i] = entry.mac[47 - i * 8 -: 8];
   endtask
 
   // 功能：SD_UPDATE：校验签名后记录每个 SD 表项（前 2 项在 SQE 字节 32 起，其余在 sd_buf_addr）；

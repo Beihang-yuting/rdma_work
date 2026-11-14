@@ -1,6 +1,33 @@
 # 组合环境验证记录
 
-最近验证日期：2026-11-13。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的 `bash -lic` 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 直接组合 RDMA，复用 virtio_work 的基础 test/配置 sequence；本次同时修正 dpu_common 的 RDMA Notify PF 限制。
+最近验证日期：2026-11-14。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的登录 bash 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 直接组合 RDMA，复用 virtio_work 的基础 test/配置 sequence；本次同时修正 dpu_common 的 RDMA Notify PF 限制。
+
+当前工作树补齐了 `multi_host_pf_vf` 场景中 Host0/PF0 本体的四项 Intel route 参数，并在 53 的登录 bash 中以当前源码和依赖重跑：`two_pf`、`multi_host_pf_vf`、`save`、`restore`、`vio_only` 全部通过，结果目录为 `/home/ubuntu/workspace/rdma_codex_manual.8fD0IH/output/virtio_full_routefix4`。
+
+## TX-only 命令入口
+
+`integration/virtio/rdma_start.tcl` 默认按 TX-only 顺序执行 `load_params → dut_config → rdma_init → rdma_run`，
+并把 `qps` 与 `rdma.traffic.count` 约束到同一首发窗口。`tx_only_commands.tcl` 只在空闲结构 top 上检查命令参数边界和失败无副作用，
+不能替代真实 DUT 的 TX monitor。2026-11-14 使用当前 RDMA、Virtio、PCIe、Host memory 工作树及匹配 AIP dist 在 53 上执行，
+`RDMA_TX_ONLY_SMOKE_ONLY=1` 返回 `RDMA_VIRTIO_TX_ONLY_ARGS_PASS`，组合 binary 编译通过，UVM WARNING/ERROR/FATAL 为 `0/0/0`。执行入口为：
+
+```bash
+RDMA_TX_ONLY_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
+```
+
+真实平台验证还需提供 `::rdma_f0`、`::rdma_qps`、`::rdma_dest_qpn`、`::rdma_dmac`，并由外部 monitor 核对完整帧的数量、QP/PSN、MAC/IP/VLAN/UDP、payload 和 IMM；本阶段不接 RX、环回或 ACK。
+
+## MSI-X 接线边界修复（2026-11-13）
+
+`project_env` 现在只消费 `dpu_common.frozen_messages`，并按同源 resource snapshot 的 VIO qpair/AF extra vector 过滤 VIO RC 接收目录；RDMA vector 不再被环境当作 VIO sink。外部 RDMA 模式仍不创建模型 `rdma_dpu_interrupt_ctrl`，等待平台提供真实 event sink。验证使用隔离目录 `/tmp/rdma-msix-fix.qKwAT4`，没有修改远端共享依赖 checkout。
+
+| 日志 | 覆盖 | 结果 |
+| --- | --- | --- |
+| `output/virtio_integration/config_seq_helper.log` | 组合环境配置 sequence，Host0 双 PF，过滤后的 MSI-X catalog 与参数重载 | `RDMA_CFG_SEQ_PASS`，UVM WARNING/ERROR/FATAL `0/0/0` |
+| `output/virtio_integration/commands_helper.log` | 同一 Function 同时存在 VIO/RDMA 时的环境连接和命令重载 | `RDMA_VIRTIO_COMMANDS_PASS`，UVM WARNING/ERROR/FATAL `0/0/0` |
+| `output/virtio_integration/dma.log` | 公共 RC DMA view 唯一所有权及通用 MSI-X sink 捕获 | `DMA_VIEWS_PASS`，UVM WARNING/ERROR/FATAL `0/0/0` |
+
+编译仅保留已有 `rdma_project_config_test.sv` 的 `ENUMASSIGN` 提示；没有新增源码错误。上述 fixture 验证配置、路由和公共 sink 契约，不代表真实 DUT 已产生 RDMA IRQ 或完成 RDMA 接收路径。公共 DMA view fixture 另以 `RDMA_DMA_VIEWS_SMOKE_ONLY=1` 编译并返回 `DMA_VIEWS_PASS`，覆盖直接 Host 地址、VIO IOVA、权限、冲突和通用 MSI-X sink。
 
 ## 独立配置 sequence 与 PF Notify 定向验证
 
@@ -24,7 +51,7 @@
 修复仅删除 `owner.kind != DPU_FUNCTION_VF`，保留原 Host、保留位和索引检查，不增加新校验或适配层。
 
 配置用例只在 `pcie_tl_reg_seq` 传输边界复用字节存储 fixture，实际执行 AF、BDF、RDMA hardware plan、Notify/RNET 的生产配置流程；没有真实 DUT，不代表 Intel 链路、`rdma_init`、QP 收发或 ETH 环回通过。
-`project_dut_config_seq` 的对象绑定和重载门禁此前也曾以入口探针单独通过；本次以实际配置流程替换了该模拟成功结果。
+`dut_cfg_seq` 的对象绑定和重载门禁此前也曾以入口探针单独通过；本次以实际配置流程替换了该模拟成功结果。
 
 本地 `git diff --check`、`bash -n integration/virtio/tests/run.sh` 和 `tools/check_changed_sv_style.py --base HEAD` 通过。
 
@@ -75,9 +102,9 @@
 
 组合配置现在由 `rdma_enabled` 门控。关闭时 `load_params` 只调用父类 VIO/DPU 重载，`dut_config` 直接使用 `vio_dpu_cfg_seq`；不会创建 RDMA 子环境、添加 RDMA service、生成 hardware plan 或发送 Notify/RNET，节省仿真时间。显式 `rdma_functions` 或 grant 会在构建前打开 RDMA，混合场景仍使用 `rdma_virtio_cfg_seq`。
 
-本次门控复核在 53 的 `/tmp/rdma-codex.UrQZDM/output/virtio_gated3` 完成：`two_pf`、`multi_host_pf_vf`、`save`、`restore` 和新增 `vio_only` 均通过，`vio_only` 返回 `RDMA_VIRTIO_VIO_ONLY_PASS`；Task6 返回 `PROJECT_TASK6_PASS`，Intel 类型回归返回 `PROJECT_INTEL_TYPES_PASS`。
+此前门控复核在 53 的 `/tmp/rdma-codex.UrQZDM/output/virtio_gated3` 完成；本次 route 修正后的结果以 `/home/ubuntu/workspace/rdma_codex_manual.8fD0IH/output/virtio_full_routefix4` 为准。Task6 返回 `PROJECT_TASK6_PASS`，Intel 类型回归返回 `PROJECT_INTEL_TYPES_PASS`。
 
-原 [run_commands.sh](../project/tests/run_commands.sh) 使用原 Task6 依赖快照 `/tmp/rdma-task6-current-deps/deps` 重跑，返回 `PROJECT_TASK6_PASS`。命令、prepare/probe 拒绝、跨进程 restore、无新 CLI 恢复和 namespace 检查均通过；重复注册与配置 fatal 为独立预期负例。未把负例的诊断混入正常通过计数。
+原 Task6 的命令、prepare/probe 拒绝、跨进程 restore、无新 CLI 恢复和 namespace 检查已迁移到本目录的 `tests/run.sh`；重复注册与配置 fatal 仍作为独立预期负例。未把负例的诊断混入正常通过计数。
 
 本地检查包括 `git diff --check`、`bash -n integration/virtio/tests/run.sh`，以及以 `5966775` 为基线、最终提交为 head 的 `tools/check_changed_sv_style.py`。本次复审覆盖新增目录、原 RDMA 配置预检边界和两处 packet package 类型接入；旧源码中不准确的函数注释随接入一并校正。
 

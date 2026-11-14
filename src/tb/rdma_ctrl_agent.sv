@@ -126,6 +126,10 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
 
     item.qp.peer = item.peer;
     item.peer.peer = item.qp;
+    item.qp.tx_only = item.tx_only;
+    item.qp.tx_dest_qpn = item.tx_dest_qpn;
+    item.qp.tx_dest_psn = item.tx_dest_psn;
+    item.qp.tx_dest_dmac = item.tx_dest_dmac;
     foreach (steps[s]) begin
       modify(item.qp, steps[s], item.peer, item.status);
       if (item.status.ok())
@@ -159,10 +163,11 @@ class rdma_ctrl_driver extends uvm_driver #(rdma_ctrl_item);
       attr.mask |= rdma_drv_qp_attr::M_DEST_QPN | rdma_drv_qp_attr::M_RQ_PSN |
                    rdma_drv_qp_attr::M_PATH_MTU | rdma_drv_qp_attr::M_AV |
                    rdma_drv_qp_attr::M_MIN_RNR | rdma_drv_qp_attr::M_ROUTE;
-      attr.dest_qpn = item.tx_only ? item.tx_dest_qpn : peer.id;
-      attr.rq_psn = item.tx_only ? item.tx_dest_psn : peer.psn;
+      attr.dest_qpn = qp.tx_only ? qp.tx_dest_qpn : peer.id;
+      attr.rq_psn = qp.tx_only ? qp.tx_dest_psn : peer.psn;
       attr.path_mtu = qp.mtu;
-      attr.dmac = item.tx_only ? item.tx_dest_dmac : peer.owner.mac;
+      attr.dmac = qp.tx_only ? qp.tx_dest_dmac :
+                  (qp.pkt.dst_mac != 0 ? qp.pkt.dst_mac : peer.owner.mac);
       attr.min_rnr = qp.min_rnr;
       attr.source_addr_valid = qp.owner.drv().cfg.source_addr_valid;
       attr.source_addr_idx = qp.owner.drv().cfg.source_addr_idx;
@@ -348,7 +353,13 @@ task rdma_ctrl_driver::execute(rdma_ctrl_item	item);
     RDMA_CTRL_CREATE_SRQ: create_srq(f, item);
     RDMA_CTRL_CREATE_QP:  create_qp(f, item);
     RDMA_CTRL_CONNECT:    connect_pair(item);
-    RDMA_CTRL_MODIFY_QP:  modify(item.qp, item.state, item.peer, item.status);
+    RDMA_CTRL_MODIFY_QP: begin
+      item.qp.tx_only = item.tx_only;
+      item.qp.tx_dest_qpn = item.tx_dest_qpn;
+      item.qp.tx_dest_psn = item.tx_dest_psn;
+      item.qp.tx_dest_dmac = item.tx_dest_dmac;
+      modify(item.qp, item.state, item.peer, item.status);
+    end
     RDMA_CTRL_DESTROY:    destroy(item);
     RDMA_CTRL_FLR: begin
       item.status = env.sys.flr(item.scope);

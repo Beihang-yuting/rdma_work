@@ -1,6 +1,6 @@
 # VIO-only 组合回归：RDMA 未开启时只加载/保留 VIO 参数，不创建 RDMA 子环境或 RDMA 表项。
 source [file join $::env(AIP_CORE) dist aip_init_so.tcl]
-source [file join $::env(RDMA_ROOT) integration project tests rdma_project_common.tcl]
+source [file join $::env(RDMA_ROOT) integration virtio tests rdma_project_common.tcl]
 run 100ns
 set initial [project_cmd compose_observe]
 project_eq $initial count 0

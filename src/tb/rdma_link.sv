@@ -246,6 +246,8 @@ class rdma_link_netpkt extends rdma_link;
   // codec 构造时的链路默认地址；每帧先恢复默认，再叠加发送 QP 的报文属性。
   protected bit [31:0] default_src_ip;
   protected bit [31:0] default_dst_ip;
+  protected bit [47:0] default_src_mac;
+  protected bit [47:0] default_dst_mac;
   protected bit [15:0] default_udp_sport;
 
   // 功能：构造 net_packet 链路并创建本链路独占的 RoCEv2 codec，记录 codec 的默认 IP/UDP 源端口，
@@ -257,18 +259,22 @@ class rdma_link_netpkt extends rdma_link;
     codec = rdma_netpkt_codec::type_id::create("codec");
     default_src_ip = codec.src_ip;
     default_dst_ip = codec.dst_ip;
+    default_src_mac = codec.src_mac;
+    default_dst_mac = codec.dst_mac;
     default_udp_sport = codec.udp_src_port;
   endfunction
 
   // 功能：按发送 QP（src Function 内 QPN = pkt.source_qpn）记录的报文属性配置 codec：VLAN 标签、
-  //   源/目的 IPv4、UDP 源端口；属性为 0 或找不到 QP 时使用链路默认。
-  // 输入/输出及副作用：修改 codec 的 VLAN/IP/UDP 字段，供紧随其后的 encode 使用。
-  // 失败/边界：远端（rxe）Function、未登记或已销毁的 QP 一律按默认编码；不改变 MAC。
+  //   源/目的 MAC、IPv4、UDP 源端口；属性为 0 或找不到 QP 时使用链路默认。
+  // 输入/输出及副作用：修改 codec 的 VLAN/MAC/IP/UDP 字段，供紧随其后的 encode 使用。
+  // 失败/边界：远端（rxe）Function、未登记或已销毁的 QP 一律按默认编码；零 MAC/IP/端口不覆盖默认值。
   protected function void apply_qp_attrs(int unsigned src, rdma_packet pkt);
     rdma_res_qp qp;
 
     codec.vlan_enable = 1'b0;
     codec.vlan_id = '0;
+    codec.src_mac = default_src_mac;
+    codec.dst_mac = default_dst_mac;
     codec.src_ip = default_src_ip;
     codec.dst_ip = default_dst_ip;
     codec.udp_src_port = default_udp_sport;
@@ -279,6 +285,10 @@ class rdma_link_netpkt extends rdma_link;
       return;
     codec.vlan_enable = qp.pkt.vlan_en;
     codec.vlan_id = qp.pkt.vlan_id[11:0];
+    if (qp.pkt.src_mac != 0)
+      codec.src_mac = qp.pkt.src_mac;
+    if (qp.pkt.dst_mac != 0)
+      codec.dst_mac = qp.pkt.dst_mac;
     if (qp.pkt.src_ip != 0)
       codec.src_ip = qp.pkt.src_ip;
     if (qp.pkt.dst_ip != 0)

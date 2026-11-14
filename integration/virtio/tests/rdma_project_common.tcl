@@ -1,4 +1,4 @@
-# 目录：integration/project/tests；真实桥断言辅助，不隐式加载/配置/初始化。
+# 目录：integration/virtio/tests；真实桥断言辅助，不隐式加载/配置/初始化。
 # 依赖：调用方已source匹配simv的AIP loader；proc在restore之后重新定义。
 # 功能：通过真实AIP桥执行command并核对预期成功/失败。
 # 输入/输出及副作用：command/want_error为输入，返回非空result；命令可推进仿真。

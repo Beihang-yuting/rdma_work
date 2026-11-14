@@ -116,7 +116,7 @@ class project_cfg_seq_test extends rdma_virtio_smoke_test;
 
   // 功能：保留原环境构建，为配置子流程安装观察探针和既有寄存器传输 fixture。
   // 输入/输出及副作用：factory override 只对本测试进程生效；生产预检/写表及状态管理照常执行。
-  // 失败/边界：不覆盖 project_dut_config_seq，不向它设置 cfg、Function 或 grant。
+  // 失败/边界：不覆盖 dut_cfg_seq，不向它设置 cfg、Function 或 grant。
   extern virtual function void build_phase(uvm_phase	phase);
 
   // 功能：沿用 Intel VIF 绑定，并在发布前声明测试平台的 RDMA Notify/RNET 表布局。
@@ -142,7 +142,7 @@ endfunction
 
 // 功能：保留原环境构建，为配置子流程安装观察探针和既有寄存器传输 fixture。
 // 输入/输出及副作用：factory override 只对本测试进程生效；生产预检/写表及状态管理照常执行。
-// 失败/边界：不覆盖 project_dut_config_seq，不向它设置 cfg、Function 或 grant。
+// 失败/边界：不覆盖 dut_cfg_seq，不向它设置 cfg、Function 或 grant。
 function void project_cfg_seq_test::build_phase(uvm_phase	phase);
   super.build_phase(phase);
   rdma_project_cfg_seq::type_id::set_type_override(project_cfg_binding_probe::get_type());
@@ -188,7 +188,7 @@ function void project_cfg_seq_test::end_of_elaboration_phase(uvm_phase	phase);
 endfunction
 
 // 宏仅创建/启动项目 sequence，与用户接入方式相同，没有调用前的字段赋值。
-`aip_cmd_user_seq(cfg_seq_direct, project_dut_config_seq, cfg_seq_rc)
+`aip_cmd_user_seq(cfg_seq_direct, dut_cfg_seq, cfg_seq_rc)
 
 // 只捕获本用例精确注入的异源错误，其他配置失败保持 fatal。
 class project_cfg_reject_catcher extends uvm_report_catcher;
@@ -251,7 +251,7 @@ endtask
 task cfg_seq_reject();
   project_cfg_seq_test		test;
   project_env_cfg		wrong_cfg;
-  project_dut_config_seq	seq;
+  dut_cfg_seq	seq;
   project_cfg_reject_catcher	catcher;
   int unsigned			before_calls;
   aip_cmd			handle;
@@ -263,7 +263,7 @@ task cfg_seq_reject();
   uvm_config_db#(project_env_cfg)::set(cfg_seq_rc, "", "project_cfg", wrong_cfg);
   catcher = new();
   uvm_report_cb::add(null, catcher);
-  seq = project_dut_config_seq::type_id::create("reject_wrong_project");
+  seq = dut_cfg_seq::type_id::create("reject_wrong_project");
   seq.start(cfg_seq_rc);
   uvm_report_cb::delete(null, catcher);
   uvm_config_db#(project_env_cfg)::set(cfg_seq_rc, "", "project_cfg", test.cfg);

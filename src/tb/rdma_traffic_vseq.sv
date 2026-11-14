@@ -47,7 +47,8 @@ class rdma_traffic_vseq extends rdma_base_vseq;
   int unsigned	f0 = 0;
   int unsigned	f1 = 1;
   int unsigned	qp_count = 1;
-  bit	 tx_only;
+  bit	tx_only;
+  bit	tx_success;
   int unsigned	tx_dest_qpn;
   bit [31:0]	tx_dest_qkey;
   bit [47:0]	tx_dmac;
@@ -98,6 +99,11 @@ class rdma_traffic_vseq extends rdma_base_vseq;
   // 输入/输出及副作用：只读 env.sys 节点；返回 -1 表示未找到，不创建资源。
   // 失败/边界：env 未绑定、Function 尚未发布或 ID 属于远端 Function 时返回 -1。
   extern function int find_global_function(int unsigned global_id);
+
+  // 功能：按当前场景把一个 WR 的 payload/立即数表达式物化到 item，确保同一 WR 后续路径复用同一值。
+  // 输入/输出及副作用：b 为冻结场景、item 为待投递 item；写入 data_fixed/data_pattern/imm，不修改配置。
+  // 失败/边界：FIXED/PATTERN 缺少对应表达式、PATTERN 缺少花括号或任一元素越界时 fatal；空 IMM 保持兼容随机默认。
+  extern function void materialize_payload(rdma_scenario_cfg b, rdma_verb_item item);
 endclass
 
   // 功能：构造默认在 Function 0 ↔ 1 之间运行、每个业务结束等待 5ms 排空的业务序列。
@@ -116,6 +122,7 @@ task rdma_traffic_vseq::body();
     int	left;
     int	right;
     int unsigned	groups;
+    time	deadline;
 
     status = env.cfg.scenario.validate();
     if (!status.ok())
@@ -125,14 +132,36 @@ task rdma_traffic_vseq::body();
           (env.cfg.scenario.qp.kind == RDMA_SCENARIO_UD && tx_dest_qkey == 0))
         `uvm_fatal("RDMA_SCENARIO",
                    "TX-only requires no flow groups and complete destination fields")
+      if (!(env.cfg.scenario.qp.kind inside {RDMA_SCENARIO_RC, RDMA_SCENARIO_UD}))
+        `uvm_fatal("RDMA_SCENARIO", "TX-only supports RC or UD only")
+      if (env.cfg.scenario.weight(RDMA_VERB_WRITE) != 0 ||
+          env.cfg.scenario.weight(RDMA_VERB_WRITE_IMM) != 0 ||
+          env.cfg.scenario.weight(RDMA_VERB_READ) != 0 ||
+          env.cfg.scenario.weight(RDMA_VERB_CMP_SWAP) != 0 ||
+          env.cfg.scenario.weight(RDMA_VERB_FETCH_ADD) != 0)
+        `uvm_fatal("RDMA_SCENARIO", "TX-only supports SEND and SEND_IMM only")
+      if (qp_count == 0 || env.cfg.scenario.traffic.count == 0 ||
+          env.cfg.scenario.traffic.count > env.cfg.scenario.mem.slots)
+        `uvm_fatal("RDMA_SCENARIO", "TX-only requires nonzero count/QPs, independent slots")
       if (env.cfg.scenario.qp.kind == RDMA_SCENARIO_RC &&
-          (qp_count != 1 || env.cfg.scenario.traffic.count != 1))
-        `uvm_fatal("RDMA_SCENARIO", "TX-only RC permits one QP and one first SEND only")
+          env.cfg.scenario.traffic.count > qp_count)
+        `uvm_fatal("RDMA_SCENARIO", "TX-only RC permits one first SEND per QP")
+      if (env.cfg.scenario.qp.kind == RDMA_SCENARIO_UD &&
+          ((env.cfg.scenario.traffic.count - 1) / qp_count + 1) > env.cfg.scenario.qp.depth)
+        `uvm_fatal("RDMA_SCENARIO", "TX-only UD exceeds the per-QP SQ window")
       if (f0 >= env.res.funcs.size() || env.res.funcs[f0].remote)
         `uvm_fatal("RDMA_SCENARIO", "TX-only sender Function is missing or remote")
+      env.sb.begin_tx();
       setup_scenario(env.cfg.scenario, p, qp_count);
       traffic(p);
-      env.wait_idle(drain);
+      // 完整帧匹配才结束；独立槽一直保留，不借助 ACK/CQE 回收或重复写入。
+      deadline = $time + env.cfg.response_timeout;
+      while (!env.sb.tx_complete(env.cfg.scenario.traffic.count) &&
+             env.sb.errors == 0 && $time < deadline)
+        #(env.cfg.poll_interval);
+      tx_success = env.sb.tx_complete(env.cfg.scenario.traffic.count);
+      if (!tx_success)
+        env.sb.tx_failure("TX frame verification failed or timed out");
       return;
     end
     // 配置中的 flow_groups 是项目级拓扑声明；序列字段仍保留给旧用例和平台临时覆盖。
@@ -275,10 +304,11 @@ task rdma_traffic_vseq::traffic(rdma_traffic_pair	p);
     end
     for (int unsigned	i = 0; i < p.scenario.traffic.count; i++)
       one(p, i, -1, quiet);
-    foreach (quiet[n])
-      foreach (quiet[n][q])
-        if (quiet[n][q] != 0)
-          one(p, p.scenario.traffic.count + n * p.qp_count + q, n, quiet, q);
+    if (!tx_only)
+      foreach (quiet[n])
+        foreach (quiet[n][q])
+          if (quiet[n][q] != 0)
+            one(p, p.scenario.traffic.count + n * p.qp_count + q, n, quiet, q);
 endtask
 
   // 功能：生成一条消息：选方向（dir_override ≥ 0 时固定方向并强制 signaled）与 verb，按槽计算本地/远端
@@ -303,7 +333,7 @@ task rdma_traffic_vseq::one(rdma_traffic_pair	p, int unsigned	i, int	dir_overrid
     rdma_res_qp	active_qp[2];
 
     b = p.scenario;
-    n = b.traffic.dir == 2 ? $urandom_range(1, 0) : b.traffic.dir;
+    n = tx_only ? 0 : (b.traffic.dir == 2 ? $urandom_range(1, 0) : b.traffic.dir);
     if (dir_override >= 0)
       n = dir_override;
     op = b.pick_op();
@@ -314,7 +344,9 @@ task rdma_traffic_vseq::one(rdma_traffic_pair	p, int unsigned	i, int	dir_overrid
     base = b.mem.slots * b.mem.slot_bytes;
     remote_side = env.res.funcs[n == 0 ? f0 : f1].remote;
     len_max = b.mem.slot_bytes;
-    if (b.qp.kind == RDMA_SCENARIO_UD)
+    if (tx_only && b.qp.mtu < len_max)
+      len_max = b.qp.mtu;
+    if (!tx_only && b.qp.kind == RDMA_SCENARIO_UD)
       len_max = b.qp.mtu < b.mem.slot_bytes - GRH_BYTES ? b.qp.mtu : b.mem.slot_bytes - GRH_BYTES;
     it = verb(op, active_qp[n], p.mr[n], slot, 0, null, base + slot);
     if (!(op inside {RDMA_VERB_SEND, RDMA_VERB_SEND_IMM}))
@@ -325,12 +357,10 @@ task rdma_traffic_vseq::one(rdma_traffic_pair	p, int unsigned	i, int	dir_overrid
     it.sge_count = it.atomic() || remote_side ? 1 : b.draw("sge", b.traffic.sge, 1, sge_max,
                                                            env.cfg.spec);
     it.data_mode = b.pick_data_mode();
-    it.data_fixed = $urandom;
-    it.data_pattern = '{$urandom, $urandom, $urandom};
-    it.imm = $urandom;
+    materialize_payload(b, it);
     it.compare_value = $urandom_range(1, 0);
     it.swap_add_value = {$urandom, $urandom};
-    it.signaled = dir_override >= 0 || quiet[n][qp_slot] + 1 >= unsigned_limit(b) ||
+    it.signaled = tx_only || dir_override >= 0 || quiet[n][qp_slot] + 1 >= unsigned_limit(b) ||
                   $urandom_range(99, 0) < b.traffic.signaled_pct;
     quiet[n][qp_slot] = it.signaled ? 0 : quiet[n][qp_slot] + 1;
     if (!tx_only && it.consumes_rqe())
@@ -345,6 +375,48 @@ task rdma_traffic_vseq::one(rdma_traffic_pair	p, int unsigned	i, int	dir_overrid
     end
     post(it);
 endtask
+
+// 功能：按 payload 模式解析并物化场景中的 FIXED/PATTERN/IMM 值，供 driver、DMA 和期望路径共同使用。
+// 输入/输出及副作用：b 提供原始表达式和统一求值器，item 接收本次 WR 的固定字节/模式集合/立即数。
+// 失败/边界：FIXED 或 PATTERN 未提供表达式、PATTERN 非 `{...}`、元素抽样超出字节范围时立即 fatal；RANDOM/INCREMENT
+//   不填固定集合，空 IMM 才保留旧的随机默认。
+function void rdma_traffic_vseq::materialize_payload(rdma_scenario_cfg b, rdma_verb_item item);
+  string spec;
+  string body;
+  string parts[$];
+
+  item.data_pattern.delete();
+  case (item.data_mode)
+    PAYLOAD_FIXED: begin
+      if (rdma_value_spec::strip(b.traffic.data_fixed) == "")
+        `uvm_fatal("RDMA_SCENARIO",
+                   {"rdma.traffic.data_fixed is required when data_mode ",
+                    "selects FIXED"})
+      item.data_fixed = b.draw("data_fixed", b.traffic.data_fixed, 0, 8'hff, env.cfg.spec);
+    end
+    PAYLOAD_PATTERN: begin
+      spec = rdma_value_spec::strip(b.traffic.data_pattern);
+      if (spec.len() < 2 || spec[0] != "{" || spec[spec.len() - 1] != "}")
+        `uvm_fatal("RDMA_SCENARIO",
+                   {"rdma.traffic.data_pattern must be an ordered collection ",
+                    "such as {0xde,0xad}"})
+      body = rdma_value_spec::strip(spec.substr(1, spec.len() - 2));
+      rdma_value_spec::split_top(body, parts);
+      if (parts.size() == 0 || rdma_value_spec::strip(parts[0]) == "")
+        `uvm_fatal("RDMA_SCENARIO", "rdma.traffic.data_pattern must not be empty")
+      foreach (parts[k])
+        item.data_pattern.push_back(
+          byte'(b.draw("data_pattern", parts[k], 0, 8'hff, env.cfg.spec)));
+    end
+    default: begin
+      item.data_fixed = 0;
+    end
+  endcase
+  if (rdma_value_spec::strip(b.traffic.imm) != "")
+    item.imm = b.draw("imm", b.traffic.imm, 0, 32'hffff_ffff, env.cfg.spec);
+  else
+    item.imm = $urandom;
+endfunction
 
   // 功能：返回一个方向允许的连续 unsigned WR 上限：min(QP 深度/2, 槽数-1)。
   // 输入/输出及副作用：b 为业务场景，纯计算。

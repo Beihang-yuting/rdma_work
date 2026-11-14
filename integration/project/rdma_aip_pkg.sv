@@ -159,7 +159,8 @@ package rdma_aip_pkg;
       group = "rdma";
       description = "RDMA sequence command";
       param_info = operation == "rdma_run" ?
-        "f0=<global id> f1=<global id> [qps=<positive integer>|group=<index>]" : "";
+        {"f0=<global id> [f1=<global id>] [qps=<positive integer>] ",
+         "[tx_only=1 dest_qpn=<qpn> dmac=<mac> dest_qkey=<qkey>]"} : "";
     endfunction
 
     // 功能：在 AIP 局部结果上下文中执行一个 RDMA 命令，并支持 AIP 原生 wait=0 后台 worker。
@@ -188,10 +189,19 @@ package rdma_aip_pkg;
       string f1_arg;
       string group_arg;
       string qps_arg;
+      string tx_only_arg;
+      string dest_qpn_arg;
+      string dest_qkey_arg;
+      string dmac_arg;
+      string dst_mac_arg;
       longint unsigned f0;
       longint unsigned f1;
       longint unsigned group;
       longint unsigned qps;
+      longint unsigned tx_only_value;
+      longint unsigned dest_qpn;
+      longint unsigned dest_qkey;
+      longint unsigned dmac;
 
       ok = 0;
       why = "RDMA AIP target is unavailable or busy";
@@ -219,11 +229,35 @@ package rdma_aip_pkg;
           f1_arg = aip_cmd::get_arg(args_in, "f1");
           group_arg = aip_cmd::get_arg(args_in, "group");
           qps_arg = aip_cmd::get_arg(args_in, "qps");
+          tx_only_arg = aip_cmd::get_arg(args_in, "tx_only");
+          dest_qpn_arg = aip_cmd::get_arg(args_in, "dest_qpn");
+          dest_qkey_arg = aip_cmd::get_arg(args_in, "dest_qkey");
+          dmac_arg = aip_cmd::get_arg(args_in, "dmac");
+          dst_mac_arg = aip_cmd::get_arg(args_in, "dst_mac");
+          if (dmac_arg == "")
+            dmac_arg = dst_mac_arg;
+          if (tx_only_arg == "")
+            tx_only_value = 0;
+          else
+            tx_only_value = aip_cmd::parse_int64_arg(tx_only_arg, '1);
+          if (dest_qpn_arg == "")
+            dest_qpn = target.env.cfg.scenario.qp.dest_qpn;
+          else
+            dest_qpn = aip_cmd::parse_int64_arg(dest_qpn_arg, '1);
+          if (dest_qkey_arg == "")
+            dest_qkey = target.env.cfg.scenario.qp.qkey;
+          else
+            dest_qkey = aip_cmd::parse_int64_arg(dest_qkey_arg, '1);
+          if (dmac_arg == "")
+            dmac = target.env.cfg.scenario.pkt.dst_mac;
+          else
+            dmac = aip_cmd::parse_int64_arg(dmac_arg, '1);
           if (!target.can_run(why))
             return;
           if (group_arg != "") begin
             group = aip_cmd::parse_int64_arg(group_arg, '1);
-            if (f0_arg != "" || f1_arg != "" || qps_arg != "" ||
+            if (f0_arg != "" || f1_arg != "" || qps_arg != "" || tx_only_arg != "" ||
+                dest_qpn_arg != "" || dest_qkey_arg != "" || dmac_arg != "" || dst_mac_arg != "" ||
                 group >= target.env.cfg.flow_groups.size()) begin
               why = "rdma_run group requires an existing flow group without f0/f1/qps";
               return;
@@ -231,13 +265,30 @@ package rdma_aip_pkg;
             f0 = target.env.cfg.flow_groups[group].f0_global_id;
             f1 = target.env.cfg.flow_groups[group].f1_global_id;
             qps = target.env.cfg.flow_groups[group].qp_count;
+          end else if (tx_only_value != 0) begin
+            f0 = aip_cmd::parse_int64_arg(f0_arg, '1);
+            f1 = '1;
+            if (qps_arg == "")
+              qps = 1;
+            else
+              qps = aip_cmd::parse_int64_arg(qps_arg, '1);
           end else begin
             f0 = aip_cmd::parse_int64_arg(f0_arg, '1);
             f1 = aip_cmd::parse_int64_arg(f1_arg, '1);
-            qps = qps_arg == "" ? 1 : aip_cmd::parse_int64_arg(qps_arg, '1);
+            if (qps_arg == "")
+              qps = 1;
+            else
+              qps = aip_cmd::parse_int64_arg(qps_arg, '1);
           end
-          if (f0 >= 256 || f1 >= 256 || f0 == f1 || qps == 0 || qps > 32'hffff_ffff) begin
-            why = "rdma_run requires two distinct global IDs in [0:255] and positive qps";
+          if (f0 >= 256 || qps == 0 || qps > 32'hffff_ffff ||
+              (tx_only_value == 0 && (f1 >= 256 || f0 == f1)) ||
+              (tx_only_value != 0 && (dest_qpn == 0 || dest_qpn > 24'hffffff || dmac == 0))) begin
+            if (tx_only_value != 0)
+              why = {"rdma_run TX-only requires sender f0, dest_qpn in ",
+                     "[1:0xffffff] and nonzero dmac"};
+            else
+              why = {"rdma_run requires two distinct global IDs in [0:255] ",
+                     "and positive qps"};
             return;
           end
           run_seq = rdma_run_seq::type_id::create("rdma_run");
@@ -245,6 +296,10 @@ package rdma_aip_pkg;
           run_seq.f0 = int'(f0);
           run_seq.f1 = int'(f1);
           run_seq.qp_count = int'(qps);
+          run_seq.tx_only = tx_only_value != 0;
+          run_seq.tx_dest_qpn = dest_qpn;
+          run_seq.tx_dest_qkey = dest_qkey;
+          run_seq.tx_dest_dmac = dmac;
           aip_cmd_seq_registry::register("rdma_run", run_seq);
           run_seq.start(null);
           aip_cmd_seq_registry::unregister("rdma_run");

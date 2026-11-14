@@ -342,6 +342,15 @@ task rdma_env::initialize(output rdma_status	status);
     if (!status.ok())
       return;
   end
+  if (cfg.scenario.pkt.src_mac != 0 || cfg.scenario.pkt.src_ip != 0)
+    foreach (sys.nodes[i]) begin
+      if (sys.nodes[i].drv_cfg.source_addr_valid) begin
+        sys.nodes[i].drv.update_source_addr(cfg.scenario.pkt.src_mac,
+                                            cfg.scenario.pkt.src_ip, status);
+        if (!status.ok())
+          return;
+      end
+    end
   foreach (sys.nodes[i]) begin
     f = res.add_func(sys.nodes[i], MAC_BASE + i);
     register_device(f);

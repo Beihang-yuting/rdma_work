@@ -38,5 +38,5 @@ simv +UVM_TESTNAME=rdma_env_traffic_test +rdma.qp.type=UD \
 
 测试入口：`rdma_scenario_cfg_test` 验证候选/优先级/身份与初始化门禁；`rdma_scenario_traffic_test` 检查每端资源数量，可用 `+EXPECT_DRAWS=N` 检查真实WR求值次数；`sim/param_regression.list`列出正向参数场景。所有VCS执行在53的登录bash环境，由验证者记录结果。
 
-项目级唯一命令、独立编译和跨进程恢复见 [集成入口](../integration/project/README.md)；
-实际验证结果见 [验证记录](../integration/project/VALIDATION.md)。本文件保留历史文件名，现行接口均为上述单场景路径。
+项目级唯一命令、独立编译和跨进程恢复见 [Virtio 集成入口](../integration/virtio/README.md)；
+实际验证结果见 [Virtio 验证记录](../integration/virtio/VALIDATION.md)。本文件保留历史文件名，现行接口均为上述单场景路径。

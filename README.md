@@ -28,10 +28,10 @@
 - `docs/rdma-driver-shaped-arch.md`：驱动形状架构与迁移计划；`docs/rdma-uvm-flow-design.md`：UVM 流程；
   `docs/rdma-arch-slim-report.md`：feature/rdma-arch-slim 总报告；`docs/history`：只读历史记录。
 
-独立 Intel/Tcl 集成使用 [integration/project](integration/project/README.md) 的显式入口，
-不加入旧生产 filelist；实际依赖、模型/传输验证与公共 DPU grant 限制见 [验证记录](integration/project/VALIDATION.md)。
-在 virtio_work 的 `project_env/project_env_cfg` 上组合 VIO 与 RDMA，使用
-[integration/virtio](integration/virtio/README.md)，共享同一 DPU 快照、Intel PCIe 和 Host 内存池。
+Intel/Tcl 组合示例使用 [integration/virtio](integration/virtio/README.md) 的显式入口，
+共享 virtio_work 的 `project_env/project_env_cfg`、DPU 快照、Intel PCIe 和 Host 内存池。
+`integration/project` 只保留可复用的 RDMA 配置、运行期 sequence 与 AIP 类型包；启动脚本、环境连接和验证 fixture
+集中在 `integration/virtio`，验证边界见其 [验证记录](integration/virtio/VALIDATION.md)。
 
 如果只集成 RDMA 基础环境，直接使用 [src/rdma.f](src/rdma.f)：从仓库根目录将清单中的
 `@AIP_CORE_ROOT@`、`@DPU_COMMON_ROOT@`、`@HOST_MEM_ROOT@` 和 `@NET_PACKET_ROOT@` 展开为实际

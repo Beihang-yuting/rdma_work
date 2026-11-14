@@ -22,6 +22,7 @@ package project_env_pkg;
   import rdma_aip_cfg_pkg::*;
   import rdma_dpu_adapter_pkg::*;
   import rdma_drv_pkg::*;
+  import rdma_pcie_pkg::*;
   import rdma_project_pkg::*;
   `include "uvm_macros.svh"
 

@@ -296,6 +296,38 @@ class rdma_drv_dev extends uvm_object;
     probed = 1'b0;
   endtask
 
+  // 功能：把一个 Function 的已物化源 MAC/IPv4 写入硬件源地址表，供 QPC 的 source_addr_idx 引用。
+  // 输入/输出及副作用：mac/ipv4 为值输入；按 cfg.source_addr_idx 组成 SRC_ADDR_UPDATE CMQ 请求并返回 status。
+  // 失败/边界：设备未 probe、source_addr_valid 未授权或 CMQ 编码/执行失败时返回错误；IPv4 仅写入 16B 地址的低四字节。
+  task update_source_addr(bit [47:0] mac, bit [31:0] ipv4, output rdma_status status);
+    rdma_hw_cmq_field_body body;
+    rdma_bytes_t cqe;
+    byte unsigned mac_bytes[];
+    byte unsigned ip_bytes[];
+
+    if (!probed || cmq == null || !cfg.source_addr_valid) begin
+      status = rdma_status::make(
+        RDMA_SC_INVALID_STATE,
+        {"source address update requires a probed Function ", "with a valid grant"});
+      return;
+    end
+    body = rdma_hw_cmq_field_body::type_id::create("source_addr_update");
+    body.values["src_addr_idx"] = cfg.source_addr_idx;
+    mac_bytes = new[6];
+    foreach (mac_bytes[i])
+      mac_bytes[i] = mac[47 - i * 8 -: 8];
+    body.blobs["src_mac"] = mac_bytes;
+    ip_bytes = new[16];
+    foreach (ip_bytes[i])
+      ip_bytes[i] = 0;
+    ip_bytes[12] = ipv4[31:24];
+    ip_bytes[13] = ipv4[23:16];
+    ip_bytes[14] = ipv4[15:8];
+    ip_bytes[15] = ipv4[7:0];
+    body.blobs["src_ip"] = ip_bytes;
+    cmq.exec_fields(RDMA_OP_SRC_ADDR_UPDATE, body, cqe, status);
+  endtask
+
   // 功能：保留第一个失败。
   // 输入/输出及副作用：可能修改 status。
   // 失败/边界：已有失败保持不变；调用契约要求 status/one 均为非 null，后续成功不能覆盖先前错误。

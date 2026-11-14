@@ -1,16 +1,16 @@
 # RDMA 共享配置与 Intel PCIe 集成设计
 
-日期：2026-11-09。状态：Tasks1–7及最终I1修复已完成，批准范围内的53验证门禁与最终技术复审通过；I1修复提交f3e03b1。工作区转交由控制方另行记录。此文记录实际接口与保留的设计约束，通过范围以 [验证记录](../../../integration/project/VALIDATION.md) 为准，不再把提案当成当前API。
+日期：2026-11-09。状态：Tasks1–7及最终I1修复已完成，批准范围内的53验证门禁与最终技术复审通过；I1修复提交f3e03b1。当前可执行入口已收敛到 `integration/virtio`，`integration/project` 仅保留可复用类型。此文记录设计约束，通过范围以 [Virtio 验证记录](../../../integration/virtio/VALIDATION.md) 为准，不再把已删除的独立 fixture 名称当成当前 API。
 
-[接入参考](../../rdma-intel-integration-reference.md) 给出实际编译/调用方式，[项目README](../../../integration/project/README.md) 区分独立模型、Intel wire fixture与真实平台。真实DUT接线、复位、网络和业务验收由平台负责；DPU RDMA grant缺口仍独立存在。
+[接入参考](../../rdma-intel-integration-reference.md) 给出实际编译/调用方式，[Virtio README](../../../integration/virtio/README.md) 区分结构 fixture 与真实平台。真实DUT接线、复位、网络和业务验收由平台负责；DPU RDMA grant缺口仍独立存在。
 
 ## 目标、版本与方案
 
 目标是参考Virtio当前project的直接组合方式，复用DPU、Host memory、PCIe、Intel和AIP，先完成RDMA独立集成，Notify固定单bank，配置、初始化和业务都由Tcl显式启动。RDMA/VIO共存只保留架构边界，本轮无VIO编译依赖或混合sequence。
 
-RDMA同步基线为 `6ab999b3b7f9f188f3c3ba7f17b6e046f9c93973`，开发基于 `feature/rdma-param-v1`。外部依赖包含当前DPU/PCIe WIP，实际七仓commit与status/content hash记录于 [dependencies.tsv](../../../integration/project/dependencies.tsv)；旧设计阅读时的短hash不作为复现输入。本轮不修改外部仓库。
+RDMA同步基线为 `6ab999b3b7f9f188f3c3ba7f17b6e046f9c93973`，开发基于 `feature/rdma-param-v1`。外部依赖包含当前DPU/PCIe WIP，实际依赖摘要记录于 [Virtio dependencies.tsv](../../../integration/virtio/dependencies.tsv)；旧设计阅读时的短hash不作为复现输入。本轮不修改外部仓库。
 
-采用直接组合已有配置和收敛现有适配器。参考 `rdma_project_env_cfg` 持有 `dpu`、`rdma`、`pcie` 及完整 `functions` 目录，用户自己的cfg可直接持有相同类型，不要求继承。RDMA 维持一个 env，内部以动态 Function 节点和 `flow_groups[$]` 管理跨 Host/PF/VF 的业务边；项目只创建/绑定/发布组件及统一提交参数候选，继续复用driver/resource/verb agent。没有复制Virtio表包装层、重写driver或引入通用registry/allocator。
+采用直接组合已有配置和收敛现有适配器。当前 `integration/virtio/project_env_cfg` 持有 `dpu`、`rdma`、`pcie` 及完整 `functions` 目录，用户自己的cfg可直接持有相同类型，不要求继承。RDMA 维持一个 env，内部以动态 Function 节点和 `flow_groups[$]` 管理跨 Host/PF/VF 的业务边；项目只创建/绑定/发布组件及统一提交参数候选，继续复用driver/resource/verb agent。没有复制Virtio表包装层、重写driver或引入通用registry/allocator。
 
 VIO 按 Host 拆分 env 是因为每个 Host 的 ring、IOMMU、worker 和 Host 级配置彼此独立；RDMA 的 CMQ、QP、link、scoreboard 和资源状态需要在 Function 之间统一观察，因此不按 Function 或 Host 复制 env。只有两个 DUT 使用完全独立的 snapshot、PCIe 路由或 reset 生命周期时，才创建两个 RDMA env；同一快照下的多 Host/PF/VF 都留在一个 env 内。
 

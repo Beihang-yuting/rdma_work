@@ -534,7 +534,8 @@ class rdma_drv_qp extends uvm_object;
     `RDMA_DRV_SET(qpc, RDMA_QPC_ACK_REQ_TH, 3)
     `RDMA_DRV_SET(qpc, RDMA_QPC_DSCP, 6'h18)
     `RDMA_DRV_SET(qpc, RDMA_QPC_HOPLIMIT, 255)
-    `RDMA_DRV_SET(qpc, RDMA_QPC_CUR_UDP_SPORT, 16'hc000 | 16'($urandom_range(0, 16'h3fff)))
+    // QP 创建阶段没有场景报文对象可供读取；使用协议默认端口，显式场景值在 RTR 修改时覆盖。
+    `RDMA_DRV_SET(qpc, RDMA_QPC_CUR_UDP_SPORT, 16'd4791)
     `RDMA_DRV_SET(qpc, RDMA_QPC_SQ_PBA, sq_kbuf.base_iova() >> 12)
     `RDMA_DRV_SET(qpc, RDMA_QPC_SQ_SIZE, $clog2(sq_depth))
     `RDMA_DRV_SET(qpc, RDMA_QPC_SQ_OM, sq_kbuf.alloc_type)

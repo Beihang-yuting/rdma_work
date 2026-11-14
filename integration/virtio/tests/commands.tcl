@@ -1,6 +1,6 @@
 # 真实组合 build/connect 和 Tcl 事务；fixture 不提供 DUT 或 RDMA grant。
 source [file join $::env(AIP_CORE) dist aip_init_so.tcl]
-source [file join $::env(RDMA_ROOT) integration project tests rdma_project_common.tcl]
+source [file join $::env(RDMA_ROOT) integration virtio tests rdma_project_common.tcl]
 run 100ns
 set initial [project_cmd compose_observe]
 project_eq $initial count 10

@@ -52,61 +52,7 @@ class rdma_virtio_bind_plugin extends rdma_env_plugin;
   endfunction
 endclass
 
-// Intel RC 的 RDMA BAR 适配层：只借用 dpu_common 的冻结目标和 pcie_tl_vip 的 RC sequencer，
-// 不创建 RDMA 专用 PCIe transport，也不拥有 BAR、RC 或 Host memory。每次写入都重新校验
-// target 的 snapshot/generation，避免 restore/rebuild 后沿用旧 Function 路由。
-class rdma_intel_pcie_bar extends rdma_drv_bar;
-  `uvm_object_utils(rdma_intel_pcie_bar)
 
-  dpu_pcie_bar_map             map;
-  dpu_bar_target_t             target;
-  uvm_sequencer #(pcie_tl_tlp) sequencer;
-
-  // 功能：构造未绑定的 Intel RC BAR 适配器。
-  // 输入/输出及副作用：name 传给 UVM；map、target 和 sequencer 保持空状态，不创建 PCIe 组件。
-  // 失败/边界：绑定完成前 write64 返回 INVALID_STATE；适配器不拥有外部 map 或 sequencer。
-  function new(string name = "rdma_intel_pcie_bar");
-    super.new(name);
-    map       = null;
-    sequencer = null;
-  endfunction
-
-  // 功能：把 RDMA 驱动的 BAR0 8B 写转换为 pcie_tl_reg_seq，并通过目标 Host 的 Intel RC 发送。
-  // 输入/输出及副作用：offset/value 为驱动寄存器访问；status 返回 PCIe posted write 的结果。
-  // 失败/边界：空绑定、过期/越界 BAR、非法 PCIe 请求或 RC 发送错误均不发出后续事务并返回失败。
-  virtual task write64(bit [63:0] offset, bit [63:0] value, output rdma_status status);
-    pcie_tl_reg_seq request;
-    bit [63:0]      address;
-    string          why;
-
-    if (map == null || sequencer == null) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE,
-                                 "Intel RDMA BAR has no RC binding");
-      return;
-    end
-    if (!map.check_range(target, offset, 8, address, why)) begin
-      status = rdma_status::make(RDMA_SC_INVALID_STATE, why);
-      return;
-    end
-
-    request          = pcie_tl_reg_seq::type_id::create({get_name(), "_write"});
-    request.is_write = 1;
-    request.addr     = address;
-    request.len      = 8;
-    request.mask     = 0;
-    request.wdata    = value;
-    request.start(sequencer);
-
-    case (request.status)
-      PCIE_RW_OK:
-        status = rdma_status::success();
-      PCIE_RW_TIMEOUT:
-        status = rdma_status::make(RDMA_SC_TIMEOUT, request.error_msg);
-      default:
-        status = rdma_status::make(RDMA_SC_PCIE_COMPLETION, request.error_msg);
-    endcase
-  endtask
-endclass
 
 class project_env extends uvm_env;
 	`uvm_component_utils(project_env)
@@ -117,9 +63,9 @@ class project_env extends uvm_env;
 	virtio_net_env	vio_envs[int unsigned];
 	host_mem_pool	shared_pool;
 	rdma_env		rdma;
-	// project_env 保持每个 Function 的非拥有硬件绑定，覆盖 RDMA driver 的使用生命周期。
-	rdma_drv_bar	rdma_bars[int unsigned];
-	rdma_drv_hw	rdma_hws[int unsigned];
+	// project_env 按冻结 Function key 保存非拥有硬件绑定，动态支持任意 PF/VF 数量。
+	rdma_drv_bar	rdma_bars[string];
+	rdma_drv_hw	rdma_hws[string];
 
 	local bit	tx_observation_bound[int unsigned];
 
@@ -170,6 +116,17 @@ class project_env extends uvm_env;
 	// 输入/输出及副作用：更新 rdma_bars/rdma_hws 和外部系统节点的硬件句柄；只借用 map、RC、Host memory。
 	// 失败/边界：RDMA 未启用为空操作；缺 map、节点、BAR、RC 或任一绑定失败立即 fatal，禁止留下半绑定系统。
 	extern protected function void bind_rdma_hardware();
+
+	// 功能：从 dpu_common 冻结 MSI-X catalog 中筛出 VIO/AF resource 实际拥有的 vector。
+	// 输入/输出及副作用：按 Host 读取同源 resource snapshot，输出可交给 VIO RC 的值复制 catalog；不修改 snapshot。
+	// 失败/边界：缺少冻结 resource snapshot 返回 why；未配置 VIO/AF resource 时输出空目录，不把 RDMA vector 当作 VIO sink。
+	extern protected function void collect_vio_msix_messages(
+		int unsigned				host_id,
+		input dpu_msix_message_t	catalog[$],
+		output dpu_msix_message_t	messages[$],
+		output string				why
+	);
+
 
 	// 运行期入口：重读当前AIP参数，只在首次prepare前或已release后更新同一个cfg。
 // 功能：按 virtio_work 契约重载 DPU/VIO 参数，并在 RDMA 开启时原子提交 RDMA 候选。
@@ -710,17 +667,18 @@ function void project_env::connect_phase(uvm_phase	phase);
 endfunction
 
 // 功能：按 RDMA 节点顺序把 dpu_common BAR0 目标和 Intel RC sequencer 投影给 RDMA driver。
-// 输入/输出及副作用：为每个节点创建一个 rdma_intel_pcie_bar 与 rdma_drv_hw，并调用
-//   rdma_dpu_system::bind_external_hw；不发送 TLP、不分配 Host memory、不启动驱动。
+// 输入/输出及副作用：为每个节点创建一个 rdma_pcie_bar 与 rdma_drv_hw，并调用
+//   rdma_dpu_system::bind_external_hw_by_key；不发送 TLP、不分配 Host memory、不启动驱动。
 // 失败/边界：只接受已冻结同源 dpu_pcie_bar_map；节点顺序、BAR0、Host RC 或外部 driver cfg 缺失时 fatal，
 //   任一失败都停止绑定，避免后续 rdma_init 看到部分可用硬件。
 function void project_env::bind_rdma_hardware();
 	dpu_pcie_bar_map				map;
-	rdma_intel_pcie_bar			bar;
+	rdma_pcie_bar			bar;
 	dpu_bar_target_t				target;
 	uvm_sequencer #(pcie_tl_tlp)	sequencer;
 	rdma_drv_hw					hw;
 	rdma_status					status;
+	string						key_name;
 	string						why;
 
 	if (!cfg.rdma_enabled)
@@ -732,7 +690,7 @@ function void project_env::bind_rdma_hardware();
 		`uvm_fatal("RDMA_VIRTIO", "RDMA hardware binding requires a frozen Intel BAR map")
 	end
 	if (rdma.sys.nodes.size() == 0 || rdma.sys.nodes.size() != cfg.rdma_functions.size()) begin
-		`uvm_fatal("RDMA_VIRTIO", "RDMA node order does not match the configured Function selection")
+		`uvm_fatal("RDMA_VIRTIO", "RDMA node set does not match the configured Function selection")
 	end
 
 	rdma_bars.delete();
@@ -750,21 +708,23 @@ function void project_env::bind_rdma_hardware();
 			`uvm_fatal("RDMA_VIRTIO", why)
 		end
 
-		bar = rdma_intel_pcie_bar::type_id::create($sformatf("rdma_bar_f%0d", i));
+		key_name = dpu_function_key_name(rdma.sys.nodes[i].func.key);
+		bar = rdma_pcie_bar::type_id::create({"rdma_bar_", key_name});
 		bar.map       = map;
 		bar.target    = target;
 		bar.sequencer = sequencer;
 
-		hw = rdma_drv_hw::type_id::create($sformatf("rdma_hw_f%0d", i));
+		hw = rdma_drv_hw::type_id::create({"rdma_hw_", key_name});
 		status = hw.bind_hw(bar, rdma.sys.nodes[i].mem);
 		if (!status.ok())
 			`uvm_fatal("RDMA_VIRTIO", status.convert2string())
-		status = rdma.sys.bind_external_hw(i, hw, rdma.sys.nodes[i].drv_cfg);
+		status = rdma.sys.bind_external_hw_by_key(rdma.sys.nodes[i].func.key,
+			hw, rdma.sys.nodes[i].drv_cfg);
 		if (!status.ok())
 			`uvm_fatal("RDMA_VIRTIO", status.convert2string())
 
-		rdma_bars[i] = bar;
-		rdma_hws[i]  = hw;
+		rdma_bars[key_name] = bar;
+		rdma_hws[key_name]  = hw;
 	end
 endfunction
 
@@ -817,6 +777,62 @@ function void project_env::register_aip_commands();
 		`uvm_fatal("PROJECT_ENV", why)
 	end
 
+endfunction
+
+// 功能：按 dpu_common resource snapshot 的 VIO qpair/AF extra vector 选择消息，隔离 RDMA-only vector。
+// 输入/输出及副作用：host_id 和 catalog 为只读输入，messages 输出值复制；why 返回快照缺失原因，不改写 catalog。
+// 失败/边界：resource snapshot 未冻结或与当前 DPU snapshot 不同源时返回空目录和失败原因；重复 vector 只保留一行。
+function void project_env::collect_vio_msix_messages(
+	int unsigned				host_id,
+	input dpu_msix_message_t	catalog[$],
+	output dpu_msix_message_t	messages[$],
+	output string				why
+);
+	dpu_resource_snapshot	resources;
+	dpu_vio_qpair_binding_t	pairs[$];
+	dpu_af_extra_queue_binding_t	extras[$];
+	bit					selected[string];
+	string					key;
+
+	messages.delete();
+	why = "DPU resource snapshot is unavailable for MSI-X filtering";
+	resources = dpu_env == null ? null : dpu_env.get_resource_snapshot();
+	if (resources == null || !resources.is_frozen())
+		return;
+	if (dpu_env.get_snapshot() == null ||
+		!resources.references_device_snapshot(dpu_env.get_snapshot())) begin
+		why = "DPU resource snapshot is not from the active device snapshot";
+		return;
+	end
+	resources.list_vio_bindings(pairs);
+	resources.list_af_extra_queue_bindings(extras);
+	foreach (pairs[i]) begin
+		if (pairs[i].service_key.function_key.host_id == host_id)
+			selected[$sformatf("%s:%0d", dpu_function_key_name(pairs[i].service_key.function_key),
+				pairs[i].local_msix_vector_id)] = 1;
+	end
+	foreach (extras[i]) begin
+		if (extras[i].af_function_key.host_id == host_id)
+			selected[$sformatf("%s:%0d", dpu_function_key_name(extras[i].af_function_key),
+				extras[i].local_msix_vector_id)] = 1;
+	end
+	foreach (catalog[i]) begin
+		if (catalog[i].owner.host_id != host_id)
+			continue;
+		key = $sformatf("%s:%0d", dpu_function_key_name(catalog[i].owner),
+			catalog[i].local_vector);
+		if (selected.exists(key)) begin
+			bit duplicate;
+			duplicate = 0;
+			foreach (messages[j])
+				if (messages[j].owner == catalog[i].owner &&
+					messages[j].local_vector == catalog[i].local_vector)
+					duplicate = 1;
+			if (!duplicate)
+				messages.push_back(catalog[i]);
+		end
+	end
+	why = "";
 endfunction
 
 // 建立一份 PCIe BAR 扩展并交给公共 cfg；driver 与配置 seq 复用同一个对象。
@@ -884,15 +900,45 @@ function void project_env::publish_dpu_configuration(
 		h    = hosts[i].host_id;
 		slot = cfg.tl_slot_by_host[h];
 		void'($cast(driver, pcie_env.rc_agents[slot].rc_driver));
-		host_messages.delete();
-		foreach (cfg.dpu_cfg.messages[m])
-		if (cfg.dpu_cfg.messages[m].owner.host_id == h)
-			host_messages.push_back(cfg.dpu_cfg.messages[m]);
+		// 只把 dpu_common 冻结 catalog 中有 VIO/AF resource 归属的条目交给 RC；
+		// RDMA vector 没有平台 event sink 时不进入 VIO responder 的消费目录。
+		collect_vio_msix_messages(h, cfg.dpu_cfg.frozen_messages, host_messages, why);
+		if (why != "")
+			return;
 		if (!driver.install_registry(map, h, 0, slot, why) || !driver.install_receive_path(
 				vio_envs[h].host_mem, vio_envs[h].iommu, host_messages, why
 			))
 			return;
 	end
+    // 同一个 Requester 可同时使用 VIO IOVA 与 RDMA 直接 Host 地址。
+    // 公共 RC 在每笔请求上检查唯一所有者；冲突拒绝，不靠业务优先级绕过权限。
+    if (rdma != null && rdma.sys != null) begin
+		foreach (rdma.sys.nodes[i]) begin
+			dpu_function_key_t key;
+			dpu_bar_target_t target;
+			pcie_tl_cq_route_t route;
+			dpu_function_policy_t policy;
+			string function_name;
+			int unsigned slot;
+			key = rdma.sys.nodes[i].func.key;
+			if (!map.resolve_function(key, rdma.sys.nodes[i].func.bar0.even_bar_id, target, why) ||
+				!map.get_route(target, route, why)) return;
+			function_name = dpu_function_key_name(key);
+			if (!cfg.dpu_cfg.function_policies.exists(function_name)) begin
+				why = {"RDMA Function has no DPU policy: ", function_name};
+				return;
+			end
+			policy = cfg.dpu_cfg.function_policies[function_name];
+			if ($isunknown(policy.requester)) begin
+				why = {"RDMA Function policy has unknown requester: ", function_name};
+				return;
+			end
+			slot = cfg.tl_slot_by_host[key.host_id];
+			if (!$cast(driver, pcie_env.rc_agents[slot].rc_driver)) return;
+			if (!driver.install_vio_dma_view(policy.requester, why) ||
+				!driver.register_dma_view(policy.requester, rdma.sys.nodes[i].mem.dma_view, why)) return;
+		end
+	    end
 	ok = !cfg.dpu_cfg.print_bar_map || map.print_bar_map(why, 1);
 endfunction
 
@@ -1025,9 +1071,10 @@ task project_env::load_params(
 			why = "project RC driver is unavailable";
 			return;
 		end
-		foreach (candidate.dpu_cfg.messages[m])
-		if (candidate.dpu_cfg.messages[m].owner.host_id == h)
-			host_messages[h].push_back(candidate.dpu_cfg.messages[m]);
+		// 候选 catalog 同样按同源 resource 过滤，避免环境替 RDMA 解释 MSI-X。
+		collect_vio_msix_messages(h, candidate.dpu_cfg.frozen_messages, host_messages[h], why);
+		if (why != "")
+			return;
 		if (!drivers[h].validate_message_catalog(host_messages[h], why)) begin
 			return;
 		end

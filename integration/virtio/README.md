@@ -1,6 +1,6 @@
 # 在 virtio project_env 上加入 RDMA
 
-本目录用本仓库的 `project_env_cfg` 和 `project_env` 组成 `project_env_pkg`，复用 `virtio_work` 的配置 sequence、`project_base_test` 和连接契约。外部 checkout 不改动，原 VirtIO filelist 也不受影响；独立 RDMA 示例仍在 [../project](../project/README.md)。
+本目录用本仓库的 `project_env_cfg` 和 `project_env` 组成 `project_env_pkg`，复用 `virtio_work` 的配置 sequence、`project_base_test` 和连接契约。外部 checkout 不改动，原 VirtIO filelist 也不受影响；可复用 RDMA sequence 类型保留在 [`../project`](../project/rdma_project_pkg.sv)。
 
 ```text
 project_env_cfg                         ← integration overlay，直接持有全部配置
@@ -23,7 +23,7 @@ project_env                               ← 本地直接组合环境，不再�
 | [rdma_project_env_pkg.sv](rdma_project_env_pkg.sv) | 使用本地 overlay，包含本地 `project_env` 和外部 `project_base_test`，不修改 virtio_work |
 | [project_env.sv](project_env.sv) | 直接创建 DPU、PCIe、VIO、共享 pool 和可选 RDMA 子环境；只负责 build/connect/load_params |
 | [rdma_virtio_cfg_seq.sv](rdma_virtio_cfg_seq.sv) | 继承 `vio_dpu_cfg_seq`；复用 RDMA 预检和 Notify/RNET 写表 |
-| [project_dut_config_seq.sv](project_dut_config_seq.sv) | 继承 `dpu_cfg_seq`；自行获取完整项目 cfg，选择业务并发布 RDMA 配置完成状态 |
+| [dut_cfg_seq.sv](dut_cfg_seq.sv) | 继承 `dpu_cfg_seq`；自行获取完整项目 cfg，选择业务并发布 RDMA 配置完成状态 |
 | [rdma_virtio_test.sv](rdma_virtio_test.sv) | 继承 `project_base_test` 的三个平台钩子；run 阶段只运行 AIP bridge |
 | [../filelists/rdma_virtio.f](../filelists/rdma_virtio.f) | 独立组合 filelist，不加入旧 `sim/filelists` |
 
@@ -41,7 +41,7 @@ project_env                               ← 本地直接组合环境，不再�
 
 ```systemverilog
 import rdma_virtio_pkg::*;
-`aip_cmd_user_seq(dut_config, project_dut_config_seq, virtual_sqr::pcie_rc_sqr)
+`aip_cmd_user_seq(dut_config, dut_cfg_seq, virtual_sqr::pcie_rc_sqr)
 ```
 
 用这行替换原 `dut_config` 注册，第三个参数沿用平台管理 RC；不与 `rdma_virtio_test` 的同名命令重复注册。
@@ -102,9 +102,9 @@ RDMA 开启后默认选择全部 DPU Function；多 Host/PF/VF 仍由 `dpu.*` �
 
 例如 `+rdma.resource.qp_count=128 +rdma.h0.pf1.resource.ceq_count=2`。SD 数量按驱动 HMC 布局自动计算，SD/CEQ/vector 不重叠；实际 SD 页表及 IOVA 在显式 `rdma_init` 时通过共享 host_mem 分配，不再填写 `sd_iova`。
 
-这些容量和编号随环境构建固定；restore 后的 `load_params` 继续重载已有的 QP 行为、报文、流量参数，不重新分配 grant。MSI-X 地址/data 使用已有 `dpu.*.msix` 模板；未提供模板时不生成中断消息，基础场景使用轮询。已生成消息在重载时保留向量编号并更新模板值。
+这些容量和编号随环境构建固定；restore 后的 `load_params` 继续重载已有的 QP 行为、报文、流量参数，不重新分配 grant。MSI-X 地址/data 使用已有 `dpu.*.msix` 模板；未提供模板时不生成中断消息，基础场景使用轮询。已生成消息在重载时保留向量编号并更新模板值。`dpu_common.frozen_messages` 是唯一的 MSI-X catalog；`project_env` 只把其中属于本 Host 的条目交给 VIO RC 适配器，RDMA 自动 grant 的候选条目不会被当作 VIO 中断 sink。外部 RDMA 当前没有平台 event sink，因此不会伪造真实 IRQ。
 
-真实 Intel PCIe 驱动模式使用 `external_configuration=1`，不要求 `dut_endpoint`。显式选择 `rdma_dut_link` 才要求该接口。ETH 环回暂未接入；DUT TX ready 仍必须由 MAC 侧驱动。没有 TX→RX 回包路径可以观察首批 TX，RC 的 ACK、接收及完成检查不能因此认为通过。
+真实 Intel PCIe 驱动模式使用 `external_configuration=1`，不要求 `dut_endpoint`。显式选择 `rdma_dut_link` 才要求该接口。ETH 环回暂未接入；DUT TX ready 仍必须由 MAC 侧驱动。TX-only 只以平台完整帧 monitor 观察到的首发帧为成功依据，RC ACK、接收和完成检查仍不在本阶段范围内。
 
 RDMA Notify/RNET catalog 使用父环境的实际 BAR map 生成，再调用 DPU 的同源 `publish()` 补齐配置值。这里不会改写冻结拓扑或重新分配资源；因为父 `publish_dpu_configuration()` 不是虚函数，适配留在本仓库。平台不要再手工添加第二份 RDMA catalog。
 
@@ -113,23 +113,24 @@ RDMA Notify/RNET catalog 使用父环境的实际 BAR map 生成，再调用 DPU
 `rdma_virtio_test.run_phase` 只启动 bridge，不自动 prepare、配置、初始化或发包。常见顺序：
 
 ```tcl
-# source 与 simv 匹配的 AIP loader 后，显式执行：
-set_param path=rdma.traffic.count value=100
-load_params
-dut_config
-# 使用 VIO 时，沿用 virtio 的 vio.target 和业务命令。
-vio_start
-# RDMA grant 已由 project_env_cfg 自动补齐；真实硬件须已 ready。
-rdma_init
-rdma_run f0=0 f1=1 qps=2
-# 0/1 只是例子，必须替换为该快照中的实际 global Function ID。
+# source 与 simv 匹配的 AIP loader 后，显式执行 TX-only 首发：
+set ::rdma_f0 0
+set ::rdma_qps 2
+set ::rdma_dest_qpn 0x12345
+set ::rdma_dmac 0x001122334455
+source /path/to/integration/virtio/rdma_start.tcl
 ```
 
-可直接使用 [rdma_start.tcl](rdma_start.tcl)：先设置 `::rdma_f0/::rdma_f1`，再 source。该脚本逐项检查 AIP 返回状态，不会在配置或初始化失败后继续发包。
+`rdma_start.tcl` 默认走 TX-only：它把 `rdma.traffic.count` 默认设为 `qps`，依次执行
+`load_params`、`dut_config`、`rdma_init` 和
+`rdma_run tx_only=1 f0=<id> qps=<n> dest_qpn=<qpn> dmac=<mac>`；可选
+`::rdma_tx_count`（范围 `1..qps`）和 `::rdma_dest_qkey`。RC 首轮每个 QP 只投递一条 SEND，
+不复用发送 buffer。脚本逐项检查 AIP 返回状态，不会在配置或初始化失败后继续发包。
+设置 `::rdma_tx_only 0` 时恢复双端命令，并额外提供 `::rdma_f1`。
 
-`dut_config` 统一启动 `project_dut_config_seq`。它获取已有项目 cfg，不重新加载参数或申请 grant：RDMA 开启且冻结资源中有 VIO 队列时调用 `rdma_virtio_cfg_seq`，在原 VIO 公共配置中加入 RDMA 表；只有 RDMA 时调用 `rdma_project_cfg_seq`；RDMA 关闭时调用原 `vio_dpu_cfg_seq`。关闭的业务不配置，公共表只配置一次。配置成功后发布 RDMA AIP 门禁，但不会自动初始化驱动或发包。
+`dut_config` 统一启动 `dut_cfg_seq`。它获取已有项目 cfg，不重新加载参数或申请 grant：RDMA 开启且冻结资源中有 VIO 队列时调用 `rdma_virtio_cfg_seq`，在原 VIO 公共配置中加入 RDMA 表；只有 RDMA 时调用 `rdma_project_cfg_seq`；RDMA 关闭时调用原 `vio_dpu_cfg_seq`。关闭的业务不配置，公共表只配置一次。配置成功后发布 RDMA AIP 门禁，但不会自动初始化驱动或发包。
 
-组合命令仍只由 Tcl 显式启动：`rdma_init` 创建 `rdma_init_seq`，`rdma_run` 创建 `rdma_run_seq`；`project_env` 不保存启动状态，也不在 phase 中自动创建或启动业务 sequence。独立 RDMA-only 案例使用相同的三个 sequence，见 [../project/tests/run_commands.sh](../project/tests/run_commands.sh)。
+组合命令仍只由 Tcl 显式启动：`rdma_init` 创建 `rdma_init_seq`，`rdma_run` 创建 `rdma_run_seq`；`project_env` 不保存启动状态，也不在 phase 中自动创建或启动业务 sequence。参数和配置入口统一由本目录的 [`tests/run.sh`](tests/run.sh) 驱动。
 
 `load_params` 只有一个有效注册对象。当前 virtio 的环境重载 task 不是 virtual，因此 test 在 EOE 核对原 loader 身份后，通过 AIP 的公开 `unregister` 接口替换这一个入口；`vio_release` 和 VIO 业务命令保持原对象/实现。没有改写 AIP 宏，也不注册第二个加载范围。
 
@@ -146,6 +147,22 @@ RDMA_GRANT_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
 ```
 
 结果、实际依赖与日志位置见 [VALIDATION.md](VALIDATION.md)。结构回归创建真实组合组件，验证多 Host/PF/VF 的快照/pool/PCIe 句柄、原 VIO 命令、事务拒绝和跨进程 restore。top 只提供空闲接口，没有 DUT 或 Completion responder，不能据此宣称真实配置写入或混合业务收发通过。
+
+TX-only 参数入口的结构负例可在 53 上执行：
+
+```bash
+RDMA_TX_ONLY_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
+```
+
+该用例验证目的 QPN/DMAC、`qps`、`group` 互斥和缺省参数的命令边界，并核对失败前后配置、Function 和资源观测不变；空闲结构 top 没有真实 DUT，不代表 ETH 发包通过。真实平台应使用上述 `rdma_start.tcl`，并由外部 TX monitor 验收完整帧。
+
+公共 PCIe DMA view 的隔离 fixture 可单独执行：
+
+```bash
+RDMA_DMA_VIEWS_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
+```
+
+该入口使用独立 `rdma_dma_views_top`，验证同一 Requester 下 RDMA 直接 Host 地址、VIO IOVA 翻译、权限拒绝、地址冲突和通用 MSI-X sink；它不代表真实 DUT 的 DMA 或中断路径。
 
 RDMA 保持单 bank，字段约束仍为 Host ID < 8、global Function ID 与 RDMA VF ID < 256。未手工提供 grant 时，组合配置自动生成，默认 RDMA VF ID 等于冻结 global Function ID；显式 grant 仍允许两者不同。SD/CEQ/source 属于 RDMA 独立资源；MSI-X 从 DPU 已占用的 LAN/mailbox/AF 前缀之后分配，不改写 VIO 分配。当前 DPU 未导出通用 RDMA allocator，组合配置显式适配并校验这一前缀契约。
 

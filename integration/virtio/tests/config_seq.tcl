@@ -2,7 +2,7 @@
 # 依赖：project_cfg_seq_test 与寄存器传输 fixture；执行生产配置流程，不执行 DUT 初始化或网络流量。
 # 生命周期：重载后两次创建全新 sequence，验证配置门禁，再检查异源拒绝并结束仿真。
 source [file join $::env(AIP_CORE) dist aip_init_so.tcl]
-source [file join $::env(RDMA_ROOT) integration project tests rdma_project_common.tcl]
+source [file join $::env(RDMA_ROOT) integration virtio tests rdma_project_common.tcl]
 run 100ns
 set initial [project_cmd cfg_seq_observe]
 project_eq $initial calls 0

@@ -2,7 +2,7 @@
 # 依赖：实际 AIP 桥与组合 smoke test；测试对象检查多 Function SD/CEQ/vector 不重叠。
 # 生命周期：只观察 build/connect 后的配置；拒绝反序初始化，再显式结束，不发配置或流量。
 source [file join $::env(AIP_CORE) dist aip_init_so.tcl]
-source [file join $::env(RDMA_ROOT) integration project tests rdma_project_common.tcl]
+source [file join $::env(RDMA_ROOT) integration virtio tests rdma_project_common.tcl]
 run 100ns
 set initial [project_cmd compose_observe]
 project_cmd rdma_init 1

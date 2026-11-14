@@ -315,9 +315,10 @@ function rdma_status rdma_env_cfg::validate_runtime_candidate(rdma_env_cfg	candi
   status = candidate.scenario.validate();
   if (!status.ok())
     return status;
-  if (!candidate.scenario.packet_defaults() && candidate.link_type != "rdma_link_netpkt")
+  if (!candidate.scenario.packet_defaults() && !candidate.external_configuration &&
+      candidate.link_type != "rdma_link_netpkt")
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-      "rdma.pkt overrides require rdma_link_netpkt; driver/platform has no scenario packet configuration API");
+      "rdma.pkt overrides require rdma_link_netpkt for model links");
   if (candidate.scenario.urc() && candidate.remote_funcs != 0)
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "rdma.qp.type URC is unsupported by remote Functions");
   return rdma_status::success();

@@ -1287,6 +1287,13 @@ package rdma_dpu_adapter_pkg;
     // 失败/边界：非外部、越界、空配置/端口、Host 视图不一致、替换已绑定上下文或启动后修改均拒绝。
     extern function rdma_status bind_external_hw(int unsigned	i, rdma_drv_hw	hw, rdma_drv_config	cfg_arg);
 
+    // 功能：按冻结 Function key 绑定平台硬件，避免调用方把动态集合的数组位置当作身份。
+    // 输入/输出及副作用：key 定位节点，hw/cfg_arg 归调用方所有；成功保存 hw/bar/drv_cfg，不 probe。
+    // 失败/边界：key 不存在、非外部、空配置/端口、Host 视图不一致、替换已绑定上下文或启动后修改均拒绝。
+    extern function rdma_status bind_external_hw_by_key(dpu_function_key_t	key,
+                                                          rdma_drv_hw	hw,
+                                                          rdma_drv_config	cfg_arg);
+
     // 功能：在任何 probe/MMIO 前检查整个系统的初始化契约，纯查询不替换节点或驱动。
     // 输入/输出及副作用：返回首个缺失依赖的 status；模型只检查完整装配，外部进一步检查配置与资源来源。
     // 失败/边界：空系统、缺失硬件/内存、视图与 pool 不一致、外部缺显式配置/grant/同源资源均 INVALID_STATE。
@@ -1444,7 +1451,8 @@ package rdma_dpu_adapter_pkg;
       n.source_snapshot = source;
       n.external_configuration = 1;
       n.mem = rdma_host_mem::type_id::create({n.get_name(), "_mem"});
-      n.mem.mem = pool.get_host(n.func.key.host_id);
+      if (!n.mem.bind_host_mem(pool.get_host(n.func.key.host_id), why))
+        return rdma_status::make(RDMA_SC_INVALID_STATE, why);
       candidates.push_back(n);
     end
     mem_pool = pool;
@@ -1493,18 +1501,22 @@ package rdma_dpu_adapter_pkg;
            cfg_arg.dst_vport_id == grant_arg.dst_vport_id && cfg_arg.fwd == grant_arg.fwd;
   endfunction
 
-  // 功能：按 nodes 顺序绑定平台核发的 RDMA 资源与路由授权，并投影为驱动配置。
-  // 输入/输出及副作用：values 为每个 Function 的非拥有 grant；成功更新 grants 和 nodes[i].drv_cfg，不发 MMIO。
+  // 功能：按每份 grant 的冻结 Function key 绑定平台核发的 RDMA 资源与路由授权，并投影为驱动配置。
+  // 输入/输出及副作用：values 为每个 Function 的非拥有 grant，可与 nodes 顺序不同；成功更新 grants 和 nodes[i].drv_cfg，不发 MMIO。
   // 失败/边界：仅外部、未锁定且数量/身份/字段校验全部通过时接受；SD 不足、跨 Function SD/CEQ/vector/source 冲突或已有不同授权均拒绝。
   function rdma_status rdma_dpu_system::bind_grants(rdma_dpu_grant	values[$]);
     rdma_drv_config	candidate;
+    rdma_dpu_grant	grant_by_node[int];
     string		why;
+    string		key_name;
     bit		seen_global[int unsigned];
     bit		seen_vf[int unsigned];
+    bit		seen_key[string];
     bit		used_sd[int unsigned];
     bit		used_ceq[int unsigned];
     bit		used_vector[int unsigned];
     bit		used_source[int unsigned];
+    int		node_index;
 
     if (binding_locked || !external_configuration || snapshot == null)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA grant binding is closed");
@@ -1514,14 +1526,20 @@ package rdma_dpu_adapter_pkg;
     foreach (values[i]) begin
       if (values[i] == null || !values[i].validate(why))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, {"invalid RDMA grant: ", why});
-      if (!dpu_same_function_key(values[i].key, nodes[i].func.key) ||
-          values[i].host_id != nodes[i].func.key.host_id ||
-          values[i].global_id != nodes[i].func.global_id ||
+      key_name = dpu_function_key_name(values[i].key);
+      node_index = find(values[i].key);
+      if (seen_key.exists(key_name) || node_index < 0)
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+          "RDMA grant identity differs from frozen Function");
+      if (values[i].host_id != nodes[node_index].func.key.host_id ||
+          values[i].global_id != nodes[node_index].func.global_id ||
           seen_global.exists(values[i].global_id) || seen_vf.exists(values[i].rdma_vf_id))
         return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
           "RDMA grant identity differs from frozen Function");
+      seen_key[key_name] = 1;
       seen_global[values[i].global_id] = 1;
       seen_vf[values[i].rdma_vf_id] = 1;
+      grant_by_node[node_index] = values[i];
 
       candidate = rdma_drv_config::type_id::create("grant_capacity_check");
       candidate.max_qp = values[i].qp_count;
@@ -1553,43 +1571,51 @@ package rdma_dpu_adapter_pkg;
     if (grants.size() != 0) begin
       if (grants.size() != values.size())
         return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA grants are already bound");
-      foreach (grants[i])
-        if (!grants[i].same_as(values[i]))
+      foreach (nodes[i])
+        if (!grant_by_node.exists(i) || !grants[i].same_as(grant_by_node[i]))
           return rdma_status::make(RDMA_SC_INVALID_STATE, "RDMA grants are already bound");
       return rdma_status::success();
     end
-    foreach (values[i]) begin
-      if (nodes[i].drv_cfg != null && !config_matches_grant(nodes[i].drv_cfg, values[i]))
+    foreach (nodes[i]) begin
+      if (!grant_by_node.exists(i))
+        return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
+          "RDMA grant set does not cover every frozen Function");
+      if (nodes[i].drv_cfg != null && !config_matches_grant(nodes[i].drv_cfg, grant_by_node[i]))
         return rdma_status::make(RDMA_SC_INVALID_STATE,
           "explicit driver configuration conflicts with RDMA grant");
     end
-    foreach (values[i]) begin
+    foreach (nodes[i]) begin
+      rdma_dpu_grant grant;
+
+      grant = grant_by_node[i];
       candidate = nodes[i].drv_cfg;
       if (candidate == null)
         candidate = rdma_drv_config::type_id::create({nodes[i].get_name(), "_grant_cfg"});
-      candidate.host_id = values[i].host_id;
-      candidate.vf_id = values[i].rdma_vf_id;
-      candidate.max_qp = values[i].qp_count;
-      candidate.max_cq = values[i].cq_count;
-      candidate.max_mr = values[i].mr_count;
-      candidate.max_pbl = values[i].pbl_count;
-      candidate.max_pd = values[i].pd_count;
-      candidate.max_srq = values[i].srq_count;
-      candidate.first_qp = values[i].first_qp;
-      candidate.first_sd = values[i].first_sd;
-      candidate.first_ceqn = values[i].first_ceqn;
-      candidate.ceq_cnt = values[i].ceq_count;
-      candidate.aeq_msix_idx = values[i].aeq_msix_idx;
-      candidate.ceq_msix_base = values[i].ceq_msix_base;
-      candidate.source_addr_valid = values[i].source_addr_valid;
-      candidate.source_addr_idx = values[i].source_addr_idx;
-      candidate.route_valid = values[i].route_valid;
-      candidate.dst_port = values[i].dst_port;
-      candidate.dst_vport_id = values[i].dst_vport_id;
-      candidate.fwd = values[i].fwd;
+      candidate.host_id = grant.host_id;
+      candidate.vf_id = grant.rdma_vf_id;
+      candidate.max_qp = grant.qp_count;
+      candidate.max_cq = grant.cq_count;
+      candidate.max_mr = grant.mr_count;
+      candidate.max_pbl = grant.pbl_count;
+      candidate.max_pd = grant.pd_count;
+      candidate.max_srq = grant.srq_count;
+      candidate.first_qp = grant.first_qp;
+      candidate.first_sd = grant.first_sd;
+      candidate.first_ceqn = grant.first_ceqn;
+      candidate.ceq_cnt = grant.ceq_count;
+      candidate.aeq_msix_idx = grant.aeq_msix_idx;
+      candidate.ceq_msix_base = grant.ceq_msix_base;
+      candidate.source_addr_valid = grant.source_addr_valid;
+      candidate.source_addr_idx = grant.source_addr_idx;
+      candidate.route_valid = grant.route_valid;
+      candidate.dst_port = grant.dst_port;
+      candidate.dst_vport_id = grant.dst_vport_id;
+      candidate.fwd = grant.fwd;
       nodes[i].drv_cfg = candidate;
     end
-    grants = values;
+    grants.delete();
+    foreach (nodes[i])
+      grants.push_back(grant_by_node[i]);
     return rdma_status::success();
   endfunction
 
@@ -1599,7 +1625,25 @@ package rdma_dpu_adapter_pkg;
   function rdma_status rdma_dpu_system::bind_external_hw(int unsigned	i, rdma_drv_hw	hw, rdma_drv_config	cfg_arg);
     if (binding_locked || !external_configuration)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "external hardware binding is closed");
-    if (i >= nodes.size() || hw == null || cfg_arg == null)
+    if (i >= nodes.size())
+      return rdma_status::make(
+        RDMA_SC_INVALID_ARGUMENT,
+        "external node/hardware/configuration is missing");
+    return bind_external_hw_by_key(nodes[i].func.key, hw, cfg_arg);
+  endfunction
+
+  // 功能：按冻结 Function key 绑定平台硬件，避免调用方把动态集合的数组位置当作身份。
+  // 输入/输出及副作用：key 定位节点，hw/cfg_arg 归调用方所有；成功保存 hw/bar/drv_cfg，不 probe。
+  // 失败/边界：key 不存在、非外部、空配置/端口、Host 视图不一致、替换已绑定上下文或启动后修改均拒绝。
+  function rdma_status rdma_dpu_system::bind_external_hw_by_key(dpu_function_key_t	key,
+                                                                  rdma_drv_hw	hw,
+                                                                  rdma_drv_config	cfg_arg);
+    int	i;
+
+    if (binding_locked || !external_configuration)
+      return rdma_status::make(RDMA_SC_INVALID_STATE, "external hardware binding is closed");
+    i = find(key);
+    if (i < 0 || hw == null || cfg_arg == null)
       return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "external node/hardware/configuration is missing");
     if (hw.bar == null || hw.host_mem != nodes[i].mem)
       return rdma_status::make(RDMA_SC_INVALID_STATE, "external hardware must use the node Host memory view");
@@ -1710,7 +1754,8 @@ package rdma_dpu_adapter_pkg;
           return rdma_status::make(RDMA_SC_INVALID_STATE, "model Host pool creation failed");
       end
       n.mem = rdma_host_mem::type_id::create({name, "_mem"});
-      n.mem.mem = mem_pool.get_host(funcs[i].key.host_id);
+      if (!n.mem.bind_host_mem(mem_pool.get_host(funcs[i].key.host_id), why))
+        return rdma_status::make(RDMA_SC_INVALID_STATE, why);
       n.dev = rdma_dev::type_id::create({name, "_dev"});
       n.dev.configure(n.mem);
       n.interrupt_ctrl = rdma_dpu_interrupt_ctrl::type_id::create({name, "_interrupt_ctrl"});

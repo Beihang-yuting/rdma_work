@@ -1,6 +1,6 @@
 # 同 binary 的进程 A：保存未配置、未初始化的真实组合环境。
 source [file join $::env(AIP_CORE) dist aip_init_so.tcl]
-source [file join $::env(RDMA_ROOT) integration project tests rdma_project_common.tcl]
+source [file join $::env(RDMA_ROOT) integration virtio tests rdma_project_common.tcl]
 set ::aip_ckpt_dir [file join $::env(RDMA_VIRTIO_RUN) snapshots]
 set ::aip_simv_path [file join $::env(RDMA_VIRTIO_RUN) simv]
 run 100ns

@@ -5,7 +5,7 @@ set ::aip_simv_path [file join $::env(RDMA_VIRTIO_RUN) simv]
 run 100ns
 aip_restore combined
 source [file join $::env(AIP_CORE) dist aip_init_so.tcl]
-source [file join $::env(RDMA_ROOT) integration project tests rdma_project_common.tcl]
+source [file join $::env(RDMA_ROOT) integration virtio tests rdma_project_common.tcl]
 set before [project_cmd compose_observe]
 project_eq $before count 10
 project_eq $before poll 10

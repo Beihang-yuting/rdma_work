@@ -24,6 +24,7 @@ package rdma_virtio_pkg;
   `include "uvm_macros.svh"
 
   `include "rdma_virtio_cfg_seq.sv"
-  `include "project_dut_config_seq.sv"
+  `include "dut_cfg_seq.sv"
+  // 对外统一暴露 dut_cfg_seq 配置入口，调用方直接依赖该短名称。
   `include "rdma_virtio_test.sv"
 endpackage
