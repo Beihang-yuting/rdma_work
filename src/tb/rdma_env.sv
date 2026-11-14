@@ -80,6 +80,8 @@ class rdma_env extends uvm_env;
       link.tx_ap.connect(checker.tx_export);
       link.rx_ap.connect(checker.rx_export);
     end
+    // TX-only 由 scoreboard 直接消费完整 wire frame；普通双向场景 tx_active=0，观测不会改变其完成模型。
+    link.tx_ap.connect(sb.wire_export);
     foreach (verb[i]) begin
       verb[i].bind_func(this, i);
       verb[i].driver.posted_ap.connect(sb.posted_export);
@@ -344,7 +346,7 @@ task rdma_env::initialize(output rdma_status	status);
   end
   if (cfg.scenario.pkt.src_mac != 0 || cfg.scenario.pkt.src_ip != 0)
     foreach (sys.nodes[i]) begin
-      if (sys.nodes[i].drv_cfg.source_addr_valid) begin
+      if (sys.nodes[i].drv_cfg != null && sys.nodes[i].drv_cfg.source_addr_valid) begin
         sys.nodes[i].drv.update_source_addr(cfg.scenario.pkt.src_mac,
                                             cfg.scenario.pkt.src_ip, status);
         if (!status.ok())

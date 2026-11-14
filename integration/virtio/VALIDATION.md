@@ -17,6 +17,20 @@ RDMA_TX_ONLY_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
 
 真实平台验证还需提供 `::rdma_f0`、`::rdma_qps`、`::rdma_dest_qpn`、`::rdma_dmac`，并由外部 monitor 核对完整帧的数量、QP/PSN、MAC/IP/VLAN/UDP、payload 和 IMM；本阶段不接 RX、环回或 ACK。
 
+## TX-only standalone model 回归（2026-11-15）
+
+在 `ubuntu@10.11.10.53` 登录 bash 中使用 `ENV_BUILD=build/tx_env6` 重新编译并执行 `rdma_env_tx_test`，命令行覆盖
+`dest_qpn=37`、`qkey=0x22223333`、VLAN `42`、UDP 源端口 `6000`、固定 payload `0xa5` 和 IMM
+`0xcafef00d`。`make env` 返回 `0`，UVM `WARNING/ERROR/FATAL=0/0/0`，scoreboard 输出
+`checked=0 tx_checked=1 errors=0`。这条路径由 QP/CMQ 控制面成功完成后写入 SQ、敲 SQ doorbell，NIC
+同步编码并发布一帧完整 RoCEv2 wire frame，TX scoreboard 完成字段匹配；capture link 不查找目的
+Function，因此不创建 RX 或 ACK。
+
+同一编译产物复跑 `rdma_drv_data_test`、`rdma_tx_contract_test`、`rdma_drv_cmq_test`、
+`rdma_drv_verbs_test`，以及旧的 `rdma_env_basic_test`、`rdma_env_netpkt_test`，全部为 UVM
+`WARNING/ERROR/FATAL=0/0/0`。这验证的是 standalone model 的控制面、SQ 数据面和 frame capture；真实
+DUT 的 TX monitor、RX/ACK 和环回仍待后续平台接通。
+
 ## MSI-X 接线边界修复（2026-11-13）
 
 `project_env` 现在只消费 `dpu_common.frozen_messages`，并按同源 resource snapshot 的 VIO qpair/AF extra vector 过滤 VIO RC 接收目录；RDMA vector 不再被环境当作 VIO sink。外部 RDMA 模式仍不创建模型 `rdma_dpu_interrupt_ctrl`，等待平台提供真实 event sink。验证使用隔离目录 `/tmp/rdma-msix-fix.qKwAT4`，没有修改远端共享依赖 checkout。

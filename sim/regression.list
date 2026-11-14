@@ -3,3 +3,4 @@ core rdma_multifunc_test core
 env rdma_env_basic_test env
 env rdma_env_netpkt_test host_mem,net_packet
 env rdma_env_high_traffic_test host_mem,net_packet
+env rdma_env_tx_test host_mem,net_packet

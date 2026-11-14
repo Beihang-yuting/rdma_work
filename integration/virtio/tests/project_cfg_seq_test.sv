@@ -82,8 +82,8 @@ function void project_cfg_binding_probe::check_notify();
     rdma_config_access_t	access;
 
     access = rdma_config_reg_fixture::accesses[i];
-    if (access.writing && access.address >= management.bar_lease.base + 'hc000 &&
-        access.address < management.bar_lease.base + 'hc800)
+    if (access.writing && access.address >= management.bar_lease.base + 'h8c000 &&
+        access.address < management.bar_lease.base + 'h8c800)
       writes.push_back(access);
   end
   if (expected_by_address.num() != 2 || writes.size() != 4)
@@ -97,7 +97,7 @@ function void project_cfg_binding_probe::check_notify();
       access = writes[2 * row + word];
       expected = expected_by_address[address];
       if (access.host != 0 || access.length != 4 ||
-          access.address != management.bar_lease.base + 'hc000 + row * 8 + (word == 0 ? 4 : 0) ||
+          access.address != management.bar_lease.base + 'h8c000 + row * 8 + (word == 0 ? 4 : 0) ||
           access.data != (word == 0 ? 128'(expected[63:32]) : 128'(expected[31:0])))
         `uvm_fatal("CFG_SEQ_TEST", "PF Notify sorting, ID or DWORD order mismatch")
     end
@@ -118,11 +118,6 @@ class project_cfg_seq_test extends rdma_virtio_smoke_test;
   // 输入/输出及副作用：factory override 只对本测试进程生效；生产预检/写表及状态管理照常执行。
   // 失败/边界：不覆盖 dut_cfg_seq，不向它设置 cfg、Function 或 grant。
   extern virtual function void build_phase(uvm_phase	phase);
-
-  // 功能：沿用 Intel VIF 绑定，并在发布前声明测试平台的 RDMA Notify/RNET 表布局。
-  // 输入/输出及副作用：仅写 authoring table_layouts；布局与独立配置 fixture 一致，不修改冻结快照。
-  // 失败/边界：真实平台必须提供自己的硬件布局；此声明不改变 DUT 能力或 Function 身份。
-  extern virtual function void bind_platform_handles();
 
   // 功能：从实际 BAR map 取得直接注册命令使用的管理 RC。
   // 输入/输出及副作用：cfg_seq_rc 借用已有 RC，向传输 fixture 登记 Host/AF 地址；父类验证自动 grant。
@@ -147,28 +142,6 @@ function void project_cfg_seq_test::build_phase(uvm_phase	phase);
   super.build_phase(phase);
   rdma_project_cfg_seq::type_id::set_type_override(project_cfg_binding_probe::get_type());
   pcie_tl_reg_seq::type_id::set_type_override(rdma_config_reg_fixture::get_type());
-endfunction
-
-// 功能：沿用 Intel VIF 绑定，并在发布前声明测试平台的 RDMA Notify/RNET 表布局。
-// 输入/输出及副作用：仅写 authoring table_layouts；布局与独立配置 fixture 一致，不修改冻结快照。
-// 失败/边界：真实平台必须提供自己的硬件布局；此声明不改变 DUT 能力或 Function 身份。
-function void project_cfg_seq_test::bind_platform_handles();
-  dpu_table_layout_t	layout;
-
-  super.bind_platform_handles();
-  layout = '{index_policy: DPU_INDEX_EXPLICIT, default: 0};
-  layout.provided = 1;
-  layout.reg_target = "h0.pf0.bar0";
-  layout.table_offset = 'hc000;
-  layout.entry_bytes = 8;
-  layout.capacity = 256;
-  cfg.dpu_cfg.table_layouts[DPU_TABLE_RDMA_NOTIFY] = layout;
-  layout.reg_target = "pf0.bar0";
-  layout.access_uses_owner_host = 1;
-  layout.module_offset = 'hb00000;
-  layout.table_offset = 'h15000;
-  layout.entry_bytes = 4;
-  cfg.dpu_cfg.table_layouts[DPU_TABLE_RNET] = layout;
 endfunction
 
 // 功能：从实际 BAR map 取得直接注册命令使用的管理 RC。

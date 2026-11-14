@@ -316,9 +316,9 @@ function rdma_status rdma_env_cfg::validate_runtime_candidate(rdma_env_cfg	candi
   if (!status.ok())
     return status;
   if (!candidate.scenario.packet_defaults() && !candidate.external_configuration &&
-      candidate.link_type != "rdma_link_netpkt")
+      candidate.link_type != "rdma_link_netpkt" && candidate.link_type != "rdma_tx_capture_link")
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT,
-      "rdma.pkt overrides require rdma_link_netpkt for model links");
+      "rdma.pkt overrides require a net_packet-based model link");
   if (candidate.scenario.urc() && candidate.remote_funcs != 0)
     return rdma_status::make(RDMA_SC_INVALID_ARGUMENT, "rdma.qp.type URC is unsupported by remote Functions");
   return rdma_status::success();

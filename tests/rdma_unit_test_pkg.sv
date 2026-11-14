@@ -43,6 +43,7 @@ package rdma_unit_test_pkg;
   `include "unit/rdma_flow_profiles_test.sv"
   `include "unit/rdma_dut_link_test.sv"
   `include "unit/rdma_tx_contract_test.sv"
+  `include "unit/rdma_tx_capture_link.sv"
 `ifdef RDMA_RXE_TEST
   `include "integration/rdma_rxe_test.sv"
   `include "integration/rdma_rxe_fault_test.sv"

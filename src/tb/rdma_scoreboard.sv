@@ -13,6 +13,7 @@
 `uvm_analysis_imp_decl(_cqe)
 `uvm_analysis_imp_decl(_aeq)
 `uvm_analysis_imp_decl(_res)
+`uvm_analysis_imp_decl(_wire)
 
 class rdma_scoreboard extends uvm_scoreboard;
   `uvm_component_utils(rdma_scoreboard)
@@ -26,6 +27,7 @@ class rdma_scoreboard extends uvm_scoreboard;
   uvm_analysis_imp_cqe #(rdma_verb_completion, rdma_scoreboard) cqe_export;
   uvm_analysis_imp_aeq #(rdma_aeq_event, rdma_scoreboard) aeq_export;
   uvm_analysis_imp_res #(rdma_res_event, rdma_scoreboard) res_export;
+  uvm_analysis_imp_wire #(rdma_link_obs, rdma_scoreboard) wire_export;
   // 投递的 verb 填好预测状态后转发（覆盖率订阅）。
   uvm_analysis_port #(rdma_verb_item) predicted_ap;
   int unsigned	checked;
@@ -92,6 +94,12 @@ class rdma_scoreboard extends uvm_scoreboard;
   // 输入/输出及副作用：每次调用仅将 aeq_events 加一；e 的内容由场景断言消费，本 scoreboard 不保留引用。
   // 失败/边界：所有 ecode 均计数且不去重；调用者应传非空事件，但本函数有意不解引用其字段。
   extern function void write_aeq(rdma_aeq_event e);
+
+  // 功能：接收链路 TX monitor 的完整帧观测并交给 TX-only 验收窗口。
+  // 输入/输出及副作用：o 提供本地 Function 下标和 Ethernet 至 ICRC 的独立帧；活动窗口内更新 tx_seen/tx_checked，普通
+  //   双向场景或没有帧的旧链路观测不改变 scoreboard 状态。
+  // 失败/边界：TX-only 窗口内的空帧、CRC 错或字段不匹配由 observe_tx 计错；窗口外观测被有意忽略，避免影响旧用例。
+  extern function void write_wire(rdma_link_obs o);
 
   // 功能：结束检查：无未结算项，全部 buffer 与期望一致。
   // 输入/输出及副作用：读真实内存；报告统计。
@@ -171,6 +179,7 @@ function rdma_scoreboard::new(string name = "rdma_scoreboard", uvm_component par
     cqe_export = new("cqe_export", this);
     aeq_export = new("aeq_export", this);
     res_export = new("res_export", this);
+    wire_export = new("wire_export", this);
     predicted_ap = new("predicted_ap", this);
     mem = rdma_mem_model::type_id::create("mem");
     exp = rdma_expect::type_id::create("exp");
@@ -239,10 +248,20 @@ function void rdma_scoreboard::write_res(rdma_res_event e);
   // 输入/输出及副作用：每次调用仅将 aeq_events 加一；e 的内容由场景断言消费，本 scoreboard 不保留引用。
   // 失败/边界：所有 ecode 均计数且不去重；调用者应传非空事件，但本函数有意不解引用其字段。
 function void rdma_scoreboard::write_aeq(rdma_aeq_event e);
-    aeq_events++;
-  endfunction
+  aeq_events++;
+endfunction
 
-  // 功能：结束检查：无未结算项，全部 buffer 与期望一致。
+// 功能：接收链路 TX monitor 的完整帧观测并交给 TX-only 验收窗口。
+// 输入/输出及副作用：o 提供本地 Function 下标和 Ethernet 至 ICRC 的独立帧；活动窗口内更新 tx_seen/tx_checked，普通
+//   双向场景或没有帧的旧链路观测不改变 scoreboard 状态。
+// 失败/边界：TX-only 窗口内的空帧、CRC 错或字段不匹配由 observe_tx 计错；窗口外观测被有意忽略，避免影响旧用例。
+function void rdma_scoreboard::write_wire(rdma_link_obs o);
+  if (o == null || !tx_active)
+    return;
+  observe_tx(o.src, o.frame);
+endfunction
+
+// 功能：结束检查：无未结算项，全部 buffer 与期望一致。
   // 输入/输出及副作用：读真实内存；报告统计。
   // 失败/边界：不一致报 UVM_ERROR。
 function void rdma_scoreboard::check_phase(uvm_phase phase);
@@ -255,7 +274,8 @@ function void rdma_scoreboard::check_phase(uvm_phase phase);
     foreach (left[i])
       fail(left[i]);
     errors += mem.compare_all();
-    `uvm_info("RDMA_SB", $sformatf("checked=%0d errors=%0d aeq=%0d", checked, errors, aeq_events),
+    `uvm_info("RDMA_SB", $sformatf("checked=%0d tx_checked=%0d errors=%0d aeq=%0d",
+                                     checked, tx_checked, errors, aeq_events),
               UVM_LOW)
   endfunction
 

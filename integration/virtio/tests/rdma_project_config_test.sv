@@ -386,21 +386,9 @@ package rdma_project_config_test_pkg;
     management_base                     = target.bar_lease.base;
     rdma_config_reg_fixture::af_address = management_base + 'h1010;
     require(rdma_project_cfg_seq::make_catalog(snapshot, map, keys, controls, why), why);
-    cfg.platform_controls                    = controls;
-    layout                                   = '{default: 0};
-    layout.provided                          = 1;
-    layout.reg_target                        = "h0.pf0.bar0";
-    layout.table_offset                      = 'hc000;
-    layout.entry_bytes                       = 8;
-    layout.capacity                          = 256;
-    layout.index_policy                      = DPU_INDEX_EXPLICIT;
-    cfg.table_layouts[DPU_TABLE_RDMA_NOTIFY] = layout;
-    layout.reg_target                        = "pf0.bar0";
-    layout.access_uses_owner_host            = 1;
-    layout.module_offset                     = 'hb00000;
-    layout.table_offset                      = 'h15000;
-    layout.entry_bytes                       = 4;
-    cfg.table_layouts[DPU_TABLE_RNET]        = layout;
+    cfg.platform_controls = controls;
+    // 正向 fixture 直接使用 dpu_common::load_params() 安装的默认 RDMA 表布局。
+    // 下面仅在明确的 MSI-X 负例中构造额外布局，避免测试重复维护生产硬件地址。
     if (with_msix) begin
       dpu_msix_message_t	message;
       dpu_msix_policy_t		policy;
@@ -593,7 +581,8 @@ package rdma_project_config_test_pkg;
             access.host, access.address, access.length));
         continue;
       end
-      if (access.address >= management_base + 'hc000 && access.address < management_base + 'hc020) begin
+      if (access.address >= management_base + 'h8c000 &&
+          access.address < management_base + 'h8c020) begin
         int unsigned	row;
         int unsigned	host;
         int unsigned	vf;
@@ -608,7 +597,8 @@ package rdma_project_config_test_pkg;
         notify_address = 64'h20_0400_2000 + host * 64'h10_0000_0000 + (1 - vf) * 64'h10000;
         expected       = (64'(global_id) << 51) | (64'(host) << 48) | (notify_address >> 13);
         require(access.host == 0 && access.length == 4, "Notify must target management Host0 in DWORDs");
-        require(access.address == management_base + 'hc000 + row * 8 + (notify_writes % 2 == 0 ? 4 : 0),
+        require(access.address == management_base + 'h8c000 + row * 8 +
+                  (notify_writes % 2 == 0 ? 4 : 0),
           "Notify sorted row or high-first DWORD address mismatch");
         require(access.data == (notify_writes % 2 == 0 ? 128'(expected[63:32]) : 128'(expected[31:0])),
           "Notify literal fields disagree with Host/address/global ID oracle");
@@ -690,8 +680,9 @@ package rdma_project_config_test_pkg;
       end
       // table_only_enable不产生MSI-X Function事务；可观察的使能是Notify enable。
       // 同时检查第一笔Notify及RNET，防止尾项虽最终补写却已让后续类别先运行。
-      if (access.writing && ((access.address >= management_base + 'hc000 &&
-          access.address < management_base + 'hc020) || access.address == management_base + 'h80044 ||
+      if (access.writing && ((access.address >= management_base + 'h8c000 &&
+          access.address < management_base + 'h8c020) ||
+          access.address == management_base + 'h80044 ||
           access.address[23:16] == 8'hb1)) begin
         require(writes == 4094 && reads == (verify ? 2047 : 0),
           "later configuration category started before complete MSI-X tail processing");
@@ -782,7 +773,7 @@ package rdma_project_config_test_pkg;
         rdma_config_reg_fixture::accesses[$].address == rdma_config_reg_fixture::fail_address,
         "tail write failure did not immediately stop configuration");
       foreach (rdma_config_reg_fixture::accesses[a])
-        require(rdma_config_reg_fixture::accesses[a].address != management_base + 'hc004 &&
+        require(rdma_config_reg_fixture::accesses[a].address != management_base + 'h8c004 &&
           rdma_config_reg_fixture::accesses[a].address != management_base + 'h80044 &&
           rdma_config_reg_fixture::accesses[a].address[23:16] != 8'hb1,
           "tail write failure reached Notify/enable/RNET");
@@ -800,7 +791,7 @@ package rdma_project_config_test_pkg;
         rdma_config_reg_fixture::accesses[$].address == rdma_config_reg_fixture::corrupt_address,
         "tail readback mismatch did not immediately stop configuration");
       foreach (rdma_config_reg_fixture::accesses[a])
-        require(rdma_config_reg_fixture::accesses[a].address != management_base + 'hc004 &&
+        require(rdma_config_reg_fixture::accesses[a].address != management_base + 'h8c004 &&
           rdma_config_reg_fixture::accesses[a].address != management_base + 'h80044 &&
           rdma_config_reg_fixture::accesses[a].address[23:16] != 8'hb1,
           "tail readback failure reached Notify/enable/RNET");
@@ -818,7 +809,7 @@ package rdma_project_config_test_pkg;
       execute(0, seq);
       require(rdma_config_reg_fixture::corrupt_count == 1, "readback mismatch injection was not observed");
       foreach (rdma_config_reg_fixture::accesses[a])
-        require(rdma_config_reg_fixture::accesses[a].address != management_base + 'hc004,
+        require(rdma_config_reg_fixture::accesses[a].address != management_base + 'h8c004,
           "readback failure continued into Notify");
     end
     // 逐个实际下发地址注入失败：AF、Notify高/低DWORD及使能；失败后不能出现任何后续事务。
@@ -827,8 +818,8 @@ package rdma_project_config_test_pkg;
       rdma_config_reg_fixture::fail_enabled = 1;
       case (i)
         0: rdma_config_reg_fixture::fail_address = management_base + 'h1010;
-        1: rdma_config_reg_fixture::fail_address = management_base + 'hc004;
-        2: rdma_config_reg_fixture::fail_address = management_base + 'hc000;
+        1: rdma_config_reg_fixture::fail_address = management_base + 'h8c004;
+        2: rdma_config_reg_fixture::fail_address = management_base + 'h8c000;
         3: rdma_config_reg_fixture::fail_address = management_base + 'h80044;
         // 循环只产生0..3；未来扩展若漏定义故障地址，必须在execute前失败而非复用旧地址。
         default: `uvm_fatal("PROJECT_CONFIG_TEST", "unexpected fault-address case index")

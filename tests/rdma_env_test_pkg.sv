@@ -58,7 +58,7 @@ package rdma_env_test_pkg;
       `uvm_info("ENV_TEST", {"link=", cfg.link_type, " vseq=", vseq_type},
                 UVM_LOW)
       run_traffic();
-      if (env.sb.checked == 0)
+      if (env.sb.checked == 0 && env.sb.tx_checked == 0)
         `uvm_error("ENV_TEST", "scoreboard checked nothing")
       phase.drop_objection(this);
     endtask
@@ -113,6 +113,94 @@ endfunction
     // 失败/边界：调用时 c 必须非空且尚未发布到 config_db；派生实现不得在 env 创建后依赖此钩子。
 function void rdma_env_base_test::configure(rdma_env_cfg	c);
 endfunction
+
+  // TX-only 数据面：单个发送 Function 建 UD QP，通过 net_packet monitor 验收完整发出帧，不创建接收端或 ACK。
+  class rdma_env_tx_test extends rdma_env_base_test;
+    `uvm_component_utils(rdma_env_tx_test)
+
+    // 功能：构造 TX-only 环境测试，选择只发布 wire frame 的 capture 链路。
+    // 输入/输出及副作用：name/parent 透传；默认序列设为 rdma_traffic_vseq，不创建配置或设备资源。
+    // 失败/边界：具体目的 QPN/QKey/MAC 和报文字段由 configure 默认值或 rdma.* plusarg 覆盖。
+    extern function new(string name = "rdma_env_tx_test", uvm_component parent = null);
+
+    // 功能：设置单向 UD TX sequence 的目的字段，启动控制面/数据面并检查实际 wire frame 已被验收。
+    // 输入/输出及副作用：创建并启动 rdma_traffic_vseq；不等待远端 CQE/ACK，tx_success 由 TX scoreboard 置位。
+    // 失败/边界：sequence 类型不匹配、目的字段缺失或少帧均报告 UVM_FATAL。
+    extern virtual task run_traffic();
+
+    // 功能：提供可运行的单向 UD 默认配置，并保留所有 rdma.qp/pkt/traffic plusarg 覆盖入口。
+    // 输入/输出及副作用：修改尚未 finalize 的场景字段；不分配资源、不抽样表达式。
+    // 失败/边界：显式 plusarg 在后续 AIP load 中覆盖这些默认值，最终非法组合由 scenario.validate 拒绝。
+    extern virtual function void configure(rdma_env_cfg c);
+  endclass
+
+    // 功能：构造 TX-only 环境测试，选择统一流量序列和标准 net_packet 链路接口。
+    // 输入/输出及副作用：name/parent 建立 UVM 层级；链路对象由 env 在 build_phase 创建。
+    // 失败/边界：未启动 run_phase 前不拥有任何 QP、Host memory 或 monitor 状态。
+function rdma_env_tx_test::new(string name = "rdma_env_tx_test", uvm_component parent = null);
+      super.new(name, parent);
+      link_type = "rdma_tx_capture_link";
+      vseq_type = "rdma_traffic_vseq";
+endfunction
+
+    // 功能：设置 TX-only 默认场景：UD、单 QP、单条 SEND、固定 payload/IMM 以及显式 RoCEv2 外层地址。
+    // 输入/输出及副作用：只写 c.scenario 和检查开关；后续 loader 可按 plusarg 替换每个字段。
+    // 失败/边界：默认值满足单向 TX 的目的字段要求；任何覆盖后的非法值由配置 finalize 拒绝。
+function void rdma_env_tx_test::configure(rdma_env_cfg c);
+      c.checker_enable = 1'b0;
+      c.cov_enable = 1'b0;
+      c.scenario.qp.kind = RDMA_SCENARIO_UD;
+      c.scenario.qp.depth = 16;
+      c.scenario.qp.dest_qpn = 23;
+      c.scenario.qp.qkey = 32'h1234_5678;
+      c.scenario.mem.buf_bytes = 'h4000;
+      c.scenario.mem.slot_bytes = 'h400;
+      c.scenario.mem.slots = 1;
+      c.scenario.traffic.op = "send";
+      c.scenario.traffic.count = 1;
+      c.scenario.traffic.w_send = 1;
+      c.scenario.traffic.w_send_imm = 0;
+      c.scenario.traffic.w_write = 0;
+      c.scenario.traffic.w_write_imm = 0;
+      c.scenario.traffic.w_read = 0;
+      c.scenario.traffic.w_cas = 0;
+      c.scenario.traffic.w_faa = 0;
+      c.scenario.traffic.len = "64";
+      c.scenario.traffic.sge = "1";
+      c.scenario.traffic.data_mode = "FIXED";
+      c.scenario.traffic.data_fixed = "0x5a";
+      c.scenario.traffic.imm = "0x1234abcd";
+      c.scenario.traffic.signaled_pct = 100;
+      c.scenario.traffic.dir = 0;
+      c.scenario.pkt.vlan_en = 1'b1;
+      c.scenario.pkt.vlan_id = 37;
+      c.scenario.pkt.src_mac = 48'h02_00_00_00_00_01;
+      c.scenario.pkt.dst_mac = 48'h02_00_00_00_00_02;
+      c.scenario.pkt.src_ip = 32'h0a00_0001;
+      c.scenario.pkt.dst_ip = 32'h0a00_0002;
+      c.scenario.pkt.udp_sport = 5071;
+endfunction
+
+    // 功能：创建 TX-only 流量序列，注入冻结场景中的目的 QPN/QKey/MAC，并等待真实 frame 验收完成。
+    // 输入/输出及副作用：sequence.start 驱动 CMQ/QP/SQ/NIC；成功时返回且 scoreboard.tx_checked 等于请求数。
+    // 失败/边界：无法 cast、tx_success=0 或 scoreboard 有错误均 fatal；不会以 CQE/ACK 缺失替代帧验收。
+task rdma_env_tx_test::run_traffic();
+      uvm_object base;
+      rdma_traffic_vseq tx;
+
+      base = uvm_factory::get().create_object_by_name(vseq_type, "", "vseq");
+      if (!$cast(tx, base))
+        `uvm_fatal("ENV_TX", {"TX-only requires rdma_traffic_vseq, got ", vseq_type})
+      tx.tx_only = 1'b1;
+      tx.tx_dest_qpn = cfg.scenario.qp.dest_qpn;
+      tx.tx_dest_qkey = cfg.scenario.qp.qkey;
+      tx.tx_dmac = cfg.scenario.pkt.dst_mac;
+      tx.start(env.vseqr);
+      if (!tx.tx_success || !env.sb.tx_complete(cfg.scenario.traffic.count))
+        `uvm_fatal("ENV_TX", $sformatf(
+          "TX frame verification failed: expected=%0d checked=%0d errors=%0d",
+          cfg.scenario.traffic.count, env.sb.tx_checked, env.sb.errors))
+endtask
 
   // loopback 链路的全功能流量。
   class rdma_env_basic_test extends rdma_env_base_test;

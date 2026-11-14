@@ -155,7 +155,7 @@ class rdma_link extends uvm_component;
   // 功能：src 向目的 MAC 发包：广播 tx → 故障规则 → deliver。
   // 输入/输出及副作用：写 tx_ap；见 deliver。
   // 失败/边界：目的 MAC 未接入报 UVM_ERROR 并丢弃。
-  task transmit(int unsigned src, rdma_packet pkt, bit [47:0] dmac);
+  virtual task transmit(int unsigned src, rdma_packet pkt, bit [47:0] dmac);
     rdma_link_fault f;
     int unsigned dst;
 

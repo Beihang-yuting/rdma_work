@@ -8,6 +8,10 @@ BUILD ?= build/core
 # 驱动归档路径默认沿用 53 主机位置，其它机器可经环境变量或命令行 RDMA_ARCHIVE=... 覆盖。
 RDMA_ARCHIVE ?= /home/ubuntu/Downloads/dpu_kernel_rdma-version_0.1.34.tar(1).gz
 TEST ?= rdma_smoke_test
+# 运行时 plusarg 透传给每个 simv 测试，例如 SIM_ARGS='+rdma.qp.dest_qpn=37 +rdma.pkt.vlan_id=42'。
+SIM_ARGS ?=
+# env 目标的可执行文件与日志目录，默认保持 build/env；回归隔离时可改为独立目录。
+ENV_BUILD ?= build/env
 VCS ?= vcs
 # Work around a VCS W-2024.09-SP1 class-codegen miscompile; not an RTL requirement.
 VCS_FLAGS := -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps -debug_access+class
@@ -207,21 +211,30 @@ net_packet_preflight:
 # env suite：UVM env 的全部场景。
 ENV_TESTS := rdma_env_basic_test rdma_env_netpkt_test rdma_env_high_traffic_test \
 	rdma_env_errors_test rdma_env_reliability_test rdma_env_srq_test rdma_env_lifecycle_test \
-	rdma_env_multifunc_test rdma_env_random_test rdma_env_biz_test
+	rdma_env_multifunc_test rdma_env_random_test rdma_env_biz_test rdma_env_tx_test
 
 env: dpu_common_preflight host_mem_preflight net_packet_preflight aip_core_preflight
 	set -euo pipefail; \
-	$(call RDMA_COMPILE,build/env,); \
+	$(call RDMA_COMPILE,$(ENV_BUILD),); \
 	tests="$(TEST)"; \
 	if [[ "$$tests" == regression ]]; then tests="$(ENV_TESTS)"; fi; \
-	rm -rf build/env/simv.vdb/snps/coverage/db/testdata build/env/cov; \
+	: "每次 env 运行清理 testdata，避免上一次启用 coverage 的残留结果参与本次 urg"; \
+	rm -rf $(ENV_BUILD)/simv.vdb/snps/coverage/db/testdata $(ENV_BUILD)/cov; \
 	for test_name in $$tests; do \
-		build/env/simv +UVM_TESTNAME=$$test_name -cm_name $$test_name | tee build/env/$$test_name.log; \
-		../scripts/check_uvm_summary.sh build/env/$$test_name.log; \
+		$(ENV_BUILD)/simv +UVM_TESTNAME=$$test_name -cm_name $$test_name $(SIM_ARGS) | tee $(ENV_BUILD)/$$test_name.log; \
+		../scripts/check_uvm_summary.sh $(ENV_BUILD)/$$test_name.log; \
 	done; \
-	: "各测试的功能覆盖率经 urg 合并，打印合并后的总分（RDMA_COV merged）"; \
-	urg -dir build/env/simv.vdb -format text -report build/env/cov > build/env/urg.log 2>&1; \
-	echo "RDMA_COV merged=$$(awk '/Total Groups Coverage Summary/ {getline; getline; print $$1; exit}' build/env/cov/groups.txt)"
+	: "TX-only 场景可显式关闭 coverage；没有 testdata 时跳过 urg，并保持 env target 成功"; \
+	coverage_testdata=$(ENV_BUILD)/simv.vdb/snps/coverage/db/testdata; \
+	coverage_entry=; \
+	if [[ -d "$$coverage_testdata" ]]; then coverage_entry=$$(find "$$coverage_testdata" -mindepth 1 -print -quit); fi; \
+	if [[ -n "$$coverage_entry" ]]; then \
+		: "各测试的功能覆盖率经 urg 合并，打印合并后的总分（RDMA_COV merged）"; \
+		urg -dir $(ENV_BUILD)/simv.vdb -format text -report $(ENV_BUILD)/cov > $(ENV_BUILD)/urg.log 2>&1; \
+		echo "RDMA_COV merged=$$(awk '/Total Groups Coverage Summary/ {getline; getline; print $$1; exit}' $(ENV_BUILD)/cov/groups.txt)"; \
+	else \
+		echo "RDMA_COV skipped=no_coverage_database"; \
+	fi
 
 # Soft-RoCE 互打：需先在本机运行 tools/rxe/rxe_tap_setup.sh up（TAP 网卡 + rxe 设备，需 sudo）。
 RXE_TAP ?= rtap0
