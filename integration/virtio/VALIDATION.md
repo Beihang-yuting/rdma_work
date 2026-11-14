@@ -1,6 +1,6 @@
 # 组合环境验证记录
 
-最近验证日期：2026-11-14。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的登录 bash 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 直接组合 RDMA，复用 virtio_work 的基础 test/配置 sequence；本次同时修正 dpu_common 的 RDMA Notify PF 限制。
+最近验证日期：2026-11-14。所有 VCS 编译/仿真均在 `ubuntu@10.11.10.53` 的登录 bash 环境执行，VCS 为 W-2024.09-SP1、UVM 1.1d。实际编译的是本目录 `project_env_pkg` overlay：`project_env_cfg` 和 `project_env` 直接组合 RDMA，复用 virtio_work 的基础 test/配置 sequence；本次同时修正 dpu_common 的 RDMA Notify PF 限制并加入 RDMA Notify/RNET 默认驱动布局。
 
 当前工作树补齐了 `multi_host_pf_vf` 场景中 Host0/PF0 本体的四项 Intel route 参数，并在 53 的登录 bash 中以当前源码和依赖重跑：`two_pf`、`multi_host_pf_vf`、`save`、`restore`、`vio_only` 全部通过，结果目录为 `/home/ubuntu/workspace/rdma_codex_manual.8fD0IH/output/virtio_full_routefix4`。
 
@@ -54,6 +54,19 @@ RDMA_TX_ONLY_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh
 `dut_cfg_seq` 的对象绑定和重载门禁此前也曾以入口探针单独通过；本次以实际配置流程替换了该模拟成功结果。
 
 本地 `git diff --check`、`bash -n integration/virtio/tests/run.sh` 和 `tools/check_changed_sv_style.py --base HEAD` 通过。
+
+## dpu_common 默认 RDMA 布局验证（2026-11-14）
+
+`dpu_common` 提交 `69843ec` 的 `dpu.driver_layouts=1` 默认值现在生成 RDMA Notify
+（模块 `0x80000`、表偏移 `0xc000`、8B、256 项）和 RNET（模块 `0xb00000`、表偏移
+`0x15000`、4B、256 项）。在 53 临时 checkout 上编译运行 `dpu_table_types_test`，结果为
+`DPU_TABLE_TYPES_PASS`，UVM WARNING/ERROR/FATAL 为 `0/0/0`；该测试同时检查显式
+`table_layouts` 不被默认值覆盖。
+
+使用同一提交和最新 `virtio_work`、`pcie_work`、`host_mem` 临时 checkout 编译组合环境，
+执行 `RDMA_TX_ONLY_SMOKE_ONLY=1 bash integration/virtio/tests/run.sh`，结果为
+`RDMA_VIRTIO_TX_ONLY_ARGS_PASS`，UVM WARNING/ERROR/FATAL 为 `0/0/0`。VCS 仍提示测试
+fixture 中已有的 `ENUMASSIGN`，没有新增源码错误；该 smoke 只验证配置和参数边界，不代表真实 DUT 发包。
 
 ## 自动 grant 定向验证（2026-11-12）
 

@@ -77,7 +77,7 @@ if (ok && cfg.rdma_enabled &&
 
 需要在加载参数前自定义默认值/Function 选择时，直接创建 `project_env_cfg`，通过 `uvm_config_db#(project_env_cfg)` 的 `project_cfg` 键提供给 test，并设置 `rdma_enabled=1`。也可以使用 `+rdma.enabled=1`；显式 Function/grant 会自动打开 RDMA。父类 `cfg` 与组合 env 的 `project_cfg` 指向同一对象，没有兼容字段同步或配置复制。
 
-普通业务参数继续使用 `+rdma.qp.*`、`+rdma.mem.*`、`+rdma.pkt.*`、`+rdma.traffic.*`；VIO/DPU 参数完全沿用 virtio 项目。VIO 默认 pairs=0，需要业务时按 virtio 的契约提供 Packed/Custom 队列几何、Notify 和完成模式。真实表布局、Function 策略与 MSI-X 消息由平台提供；本示例不会猜测硬件偏移或 requester 编码。
+普通业务参数继续使用 `+rdma.qp.*`、`+rdma.mem.*`、`+rdma.pkt.*`、`+rdma.traffic.*`；VIO/DPU 参数完全沿用 virtio 项目。VIO 默认 pairs=0，需要业务时按 virtio 的契约提供 Packed/Custom 队列几何、Notify 和完成模式。`dpu.driver_layouts=1` 默认安装 53 驱动已核对的 VIO/QSCH/BDF/MSI-X、RDMA Notify 和 RNET 表布局；硬件变体只需用现有 `dpu.*.reg_target` 或显式 `table_layouts` 覆盖。Function 策略与 MSI-X 消息由冻结的 dpu_common 拓扑生成，示例不会猜测 requester 编码。
 
 ### 自动 grant 与启动参数
 
@@ -168,4 +168,4 @@ RDMA 保持单 bank，字段约束仍为 Host ID < 8、global Function ID 与 RD
 
 PF 配置需同步本次 `dpu_common.public_records()` 修复：删除 RDMA Notify 的 VF-only 限制，
 保留既有 Host、保留位和表索引检查。Notify 的 `vf_id` 是 RDMA Function ID，可对应 PF 或 VF；
-平台仍须显式提供 RDMA Notify/RNET 的实际表布局。
+默认布局由 `dpu.driver_layouts=1` 提供，平台只需在硬件变体时显式覆盖 RDMA Notify/RNET 的 target 或完整布局。
